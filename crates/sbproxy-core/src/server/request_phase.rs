@@ -119,7 +119,11 @@ pub(super) enum InboundKeyPhase {
     /// A minted key resolved. The configured auth provider is skipped.
     Resolved,
     /// Refuse the request with this status and message.
-    Deny(u16, String),
+    Deny {
+        status: u16,
+        message: String,
+        trust_outcome: AuthTrustOutcome,
+    },
 }
 
 /// Resolve a minted virtual key out of the configured inbound headers, before
@@ -136,10 +140,11 @@ pub(super) async fn resolve_inbound_key(
     let (header, token) = match crate::inbound_key::sweep_headers(headers, plane.inbound()) {
         crate::inbound_key::SweepOutcome::None => return InboundKeyPhase::NotPresent,
         crate::inbound_key::SweepOutcome::Ambiguous => {
-            return InboundKeyPhase::Deny(
-                400,
-                "conflicting api keys in more than one header".to_string(),
-            );
+            return InboundKeyPhase::Deny {
+                status: 400,
+                message: "conflicting api keys in more than one header".to_string(),
+                trust_outcome: AuthTrustOutcome::InvalidProof,
+            };
         }
         crate::inbound_key::SweepOutcome::Found { header, token } => (header, token),
     };
@@ -159,15 +164,31 @@ pub(super) async fn resolve_inbound_key(
                 );
                 InboundKeyPhase::NotPresent
             } else {
-                InboundKeyPhase::Deny(503, "key store unavailable".to_string())
+                InboundKeyPhase::Deny {
+                    status: 503,
+                    message: "key store unavailable".to_string(),
+                    trust_outcome: AuthTrustOutcome::BackendFailure,
+                }
             }
         }
-        Ok(None) => InboundKeyPhase::Deny(401, "invalid key".to_string()),
+        Ok(None) => InboundKeyPhase::Deny {
+            status: 401,
+            message: "invalid key".to_string(),
+            trust_outcome: AuthTrustOutcome::InvalidProof,
+        },
         Ok(Some(rec)) => {
             if !plane.crypto().verify_record(&rec, secret, now) {
-                InboundKeyPhase::Deny(401, "invalid key".to_string())
+                InboundKeyPhase::Deny {
+                    status: 401,
+                    message: "invalid key".to_string(),
+                    trust_outcome: AuthTrustOutcome::InvalidProof,
+                }
             } else if !rec.is_usable(now) {
-                InboundKeyPhase::Deny(403, "key is not active".to_string())
+                InboundKeyPhase::Deny {
+                    status: 403,
+                    message: "key is not active".to_string(),
+                    trust_outcome: AuthTrustOutcome::InvalidProof,
+                }
             } else {
                 ctx.inbound_key_header = Some(header);
                 ctx.resolved_inbound_key = Some(Box::new(rec));
@@ -175,6 +196,10 @@ pub(super) async fn resolve_inbound_key(
             }
         }
     }
+}
+
+fn finalize_inbound_key_trust(ctx: &mut RequestContext, trust_outcome: AuthTrustOutcome) {
+    crate::trust_tier::finalize(ctx, trust_outcome.is_suspicious());
 }
 
 /// Handle an incoming request before proxying. See the trait method
@@ -2250,6 +2275,7 @@ pub(super) async fn request_filter(
             }
             InboundKeyPhase::NotPresent => {
                 if crate::inbound_key::requires_minted_key(plane.inbound()) {
+                    finalize_inbound_key_trust(ctx, AuthTrustOutcome::Missing);
                     sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", false);
                     emit_auth_audit(
                         "auth_denied",
@@ -2263,7 +2289,12 @@ pub(super) async fn request_filter(
                     return Ok(true);
                 }
             }
-            InboundKeyPhase::Deny(status, message) => {
+            InboundKeyPhase::Deny {
+                status,
+                message,
+                trust_outcome,
+            } => {
+                finalize_inbound_key_trust(ctx, trust_outcome);
                 sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", false);
                 emit_auth_audit(
                     "auth_denied",
@@ -5249,9 +5280,64 @@ mod olp_form_tests {
 mod inbound_key_phase_tests {
     use super::*;
     use sbproxy_keystore::crypto::KeyCrypto;
-    use sbproxy_keystore::record::{KeyRecord, RecordStatus};
-    use sbproxy_keystore::{KeyStore, MemoryKeyStore, TtlCache, TtlCacheConfig};
+    use sbproxy_keystore::record::{CredentialRecord, KeyRecord, RecordStatus};
+    use sbproxy_keystore::{
+        KeyPolicyCasResult, KeyStore, MemoryKeyStore, TtlCache, TtlCacheConfig,
+    };
     use std::sync::Arc;
+
+    struct BrokenKeyReadStore {
+        inner: MemoryKeyStore,
+    }
+
+    #[async_trait::async_trait]
+    impl KeyStore for BrokenKeyReadStore {
+        async fn get_key(&self, _key_id: &str) -> anyhow::Result<Option<KeyRecord>> {
+            anyhow::bail!("store down")
+        }
+
+        async fn list_keys(&self) -> anyhow::Result<Vec<KeyRecord>> {
+            self.inner.list_keys().await
+        }
+
+        async fn put_key(&self, record: KeyRecord) -> anyhow::Result<()> {
+            self.inner.put_key(record).await
+        }
+
+        async fn put_key_if_revision(
+            &self,
+            record: KeyRecord,
+            expected_revision: u64,
+        ) -> anyhow::Result<KeyPolicyCasResult> {
+            self.inner
+                .put_key_if_revision(record, expected_revision)
+                .await
+        }
+
+        async fn delete_key(&self, key_id: &str) -> anyhow::Result<()> {
+            self.inner.delete_key(key_id).await
+        }
+
+        async fn get_credential(&self, id: &str) -> anyhow::Result<Option<CredentialRecord>> {
+            self.inner.get_credential(id).await
+        }
+
+        async fn list_credentials(&self) -> anyhow::Result<Vec<CredentialRecord>> {
+            self.inner.list_credentials().await
+        }
+
+        async fn put_credential(&self, record: CredentialRecord) -> anyhow::Result<()> {
+            self.inner.put_credential(record).await
+        }
+
+        async fn delete_credential(&self, id: &str) -> anyhow::Result<()> {
+            self.inner.delete_credential(id).await
+        }
+
+        async fn revision(&self) -> anyhow::Result<u64> {
+            self.inner.revision().await
+        }
+    }
 
     /// A plane holding one active and one revoked key, plus their tokens.
     async fn plane_with_keys() -> (crate::key_plane::KeyPlane, String, String) {
@@ -5290,6 +5376,24 @@ mod inbound_key_phase_tests {
 
     fn ctx() -> RequestContext {
         RequestContext::default()
+    }
+
+    fn assert_denial(
+        outcome: InboundKeyPhase,
+        expected_status: u16,
+        expected_trust: AuthTrustOutcome,
+    ) {
+        assert!(
+            matches!(
+                outcome,
+                InboundKeyPhase::Deny {
+                    status,
+                    trust_outcome,
+                    ..
+                } if status == expected_status && trust_outcome == expected_trust
+            ),
+            "unexpected inbound key outcome: {outcome:?}"
+        );
     }
 
     #[tokio::test]
@@ -5348,10 +5452,7 @@ mod inbound_key_phase_tests {
         let mut c = ctx();
         let outcome =
             resolve_inbound_key(&plane, &headers(&[("x-api-key", &revoked)]), &mut c).await;
-        assert!(
-            matches!(outcome, InboundKeyPhase::Deny(403, _)),
-            "{outcome:?}"
-        );
+        assert_denial(outcome, 403, AuthTrustOutcome::InvalidProof);
         assert!(
             c.resolved_inbound_key.is_none(),
             "a denied key is not stamped"
@@ -5365,10 +5466,7 @@ mod inbound_key_phase_tests {
         let unknown = format!("sbp_{}_{}", "f".repeat(16), "e".repeat(64));
         let outcome =
             resolve_inbound_key(&plane, &headers(&[("x-api-key", &unknown)]), &mut c).await;
-        assert!(
-            matches!(outcome, InboundKeyPhase::Deny(401, _)),
-            "{outcome:?}"
-        );
+        assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
     }
 
     #[tokio::test]
@@ -5379,10 +5477,7 @@ mod inbound_key_phase_tests {
         let wrong = format!("sbp_{key_id}_{}", "0".repeat(64));
         let mut c = ctx();
         let outcome = resolve_inbound_key(&plane, &headers(&[("x-api-key", &wrong)]), &mut c).await;
-        assert!(
-            matches!(outcome, InboundKeyPhase::Deny(401, _)),
-            "{outcome:?}"
-        );
+        assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
     }
 
     #[tokio::test]
@@ -5391,10 +5486,55 @@ mod inbound_key_phase_tests {
         let mut c = ctx();
         let h = headers(&[("x-api-key", &token), ("x-sb-api", &revoked)]);
         let outcome = resolve_inbound_key(&plane, &h, &mut c).await;
-        assert!(
-            matches!(outcome, InboundKeyPhase::Deny(400, _)),
-            "{outcome:?}"
-        );
+        assert_denial(outcome, 400, AuthTrustOutcome::InvalidProof);
+    }
+
+    #[tokio::test]
+    async fn a_key_store_outage_is_a_neutral_backend_failure() {
+        let crypto = KeyCrypto::new(b"pep".to_vec(), b"mas".to_vec());
+        let token = crypto.mint_key().token;
+        let store: Arc<dyn KeyStore> = Arc::new(BrokenKeyReadStore {
+            inner: MemoryKeyStore::new(),
+        });
+        let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
+        let plane = crate::key_plane::KeyPlane::from_parts(crypto, cache, false, false, None);
+        let mut c = ctx();
+
+        let outcome = resolve_inbound_key(&plane, &headers(&[("x-api-key", &token)]), &mut c).await;
+
+        assert_denial(outcome, 503, AuthTrustOutcome::BackendFailure);
+    }
+
+    #[test]
+    fn inbound_key_early_refusals_finalize_trust_exactly_once() {
+        let cases = [
+            (
+                AuthTrustOutcome::Missing,
+                sbproxy_modules::auth::TrustTier::Anonymous,
+            ),
+            (
+                AuthTrustOutcome::BackendFailure,
+                sbproxy_modules::auth::TrustTier::Anonymous,
+            ),
+            (
+                AuthTrustOutcome::InvalidProof,
+                sbproxy_modules::auth::TrustTier::Suspicious,
+            ),
+        ];
+
+        for (outcome, expected_tier) in cases {
+            let mut c = ctx();
+            finalize_inbound_key_trust(&mut c, outcome);
+            assert_eq!(c.trust_tier, expected_tier);
+            assert!(c.trust_tier_metric_recorded);
+
+            let first_tier = c.trust_tier;
+            finalize_inbound_key_trust(&mut c, AuthTrustOutcome::InvalidProof);
+            assert_eq!(
+                c.trust_tier, first_tier,
+                "a second finalization attempt must be ignored"
+            );
+        }
     }
 
     #[test]

@@ -37,6 +37,31 @@ fn response_info(policy: &RateLimitBudgetPolicy, decision: &BudgetDecision) -> R
     }
 }
 
+fn apply_budget_decision(
+    policy: &RateLimitBudgetPolicy,
+    decision: &BudgetDecision,
+    ctx: &mut RequestContext,
+) -> PolicyDecision {
+    sbproxy_observe::metrics::record_rate_limit_decision(
+        DEFAULT_WORKSPACE,
+        if decision.allowed {
+            "allow"
+        } else {
+            "throttle_tenant"
+        },
+    );
+    if decision.allowed {
+        return PolicyDecision::Allow;
+    }
+
+    ctx.rate_limit_info = Some(response_info(policy, decision));
+    ctx.deny_policy_type = Some("rate_limit_budget");
+    PolicyDecision::Deny {
+        status: 429,
+        message: "rate limit budget exceeded".to_string(),
+    }
+}
+
 impl PolicyEnforcer for RateLimitBudgetEnforcer {
     fn policy_type(&self) -> &'static str {
         "rate_limit_budget"
@@ -73,20 +98,8 @@ impl PolicyEnforcer for RateLimitBudgetEnforcer {
         // resolves a per-tenant workspace here.)
         let _ = &ctx.tenant_id;
         let decision = registry.check(DEFAULT_WORKSPACE);
-
-        if decision.allowed {
-            return Box::pin(async move { Ok(PolicyDecision::Allow) });
-        }
-
-        // Throttled: stash the info for the 429 header emitter.
-        ctx.rate_limit_info = Some(response_info(&policy, &decision));
-        ctx.deny_policy_type = Some("rate_limit_budget");
-        Box::pin(async move {
-            Ok(PolicyDecision::Deny {
-                status: 429,
-                message: "rate limit budget exceeded".to_string(),
-            })
-        })
+        let outcome = apply_budget_decision(&policy, &decision, ctx);
+        Box::pin(async move { Ok(outcome) })
     }
 }
 
@@ -94,6 +107,61 @@ impl PolicyEnforcer for RateLimitBudgetEnforcer {
 mod tests {
     use super::*;
     use sbproxy_modules::policy::rate_limit_budget::Tier;
+
+    fn decision_count(result: &str) -> u64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_rate_limit_decisions_total")
+            .and_then(|family| {
+                family.get_metric().iter().find_map(|metric| {
+                    let matches = metric.get_label().iter().all(|label| match label.name() {
+                        "policy" => label.value() == DEFAULT_WORKSPACE,
+                        "result" => label.value() == result,
+                        _ => true,
+                    });
+                    matches.then(|| metric.get_counter().value() as u64)
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn workspace_budget_decisions_feed_the_alert_counter() {
+        let policy = RateLimitBudgetPolicy::from_config(serde_json::json!({
+            "type": "rate_limit_budget"
+        }))
+        .unwrap();
+        let mut ctx = RequestContext::new();
+        let allowed = BudgetDecision {
+            allowed: true,
+            tier: Tier::Normal,
+            limit: 10,
+            remaining: 9,
+            reset_secs: 1,
+            window_secs: 1,
+        };
+        let before_allow = decision_count("allow");
+        assert!(matches!(
+            apply_budget_decision(&policy, &allowed, &mut ctx),
+            PolicyDecision::Allow
+        ));
+        assert_eq!(decision_count("allow"), before_allow + 1);
+
+        let throttled = BudgetDecision {
+            allowed: false,
+            tier: Tier::Throttle,
+            limit: 10,
+            remaining: 0,
+            reset_secs: 1,
+            window_secs: 1,
+        };
+        let before_throttle = decision_count("throttle_tenant");
+        assert!(matches!(
+            apply_budget_decision(&policy, &throttled, &mut ctx),
+            PolicyDecision::Deny { status: 429, .. }
+        ));
+        assert_eq!(decision_count("throttle_tenant"), before_throttle + 1);
+    }
 
     #[test]
     fn response_info_honors_rate_limit_policy_header_preference() {

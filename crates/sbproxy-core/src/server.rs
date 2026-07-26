@@ -2922,6 +2922,134 @@ fn bot_auth_directory_client() -> &'static reqwest::Client {
     })
 }
 
+fn is_auth_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Return whether an HTTP authentication challenge explicitly carries the
+/// requested auth parameter and value.
+///
+/// The scanner ignores quoted strings while looking for parameter names and
+/// enforces RFC token boundaries, so values such as
+/// `error_description="invalid_token"` cannot masquerade as `error=...`.
+fn auth_challenge_has_parameter(header: &str, name: &str, expected: &str) -> bool {
+    let bytes = header.as_bytes();
+    let name = name.as_bytes();
+    let expected = expected.as_bytes();
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'"' {
+            cursor += 1;
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'\\' if cursor + 1 < bytes.len() => cursor += 2,
+                    b'"' => {
+                        cursor += 1;
+                        break;
+                    }
+                    _ => cursor += 1,
+                }
+            }
+            continue;
+        }
+
+        let name_end = cursor.saturating_add(name.len());
+        let has_name = name_end <= bytes.len()
+            && bytes[cursor..name_end].eq_ignore_ascii_case(name)
+            && (cursor == 0 || !is_auth_token_byte(bytes[cursor - 1]))
+            && (name_end == bytes.len() || !is_auth_token_byte(bytes[name_end]));
+        if !has_name {
+            cursor += 1;
+            continue;
+        }
+
+        let mut value_start = name_end;
+        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+        if bytes.get(value_start) != Some(&b'=') {
+            cursor = name_end;
+            continue;
+        }
+        value_start += 1;
+        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+
+        if bytes.get(value_start) == Some(&b'"') {
+            value_start += 1;
+            let mut value_end = value_start;
+            while value_end < bytes.len() && bytes[value_end] != b'"' {
+                if bytes[value_end] == b'\\' {
+                    break;
+                }
+                value_end += 1;
+            }
+            if value_end < bytes.len()
+                && bytes[value_start..value_end].eq_ignore_ascii_case(expected)
+            {
+                return true;
+            }
+        } else {
+            let mut value_end = value_start;
+            while value_end < bytes.len() && is_auth_token_byte(bytes[value_end]) {
+                value_end += 1;
+            }
+            if bytes[value_start..value_end].eq_ignore_ascii_case(expected) {
+                return true;
+            }
+        }
+
+        cursor = value_start.saturating_add(1);
+    }
+
+    false
+}
+
+fn forward_auth_denial_trust_outcome(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+) -> AuthTrustOutcome {
+    if status >= 500 {
+        return AuthTrustOutcome::BackendFailure;
+    }
+
+    let mut challenge_present = false;
+    for value in headers.get_all(reqwest::header::WWW_AUTHENTICATE).iter() {
+        challenge_present = true;
+        if value
+            .to_str()
+            .is_ok_and(|value| auth_challenge_has_parameter(value, "error", "invalid_token"))
+        {
+            return AuthTrustOutcome::InvalidProof;
+        }
+    }
+
+    if challenge_present {
+        AuthTrustOutcome::Challenge
+    } else {
+        AuthTrustOutcome::Missing
+    }
+}
+
 /// Run forward auth by making an HTTP subrequest to the auth service.
 async fn check_forward_auth(
     fwd: &sbproxy_modules::auth::ForwardAuthProvider,
@@ -2972,15 +3100,8 @@ async fn check_forward_auth(
         }
         Ok(forwarded)
     } else {
-        Err((
-            401u16,
-            "unauthorized".to_string(),
-            if status >= 500 {
-                AuthTrustOutcome::BackendFailure
-            } else {
-                AuthTrustOutcome::InvalidProof
-            },
-        ))
+        let trust_outcome = forward_auth_denial_trust_outcome(status, response.headers());
+        Err((401u16, "unauthorized".to_string(), trust_outcome))
     }
 }
 

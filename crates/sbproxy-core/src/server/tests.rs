@@ -6,6 +6,57 @@
 use super::*;
 
 #[test]
+fn forward_auth_refusals_require_explicit_invalid_proof_evidence() {
+    let no_challenge = reqwest::header::HeaderMap::new();
+    assert_eq!(
+        forward_auth_denial_trust_outcome(401, &no_challenge),
+        AuthTrustOutcome::Missing,
+        "a bare 401 is ambiguous and must remain neutral"
+    );
+
+    let mut challenge = reqwest::header::HeaderMap::new();
+    challenge.insert(
+        reqwest::header::WWW_AUTHENTICATE,
+        reqwest::header::HeaderValue::from_static("Bearer realm=\"api\""),
+    );
+    assert_eq!(
+        forward_auth_denial_trust_outcome(401, &challenge),
+        AuthTrustOutcome::Challenge,
+        "a protocol challenge is neutral"
+    );
+
+    let mut invalid_proof = reqwest::header::HeaderMap::new();
+    invalid_proof.insert(
+        reqwest::header::WWW_AUTHENTICATE,
+        reqwest::header::HeaderValue::from_static(
+            "Bearer realm=\"api\", ERROR = \"INVALID_TOKEN\"",
+        ),
+    );
+    assert_eq!(
+        forward_auth_denial_trust_outcome(401, &invalid_proof),
+        AuthTrustOutcome::InvalidProof,
+        "an explicit invalid_token auth parameter is suspicious"
+    );
+
+    let mut lookalike = reqwest::header::HeaderMap::new();
+    lookalike.insert(
+        reqwest::header::WWW_AUTHENTICATE,
+        reqwest::header::HeaderValue::from_static("Bearer error_description=\"invalid_token\""),
+    );
+    assert_eq!(
+        forward_auth_denial_trust_outcome(401, &lookalike),
+        AuthTrustOutcome::Challenge,
+        "an error-description substring is not explicit invalid-proof evidence"
+    );
+
+    assert_eq!(
+        forward_auth_denial_trust_outcome(503, &invalid_proof),
+        AuthTrustOutcome::BackendFailure,
+        "backend failures remain neutral even if an upstream header is misleading"
+    );
+}
+
+#[test]
 fn swr_write_back_does_not_resurrect_an_invalidated_entry() {
     let store: std::sync::Arc<dyn sbproxy_cache::CacheStore> =
         std::sync::Arc::new(sbproxy_cache::MemoryCacheStore::new(0));

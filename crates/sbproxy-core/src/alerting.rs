@@ -186,9 +186,14 @@ async fn run(
                 let pipeline = crate::reload::current_pipeline();
                 let circuit_breakers = sample_circuit_breakers(
                     &pipeline.actions,
-                    |action_index| {
-                        pipeline.config.origins.get(action_index).map(|origin| {
-                            format!("{}/{}", origin.workspace_id, origin.origin_id)
+                    &pipeline.forward_rules,
+                    |action_index, forward_rule_index| {
+                        pipeline.config.origins.get(action_index).map(|origin| match forward_rule_index {
+                            Some(rule_index) => format!(
+                                "{}/{}#forward-rule-{rule_index}",
+                                origin.workspace_id, origin.origin_id
+                            ),
+                            None => format!("{}/{}", origin.workspace_id, origin.origin_id),
                         })
                     },
                 );
@@ -261,24 +266,28 @@ async fn run(
 
 fn sample_circuit_breakers<F>(
     actions: &[sbproxy_modules::Action],
+    forward_rules: &[Vec<crate::pipeline::CompiledForwardRule>],
     mut action_identity: F,
 ) -> Option<Vec<CircuitBreakerReading>>
 where
-    F: FnMut(usize) -> Option<String>,
+    F: FnMut(usize, Option<usize>) -> Option<String>,
 {
     let mut readings = Vec::new();
-    for (action_index, action) in actions.iter().enumerate() {
+    let mut sample_action = |action_index: usize,
+                             forward_rule_index: Option<usize>,
+                             action: &sbproxy_modules::Action|
+     -> Option<()> {
         let sbproxy_modules::Action::LoadBalancer(load_balancer) = action else {
-            continue;
+            return Some(());
         };
         let Some(breakers) = load_balancer.circuit_breakers.as_ref() else {
-            continue;
+            return Some(());
         };
         // The compiled origin IDs are bounded configuration values and are
         // parallel to `actions`. They distinguish two load-balancer actions
         // without placing target URLs or process-local pointer values into
         // alert identities.
-        let action_identity = action_identity(action_index)?;
+        let action_identity = action_identity(action_index, forward_rule_index)?;
         readings.extend(breakers.iter().enumerate().map(|(index, breaker)| {
             let state = match breaker.state() {
                 sbproxy_platform::CircuitState::Closed => CircuitBreakerState::Closed,
@@ -290,6 +299,15 @@ where
                 state,
             }
         }));
+        Some(())
+    };
+    for (action_index, action) in actions.iter().enumerate() {
+        sample_action(action_index, None, action)?;
+        if let Some(rules) = forward_rules.get(action_index) {
+            for (rule_index, rule) in rules.iter().enumerate() {
+                sample_action(action_index, Some(rule_index), &rule.action)?;
+            }
+        }
     }
     // An available pipeline with no configured breakers is a complete empty
     // snapshot. The engine uses it to resolve incidents removed by reload.
@@ -320,8 +338,16 @@ mod tests {
     use sbproxy_observe::alerting::AlertChannelConfig;
     use sbproxy_observe::alerting::{RequestCounters, RuleEvaluationState};
 
-    fn breaker_origin_identity(action_index: usize) -> Option<String> {
-        Some(format!("workspace/origin-{action_index}"))
+    fn breaker_origin_identity(
+        action_index: usize,
+        forward_rule_index: Option<usize>,
+    ) -> Option<String> {
+        Some(match forward_rule_index {
+            Some(rule_index) => {
+                format!("workspace/origin-{action_index}#forward-rule-{rule_index}")
+            }
+            None => format!("workspace/origin-{action_index}"),
+        })
     }
 
     // Paused time removes the wall clock from this test. A log-channel
@@ -400,7 +426,7 @@ mod tests {
         load_balancer.record_breaker_failure(0);
         let actions = vec![sbproxy_modules::Action::LoadBalancer(load_balancer)];
 
-        let readings = sample_circuit_breakers(&actions, breaker_origin_identity).unwrap();
+        let readings = sample_circuit_breakers(&actions, &[], breaker_origin_identity).unwrap();
         assert_eq!(readings.len(), 1);
         assert_eq!(readings[0].origin, "workspace/origin-0#target-0");
         assert_eq!(
@@ -408,7 +434,7 @@ mod tests {
             sbproxy_observe::alerting::CircuitBreakerState::Open
         );
         assert_eq!(
-            sample_circuit_breakers(&[], breaker_origin_identity),
+            sample_circuit_breakers(&[], &[], breaker_origin_identity),
             Some(Vec::new())
         );
     }
@@ -431,13 +457,79 @@ mod tests {
         sbproxy_modules::Action::LoadBalancer(load_balancer)
     }
 
+    fn forward_rules_with_breaker(open: bool) -> Vec<Vec<crate::pipeline::CompiledForwardRule>> {
+        vec![vec![crate::pipeline::CompiledForwardRule {
+            matchers: Vec::new(),
+            action: load_balancer_with_breaker(open),
+            request_modifiers: Vec::new(),
+            parameters: Vec::new(),
+        }]]
+    }
+
+    #[test]
+    fn forward_rule_breakers_open_resolve_and_disappear_by_stable_identity() {
+        let actions = vec![sbproxy_modules::Action::Noop];
+        let identity = |origin_index: usize, forward_rule_index: Option<usize>| {
+            Some(match forward_rule_index {
+                Some(rule_index) => {
+                    format!("workspace/origin-{origin_index}#forward-rule-{rule_index}")
+                }
+                None => format!("workspace/origin-{origin_index}"),
+            })
+        };
+        let opened =
+            sample_circuit_breakers(&actions, &forward_rules_with_breaker(true), identity).unwrap();
+        assert_eq!(
+            opened[0].origin,
+            "workspace/origin-0#forward-rule-0#target-0"
+        );
+
+        let mut engine = AlertEngine::new(EngineConfig::default());
+        assert_eq!(
+            engine
+                .evaluate(&MetricReadings {
+                    circuit_breakers: Some(opened),
+                    ..MetricReadings::default()
+                })
+                .len(),
+            1
+        );
+        let recovered =
+            sample_circuit_breakers(&actions, &forward_rules_with_breaker(false), identity)
+                .unwrap();
+        let resolved = engine.evaluate(&MetricReadings {
+            circuit_breakers: Some(recovered),
+            ..MetricReadings::default()
+        });
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].resolved);
+
+        let reopened =
+            sample_circuit_breakers(&actions, &forward_rules_with_breaker(true), identity).unwrap();
+        let reopened_events = engine.evaluate(&MetricReadings {
+            circuit_breakers: Some(reopened),
+            ..MetricReadings::default()
+        });
+        assert_eq!(reopened_events.len(), 1);
+        assert!(!reopened_events[0].resolved);
+
+        let removed = sample_circuit_breakers(&actions, &[Vec::new()], identity).unwrap();
+        assert!(removed.is_empty());
+        let removal_events = engine.evaluate(&MetricReadings {
+            circuit_breakers: Some(removed),
+            ..MetricReadings::default()
+        });
+        assert_eq!(removal_events.len(), 1);
+        assert!(removal_events[0].resolved);
+    }
+
     #[test]
     fn duplicate_targets_in_separate_actions_keep_independent_breaker_incidents() {
         let actions = vec![
             load_balancer_with_breaker(true),
             load_balancer_with_breaker(false),
         ];
-        let readings = sample_circuit_breakers(&actions, breaker_origin_identity).unwrap();
+        let readings = sample_circuit_breakers(&actions, &[], breaker_origin_identity).unwrap();
         assert_ne!(readings[0].origin, readings[1].origin);
 
         let mut engine = AlertEngine::new(EngineConfig::default());
@@ -455,6 +547,7 @@ mod tests {
                     load_balancer_with_breaker(false),
                     load_balancer_with_breaker(false),
                 ],
+                &[],
                 breaker_origin_identity,
             ),
             ..MetricReadings::default()
@@ -470,13 +563,14 @@ mod tests {
         let fired = engine.evaluate(&MetricReadings {
             circuit_breakers: sample_circuit_breakers(
                 &[load_balancer_with_breaker(true)],
+                &[],
                 breaker_origin_identity,
             ),
             ..MetricReadings::default()
         });
         assert_eq!(fired.len(), 1);
 
-        let removed = sample_circuit_breakers(&[], breaker_origin_identity);
+        let removed = sample_circuit_breakers(&[], &[], breaker_origin_identity);
         assert_eq!(removed, Some(Vec::new()));
         let resolved = engine.evaluate(&MetricReadings {
             circuit_breakers: removed,
