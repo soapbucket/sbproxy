@@ -41,6 +41,7 @@ pub struct FileCacheConfig {
 pub struct FileCacheStore {
     dir: PathBuf,
     max_size_bytes: u64,
+    operation_lock: parking_lot::Mutex<()>,
 }
 
 impl FileCacheStore {
@@ -56,6 +57,7 @@ impl FileCacheStore {
         Ok(Self {
             dir,
             max_size_bytes: config.max_size_mb * 1024 * 1024,
+            operation_lock: parking_lot::Mutex::new(()),
         })
     }
 
@@ -169,6 +171,7 @@ impl FileCacheStore {
 
 impl CacheStore for FileCacheStore {
     fn get(&self, key: &str) -> Result<Option<CachedResponse>> {
+        let _guard = self.operation_lock.lock();
         let path = self.path_for(key);
         Self::read_entry(&path, false)
     }
@@ -178,11 +181,13 @@ impl CacheStore for FileCacheStore {
     /// removes an expired record, which would destroy the entry the SWR
     /// window intended to serve.
     fn get_including_expired(&self, key: &str) -> Result<Option<CachedResponse>> {
+        let _guard = self.operation_lock.lock();
         let path = self.path_for(key);
         Self::read_entry(&path, true)
     }
 
     fn put(&self, key: &str, value: &CachedResponse) -> Result<()> {
+        let _guard = self.operation_lock.lock();
         // Enforce size limit (skip check when unlimited).
         if self.max_size_bytes > 0 {
             let used = self.current_size_bytes();
@@ -200,7 +205,26 @@ impl CacheStore for FileCacheStore {
         Self::write_entry(&path, value)
     }
 
+    fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: &CachedResponse,
+        replacement: &CachedResponse,
+    ) -> Result<bool> {
+        let _guard = self.operation_lock.lock();
+        let path = self.path_for(key);
+        let Some(current) = Self::read_entry(&path, true)? else {
+            return Ok(false);
+        };
+        if current != *expected {
+            return Ok(false);
+        }
+        Self::write_entry(&path, replacement)?;
+        Ok(true)
+    }
+
     fn delete(&self, key: &str) -> Result<()> {
+        let _guard = self.operation_lock.lock();
         let path = self.path_for(key);
         if path.exists() {
             fs::remove_file(&path).context("FileCacheStore: delete failed")?;
@@ -209,6 +233,7 @@ impl CacheStore for FileCacheStore {
     }
 
     fn clear(&self) -> Result<()> {
+        let _guard = self.operation_lock.lock();
         for entry in fs::read_dir(&self.dir).context("FileCacheStore: read dir failed")? {
             let entry = entry.context("FileCacheStore: dir entry error")?;
             let path = entry.path();
@@ -238,6 +263,7 @@ mod tests {
 
     fn make_entry(ttl_secs: u64) -> CachedResponse {
         CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![
                 ("content-type".into(), "text/plain".into()),
@@ -289,6 +315,7 @@ mod tests {
         let store = make_store(&dir);
 
         let expired = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: b"stale".to_vec(),
@@ -350,6 +377,7 @@ mod tests {
         let store = make_store(&dir);
 
         let e1 = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: b"one".to_vec(),
@@ -357,6 +385,7 @@ mod tests {
             ttl_secs: 300,
         };
         let e2 = CachedResponse {
+            generation: 0,
             status: 404,
             headers: vec![],
             body: b"two".to_vec(),
@@ -385,6 +414,7 @@ mod tests {
 
         // A 2 MB body should be rejected.
         let huge = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: vec![0u8; 2 * 1024 * 1024],
@@ -404,6 +434,7 @@ mod tests {
         let store = make_store(&dir);
 
         let stale = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: b"stale".to_vec(),
@@ -442,6 +473,7 @@ mod tests {
         let store = make_store(&dir);
 
         let stale = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: b"stale".to_vec(),
@@ -469,6 +501,7 @@ mod tests {
             let store = Arc::clone(&store);
             handles.push(std::thread::spawn(move || {
                 let entry = CachedResponse {
+                    generation: 0,
                     status: 200,
                     headers: vec![("x-writer".into(), i.to_string())],
                     body: vec![i; 64 * 1024],
@@ -503,6 +536,29 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn conditional_replace_rejects_a_newer_file_entry() {
+        let dir = TempDir::new().unwrap();
+        let store = make_store(&dir);
+        let mut stale = make_entry(300);
+        stale.generation = 1;
+        store.put("key", &stale).unwrap();
+
+        let mut foreground = make_entry(300);
+        foreground.generation = 2;
+        foreground.body = b"foreground".to_vec();
+        store.put("key", &foreground).unwrap();
+
+        let mut background = make_entry(300);
+        background.generation = 3;
+        background.body = b"background".to_vec();
+        assert!(!store.compare_and_swap("key", &stale, &background).unwrap());
+        assert_eq!(
+            store.get("key").unwrap().expect("foreground entry").body,
+            b"foreground"
         );
     }
 }

@@ -16,8 +16,15 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// A cached HTTP response with TTL metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachedResponse {
+    /// Opaque write generation used for conditional background refreshes.
+    ///
+    /// Legacy serialized entries default to zero. Every new write receives a
+    /// non-zero random generation, so a stale revalidator can replace only the
+    /// exact entry it originally observed.
+    #[serde(default)]
+    pub generation: u64,
     /// HTTP status code of the cached response.
     pub status: u16,
     /// Response headers as ordered name/value pairs.
@@ -81,6 +88,7 @@ impl CachedResponse {
             .collect();
         headers.extend(updates.into_iter().cloned());
         Self {
+            generation: new_cache_generation(),
             status: self.status,
             headers,
             body: self.body.clone(),
@@ -111,6 +119,11 @@ impl CachedResponse {
             .as_secs();
         now > self.cached_at.saturating_add(self.ttl_secs)
     }
+}
+
+/// Generate a non-zero opaque generation for a new cache write.
+pub fn new_cache_generation() -> u64 {
+    rand::random::<u64>() | 1
 }
 
 fn is_unstorable_validation_header(name: &str) -> bool {
@@ -147,6 +160,20 @@ pub trait CacheStore: Send + Sync + 'static {
 
     /// Store a cached response.
     fn put(&self, key: &str, value: &CachedResponse) -> Result<()>;
+
+    /// Atomically replace `expected` only if its generation is still current.
+    ///
+    /// Backends that cannot guarantee atomicity return an error. Callers must
+    /// then leave the current entry untouched rather than falling back to an
+    /// unconditional write.
+    fn compare_and_swap(
+        &self,
+        _key: &str,
+        _expected: &CachedResponse,
+        _replacement: &CachedResponse,
+    ) -> Result<bool> {
+        anyhow::bail!("conditional cache replacement is not supported by this backend")
+    }
 
     /// Remove a cached response by key.
     fn delete(&self, key: &str) -> Result<()>;
@@ -191,6 +218,7 @@ mod tests {
         // the expiry sum must saturate. An unchecked add here panics in
         // a debug build and takes the request with it.
         let entry = CachedResponse {
+            generation: 0,
             status: 200,
             headers: Vec::new(),
             body: Vec::new(),
@@ -200,6 +228,7 @@ mod tests {
         assert!(!entry.is_expired(), "a saturated expiry is still future");
 
         let pinned = CachedResponse {
+            generation: 0,
             status: 200,
             headers: Vec::new(),
             body: Vec::new(),
@@ -212,6 +241,7 @@ mod tests {
     #[test]
     fn a_lapsed_ttl_still_reports_expired() {
         let entry = CachedResponse {
+            generation: 0,
             status: 200,
             headers: Vec::new(),
             body: Vec::new(),
@@ -224,6 +254,7 @@ mod tests {
     #[test]
     fn validators_are_discoverable_after_the_json_store_roundtrip() {
         let entry = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![
                 ("ETag".to_string(), r#"W/"json-v1""#.to_string()),
@@ -250,6 +281,7 @@ mod tests {
     #[test]
     fn not_modified_revalidation_refreshes_metadata_without_replacing_the_body() {
         let entry = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![
                 ("content-type".to_string(), "application/json".to_string()),

@@ -300,6 +300,7 @@ mod tests {
 
     fn make_entry(ttl_secs: u64) -> CachedResponse {
         CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![
                 ("x-test".into(), "value".into()),
@@ -378,6 +379,7 @@ mod tests {
         // a 1970 timestamp and the item expired the moment it was
         // written, so long-TTL entries never cached at all.
         let entry = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: vec![],
@@ -409,6 +411,7 @@ mod tests {
     #[test]
     fn remaining_ttl_expired_entry() {
         let entry = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: vec![],

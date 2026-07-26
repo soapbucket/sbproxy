@@ -818,6 +818,7 @@ mod tests {
             .unwrap()
             .as_secs();
         let resp = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: vec![],
@@ -836,6 +837,7 @@ mod tests {
             .unwrap()
             .as_secs();
         let resp = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: vec![],

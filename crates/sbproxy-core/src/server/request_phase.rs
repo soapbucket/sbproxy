@@ -3297,6 +3297,12 @@ pub(super) async fn request_filter(
                             // can drain in-flight refreshes.
                             if in_swr {
                                 let req = session.req_header();
+                                let revalidation_request = build_swr_revalidation_request(
+                                    &pipeline,
+                                    origin_idx,
+                                    req,
+                                    &cache_cfg.vary,
+                                );
                                 let path_and_query = req
                                     .uri
                                     .path_and_query()
@@ -3307,16 +3313,17 @@ pub(super) async fn request_filter(
                                 // the response_filter does.
                                 let cacheable_status = cache_cfg.cacheable_status.clone();
                                 let new_ttl = cache_cfg.ttl_secs;
-                                spawn_swr_revalidation(
-                                    cache_store.clone(),
-                                    key.clone(),
-                                    entry,
-                                    new_ttl,
-                                    origin.action_config.clone(),
-                                    ctx.hostname.to_string(),
-                                    path_and_query,
-                                    cacheable_status,
-                                );
+                                if let Some(revalidation_request) = revalidation_request {
+                                    spawn_swr_revalidation(
+                                        cache_store.clone(),
+                                        key.clone(),
+                                        entry,
+                                        new_ttl,
+                                        revalidation_request,
+                                        path_and_query,
+                                        cacheable_status,
+                                    );
+                                }
                             }
                             return Ok(true);
                         }

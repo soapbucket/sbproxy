@@ -367,6 +367,30 @@ impl KVStore for RedisKVStore {
         })
     }
 
+    fn compare_and_swap_with_ttl(
+        &self,
+        key: &[u8],
+        expected: &[u8],
+        value: &[u8],
+        ttl_secs: u64,
+    ) -> Result<bool> {
+        self.execute(RedisOperation::CompareSwap, || {
+            const COMPARE_AND_SET: &[u8] = b"if redis.call('get', KEYS[1]) == ARGV[1] then redis.call('set', KEYS[1], ARGV[2], 'EX', ARGV[3]); return 1 else return 0 end";
+            let encoded = Self::encode_key(key);
+            self.with_conn(RedisOperation::CompareSwap, |connection| {
+                let replaced: i64 = redis::cmd("EVAL")
+                    .arg(COMPARE_AND_SET)
+                    .arg(1)
+                    .arg(&encoded)
+                    .arg(expected)
+                    .arg(value)
+                    .arg(ttl_secs)
+                    .query(connection)?;
+                Ok(replaced == 1)
+            })
+        })
+    }
+
     fn incr_with_ttl(&self, key: &[u8], ttl_secs: u64) -> Result<i64> {
         self.execute(RedisOperation::Increment, || {
             // Use MULTI / INCR / EXPIRE / EXEC so both commands land atomically.
@@ -484,6 +508,7 @@ enum RedisOperation {
     Get,
     Set,
     SetTtl,
+    CompareSwap,
     Delete,
     Increment,
     Lock,
@@ -497,6 +522,7 @@ impl RedisOperation {
             Self::Get => "get",
             Self::Set => "set",
             Self::SetTtl => "set_ttl",
+            Self::CompareSwap => "compare_swap",
             Self::Delete => "delete",
             Self::Increment => "increment",
             Self::Lock => "lock",
@@ -683,6 +709,7 @@ mod tests {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     const RELEASE_LOCK_SCRIPT: &[u8] = b"if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+    const COMPARE_SWAP_SCRIPT: &[u8] = b"if redis.call('get', KEYS[1]) == ARGV[1] then redis.call('set', KEYS[1], ARGV[2], 'EX', ARGV[3]); return 1 else return 0 end";
 
     #[derive(Debug)]
     enum ScriptedReply {
@@ -1113,6 +1140,7 @@ mod tests {
             reply(b"+OK\r\n"),
             reply(b":1\r\n"),
             reply(b"+OK\r\n"),
+            reply(b":1\r\n"),
         ]);
         let store = store_for(&server);
         let raw_key = b"sentinel:key:\x00\xff";
@@ -1127,6 +1155,9 @@ mod tests {
         store
             .put_with_ttl(raw_key, b"sentinel-ttl-value", 73)
             .unwrap();
+        assert!(store
+            .compare_and_swap_with_ttl(raw_key, b"sentinel-ttl-value", b"sentinel-replacement", 71,)
+            .unwrap());
 
         assert_eq!(
             server.application_commands(),
@@ -1136,10 +1167,19 @@ mod tests {
                 vec![b"DEL".to_vec(), encoded.clone()],
                 vec![
                     b"SET".to_vec(),
-                    encoded,
+                    encoded.clone(),
                     b"sentinel-ttl-value".to_vec(),
                     b"EX".to_vec(),
                     b"73".to_vec(),
+                ],
+                vec![
+                    b"EVAL".to_vec(),
+                    COMPARE_SWAP_SCRIPT.to_vec(),
+                    b"1".to_vec(),
+                    encoded,
+                    b"sentinel-ttl-value".to_vec(),
+                    b"sentinel-replacement".to_vec(),
+                    b"71".to_vec(),
                 ],
             ]
         );
@@ -1620,6 +1660,7 @@ mod tests {
                             "get"
                                 | "set"
                                 | "set_ttl"
+                                | "compare_swap"
                                 | "delete"
                                 | "increment"
                                 | "lock"

@@ -120,6 +120,7 @@ async fn reserve_hit_returns_body_and_promotes_to_hot() {
 
     // Promotion: write into hot.
     let cached = CachedResponse {
+        generation: 0,
         status: got_meta.status,
         headers: vec![],
         body: got_body.to_vec(),
@@ -152,6 +153,7 @@ async fn evicted_hot_entry_is_admitted_and_recovered_from_reserve() {
     // Hot put + admission to reserve.
     let body = Bytes::from_static(b"will-survive-eviction");
     let cached = CachedResponse {
+        generation: 0,
         status: 200,
         headers: vec![("content-type".to_string(), "text/plain".to_string())],
         body: body.to_vec(),

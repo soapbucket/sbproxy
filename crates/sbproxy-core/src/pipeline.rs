@@ -3362,6 +3362,7 @@ origins: {}
         // Still reports the wrapped backend, and actually encrypts.
         assert_eq!(store.backend_name(), "memory");
         let entry = sbproxy_cache::CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: b"needle-in-the-haystack".to_vec(),

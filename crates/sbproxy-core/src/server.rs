@@ -937,6 +937,69 @@ fn swr_client() -> Option<&'static reqwest::Client> {
         .as_ref()
 }
 
+fn swr_cache_write_back(
+    cache_store: &dyn sbproxy_cache::CacheStore,
+    cache_key: &str,
+    stale_entry: &sbproxy_cache::CachedResponse,
+    refreshed_entry: &sbproxy_cache::CachedResponse,
+) -> anyhow::Result<bool> {
+    cache_store.compare_and_swap(cache_key, stale_entry, refreshed_entry)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SwrRevalidationRequest {
+    upstream_url: String,
+    host_header: String,
+    vary_headers: Vec<(String, String)>,
+}
+
+fn build_swr_revalidation_request(
+    pipeline: &CompiledPipeline,
+    origin_idx: usize,
+    request: &pingora_http::RequestHeader,
+    vary: &[String],
+) -> Option<SwrRevalidationRequest> {
+    let path = request.uri.path();
+    let query = request.uri.query();
+    let forward_action = pipeline
+        .forward_rules
+        .get(origin_idx)
+        .and_then(|rules| {
+            rules.iter().find(|rule| {
+                rule.matchers.iter().any(|matcher| {
+                    matcher
+                        .match_request(path, query, &request.headers)
+                        .is_some()
+                })
+            })
+        })
+        .map(|rule| &rule.action);
+    let action = forward_action.or_else(|| pipeline.actions.get(origin_idx))?;
+    let Action::Proxy(proxy) = action else {
+        return None;
+    };
+    let host_header = proxy.host_override.clone().or_else(|| {
+        url::Url::parse(&proxy.url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+    })?;
+    let vary_headers = vary
+        .iter()
+        .filter(|name| !name.eq_ignore_ascii_case("host"))
+        .filter_map(|name| {
+            let lower = name.to_ascii_lowercase();
+            let value = request.headers.get(&lower)?.to_str().ok()?.to_string();
+            Some((lower, value))
+        })
+        .collect();
+
+    Some(SwrRevalidationRequest {
+        upstream_url: proxy.url.trim_end_matches('/').to_string(),
+        host_header,
+        vary_headers,
+    })
+}
+
 /// Spawn an async refresh of `cache_key` against the origin's upstream.
 ///
 /// The entry is stale but still inside its SWR window. The caller has
@@ -956,42 +1019,25 @@ fn spawn_swr_revalidation(
     cache_key: String,
     stale_entry: sbproxy_cache::CachedResponse,
     ttl_secs: u64,
-    action_config: serde_json::Value,
-    hostname: String,
+    revalidation_request: SwrRevalidationRequest,
     path_and_query: String,
     cacheable_status: Vec<u16>,
 ) {
-    // Extract the upstream URL from the action config. Only `proxy`
-    // actions are revalidatable; static / redirect / etc. have no
-    // upstream and we noop. The two field names (`url` and `target`)
-    // both appear in the wild, so we accept either.
-    let upstream_url = action_config
-        .get("url")
-        .or_else(|| action_config.get("target"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim_end_matches('/').to_string());
-    let Some(base) = upstream_url else {
-        tracing::debug!(
-            host = %hostname,
-            "swr: action has no proxy URL, skipping revalidation"
-        );
-        return;
-    };
-    let full_url = format!("{}{}", base, path_and_query);
+    let full_url = format!("{}{}", revalidation_request.upstream_url, path_and_query);
 
     CACHE_REVALIDATE_TASKS.spawn(async move {
-        // Build a clean GET against the upstream. We deliberately
-        // forward only the Host header; downstream callbacks /
-        // modifiers / forward rules etc. are skipped because they
-        // already ran on the synchronous request that triggered this
-        // refresh.
         let Some(client) = swr_client() else {
             // The revalidation client could not be built (logged once at
             // init). SWR is best-effort, so skip the refresh and keep
             // serving the cached entry.
             return;
         };
-        let mut request = client.get(&full_url).header("host", &hostname);
+        let mut request = client
+            .get(&full_url)
+            .header("host", &revalidation_request.host_header);
+        for (name, value) in &revalidation_request.vary_headers {
+            request = request.header(name, value);
+        }
         if let Some(etag) = stale_entry
             .etag()
             .and_then(|value| reqwest::header::HeaderValue::from_str(value).ok())
@@ -1034,8 +1080,19 @@ fn spawn_swr_revalidation(
         if status == 304 {
             let refreshed = stale_entry.freshen_from_not_modified(&headers, refreshed_at, ttl_secs);
             let _ = tokio::task::spawn_blocking(move || {
-                if let Err(e) = cache_store.put(&cache_key, &refreshed) {
-                    tracing::warn!(error = %e, "swr: 304 write-back to cache failed");
+                match swr_cache_write_back(
+                    cache_store.as_ref(),
+                    &cache_key,
+                    &stale_entry,
+                    &refreshed,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::debug!("swr: stale 304 write-back lost a generation race")
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "swr: 304 write-back to cache failed")
+                    }
                 }
             })
             .await;
@@ -1119,6 +1176,7 @@ fn spawn_swr_revalidation(
             body.extend_from_slice(&chunk);
         }
         let entry = sbproxy_cache::CachedResponse {
+            generation: sbproxy_cache::new_cache_generation(),
             status,
             headers,
             body,
@@ -1128,8 +1186,10 @@ fn spawn_swr_revalidation(
         // Write-back goes through spawn_blocking for the same reason
         // the live path does: blocking I/O for the Redis backend.
         let _ = tokio::task::spawn_blocking(move || {
-            if let Err(e) = cache_store.put(&cache_key, &entry) {
-                tracing::warn!(error = %e, "swr: write-back to cache failed");
+            match swr_cache_write_back(cache_store.as_ref(), &cache_key, &stale_entry, &entry) {
+                Ok(true) => {}
+                Ok(false) => tracing::debug!("swr: stale write-back lost a generation race"),
+                Err(e) => tracing::warn!(error = %e, "swr: write-back to cache failed"),
             }
         })
         .await;

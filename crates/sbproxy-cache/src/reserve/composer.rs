@@ -215,6 +215,7 @@ mod tests {
 
     fn entry(body: &[u8], ttl: u64) -> CachedResponse {
         CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: body.to_vec(),

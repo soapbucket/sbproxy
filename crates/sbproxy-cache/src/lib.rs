@@ -18,6 +18,7 @@ pub use response::{
     CachedPrecondition, QueryMode, ResponseCacheConfig,
 };
 pub use store::{
-    CacheKeyMaterial, CacheStore, CachedResponse, EncryptedCacheStore, FileCacheConfig,
-    FileCacheStore, MemcachedConfig, MemcachedStore, MemoryCacheStore, RedisCacheStore,
+    new_cache_generation, CacheKeyMaterial, CacheStore, CachedResponse, EncryptedCacheStore,
+    FileCacheConfig, FileCacheStore, MemcachedConfig, MemcachedStore, MemoryCacheStore,
+    RedisCacheStore,
 };

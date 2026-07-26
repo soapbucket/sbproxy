@@ -54,6 +54,21 @@ pub trait KVStore: Send + Sync + 'static {
         anyhow::bail!("put_with_ttl: not supported by this backend")
     }
 
+    /// Atomically replace `expected` with `value` and set a TTL.
+    ///
+    /// The byte comparison and replacement must be one indivisible backend
+    /// operation. Unsupported backends return an error so callers never
+    /// degrade a conditional update into an unsafe unconditional write.
+    fn compare_and_swap_with_ttl(
+        &self,
+        _key: &[u8],
+        _expected: &[u8],
+        _value: &[u8],
+        _ttl_secs: u64,
+    ) -> Result<bool> {
+        anyhow::bail!("compare_and_swap_with_ttl: not supported by this backend")
+    }
+
     /// Atomically increment the integer counter stored at `key` and ensure
     /// the key's TTL is at least `ttl_secs` seconds. Returns the post-increment
     /// value.

@@ -5,6 +5,82 @@
 
 use super::*;
 
+#[test]
+fn swr_write_back_does_not_resurrect_an_invalidated_entry() {
+    let store: std::sync::Arc<dyn sbproxy_cache::CacheStore> =
+        std::sync::Arc::new(sbproxy_cache::MemoryCacheStore::new(0));
+    let stale = sbproxy_cache::CachedResponse {
+        generation: 1,
+        status: 200,
+        headers: Vec::new(),
+        body: b"stale".to_vec(),
+        cached_at: 1,
+        ttl_secs: 60,
+    };
+    let refreshed = sbproxy_cache::CachedResponse {
+        generation: 2,
+        body: b"background".to_vec(),
+        ..stale.clone()
+    };
+    store.put("key", &stale).unwrap();
+    store.delete("key").unwrap();
+
+    assert!(!swr_cache_write_back(store.as_ref(), "key", &stale, &refreshed).unwrap());
+    assert!(store.get_including_expired("key").unwrap().is_none());
+}
+
+#[test]
+fn swr_revalidation_uses_the_matching_forward_action_and_vary_headers() {
+    let mut pipeline = CompiledPipeline::default();
+    pipeline.actions.push(
+        sbproxy_modules::compile_action(&serde_json::json!({
+            "type": "proxy",
+            "url": "https://main.example"
+        }))
+        .unwrap(),
+    );
+    pipeline
+        .forward_rules
+        .push(vec![crate::pipeline::CompiledForwardRule {
+            matchers: vec![crate::pipeline::MatcherEntry {
+                path: Some(crate::pipeline::PathMatch::Prefix("/forward".to_string())),
+                header: None,
+                query: None,
+            }],
+            action: sbproxy_modules::compile_action(&serde_json::json!({
+                "type": "proxy",
+                "url": "https://forward.example",
+                "host_override": "tenant.internal"
+            }))
+            .unwrap(),
+            request_modifiers: Vec::new(),
+            parameters: Vec::new(),
+        }]);
+    let mut request =
+        pingora_http::RequestHeader::build("GET", b"/forward/resource?view=full", None).unwrap();
+    request.insert_header("x-tenant", "tenant-a").unwrap();
+    request.insert_header("accept-language", "fr-CA").unwrap();
+    request.insert_header("x-not-vary", "discard-me").unwrap();
+
+    let plan = build_swr_revalidation_request(
+        &pipeline,
+        0,
+        &request,
+        &["X-Tenant".to_string(), "Accept-Language".to_string()],
+    )
+    .expect("matching forward proxy should be revalidatable");
+
+    assert_eq!(plan.upstream_url, "https://forward.example");
+    assert_eq!(plan.host_header, "tenant.internal");
+    assert_eq!(
+        plan.vary_headers,
+        vec![
+            ("x-tenant".to_string(), "tenant-a".to_string()),
+            ("accept-language".to_string(), "fr-CA".to_string())
+        ]
+    );
+}
+
 // --- WOR-168: mirror state drift no-panic regression ---
 
 /// Pre-WOR-168, `request_body_filter` called

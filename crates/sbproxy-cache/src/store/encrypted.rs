@@ -9,10 +9,10 @@
 //!
 //! # What is sealed and what is not
 //!
-//! `headers` and `body` are sealed. `status`, `cached_at`, and
+//! `headers` and `body` are sealed. `generation`, `status`, `cached_at`, and
 //! `ttl_secs` stay in the clear because the backing stores read them:
 //! the file store writes the expiry into its 8-byte record header and
-//! memcached needs a relative TTL on the `set` command. All three are
+//! memcached needs a relative TTL on the `set` command. All four are
 //! bound into the AEAD associated data, so they are visible but cannot
 //! be altered without failing authentication. Binding `cached_at` and
 //! `ttl_secs` matters as much as binding `status`: without it, anyone
@@ -31,8 +31,9 @@
 //! 37      ..    ciphertext followed by the 16-byte GCM tag
 //! ```
 //!
-//! The associated data is the 37-byte header, then `status`,
-//! `cached_at`, and `ttl_secs` as big-endian bytes, then the cache key.
+//! The associated data is the 37-byte header, then a non-zero `generation`,
+//! `status`, `cached_at`, and `ttl_secs` as big-endian bytes, then the cache
+//! key. Legacy records with generation zero retain the pre-generation shape.
 //! Every field before the key is fixed-width, so the encoding is
 //! unambiguous and two different tuples cannot flatten to the same AAD.
 //! Binding the cache key means a stored record cannot be lifted from one
@@ -301,13 +302,20 @@ fn unframe_payload(bytes: &[u8]) -> Result<UnframedPayload> {
 /// injective encoding and no two distinct tuples share an AAD.
 fn associated_data(
     header: &[u8],
+    generation: u64,
     status: u16,
     cached_at: u64,
     ttl_secs: u64,
     key: &str,
 ) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(header.len() + 2 + 8 + 8 + key.len());
+    let mut aad = Vec::with_capacity(header.len() + 8 + 2 + 8 + 8 + key.len());
     aad.extend_from_slice(header);
+    // Version-1 envelopes written before cache generations existed deserialize
+    // with generation zero and used the older AAD shape. Keep them readable;
+    // every new write uses a non-zero generation and binds it here.
+    if generation != 0 {
+        aad.extend_from_slice(&generation.to_be_bytes());
+    }
     aad.extend_from_slice(&status.to_be_bytes());
     aad.extend_from_slice(&cached_at.to_be_bytes());
     aad.extend_from_slice(&ttl_secs.to_be_bytes());
@@ -388,7 +396,14 @@ impl EncryptedCacheStore {
         header.extend_from_slice(&salt);
         header.extend_from_slice(&nonce);
 
-        let aad = associated_data(&header, entry.status, entry.cached_at, entry.ttl_secs, key);
+        let aad = associated_data(
+            &header,
+            entry.generation,
+            entry.status,
+            entry.cached_at,
+            entry.ttl_secs,
+            key,
+        );
         let entry_key = self.active.entry_key(&salt);
         let ciphertext = aes256gcm_encrypt(&entry_key, &nonce, &frame_payload(entry)?, &aad)
             .context("seal response-cache entry")?;
@@ -396,6 +411,7 @@ impl EncryptedCacheStore {
         let mut body = header;
         body.extend_from_slice(&ciphertext);
         Ok(CachedResponse {
+            generation: entry.generation,
             status: entry.status,
             headers: Vec::new(),
             body,
@@ -431,6 +447,7 @@ impl EncryptedCacheStore {
 
         let aad = associated_data(
             &body[..HEADER_LEN],
+            stored.generation,
             stored.status,
             stored.cached_at,
             stored.ttl_secs,
@@ -488,6 +505,7 @@ impl EncryptedCacheStore {
 
         let (headers, plain_body) = unframe_payload(&plaintext)?;
         Ok(Some(CachedResponse {
+            generation: stored.generation,
             status: stored.status,
             headers,
             body: plain_body,
@@ -538,6 +556,25 @@ impl CacheStore for EncryptedCacheStore {
         self.inner.put(key, &sealed)
     }
 
+    fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: &CachedResponse,
+        replacement: &CachedResponse,
+    ) -> Result<bool> {
+        let Some(raw_expected) = self.inner.get_including_expired(key)? else {
+            return Ok(false);
+        };
+        let Some(current) = self.open(key, &raw_expected)? else {
+            return Ok(false);
+        };
+        if current != *expected {
+            return Ok(false);
+        }
+        let sealed = self.seal(key, replacement)?;
+        self.inner.compare_and_swap(key, &raw_expected, &sealed)
+    }
+
     fn delete(&self, key: &str) -> Result<()> {
         self.inner.delete(key)
     }
@@ -575,6 +612,7 @@ mod tests {
 
     fn entry() -> CachedResponse {
         CachedResponse {
+            generation: crate::store::new_cache_generation(),
             status: 200,
             headers: vec![
                 ("content-type".into(), "application/json".into()),
@@ -613,6 +651,7 @@ mod tests {
         let got = store.get("k").unwrap().expect("should hit");
 
         assert_eq!(got.status, original.status);
+        assert_eq!(got.generation, original.generation);
         assert_eq!(got.headers, original.headers);
         assert_eq!(got.body, original.body);
         assert_eq!(got.cached_at, original.cached_at);
@@ -684,6 +723,29 @@ mod tests {
     }
 
     #[test]
+    fn conditional_replace_preserves_a_newer_encrypted_entry() {
+        let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
+        let store = wrap(Arc::clone(&inner), material(12), Vec::new());
+        let mut stale = entry();
+        stale.generation = 1;
+        store.put("k", &stale).unwrap();
+
+        let mut foreground = entry();
+        foreground.generation = 2;
+        foreground.body = b"foreground".to_vec();
+        store.put("k", &foreground).unwrap();
+
+        let mut background = entry();
+        background.generation = 3;
+        background.body = b"background".to_vec();
+        assert!(!store.compare_and_swap("k", &stale, &background).unwrap());
+        assert_eq!(
+            store.get("k").unwrap().expect("foreground entry").body,
+            b"foreground"
+        );
+    }
+
+    #[test]
     fn each_seal_draws_a_fresh_salt_and_nonce() {
         // Nonce reuse under one key is the one failure AES-GCM cannot
         // survive, so pin the two random fields directly rather than
@@ -737,6 +799,22 @@ mod tests {
         assert!(
             store.get("k").is_err(),
             "status is bound into the AAD and must not be swappable"
+        );
+    }
+
+    #[test]
+    fn a_tampered_generation_fails_authentication() {
+        let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
+        let store = wrap(Arc::clone(&inner), material(31), Vec::new());
+        store.put("k", &entry()).unwrap();
+
+        let mut stored = inner.get("k").unwrap().unwrap();
+        stored.generation = stored.generation.wrapping_add(2);
+        inner.put("k", &stored).unwrap();
+
+        assert!(
+            store.get("k").is_err(),
+            "generation is bound into the AAD and must not be swappable"
         );
     }
 
@@ -942,6 +1020,7 @@ mod tests {
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
         let store = wrap(Arc::clone(&inner), material(16), Vec::new());
         let stale = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: b"stale".to_vec(),
@@ -962,6 +1041,7 @@ mod tests {
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
         let store = wrap(Arc::clone(&inner), material(17), Vec::new());
         let empty = CachedResponse {
+            generation: 0,
             status: 204,
             headers: vec![],
             body: vec![],

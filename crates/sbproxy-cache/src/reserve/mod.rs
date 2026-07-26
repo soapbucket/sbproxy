@@ -99,6 +99,7 @@ impl ReserveMetadata {
         ttl_secs: u64,
     ) -> crate::store::CachedResponse {
         crate::store::CachedResponse {
+            generation: crate::store::new_cache_generation(),
             status: self.status,
             headers: self.headers.clone(),
             body: body.to_vec(),
@@ -174,6 +175,7 @@ mod tests {
     fn cache_entry_roundtrip_preserves_validators_for_promotion() {
         let now = SystemTime::now();
         let cached = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![
                 ("content-type".to_string(), "application/json".to_string()),

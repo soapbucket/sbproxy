@@ -3750,6 +3750,7 @@ impl ProxyHttp for SbProxy {
                     let pipeline_for_write = ctx.pipeline.clone();
                     if let Some(cache_store) = pipeline_for_write.cache_store.clone() {
                         let entry = sbproxy_cache::CachedResponse {
+                            generation: sbproxy_cache::new_cache_generation(),
                             status,
                             headers,
                             body: body_buf.to_vec(),
