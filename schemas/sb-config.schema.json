@@ -2517,7 +2517,7 @@
       ]
     },
     "ConfigAuthorityConfig": {
-      "description": "`proxy.config_authority`: how this node takes part in config authority.\n\nToday only the subscriber half exists: [`Self::upstream`] pulls signed bundles from an authority, verifies them, merges them over the local document, and applies the result through the ordinary reload transaction. The publishing half is a separate change; see [`ConfigAuthorityConfig::publishes_bundles`] for the seam it lands on.",
+      "description": "`proxy.config_authority`: how this node takes part in config authority.\n\nBoth halves live here, and they are mutually exclusive. [`Self::upstream`] makes this node a subscriber: it pulls signed bundles from an authority, verifies them, merges them over the local document, and applies the result through the ordinary reload transaction. [`Self::publish`] makes it an authority: it validates, signs, and serves bundles to subscribers of its own.",
       "type": "object",
       "properties": {
         "upstream": {
@@ -2526,6 +2526,18 @@
           "anyOf": [
             {
               "$ref": "#/definitions/ConfigAuthorityUpstreamConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "publish": {
+          "description": "Publication settings that make this node an authority. Absent means this node serves no bundles.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ConfigAuthorityPublishConfig"
             },
             {
               "type": "null"
@@ -2631,6 +2643,85 @@
           ]
         }
       ]
+    },
+    "ConfigAuthorityPublishConfig": {
+      "description": "`proxy.config_authority.publish`: this node signs and serves configuration bundles to subscribers.\n\n```yaml proxy: config_authority: publish: authority_id: control-plane-eu key_id: authority-2026-07 signing_key_file: /etc/sbproxy/authority-signing.key store_dir: /var/lib/sbproxy/config-authority bind: 0.0.0.0:9443 tls: cert_file: /etc/sbproxy/authority.pem key_file: /etc/sbproxy/authority-key.pem ```\n\nThe bundle endpoint gets its own listener on [`Self::bind`], separate from the admin server, and serves exactly one path. Publication, status, and subscriber management are admin routes on the admin listener, because those are operator actions authenticated with operator credentials, while a bundle fetch is a fleet action authenticated with a per-subscriber credential.",
+      "type": "object",
+      "required": [
+        "authority_id",
+        "bind",
+        "key_id",
+        "signing_key_file",
+        "store_dir"
+      ],
+      "properties": {
+        "authority_id": {
+          "description": "Stable identifier stamped into every bundle this node signs. Subscribers read it as `authority_id` in the envelope.",
+          "type": "string"
+        },
+        "key_id": {
+          "description": "Key ID stamped into every envelope, selecting which entry of a subscriber's `verifying_keys_file` verifies the signature.\n\nRotation publishes under a new ID while subscribers still trust the old one, so this changes without a synchronized fleet restart.",
+          "type": "string"
+        },
+        "signing_key_file": {
+          "description": "Path to the Ed25519 signing key: one standard-base64 32-byte seed.\n\nMust be owner-only on unix. A node with `publish` configured and no readable signing key refuses to start, because an authority that cannot sign cannot serve, and finding that out at the first publish attempt means finding it out during a change window.",
+          "type": "string"
+        },
+        "store_dir": {
+          "description": "Directory holding the durable revision counter, the current and previous signed bundles, and the subscriber registry.",
+          "type": "string"
+        },
+        "bind": {
+          "description": "`host:port` for the bundle listener, for example `0.0.0.0:9443`.\n\nIts own listener, not the admin port: subscribers authenticate with a per-subscriber credential rather than operator credentials, and nothing on this listener answers `/admin/*`, `/metrics`, or the UI.",
+          "type": "string"
+        },
+        "tls": {
+          "description": "TLS material for the bundle listener.\n\nRequired whenever [`Self::bind`] is not a loopback address. The admin listener leaves TLS optional on a remote bind; this one does not, because the credential a subscriber presents here is a long-lived fleet credential and the payload is the whole configuration.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ConfigAuthorityPublishTlsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rate_limit_per_subscriber_per_minute": {
+          "description": "Requests one subscriber may make per minute before the listener answers `429`.",
+          "default": 30,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "rate_limit_total_per_minute": {
+          "description": "Requests the listener serves per minute across the whole fleet before it answers `429`.",
+          "default": 1200,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ConfigAuthorityPublishTlsConfig": {
+      "description": "TLS material for the config-authority bundle listener.\n\nBoth fields are required together. Unlike the admin listener's TLS block, this one is mandatory on any non-loopback bind.",
+      "type": "object",
+      "required": [
+        "cert_file",
+        "key_file"
+      ],
+      "properties": {
+        "cert_file": {
+          "description": "Path to the PEM certificate chain, leaf first.",
+          "type": "string"
+        },
+        "key_file": {
+          "description": "Path to the PEM private key (PKCS#8 or RSA).",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "SecretsConfig": {
       "description": "Top-level secrets management configuration.\n\nThe live surface is [`SecretsConfig::backends`], selected by provider URI references. The legacy single-backend and rotation fields remain parseable for compatibility but are not consumed by the OSS runtime.",

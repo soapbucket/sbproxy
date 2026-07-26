@@ -46,6 +46,37 @@ fn redis_tls_example_fixtures() -> &'static RedisTlsExampleFixtures {
     })
 }
 
+/// A signing key for the config-authority example.
+///
+/// `compile_config` refuses a publishing node whose signing key cannot be
+/// loaded, so the sweep has to materialize one the way that example's README
+/// tells a reader to. Owner-only, because the loader refuses a key any other
+/// account on the box could read. Absolute, because this sweep chdirs to the
+/// workspace root.
+fn config_authority_signing_key() -> &'static (tempfile::TempDir, String) {
+    static FIXTURE: OnceLock<(tempfile::TempDir, String)> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        use base64::Engine as _;
+
+        let directory =
+            tempfile::tempdir().expect("create config-authority example fixture directory");
+        let path = directory.path().join("authority-signing.key");
+        std::fs::write(
+            &path,
+            base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+        )
+        .expect("write config-authority example signing key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("tighten config-authority example signing key permissions");
+        }
+        let rendered = path.to_string_lossy().into_owned();
+        (directory, rendered)
+    })
+}
+
 fn workspace_root() -> PathBuf {
     // sbproxy-core lives at crates/sbproxy-core/ inside the workspace.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -117,6 +148,9 @@ fn export_example_env_dummies() {
     std::env::set_var("REDIS_CA_FILE", &redis.ca_file);
     std::env::set_var("REDIS_CLIENT_CERT_FILE", &redis.cert_file);
     std::env::set_var("REDIS_CLIENT_KEY_FILE", &redis.key_file);
+
+    let (_directory, signing_key) = config_authority_signing_key();
+    std::env::set_var("SB_CONFIG_AUTHORITY_SIGNING_KEY", signing_key);
 }
 
 #[test]

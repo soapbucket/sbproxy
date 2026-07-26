@@ -114,6 +114,14 @@ const MAX_SIGNED_BUNDLE_BYTES: usize = 2 * MAX_CONFIG_YAML_BYTES + 64 * 1024;
 /// Largest accepted verifying-key file, in bytes.
 const MAX_KEY_FILE_BYTES: u64 = 256 * 1024;
 
+/// Largest accepted signing-key file, in bytes.
+///
+/// A signing key file holds one base64 seed and nothing else, so anything
+/// larger than a few hundred bytes is the wrong file. Bounded before the
+/// read so pointing this at a disk image is an error rather than an
+/// allocation.
+const MAX_SIGNING_KEY_FILE_BYTES: u64 = 4 * 1024;
+
 /// Largest accepted cursor file, in bytes.
 const MAX_CURSOR_BYTES: u64 = 4 * 1024;
 
@@ -545,6 +553,95 @@ impl ConfigBundleSigner {
                 VerifyingKeyMaterial::SharedSecret(secret.clone())
             }
         }
+    }
+
+    /// Load an Ed25519 signer from a bounded base64 seed file.
+    ///
+    /// The file holds exactly one standard-base64 32-byte seed, which is
+    /// the same alphabet [`VerifyingKeySet::from_file`] reads public keys
+    /// in, so an operator generating a key pair works in one encoding
+    /// rather than two. Surrounding whitespace and a trailing newline are
+    /// tolerated because every editor adds one.
+    ///
+    /// On unix the file must be owner-only. A signing key readable by
+    /// another account on the box is a signing key that account holds, and
+    /// this key mints configuration for a whole fleet, so the permission
+    /// check is a refusal rather than a warning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::Io`] when the file cannot be read,
+    /// [`BundleError::Invalid`] when it is empty, not a regular file,
+    /// oversized, or group- or world-accessible, and
+    /// [`BundleError::Crypto`] when the contents are not a base64 32-byte
+    /// seed.
+    pub fn ed25519_from_seed_file(
+        key_id: impl Into<String>,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, BundleError> {
+        let path = path.as_ref();
+        let metadata = std::fs::metadata(path)?;
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_SIGNING_KEY_FILE_BYTES
+        {
+            return Err(BundleError::invalid(
+                "config bundle signing key file is empty, not regular, or oversized",
+            ));
+        }
+        require_owner_only(path, &metadata)?;
+        let encoded = std::fs::read_to_string(path)?;
+        let bytes = BASE64.decode(encoded.trim()).map_err(|_| {
+            BundleError::Crypto("config bundle signing key is invalid base64".to_string())
+        })?;
+        let seed: [u8; ED25519_KEY_BYTES] = bytes.try_into().map_err(|_| {
+            BundleError::Crypto(format!(
+                "config bundle signing key must contain exactly {ED25519_KEY_BYTES} bytes"
+            ))
+        })?;
+        Self::ed25519(key_id, SigningKey::from_bytes(&seed))
+    }
+
+    /// Base64 material a subscriber installs to verify this signer.
+    ///
+    /// For an Ed25519 signer this is the public key, which is safe to
+    /// publish. For a shared-secret signer it is the secret itself,
+    /// because HMAC verification needs it: that asymmetry is the whole
+    /// reason [`VerifyingKeySet`] refuses shared secrets until a
+    /// subscriber acknowledges it.
+    pub fn verifying_material_base64(&self) -> String {
+        match &self.material {
+            SigningMaterial::Ed25519(key) => BASE64.encode(key.verifying_key().to_bytes()),
+            SigningMaterial::SharedSecret(secret) => BASE64.encode(secret),
+        }
+    }
+
+    /// The verifying-key file body a subscriber installs to trust this
+    /// signer, in the shape [`VerifyingKeySet::from_file`] parses.
+    ///
+    /// Generated rather than hand-written so an authority's `key_id` and
+    /// its subscribers' `verifying_keys_file` cannot drift apart. During a
+    /// rotation an operator concatenates the entries from two signers into
+    /// one object; both keys then verify until the old entry is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::Json`] when the object cannot be encoded.
+    pub fn verifying_key_file_json(&self) -> Result<String, BundleError> {
+        // Built through a `Map` rather than a `json!` object literal
+        // because the key is this signer's `key_id`, a runtime value.
+        let mut entries = serde_json::Map::new();
+        entries.insert(
+            self.key_id.clone(),
+            serde_json::json!({
+                "algorithm": self.algorithm().as_str(),
+                "key": self.verifying_material_base64(),
+            }),
+        );
+        serde_json::to_string_pretty(&serde_json::Value::Object(entries)).map_err(|source| {
+            BundleError::Json {
+                operation: "encode verifying key file",
+                source,
+            }
+        })
     }
 
     /// Sign one bundle.
@@ -1005,6 +1102,29 @@ fn digests_equal(left: &str, right: &str) -> bool {
     bool::from(left.as_bytes().ct_eq(right.as_bytes()))
 }
 
+/// Refuse a private key file that any account other than its owner can
+/// reach.
+#[cfg(unix)]
+fn require_owner_only(path: &Path, metadata: &std::fs::Metadata) -> Result<(), BundleError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if metadata.mode() & 0o077 != 0 {
+        return Err(BundleError::invalid(format!(
+            "config bundle signing key '{}' is group- or world-accessible; it must be owner-only \
+             (chmod 600), because this key signs configuration for every subscriber",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Windows has no mode bits to check, so the permission gate is a no-op
+/// there rather than a false assurance.
+#[cfg(not(unix))]
+fn require_owner_only(_path: &Path, _metadata: &std::fs::Metadata) -> Result<(), BundleError> {
+    Ok(())
+}
+
 /// Validate the `sha256:<64 lowercase hex>` digest shape.
 fn validate_digest(digest: &str) -> Result<(), BundleError> {
     let Some(digest_hex) = digest.strip_prefix(DIGEST_PREFIX) else {
@@ -1022,6 +1142,18 @@ fn validate_digest(digest: &str) -> Result<(), BundleError> {
         ));
     }
     Ok(())
+}
+
+/// Whether `value` is acceptable as an `authority_id` or a `key_id` in a
+/// signed bundle envelope.
+///
+/// Exposed so the config layer refuses an identifier at compile time
+/// instead of letting the authority publish a bundle every subscriber then
+/// rejects. Applies the tighter of the two envelope bounds, which is the
+/// key-ID bound.
+#[must_use]
+pub fn is_valid_bundle_identifier(value: &str) -> bool {
+    valid_identifier(value, MAX_KEY_ID_BYTES)
 }
 
 /// Bounded identifier: printable ASCII, no separators that could be parsed as
@@ -1519,5 +1651,99 @@ mod tests {
             SignedConfigBundle::from_json(json),
             Err(BundleError::Json { .. })
         ));
+    }
+
+    /// Write a signing-key seed file with owner-only permissions.
+    fn write_seed_file(path: &Path, body: &str) {
+        std::fs::write(path, body).expect("write seed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("tighten seed permissions");
+        }
+    }
+
+    #[test]
+    fn a_signing_key_seed_file_round_trips_into_a_verifiable_signer() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("authority-signing.key");
+        // A trailing newline is what every editor writes, so it has to be
+        // tolerated rather than rejected as "invalid base64".
+        write_seed_file(&path, &format!("{}\n", BASE64.encode([7u8; 32])));
+
+        let signer =
+            ConfigBundleSigner::ed25519_from_seed_file("authority-2026-07", &path).expect("load");
+        assert_eq!(signer.key_id(), "authority-2026-07");
+        assert_eq!(signer.algorithm(), BundleAlgorithm::Ed25519);
+        // The same seed the unit fixtures use, so the loaded signer is the
+        // fixture signer rather than merely a working one.
+        assert_eq!(
+            signer.verifying_material_base64(),
+            ed25519_signer().verifying_material_base64(),
+        );
+
+        // The generated key file is exactly what a subscriber installs.
+        let keys = VerifyingKeySet::from_json(
+            signer
+                .verifying_key_file_json()
+                .expect("render key file")
+                .as_bytes(),
+        )
+        .expect("parse generated key file");
+        assert_eq!(keys.len(), 1);
+        assert!(signer
+            .sign(bundle())
+            .expect("sign")
+            .verify_at(&keys, NOW)
+            .is_ok());
+    }
+
+    #[test]
+    fn a_malformed_or_missing_signing_key_file_is_refused() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let missing = dir.path().join("absent.key");
+        assert!(matches!(
+            ConfigBundleSigner::ed25519_from_seed_file("k", &missing),
+            Err(BundleError::Io(_))
+        ));
+
+        let empty = dir.path().join("empty.key");
+        write_seed_file(&empty, "");
+        assert!(matches!(
+            ConfigBundleSigner::ed25519_from_seed_file("k", &empty),
+            Err(BundleError::Invalid(_))
+        ));
+
+        let garbage = dir.path().join("garbage.key");
+        write_seed_file(&garbage, "not base64 at all!!");
+        assert!(matches!(
+            ConfigBundleSigner::ed25519_from_seed_file("k", &garbage),
+            Err(BundleError::Crypto(_))
+        ));
+
+        // Right encoding, wrong length.
+        let short = dir.path().join("short.key");
+        write_seed_file(&short, &BASE64.encode([7u8; 16]));
+        let error = ConfigBundleSigner::ed25519_from_seed_file("k", &short)
+            .expect_err("a 16-byte seed is not an Ed25519 key");
+        assert!(error.to_string().contains("32 bytes"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_readable_signing_key_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("loose.key");
+        std::fs::write(&path, BASE64.encode([7u8; 32])).expect("write seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen permissions");
+        let error = ConfigBundleSigner::ed25519_from_seed_file("k", &path)
+            .expect_err("a world-readable signing key must be refused");
+        let message = error.to_string();
+        assert!(message.contains("owner-only"), "{message}");
+        assert!(message.contains("every subscriber"), "{message}");
     }
 }

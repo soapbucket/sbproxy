@@ -40,6 +40,36 @@ fn redis_tls_example_fixtures() -> &'static RedisTlsExampleFixtures {
     })
 }
 
+/// A signing key for the config-authority example.
+///
+/// `compile_config` refuses a publishing node whose signing key cannot be
+/// loaded, so the sweep has to materialize one the way the example's README
+/// tells a reader to. Owner-only, because the loader refuses a key any other
+/// account on the box could read.
+fn config_authority_signing_key() -> &'static (tempfile::TempDir, String) {
+    static FIXTURE: OnceLock<(tempfile::TempDir, String)> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        use base64::Engine as _;
+
+        let directory =
+            tempfile::tempdir().expect("create config-authority example fixture directory");
+        let path = directory.path().join("authority-signing.key");
+        std::fs::write(
+            &path,
+            base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+        )
+        .expect("write config-authority example signing key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("tighten config-authority example signing key permissions");
+        }
+        let rendered = path.to_string_lossy().into_owned();
+        (directory, rendered)
+    })
+}
+
 fn examples_root() -> PathBuf {
     // sbproxy-config lives at crates/sbproxy-config/ inside the workspace.
     // Ascend to the workspace root, then dive into examples/.
@@ -118,6 +148,9 @@ fn export_example_env_dummies() {
     std::env::set_var("REDIS_CA_FILE", &redis.ca_file);
     std::env::set_var("REDIS_CLIENT_CERT_FILE", &redis.cert_file);
     std::env::set_var("REDIS_CLIENT_KEY_FILE", &redis.key_file);
+
+    let (_directory, signing_key) = config_authority_signing_key();
+    std::env::set_var("SB_CONFIG_AUTHORITY_SIGNING_KEY", signing_key);
 }
 
 #[test]
@@ -159,6 +192,50 @@ fn every_oss_example_compiles() {
             summary
         );
     }
+}
+
+/// The config-authority example ships three files and the sweep above only
+/// picks up `sb.yml`. Both halves of the pair have to compile, and so does
+/// the payload: a published bundle is validated as a configuration in its
+/// own right, so an example payload that does not compile is an example of
+/// something the authority would refuse.
+#[test]
+fn the_config_authority_example_compiles_on_both_sides_of_the_wire() {
+    export_example_env_dummies();
+    // The subscriber's credential is a reference rather than an inline
+    // token, so the sweep exports it the way the README does.
+    std::env::set_var("SB_CONFIG_AUTHORITY_TOKEN", "sbca1.example.dummy-token");
+    let example = examples_root().join("config-authority");
+    for name in ["sb.yml", "subscriber.yml", "bundle.yml"] {
+        let file = example.join(name);
+        let yaml = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("{}: read failed: {error}", file.display()));
+        sbproxy_config::compile_config(&yaml)
+            .unwrap_or_else(|error| panic!("{}: compile_config: {error:#}", file.display()));
+    }
+
+    // And the pair really is a pair: the authority publishes, the
+    // subscriber subscribes, and neither does both.
+    let authority = std::fs::read_to_string(example.join("sb.yml")).expect("read sb.yml");
+    let authority: sbproxy_config::ConfigFile =
+        serde_yaml::from_str(&authority).expect("parse sb.yml");
+    let authority = authority
+        .proxy
+        .config_authority
+        .expect("the example authority declares a config_authority block");
+    assert!(authority.publishes_bundles());
+    assert!(authority.upstream.is_none());
+
+    let subscriber =
+        std::fs::read_to_string(example.join("subscriber.yml")).expect("read subscriber.yml");
+    let subscriber: sbproxy_config::ConfigFile =
+        serde_yaml::from_str(&subscriber).expect("parse subscriber.yml");
+    let subscriber = subscriber
+        .proxy
+        .config_authority
+        .expect("the example subscriber declares a config_authority block");
+    assert!(!subscriber.publishes_bundles());
+    assert!(subscriber.upstream.is_some());
 }
 
 #[test]

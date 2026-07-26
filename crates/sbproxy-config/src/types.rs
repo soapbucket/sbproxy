@@ -882,30 +882,33 @@ const fn default_config_authority_staleness_secs() -> u64 {
 
 /// `proxy.config_authority`: how this node takes part in config authority.
 ///
-/// Today only the subscriber half exists: [`Self::upstream`] pulls signed
+/// Both halves live here, and they are mutually exclusive.
+/// [`Self::upstream`] makes this node a subscriber: it pulls signed
 /// bundles from an authority, verifies them, merges them over the local
 /// document, and applies the result through the ordinary reload
-/// transaction. The publishing half is a separate change; see
-/// [`ConfigAuthorityConfig::publishes_bundles`] for the seam it lands on.
+/// transaction. [`Self::publish`] makes it an authority: it validates,
+/// signs, and serves bundles to subscribers of its own.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConfigAuthorityConfig {
     /// Upstream authority this node subscribes to. Absent means this node
     /// pulls no remote configuration.
     pub upstream: Option<ConfigAuthorityUpstreamConfig>,
+    /// Publication settings that make this node an authority. Absent
+    /// means this node serves no bundles.
+    pub publish: Option<ConfigAuthorityPublishConfig>,
 }
 
 impl ConfigAuthorityConfig {
     /// Whether this node publishes bundles to subscribers of its own.
     ///
-    /// The publishing half of the config authority is a separate change.
-    /// This is the seam it lands on: when a `publish:` block joins this
-    /// struct, this method returns whether it is present, and
-    /// [`Self::validate`] already refuses a node that both publishes and
-    /// subscribes. Deliberately not a `todo!()`: a subscriber-only build
-    /// has to answer the question, and the answer is `false`.
+    /// Feeds the one-role rule in [`Self::validate`]: a node that both
+    /// publishes and subscribes is refused, because the deny list keeps a
+    /// bundle from rewriting `proxy.config_authority` and the republished
+    /// provenance would name this node rather than the authority the
+    /// values came from.
     pub const fn publishes_bundles(&self) -> bool {
-        false
+        self.publish.is_some()
     }
 
     /// Validate the block, including the rules that cross fields.
@@ -916,8 +919,9 @@ impl ConfigAuthorityConfig {
     /// # Errors
     ///
     /// Returns [`ConfigAuthorityConfigError`] when a node both subscribes
-    /// and publishes, or when the upstream block fails any of its own
-    /// rules. See [`ConfigAuthorityUpstreamConfig::validate`].
+    /// and publishes, or when either half fails any of its own rules. See
+    /// [`ConfigAuthorityUpstreamConfig::validate`] and
+    /// [`ConfigAuthorityPublishConfig::validate`].
     pub fn validate(&self) -> Result<(), ConfigAuthorityConfigError> {
         if let Some(upstream) = &self.upstream {
             // One node cannot be both the authority and a subscriber of
@@ -931,8 +935,243 @@ impl ConfigAuthorityConfig {
             }
             upstream.validate()?;
         }
+        if let Some(publish) = &self.publish {
+            publish.validate()?;
+        }
         Ok(())
     }
+}
+
+/// Default per-subscriber request budget on the bundle listener, per minute.
+///
+/// A subscriber polls once per interval and the shortest interval the
+/// schema accepts is [`MIN_CONFIG_AUTHORITY_POLL_SECS`], so twelve
+/// requests a minute is the most a well-behaved subscriber ever needs.
+/// The rest is headroom for a retry or a manual `curl`, and it still
+/// leaves no room for a node polling in a loop.
+const DEFAULT_PUBLISH_SUBSCRIBER_RATE_LIMIT: u64 = 30;
+
+/// Default fleet-wide request budget on the bundle listener, per minute.
+///
+/// The per-subscriber cap alone does not bound the authority: a thousand
+/// nodes restarting together each stay inside their own limit while
+/// collectively saturating it. This is the cap that turns a restart storm
+/// into a queue of `429`s the subscribers retry through, rather than an
+/// authority that stops answering anyone.
+const DEFAULT_PUBLISH_TOTAL_RATE_LIMIT: u64 = 1_200;
+
+/// Largest per-subscriber or fleet-wide rate limit the schema accepts.
+///
+/// Neither limit can be set to zero: an authority with no bound is an
+/// authority one misconfigured subscriber can take down, and the whole
+/// fleet loses configuration distribution with it.
+pub const MAX_PUBLISH_RATE_LIMIT: u64 = 1_000_000;
+
+const fn default_publish_subscriber_rate_limit() -> u64 {
+    DEFAULT_PUBLISH_SUBSCRIBER_RATE_LIMIT
+}
+
+const fn default_publish_total_rate_limit() -> u64 {
+    DEFAULT_PUBLISH_TOTAL_RATE_LIMIT
+}
+
+/// `proxy.config_authority.publish`: this node signs and serves
+/// configuration bundles to subscribers.
+///
+/// ```yaml
+/// proxy:
+///   config_authority:
+///     publish:
+///       authority_id: control-plane-eu
+///       key_id: authority-2026-07
+///       signing_key_file: /etc/sbproxy/authority-signing.key
+///       store_dir: /var/lib/sbproxy/config-authority
+///       bind: 0.0.0.0:9443
+///       tls:
+///         cert_file: /etc/sbproxy/authority.pem
+///         key_file: /etc/sbproxy/authority-key.pem
+/// ```
+///
+/// The bundle endpoint gets its own listener on [`Self::bind`], separate
+/// from the admin server, and serves exactly one path. Publication,
+/// status, and subscriber management are admin routes on the admin
+/// listener, because those are operator actions authenticated with
+/// operator credentials, while a bundle fetch is a fleet action
+/// authenticated with a per-subscriber credential.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigAuthorityPublishConfig {
+    /// Stable identifier stamped into every bundle this node signs.
+    /// Subscribers read it as `authority_id` in the envelope.
+    pub authority_id: String,
+    /// Key ID stamped into every envelope, selecting which entry of a
+    /// subscriber's `verifying_keys_file` verifies the signature.
+    ///
+    /// Rotation publishes under a new ID while subscribers still trust the
+    /// old one, so this changes without a synchronized fleet restart.
+    pub key_id: String,
+    /// Path to the Ed25519 signing key: one standard-base64 32-byte seed.
+    ///
+    /// Must be owner-only on unix. A node with `publish` configured and no
+    /// readable signing key refuses to start, because an authority that
+    /// cannot sign cannot serve, and finding that out at the first publish
+    /// attempt means finding it out during a change window.
+    pub signing_key_file: String,
+    /// Directory holding the durable revision counter, the current and
+    /// previous signed bundles, and the subscriber registry.
+    pub store_dir: String,
+    /// `host:port` for the bundle listener, for example `0.0.0.0:9443`.
+    ///
+    /// Its own listener, not the admin port: subscribers authenticate with
+    /// a per-subscriber credential rather than operator credentials, and
+    /// nothing on this listener answers `/admin/*`, `/metrics`, or the UI.
+    pub bind: String,
+    /// TLS material for the bundle listener.
+    ///
+    /// Required whenever [`Self::bind`] is not a loopback address. The
+    /// admin listener leaves TLS optional on a remote bind; this one does
+    /// not, because the credential a subscriber presents here is a
+    /// long-lived fleet credential and the payload is the whole
+    /// configuration.
+    #[serde(default)]
+    pub tls: Option<ConfigAuthorityPublishTlsConfig>,
+    /// Requests one subscriber may make per minute before the listener
+    /// answers `429`.
+    #[serde(default = "default_publish_subscriber_rate_limit")]
+    pub rate_limit_per_subscriber_per_minute: u64,
+    /// Requests the listener serves per minute across the whole fleet
+    /// before it answers `429`.
+    #[serde(default = "default_publish_total_rate_limit")]
+    pub rate_limit_total_per_minute: u64,
+}
+
+impl ConfigAuthorityPublishConfig {
+    /// Whether [`Self::bind`] names a loopback address.
+    ///
+    /// A bind that does not parse counts as remote, so an unparseable
+    /// value cannot slip past the TLS requirement by being unreadable.
+    /// [`Self::validate`] rejects it separately with a clearer message.
+    pub fn binds_loopback_only(&self) -> bool {
+        self.bind
+            .trim()
+            .parse::<std::net::SocketAddr>()
+            .is_ok_and(|addr| addr.ip().to_canonical().is_loopback())
+    }
+
+    /// The parsed listener address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigAuthorityConfigError::PublishBind`] when `bind` is
+    /// not an IP address and port.
+    pub fn socket_addr(&self) -> Result<std::net::SocketAddr, ConfigAuthorityConfigError> {
+        self.bind
+            .trim()
+            .parse()
+            .map_err(|_| ConfigAuthorityConfigError::PublishBind {
+                bind: self.bind.clone(),
+                reason: "must be an IP address and port, for example 0.0.0.0:9443 or \
+                         127.0.0.1:9443; a hostname is not accepted because the listener binds \
+                         rather than resolves",
+            })
+    }
+
+    /// Validate every rule this block owns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigAuthorityConfigError`] when an identifier or path
+    /// is empty or oversized, when `authority_id` or `key_id` carries a
+    /// character the signature envelope refuses, when `bind` is not a
+    /// fixed IP address and port, when a non-loopback bind carries no
+    /// `tls` block, or when a rate limit is zero, above
+    /// [`MAX_PUBLISH_RATE_LIMIT`], or smaller than the per-subscriber
+    /// limit it is supposed to bound.
+    pub fn validate(&self) -> Result<(), ConfigAuthorityConfigError> {
+        for (field, value) in [
+            ("authority_id", &self.authority_id),
+            ("key_id", &self.key_id),
+            ("signing_key_file", &self.signing_key_file),
+            ("store_dir", &self.store_dir),
+            ("bind", &self.bind),
+        ] {
+            validate_publish_value(field, value)?;
+        }
+        // The envelope bounds these two more tightly than a filesystem
+        // path does, so a value that would produce a bundle no subscriber
+        // accepts is caught here rather than at the first publish.
+        for (field, value) in [
+            ("authority_id", &self.authority_id),
+            ("key_id", &self.key_id),
+        ] {
+            if !crate::config_bundle::is_valid_bundle_identifier(value) {
+                return Err(ConfigAuthorityConfigError::PublishIdentifier { field });
+            }
+        }
+        if self.socket_addr()?.port() == 0 {
+            return Err(ConfigAuthorityConfigError::PublishBind {
+                bind: self.bind.clone(),
+                reason: "must name a fixed port; port 0 would move on every restart and no \
+                         subscriber URL could point at it",
+            });
+        }
+        if let Some(tls) = &self.tls {
+            validate_publish_value("tls.cert_file", &tls.cert_file)?;
+            validate_publish_value("tls.key_file", &tls.key_file)?;
+        } else if !self.binds_loopback_only() {
+            return Err(ConfigAuthorityConfigError::PublishTlsRequired {
+                bind: self.bind.clone(),
+            });
+        }
+        for (field, found) in [
+            (
+                "rate_limit_per_subscriber_per_minute",
+                self.rate_limit_per_subscriber_per_minute,
+            ),
+            (
+                "rate_limit_total_per_minute",
+                self.rate_limit_total_per_minute,
+            ),
+        ] {
+            if found == 0 || found > MAX_PUBLISH_RATE_LIMIT {
+                return Err(ConfigAuthorityConfigError::PublishRateLimit { field, found });
+            }
+        }
+        if self.rate_limit_total_per_minute < self.rate_limit_per_subscriber_per_minute {
+            return Err(ConfigAuthorityConfigError::PublishRateLimitInverted {
+                total: self.rate_limit_total_per_minute,
+                per_subscriber: self.rate_limit_per_subscriber_per_minute,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// TLS material for the config-authority bundle listener.
+///
+/// Both fields are required together. Unlike the admin listener's TLS
+/// block, this one is mandatory on any non-loopback bind.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigAuthorityPublishTlsConfig {
+    /// Path to the PEM certificate chain, leaf first.
+    pub cert_file: String,
+    /// Path to the PEM private key (PKCS#8 or RSA).
+    pub key_file: String,
+}
+
+/// Validate one bounded, non-empty, control-character-free publish value.
+fn validate_publish_value(
+    field: &'static str,
+    value: &str,
+) -> Result<(), ConfigAuthorityConfigError> {
+    if value.trim().is_empty()
+        || value.len() > MAX_CONFIG_AUTHORITY_VALUE_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(ConfigAuthorityConfigError::PublishValue { field });
+    }
+    Ok(())
 }
 
 /// `proxy.config_authority.upstream`: the authority this node pulls
@@ -1146,6 +1385,53 @@ pub enum ConfigAuthorityConfigError {
     /// `require_bundle_on_boot: false`.
     #[error("proxy.config_authority.upstream sets `mode: replace` with `require_bundle_on_boot: false`; under replace the local document is not a servable configuration, so there is nothing to boot on. Remove the field (replace implies true) or switch to `mode: overlay`")]
     ReplaceWithoutBundleOnBoot,
+    /// A required publish identifier or path was empty, oversized, or
+    /// carried control characters.
+    #[error(
+        "proxy.config_authority.publish.{field} must be a bounded value with no control characters"
+    )]
+    PublishValue {
+        /// Offending field name.
+        field: &'static str,
+    },
+    /// A publish identifier carried a character the signed envelope
+    /// refuses.
+    #[error("proxy.config_authority.publish.{field} must be printable ASCII limited to letters, digits, and `. - _ :`; the signed bundle envelope refuses anything else, so a bundle carrying this value would be rejected by every subscriber")]
+    PublishIdentifier {
+        /// Offending field name.
+        field: &'static str,
+    },
+    /// The publish listener bind was not a usable address and port.
+    #[error("proxy.config_authority.publish.bind {bind:?} is invalid: {reason}")]
+    PublishBind {
+        /// Bind as configured.
+        bind: String,
+        /// What was wrong with it.
+        reason: &'static str,
+    },
+    /// The publish listener binds off loopback with no TLS material.
+    #[error("proxy.config_authority.publish.bind is `{bind}`, which is not a loopback address, and no `tls` block is set. The bundle listener refuses to start rather than serve plaintext: subscribers present a long-lived fleet credential on it and the response body is the whole configuration. Set publish.tls.cert_file and publish.tls.key_file, or bind to loopback and terminate TLS in front")]
+    PublishTlsRequired {
+        /// Bind as configured.
+        bind: String,
+    },
+    /// A publish rate limit was zero or above the accepted maximum.
+    #[error("proxy.config_authority.publish.{field} is {found}; it must be between 1 and {MAX_PUBLISH_RATE_LIMIT} requests per minute (the bundle listener's rate limit cannot be turned off, because an unbounded authority is one a single misconfigured subscriber can take down and the whole fleet loses config distribution with it)")]
+    PublishRateLimit {
+        /// Offending field name.
+        field: &'static str,
+        /// Configured value.
+        found: u64,
+    },
+    /// The fleet-wide rate limit was below the per-subscriber limit it is
+    /// supposed to bound.
+    #[error("proxy.config_authority.publish.rate_limit_total_per_minute is {total}, below the {per_subscriber} allowed to a single subscriber; the fleet-wide cap is meant to bound the sum, so a value under the per-subscriber cap means one subscriber can exhaust the whole authority")]
+    PublishRateLimitInverted {
+        /// Configured fleet-wide limit.
+        total: u64,
+        /// Configured per-subscriber limit.
+        per_subscriber: u64,
+    },
 }
 
 /// Whether `value` names a secret rather than carrying one inline.
@@ -7835,14 +8121,254 @@ upstream:
         assert!(error.to_string().contains("poll_intervall"), "{error}");
     }
 
+    // --- publish half -------------------------------------------------
+
+    /// The block from the field documentation, so the documented example
+    /// is also the parsed fixture.
+    const PUBLISH_YAML: &str = r#"
+publish:
+  authority_id: control-plane-eu
+  key_id: authority-2026-07
+  signing_key_file: /etc/sbproxy/authority-signing.key
+  store_dir: /var/lib/sbproxy/config-authority
+  bind: 0.0.0.0:9443
+  tls:
+    cert_file: /etc/sbproxy/authority.pem
+    key_file: /etc/sbproxy/authority-key.pem
+"#;
+
+    fn base_publish() -> ConfigAuthorityPublishConfig {
+        parse(PUBLISH_YAML).publish.expect("publish present")
+    }
+
     #[test]
-    fn the_publish_seam_reports_no_publishing_role_yet() {
-        // The subscriber-only build answers the question rather than
-        // panicking, and the conflict rule it feeds is already written.
-        let authority = parse(UPSTREAM_YAML);
-        assert!(!authority.publishes_bundles());
-        let conflict = ConfigAuthorityConfigError::BothRoles.to_string();
-        assert!(conflict.contains("upstream"), "{conflict}");
-        assert!(conflict.contains("publish"), "{conflict}");
+    fn the_documented_publish_block_parses_and_validates() {
+        let authority = parse(PUBLISH_YAML);
+        assert!(authority.publishes_bundles());
+        assert!(authority.upstream.is_none());
+        authority.validate().expect("documented block validates");
+        let publish = authority.publish.expect("publish present");
+        assert_eq!(publish.authority_id, "control-plane-eu");
+        assert_eq!(publish.key_id, "authority-2026-07");
+        assert_eq!(publish.bind, "0.0.0.0:9443");
+        assert_eq!(publish.socket_addr().expect("addr").port(), 9443);
+        assert!(!publish.binds_loopback_only());
+        let tls = publish.tls.expect("tls present");
+        assert_eq!(tls.cert_file, "/etc/sbproxy/authority.pem");
+        assert_eq!(tls.key_file, "/etc/sbproxy/authority-key.pem");
+        // The rate limits are on by default and the fleet cap bounds the
+        // per-subscriber one.
+        assert_eq!(publish.rate_limit_per_subscriber_per_minute, 30);
+        assert_eq!(publish.rate_limit_total_per_minute, 1_200);
+    }
+
+    #[test]
+    fn publishing_and_subscribing_at_once_is_refused() {
+        // The seam CA-03 left behind: with a publish block present the
+        // conflict rule is finally reachable.
+        let mut authority = parse(UPSTREAM_YAML);
+        authority.publish = Some(base_publish());
+        assert!(authority.publishes_bundles());
+        let error = authority
+            .validate()
+            .expect_err("one node cannot be both an authority and a subscriber");
+        assert_eq!(error, ConfigAuthorityConfigError::BothRoles);
+        let message = error.to_string();
+        assert!(message.contains("upstream"), "{message}");
+        assert!(message.contains("publish"), "{message}");
+        // Each half alone still validates, which pins the failure on the
+        // combination rather than on either block.
+        authority.upstream = None;
+        authority.validate().expect("publish alone is fine");
+        assert!(parse(UPSTREAM_YAML).validate().is_ok());
+    }
+
+    #[test]
+    fn a_non_loopback_bind_without_tls_is_refused() {
+        let mut publish = base_publish();
+        publish.tls = None;
+        let error = publish
+            .validate()
+            .expect_err("a remote bundle listener must terminate TLS");
+        assert_eq!(
+            error,
+            ConfigAuthorityConfigError::PublishTlsRequired {
+                bind: "0.0.0.0:9443".to_string()
+            }
+        );
+        let message = error.to_string();
+        assert!(message.contains("refuses to start"), "{message}");
+        assert!(message.contains("cert_file"), "{message}");
+
+        // Loopback without TLS is the local-development path and stays
+        // valid, which is the one place this differs from proxy.admin.
+        for bind in ["127.0.0.1:9443", "[::1]:9443", "[::ffff:127.0.0.1]:9443"] {
+            let mut loopback = base_publish();
+            loopback.tls = None;
+            loopback.bind = bind.to_string();
+            assert!(loopback.binds_loopback_only(), "{bind}");
+            loopback
+                .validate()
+                .unwrap_or_else(|error| panic!("{bind} must validate: {error}"));
+        }
+
+        // And TLS on a remote bind is accepted, so the rule is about the
+        // missing block rather than about the bind.
+        base_publish().validate().expect("remote bind with tls");
+    }
+
+    #[test]
+    fn an_unusable_bind_is_refused_rather_than_treated_as_loopback() {
+        for (bind, needle) in [
+            // A hostname cannot be bound, only resolved.
+            ("authority.example.com:9443", "IP address and port"),
+            ("0.0.0.0", "IP address and port"),
+            // Port 0 would move on every restart.
+            ("127.0.0.1:0", "fixed port"),
+        ] {
+            let mut publish = base_publish();
+            publish.bind = bind.to_string();
+            let error = publish.validate().expect_err("must be refused");
+            assert!(error.to_string().contains(needle), "{bind}: {error}");
+        }
+
+        // A bind that does not parse counts as remote, so an unreadable
+        // value cannot slip past the TLS requirement by being unreadable.
+        let mut unparseable = base_publish();
+        unparseable.bind = "authority.example.com:9443".to_string();
+        unparseable.tls = None;
+        assert!(!unparseable.binds_loopback_only());
+    }
+
+    #[test]
+    fn publish_identifiers_the_envelope_would_refuse_are_caught_at_compile_time() {
+        for field in ["authority_id", "key_id"] {
+            let mut publish = base_publish();
+            // A space is fine in a filesystem path and fatal in a bundle
+            // identifier, so the two are validated separately.
+            match field {
+                "authority_id" => publish.authority_id = "control plane".to_string(),
+                _ => publish.key_id = "key/2026".to_string(),
+            }
+            let error = publish.validate().expect_err("must be refused");
+            assert_eq!(
+                error,
+                ConfigAuthorityConfigError::PublishIdentifier { field }
+            );
+            assert!(
+                error.to_string().contains("every subscriber"),
+                "the message must name the consequence: {error}"
+            );
+        }
+    }
+
+    /// A named edit that blanks one required field of a publish block.
+    type PublishFieldSetter = (&'static str, fn(&mut ConfigAuthorityPublishConfig));
+
+    #[test]
+    fn every_required_publish_value_is_refused_when_empty() {
+        let setters: [PublishFieldSetter; 5] = [
+            ("authority_id", |publish| {
+                publish.authority_id = String::new();
+            }),
+            ("key_id", |publish| publish.key_id = String::new()),
+            ("signing_key_file", |publish| {
+                publish.signing_key_file = "   ".to_string();
+            }),
+            ("store_dir", |publish| publish.store_dir = String::new()),
+            ("bind", |publish| publish.bind = String::new()),
+        ];
+        for (field, apply) in setters {
+            let mut publish = base_publish();
+            apply(&mut publish);
+            assert_eq!(
+                publish.validate(),
+                Err(ConfigAuthorityConfigError::PublishValue { field }),
+                "{field} must be refused when empty",
+            );
+        }
+        for field in ["tls.cert_file", "tls.key_file"] {
+            let mut publish = base_publish();
+            let tls = publish.tls.as_mut().expect("tls present");
+            if field.ends_with("cert_file") {
+                tls.cert_file = String::new();
+            } else {
+                tls.key_file = String::new();
+            }
+            assert_eq!(
+                publish.validate(),
+                Err(ConfigAuthorityConfigError::PublishValue { field }),
+            );
+        }
+    }
+
+    #[test]
+    fn the_bundle_listener_rate_limits_cannot_be_turned_off_or_inverted() {
+        for field in [
+            "rate_limit_per_subscriber_per_minute",
+            "rate_limit_total_per_minute",
+        ] {
+            let mut publish = base_publish();
+            if field.starts_with("rate_limit_per_subscriber") {
+                publish.rate_limit_per_subscriber_per_minute = 0;
+            } else {
+                publish.rate_limit_total_per_minute = 0;
+            }
+            let error = publish.validate().expect_err("zero is not off");
+            assert_eq!(
+                error,
+                ConfigAuthorityConfigError::PublishRateLimit { field, found: 0 }
+            );
+            assert!(
+                error.to_string().contains("cannot be turned off"),
+                "{error}"
+            );
+
+            let mut over = base_publish();
+            if field.starts_with("rate_limit_per_subscriber") {
+                over.rate_limit_per_subscriber_per_minute = MAX_PUBLISH_RATE_LIMIT + 1;
+                over.rate_limit_total_per_minute = MAX_PUBLISH_RATE_LIMIT + 1;
+            } else {
+                over.rate_limit_total_per_minute = MAX_PUBLISH_RATE_LIMIT + 1;
+            }
+            assert!(matches!(
+                over.validate(),
+                Err(ConfigAuthorityConfigError::PublishRateLimit { .. })
+            ));
+        }
+
+        let mut inverted = base_publish();
+        inverted.rate_limit_per_subscriber_per_minute = 100;
+        inverted.rate_limit_total_per_minute = 50;
+        let error = inverted
+            .validate()
+            .expect_err("a fleet cap below the per-subscriber cap bounds nothing");
+        assert_eq!(
+            error,
+            ConfigAuthorityConfigError::PublishRateLimitInverted {
+                total: 50,
+                per_subscriber: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn a_misspelled_publish_key_is_refused_rather_than_defaulted() {
+        let error = serde_yaml::from_str::<ConfigAuthorityConfig>(
+            r#"
+publish:
+  authority_id: control-plane-eu
+  key_id: authority-2026-07
+  signing_key_file: /etc/sbproxy/authority-signing.key
+  store_dir: /var/lib/sbproxy/config-authority
+  bind: 127.0.0.1:9443
+  rate_limit_totall_per_minute: 10
+"#,
+        )
+        .expect_err("a typo must not silently take the default");
+        assert!(
+            error.to_string().contains("rate_limit_totall_per_minute"),
+            "{error}"
+        );
     }
 }
