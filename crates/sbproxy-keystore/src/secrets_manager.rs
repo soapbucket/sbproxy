@@ -354,6 +354,8 @@ mod tests {
             name: "openai".into(),
             provider: Some("openai".into()),
             kind: "ai_provider".into(),
+            header: crate::record::default_cred_header(),
+            scheme: crate::record::default_cred_scheme(),
             material: CredentialMaterial::VaultRef {
                 reference: "vault://openai".into(),
             },

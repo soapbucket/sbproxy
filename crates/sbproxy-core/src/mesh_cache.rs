@@ -211,6 +211,8 @@ mod tests {
             name: "openai".into(),
             provider: Some("openai".into()),
             kind: "ai_provider".into(),
+            header: sbproxy_keystore::record::default_cred_header(),
+            scheme: sbproxy_keystore::record::default_cred_scheme(),
             material: sbproxy_keystore::record::CredentialMaterial::VaultRef {
                 reference: "vault://openai".into(),
             },

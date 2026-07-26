@@ -1317,6 +1317,8 @@ fn create_credential(body: Option<&str>) -> Resp {
         name: c.name.unwrap_or_else(|| id.clone()),
         provider: c.provider,
         kind: c.kind.unwrap_or_else(|| "ai_provider".to_string()),
+        header: sbproxy_keystore::record::default_cred_header(),
+        scheme: sbproxy_keystore::record::default_cred_scheme(),
         material,
         status: RecordStatus::Active,
         tenant_id: c.tenant,
@@ -1656,6 +1658,10 @@ fn invalidate(plane: &KeyPlane, id: &str) {
     let cache = plane.cache().clone();
     let owned = id.to_string();
     block_on_keystore(async move { cache.invalidate(&owned).await });
+    // A credential's resolved secret is cached separately from its record, so
+    // a rotation has to drop both on the same signal or the old secret keeps
+    // going upstream until the TTL lapses.
+    crate::key_plane::invalidate_resolved_credential(id);
 }
 
 fn status_verb(status: RecordStatus) -> &'static str {

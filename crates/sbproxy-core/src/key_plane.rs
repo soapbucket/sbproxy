@@ -173,6 +173,156 @@ impl KeyPlane {
     }
 }
 
+/// An upstream credential resolved into the exact header the proxy writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCredential {
+    /// Lowercase header name to set on the upstream request.
+    pub header: String,
+    /// Full header value, scheme prefix already applied.
+    pub value: String,
+}
+
+/// Why a key's bound credential could not be presented.
+///
+/// Every variant refuses the request. None falls back to the origin's own
+/// `outbound_credential`, because that would hand the key an upstream identity
+/// it was never bound to. That is the one failure mode this whole path exists
+/// to prevent, so it is encoded in the type rather than left to a caller's
+/// `unwrap_or_default`.
+#[derive(Debug, Clone)]
+pub enum CredentialResolveError {
+    /// No credential with that id.
+    NotFound,
+    /// Present but blocked or revoked.
+    NotUsable,
+    /// The credential belongs to a different tenant than the key that binds it.
+    TenantMismatch,
+    /// Present and usable, but the secret could not be obtained: a vault
+    /// outage, an unsupported reference scheme, or an envelope sealed under a
+    /// master key this process does not hold.
+    Unresolvable(String),
+}
+
+impl std::fmt::Display for CredentialResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "credential not found"),
+            Self::NotUsable => write!(f, "credential is not active"),
+            Self::TenantMismatch => write!(f, "credential belongs to another tenant"),
+            Self::Unresolvable(reason) => write!(f, "credential unresolvable: {reason}"),
+        }
+    }
+}
+
+/// How long a resolved credential secret stays cached.
+///
+/// Vault resolution is a network round-trip and must not run per request.
+/// Dropped by [`invalidate_resolved_credential`] on any admin mutation, so a
+/// rotation takes effect on the same signal that drops the record itself.
+const RESOLVED_CREDENTIAL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+type ResolvedCredentialCache =
+    parking_lot::Mutex<std::collections::HashMap<String, (std::time::Instant, ResolvedCredential)>>;
+
+fn resolved_credential_cache() -> &'static ResolvedCredentialCache {
+    static CACHE: OnceLock<ResolvedCredentialCache> = OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Drop any cached resolved secret for `id`. Called from the admin mutation
+/// path alongside the record-cache invalidation.
+pub fn invalidate_resolved_credential(id: &str) {
+    resolved_credential_cache().lock().remove(id);
+}
+
+/// Drop every cached resolved secret.
+pub fn invalidate_all_resolved_credentials() {
+    resolved_credential_cache().lock().clear();
+}
+
+impl KeyPlane {
+    /// Resolve a key's bound credential into the header the upstream carries.
+    ///
+    /// `tenant_id` is the owning tenant of the key that names this credential.
+    /// A cross-tenant binding is refused here as well as at the admin
+    /// boundary, because either record's tenant can be patched after the
+    /// binding was made.
+    ///
+    /// # Errors
+    ///
+    /// Every [`CredentialResolveError`] variant means "refuse the request".
+    /// There is deliberately no success path that omits the credential.
+    pub async fn resolve_credential_secret(
+        &self,
+        id: &str,
+        tenant_id: Option<&str>,
+    ) -> std::result::Result<ResolvedCredential, CredentialResolveError> {
+        if let Some(hit) = {
+            let cache = resolved_credential_cache().lock();
+            cache.get(id).and_then(|(at, value)| {
+                (at.elapsed() < RESOLVED_CREDENTIAL_TTL).then(|| value.clone())
+            })
+        } {
+            return Ok(hit);
+        }
+
+        let record = self
+            .cache()
+            .resolve_credential(id)
+            .await
+            .map_err(|e| CredentialResolveError::Unresolvable(e.to_string()))?
+            .ok_or(CredentialResolveError::NotFound)?;
+
+        if !record.is_usable() {
+            return Err(CredentialResolveError::NotUsable);
+        }
+        // A credential with no tenant is shared; one with a tenant may only be
+        // bound by a key of that same tenant.
+        if record.tenant_id.is_some() && record.tenant_id.as_deref() != tenant_id {
+            return Err(CredentialResolveError::TenantMismatch);
+        }
+
+        let secret = match &record.material {
+            CredentialMaterial::Plaintext { value } => value.clone(),
+            CredentialMaterial::Envelope { envelope } => {
+                let bytes = self.crypto().open(&record.id, envelope).map_err(|e| {
+                    // Distinct message: after a master-key rotation every
+                    // existing envelope stops opening, and that is otherwise
+                    // very hard to tell apart from a corrupt store.
+                    CredentialResolveError::Unresolvable(format!(
+                        "envelope did not open under the configured master key: {e}"
+                    ))
+                })?;
+                String::from_utf8(bytes).map_err(|_| {
+                    CredentialResolveError::Unresolvable("secret is not utf-8".to_string())
+                })?
+            }
+            CredentialMaterial::VaultRef { reference } => {
+                let resolver = sbproxy_vault::process_resolver().ok_or_else(|| {
+                    CredentialResolveError::Unresolvable(
+                        "no secret resolver is installed for a vault-referenced credential"
+                            .to_string(),
+                    )
+                })?;
+                resolver
+                    .resolve_async(reference.clone())
+                    .await
+                    .map_err(|e| CredentialResolveError::Unresolvable(e.to_string()))?
+            }
+        };
+
+        let resolved = ResolvedCredential {
+            header: record.header.trim().to_ascii_lowercase(),
+            value: format!("{}{}", record.scheme, secret),
+        };
+        resolved_credential_cache().lock().insert(
+            id.to_string(),
+            (std::time::Instant::now(), resolved.clone()),
+        );
+        Ok(resolved)
+    }
+}
+
 fn runtime_governance_consistency(
     consistency: ConfigGovernanceConsistency,
 ) -> RuntimeGovernanceConsistency {
@@ -556,6 +706,8 @@ fn lower_seed_credential(
             .kind
             .clone()
             .unwrap_or_else(|| "ai_provider".to_string()),
+        header: sbproxy_keystore::record::default_cred_header(),
+        scheme: sbproxy_keystore::record::default_cred_scheme(),
         material,
         status: RecordStatus::Active,
         tenant_id: seed.tenant.clone(),
@@ -1005,5 +1157,190 @@ mod tests {
             .unwrap()
             .expect("seeded key present in secrets-manager store");
         assert_eq!(rec.name.as_deref(), Some("sm-seeded"));
+    }
+}
+
+#[cfg(test)]
+mod resolve_credential_secret_tests {
+    use super::*;
+    use sbproxy_keystore::MemoryKeyStore;
+
+    fn plane() -> KeyPlane {
+        let crypto = KeyCrypto::new(b"pep".to_vec(), b"master".to_vec());
+        let store = Arc::new(MemoryKeyStore::new());
+        let cache = Arc::new(TtlCache::new(
+            store as Arc<dyn KeyStore>,
+            TtlCacheConfig::default(),
+        ));
+        KeyPlane::from_parts(crypto, cache, false, false, None)
+    }
+
+    fn credential(id: &str, material: CredentialMaterial) -> CredentialRecord {
+        let now = Utc::now();
+        CredentialRecord {
+            id: id.to_string(),
+            name: id.to_string(),
+            provider: None,
+            kind: "api_key".to_string(),
+            header: sbproxy_keystore::record::default_cred_header(),
+            scheme: sbproxy_keystore::record::default_cred_scheme(),
+            material,
+            status: RecordStatus::Active,
+            tenant_id: None,
+            metadata: Default::default(),
+            created_at: now,
+            updated_at: now,
+            source: RecordSource::Api,
+        }
+    }
+
+    async fn put(plane: &KeyPlane, rec: CredentialRecord) {
+        plane.cache().store().put_credential(rec).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolves_an_envelope_credential_into_a_presentable_header() {
+        invalidate_all_resolved_credentials();
+        let p = plane();
+        let envelope = p.crypto().seal("c1", b"upstream-secret").unwrap();
+        let mut rec = credential("c1", CredentialMaterial::Envelope { envelope });
+        rec.header = "x-api-key".to_string();
+        rec.scheme = String::new();
+        put(&p, rec).await;
+
+        let resolved = p.resolve_credential_secret("c1", None).await.unwrap();
+        assert_eq!(resolved.header, "x-api-key");
+        assert_eq!(resolved.value, "upstream-secret");
+    }
+
+    #[tokio::test]
+    async fn applies_the_scheme_prefix_when_one_is_configured() {
+        invalidate_all_resolved_credentials();
+        let p = plane();
+        put(
+            &p,
+            credential(
+                "c2",
+                CredentialMaterial::Plaintext {
+                    value: "abc123".into(),
+                },
+            ),
+        )
+        .await;
+
+        let resolved = p.resolve_credential_secret("c2", None).await.unwrap();
+        assert_eq!(resolved.header, "authorization");
+        assert_eq!(resolved.value, "Bearer abc123");
+    }
+
+    #[tokio::test]
+    async fn a_missing_credential_is_an_error_not_a_fallback() {
+        invalidate_all_resolved_credentials();
+        let p = plane();
+        assert!(matches!(
+            p.resolve_credential_secret("nope", None).await,
+            Err(CredentialResolveError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_credential_is_not_usable() {
+        invalidate_all_resolved_credentials();
+        let p = plane();
+        let mut rec = credential("c3", CredentialMaterial::Plaintext { value: "x".into() });
+        rec.status = RecordStatus::Revoked;
+        put(&p, rec).await;
+        assert!(matches!(
+            p.resolve_credential_secret("c3", None).await,
+            Err(CredentialResolveError::NotUsable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_cross_tenant_binding_is_refused_at_resolution() {
+        // Checked here as well as at the admin boundary, because either
+        // record's tenant can be patched after the binding was made.
+        invalidate_all_resolved_credentials();
+        let p = plane();
+        let mut rec = credential("c4", CredentialMaterial::Plaintext { value: "x".into() });
+        rec.tenant_id = Some("tenant-a".to_string());
+        put(&p, rec).await;
+
+        assert!(matches!(
+            p.resolve_credential_secret("c4", Some("tenant-b")).await,
+            Err(CredentialResolveError::TenantMismatch)
+        ));
+        assert!(p
+            .resolve_credential_secret("c4", Some("tenant-a"))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_envelope_sealed_under_another_master_key_is_unresolvable() {
+        // A master-key rotation stops every existing envelope opening. That
+        // must be a loud, distinct error, never a silent fallback.
+        invalidate_all_resolved_credentials();
+        let sealer = KeyCrypto::new(b"pep".to_vec(), b"a-different-master".to_vec());
+        let envelope = sealer.seal("c5", b"secret").unwrap();
+        let p = plane();
+        put(
+            &p,
+            credential("c5", CredentialMaterial::Envelope { envelope }),
+        )
+        .await;
+
+        match p.resolve_credential_secret("c5", None).await {
+            Err(CredentialResolveError::Unresolvable(reason)) => {
+                assert!(reason.contains("master key"), "{reason}");
+            }
+            other => panic!("expected Unresolvable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resolved_secret_is_cached_and_dropped_on_invalidation() {
+        invalidate_all_resolved_credentials();
+        let p = plane();
+        put(
+            &p,
+            credential(
+                "c6",
+                CredentialMaterial::Plaintext {
+                    value: "first".into(),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            p.resolve_credential_secret("c6", None).await.unwrap().value,
+            "Bearer first"
+        );
+
+        // Rotate the stored secret. The cache still holds the old one, which
+        // is the behaviour that makes invalidation load-bearing.
+        put(
+            &p,
+            credential(
+                "c6",
+                CredentialMaterial::Plaintext {
+                    value: "second".into(),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            p.resolve_credential_secret("c6", None).await.unwrap().value,
+            "Bearer first",
+            "served from cache until invalidated"
+        );
+
+        invalidate_resolved_credential("c6");
+        p.cache().invalidate("c6").await;
+        assert_eq!(
+            p.resolve_credential_secret("c6", None).await.unwrap().value,
+            "Bearer second",
+            "invalidation drops the resolved secret, not just the record"
+        );
     }
 }
