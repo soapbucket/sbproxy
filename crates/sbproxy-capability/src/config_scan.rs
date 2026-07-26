@@ -1274,7 +1274,7 @@ impl RustTypeIndex {
                                 expanded.leading_colon = true;
                             }
                             self.transparent_wrapper_argument_index_inner(
-                                &expanded, false, resolving,
+                                &expanded, true, resolving,
                             )
                         })
                         .collect();
@@ -8226,6 +8226,38 @@ fn production(config: Config) {
             assert!(
                 errors.is_empty(),
                 "a renamed or aliased standard Result remains transparent: {errors:?}\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn module_scope_prelude_wrapper_aliases_preserve_provenance() {
+        for text in [
+            "use Result as Wrapped;\n\
+             struct Config { live: bool }\n\
+             fn fold(c: Config) -> Wrapped<Config, ()> { todo!() }\n\
+             fn run(c: Config) -> Wrapped<(), ()> {\n\
+                 consume(fold(c)?.live);\n\
+                 Ok(())\n\
+             }",
+            "use Option as Wrapped;\n\
+             struct Config { live: bool }\n\
+             fn fold(c: Config) -> Wrapped<Config> { todo!() }\n\
+             fn run(c: Config) { consume(fold(c).unwrap().live); }",
+            "use Box as Wrapped;\n\
+             struct Config { live: bool }\n\
+             fn fold(c: Config) -> Wrapped<Config> { todo!() }\n\
+             fn run(c: Config) { consume(fold(c).live); }",
+            "use Vec as Wrapped;\n\
+             struct Config { live: bool }\n\
+             fn fold(c: Config) -> Wrapped<Config> { todo!() }\n\
+             fn run(c: Config) { consume(fold(c).first().unwrap().live); }",
+        ] {
+            let errors = verify_config_readers(&[key("proxy.live", "live")], &[], &[source(text)]);
+
+            assert!(
+                errors.is_empty(),
+                "a module-scope alias of a prelude wrapper remains transparent: {errors:?}\n{text}"
             );
         }
     }
