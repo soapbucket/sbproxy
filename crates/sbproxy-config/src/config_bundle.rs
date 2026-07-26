@@ -140,8 +140,13 @@ const MAX_KEYS: usize = 256;
 /// Shortest accepted HMAC shared secret, in bytes.
 const MIN_SHARED_SECRET_BYTES: usize = 32;
 
-/// Exact length of an Ed25519 public key, in bytes.
-const ED25519_KEY_BYTES: usize = 32;
+/// Exact length of an Ed25519 key, in bytes: a public key, and equally the
+/// private seed a signing-key file holds.
+///
+/// Public because a caller that generates a key pair has to size the seed
+/// buffer it fills, and a hand-written `32` at that call site is a constant
+/// that can drift away from this one.
+pub const ED25519_KEY_BYTES: usize = 32;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -597,7 +602,26 @@ impl ConfigBundleSigner {
                 "config bundle signing key must contain exactly {ED25519_KEY_BYTES} bytes"
             ))
         })?;
-        Self::ed25519(key_id, SigningKey::from_bytes(&seed))
+        Self::ed25519_from_seed_bytes(key_id, &seed)
+    }
+
+    /// Build an Ed25519 signer from a seed already in memory.
+    ///
+    /// The counterpart to [`Self::ed25519_from_seed_file`], for the one
+    /// caller that has the seed before the file exists: key generation.
+    /// Pairing it with [`encode_signing_key_seed`] is what lets a generator
+    /// write a file this loader will read back, without either side
+    /// hand-rolling the encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::Invalid`] when `key_id` is empty, invalid, or
+    /// oversized.
+    pub fn ed25519_from_seed_bytes(
+        key_id: impl Into<String>,
+        seed: &[u8; ED25519_KEY_BYTES],
+    ) -> Result<Self, BundleError> {
+        Self::ed25519(key_id, SigningKey::from_bytes(seed))
     }
 
     /// Base64 material a subscriber installs to verify this signer.
@@ -670,6 +694,17 @@ impl ConfigBundleSigner {
             signature,
         })
     }
+}
+
+/// Encode an Ed25519 seed in the exact form
+/// [`ConfigBundleSigner::ed25519_from_seed_file`] reads back.
+///
+/// One function so a generator and the loader cannot disagree about the
+/// alphabet. The returned string is private key material: write it to an
+/// owner-only file and clear it, never log it.
+#[must_use]
+pub fn encode_signing_key_seed(seed: &[u8; ED25519_KEY_BYTES]) -> String {
+    BASE64.encode(seed)
 }
 
 /// Public material verifying one key ID.

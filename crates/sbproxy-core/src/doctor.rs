@@ -246,6 +246,21 @@ pub struct LocalServing {
     pub recommendation: Option<String>,
 }
 
+/// Whether the `git` binary is present, and what it reports.
+///
+/// A config that declares `source: {kind: git}` shells out to `git` on
+/// every resolution, so `git` is a runtime dependency of that config and
+/// not just of the build. A host missing it should learn that from
+/// `doctor` before it boots rather than from a clone error during a
+/// change window, which is the failure this block exists to prevent.
+#[derive(Debug, Clone, Serialize)]
+pub struct GitBinary {
+    /// Resolved path on `PATH`, `None` when absent.
+    pub path: Option<PathBuf>,
+    /// First line of `git --version`, when it could be run.
+    pub version: Option<String>,
+}
+
 /// The full diagnostics report. Serializes to the JSON shape
 /// `sbproxy doctor --format json` emits.
 #[derive(Debug, Clone, Serialize)]
@@ -271,6 +286,9 @@ pub struct DoctorReport {
     pub containers: ContainerInfo,
     /// System package managers.
     pub package_managers: PackageManagers,
+    /// The `git` binary, which any config declaring a
+    /// `source: {kind: git}` block needs at runtime.
+    pub git: GitBinary,
     /// Python toolchain.
     pub python: PythonInfo,
     /// Hugging Face endpoint, token, reach.
@@ -349,6 +367,11 @@ impl DoctorReport {
             brew: find_on_path("brew"),
             apt: find_on_path("apt-get"),
         };
+        let (git_path, git_version) = crate::config_source::git_binary_status();
+        let git = GitBinary {
+            path: git_path,
+            version: git_version,
+        };
         let python = PythonInfo {
             python3: run_version("python3", &["--version"]),
             uv: run_version("uv", &["--version"]),
@@ -399,6 +422,7 @@ impl DoctorReport {
             container_runtime,
             containers,
             package_managers,
+            git,
             python,
             huggingface,
             model_cache_dir,
@@ -688,6 +712,15 @@ impl DoctorReport {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "not found".to_string())
+        ));
+        out.push_str(&format!(
+            "  git         {}\n",
+            match (&self.git.path, &self.git.version) {
+                (Some(path), Some(version)) => format!("{} ({version})", path.display()),
+                (Some(path), None) => path.display().to_string(),
+                (None, _) =>
+                    "not found (required only by a `source: {kind: git}` config)".to_string(),
+            }
         ));
 
         out.push_str("\nhugging face\n");

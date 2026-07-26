@@ -175,7 +175,7 @@
   },
   "definitions": {
     "ConfigSource": {
-      "description": "Where to load a `sb.yml` config text from.\n\nThe default (no `source:` field at all) means the file is the config: the surrounding `ConfigFile` is treated as inline content and consumed directly. When `source:` is present, the compiler resolves it to a config text string before parsing.\n\nThree kinds are recognised today:\n\n* `local` keeps the historical behaviour - the inline file is the config. This is the form that round-trips when an operator writes `source: { kind: local }` explicitly. * `git` points at a remote git repository, an optional revision (branch, tag, or commit), and a path within the repository to the actual config file. * `git_overlay` composes one base source with one or more overlay sources, merging each in order. A `db` form is reserved for a later iteration but is intentionally not part of this primitive yet.",
+      "description": "Where to load a `sb.yml` config text from.\n\nThe default (no `source:` field at all) means the file is the config: the surrounding `ConfigFile` is treated as inline content and consumed directly. When `source:` is present, the compiler resolves it to a config text string before parsing.\n\nThree kinds are recognised today:\n\n* `local` keeps the historical behaviour - the inline file is the config. This is the form that round-trips when an operator writes `source: { kind: local }` explicitly. * `git` points at a remote git repository, an optional revision (branch, tag, or commit), and a path within the repository to the actual config file. * `git_overlay` composes one base source with one or more overlay sources, merging each in order. A `db` form is reserved for a later iteration but is intentionally not part of this primitive yet.\n\nA git source is transport trust: HTTPS plus whatever the git host authenticated, and nothing more. Pin `revision` to a full commit sha and set `verify_signature` to close most of that gap; see [`crate::source`] for the resolution contract.",
       "oneOf": [
         {
           "description": "The inline file is the config; nothing is fetched. This is the historical behaviour and the implied default when `source:` is omitted.",
@@ -212,7 +212,7 @@
               "type": "string"
             },
             "revision": {
-              "description": "Optional branch, tag, or commit sha. When `None`, the default branch is used.",
+              "description": "Optional branch, tag, or full commit sha. When `None`, the default branch is used. A full commit sha is a pin: the loader verifies the resolved `HEAD` equals it, so a branch moving underneath the node cannot be followed silently.",
               "default": null,
               "type": [
                 "string",
@@ -222,6 +222,33 @@
             "path": {
               "description": "Path inside the repository to the config file, relative to the repository root.",
               "type": "string"
+            },
+            "credential": {
+              "description": "Optional credential reference for a private repository, as `env:NAME`, `${NAME}`, `file:/path`, or `secret://backend/name`. An inline literal is refused: a token in a config file is a token in every copy of that file.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "verify_signature": {
+              "description": "Require a valid signature on the resolved tag or commit. Off by default, because most repositories are not signed.",
+              "default": false,
+              "type": "boolean"
+            },
+            "timeout_secs": {
+              "description": "Hard timeout for one fetch, in seconds. The child `git` process is killed when it expires; a config-load path with no timeout hangs startup.",
+              "default": 60,
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "refresh_interval_secs": {
+              "description": "How often to re-resolve this source while the proxy runs, in seconds. `0` disables refresh, so the document is resolved once at boot and on every ordinary reload.",
+              "default": 60,
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
             }
           }
         },
@@ -3533,6 +3560,31 @@
             }
           ]
         },
+        "inbound": {
+          "description": "Which inbound headers carry a minted key, and whether one is required.",
+          "default": {
+            "headers": [
+              {
+                "name": "authorization",
+                "scheme": "Bearer "
+              },
+              {
+                "name": "x-api-key",
+                "scheme": ""
+              },
+              {
+                "name": "x-sb-api",
+                "scheme": ""
+              }
+            ],
+            "require": false
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeyInboundConfig"
+            }
+          ]
+        },
         "allow_api_override": {
           "description": "Allow the admin API to override config-seeded records on reload. When false (default), config-seeded records are authoritative and re-asserted on every reload.",
           "default": false,
@@ -4087,6 +4139,56 @@
             "string",
             "null"
           ]
+        }
+      }
+    },
+    "KeyInboundConfig": {
+      "description": "`key_management.inbound:` block. Controls which request headers are swept for a minted key, and whether a route refuses requests that carry none.\n\nThe header a key arrives in is a property of the calling tool, not of the key: to know which header holds the key you would have to have resolved it already. So extraction is configured per route here rather than per key.",
+      "type": "object",
+      "properties": {
+        "headers": {
+          "description": "Ordered candidate headers. The first value whose shape parses wins. An empty list disables the sweep and leaves the legacy `authorization` path as the only front door.",
+          "default": [
+            {
+              "name": "authorization",
+              "scheme": "Bearer "
+            },
+            {
+              "name": "x-api-key",
+              "scheme": ""
+            },
+            {
+              "name": "x-sb-api",
+              "scheme": ""
+            }
+          ],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/InboundHeaderConfig"
+          }
+        },
+        "require": {
+          "description": "Deny with 401 when no minted key resolved. Off by default, so an upgrade changes nothing. Set per origin to make the proxy the only door on a route that has no other auth provider.",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
+    "InboundHeaderConfig": {
+      "description": "One entry in `key_management.inbound.headers:`.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "description": "Header name, matched case-insensitively.",
+          "type": "string"
+        },
+        "scheme": {
+          "description": "Prefix stripped from the value before the token shape is tested, matched case-insensitively. Empty for raw-value headers such as `x-api-key`.",
+          "default": "",
+          "type": "string"
         }
       }
     },

@@ -15,8 +15,13 @@
 //!    algorithm, and expiry are all checked by
 //!    [`sbproxy_config::SignedConfigBundle::verify_at`]; this module adds only the
 //!    declared-mode check and the anti-replay cursor probe.
-//! 3. Merge the payload over the local document with
-//!    [`sbproxy_config::merge_config`], as [`sbproxy_config::BaseOrigin::Local`], in the configured mode.
+//! 3. Merge the payload over the base document with
+//!    [`sbproxy_config::merge_config`], in the configured mode. The base
+//!    is the local file, or, on a node whose local file declares a
+//!    `source:` block, the document that source resolved to. The
+//!    [`sbproxy_config::BaseOrigin`] tag follows: `local` for a local
+//!    file, `git` for a resolved repository, so the provenance map has
+//!    three values rather than two.
 //! 4. Refuse a merged document that still carries an unresolved
 //!    `${VAR}` reference.
 //! 5. Apply through `try_reload_from_config_yaml`, the same three-phase
@@ -134,6 +139,101 @@ const JITTER_FRACTION: f64 = 0.15;
 /// hostile authority cannot make a subscriber buffer the whole stream
 /// first.
 const MAX_RESPONSE_BYTES: usize = 2 * MAX_CONFIG_YAML_BYTES + 64 * 1024;
+
+/// The authority payload this node last applied, kept so a document
+/// resolved from a `source:` block can have the same overlay re-applied
+/// on top of it.
+///
+/// Resolution order is fixed: the source document is the base and the
+/// authority overlay goes on top. Without this, a git source that moved
+/// would reload the repository's document alone and silently drop
+/// central policy until the next authority poll, which is a fleet-wide
+/// window where the configuration is not what either layer says it is.
+///
+/// The payload was verified before it was applied, so re-merging it
+/// needs no signature check. Only the payload is kept, never a key.
+#[derive(Debug, Clone)]
+struct AppliedBundle {
+    config_yaml: String,
+    merge_mode: MergeMode,
+    revision: u64,
+    authority_id: String,
+}
+
+/// The authority payload currently applied on this node, if any.
+static APPLIED_BUNDLE: std::sync::Mutex<Option<AppliedBundle>> = std::sync::Mutex::new(None);
+
+/// Record the authority payload this node has applied.
+fn record_applied_bundle(bundle: &ConfigBundle) {
+    let mut slot = APPLIED_BUNDLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = Some(AppliedBundle {
+        config_yaml: bundle.config_yaml.clone(),
+        merge_mode: match bundle.mode {
+            BundleMode::Overlay => MergeMode::Overlay,
+            BundleMode::Replace => MergeMode::Replace,
+        },
+        revision: bundle.revision,
+        authority_id: bundle.authority_id.clone(),
+    });
+}
+
+/// Merge the authority payload this node already applied over a freshly
+/// resolved base document.
+///
+/// `Ok(None)` means this node has no authority overlay, so the base
+/// document is the effective document and the caller applies it
+/// unchanged. That is the standalone-GitOps shape and the common case.
+///
+/// Called by the config-source refresh poller so a moved commit lands
+/// underneath the authority's document rather than replacing it. The
+/// deny list still applies: an authority payload naming `source:` was
+/// already refused when it was first merged, and it is refused again
+/// here.
+///
+/// # Errors
+///
+/// Returns an error when the merge fails, including when the recorded
+/// payload names a subscriber-owned path.
+pub fn overlay_applied_bundle(
+    base_yaml: &str,
+    base_origin: BaseOrigin,
+) -> anyhow::Result<Option<String>> {
+    let applied = {
+        let slot = APPLIED_BUNDLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.clone()
+    };
+    let Some(applied) = applied else {
+        return Ok(None);
+    };
+    let merged = merge_config(
+        base_yaml,
+        base_origin,
+        &applied.config_yaml,
+        applied.merge_mode,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "re-merging authority {} revision {} over the resolved source document failed: \
+             {error}",
+            applied.authority_id,
+            applied.revision
+        )
+    })?;
+    Ok(Some(merged.merged_yaml))
+}
+
+/// Forget the applied authority payload. Test-only.
+#[doc(hidden)]
+pub fn clear_applied_bundle() {
+    let mut slot = APPLIED_BUNDLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = None;
+}
 
 /// Cursor rendered as an HTTP entity tag, or `None` when nothing has been
 /// applied yet and every revision is new.
@@ -632,7 +732,7 @@ impl ConfigSubscriber {
 
         let merged = match merge_config(
             base_yaml,
-            BaseOrigin::Local,
+            base_origin_for(base_yaml),
             &bundle.config_yaml,
             self.merge_mode,
         ) {
@@ -727,6 +827,11 @@ impl ConfigSubscriber {
         }
 
         let received_at_unix_ms = now_unix_ms();
+        // Recorded so the config-source refresh poller can put this same
+        // overlay back on top of a newly resolved base document, which is
+        // what keeps the documented resolution order true on every apply
+        // rather than only on the authority's own cycles.
+        record_applied_bundle(&candidate.signed.bundle);
         self.cursor = candidate.cursor;
         self.received_at_unix_ms = Some(received_at_unix_ms);
         self.persist(&candidate.signed, received_at_unix_ms);
@@ -839,12 +944,21 @@ impl ConfigSubscriber {
         }
     }
 
-    /// Read the local document that every merge uses as its base.
+    /// Read the document that every merge uses as its base.
+    ///
+    /// On a node whose local file declares a `source:` block, the base is
+    /// the document that source resolved to, not the pointer file. The
+    /// pointer file is a few lines naming a repository; merging a bundle
+    /// over it would discard the whole configuration the repository
+    /// carries.
     ///
     /// `None` is a refusal, not an empty base: merging over a document
     /// this node cannot read would silently discard whatever the operator
     /// put in it.
     fn read_base_document(&self) -> Option<String> {
+        if let Some(base) = crate::config_source::current_resolved_base() {
+            return Some(base.yaml.clone());
+        }
         match std::fs::read_to_string(&self.config_path) {
             Ok(yaml) => Some(yaml),
             Err(error) => {
@@ -1110,6 +1224,7 @@ impl ConfigSubscriber {
             ));
         }
 
+        record_applied_bundle(&cached.bundle.bundle);
         self.cursor = candidate.cursor;
         self.received_at_unix_ms = Some(cached.received_at_unix_ms);
         // A cache seeded by hand may arrive without a cursor beside it, so
@@ -1229,6 +1344,20 @@ pub fn spawn(subscriber: Option<ConfigSubscriber>) {
         .ok();
 }
 
+/// The provenance tag for a merge base document.
+///
+/// `Git` only when the base actually is the document a `source:` block
+/// resolved to, compared by content rather than assumed: the tag ends up
+/// in the provenance map an operator reads to answer "who set this
+/// value", and a tag that names a repository the value did not come from
+/// is worse than no tag at all.
+fn base_origin_for(base_yaml: &str) -> BaseOrigin {
+    match crate::config_source::current_resolved_base() {
+        Some(base) if base.yaml == base_yaml => base.origin.clone(),
+        _ => BaseOrigin::Local,
+    }
+}
+
 /// Cursor file that accompanies one cache file.
 fn cursor_path_for(cache_path: &Path) -> PathBuf {
     let mut name = cache_path
@@ -1253,39 +1382,9 @@ fn cursor_path_for(cache_path: &Path) -> PathBuf {
 /// arriving at the authority as a bearer credential is the failure this
 /// avoids.
 fn resolve_credential(reference: &str) -> anyhow::Result<String> {
-    let reference = reference.trim();
-    let normalized = match reference.strip_prefix("env:") {
-        Some(name) => format!("${{{name}}}"),
-        None => reference.to_string(),
-    };
-    if let Some(resolver) = sbproxy_vault::process_resolver() {
-        return resolver.resolve(&normalized).map_err(|error| {
-            anyhow::anyhow!("resolve proxy.config_authority.upstream.credential: {error:#}")
-        });
-    }
-    if let Some(name) = normalized
-        .strip_prefix("${")
-        .and_then(|rest| rest.strip_suffix('}'))
-    {
-        return std::env::var(name).map_err(|_| {
-            anyhow::anyhow!(
-                "proxy.config_authority.upstream.credential names the environment variable \
-                 {name}, which is not set"
-            )
-        });
-    }
-    if let Some(path) = normalized.strip_prefix("file:") {
-        return std::fs::read_to_string(path)
-            .map(|token| token.trim().to_string())
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "read proxy.config_authority.upstream.credential file '{path}': {error}"
-                )
-            });
-    }
-    anyhow::bail!(
-        "proxy.config_authority.upstream.credential references the secret '{reference}' but no \
-         secret backend is configured to resolve it; declare one under proxy.secrets.backends"
+    crate::config_source::resolve_secret_reference(
+        reference,
+        "proxy.config_authority.upstream.credential",
     )
 }
 

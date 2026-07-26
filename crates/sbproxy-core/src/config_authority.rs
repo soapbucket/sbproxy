@@ -85,6 +85,22 @@
 //! hitting upstreams; publish validates on every call, so it is the
 //! highest-frequency place that leak could be reintroduced.
 //!
+//! # A git-backed authority
+//!
+//! [`crate::config_authority::ConfigAuthority::publish`] resolves a
+//! `source:` block in the payload before it validates or signs anything,
+//! so a customer can keep their configuration in their own repository
+//! and have this authority sign and distribute it. What travels is the
+//! resolved document, never the pointer: signing the pointer would ship
+//! every subscriber a URL to fetch for itself, which is transport trust
+//! rather than the signed guarantee this endpoint promises.
+//!
+//! The resolved document is then screened like any other payload, so a
+//! repository whose configuration declares its own `source:` block is
+//! refused. `source` is on the deny list because the authority overlays
+//! a base document and does not get to choose where that base comes
+//! from.
+//!
 //! # Payload scope
 //!
 //! A published payload is validated as a configuration in its own right,
@@ -108,7 +124,7 @@
 //! propagation speed and nothing else. Nothing about a publication's success
 //! depends on it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -129,6 +145,10 @@ use crate::config_subscriber::BUNDLE_ENDPOINT_PATH;
 /// `POST` here to validate, sign, and publish a configuration. Admin
 /// listener, operator credentials.
 pub const PUBLISH_PATH: &str = "/admin/config-authority/publish";
+
+/// `POST` here to republish the previous stored revision's payload. Admin
+/// listener, operator credentials.
+pub const ROLLBACK_PATH: &str = "/admin/config-authority/rollback";
 
 /// `GET` here for the current revision, digest, key ID, and per-subscriber
 /// last-seen revision.
@@ -281,6 +301,63 @@ pub struct PublishOutcome {
     pub mode: BundleMode,
     /// Publication time in unix milliseconds.
     pub issued_at_unix_ms: u64,
+}
+
+/// Why a rollback was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum RollbackError {
+    /// The store holds no previous revision to go back to.
+    #[error(
+        "config authority rollback rejected: no previous revision is stored (current revision \
+         is {published}), and a rollback needs a revision to go back to"
+    )]
+    NoPreviousRevision {
+        /// Revision currently served. Zero means nothing was ever published.
+        published: u64,
+    },
+    /// The previous payload no longer publishes, or could not be signed or
+    /// stored.
+    ///
+    /// Revalidating is the point: a payload that published cleanly before a
+    /// binary upgrade need not still construct after one, and republishing
+    /// it unchecked would push a configuration the fleet then refuses at
+    /// boot.
+    #[error(transparent)]
+    Publish(#[from] PublishError),
+}
+
+impl RollbackError {
+    /// Stable machine-readable code for the admin response.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoPreviousRevision { .. } => "no_previous_revision",
+            Self::Publish(error) => error.code(),
+        }
+    }
+
+    /// Whether the operator's request or the stored state is at fault, as
+    /// opposed to the authority itself. Drives the HTTP status.
+    #[must_use]
+    pub fn is_request_fault(&self) -> bool {
+        match self {
+            Self::NoPreviousRevision { .. } => true,
+            Self::Publish(error) => error.is_payload_fault(),
+        }
+    }
+}
+
+/// What one accepted rollback produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackOutcome {
+    /// Revision whose payload was republished.
+    pub restored_from_revision: u64,
+    /// Revision that was current before the rollback.
+    pub replaced_revision: u64,
+    /// The new publication carrying the restored payload. Its `revision` is
+    /// a fresh number, above `replaced_revision`, because a subscriber's
+    /// cursor refuses anything else.
+    pub outcome: PublishOutcome,
 }
 
 /// One inbound bundle fetch, reduced to the fields that decide the answer.
@@ -493,6 +570,21 @@ impl ConfigAuthority {
         mode: BundleMode,
         now_unix_ms: u64,
     ) -> Result<PublishOutcome, PublishError> {
+        // A git-backed authority: the document handed in may be a
+        // `source:` pointer, and what gets signed and distributed has to
+        // be the document that pointer resolves to. Signing the pointer
+        // would ship every subscriber a repository URL to fetch for
+        // itself, which is a different (and unsigned) trust story than
+        // the one this endpoint promises. A payload with no `source:`
+        // block resolves to itself and does no I/O.
+        let resolved = crate::config_source::resolve(config_yaml)
+            .map_err(|error| PublishError::Invalid(format!("{error:#}")))?;
+        let config_yaml = resolved.text.as_str();
+        // The resolved document is screened like any other payload, so a
+        // repository whose config declares its own `source:` is refused
+        // here rather than shipped to the fleet: `source` is on the deny
+        // list precisely because the authority overlays a base document
+        // and does not get to choose where that base comes from.
         self.validate_payload(config_yaml)?;
 
         // Validation passed, so the number is now safe to spend.
@@ -556,51 +648,19 @@ impl ConfigAuthority {
     /// Run the boot-equivalent validation over one payload.
     ///
     /// Exposed so a dry-run path can ask "would this publish?" without
-    /// spending a revision.
+    /// spending a revision. The checks themselves live in
+    /// [`validate_publish_payload`], which a caller with no authority in
+    /// hand (the CLI) runs against the same code.
     ///
     /// # Errors
     ///
     /// Returns [`PublishError`] naming the step that refused it.
     pub fn validate_payload(&self, config_yaml: &str) -> Result<(), PublishError> {
-        if config_yaml.trim().is_empty() {
-            return Err(PublishError::Invalid(
-                "the payload is empty; publish the YAML fragment subscribers should apply"
-                    .to_string(),
-            ));
-        }
-        if config_yaml.len() > sbproxy_config::MAX_CONFIG_YAML_BYTES {
-            return Err(PublishError::Invalid(format!(
-                "the payload is {} bytes; the signed-bundle limit is {} bytes",
-                config_yaml.len(),
-                sbproxy_config::MAX_CONFIG_YAML_BYTES
-            )));
-        }
-        // Screened with the subscriber's own detection, so a deny-listed
-        // path cannot publish clean and then be refused by the whole fleet
-        // at once.
-        let denied = sbproxy_config::denied_paths_in(config_yaml)
-            .map_err(|error| PublishError::Compile(error.to_string()))?;
-        if !denied.is_empty() {
-            return Err(PublishError::DeniedPaths(denied));
-        }
-        let compiled = sbproxy_config::compile_config(config_yaml)
-            .map_err(|error| PublishError::Compile(format!("{error:#}")))?;
-        // The deep checks live in the module constructors, not in
-        // `compile_config`: a typo inside an opaque `policies:` entry is
-        // invisible until something tries to build it. Deliberately the
-        // validation constructor, which spawns no health-check probes to
-        // outlive the pipeline it is thrown away with.
-        let pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
-            .map_err(|error| PublishError::Construct(format!("{error:#}")))?;
-        crate::model_runtime::validate_model_runtime(&pipeline, &self.validation_dir)
-            .map_err(|error| PublishError::ModelRuntime(format!("{error:#}")))?;
-        drop(pipeline);
-
+        let unresolved = validate_publish_payload(config_yaml, &self.validation_dir)?;
         // Not a refusal: the reference may resolve on the subscriber, and
         // if it does not, the subscriber refuses it there rather than
         // applying the literal text. Loud, because the operator publishing
         // it is the only person who can tell which case this is.
-        let unresolved = sbproxy_config::unresolved_env_references(config_yaml);
         if !unresolved.is_empty() {
             tracing::warn!(
                 refs = %unresolved.join(", "),
@@ -611,6 +671,62 @@ impl ConfigAuthority {
             );
         }
         Ok(())
+    }
+
+    /// Republish the previous stored revision's payload.
+    ///
+    /// The store keeps the current bundle and the one before it for exactly
+    /// this. What this does *not* do is re-serve the previous revision
+    /// number: a subscriber's anti-replay cursor refuses any revision that
+    /// is not greater than the one it applied, so serving revision 6 again
+    /// after 7 would be refused by every node that already took 7, which is
+    /// a rollback that reaches nobody. Rolling back therefore means signing
+    /// the previous *payload* as a new revision, which every subscriber
+    /// accepts and which leaves the revision sequence monotonic.
+    ///
+    /// The payload is revalidated on the way through, because a payload that
+    /// published cleanly before an upgrade need not still construct after
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RollbackError::NoPreviousRevision`] when there is nothing
+    /// to go back to, and [`RollbackError::Publish`] when the previous
+    /// payload no longer validates or cannot be signed or stored. Nothing
+    /// about the served bundle changes unless the whole call succeeds.
+    pub fn rollback(&self) -> Result<RollbackOutcome, RollbackError> {
+        // Copied out under the lock and the lock released, so the
+        // republication below takes it fresh rather than holding it across
+        // a full validation pass.
+        let (restored_from_revision, mode, config_yaml, replaced_revision) = {
+            let store = self.lock_store();
+            let replaced_revision = store.current_revision();
+            let Some(previous) = store.previous() else {
+                return Err(RollbackError::NoPreviousRevision {
+                    published: replaced_revision,
+                });
+            };
+            (
+                previous.bundle.revision,
+                previous.bundle.mode,
+                previous.bundle.config_yaml.clone(),
+                replaced_revision,
+            )
+        };
+        let outcome = self.publish(&config_yaml, mode)?;
+        tracing::warn!(
+            revision = outcome.revision,
+            restored_from_revision,
+            replaced_revision,
+            authority_id = %self.authority_id,
+            "config authority rolled back: the payload of an earlier revision is republished \
+             under a new revision number",
+        );
+        Ok(RollbackOutcome {
+            restored_from_revision,
+            replaced_revision,
+            outcome,
+        })
     }
 
     /// Answer one bundle fetch.
@@ -893,6 +1009,67 @@ impl ConfigAuthority {
     }
 }
 
+/// Run the boot-equivalent validation an authority runs before it signs a
+/// payload, without needing a loaded signing key or an open store to run it
+/// with.
+///
+/// This is the function [`ConfigAuthority::validate_payload`] is made of, so
+/// `sbproxy config authority publish` can refuse a payload locally, before a
+/// revision is spent, using the same three steps in the same order the
+/// server would. Two implementations of "what publishes" would drift, and
+/// the drift would show up as a payload that passed the CLI and then burned
+/// a revision on the authority.
+///
+/// `validation_dir` is the directory relative model-host paths in the
+/// payload resolve against. See the module docs for why that axis of the
+/// check is advisory and the rest is not.
+///
+/// Returns the `${VAR}` references that could not be resolved here. They are
+/// a warning, not a refusal, so the caller decides where to report them: the
+/// server logs them against its `authority_id`, and the CLI prints them
+/// where the operator is looking.
+///
+/// # Errors
+///
+/// Returns [`PublishError`] naming the step that refused the payload.
+pub fn validate_publish_payload(
+    config_yaml: &str,
+    validation_dir: &Path,
+) -> Result<Vec<String>, PublishError> {
+    if config_yaml.trim().is_empty() {
+        return Err(PublishError::Invalid(
+            "the payload is empty; publish the YAML fragment subscribers should apply".to_string(),
+        ));
+    }
+    if config_yaml.len() > sbproxy_config::MAX_CONFIG_YAML_BYTES {
+        return Err(PublishError::Invalid(format!(
+            "the payload is {} bytes; the signed-bundle limit is {} bytes",
+            config_yaml.len(),
+            sbproxy_config::MAX_CONFIG_YAML_BYTES
+        )));
+    }
+    // Screened with the subscriber's own detection, so a deny-listed path
+    // cannot publish clean and then be refused by the whole fleet at once.
+    let denied = sbproxy_config::denied_paths_in(config_yaml)
+        .map_err(|error| PublishError::Compile(error.to_string()))?;
+    if !denied.is_empty() {
+        return Err(PublishError::DeniedPaths(denied));
+    }
+    let compiled = sbproxy_config::compile_config(config_yaml)
+        .map_err(|error| PublishError::Compile(format!("{error:#}")))?;
+    // The deep checks live in the module constructors, not in
+    // `compile_config`: a typo inside an opaque `policies:` entry is
+    // invisible until something tries to build it. Deliberately the
+    // validation constructor, which spawns no health-check probes to
+    // outlive the pipeline it is thrown away with.
+    let pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+        .map_err(|error| PublishError::Construct(format!("{error:#}")))?;
+    crate::model_runtime::validate_model_runtime(&pipeline, validation_dir)
+        .map_err(|error| PublishError::ModelRuntime(format!("{error:#}")))?;
+    drop(pipeline);
+    Ok(sbproxy_config::unresolved_env_references(config_yaml))
+}
+
 /// The `429` every rate-limited path returns.
 fn rate_limited() -> BundleReply {
     BundleReply::plain(
@@ -973,6 +1150,7 @@ pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<AdminRes
     let path_only = path.split('?').next().unwrap_or(path);
     match path_only {
         PUBLISH_PATH => Some(dispatch_publish(method, query, body)),
+        ROLLBACK_PATH => Some(dispatch_rollback(method)),
         STATUS_PATH => Some(dispatch_status(method)),
         SUBSCRIBERS_PATH => Some(dispatch_subscribers(method, body)),
         SUBSCRIBER_REVOKE_PATH => Some(dispatch_revoke(method, body)),
@@ -1041,6 +1219,53 @@ fn dispatch_publish(method: &str, query: Option<&str>, body: Option<&str>) -> Ad
                     // The revision counter is untouched by a rejected
                     // payload, which is the fact an operator retrying a
                     // fixed config needs to know.
+                    "revision_consumed": false,
+                }),
+            )
+        }
+    }
+}
+
+/// `POST /admin/config-authority/rollback`: republish the previous stored
+/// revision's payload under a new revision number.
+///
+/// No body and no query parameters. There is exactly one revision to go back
+/// to, so there is nothing to name.
+fn dispatch_rollback(method: &str) -> AdminResponse {
+    if !method.eq_ignore_ascii_case("POST") {
+        return method_not_allowed();
+    }
+    let Some(authority) = current_authority() else {
+        return not_publishing();
+    };
+    match authority.rollback() {
+        Ok(rolled_back) => json(
+            200,
+            serde_json::json!({
+                "schema_version": ADMIN_SCHEMA_VERSION,
+                "authority_id": authority.authority_id(),
+                "key_id": authority.key_id(),
+                "revision": rolled_back.outcome.revision,
+                "restored_from_revision": rolled_back.restored_from_revision,
+                "replaced_revision": rolled_back.replaced_revision,
+                "content_digest": rolled_back.outcome.content_digest,
+                "etag": rolled_back.outcome.etag,
+                "mode": format_mode(rolled_back.outcome.mode),
+                "issued_at_unix_ms": rolled_back.outcome.issued_at_unix_ms,
+            }),
+        ),
+        Err(error) => {
+            let status = if error.is_request_fault() { 400 } else { 500 };
+            if !error.is_request_fault() {
+                tracing::error!(error = %error, "config authority rollback failed");
+            }
+            json(
+                status,
+                serde_json::json!({
+                    "error": error.to_string(),
+                    "code": error.code(),
+                    // Nothing moved, so the operator retrying after fixing
+                    // whatever this names is not skipping a number.
                     "revision_consumed": false,
                 }),
             )

@@ -679,8 +679,21 @@ impl ClusterOwner {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(current) = installed.as_ref() {
             if current.restart_fingerprint != fingerprint {
+                // Name the fields. A generic message was tolerable when
+                // reloads were hand-driven; a config arriving from a
+                // shared git repository makes this the most likely
+                // first-day failure, and "something changed" is not
+                // something an operator can act on.
+                let detail = ClusterRestartFingerprint::describe_change(
+                    current.restart_fingerprint.as_ref(),
+                    fingerprint.as_ref(),
+                );
                 anyhow::bail!(
-                    "cluster identity, roles, labels, discovery, listeners, endpoints, or peer security changed; restart sbproxy to apply the new process-owned cluster configuration"
+                    "process-owned cluster configuration changed and cannot be applied to a \
+                     running process ({detail}); restart sbproxy to adopt it. If this document \
+                     comes from a shared source, node-local values belong in `${{VAR}}` \
+                     references this host exports, or in a node-local overlay, not in the \
+                     shared document"
                 );
             }
             current.settings.update(settings);

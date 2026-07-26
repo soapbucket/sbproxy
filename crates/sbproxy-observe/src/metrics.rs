@@ -1993,6 +1993,80 @@ pub fn record_config_bundle_applied_degraded() {
     counter.inc();
 }
 
+// --- config source (git) metrics --------------------------------------
+//
+// A `source:` block resolves the config document from somewhere other
+// than the local file, today a git repository. These two families make a
+// stuck source as visible as a stale bundle: the counter says whether
+// the last resolution worked and why not, and the info gauge says which
+// commit the node is actually running.
+
+/// Count one config-source resolution on
+/// `sbproxy_config_source_fetch_total{kind,result}`.
+///
+/// `kind` is the `source.kind` that was resolved (`git` or
+/// `git_overlay`). `result` is a closed string:
+///
+/// | Result | Meaning |
+/// |---|---|
+/// | `ok` | Resolved, and the resolved commit differs from the one already serving, so it was compiled and applied. |
+/// | `not_modified` | Resolved to the commit already serving. No compile and no reload. |
+/// | `unreachable` | The remote could not be reached, or `git` is not installed. The cached document keeps serving. |
+/// | `timeout` | The fetch did not finish inside `timeout_secs` and the child process was killed. |
+/// | `revision_mismatch` | `revision` pins a commit sha and the resolved `HEAD` is a different commit. |
+/// | `verify_failed` | `verify_signature` is set and the tag or commit carries no signature this host can verify. |
+/// | `invalid` | The source block, the resolved path, or the resolved document itself is unusable. |
+/// | `compile_failed` | The resolved document did not compile, could not be constructed, or left a node-local `${VAR}` unresolved. |
+/// | `reload_busy` | Another reload held the reload lock; the cycle was skipped and the next interval retries. |
+pub fn record_config_source_fetch(kind: &'static str, result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_source_fetch_total",
+            "Config source resolutions, by source kind and result",
+            &["kind", "result"],
+        )
+        .expect("config source fetch counter registers")
+    });
+    counter.with_label_values(&[kind, result]).inc();
+}
+
+/// Publish the commit the config source resolved to on
+/// `sbproxy_config_source_revision_info{sha}`.
+///
+/// An info-style gauge: the value is always `1` and the commit travels
+/// as a label, which is how an operator joins "which config" onto every
+/// other series from this node. The previous label set is removed before
+/// the new one is set, so a node that has followed a branch for a year
+/// exports one series rather than a year of them.
+pub fn set_config_source_revision_info(sha: &str) {
+    use prometheus::{register_int_gauge_vec, IntGaugeVec};
+    use std::sync::{Mutex, OnceLock};
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    static CURRENT: Mutex<Option<String>> = Mutex::new(None);
+    let gauge = G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "sbproxy_config_source_revision_info",
+            "Commit the config source resolved to; always 1, the commit is the label",
+            &["sha"],
+        )
+        .expect("config source revision gauge registers")
+    });
+    let mut current = CURRENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if current.as_deref() == Some(sha) {
+        return;
+    }
+    if let Some(previous) = current.as_deref() {
+        let _ = gauge.remove_label_values(&[previous]);
+    }
+    gauge.with_label_values(&[sha]).set(1);
+    *current = Some(sha.to_string());
+}
+
 /// Count one config-revision announcement on
 /// `sbproxy_config_authority_announce_total{result}`.
 ///

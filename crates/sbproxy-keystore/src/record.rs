@@ -61,7 +61,7 @@ fn default_policy_revision() -> u64 {
 /// `secret_hash` (and, during a rotation grace window, `prev_secret_hash`) is.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyRecord {
-    /// Stable public identifier and the token prefix (`sk-<key_id>-<secret>`).
+    /// Stable public identifier and the token prefix (`sbp_<key_id>_<secret>`).
     pub key_id: String,
     /// Monotonic revision of this key's policy, starting at one.
     #[serde(default = "default_policy_revision")]
@@ -164,6 +164,16 @@ pub struct KeyRecord {
     /// Owning tenant, if multi-tenant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
+    /// Upstream credential this key presents, naming a [`CredentialRecord`] by
+    /// id.
+    ///
+    /// `None` leaves the origin's own `outbound_credential` in charge. When
+    /// set, the bound credential is the only upstream identity this key may
+    /// reach an origin with: a missing, revoked, or unresolvable credential
+    /// refuses the request rather than falling back, because that fallback
+    /// would grant the key an identity it was never bound to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
     /// Expiry; past this instant the key is unusable regardless of status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
@@ -214,6 +224,7 @@ impl KeyRecord {
             tags: Vec::new(),
             metadata: BTreeMap::new(),
             tenant_id: None,
+            credential_id: None,
             expires_at: None,
             created_at: now,
             updated_at: now,
@@ -292,6 +303,18 @@ pub struct CredentialRecord {
     /// Credential kind (`ai_provider`, `bearer`, `api_key`, ...).
     #[serde(default = "default_cred_kind")]
     pub kind: String,
+    /// Header this credential is written to on the upstream request.
+    ///
+    /// Presentation belongs to the credential rather than to the key that
+    /// binds it, because it is a property of the upstream: one credential
+    /// shared by many keys then presents identically every time. Defaults to
+    /// `authorization`.
+    #[serde(default = "default_cred_header")]
+    pub header: String,
+    /// Scheme prefix on the header value. Defaults to `Bearer `. Set to an
+    /// empty string for raw-value headers such as `x-api-key`.
+    #[serde(default = "default_cred_scheme")]
+    pub scheme: String,
     /// How the secret is held at rest.
     pub material: CredentialMaterial,
     /// Lifecycle status.
@@ -314,6 +337,17 @@ pub struct CredentialRecord {
 
 fn default_cred_kind() -> String {
     "ai_provider".to_string()
+}
+
+/// Default upstream header a credential is presented in. Matches the
+/// `outbound_credential` resolver's default so there is one spelling.
+pub fn default_cred_header() -> String {
+    "authorization".to_string()
+}
+
+/// Default scheme prefix on the credential's header value.
+pub fn default_cred_scheme() -> String {
+    "Bearer ".to_string()
 }
 
 impl CredentialRecord {
@@ -353,13 +387,13 @@ mod tests {
     fn verify_secret_accepts_current_and_graced_prev() {
         let pepper = b"pep";
         let minted = mint_key(pepper);
-        let (_, secret) = crate::crypto::parse_token(&minted.token).unwrap();
+        let (_, secret) = crate::crypto::parse_minted_token(&minted.token).unwrap();
         let mut r = KeyRecord::new(&minted.key_id, &minted.secret_hash, now());
         assert!(r.verify_secret(secret, pepper, now()));
 
         // Rotate: the old secret becomes prev with a grace window.
         let rotated = mint_key(pepper);
-        let (_, new_secret) = crate::crypto::parse_token(&rotated.token).unwrap();
+        let (_, new_secret) = crate::crypto::parse_minted_token(&rotated.token).unwrap();
         r.prev_secret_hash = Some(r.secret_hash.clone());
         r.prev_hash_expires_at = Some(now() + Duration::seconds(60));
         r.secret_hash = rotated.secret_hash.clone();
@@ -446,12 +480,74 @@ mod tests {
     }
 
     #[test]
+    fn credential_presentation_defaults_to_bearer_authorization() {
+        let json = serde_json::json!({
+            "id": "c1",
+            "name": "n",
+            "material": {"kind": "vault_ref", "reference": "vault://x"},
+            "created_at": "2023-11-14T22:13:20Z",
+            "updated_at": "2023-11-14T22:13:20Z"
+        });
+        let r: CredentialRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(r.header, "authorization");
+        assert_eq!(r.scheme, "Bearer ");
+    }
+
+    #[test]
+    fn credential_presentation_round_trips_a_raw_value_header() {
+        let json = serde_json::json!({
+            "id": "c1",
+            "name": "n",
+            "header": "x-api-key",
+            "scheme": "",
+            "material": {"kind": "vault_ref", "reference": "vault://x"},
+            "created_at": "2023-11-14T22:13:20Z",
+            "updated_at": "2023-11-14T22:13:20Z"
+        });
+        let r: CredentialRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(r.header, "x-api-key");
+        assert_eq!(r.scheme, "");
+        let back: CredentialRecord =
+            serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
+        assert_eq!(r, back);
+    }
+
+    #[test]
+    fn key_credential_binding_defaults_to_none_and_round_trips() {
+        let created = KeyRecord::new("abcd", "hash", now());
+        assert!(created.credential_id.is_none());
+
+        let mut record = created.clone();
+        record.credential_id = Some("cred-1".to_string());
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["credential_id"], "cred-1");
+        let restored: KeyRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.credential_id.as_deref(), Some("cred-1"));
+    }
+
+    #[test]
+    fn a_legacy_record_without_the_new_fields_still_deserializes() {
+        // Mixed-version fleets replicate records as plain JSON, so an older
+        // node's record must keep loading here.
+        let legacy = serde_json::json!({
+            "key_id": "abcd",
+            "secret_hash": "deadbeef",
+            "created_at": "2023-11-14T22:13:20Z",
+            "updated_at": "2023-11-14T22:13:20Z"
+        });
+        let r: KeyRecord = serde_json::from_value(legacy).unwrap();
+        assert!(r.credential_id.is_none());
+    }
+
+    #[test]
     fn credential_material_tagged_serde() {
         let r = CredentialRecord {
             id: "c1".into(),
             name: "openai-prod".into(),
             provider: Some("openai".into()),
             kind: "ai_provider".into(),
+            header: default_cred_header(),
+            scheme: default_cred_scheme(),
             material: CredentialMaterial::VaultRef {
                 reference: "vault://openai".into(),
             },

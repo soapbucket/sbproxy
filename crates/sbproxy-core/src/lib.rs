@@ -76,8 +76,12 @@ pub mod config_authority;
 /// pulls on the hint instead of waiting out its poll interval. Never a
 /// correctness requirement; polling alone already converges.
 pub mod config_gossip;
+/// Honouring `source:`: resolve the config document from a git
+/// repository (or an overlay chain over one), keep it fresh on a timer,
+/// and hand the result to the shared reload transaction.
+pub mod config_source;
 /// Config-authority subscriber: pull signed configuration from an
-/// upstream authority, verify it, merge it over the local document, and
+/// upstream authority, verify it, merge it over the base document, and
 /// apply it through the shared reload transaction.
 pub mod config_subscriber;
 pub mod context;
@@ -92,6 +96,10 @@ pub mod governance_runtime;
 pub mod hook_registry;
 pub mod hooks;
 pub mod identity;
+/// Extraction of a minted virtual key from configured inbound headers.
+pub mod inbound_key;
+/// Fleet capability gate for record fields older nodes silently drop.
+pub mod key_capability;
 /// WOR-1546: dynamic key plane assembly + process-global handle.
 pub mod key_plane;
 /// Canonical, secret-free lowering for governed key policy.

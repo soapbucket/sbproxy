@@ -12,6 +12,8 @@
 //!   ([`config_authority`])
 //! - Merging an authority-supplied document into a locally owned one
 //!   ([`config_merge`])
+//! - Resolving a `source:` block, including a git repository, into the
+//!   config document that actually compiles ([`source`])
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -65,7 +67,10 @@ pub use plan::{
 pub use raw::*;
 pub use snapshot::*;
 pub use source::{
-    load_from_source, ConfigSourceError, FetchContext, GitBinaryCloner, MAX_RECURSION_DEPTH,
+    credential_references, is_full_commit_sha, load_from_source, load_source_blocking,
+    parse_source_head, redact_repo, refresh_interval, resolve_document, scrub_credentials, Cloner,
+    ConfigSourceError, FetchContext, FetchRequest, GitBinaryCloner, ResolvedDocument,
+    ResolvedRevision, MAX_RECURSION_DEPTH,
 };
 pub use types::*;
 pub use validate::{
