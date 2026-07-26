@@ -13,12 +13,36 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 use super::{CacheStore, CachedResponse};
+
+type DirectoryOperationLock = parking_lot::Mutex<()>;
+
+/// Same-process operation locks keyed by canonical cache directory.
+///
+/// Only weak references live in the registry, and dead entries are pruned on
+/// every lookup. Reload-created stores therefore coordinate while alive
+/// without retaining every historical directory forever.
+static DIRECTORY_OPERATION_LOCKS: LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<PathBuf, Weak<DirectoryOperationLock>>>,
+> = LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+fn shared_directory_operation_lock(directory: &Path) -> Arc<DirectoryOperationLock> {
+    let mut locks = DIRECTORY_OPERATION_LOCKS.lock();
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(directory).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(parking_lot::Mutex::new(()));
+    locks.insert(directory.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
 
 // --- Config ---
 
@@ -35,13 +59,14 @@ pub struct FileCacheConfig {
 
 /// File-backed cache store.
 ///
-/// Thread-safe: file system operations are atomic at the level of individual
-/// file writes (write to temp file then rename).  Concurrent reads are always
-/// safe; concurrent writes to the same key are last-write-wins.
+/// Stores created in the same process for the same canonical directory share
+/// one operation lock. File publication is atomic at the level of individual
+/// writes (write to a unique temp file, then rename). This does not claim
+/// cross-process compare-and-swap atomicity.
 pub struct FileCacheStore {
     dir: PathBuf,
     max_size_bytes: u64,
-    operation_lock: parking_lot::Mutex<()>,
+    operation_lock: Arc<DirectoryOperationLock>,
 }
 
 impl FileCacheStore {
@@ -54,10 +79,17 @@ impl FileCacheStore {
                 config.directory
             )
         })?;
+        let dir = fs::canonicalize(&dir).with_context(|| {
+            format!(
+                "FileCacheStore: cannot canonicalize directory '{}'",
+                config.directory
+            )
+        })?;
+        let operation_lock = shared_directory_operation_lock(&dir);
         Ok(Self {
             dir,
             max_size_bytes: config.max_size_mb * 1024 * 1024,
-            operation_lock: parking_lot::Mutex::new(()),
+            operation_lock,
         })
     }
 
@@ -80,6 +112,39 @@ impl FileCacheStore {
             .filter_map(|e| e.metadata().ok())
             .map(|m| m.len())
             .sum()
+    }
+
+    /// Reject a write whose net effect would exceed the configured limit.
+    ///
+    /// Replacements subtract the bytes already owned by this key before
+    /// adding the exact encoded record size (expiry header plus JSON).
+    fn ensure_write_fits(&self, path: &Path, entry: &CachedResponse) -> Result<()> {
+        if self.max_size_bytes == 0 {
+            return Ok(());
+        }
+
+        let payload = serde_json::to_vec(entry).context("FileCacheStore: JSON serialise failed")?;
+        let replacement_size =
+            8u64.saturating_add(u64::try_from(payload.len()).unwrap_or(u64::MAX));
+        let existing_size = match fs::metadata(path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => {
+                return Err(error).context("FileCacheStore: existing entry metadata failed");
+            }
+        };
+        let projected_size = self
+            .current_size_bytes()
+            .saturating_sub(existing_size)
+            .saturating_add(replacement_size);
+        if projected_size > self.max_size_bytes {
+            return Err(anyhow::anyhow!(
+                "FileCacheStore: cache directory exceeds {} MB limit",
+                self.max_size_bytes / (1024 * 1024)
+            ));
+        }
+
+        Ok(())
     }
 
     /// Read the record at `path`.
@@ -188,20 +253,8 @@ impl CacheStore for FileCacheStore {
 
     fn put(&self, key: &str, value: &CachedResponse) -> Result<()> {
         let _guard = self.operation_lock.lock();
-        // Enforce size limit (skip check when unlimited).
-        if self.max_size_bytes > 0 {
-            let used = self.current_size_bytes();
-            let payload_estimate = serde_json::to_vec(value)
-                .map(|v| v.len() as u64)
-                .unwrap_or(0);
-            if used + payload_estimate > self.max_size_bytes {
-                return Err(anyhow::anyhow!(
-                    "FileCacheStore: cache directory exceeds {} MB limit",
-                    self.max_size_bytes / (1024 * 1024)
-                ));
-            }
-        }
         let path = self.path_for(key);
+        self.ensure_write_fits(&path, value)?;
         Self::write_entry(&path, value)
     }
 
@@ -219,6 +272,7 @@ impl CacheStore for FileCacheStore {
         if current != *expected {
             return Ok(false);
         }
+        self.ensure_write_fits(&path, replacement)?;
         Self::write_entry(&path, replacement)?;
         Ok(true)
     }
@@ -425,6 +479,61 @@ mod tests {
     }
 
     #[test]
+    fn file_cas_accounts_for_replaced_bytes_and_rejects_net_growth_past_limit() {
+        let dir = TempDir::new().unwrap();
+        let store = FileCacheStore::new(FileCacheConfig {
+            directory: dir.path().to_str().unwrap().to_string(),
+            max_size_mb: 1,
+        })
+        .unwrap();
+
+        let mut expected = make_entry(300);
+        expected.generation = 1;
+        expected.headers = vec![("x-fill".into(), "a".repeat(900 * 1024))];
+        store.put("bounded", &expected).unwrap();
+        assert!(std::fs::metadata(store.path_for("bounded")).unwrap().len() < 1024 * 1024);
+
+        // Replacing the existing bytes with an equivalently sized record is
+        // valid even though adding both sizes would cross the limit.
+        let mut same_size = expected.clone();
+        same_size.generation = 2;
+        same_size.headers = vec![("x-fill".into(), "b".repeat(900 * 1024))];
+        assert!(store
+            .compare_and_swap("bounded", &expected, &same_size)
+            .unwrap());
+
+        let mut oversized = same_size.clone();
+        oversized.generation = 3;
+        oversized.headers = vec![("x-fill".into(), "c".repeat(2 * 1024 * 1024))];
+        store
+            .compare_and_swap("bounded", &same_size, &oversized)
+            .expect_err("net growth beyond the configured limit must be rejected");
+
+        assert_eq!(
+            store
+                .get_including_expired("bounded")
+                .unwrap()
+                .expect("rejected replacement must preserve the current entry"),
+            same_size
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .map(|extension| extension == "tmp")
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "rejected admission left temp files: {leftovers:?}"
+        );
+    }
+
+    #[test]
     fn get_including_expired_returns_stale_without_deleting() {
         // The SWR path always reads through get_including_expired. The
         // trait default delegates to `get`, which evicts on expiry, so
@@ -559,6 +668,76 @@ mod tests {
         assert_eq!(
             store.get("key").unwrap().expect("foreground entry").body,
             b"foreground"
+        );
+    }
+
+    #[test]
+    fn reload_instances_share_one_atomic_compare_and_swap_domain() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = TempDir::new().unwrap();
+        let original = Arc::new(make_store(&dir));
+        let alias = Arc::new(
+            FileCacheStore::new(FileCacheConfig {
+                directory: dir.path().join(".").to_string_lossy().into_owned(),
+                max_size_mb: 0,
+            })
+            .unwrap(),
+        );
+
+        let mut expected = make_entry(300);
+        expected.generation = 1;
+        original.put("reload-race", &expected).unwrap();
+
+        // Large, independently-derived replacement payloads keep both real
+        // filesystem CAS calls in flight long enough to expose an
+        // instance-local read/compare/write critical section.
+        let mut first_replacement = make_entry(300);
+        first_replacement.generation = 2;
+        first_replacement.headers = vec![("x-race".into(), "a".repeat(16 * 1024 * 1024))];
+        let mut second_replacement = make_entry(300);
+        second_replacement.generation = 3;
+        second_replacement.headers = vec![("x-race".into(), "b".repeat(16 * 1024 * 1024))];
+
+        let barrier = Arc::new(Barrier::new(3));
+        let first = {
+            let store = Arc::clone(&original);
+            let barrier = Arc::clone(&barrier);
+            let expected = expected.clone();
+            let replacement = first_replacement.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .compare_and_swap("reload-race", &expected, &replacement)
+                    .unwrap()
+            })
+        };
+        let second = {
+            let store = Arc::clone(&alias);
+            let barrier = Arc::clone(&barrier);
+            let expected = expected.clone();
+            let replacement = second_replacement.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .compare_and_swap("reload-race", &expected, &replacement)
+                    .unwrap()
+            })
+        };
+        barrier.wait();
+
+        let successes = usize::from(first.join().unwrap()) + usize::from(second.join().unwrap());
+        assert_eq!(
+            successes, 1,
+            "one expected generation permits exactly one replacement across reload instances"
+        );
+        let stored = original
+            .get_including_expired("reload-race")
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored == first_replacement || stored == second_replacement,
+            "the winning replacement must be published intact"
         );
     }
 }

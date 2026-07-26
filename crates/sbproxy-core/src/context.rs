@@ -163,6 +163,9 @@ pub(crate) struct LoadBalancerAttemptToken {
     pub(crate) action: LoadBalancerActionKey,
     pub(crate) target_index: usize,
     pub(crate) started_at: Instant,
+    /// Status received from the selected upstream before any proxy response
+    /// fallback or modifier can rewrite the downstream status.
+    pub(crate) observed_upstream_status: Option<u16>,
 }
 
 /// Per-request state threaded through all Pingora phases as CTX.

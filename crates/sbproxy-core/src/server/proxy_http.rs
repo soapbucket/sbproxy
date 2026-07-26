@@ -239,9 +239,19 @@ fn begin_load_balancer_attempt(
         action,
         target_index: selection.target_index,
         started_at: std::time::Instant::now(),
+        observed_upstream_status: None,
     });
     ctx.admin_load_balancer_strategy = Some(selection.selection_method.clone());
     ctx.admin_load_balancer_target = Some(format!("{}:{}", selection.host, selection.port));
+}
+
+fn capture_load_balancer_upstream_response(
+    ctx: &mut RequestContext,
+    upstream_response: &pingora_http::ResponseHeader,
+) {
+    if let Some(attempt) = ctx.lb_attempt.as_mut() {
+        attempt.observed_upstream_status = Some(upstream_response.status.as_u16());
+    }
 }
 
 fn active_load_balancer_target_index(ctx: &RequestContext) -> Option<usize> {
@@ -261,6 +271,19 @@ fn terminal_load_balancer_attempt_outcome(
     } else {
         LoadBalancerAttemptOutcome::Success
     }
+}
+
+fn finish_terminal_load_balancer_attempt(
+    ctx: &mut RequestContext,
+    error_source: Option<&pingora_error::ErrorSource>,
+) {
+    let observed_upstream_status = ctx
+        .lb_attempt
+        .as_ref()
+        .and_then(|attempt| attempt.observed_upstream_status)
+        .unwrap_or(0);
+    let outcome = terminal_load_balancer_attempt_outcome(observed_upstream_status, error_source);
+    finish_load_balancer_attempt(ctx, outcome);
 }
 
 /// Scheme-agnostic host + path of an upstream URL (WOR-1698).
@@ -1728,6 +1751,7 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        capture_load_balancer_upstream_response(ctx, upstream_response);
         maybe_retry_upstream_status(session, upstream_response, ctx).await
     }
 
@@ -4343,9 +4367,7 @@ impl ProxyHttp for SbProxy {
             .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
 
         let pipeline = ctx.pipeline.clone();
-        let status = final_response_status(ctx, session.as_ref().response_written());
-        let attempt_outcome = terminal_load_balancer_attempt_outcome(status, Some(e.esource()));
-        finish_load_balancer_attempt(ctx, attempt_outcome);
+        finish_terminal_load_balancer_attempt(ctx, Some(e.esource()));
         let Some(action) = active_action(&pipeline, ctx) else {
             return e;
         };
@@ -4796,9 +4818,7 @@ impl ProxyHttp for SbProxy {
         // Close any attempt that did not already end in a retry/error
         // callback. The token resolves its own main or forward-rule action, so
         // strategy, outlier, breaker, and connection state are updated once.
-        let attempt_outcome =
-            terminal_load_balancer_attempt_outcome(status_u16, e.map(|error| error.esource()));
-        finish_load_balancer_attempt(ctx, attempt_outcome);
+        finish_terminal_load_balancer_attempt(ctx, e.map(|error| error.esource()));
 
         // --- Access log emission (Prereq.A) ---
         //
@@ -5288,6 +5308,53 @@ mod tests {
             LoadBalancerAttemptOutcome::Failure,
             "a downstream write error must not erase an upstream 5xx"
         );
+    }
+
+    #[test]
+    fn attempt_feedback_uses_observed_upstream_status_not_rewritten_downstream_status() {
+        let pipeline = lifecycle_pipeline();
+        let main = load_balancer(&pipeline.actions[0]);
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+        let action = LoadBalancerActionKey::new(0, None);
+
+        begin_load_balancer_attempt(&mut ctx, action, &target_selection(0, "bandit"));
+        let upstream_ok = pingora_http::ResponseHeader::build(200, None).unwrap();
+        capture_load_balancer_upstream_response(&mut ctx, &upstream_ok);
+        ctx.response_status = Some(503);
+        finish_terminal_load_balancer_attempt(&mut ctx, Some(&ErrorSource::Downstream));
+
+        assert_eq!(main.connection_count(0), 0);
+        assert_eq!(
+            breaker_state(&main, 0),
+            sbproxy_platform::CircuitState::Closed,
+            "a downstream 5xx rewrite must not train an observed upstream 200 as failed"
+        );
+        assert!(!main
+            .outlier_detector
+            .as_ref()
+            .unwrap()
+            .is_ejected(&main.target_id(0)));
+
+        begin_load_balancer_attempt(&mut ctx, action, &target_selection(1, "bandit"));
+        let upstream_failure = pingora_http::ResponseHeader::build(503, None).unwrap();
+        capture_load_balancer_upstream_response(&mut ctx, &upstream_failure);
+        ctx.response_status = Some(200);
+        finish_terminal_load_balancer_attempt(&mut ctx, None);
+
+        assert_eq!(main.connection_count(1), 0);
+        assert_eq!(
+            breaker_state(&main, 1),
+            sbproxy_platform::CircuitState::Open,
+            "a downstream 2xx rewrite must not erase an observed upstream 503"
+        );
+        assert!(main
+            .outlier_detector
+            .as_ref()
+            .unwrap()
+            .is_ejected(&main.target_id(1)));
     }
 
     #[test]
