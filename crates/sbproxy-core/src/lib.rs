@@ -71,6 +71,11 @@ pub mod compression_value;
 /// does, sign it, store it under a monotonic revision, and serve it to
 /// subscribers on a listener of its own.
 pub mod config_authority;
+/// Gossip accelerator for config distribution: an authority announces its
+/// current revision into typed cluster state, and a mesh-member subscriber
+/// pulls on the hint instead of waiting out its poll interval. Never a
+/// correctness requirement; polling alone already converges.
+pub mod config_gossip;
 /// Config-authority subscriber: pull signed configuration from an
 /// upstream authority, verify it, merge it over the local document, and
 /// apply it through the shared reload transaction.

@@ -33,6 +33,23 @@
 //! the try-lock entry point and reports `reload_busy` instead, and the
 //! next interval retries with whatever the authority is serving by then.
 //!
+//! # Polling is the required path; gossip only shortens the wait
+//!
+//! Every subscriber converges by polling, on `poll_interval`, and that is
+//! what the contract promises. A subscriber that also happens to be a mesh
+//! member gets an accelerator on top: the authority announces its current
+//! revision into typed cluster state, and
+//! [`crate::config_subscriber::ConfigSubscriber::await_next_cycle`] cuts the
+//! interval short when it sees a revision this node does not hold. The pull
+//! it triggers is the same cycle as any other, with every verification step
+//! intact; nothing gossiped is ever adopted as configuration. See
+//! [`crate::config_gossip`].
+//!
+//! A subscriber with no mesh node holds no watcher and takes none of that
+//! code: `await_next_cycle` is one `sleep`. That case is not an afterthought,
+//! it is the common one. Managed-service subscribers reach the authority over
+//! the internet and are in nobody's gossip cluster.
+//!
 //! # Failure behaviour
 //!
 //! | Situation | Behaviour |
@@ -361,6 +378,25 @@ pub struct ConfigSubscriber {
     /// Local receipt time of the bundle currently serving, if any.
     received_at_unix_ms: Option<u64>,
     client: reqwest::Client,
+    /// The gossip accelerator, present only on a mesh member.
+    ///
+    /// `None` is the whole of the non-mesh code path: a subscriber without a
+    /// watcher sleeps out its jittered interval exactly as it did before the
+    /// accelerator existed. Managed-service subscribers are in nobody's
+    /// gossip cluster, so that path is the one that has to stay boring.
+    gossip: Option<crate::config_gossip::ConfigGossipWatcher>,
+    /// Cursor revision at which a gossip hint last shortened the wait.
+    ///
+    /// Bounds the accelerator to one early pull per applied revision. Without
+    /// it, an announcement the pull cannot satisfy (a revision this node
+    /// refuses, a peer announcing a number no authority ever served, a reload
+    /// that stays busy) would still be a hint on the next probe, and the next,
+    /// so the subscriber would fetch on the probe cadence instead of the poll
+    /// interval: fast enough to trip the authority's own per-subscriber rate
+    /// limit and turn a speed-up into a stream of `429`s. One pull per
+    /// revision means a hint that does not move the cursor costs exactly one
+    /// extra fetch, after which this node is back on its interval.
+    gossip_pulled_at_cursor: Option<u64>,
 }
 
 impl std::fmt::Debug for ConfigSubscriber {
@@ -377,6 +413,7 @@ impl std::fmt::Debug for ConfigSubscriber {
             .field("mode", &self.mode)
             .field("keys", &self.keys.as_ref().map(VerifyingKeySet::len))
             .field("cursor", &self.cursor)
+            .field("gossip_accelerated", &self.gossip.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -439,9 +476,36 @@ impl ConfigSubscriber {
             cursor,
             received_at_unix_ms: None,
             client,
+            // Deliberately not resolved here. Construction runs from
+            // `fold_boot_bundle`, which the boot path calls before the
+            // process cluster is installed, so asking for a handle now would
+            // always answer `None` and quietly disable the accelerator on
+            // every clustered node. `run` resolves it instead, by which
+            // point the cluster is up.
+            gossip: None,
+            gossip_pulled_at_cursor: None,
         };
         subscriber.load_keys();
         Ok(subscriber)
+    }
+
+    /// Install a gossip accelerator, replacing any already attached.
+    ///
+    /// [`Self::run`] resolves the process cluster's watcher on its own, so
+    /// production never needs this. It exists so a test can point a
+    /// subscriber at a specific cluster handle without installing a
+    /// process-wide one.
+    pub fn attach_gossip(&mut self, watcher: crate::config_gossip::ConfigGossipWatcher) {
+        self.gossip = Some(watcher);
+    }
+
+    /// Whether a gossip accelerator is attached.
+    ///
+    /// `false` is the non-mesh subscriber: it converges by polling and takes
+    /// no cluster code path at all.
+    #[must_use]
+    pub const fn is_gossip_accelerated(&self) -> bool {
+        self.gossip.is_some()
     }
 
     /// Revision this node currently serves. Zero means none applied.
@@ -923,25 +987,73 @@ impl ConfigSubscriber {
         result
     }
 
+    /// Sleep until the next cycle is due.
+    ///
+    /// The jittered poll interval, cut short when a cluster peer announces a
+    /// revision this node does not hold. Returns what woke it.
+    ///
+    /// Without a gossip accelerator this is one `sleep` and nothing else,
+    /// which is exactly what a non-mesh subscriber does and the only thing it
+    /// does.
+    ///
+    /// At most one wait per applied revision is shortened; see
+    /// `gossip_pulled_at_cursor` for why.
+    pub async fn await_next_cycle(&mut self) -> crate::config_gossip::CycleTrigger {
+        use crate::config_gossip::CycleTrigger;
+
+        let interval = jitter(self.poll_interval);
+        let Some(watcher) = self.gossip.as_ref() else {
+            tokio::time::sleep(interval).await;
+            return CycleTrigger::Interval;
+        };
+        if self.gossip_pulled_at_cursor == Some(self.cursor.revision) {
+            // A hint already bought this revision an early pull and the pull
+            // did not move the cursor. Whatever the announcement is saying,
+            // this node cannot act on it, so stop asking faster than the
+            // interval and let the ordinary cycle keep retrying.
+            tokio::time::sleep(interval).await;
+            return CycleTrigger::Interval;
+        }
+        let trigger = watcher.wait(self.cursor.revision, interval).await;
+        if trigger == CycleTrigger::Gossip {
+            self.gossip_pulled_at_cursor = Some(self.cursor.revision);
+            tracing::info!(
+                trigger = trigger.as_str(),
+                applied_revision = self.cursor.revision,
+                "a cluster peer announced a config revision this node does not hold; polling the \
+                 authority now rather than waiting out the interval",
+            );
+        }
+        trigger
+    }
+
     /// Poll forever, with jitter.
     ///
     /// The first sleep is a random fraction of a whole interval so a
     /// fleet that restarted together does not arrive at the authority in
     /// lockstep; every later sleep is the interval plus or minus the
-    /// documented jitter fraction of it.
+    /// documented jitter fraction of it, or less when a cluster peer
+    /// announces a newer revision first.
     pub async fn run(mut self) {
+        // Resolved here rather than at construction: this runs from the
+        // boot path's task spawn, after the process cluster is installed.
+        // A watcher already attached by a caller wins, so a test can pin one.
+        if self.gossip.is_none() {
+            self.gossip = crate::config_gossip::ConfigGossipWatcher::process();
+        }
         tracing::info!(
             authority_url = %self.base_url,
             subscriber_id = %self.subscriber_id,
             mode = %format_mode(self.mode),
             poll_interval_secs = self.poll_interval.as_secs(),
             revision = self.cursor.revision,
+            gossip_accelerated = self.is_gossip_accelerated(),
             "config authority subscriber started",
         );
         tokio::time::sleep(self.poll_interval.mul_f64(random_unit())).await;
         loop {
             self.poll_once().await;
-            tokio::time::sleep(jitter(self.poll_interval)).await;
+            self.await_next_cycle().await;
         }
     }
 

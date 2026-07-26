@@ -1993,6 +1993,69 @@ pub fn record_config_bundle_applied_degraded() {
     counter.inc();
 }
 
+/// Count one config-revision announcement on
+/// `sbproxy_config_authority_announce_total{result}`.
+///
+/// An authority publishes its current revision into typed cluster state
+/// after every successful publication, so a mesh-member subscriber can pull
+/// on the hint rather than waiting out its poll interval. The announcement
+/// is an accelerator: `failed` costs propagation speed and nothing else,
+/// because polling converges on its own.
+///
+/// `result` is a closed string:
+///
+/// | Result | Meaning |
+/// |---|---|
+/// | `published` | Written into typed cluster state. |
+/// | `not_clustered` | This node has no mesh node, so there is nobody to tell. The ordinary case for a single-node authority serving subscribers over the internet. |
+/// | `failed` | The cluster write was refused or its owner was unreachable. Subscribers still converge on their poll interval. |
+pub fn record_config_authority_announce(result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_authority_announce_total",
+            "Config revision announcements published to the cluster, by result",
+            &["result"],
+        )
+        .expect("config authority announce counter registers")
+    });
+    counter.with_label_values(&[result]).inc();
+}
+
+/// Count one read of the cluster's config-revision announcement on
+/// `sbproxy_config_bundle_gossip_total{outcome}`.
+///
+/// Recorded once per probe by a mesh-member subscriber while it waits out
+/// its poll interval. `hint` is the interesting series: it counts the pulls
+/// gossip brought forward, so `rate(hint)` is what the accelerator is
+/// actually buying. Every other outcome leaves the subscriber on its
+/// interval.
+///
+/// `outcome` is a closed string:
+///
+/// | Outcome | Meaning |
+/// |---|---|
+/// | `hint` | An announced revision above this node's cursor. The poll interval was cut short and a full verify-and-apply pull ran. |
+/// | `stale` | An announced revision at or below this node's cursor. No fetch. |
+/// | `absent` | Nothing announced, or the announcement passed its TTL. |
+/// | `unreadable` | The announcement could not be read or did not validate. |
+pub fn record_config_bundle_gossip(outcome: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_bundle_gossip_total",
+            "Cluster config-revision announcement probes, by outcome",
+            &["outcome"],
+        )
+        .expect("config bundle gossip counter registers")
+    });
+    counter.with_label_values(&[outcome]).inc();
+}
+
 /// Count a well-known projection render failure on
 /// `sbproxy_projection_render_failures_total{projection}`. A non-zero
 /// value means a robots.txt / llms.txt / similar projection could not
