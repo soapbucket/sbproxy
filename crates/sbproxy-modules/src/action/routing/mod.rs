@@ -166,6 +166,15 @@ pub struct TargetState {
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
+/// One completed upstream attempt reported to a [`RoutingStrategy`].
+#[derive(Debug, Clone, Copy)]
+pub struct RoutingOutcome {
+    /// Whether the upstream attempt completed successfully.
+    pub success: bool,
+    /// Wall-clock duration of the upstream attempt.
+    pub latency: std::time::Duration,
+}
+
 // --- RoutingStrategy trait ---
 
 /// Pluggable routing strategy.
@@ -198,6 +207,12 @@ pub trait RoutingStrategy: Send + Sync {
     /// Stable identifier for this strategy, matching the `name` used
     /// at registration time. Used for logging and metrics labels.
     fn name(&self) -> &str;
+
+    /// Record the outcome of an upstream attempt selected by this strategy.
+    ///
+    /// The default is intentionally a no-op so existing third-party strategy
+    /// implementations remain source-compatible.
+    fn record_outcome(&self, _target_url: &str, _outcome: RoutingOutcome) {}
 }
 
 // --- Plugin registry ---
@@ -302,11 +317,18 @@ mod tests {
     }
 
     #[test]
-    fn trait_is_object_safe() {
+    fn strategy_implementing_only_selection_and_name_is_object_safe() {
         // Compile-time check: if `RoutingStrategy` ever loses object
         // safety, this stops compiling. The `Box::new` keeps it from
         // being optimized away in release builds.
-        let _: Box<dyn RoutingStrategy> = Box::new(NoopStrategy);
+        let strategy: Box<dyn RoutingStrategy> = Box::new(NoopStrategy);
+        strategy.record_outcome(
+            "http://upstream",
+            RoutingOutcome {
+                success: true,
+                latency: std::time::Duration::from_millis(1),
+            },
+        );
     }
 
     #[test]

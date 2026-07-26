@@ -28,8 +28,8 @@ pub use mcp::{
 };
 pub use routing::{
     build_routing_strategy, list_routing_strategies, AlwaysFirstHealthyStrategy, BanditStrategy,
-    GpuAwareStrategy, LoraAwareStrategy, LoraStrategy, RoutingRequest, RoutingStrategy,
-    RoutingStrategyRegistration, TargetState,
+    GpuAwareStrategy, LoraAwareStrategy, LoraStrategy, RoutingOutcome, RoutingRequest,
+    RoutingStrategy, RoutingStrategyRegistration, TargetState,
 };
 pub use storage::*;
 pub use versioning::*;

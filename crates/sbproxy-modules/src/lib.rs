@@ -19,8 +19,8 @@ pub mod transform;
 pub use action::{
     build_routing_strategy, extract_version, list_routing_strategies, resolve_shapes, Action,
     AlwaysFirstHealthyStrategy, ContentNegotiateConfig, LoadBalancerAction, NegotiatedShapes,
-    ProxyAction, RoutingRequest, RoutingStrategy, RoutingStrategyRegistration, TargetState,
-    VersionSource,
+    ProxyAction, RoutingOutcome, RoutingRequest, RoutingStrategy, RoutingStrategyRegistration,
+    TargetState, VersionSource,
 };
 pub use auth::a2a::{detect as detect_a2a, A2AContext, A2ASpec, ChainHop, DetectedSpec};
 pub use auth::{ApiKeyAuth, Auth};
