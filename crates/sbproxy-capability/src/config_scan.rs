@@ -491,9 +491,15 @@ struct GenericRequirements {
 }
 
 #[derive(Debug, Clone)]
+enum ValueTypeReference {
+    Nominal(TypeReference),
+    Tuple(Vec<Option<ValueTypeReference>>),
+}
+
+#[derive(Debug, Clone)]
 struct FunctionReturn {
     symbol: String,
-    result: TypeReference,
+    result: ValueTypeReference,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -620,6 +626,7 @@ impl NamespaceResolution {
 #[derive(Default)]
 struct RustTypeIndex {
     fields: BTreeMap<String, BTreeMap<String, Option<TypeReference>>>,
+    schema_fields: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     type_components: BTreeMap<String, Vec<Option<TypeReference>>>,
     generic_type_parameters: BTreeMap<String, Vec<TypeAliasParameter>>,
     tuple_struct_fields: BTreeMap<String, Vec<Option<TypeReference>>>,
@@ -815,6 +822,14 @@ impl RustTypeIndex {
                 .push(nominal_type_reference(&field.ty, context));
             if let Some(ident) = &field.ident {
                 let field_name = ident.to_string().trim_start_matches("r#").to_string();
+                let serialized_name = explicit_schema_field_rename(&field.attrs)
+                    .unwrap_or_else(|| field_name.clone());
+                self.schema_fields
+                    .entry(owner.to_string())
+                    .or_default()
+                    .entry(rust_field_name(&serialized_name))
+                    .or_default()
+                    .insert(field_name.clone());
                 self.fields
                     .entry(owner.to_string())
                     .or_default()
@@ -853,6 +868,23 @@ impl RustTypeIndex {
             .and_then(|fields| fields.get(field))
             .and_then(Option::as_ref)
             .and_then(|reference| self.resolve_exact_type_reference(reference))
+    }
+
+    fn rust_field_for_schema_field<'a>(
+        &'a self,
+        owner: &str,
+        schema_field: &'a str,
+    ) -> Option<&'a str> {
+        let Some(candidates) = self
+            .schema_fields
+            .get(owner)
+            .and_then(|fields| fields.get(schema_field))
+        else {
+            return Some(schema_field);
+        };
+        (candidates.len() == 1)
+            .then(|| candidates.first().map(String::as_str))
+            .flatten()
     }
 
     fn resolve_type_reference(&self, reference: &TypeReference) -> Option<String> {
@@ -1535,7 +1567,7 @@ impl RustTypeIndex {
         let syn::ReturnType::Type(_, ty) = &signature.output else {
             return;
         };
-        let Some(result) = type_reference(ty, context) else {
+        let Some(result) = value_type_reference(ty, context) else {
             return;
         };
         let name = signature.ident.to_string();
@@ -2443,9 +2475,88 @@ fn serde_enum_tag(attributes: &[syn::Attribute]) -> Option<String> {
     tag
 }
 
+fn explicit_attribute_rename(
+    attributes: &[syn::Attribute],
+    attribute_name: &str,
+) -> Option<String> {
+    let mut rename = None;
+    for attribute in attributes
+        .iter()
+        .filter(|attribute| attribute.path().is_ident(attribute_name))
+    {
+        let _ = attribute.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") && meta.input.peek(syn::Token![=]) {
+                rename = Some(meta.value()?.parse::<syn::LitStr>()?.value());
+            } else if meta.input.peek(syn::Token![=]) {
+                let _ = meta.value()?.parse::<syn::Expr>()?;
+            }
+            Ok(())
+        });
+    }
+    rename
+}
+
+fn explicit_schema_field_rename(attributes: &[syn::Attribute]) -> Option<String> {
+    explicit_attribute_rename(attributes, "schemars")
+        .or_else(|| explicit_attribute_rename(attributes, "serde"))
+}
+
 fn type_reference(ty: &syn::Type, context: &ModuleContext) -> Option<TypeReference> {
     let path = innermost_type_path(ty)?;
     path_reference(path, context)
+}
+
+fn transparent_type_argument(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(path) = ty else {
+        return None;
+    };
+    let segment = path.path.segments.last()?;
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return None;
+    };
+    let generic_types: Vec<&syn::Type> = arguments
+        .args
+        .iter()
+        .filter_map(|argument| match argument {
+            syn::GenericArgument::Type(ty) => Some(ty),
+            _ => None,
+        })
+        .collect();
+    match segment.ident.to_string().as_str() {
+        "HashMap" | "BTreeMap" | "IndexMap" => generic_types.get(1).copied(),
+        "Result" => generic_types.first().copied(),
+        "Option" | "Vec" | "VecDeque" | "Box" | "Arc" | "Rc" | "Cow" | "SmallVec" | "HashSet"
+        | "BTreeSet" | "Guard" | "MappedGuard" | "MutexGuard" | "RwLockReadGuard"
+        | "RwLockWriteGuard" => generic_types.first().copied(),
+        _ => None,
+    }
+}
+
+fn value_type_reference(ty: &syn::Type, context: &ModuleContext) -> Option<ValueTypeReference> {
+    match ty {
+        syn::Type::Array(array) => value_type_reference(&array.elem, context),
+        syn::Type::Group(group) => value_type_reference(&group.elem, context),
+        syn::Type::Paren(paren) => value_type_reference(&paren.elem, context),
+        syn::Type::Ptr(pointer) => value_type_reference(&pointer.elem, context),
+        syn::Type::Reference(reference) => value_type_reference(&reference.elem, context),
+        syn::Type::Slice(slice) => value_type_reference(&slice.elem, context),
+        syn::Type::Tuple(tuple) => Some(ValueTypeReference::Tuple(
+            tuple
+                .elems
+                .iter()
+                .map(|element| value_type_reference(element, context))
+                .collect(),
+        )),
+        syn::Type::Path(_) => {
+            if let Some(inner) = transparent_type_argument(ty) {
+                if let Some(reference) = value_type_reference(inner, context) {
+                    return Some(reference);
+                }
+            }
+            type_reference(ty, context).map(ValueTypeReference::Nominal)
+        }
+        _ => type_reference(ty, context).map(ValueTypeReference::Nominal),
+    }
 }
 
 fn nominal_type_reference(ty: &syn::Type, context: &ModuleContext) -> Option<TypeReference> {
@@ -2679,7 +2790,7 @@ struct LocalSymbolScope {
     traits_by_method: BTreeMap<String, BTreeSet<String>>,
     type_declarations: BTreeSet<String>,
     function_declarations: BTreeSet<String>,
-    function_returns: BTreeMap<String, Vec<TypeReference>>,
+    function_returns: BTreeMap<String, Vec<ValueTypeReference>>,
     namespace_declarations: BTreeSet<String>,
 }
 
@@ -2955,7 +3066,48 @@ impl<'a> FieldReadVisitor<'a> {
         traits
     }
 
-    fn function_return_scoped(&self, path: &syn::Path) -> Option<String> {
+    fn resolve_value_type_scoped_with_limit(
+        &self,
+        reference: &ValueTypeReference,
+        scope_limit: usize,
+    ) -> Option<InferredValue> {
+        match reference {
+            ValueTypeReference::Nominal(reference) => self
+                .resolve_exact_type_scoped_with_limit(reference, scope_limit)
+                .map(|owner| InferredValue::nominal(owner, false)),
+            ValueTypeReference::Tuple(elements) => Some(InferredValue::tuple(
+                elements
+                    .iter()
+                    .map(|element| {
+                        element.as_ref().and_then(|element| {
+                            self.resolve_value_type_scoped_with_limit(element, scope_limit)
+                        })
+                    })
+                    .collect(),
+            )),
+        }
+    }
+
+    fn resolve_value_type(&self, reference: &ValueTypeReference) -> Option<InferredValue> {
+        match reference {
+            ValueTypeReference::Nominal(reference) => self
+                .types
+                .resolve_exact_type_reference(reference)
+                .map(|owner| InferredValue::nominal(owner, false)),
+            ValueTypeReference::Tuple(elements) => Some(InferredValue::tuple(
+                elements
+                    .iter()
+                    .map(|element| {
+                        element
+                            .as_ref()
+                            .and_then(|element| self.resolve_value_type(element))
+                    })
+                    .collect(),
+            )),
+        }
+    }
+
+    fn function_return_scoped(&self, path: &syn::Path) -> Option<InferredValue> {
         let reference = path_reference(path, &self.context)?;
         if !reference.leading_colon && reference.segments.len() == 1 {
             let name = reference.segments.first()?;
@@ -2968,7 +3120,7 @@ impl<'a> FieldReadVisitor<'a> {
                 if returns.len() != 1 {
                     return None;
                 }
-                return self.resolve_exact_type_scoped_with_limit(&returns[0], scope_index + 1);
+                return self.resolve_value_type_scoped_with_limit(&returns[0], scope_index + 1);
             }
         }
         let symbol = self.resolve_symbol_scoped(SymbolKind::Function, &reference)?;
@@ -2980,7 +3132,7 @@ impl<'a> FieldReadVisitor<'a> {
             .iter()
             .find(|candidate| candidate.symbol == symbol)?
             .result;
-        self.types.resolve_exact_type_reference(result)
+        self.resolve_value_type(result)
     }
 
     fn block_symbol_scope(&self, block: &syn::Block) -> LocalSymbolScope {
@@ -3107,7 +3259,7 @@ impl<'a> FieldReadVisitor<'a> {
                     let name = item_fn.sig.ident.to_string();
                     scope.function_declarations.insert(name.clone());
                     if let syn::ReturnType::Type(_, ty) = &item_fn.sig.output {
-                        if let Some(result) = type_reference(ty, &self.context) {
+                        if let Some(result) = value_type_reference(ty, &self.context) {
                             scope.function_returns.entry(name).or_default().push(result);
                         }
                     }
@@ -4078,7 +4230,6 @@ impl<'a> FieldReadVisitor<'a> {
                     return None;
                 };
                 self.function_return_scoped(&path.path)
-                    .map(|owner| InferredValue::nominal(owner, false))
             }
             syn::Expr::Field(field) => {
                 let member = Self::named_member(&field.member)?;
@@ -4558,7 +4709,10 @@ fn has_unambiguous_field_read(
     let Some(owner) = types.schema_owner(owner) else {
         return false;
     };
-    typed_reads.contains(&(owner, key.rust_field.clone()))
+    let Some(rust_field) = types.rust_field_for_schema_field(&owner, &key.rust_field) else {
+        return false;
+    };
+    typed_reads.contains(&(owner, rust_field.to_string()))
 }
 
 fn production_consumer_exists(consumer: &str, sources: &[&SourceFile]) -> bool {
@@ -6770,6 +6924,95 @@ fn production() {
         )];
 
         assert_eq!(verify_config_readers(&keys, &[], &sources), vec![]);
+    }
+
+    #[test]
+    fn tuple_function_return_destructuring_preserves_the_selected_owner() {
+        let keys = [key("proxy.live", "live")];
+        let sources = [source(
+            r#"
+struct Config {
+    live: bool,
+}
+
+fn fold(config: Config) -> Result<(String, Config, bool), ()> {
+    Ok((String::new(), config, false))
+}
+
+fn production(config: Config) -> Result<(), ()> {
+    let (_, config, _) = fold(config)?;
+    consume(config.live);
+    Ok(())
+}
+"#,
+        )];
+
+        assert_eq!(verify_config_readers(&keys, &[], &sources), vec![]);
+    }
+
+    #[test]
+    fn tuple_function_return_destructuring_does_not_cross_contaminate_slots() {
+        let keys = [key("proxy.live", "live")];
+        let sources = [source(
+            r#"
+struct Config {
+    live: bool,
+}
+
+struct Unrelated {
+    live: bool,
+}
+
+fn fold(config: Config) -> (Config, Unrelated) {
+    todo!()
+}
+
+fn production(config: Config) {
+    let (_, unrelated) = fold(config);
+    consume(unrelated.live);
+}
+"#,
+        )];
+
+        assert_eq!(verify_config_readers(&keys, &[], &sources).len(), 1);
+    }
+
+    #[test]
+    fn serde_renamed_schema_field_maps_back_to_the_rust_field() {
+        let keys = [key("proxy.poll_interval", "poll_interval")];
+        let sources = [source(
+            r#"
+struct Config {
+    #[serde(rename = "poll_interval")]
+    poll_interval_secs: u64,
+}
+
+fn production(config: &Config) {
+    consume(config.poll_interval_secs);
+}
+"#,
+        )];
+
+        assert_eq!(verify_config_readers(&keys, &[], &sources), vec![]);
+    }
+
+    #[test]
+    fn serde_renamed_schema_field_still_requires_a_value_read() {
+        let keys = [key("proxy.poll_interval", "poll_interval")];
+        let sources = [source(
+            r#"
+struct Config {
+    #[serde(rename = "poll_interval")]
+    poll_interval_secs: u64,
+}
+
+fn production(config: &mut Config) {
+    config.poll_interval_secs = 30;
+}
+"#,
+        )];
+
+        assert_eq!(verify_config_readers(&keys, &[], &sources).len(), 1);
     }
 
     #[test]
