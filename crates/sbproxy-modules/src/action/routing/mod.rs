@@ -90,13 +90,13 @@ pub struct RoutingRequest {
     /// The hostname the request matched, before any forwarding rule
     /// rewrote it. Useful for tenant-aware strategies.
     pub hostname: String,
-    /// AI model identifier when the request is an AI proxy request.
-    /// Only set on the AI-proxy code path; plain HTTP routing leaves
-    /// this `None`.
+    /// Model identifier when present. The production load-balancer
+    /// projection fills an unset value from `X-Model` or `?model=`.
     pub model: Option<String>,
     /// LoRA / fine-tune adapter identifier when present in the request
-    /// (e.g. `?adapter=...` or `X-LoRA-Adapter`). Only set on the
-    /// AI-proxy code path.
+    /// (e.g. `?adapter=...` or `X-LoRA-Adapter`). The production
+    /// load-balancer projection performs this extraction for plain HTTP
+    /// requests as well as AI gateway requests.
     pub adapter: Option<String>,
     /// Free-form metadata bag for additional signals the strategy
     /// might want (sticky session keys, geo zone, A/B bucket, ...).
