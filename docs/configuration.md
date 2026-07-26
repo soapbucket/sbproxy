@@ -4600,14 +4600,32 @@ A publish payload is bounded by the admin server's request-body limit (512 KiB) 
 
 ### Admin routes
 
-All four sit on the admin listener behind operator auth and RBAC.
+All five sit on the admin listener behind operator auth and RBAC.
 
 | Route | Method | Purpose |
 |---|---|---|
 | `/admin/config-authority/publish` | `POST` | Body is the YAML payload; `?mode=overlay\|replace` selects how subscribers apply it (default `overlay`). |
+| `/admin/config-authority/rollback` | `POST` | Republish the previous stored revision's payload. No body, no query. |
 | `/admin/config-authority/status` | `GET` | Current revision, digest, ETag, key ID, the verifying-key file to distribute, and per-subscriber last-seen revision. |
 | `/admin/config-authority/subscribers` | `GET` / `POST` | List subscribers, or register one with `{"subscriber_id":"edge-01"}`. |
 | `/admin/config-authority/subscribers/revoke` | `POST` | `{"credential_id":"..."}` for one credential, `{"subscriber_id":"..."}` for every credential that node holds. |
+
+Operating these from `curl` is possible but nobody should have to.
+`sbproxy config authority {init|publish|status|rollback|subscriber}` is the
+same surface with local validation, an exit-code contract, and
+`--format json`; `sbproxy config pull --dry-run` previews what a
+subscriber would apply next without applying it. See
+[manual.md](manual.md#config-authority---operate-a-config-authority).
+
+`rollback` republishes the previous payload under a *new* revision number
+rather than re-serving the old one. A subscriber's anti-replay cursor
+refuses any revision that is not greater than the one it applied, so
+re-serving the old number would reach only the nodes that had not yet
+taken the revision being undone. The payload is revalidated on the way
+through, since a payload that published cleanly before a binary upgrade
+need not still construct after one. With nothing to go back to, the route
+answers `400` with code `no_previous_revision` and
+`"revision_consumed": false`.
 
 Registration returns the clear credential exactly once. The authority stores only a SHA-256 fingerprint of it, so the registry file is not a credential store: someone who reads it cannot authenticate with it. Credentials look like `sbca1.<credential-id>.<secret>` and are long-lived and reusable, unlike the single-use `sbce1` cluster enrollment tokens.
 

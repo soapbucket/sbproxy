@@ -12,6 +12,33 @@ the next version cut.
 
 ### Added
 
+- **Operate a config authority from the command line.** Running one used
+  to mean hand-rolled `curl`. `sbproxy config authority init` generates
+  the Ed25519 signing key owner-only, writes the verifying-key file
+  subscribers install, and prints what to copy where; it refuses to
+  overwrite an existing key, and `--force` rotates by adding the new
+  verifying key beside the old one so subscribers keep verifying while
+  they are updated. `publish` runs the same three validation steps the
+  authority runs, through the same code, so a payload that would be
+  refused is refused locally before a revision number is spent on it.
+  `status` shows the current revision, the key id, and every subscriber's
+  last-seen revision, which is fleet drift visible from a terminal.
+  `rollback` republishes the previous revision's payload under a new
+  revision number, because a subscriber's anti-replay cursor refuses
+  anything that does not move forward. `subscriber add | list | revoke`
+  manages credentials, and `add` prints the credential exactly once and
+  says so. Every command that changes what the fleet sees goes over the
+  admin API and reports what the server returned, and an unreachable
+  authority is a distinct non-zero exit rather than something local that
+  looks like success. New admin route:
+  `POST /admin/config-authority/rollback`.
+- **Preview the configuration an authority would push, before it lands.**
+  `sbproxy config pull --dry-run` runs a real subscriber cycle up to the
+  point of applying: conditional fetch, signature and digest and replay
+  verification, the merge over the local document, and the
+  unresolved-`${VAR}` screen. Then it prints the plan diff and stops. The
+  bundle cache is not written, the replay cursor is not advanced, and
+  nothing reloads.
 - **Subscribe to signed configuration from an upstream authority.** A new
   `proxy.config_authority.upstream` block points a node at an authority
   that publishes signed configuration bundles. The node polls, verifies
