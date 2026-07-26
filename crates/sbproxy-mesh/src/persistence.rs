@@ -11,6 +11,15 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 /// A complete snapshot of a node's CRDT state, ready to be persisted.
+///
+/// Carries no serde attributes, and in particular no
+/// `deny_unknown_fields`. That absence is load-bearing rather than
+/// incidental: a snapshot is written by one build and read by another
+/// during a rolling restart, so a key one side does not know about has to
+/// be ignored rather than fatal. Adding `deny_unknown_fields` would turn
+/// every future field removal into a boot failure on whichever node
+/// upgraded first. `snapshot_tolerates_an_unknown_key_from_another_build`
+/// pins it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedState {
     /// Per-key rate-limit G-Counters.
@@ -21,8 +30,6 @@ pub struct PersistedState {
     pub blocked_users: crate::state::set::ORSet,
     /// Per-session last-writer-wins registers.
     pub sessions: HashMap<String, crate::state::register::LWWRegister>,
-    /// Latest broadcast config version, if any.
-    pub config_version: Option<crate::state::config_broadcast::ConfigVersion>,
     /// Unix timestamp (seconds) when this snapshot was saved.
     pub saved_at: u64,
 }
@@ -35,7 +42,6 @@ impl PersistedState {
             blocked_ips: crate::state::set::ORSet::new(),
             blocked_users: crate::state::set::ORSet::new(),
             sessions: HashMap::new(),
-            config_version: None,
             saved_at: now_secs(),
         }
     }
@@ -216,9 +222,8 @@ impl SharedState {
     /// - Phase 3 cold-start load (merge the Redis snapshot into local).
     /// - Phase 5 federation pull (merge peer-cluster summaries into local).
     ///
-    /// `config_version` uses LWW-Register semantics: the higher timestamp
-    /// wins. `saved_at` tracks the wall-clock of the merged-in state when
-    /// it's newer, so subsequent staleness checks see the correct age.
+    /// `saved_at` tracks the wall-clock of the merged-in state when it's
+    /// newer, so subsequent staleness checks see the correct age.
     pub fn merge_in(&self, incoming: &PersistedState) {
         let mut guard = match self.inner.write() {
             Ok(g) => g,
@@ -239,13 +244,6 @@ impl SharedState {
                 .entry(sid.clone())
                 .and_modify(|local| local.merge(remote))
                 .or_insert_with(|| remote.clone());
-        }
-        // Config version: take the newer one if present.
-        if let Some(remote_cv) = &incoming.config_version {
-            guard.config_version = match guard.config_version.take() {
-                Some(local_cv) if local_cv.version >= remote_cv.version => Some(local_cv),
-                _ => Some(remote_cv.clone()),
-            };
         }
         // saved_at: track the most recent merge as "this is when our view
         // was last refreshed". Useful for staleness checks.
@@ -718,6 +716,70 @@ mod tests {
 
         // Timestamp is present.
         assert!(loaded.saved_at > 0);
+    }
+
+    /// The shape `PersistedState` had while it still carried a broadcast
+    /// config version, reduced to the two fields that decide compatibility.
+    ///
+    /// Standing in for an older binary reading a snapshot this build wrote.
+    /// It needs no `deny_unknown_fields` to be a fair stand-in, because the
+    /// real struct never had one either; the fields it does not name are the
+    /// ones both builds agree on.
+    #[derive(Debug, Deserialize)]
+    struct LegacySnapshot {
+        /// The removed field. `Option`, so serde's `missing_field` handling
+        /// resolves an absent key to `None` rather than an error.
+        config_version: Option<serde_json::Value>,
+        saved_at: u64,
+    }
+
+    #[test]
+    fn snapshot_tolerates_an_unknown_key_from_another_build() {
+        // Both directions of removing `config_version`, because a rolling
+        // restart runs both at once.
+        //
+        // Forward: a snapshot written before the removal still loads. This
+        // works only because `PersistedState` carries no
+        // `deny_unknown_fields`; someone adding one later would break every
+        // in-flight snapshot at once, and this is the test that says so.
+        let mut legacy = serde_json::to_value(make_state()).expect("encode snapshot");
+        legacy
+            .as_object_mut()
+            .expect("a snapshot encodes as a JSON object")
+            .insert(
+                "config_version".to_string(),
+                serde_json::json!({
+                    "version": 3,
+                    "hash": "sha256:abc",
+                    "updated_by": "node-a",
+                    "timestamp": 1_000,
+                }),
+            );
+        let bytes = serde_json::to_vec(&legacy).expect("encode legacy snapshot");
+        let text = String::from_utf8(bytes.clone()).expect("legacy snapshot is UTF-8");
+
+        // `load_from_file` decodes with `from_str` and `load_from_redis` with
+        // `from_slice`, so both paths are checked rather than assumed to
+        // agree.
+        for state in [
+            serde_json::from_str::<PersistedState>(&text).expect("file path decodes"),
+            serde_json::from_slice::<PersistedState>(&bytes).expect("Redis path decodes"),
+        ] {
+            assert_eq!(
+                state.rate_counters["api:/v1"].value(),
+                42,
+                "the fields both builds share must survive the unknown key",
+            );
+            assert!(state.blocked_ips.contains("10.0.0.1"));
+        }
+
+        // Backward: this build's snapshot loads into the older shape. The key
+        // is simply gone, and the older `Option` field reads `None`.
+        let current = serde_json::to_vec(&make_state()).expect("encode current snapshot");
+        let as_legacy: LegacySnapshot =
+            serde_json::from_slice(&current).expect("an older binary decodes this snapshot");
+        assert!(as_legacy.config_version.is_none());
+        assert!(as_legacy.saved_at > 0);
     }
 
     #[test]

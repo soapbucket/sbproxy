@@ -96,6 +96,17 @@
 //! document. An `${VAR}` the authority cannot resolve is warned about
 //! rather than refused for the same reason: it may well resolve on the
 //! subscriber, and if it does not, the subscriber refuses it there.
+//!
+//! # Announcing a publication to a cluster
+//!
+//! A successful publication also announces `{revision, digest, authority_id}`
+//! into typed cluster state, so a subscriber that is a mesh member pulls in
+//! seconds instead of waiting out its poll interval. See
+//! [`crate::config_gossip`]. It is an accelerator on top of a mechanism that
+//! is already complete: the conditional GET above is what every subscriber
+//! relies on, mesh member or not, and an announcement that never lands costs
+//! propagation speed and nothing else. Nothing about a publication's success
+//! depends on it.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -521,6 +532,23 @@ impl ConfigAuthority {
             content_digest = %outcome.content_digest,
             mode = %format_mode(mode),
             "config authority published a new revision",
+        );
+        // Tell the cluster, if this node is in one. Deliberately after the
+        // commit and after the swap: the announcement says "this revision is
+        // being served", and saying it before that were true would have a
+        // peer fetch a revision this authority might still fail to store. A
+        // failure here is counted and logged, never returned, because the
+        // revision is live either way and subscribers converge on their poll
+        // interval without any of this.
+        let announced = crate::config_gossip::announce_revision(
+            self.authority_id.as_str(),
+            revision,
+            outcome.content_digest.as_str(),
+        );
+        tracing::debug!(
+            revision,
+            announced = announced.as_str(),
+            "config revision announcement outcome",
         );
         Ok(outcome)
     }

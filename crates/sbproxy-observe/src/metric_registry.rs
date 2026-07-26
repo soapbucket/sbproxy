@@ -1384,6 +1384,18 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_config_authority_announce_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_config_authority_announce"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["result"],
+        description:
+            "Config revision announcements published to the cluster, by result.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_config_bundle_age_seconds",
         kind: MetricKind::Gauge,
         writer: Writer::Recorder("set_config_bundle_age_seconds"),
@@ -1426,6 +1438,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["result"],
         description: "Config bundle fetch cycles, by result.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_config_bundle_gossip_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_config_bundle_gossip"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["outcome"],
+        description: "Cluster config-revision announcement probes, by outcome.",
         dead_reason: None,
     },
     MetricCapability {
