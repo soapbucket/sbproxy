@@ -19,6 +19,10 @@ x-sbproxy-env: &sbproxy-env
   SBPROXY_KEY_MASTER: demo-cluster-master-change-me
   OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-not-set}
   SB_LOG_LEVEL: info
+  # Export this before `docker compose up`. Both replicas bind the admin
+  # surface wide for Docker networking, so a guessable password here is
+  # the admin API handed to anything on the bridge network.
+  SB_ADMIN_PASSWORD: ${SB_ADMIN_PASSWORD:-change-this-before-running}
   # Per-replica mesh identity (SB_NODE_ID, SB_ADVERTISE, SB_SEED) is set on each
   # service below; the shared sb.yml reads it from the environment.
 

@@ -35,6 +35,7 @@ You do not need Docker to try the feature. Point one binary at the single-node
 example:
 
 ```bash
+export SB_ADMIN_PASSWORD=pick-something-real
 export SBPROXY_KEY_PEPPER=dev-pepper SBPROXY_KEY_MASTER=dev-master OPENAI_API_KEY=sk-...
 make run CONFIG=examples/ai-dynamic-keys/sb.yml
 ```
@@ -43,6 +44,7 @@ make run CONFIG=examples/ai-dynamic-keys/sb.yml
 
 ```bash
 cd examples/ai-dynamic-keys-cluster
+export SB_ADMIN_PASSWORD=pick-something-real
 export OPENAI_API_KEY=sk-...        # only needed for live upstream calls
 docker compose up --build
 ```
@@ -55,7 +57,7 @@ on `:8082`, admin on `:9092`).
 Mint a key on `sb1`:
 
 ```bash
-TOKEN=$(curl -s -u admin:admin -X POST http://127.0.0.1:9091/admin/keys \
+TOKEN=$(curl -s -u "admin:$SB_ADMIN_PASSWORD" -X POST http://127.0.0.1:9091/admin/keys \
   -H 'Content-Type: application/json' \
   -d '{"name":"fleet-key","max_requests_per_minute":600}' | jq -r .token)
 echo "$TOKEN"
@@ -76,8 +78,8 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8082/v1/chat/completio
 Revoke it on `sb1`:
 
 ```bash
-KEY_ID=$(curl -s -u admin:admin http://127.0.0.1:9091/admin/keys | jq -r '.keys[0].key_id')
-curl -s -u admin:admin -X POST http://127.0.0.1:9091/admin/keys/$KEY_ID/revoke
+KEY_ID=$(curl -s -u "admin:$SB_ADMIN_PASSWORD" http://127.0.0.1:9091/admin/keys | jq -r '.keys[0].key_id')
+curl -s -u "admin:$SB_ADMIN_PASSWORD" -X POST http://127.0.0.1:9091/admin/keys/$KEY_ID/revoke
 ```
 
 The next request on `sb2` is denied. The revoke updated the record in Redis and
