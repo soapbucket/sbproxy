@@ -3885,6 +3885,46 @@ pub const SENSITIVE_HEADER_DENYLIST: &[&str] = &[
     "x-sb-api",
 ];
 
+/// Extra header names excluded from `*` and glob capture, on top of
+/// [`SENSITIVE_HEADER_DENYLIST`].
+///
+/// Holds whatever `key_management.inbound.headers` names, set at load and on
+/// every reload. Without it an operator who sweeps a custom header would have
+/// that header captured by a `capture_headers: ["*"]` glob, and the value it
+/// carries is a live minted key.
+static EXTRA_SENSITIVE_HEADERS: std::sync::OnceLock<
+    std::sync::RwLock<std::sync::Arc<Vec<String>>>,
+> = std::sync::OnceLock::new();
+
+fn extra_sensitive_slot() -> &'static std::sync::RwLock<std::sync::Arc<Vec<String>>> {
+    EXTRA_SENSITIVE_HEADERS.get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(Vec::new())))
+}
+
+/// Replace the operator-configured set of key-bearing headers that globs must
+/// never capture. Pass [`KeyInboundConfig::header_names`].
+pub fn set_extra_sensitive_headers(names: Vec<String>) {
+    let lowered: Vec<String> = names
+        .into_iter()
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if let Ok(mut slot) = extra_sensitive_slot().write() {
+        *slot = std::sync::Arc::new(lowered);
+    }
+}
+
+/// Whether `header_name` is sensitive: on the built-in denylist, or named by
+/// the operator's inbound key sweep.
+pub fn is_sensitive_header(header_name: &str) -> bool {
+    if SENSITIVE_HEADER_DENYLIST.contains(&header_name) {
+        return true;
+    }
+    extra_sensitive_slot()
+        .read()
+        .map(|slot| slot.iter().any(|n| n == header_name))
+        .unwrap_or(false)
+}
+
 /// Compiled allowlist suitable for the request hot path. Built once
 /// per config-reload from a [`CaptureHeadersConfig`] list.
 #[derive(Debug, Clone, Default)]
@@ -3918,7 +3958,7 @@ impl CompiledHeaderAllowlist {
                 compiled.prefixes.push(prefix.to_string());
                 continue;
             }
-            if SENSITIVE_HEADER_DENYLIST.contains(&entry.as_str()) {
+            if is_sensitive_header(&entry) {
                 warnings.push(entry.clone());
             }
             compiled.exact.insert(entry);
@@ -3938,7 +3978,7 @@ impl CompiledHeaderAllowlist {
         if self.exact.contains(header_name) {
             return true;
         }
-        let denied = SENSITIVE_HEADER_DENYLIST.contains(&header_name);
+        let denied = is_sensitive_header(header_name);
         if denied {
             return false;
         }
@@ -8630,6 +8670,43 @@ mod inbound_key_header_tests {
                 "{} must be excluded from capture globs",
                 entry.name
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod sweep_header_capture_tests {
+    use super::*;
+
+    #[test]
+    fn a_configured_sweep_header_is_excluded_from_a_wildcard_glob() {
+        // Same trap as the log redactor: a custom name is on no static list,
+        // so `capture_headers: ["*"]` would capture a live minted key.
+        let (compiled, _) = CompiledHeaderAllowlist::compile(&["*".to_string()]);
+
+        set_extra_sensitive_headers(Vec::new());
+        assert!(
+            compiled.matches("x-tool-auth"),
+            "precondition: a wildcard captures it when nothing marks it sensitive"
+        );
+
+        set_extra_sensitive_headers(vec!["x-tool-auth".to_string()]);
+        assert!(!compiled.matches("x-tool-auth"));
+
+        // An exact listing still wins, which is the documented opt-in.
+        let (exact, warnings) = CompiledHeaderAllowlist::compile(&["x-tool-auth".to_string()]);
+        assert!(exact.matches("x-tool-auth"));
+        assert_eq!(warnings, vec!["x-tool-auth".to_string()]);
+
+        set_extra_sensitive_headers(Vec::new());
+    }
+
+    #[test]
+    fn the_builtin_denylist_still_applies_with_no_extras_configured() {
+        set_extra_sensitive_headers(Vec::new());
+        let (compiled, _) = CompiledHeaderAllowlist::compile(&["*".to_string()]);
+        for name in SENSITIVE_HEADER_DENYLIST {
+            assert!(!compiled.matches(name), "{name} must stay excluded");
         }
     }
 }

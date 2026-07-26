@@ -732,6 +732,52 @@ fn apply_op_regex_patterns_with(
     out.into_owned()
 }
 
+/// Header names the inbound minted-key sweep reads, lowercased.
+///
+/// Fed from `key_management.inbound.headers` at load and on every reload
+/// rather than hardcoded, because an operator who configures a custom header
+/// would otherwise get no redaction at all: a name like `x-tool-auth` matches
+/// none of the `-key` / `-secret` / `-token` suffix rules below, and their live
+/// key would reach the access log in plaintext. Making the redactor follow the
+/// configuration means adding a sweep header cannot silently open that hole.
+static SWEPT_HEADERS: OnceLock<std::sync::RwLock<std::sync::Arc<Vec<String>>>> = OnceLock::new();
+
+fn swept_headers_slot() -> &'static std::sync::RwLock<std::sync::Arc<Vec<String>>> {
+    SWEPT_HEADERS.get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(Vec::new())))
+}
+
+/// Replace the set of header names treated as key-bearing for redaction.
+///
+/// Call on config load and on every reload with
+/// `KeyInboundConfig::header_names()`. Names are lowercased by the caller;
+/// this lowercases again so a hand-built list cannot slip through uncased.
+pub fn set_swept_header_names(names: Vec<String>) {
+    let lowered: Vec<String> = names
+        .into_iter()
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if let Ok(mut slot) = swept_headers_slot().write() {
+        *slot = std::sync::Arc::new(lowered);
+    }
+}
+
+/// The currently configured sweep header names, for diagnostics and tests.
+pub fn swept_header_names() -> std::sync::Arc<Vec<String>> {
+    swept_headers_slot()
+        .read()
+        .map(|slot| slot.clone())
+        .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()))
+}
+
+/// Whether `k` is a header the sweep reads, and therefore carries a live key.
+fn is_swept_header(k: &str) -> bool {
+    swept_headers_slot()
+        .read()
+        .map(|slot| slot.iter().any(|n| n == k))
+        .unwrap_or(false)
+}
+
 /// Recursively walk a JSON value and redact any field whose key is on
 /// the denylist. Replacements use the typed `[REDACTED:FOO]` marker
 /// (schema v2).
@@ -827,6 +873,9 @@ fn match_denylist(key: &str, sink: Sink, extra_fields: &[String]) -> Option<&'st
     // normalisation pass that the JSON renderer would do.
     if k == "api_key"
         || k == "x-api-key"
+        // Any header the operator configured the key sweep to read carries a
+        // live token by definition, whatever it happens to be called.
+        || is_swept_header(&k)
         || k.ends_with("_secret")
         || k.ends_with("_token")
         || k.ends_with("_key")
@@ -1531,6 +1580,44 @@ mod tests {
     }
 
     // --- Redaction ---
+
+    #[test]
+    fn the_default_sidecar_header_is_redacted() {
+        set_swept_header_names(vec!["x-sb-api".to_string()]);
+        let mut value = serde_json::json!({"x-sb-api": "sbp_secret_value"});
+        redact_value(&mut value, Sink::AccessLog, &[]);
+        assert_eq!(value["x-sb-api"], "[REDACTED:API_KEY]");
+        set_swept_header_names(Vec::new());
+    }
+
+    #[test]
+    fn a_custom_sweep_header_is_redacted_without_editing_any_denylist() {
+        // The trap this closes. `x-tool-auth` ends in none of -key, -secret or
+        // -token, so before the sweep list drove redaction an operator who
+        // configured it got their live key written to the access log.
+        let mut before = serde_json::json!({"x-tool-auth": "sbp_secret_value"});
+        redact_value(&mut before, Sink::AccessLog, &[]);
+        assert_eq!(
+            before["x-tool-auth"], "sbp_secret_value",
+            "precondition: nothing else redacts this name"
+        );
+
+        set_swept_header_names(vec!["x-tool-auth".to_string()]);
+        let mut after = serde_json::json!({"x-tool-auth": "sbp_secret_value"});
+        redact_value(&mut after, Sink::AccessLog, &[]);
+        assert_eq!(after["x-tool-auth"], "[REDACTED:API_KEY]");
+        set_swept_header_names(Vec::new());
+    }
+
+    #[test]
+    fn sweep_header_names_are_matched_case_insensitively() {
+        set_swept_header_names(vec!["  X-Tool-Auth ".to_string()]);
+        assert_eq!(*swept_header_names(), vec!["x-tool-auth".to_string()]);
+        let mut value = serde_json::json!({"x-tool-auth": "sbp_secret_value"});
+        redact_value(&mut value, Sink::AccessLog, &[]);
+        assert_eq!(value["x-tool-auth"], "[REDACTED:API_KEY]");
+        set_swept_header_names(Vec::new());
+    }
 
     #[test]
     fn redaction_replaces_authorization_header() {

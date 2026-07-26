@@ -372,9 +372,10 @@ fn validate_credential_binding(
     // record, resolves the key without a binding, and dispatches on the
     // origin's shared credential. Refuse to create such a record until every
     // node has declared it understands the field.
-    match crate::key_capability::check_fleet_capability(
-        crate::key_capability::CAP_CREDENTIAL_BINDING,
-    ) {
+    match block_on_keystore(async {
+        crate::key_capability::check_fleet_capability(crate::key_capability::CAP_CREDENTIAL_BINDING)
+            .await
+    }) {
         crate::key_capability::FleetCapability::Satisfied => {}
         crate::key_capability::FleetCapability::Missing(nodes) => {
             return Err(conflict(&format!(

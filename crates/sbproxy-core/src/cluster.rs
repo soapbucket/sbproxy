@@ -1563,6 +1563,28 @@ fn start_cluster_metrics(handle: &ClusterHandle) {
         sbproxy_mesh::cluster_metrics::ClusterMetrics::new(),
     ));
     cluster_runtime().spawn(crate::cluster_metrics::run_loop(handle.clone(), 15));
+    cluster_runtime().spawn(run_capability_announcer());
+}
+
+/// Republish this node's capability set for as long as the process lives.
+///
+/// The gate that guards credential bindings reads one of these per member and
+/// treats a member with no record as a node that cannot honour the field. A
+/// node therefore has to keep saying so: if this loop stops, the record expires
+/// and the fleet correctly starts refusing new bindings rather than assuming
+/// the node is still fine.
+///
+/// The generation is a monotonic tick rather than a timestamp, because cluster
+/// state fences on generation and a clock that moves backwards would make a
+/// republish look stale.
+async fn run_capability_announcer() {
+    let period = crate::key_capability::CAPABILITY_TTL / 2;
+    let mut generation: u64 = 0;
+    loop {
+        generation = generation.saturating_add(1);
+        crate::key_capability::announce_local_capabilities(generation).await;
+        tokio::time::sleep(period).await;
+    }
 }
 
 /// Start the cross-node governance-counter dissemination loop, once, for a
