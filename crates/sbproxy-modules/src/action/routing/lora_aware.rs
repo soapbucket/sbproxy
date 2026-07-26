@@ -4,7 +4,7 @@
 //! adapter loaded in memory, avoiding the cold-load penalty paid when a
 //! new adapter has to be paged onto a fresh GPU. Falls back to `None`
 //! when no upstream advertises the adapter so the configured
-//! `lb_method` still gets to pick.
+//! `algorithm` still gets to pick.
 //!
 //! # Metadata contract
 //!
@@ -21,10 +21,10 @@
 //! so a misconfigured upstream cannot poison routing for the rest of
 //! the pool.
 //!
-//! Populating this metadata is operator work and is intentionally
-//! out of scope for this PR. The Fail-6 GPU-aware sibling card will
-//! productionise the live telemetry feed; until then, configs can hard
-//! code the inventory under each target's `metadata:` block.
+//! The production load-balancer action copies static target metadata
+//! from config into this projection. SBproxy does not poll upstreams
+//! for adapter inventories. Operators can generate this metadata from
+//! their source of truth and update it through config hot reload.
 //!
 //! # Fall-back semantics
 //!
@@ -32,7 +32,7 @@
 //! hands control back to the caller. If fewer than that many healthy
 //! targets advertise the adapter,
 //! [`select`](RoutingStrategy::select) returns `None` and the load
-//! balancer's configured `lb_method` runs. The default is `1`: route to
+//! balancer's configured `algorithm` runs. The default is `1`: route to
 //! a warm target whenever one exists, fall through otherwise. Operators
 //! that want a stronger signal (e.g. only engage when at least two warm
 //! replicas are available, so a single slow target cannot be
@@ -81,7 +81,7 @@ pub struct LoraAwareStrategy {
     /// Minimum number of healthy targets that must advertise the
     /// adapter before the strategy will commit to one. Anything below
     /// this returns `None` and falls through to the configured
-    /// `lb_method`.
+    /// `algorithm`.
     fallback_below: usize,
 }
 
@@ -128,7 +128,7 @@ impl LoraAwareStrategy {
 impl RoutingStrategy for LoraAwareStrategy {
     fn select(&self, request: &RoutingRequest, targets: &[TargetState]) -> Option<usize> {
         // No adapter on the request means there is no LoRA signal to
-        // route on; defer to the configured lb_method.
+        // route on; defer to the configured algorithm.
         let adapter = request.adapter.as_deref()?;
 
         // Walk the targets once, collecting (slice index, active conns)
@@ -381,7 +381,7 @@ mod tests {
     fn from_config_honours_fallback_below() {
         // fallback_below = 2 means: only fire when at least two warm
         // targets are available. A single warm target falls through
-        // to the lb_method.
+        // to the configured algorithm.
         let strat_arc = LoraAwareStrategy::from_config(&serde_json::json!({
             "fallback_below": 2,
         }))

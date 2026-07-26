@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-25*
+*Last modified: 2026-07-26*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -1061,6 +1061,9 @@ origins:
 |-------|------|---------|-------------|
 | `targets` | list | required | Backend targets. |
 | `algorithm` | string \| object | `round_robin` | Routing algorithm (see below). |
+| `strategy` | string | unset | Registered routing strategy name. The compiled strategy runs before `algorithm`; unknown names fail config compilation. See [Routing strategies](routing-strategies.md). |
+| `strategy_config` | object | `{}` | Strategy-specific settings. Must be an object. |
+| `lb_method` | string | unset | Compatibility marker for plugin routing. `plugin` requires `strategy`; `algorithm` remains the fallback. |
 | `sticky` | object | | Sticky-session config: `cookie_name` (default `sb_sticky`), `ttl` seconds. |
 | `deployment_mode` | object | `{mode: normal}` | Deployment mode. See below. |
 | `outlier_detection` | object | unset | Passive ejection policy. See [Outlier detection](#outlier-detection). |
@@ -1077,6 +1080,12 @@ Algorithms:
 | `header_hash` | Hash a named request header. Configured as `algorithm: { header_hash: { header: X-User } }`. |
 | `cookie_hash` | Hash a named cookie. Configured as `algorithm: { cookie_hash: { cookie: sid } }`. |
 
+When `strategy` is set, deployment, backup, priority, health, circuit-breaker, and outlier filters run first. The registered strategy receives only eligible targets. Returning no selection falls through to `algorithm`.
+
+The production registry includes `first-healthy`, `lora`, `lora-aware`, `gpu-aware`, and `bandit`. `lora-aware` reads the adapter from `X-LoRA-Adapter` or `?adapter=` and matches it against `targets[].metadata.loaded_adapters`. `gpu-aware` selects the lowest valid numeric `targets[].metadata.gpu_utilization` in `[0.0, 1.0]`; it does not poll GPUs. `bandit` records real success and latency outcomes, with successful reward `1 / (1 + latency_seconds)` and failure reward `0`; it does not fabricate cost data. Empty request hints and hints over 256 bytes are ignored.
+
+Bandit learning survives a compatible hot reload in the same process when the origin, strategy name, and ordered target URLs remain unchanged. A process restart resets it. State is bounded to 256 retained namespaces and 256 target arms per namespace. See [Routing strategies](routing-strategies.md) for configuration and fallback details.
+
 Target fields:
 
 | Field | Type | Default | Description |
@@ -1087,6 +1096,7 @@ Target fields:
 | `group` | string | | Deployment group label (`blue`, `green`, `canary`). |
 | `priority` | int | 5 | Routing priority (1 = highest, 10 = lowest). Read from `X-Priority` header when not set here. |
 | `zone` | string | | Availability zone or region label for locality-aware routing. |
+| `metadata` | object | `{}` | Strategy-specific JSON signals such as `loaded_adapters` or `gpu_utilization`. Limited to 64 entries per target and 64 bytes per key. |
 | `health_check` | object | | Active health-check probe config. See [Active health checks](#active-health-checks). |
 | `host_override` | string | unset | Override the upstream `Host` for this target. Default is the target URL's hostname. |
 | `disable_*_header` | bool | false | Same per-header opt-outs as on `proxy` actions; see [Forwarding headers](#trusted-proxies-and-forwarding-headers). |

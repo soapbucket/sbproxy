@@ -1,19 +1,15 @@
 //! Pluggable routing strategy trait + plugin registry.
 //!
-//! This is the OSS scaffold for [Fail-6](../../../../docs/roadmap.md):
-//! third-party crates (think the enterprise team's LoRA-aware,
-//! GPU-aware, and contextual-bandit routers) implement
-//! [`RoutingStrategy`] and register a factory via
-//! [`inventory::submit!`]. The proxy discovers them at link time,
-//! exactly like the auth-plugin registry in `sbproxy-plugin::registry`.
+//! Third-party crates implement [`RoutingStrategy`] and register a
+//! factory via [`inventory::submit!`]. The proxy discovers them at
+//! link time, exactly like the auth-plugin registry in
+//! `sbproxy-plugin::registry`.
 //!
-//! The trait runs *alongside* the existing built-in load-balancer
-//! algorithms (`round_robin`, `weighted`, `least_connections`,
-//! `consistent_hash`, ...). Those algorithms are not behind this trait
-//! and are not changed by the introduction of this module. A future
-//! follow-up will route through the trait first, fall back to the
-//! configured `lb_method` when [`RoutingStrategy::select`] returns
-//! `None`, and migrate the built-ins to live behind the trait.
+//! A production `load_balancer` action with `strategy` compiles the
+//! registered implementation once and invokes it before the configured
+//! `algorithm`. When [`RoutingStrategy::select`] returns `None`, the
+//! action falls back to that algorithm. The standard algorithms remain
+//! separate from this trait.
 //!
 //! # Why a hot-path trait
 //!
@@ -193,7 +189,7 @@ pub struct RoutingOutcome {
 ///   slice mean the strategy can be a pure function over its own
 ///   accumulated state.
 /// - **Returning `None`** signals "fall through to the configured
-///   `lb_method`". Strategies that always have an opinion can return
+///   `algorithm`". Strategies that always have an opinion can return
 ///   `Some(0)` as a degenerate fall-back rather than `None`.
 pub trait RoutingStrategy: Send + Sync {
     /// Pick a target for this request.
@@ -274,13 +270,14 @@ pub fn list_routing_strategies() -> Vec<&'static str> {
 /// Reference [`RoutingStrategy`] implementation that picks the
 /// lowest-index healthy target.
 ///
-/// This is **for documentation and tests only**. Production-grade
-/// adapters ship in this same module: [`BanditStrategy`] for
+/// This is the shipped `first-healthy` strategy and also serves as the
+/// minimal registry example. Other production strategies in this module
+/// include [`BanditStrategy`] for
 /// epsilon-greedy multi-armed bandit routing, [`GpuAwareStrategy`]
 /// for telemetry-driven GPU-utilisation routing, and [`LoraStrategy`]
-/// plus [`LoraAwareStrategy`] for LoRA-adapter affinity. The existing
-/// `lb_method: round_robin` and `least_connections` algorithms remain
-/// the right defaults when no specialised signal is available.
+/// plus [`LoraAwareStrategy`] for LoRA-adapter affinity. Configured
+/// algorithms such as `round_robin` and `least_connections` remain the
+/// fallback when no specialised signal is available.
 pub struct AlwaysFirstHealthyStrategy;
 
 impl RoutingStrategy for AlwaysFirstHealthyStrategy {

@@ -35,7 +35,7 @@
 //! # Fall-back semantics
 //!
 //! Returns `None` when no healthy target exists, so the caller falls
-//! through to the configured `lb_method`. Otherwise always returns
+//! through to the configured `algorithm`. Otherwise always returns
 //! `Some`.
 
 use std::collections::{HashMap, VecDeque};
@@ -234,7 +234,7 @@ impl BanditStrategy {
 impl RoutingStrategy for BanditStrategy {
     fn select(&self, _request: &RoutingRequest, targets: &[TargetState]) -> Option<usize> {
         // Build the healthy candidate list. No healthy target means we
-        // fall through to the configured lb_method.
+        // fall through to the configured algorithm.
         let healthy: Vec<usize> = targets
             .iter()
             .enumerate()

@@ -140,6 +140,11 @@ path = "tests/rate_limit_budget.rs"
 name = "model_cluster_dispatch"
 path = "tests/model_cluster_dispatch.rs"
 
+# WOR-1980: real-network acceptance proof for compiled routing strategies.
+[[test]]
+name = "routing_registry"
+path = "tests/routing_registry.rs"
+
 [build-dependencies]
 # Compiles the in-tree `proto/echo.proto` for the gRPC e2e test. Kept
 # pinned to the same major as `tonic` above.
