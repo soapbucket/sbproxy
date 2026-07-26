@@ -535,6 +535,19 @@ fn a_deny_listed_path_is_rejected_at_publish() {
             ),
             Err(error) => error,
         };
+        if *path == "source" {
+            // `source` is the one deny-listed path that is legitimate in a
+            // *submitted* payload: that is how a git-backed authority points
+            // at the repository it publishes from. The deny-list applies to
+            // the *resolved* document, so this submission is read as a
+            // pointer and refused for being a malformed one rather than for
+            // naming a denied path. Refusal either way, but for the accurate
+            // reason. The resolved-document case is covered by
+            // `an_authority_bundle_carrying_source_is_rejected` in
+            // sbproxy-config's config_source_git tests.
+            assert_eq!(error.code(), "invalid_payload", "{path}: {error}");
+            continue;
+        }
         assert_eq!(error.code(), "denied_path", "{path}: {error}");
         assert!(error.to_string().contains(path), "{path}: {error}");
     }

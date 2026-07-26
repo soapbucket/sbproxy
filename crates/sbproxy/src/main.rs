@@ -222,6 +222,12 @@ struct ValidateArgs {
     /// emits a single structured object for CI consumption.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+    /// Do not resolve a `source:` block. Validates the pointer file
+    /// alone, which is what you want on a machine with no network or no
+    /// credential for the repository, and a lie about a git-sourced
+    /// config anywhere else.
+    #[arg(long = "no-fetch")]
+    no_fetch: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -229,6 +235,11 @@ struct PlanArgs {
     /// Proposed config file. Required.
     #[arg(short = 'f', long = "config")]
     config: Option<PathBuf>,
+    /// Do not resolve a `source:` block on either side of the diff.
+    /// Without it, a git-sourced config is planned against the document
+    /// the repository actually serves.
+    #[arg(long = "no-fetch")]
+    no_fetch: bool,
     /// Baseline config file. Default: empty baseline (every origin
     /// in the proposed config surfaces as `added`).
     #[arg(long = "against")]
@@ -991,6 +1002,7 @@ fn main() {
         let args = ValidateArgs {
             config_path: path,
             format: OutputFormat::Text,
+            no_fetch: false,
         };
         run_subcommand("validate", 2, handle_validate_subcommand(&args));
     }
@@ -1732,6 +1744,11 @@ fn handle_validate_subcommand(args: &ValidateArgs) -> anyhow::Result<i32> {
     let outcome = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read config '{path_str}': {e}"))
         .and_then(|yaml| {
+            // Validate what would actually boot. A `source:` block means
+            // the file on disk is a pointer, and compiling the pointer
+            // would report a config valid without ever looking at the
+            // document that serves traffic.
+            let yaml = resolve_source_for_cli(&yaml, args.no_fetch, &path_str)?;
             let compiled = sbproxy_config::compile_config(&yaml)
                 .map_err(|e| anyhow::anyhow!("config '{path_str}' did not compile:\n{e:#}"))?;
             let pipeline =
@@ -1777,6 +1794,35 @@ fn handle_validate_subcommand(args: &ValidateArgs) -> anyhow::Result<i32> {
             Ok(2)
         }
     }
+}
+
+/// Resolve a `source:` block for a CLI subcommand that is about to
+/// validate or diff a config document.
+///
+/// With `--no-fetch`, the pointer file stands and a remote source is
+/// reported on stderr rather than silently ignored. Silence is what the
+/// old behaviour was, and it is why `validate` used to pass on a config
+/// whose real content nobody had looked at.
+///
+/// # Errors
+///
+/// Returns an error when the `source:` block is malformed or cannot be
+/// resolved.
+fn resolve_source_for_cli(yaml: &str, no_fetch: bool, path_str: &str) -> anyhow::Result<String> {
+    if !no_fetch {
+        return Ok(sbproxy_core::config_source::resolve(yaml)?.text);
+    }
+    let declares_remote_source = sbproxy_config::source::parse_source_head(yaml)
+        .map_err(|e| anyhow::anyhow!("config '{path_str}': {e}"))?
+        .is_some();
+    if declares_remote_source {
+        eprintln!(
+            "note: '{path_str}' declares a `source:` block and --no-fetch was passed, so only \
+             the pointer file was checked. The document this proxy would actually serve was not \
+             looked at."
+        );
+    }
+    Ok(yaml.to_string())
 }
 
 // --- `doctor` handler ---
@@ -5596,9 +5642,25 @@ fn lookup_projection<'a>(
 fn load_and_validate(
     path: &std::path::Path,
 ) -> anyhow::Result<(sbproxy_config::ConfigFile, Option<String>)> {
+    load_and_validate_with(path, false)
+}
+
+/// [`load_and_validate`] with control over whether a `source:` block is
+/// resolved.
+///
+/// `plan` exposes the choice as `--no-fetch`; `apply` always resolves,
+/// because the document it is about to push is the resolved one.
+fn load_and_validate_with(
+    path: &std::path::Path,
+    no_fetch: bool,
+) -> anyhow::Result<(sbproxy_config::ConfigFile, Option<String>)> {
     let path_str = path.to_string_lossy();
     let yaml = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read config '{path_str}': {e}"))?;
+    // Diff and validate the document that would boot, not the pointer at
+    // it. Both sides of a plan go through here, so an `--against`
+    // baseline that is itself git-sourced resolves too.
+    let yaml = resolve_source_for_cli(&yaml, no_fetch, &path_str)?;
     let compiled = sbproxy_config::compile_config(&yaml)
         .map_err(|e| anyhow::anyhow!("config '{path_str}' did not compile:\n{e:#}"))?;
     // WOR-1815: run the boot-time module constructors too, so `plan`
@@ -5651,11 +5713,11 @@ fn load_plan_inputs(
         .config
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("missing -f / --config"))?;
-    let (proposed, construction_error) = load_and_validate(config)?;
+    let (proposed, construction_error) = load_and_validate_with(config, args.no_fetch)?;
     // The baseline is the operator's current state; only the proposed
     // side's construction result gates the plan.
     let baseline = match args.against.as_deref() {
-        Some(p) => load_and_validate(p)?.0,
+        Some(p) => load_and_validate_with(p, args.no_fetch)?.0,
         None => empty_config_file(),
     };
     Ok((baseline, proposed, construction_error))
@@ -7467,6 +7529,7 @@ mod tests {
             } else {
                 OutputFormat::Text
             },
+            no_fetch: false,
         }
     }
 
@@ -7615,6 +7678,7 @@ origins:
         let args = ValidateArgs {
             config_path: None,
             format: OutputFormat::Json,
+            no_fetch: false,
         };
         assert!(handle_validate_subcommand(&args).is_err());
     }
@@ -7658,6 +7722,7 @@ origins:
         let path = temp_config(MINIMAL_VALID);
         let args = PlanArgs {
             config: Some(path.clone()),
+            no_fetch: false,
             against: None,
             format: OutputFormat::Text,
             out: None,
@@ -7666,6 +7731,7 @@ origins:
         // Plan against itself: no changes -> exit 0.
         let args = PlanArgs {
             config: Some(path.clone()),
+            no_fetch: false,
             against: Some(path.clone()),
             format: OutputFormat::Text,
             out: None,
@@ -7678,6 +7744,7 @@ origins:
     fn handle_plan_missing_config_is_usage_error() {
         let args = PlanArgs {
             config: None,
+            no_fetch: false,
             against: None,
             format: OutputFormat::Text,
             out: None,

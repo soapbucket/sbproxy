@@ -410,6 +410,11 @@ pub enum SessionLedgerSinkKind {
 ///   sources, merging each in order. A `db` form is reserved for a
 ///   later iteration but is intentionally not part of this primitive
 ///   yet.
+///
+/// A git source is transport trust: HTTPS plus whatever the git host
+/// authenticated, and nothing more. Pin `revision` to a full commit sha
+/// and set `verify_signature` to close most of that gap; see
+/// [`crate::source`] for the resolution contract.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConfigSource {
@@ -422,13 +427,35 @@ pub enum ConfigSource {
     Git {
         /// Repository URL (https, ssh, or any URL `git clone` accepts).
         repo: String,
-        /// Optional branch, tag, or commit sha. When `None`, the
-        /// default branch is used.
+        /// Optional branch, tag, or full commit sha. When `None`, the
+        /// default branch is used. A full commit sha is a pin: the
+        /// loader verifies the resolved `HEAD` equals it, so a branch
+        /// moving underneath the node cannot be followed silently.
         #[serde(default)]
         revision: Option<String>,
         /// Path inside the repository to the config file, relative
         /// to the repository root.
         path: String,
+        /// Optional credential reference for a private repository, as
+        /// `env:NAME`, `${NAME}`, `file:/path`, or `secret://backend/name`.
+        /// An inline literal is refused: a token in a config file is a
+        /// token in every copy of that file.
+        #[serde(default)]
+        credential: Option<String>,
+        /// Require a valid signature on the resolved tag or commit.
+        /// Off by default, because most repositories are not signed.
+        #[serde(default)]
+        verify_signature: bool,
+        /// Hard timeout for one fetch, in seconds. The child `git`
+        /// process is killed when it expires; a config-load path with
+        /// no timeout hangs startup.
+        #[serde(default = "default_source_timeout_secs")]
+        timeout_secs: u64,
+        /// How often to re-resolve this source while the proxy runs, in
+        /// seconds. `0` disables refresh, so the document is resolved
+        /// once at boot and on every ordinary reload.
+        #[serde(default = "default_source_refresh_secs")]
+        refresh_interval_secs: u64,
     },
     /// Compose a base source with one or more overlays. Each overlay
     /// is merged onto the accumulated result in the order it appears
@@ -441,6 +468,23 @@ pub enum ConfigSource {
         /// recursion cap enforced by the loader).
         overlays: Vec<ConfigSource>,
     },
+}
+
+/// Default hard timeout for one git fetch, in seconds.
+///
+/// Long enough for a shallow clone of a config repository over a slow
+/// link, short enough that a hung remote does not hold boot open.
+fn default_source_timeout_secs() -> u64 {
+    60
+}
+
+/// Default refresh cadence for a git source, in seconds.
+///
+/// A GitOps deployment wants the repository to be the live source of
+/// truth, so refresh is on by default. Set `refresh_interval_secs: 0`
+/// to resolve once at boot instead.
+fn default_source_refresh_secs() -> u64 {
+    60
 }
 
 // --- Agent-class top-level config ---

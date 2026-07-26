@@ -152,6 +152,8 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_config_bundle_gossip_total` | Counter | `stable` | `beta` | `outcome` | Cluster config-revision announcement probes, by outcome. |
 | `sbproxy_config_bundle_revision` | Gauge | `stable` | `beta` | none | Authority revision of the config bundle this node currently serves. |
 | `sbproxy_config_reload_total` | Counter | `stable` | `beta` | `result` | Config reload attempts, by result. |
+| `sbproxy_config_source_fetch_total` | Counter | `stable` | `beta` | `kind`, `result` | Config source resolutions, by source kind and result. |
+| `sbproxy_config_source_revision_info` | Gauge | `stable` | `beta` | `sha` | Commit the config source resolved to; always 1, the commit is the label. |
 | `sbproxy_errors_total` | Counter | `stable` | `beta` | `hostname`, `error_type` | Total errors. |
 | `sbproxy_governance_fail_open_total` | Counter | `stable` | `beta` | `key_id` | Governed admissions that bypassed reservation because the governance backend was unavailable and failure_mode is allow_unreserved. |
 | `sbproxy_grpc_status_total` | Counter | `stable` | `beta` | `code` | Observed gRPC status codes, by canonical name. |

@@ -534,7 +534,16 @@ pub fn hold_config_reload_lock_for_test() -> std::sync::MutexGuard<'static, ()> 
 
 /// The reload transaction body. Callers hold `CONFIG_RELOAD_LOCK`.
 fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Result<ReloadOutcome> {
-    let compiled = sbproxy_config::compile_config(yaml)?;
+    // Honour `source:` before anything else, so the file watcher,
+    // SIGHUP, and `POST /admin/reload` all reload what the source says
+    // rather than the pointer at it. A document with no `source:` block
+    // resolves to itself and does no I/O, which is every reload on a
+    // node whose config is its local file. A document that already came
+    // from a source carries no `source:` key, so an apply driven by the
+    // refresh poller or by the config-authority subscriber does not
+    // re-fetch.
+    let resolved = crate::config_source::resolve(yaml)?;
+    let compiled = sbproxy_config::compile_config(&resolved.text)?;
     if let Some(al) = compiled.access_log.as_ref() {
         log_capture_header_warnings(al);
     }
@@ -1099,6 +1108,29 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // baseline was the merged document would report drift on every scrape
     // forever.
     let initial_content_hash = crate::identity::config_revision(yaml.as_bytes());
+
+    // Honour `source:` first. Resolution order is fixed and documented:
+    // the source produces the base document, then the config-authority
+    // overlay goes on top of it, then it compiles. A file with no
+    // `source:` block resolves to itself and does no I/O, so this is
+    // free on the historical path. A failure here is fatal on purpose: a
+    // node whose configuration lives in a repository it cannot reach has
+    // nothing to serve, and booting on the pointer file would serve an
+    // empty configuration while reporting success.
+    let resolved_source = crate::config_source::resolve(&yaml)?;
+    if resolved_source.is_remote() {
+        // Published before the subscriber is built, because the merge
+        // base a subscriber uses is this document rather than the pointer
+        // file on disk.
+        crate::config_source::publish_resolved_base(crate::config_source::ResolvedBase {
+            yaml: resolved_source.text.clone(),
+            origin: resolved_source.base_origin(),
+            fingerprint: resolved_source.revision_fingerprint(),
+        });
+    }
+    let source_poller =
+        crate::config_source::SourcePoller::from_boot(config_path, &yaml, &resolved_source)?;
+    let yaml = resolved_source.text.clone();
     let compiled = sbproxy_config::compile_config(&yaml)?;
     // Fold a cached config-authority bundle into the boot document before
     // anything downstream reads the compiled config: listener ports, TLS
@@ -1374,6 +1406,13 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // reload never queues up poll cycles behind it. No-op when no
     // authority is configured.
     crate::config_subscriber::spawn(config_subscriber);
+
+    // Start the config-source refresh loop. Same shape as the authority
+    // poller: an interval with jitter, the resolved commit playing the
+    // part an ETag plays, and the non-blocking reload entry point. No-op
+    // when the config has no `source:` block or set
+    // `refresh_interval_secs: 0`.
+    crate::config_source::spawn(source_poller);
 
     // Start the config-authority publisher: load the signing key, open
     // the durable revision store, and bind the bundle listener. Fatal on

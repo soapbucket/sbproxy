@@ -85,6 +85,22 @@
 //! hitting upstreams; publish validates on every call, so it is the
 //! highest-frequency place that leak could be reintroduced.
 //!
+//! # A git-backed authority
+//!
+//! [`crate::config_authority::ConfigAuthority::publish`] resolves a
+//! `source:` block in the payload before it validates or signs anything,
+//! so a customer can keep their configuration in their own repository
+//! and have this authority sign and distribute it. What travels is the
+//! resolved document, never the pointer: signing the pointer would ship
+//! every subscriber a URL to fetch for itself, which is transport trust
+//! rather than the signed guarantee this endpoint promises.
+//!
+//! The resolved document is then screened like any other payload, so a
+//! repository whose configuration declares its own `source:` block is
+//! refused. `source` is on the deny list because the authority overlays
+//! a base document and does not get to choose where that base comes
+//! from.
+//!
 //! # Payload scope
 //!
 //! A published payload is validated as a configuration in its own right,
@@ -493,6 +509,21 @@ impl ConfigAuthority {
         mode: BundleMode,
         now_unix_ms: u64,
     ) -> Result<PublishOutcome, PublishError> {
+        // A git-backed authority: the document handed in may be a
+        // `source:` pointer, and what gets signed and distributed has to
+        // be the document that pointer resolves to. Signing the pointer
+        // would ship every subscriber a repository URL to fetch for
+        // itself, which is a different (and unsigned) trust story than
+        // the one this endpoint promises. A payload with no `source:`
+        // block resolves to itself and does no I/O.
+        let resolved = crate::config_source::resolve(config_yaml)
+            .map_err(|error| PublishError::Invalid(format!("{error:#}")))?;
+        let config_yaml = resolved.text.as_str();
+        // The resolved document is screened like any other payload, so a
+        // repository whose config declares its own `source:` is refused
+        // here rather than shipped to the fleet: `source` is on the deny
+        // list precisely because the authority overlays a base document
+        // and does not get to choose where that base comes from.
         self.validate_payload(config_yaml)?;
 
         // Validation passed, so the number is now safe to spend.

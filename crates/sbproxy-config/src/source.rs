@@ -19,19 +19,46 @@
 //! existing schema, env-var interpolation, and validation pipeline
 //! unchanged.
 //!
+//! ## What a git source proves
+//!
+//! Transport trust and nothing more: HTTPS plus whatever the git host
+//! authenticated the fetch as. There is no signature over the document
+//! and no provenance beyond "the remote served this". That is what every
+//! GitOps tool offers and it is a reasonable place to stand, but it is
+//! not the guarantee a signed config bundle carries. Two settings close
+//! most of the gap and both are the operator's choice:
+//!
+//! * Pin `revision` to a full commit sha. The loader resolves `HEAD`
+//!   after fetching and refuses the document when it does not equal the
+//!   pin, so a branch moving underneath the node cannot be followed.
+//! * Set `verify_signature: true`. The loader then requires a good
+//!   signature on the resolved tag or commit.
+//!
+//! ## The `git` binary is a runtime dependency
+//!
+//! [`crate::source::GitBinaryCloner`] shells out, so every host resolving
+//! a git source needs `git` installed, container images included. A
+//! missing binary is reported as
+//! [`crate::source::ConfigSourceError::MissingGitBinary`], which names the
+//! dependency rather than surfacing a confusing clone error, and
+//! `sbproxy doctor` reports the same thing before anyone boots.
+//!
 //! ## Recursion
 //!
-//! Overlay chains are bounded by [`MAX_RECURSION_DEPTH`]. The cap
+//! Overlay chains are bounded by
+//! [`crate::source::MAX_RECURSION_DEPTH`]. The cap
 //! prevents a malicious or accidental overlay loop from spinning up
 //! unbounded git clones.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_yaml::Value as YamlValue;
 use tempfile::TempDir;
 use thiserror::Error;
 
+use crate::config_merge::BaseOrigin;
 use crate::types::ConfigSource;
 
 /// Hard cap on `GitOverlay` nesting depth. The compiler trades the
@@ -39,10 +66,32 @@ use crate::types::ConfigSource;
 /// upper bound on disk and network use.
 pub const MAX_RECURSION_DEPTH: usize = 8;
 
-/// Errors raised by [`load_from_source`].
+/// Interval between `try_wait` probes while a `git` child runs.
+///
+/// Short enough that the enforced timeout is accurate to a fraction of a
+/// second, long enough that waiting out a one-minute clone costs a
+/// negligible number of syscalls.
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Largest `timeout_secs` a source may ask for.
+///
+/// An hour is far past any legitimate config-repository fetch, and the
+/// cap also keeps the deadline arithmetic away from the point where
+/// adding a `Duration` to an `Instant` overflows.
+const MAX_FETCH_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// Largest number of stderr bytes carried into an error message.
+///
+/// `git` can be verbose on failure and the whole thing ends up in a log
+/// line, so the tail is truncated rather than reproduced in full.
+const MAX_CAPTURED_STDERR: usize = 4 * 1024;
+
+/// Errors raised by [`load_from_source`] and [`resolve_document`].
 ///
 /// Each variant carries a human-readable message; the prefix in the
-/// `Display` impl tells operators which stage of the loader failed.
+/// `Display` impl tells operators which stage of the loader failed. No
+/// variant ever carries a credential: the repository URL is redacted
+/// before it reaches a message, and captured `git` output is scrubbed.
 #[derive(Debug, Error)]
 pub enum ConfigSourceError {
     /// A git clone (or local-fixture clone) failed. The wrapped string
@@ -59,22 +108,203 @@ pub enum ConfigSourceError {
     /// The overlay chain exceeded [`MAX_RECURSION_DEPTH`].
     #[error("source.recursion: max recursion depth exceeded")]
     RecursionLimit,
+    /// The `git` binary is not installed or is not executable. Named
+    /// separately so the message can name the dependency instead of
+    /// reporting a spawn failure nobody can act on.
+    #[error("source.git_missing: {0}")]
+    MissingGitBinary(String),
+    /// The fetch did not finish inside the configured timeout and the
+    /// child process was killed.
+    #[error("source.timeout: {0}")]
+    Timeout(String),
+    /// `revision` pinned a commit sha and the resolved `HEAD` is a
+    /// different commit, so following it would mean serving a document
+    /// the operator did not pin.
+    #[error("source.revision: {0}")]
+    RevisionMismatch(String),
+    /// `verify_signature` was set and the resolved tag or commit has no
+    /// valid signature.
+    #[error("source.signature: {0}")]
+    Signature(String),
+    /// The source block itself is unusable: an empty repo URL, an empty
+    /// path, a path that escapes the repository, or a timeout of zero.
+    #[error("source.invalid: {0}")]
+    Invalid(String),
 }
 
-/// Pluggable git clone surface (test seam).
+impl ConfigSourceError {
+    /// Whether this error means the source could not be reached, as
+    /// opposed to reaching it and refusing what it served.
+    ///
+    /// The refresh poller keeps serving its cached document either way,
+    /// but the two get different metric labels because only one of them
+    /// is the operator's content being wrong.
+    #[must_use]
+    pub const fn is_unreachable(&self) -> bool {
+        matches!(
+            self,
+            Self::Clone(_) | Self::Timeout(_) | Self::MissingGitBinary(_)
+        )
+    }
+
+    /// Stable `result` label for `sbproxy_config_source_fetch_total`.
+    #[must_use]
+    pub const fn metric_label(&self) -> &'static str {
+        match self {
+            Self::Clone(_) | Self::MissingGitBinary(_) => "unreachable",
+            Self::Timeout(_) => "timeout",
+            Self::RevisionMismatch(_) => "revision_mismatch",
+            Self::Signature(_) => "verify_failed",
+            Self::Read(_) | Self::Merge(_) | Self::RecursionLimit | Self::Invalid(_) => "invalid",
+        }
+    }
+}
+
+/// One resolved git revision: what was asked for and what it turned
+/// out to be.
+///
+/// The commit plays the part an `ETag` plays for a signed bundle. An
+/// unchanged commit means the document cannot have changed, so the
+/// refresh path skips the recompile and the reload entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRevision {
+    /// Repository the document was read from, with any credential
+    /// already removed.
+    pub repo: String,
+    /// Branch, tag, or sha that was requested. `HEAD` when the source
+    /// named no revision.
+    pub reference: String,
+    /// Commit the reference resolved to.
+    pub commit: String,
+}
+
+/// A resolved config document plus where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDocument {
+    /// The config text, ready for [`crate::compile_config`].
+    pub text: String,
+    /// The git revisions this document was assembled from, in
+    /// resolution order. Empty for a purely local source.
+    pub revisions: Vec<ResolvedRevision>,
+}
+
+impl ResolvedDocument {
+    /// A local document: the inline file stands as written.
+    #[must_use]
+    pub fn local(text: String) -> Self {
+        Self {
+            text,
+            revisions: Vec::new(),
+        }
+    }
+
+    /// Whether any part of this document came from git.
+    #[must_use]
+    pub fn is_remote(&self) -> bool {
+        !self.revisions.is_empty()
+    }
+
+    /// The provenance tag [`crate::merge_config`] should record for
+    /// leaves this document contributes.
+    ///
+    /// The first resolved revision is the base of the chain, which is
+    /// the one an operator asking "which repository is this from?"
+    /// means.
+    #[must_use]
+    pub fn base_origin(&self) -> BaseOrigin {
+        match self.revisions.first() {
+            None => BaseOrigin::Local,
+            Some(revision) => BaseOrigin::Git {
+                repo: revision.repo.clone(),
+                reference: revision.reference.clone(),
+                commit: revision.commit.clone(),
+            },
+        }
+    }
+
+    /// Identity of this resolution for change detection: every resolved
+    /// commit, in order.
+    ///
+    /// Two resolutions with the same fingerprint resolved the same
+    /// content, so the refresh path can skip the compile and the reload.
+    #[must_use]
+    pub fn revision_fingerprint(&self) -> String {
+        self.revisions
+            .iter()
+            .map(|revision| revision.commit.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// The commit to publish on `sbproxy_config_source_revision_info`,
+    /// which is the base of the chain.
+    #[must_use]
+    pub fn head_commit(&self) -> Option<&str> {
+        self.revisions
+            .first()
+            .map(|revision| revision.commit.as_str())
+    }
+}
+
+/// One fetch the loader asks a [`Cloner`] to perform.
+///
+/// `Debug` is implemented by hand rather than derived: `repo` carries the
+/// interpolated credential, and a derived `Debug` would put it in a log
+/// line the first time anyone added one.
+pub struct FetchRequest<'a> {
+    /// Repository URL, with the credential already interpolated when
+    /// one was supplied. Never logged; use [`redact_repo`] first.
+    pub repo: &'a str,
+    /// Branch, tag, or full commit sha, or `None` for the default
+    /// branch.
+    pub revision: Option<&'a str>,
+    /// Hard timeout for the whole fetch.
+    pub timeout: Duration,
+    /// Whether the resolved tag or commit must carry a valid signature.
+    pub verify_signature: bool,
+    /// Empty directory the working tree is materialised into.
+    pub dest: &'a Path,
+    /// Writable directory outside `dest` for captured child output.
+    ///
+    /// Separate from `dest` because `git clone` refuses a destination
+    /// that already has files in it, and a log file is a file.
+    pub scratch: &'a Path,
+}
+
+impl std::fmt::Debug for FetchRequest<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FetchRequest")
+            .field("repo", &redact_repo(self.repo))
+            .field("revision", &self.revision)
+            .field("timeout", &self.timeout)
+            .field("verify_signature", &self.verify_signature)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Pluggable git fetch surface (test seam).
 ///
 /// The default production implementation shells out to `git`. Tests
-/// install a fake cloner that copies a fixture directory into the
-/// temp dir; the loader logic stays identical.
+/// install a fake that copies a fixture directory into the destination;
+/// the loader logic stays identical.
 pub trait Cloner: Send + Sync {
-    /// Clone `repo` at `revision` into `dest`. The directory at `dest`
-    /// exists and is empty when the cloner is invoked.
-    fn clone_into(
-        &self,
-        repo: &str,
-        revision: Option<&str>,
-        dest: &Path,
-    ) -> Result<(), ConfigSourceError>;
+    /// Materialise `request.repo` at `request.revision` into
+    /// `request.dest` and report the commit it resolved to.
+    ///
+    /// The directory at `dest` exists and is empty when the cloner is
+    /// invoked.
+    fn fetch(&self, request: &FetchRequest<'_>) -> Result<ResolvedRevision, ConfigSourceError>;
+
+    /// Confirm the transport this cloner needs is usable, before any
+    /// repository is contacted.
+    ///
+    /// The production implementation runs `git --version` so a host
+    /// with no `git` fails with a message naming the dependency rather
+    /// than with a clone error.
+    fn preflight(&self) -> Result<(), ConfigSourceError> {
+        Ok(())
+    }
 }
 
 /// Production cloner. Shells out to the `git` binary the caller
@@ -84,35 +314,466 @@ pub struct GitBinaryCloner {
     pub git: PathBuf,
 }
 
-impl Cloner for GitBinaryCloner {
-    fn clone_into(
+impl GitBinaryCloner {
+    /// Run one `git` invocation with a hard timeout, returning its
+    /// captured stderr.
+    ///
+    /// Output is redirected to a file rather than a pipe on purpose: a
+    /// piped child that fills the pipe buffer blocks forever, and this
+    /// function's whole job is to be the thing that cannot hang.
+    fn run(
         &self,
-        repo: &str,
-        revision: Option<&str>,
-        dest: &Path,
-    ) -> Result<(), ConfigSourceError> {
-        // `Cloner::clone_into` is sync; the loader drives it from a
-        // sync context inside an async wrapper. We shell out to the
-        // sync `std::process::Command` directly so we never have to
-        // ask whether we are nested inside a tokio runtime.
-        let mut cmd = std::process::Command::new(&self.git);
-        cmd.arg("clone").arg("--depth").arg("1");
-        if let Some(rev) = revision {
-            cmd.arg("--branch").arg(rev);
+        args: &[&str],
+        working_dir: Option<&Path>,
+        scratch: &Path,
+        timeout: Duration,
+    ) -> Result<GitOutput, ConfigSourceError> {
+        let log_path = scratch.join("git-stderr.log");
+        let out_path = scratch.join("git-stdout.log");
+        let stderr_file = std::fs::File::create(&log_path)
+            .map_err(|e| ConfigSourceError::Clone(format!("open git log: {e}")))?;
+        let stdout_file = std::fs::File::create(&out_path)
+            .map_err(|e| ConfigSourceError::Clone(format!("open git log: {e}")))?;
+
+        let mut command = Command::new(&self.git);
+        command.args(args);
+        if let Some(dir) = working_dir {
+            command.current_dir(dir);
         }
-        cmd.arg("--").arg(repo).arg(dest);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let output = cmd
-            .output()
-            .map_err(|e| ConfigSourceError::Clone(format!("spawn git: {e}")))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        // No interactive prompt can ever be answered here, and one that
+        // waits for an answer is a hang that the timeout below then has to
+        // clean up. These three turn every credential prompt into an
+        // immediate failure instead. The askpass helpers are removed
+        // rather than blanked, because git will happily try to execute an
+        // empty program name.
+        command.env("GIT_TERMINAL_PROMPT", "0");
+        command.env_remove("GIT_ASKPASS");
+        command.env_remove("SSH_ASKPASS");
+        command.env("GCM_INTERACTIVE", "never");
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::from(stdout_file));
+        command.stderr(Stdio::from(stderr_file));
+
+        let mut child = command.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ConfigSourceError::MissingGitBinary(format!(
+                    "the `git` binary was not found at '{}'. A `source: {{kind: git}}` config \
+                     shells out to git, so every host resolving one needs git installed \
+                     (container images included). Install git, or point at it explicitly",
+                    self.git.display()
+                ))
+            } else {
+                ConfigSourceError::Clone(format!("spawn git: {e}"))
+            }
+        })?;
+
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(e) => return Err(ConfigSourceError::Clone(format!("wait for git: {e}"))),
+            }
+            if Instant::now() >= deadline {
+                // Kill, then reap, so the child cannot outlive this
+                // process as a zombie holding a network connection open.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ConfigSourceError::Timeout(format!(
+                    "`git {}` did not finish within {}s and was killed",
+                    args.first().copied().unwrap_or("?"),
+                    timeout.as_secs_f64()
+                )));
+            }
+            std::thread::sleep(CHILD_POLL_INTERVAL);
+        };
+
+        let stderr = read_capped(&log_path);
+        let stdout = read_capped(&out_path);
+        Ok(GitOutput {
+            success: status.success(),
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Resolve `HEAD` in an already-materialised working tree.
+    fn head_commit(
+        &self,
+        dest: &Path,
+        scratch: &Path,
+        timeout: Duration,
+    ) -> Result<String, ConfigSourceError> {
+        let output = self.run(&["rev-parse", "HEAD"], Some(dest), scratch, timeout)?;
+        if !output.success {
             return Err(ConfigSourceError::Clone(format!(
-                "git clone failed: {}",
-                stderr.trim()
+                "git rev-parse HEAD failed: {}",
+                output.stderr.trim()
+            )));
+        }
+        let commit = output.stdout.trim().to_string();
+        if commit.is_empty() {
+            return Err(ConfigSourceError::Clone(
+                "git rev-parse HEAD produced no commit".to_string(),
+            ));
+        }
+        Ok(commit)
+    }
+}
+
+/// One completed `git` invocation.
+struct GitOutput {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+/// Read at most [`MAX_CAPTURED_STDERR`] bytes of a captured stream,
+/// lossily. A missing file reads as empty.
+fn read_capped(path: &Path) -> String {
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let start = bytes.len().saturating_sub(MAX_CAPTURED_STDERR);
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
+}
+
+/// Whether `revision` is a full commit sha, and therefore a pin rather
+/// than a moving reference.
+///
+/// Only the full 40-hex (SHA-1) and 64-hex (SHA-256) forms count. An
+/// abbreviated sha is deliberately treated as a reference: it cannot be
+/// fetched directly and it cannot be compared against a resolved `HEAD`
+/// without deciding how many characters are enough.
+#[must_use]
+pub fn is_full_commit_sha(revision: &str) -> bool {
+    matches!(revision.len(), 40 | 64) && revision.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Remove any embedded credential from a repository URL so it is safe
+/// to log.
+///
+/// `https://token@host/repo.git` and `https://user:token@host/repo.git`
+/// both become `https://host/repo.git`. A URL with no userinfo is
+/// returned unchanged. Applied to every repository string that reaches a
+/// log line, an error message, or a provenance record.
+#[must_use]
+pub fn redact_repo(repo: &str) -> String {
+    let Some(scheme_end) = repo.find("://") else {
+        return repo.to_string();
+    };
+    let after_scheme = scheme_end + 3;
+    let authority_end = repo[after_scheme..]
+        .find('/')
+        .map_or(repo.len(), |offset| after_scheme + offset);
+    let authority = &repo[after_scheme..authority_end];
+    match authority.rfind('@') {
+        None => repo.to_string(),
+        Some(at) => format!(
+            "{}{}{}",
+            &repo[..after_scheme],
+            &authority[at + 1..],
+            &repo[authority_end..]
+        ),
+    }
+}
+
+/// Interpolate a resolved credential into an `https` repository URL.
+///
+/// Returns the URL unchanged for a source with no credential, and for
+/// an `ssh` or `git` transport, where the credential is the SSH key the
+/// host already holds rather than anything this loader can inject.
+fn repo_with_credential(repo: &str, credential: Option<&str>) -> String {
+    let Some(credential) = credential else {
+        return repo.to_string();
+    };
+    if !repo.starts_with("https://") && !repo.starts_with("http://") {
+        return repo.to_string();
+    }
+    let (scheme, rest) = repo.split_once("://").unwrap_or(("https", repo));
+    // A URL that already carries userinfo keeps it: the operator wrote
+    // a username in the URL on purpose, and the credential is the
+    // password half.
+    match rest.split_once('@') {
+        Some((user, host_and_path)) if !user.contains('/') => {
+            format!(
+                "{scheme}://{}:{}@{host_and_path}",
+                encode_userinfo(user),
+                encode_userinfo(credential)
+            )
+        }
+        _ => format!(
+            "{scheme}://x-access-token:{}@{rest}",
+            encode_userinfo(credential)
+        ),
+    }
+}
+
+/// Percent-encode the characters that would otherwise end the userinfo
+/// component of a URL early.
+fn encode_userinfo(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Strip anything that looks like a credential out of captured `git`
+/// output before it reaches a log line.
+///
+/// `git` echoes the remote URL in most of its failure messages, and a
+/// URL carrying an injected token would otherwise land in the logs.
+#[must_use]
+pub fn scrub_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find("://") {
+        let (before, tail) = rest.split_at(index + 3);
+        out.push_str(before);
+        // The authority runs to the next delimiter that cannot appear
+        // inside it.
+        let authority_end = tail
+            .find(|c: char| c == '/' || c.is_whitespace() || c == '\'' || c == '"')
+            .unwrap_or(tail.len());
+        let authority = &tail[..authority_end];
+        match authority.rfind('@') {
+            Some(at) => out.push_str(&authority[at + 1..]),
+            None => out.push_str(authority),
+        }
+        rest = &tail[authority_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+impl Cloner for GitBinaryCloner {
+    fn preflight(&self) -> Result<(), ConfigSourceError> {
+        match Command::new(&self.git)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(ConfigSourceError::MissingGitBinary(format!(
+                "`{} --version` exited with {status}; the `git` binary is required to resolve a \
+                 `source: {{kind: git}}` config",
+                self.git.display()
+            ))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(ConfigSourceError::MissingGitBinary(format!(
+                    "the `git` binary was not found at '{}'. A `source: {{kind: git}}` config \
+                     shells out to git, so every host resolving one needs git installed \
+                     (container images included). Install git, or point at it explicitly",
+                    self.git.display()
+                )))
+            }
+            Err(e) => Err(ConfigSourceError::MissingGitBinary(format!(
+                "`{} --version` could not be run: {e}",
+                self.git.display()
+            ))),
+        }
+    }
+
+    fn fetch(&self, request: &FetchRequest<'_>) -> Result<ResolvedRevision, ConfigSourceError> {
+        let dest = request.dest;
+        let dest_str = dest.to_string_lossy().to_string();
+        let pinned = request.revision.is_some_and(is_full_commit_sha);
+
+        if pinned {
+            let sha = request.revision.unwrap_or_default();
+            self.fetch_pinned_sha(request, &dest_str, sha)?;
+        } else {
+            let mut args: Vec<&str> = vec!["clone", "--quiet", "--depth", "1"];
+            if let Some(reference) = request.revision {
+                args.push("--branch");
+                args.push(reference);
+            }
+            args.push("--");
+            args.push(request.repo);
+            args.push(&dest_str);
+            let output = self.run(&args, None, request.scratch, request.timeout)?;
+            if !output.success {
+                return Err(ConfigSourceError::Clone(format!(
+                    "git clone of {} failed: {}",
+                    redact_repo(request.repo),
+                    scrub_credentials(output.stderr.trim())
+                )));
+            }
+        }
+
+        let commit = self.head_commit(dest, request.scratch, request.timeout)?;
+        if pinned {
+            let sha = request.revision.unwrap_or_default();
+            if !commit.eq_ignore_ascii_case(sha) {
+                return Err(ConfigSourceError::RevisionMismatch(format!(
+                    "revision pins commit {sha} but {} resolved to {commit}; refusing to serve a \
+                     document the pin does not name",
+                    redact_repo(request.repo)
+                )));
+            }
+        }
+        if request.verify_signature {
+            self.verify_signature(request, dest, request.scratch, &commit)?;
+        }
+        Ok(ResolvedRevision {
+            repo: redact_repo(request.repo),
+            reference: request.revision.unwrap_or("HEAD").to_string(),
+            commit,
+        })
+    }
+}
+
+impl GitBinaryCloner {
+    /// Materialise one exact commit sha.
+    ///
+    /// `git clone --depth 1` cannot ask for an arbitrary commit: the
+    /// server has to allow it, which most do not by default (it is
+    /// `uploadpack.allowReachableSHA1InWant`). So the pinned path is
+    /// `git init` plus a targeted shallow fetch, and falls back to a
+    /// full fetch of every ref when the server refuses the shallow one.
+    fn fetch_pinned_sha(
+        &self,
+        request: &FetchRequest<'_>,
+        dest_str: &str,
+        sha: &str,
+    ) -> Result<(), ConfigSourceError> {
+        let dest = request.dest;
+        let scratch = request.scratch;
+        let started = Instant::now();
+        let remaining =
+            |started: Instant| -> Duration { request.timeout.saturating_sub(started.elapsed()) };
+
+        let init = self.run(
+            &["init", "--quiet", dest_str],
+            None,
+            scratch,
+            request.timeout,
+        )?;
+        if !init.success {
+            return Err(ConfigSourceError::Clone(format!(
+                "git init failed: {}",
+                scrub_credentials(init.stderr.trim())
+            )));
+        }
+        let add_remote = self.run(
+            &["remote", "add", "origin", request.repo],
+            Some(dest),
+            scratch,
+            remaining(started),
+        )?;
+        if !add_remote.success {
+            return Err(ConfigSourceError::Clone(format!(
+                "git remote add failed: {}",
+                scrub_credentials(add_remote.stderr.trim())
+            )));
+        }
+
+        // The shallow, targeted fetch first. It is one commit over the
+        // wire when the server allows it.
+        let shallow = self.run(
+            &["fetch", "--quiet", "--depth", "1", "origin", sha],
+            Some(dest),
+            scratch,
+            remaining(started),
+        )?;
+        if !shallow.success {
+            // Fall back to fetching every ref, then look for the commit
+            // locally. Slower and heavier, and the only thing that works
+            // against a server without `allowReachableSHA1InWant`.
+            let full = self.run(
+                &["fetch", "--quiet", "--tags", "origin"],
+                Some(dest),
+                scratch,
+                remaining(started),
+            )?;
+            if !full.success {
+                return Err(ConfigSourceError::Clone(format!(
+                    "git fetch of {} at {sha} failed, both as a shallow single-commit fetch \
+                     (the server may not allow it) and as a full fetch: {}",
+                    redact_repo(request.repo),
+                    scrub_credentials(full.stderr.trim())
+                )));
+            }
+            let checkout = self.run(
+                &["checkout", "--quiet", "--detach", sha],
+                Some(dest),
+                scratch,
+                remaining(started),
+            )?;
+            if !checkout.success {
+                return Err(ConfigSourceError::RevisionMismatch(format!(
+                    "commit {sha} is not present in {} after a full fetch; the pin names a \
+                     commit this repository does not contain: {}",
+                    redact_repo(request.repo),
+                    scrub_credentials(checkout.stderr.trim())
+                )));
+            }
+            return Ok(());
+        }
+
+        let checkout = self.run(
+            &["checkout", "--quiet", "--detach", "FETCH_HEAD"],
+            Some(dest),
+            scratch,
+            remaining(started),
+        )?;
+        if !checkout.success {
+            return Err(ConfigSourceError::Clone(format!(
+                "git checkout of the fetched commit failed: {}",
+                scrub_credentials(checkout.stderr.trim())
             )));
         }
         Ok(())
+    }
+
+    /// Require a good signature on the resolved tag or commit.
+    ///
+    /// A named tag is checked as a tag first, because an operator who
+    /// signs releases signs the tag object rather than every commit on
+    /// the branch. Otherwise, and when the tag check does not apply, the
+    /// commit itself has to be signed.
+    fn verify_signature(
+        &self,
+        request: &FetchRequest<'_>,
+        dest: &Path,
+        scratch: &Path,
+        commit: &str,
+    ) -> Result<(), ConfigSourceError> {
+        if let Some(reference) = request.revision {
+            if !is_full_commit_sha(reference) {
+                let tag = self.run(
+                    &["verify-tag", reference],
+                    Some(dest),
+                    scratch,
+                    request.timeout,
+                )?;
+                if tag.success {
+                    return Ok(());
+                }
+            }
+        }
+        let commit_check = self.run(
+            &["verify-commit", commit],
+            Some(dest),
+            scratch,
+            request.timeout,
+        )?;
+        if commit_check.success {
+            return Ok(());
+        }
+        Err(ConfigSourceError::Signature(format!(
+            "verify_signature is set, but neither the reference nor commit {commit} in {} carries \
+             a signature this host can verify: {}. Import the signing key into the git \
+             trust store, or clear verify_signature",
+            redact_repo(request.repo),
+            scrub_credentials(commit_check.stderr.trim())
+        )))
     }
 }
 
@@ -129,35 +790,82 @@ pub struct FetchContext {
     pub temp_root: Option<PathBuf>,
     /// Cloner strategy used by [`ConfigSource::Git`].
     pub cloner: Box<dyn Cloner>,
+    /// Resolved credential per repository URL, keyed by the exact
+    /// `repo` string in the config.
+    ///
+    /// The loader never resolves a secret itself: `sbproxy-config` has
+    /// no secret backend and must not grow one. The caller resolves
+    /// every `credential:` reference through the process
+    /// `SecretResolver` and hands the results in here, which also keeps
+    /// resolution failures at boot rather than at the first refresh.
+    pub credentials: std::collections::HashMap<String, String>,
+}
+
+impl std::fmt::Debug for FetchContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FetchContext")
+            .field("temp_root", &self.temp_root)
+            .field("credentials", &self.credentials.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl FetchContext {
     /// Build a production fetch context that shells out to `git` on
     /// `PATH`.
+    #[must_use]
     pub fn with_git_binary() -> Self {
         Self {
             temp_root: None,
             cloner: Box::new(GitBinaryCloner {
                 git: PathBuf::from("git"),
             }),
+            credentials: std::collections::HashMap::new(),
         }
     }
 
     /// Build a fetch context that shells out to a specific git binary.
+    #[must_use]
     pub fn with_git_binary_at(git: impl Into<PathBuf>) -> Self {
         Self {
             temp_root: None,
             cloner: Box::new(GitBinaryCloner { git: git.into() }),
+            credentials: std::collections::HashMap::new(),
         }
     }
 
     /// Build a fetch context with a custom cloner. The test suite uses
     /// this seam to install a fixture-copying stub in place of `git`.
+    #[must_use]
     pub fn with_cloner(cloner: Box<dyn Cloner>) -> Self {
         Self {
             temp_root: None,
             cloner,
+            credentials: std::collections::HashMap::new(),
         }
+    }
+
+    /// Record the resolved credential for one repository URL.
+    #[must_use]
+    pub fn with_credential(
+        mut self,
+        repo: impl Into<String>,
+        credential: impl Into<String>,
+    ) -> Self {
+        self.credentials.insert(repo.into(), credential.into());
+        self
+    }
+
+    /// Confirm the transport is usable before any repository is
+    /// contacted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigSourceError::MissingGitBinary`] when the `git`
+    /// binary this context was built around cannot be run.
+    pub fn preflight(&self) -> Result<(), ConfigSourceError> {
+        self.cloner.preflight()
     }
 
     fn new_tempdir(&self) -> Result<TempDir, ConfigSourceError> {
@@ -178,11 +886,15 @@ impl FetchContext {
 /// file the operator handed the binary; it is used as the `Local`
 /// payload (so the historical "no source field" path still works).
 ///
+/// # Errors
+///
+/// Returns [`ConfigSourceError`] naming the stage that failed.
+///
 /// # Blocking I/O
 ///
 /// Resolving a [`ConfigSource::Git`] source does blocking
 /// filesystem work (tempdir creation, `mkdir`, `read_to_string`) and
-/// shells out to `git` synchronously through [`Cloner::clone_into`].
+/// shells out to `git` synchronously through [`Cloner::fetch`].
 /// That work runs inline rather than pulling a tokio runtime dependency
 /// into this (public) crate: it happens at config load and reload, never
 /// on the per-request path. A caller that drives this from a hot
@@ -192,7 +904,133 @@ pub async fn load_from_source(
     inline_text: &str,
     fetch_ctx: &FetchContext,
 ) -> Result<String, ConfigSourceError> {
-    load_with_depth(source, inline_text, fetch_ctx, 0)
+    load_source_blocking(source, inline_text, fetch_ctx).map(|resolved| resolved.text)
+}
+
+/// [`load_from_source`] without the async wrapper.
+///
+/// The boot path and the reload transaction are both synchronous and
+/// run outside any tokio runtime, so they call this directly rather
+/// than block on a future that never yields.
+///
+/// # Errors
+///
+/// Returns [`ConfigSourceError`] naming the stage that failed.
+pub fn load_source_blocking(
+    source: &ConfigSource,
+    inline_text: &str,
+    fetch_ctx: &FetchContext,
+) -> Result<ResolvedDocument, ConfigSourceError> {
+    let mut revisions = Vec::new();
+    let text = load_with_depth(source, inline_text, fetch_ctx, 0, &mut revisions)?;
+    Ok(ResolvedDocument { text, revisions })
+}
+
+/// Parse the `source:` discriminator out of one config text and resolve
+/// it.
+///
+/// This is the single entry point every caller that has "the bytes an
+/// operator handed us" should use: boot, the reload transaction, the
+/// refresh poller, `sbproxy validate`, `sbproxy plan`, and the config
+/// authority's publish path. A document with no `source:` block, or an
+/// explicit `source: {kind: local}`, resolves to itself with no I/O at
+/// all, so the call is free on the historical path.
+///
+/// # Errors
+///
+/// Returns [`ConfigSourceError::Invalid`] when the `source:` block does
+/// not parse, and otherwise whatever [`load_source_blocking`] returns.
+pub fn resolve_document(
+    inline_text: &str,
+    fetch_ctx: &FetchContext,
+) -> Result<ResolvedDocument, ConfigSourceError> {
+    let Some(source) = parse_source_head(inline_text)? else {
+        return Ok(ResolvedDocument::local(inline_text.to_string()));
+    };
+    load_source_blocking(&source, inline_text, fetch_ctx)
+}
+
+/// Read just the `source:` block out of a config text.
+///
+/// Returns `Ok(None)` for a document with no `source:` and for an
+/// explicit `kind: local`, which are the same thing. Parsed with a
+/// permissive one-field type so a config that is otherwise garbage
+/// still reports its source error here rather than behind a downstream
+/// schema failure.
+///
+/// A blank document (empty, whitespace, comments, or a bare `---`) has no
+/// source, the same way [`crate::merge_config`] treats it as an empty
+/// mapping. Deciding it is malformed here would turn "you published an
+/// empty payload" into a confusing parse error about a block the
+/// operator never wrote.
+///
+/// # Errors
+///
+/// Returns [`ConfigSourceError::Invalid`] when the block is present but
+/// malformed, or when the document root is not a mapping.
+pub fn parse_source_head(inline_text: &str) -> Result<Option<ConfigSource>, ConfigSourceError> {
+    #[derive(serde::Deserialize)]
+    struct SourceHead {
+        #[serde(default)]
+        source: Option<ConfigSource>,
+    }
+    let head: Option<SourceHead> = serde_yaml::from_str(inline_text)
+        .map_err(|e| ConfigSourceError::Invalid(format!("failed to parse `source:` block: {e}")))?;
+    Ok(match head.and_then(|head| head.source) {
+        None | Some(ConfigSource::Local) => None,
+        Some(source) => Some(source),
+    })
+}
+
+/// The refresh cadence a resolved source wants, or `None` when every
+/// git node in it disabled refresh.
+///
+/// A tree with several git nodes refreshes on the shortest cadence any
+/// of them asked for: they are all inputs to one document, so the
+/// document is only as fresh as its most impatient input.
+#[must_use]
+pub fn refresh_interval(source: &ConfigSource) -> Option<Duration> {
+    match source {
+        ConfigSource::Local => None,
+        ConfigSource::Git {
+            refresh_interval_secs,
+            ..
+        } => (*refresh_interval_secs > 0).then(|| Duration::from_secs(*refresh_interval_secs)),
+        ConfigSource::GitOverlay { base, overlays } => std::iter::once(base.as_ref())
+            .chain(overlays.iter())
+            .filter_map(refresh_interval)
+            .min(),
+    }
+}
+
+/// Every `credential:` reference named anywhere in a source tree,
+/// paired with the repository it belongs to.
+///
+/// The caller resolves each one through the process `SecretResolver`
+/// and hands the results back on [`FetchContext::credentials`].
+#[must_use]
+pub fn credential_references(source: &ConfigSource) -> Vec<(String, String)> {
+    fn walk(source: &ConfigSource, out: &mut Vec<(String, String)>) {
+        match source {
+            ConfigSource::Local => {}
+            ConfigSource::Git {
+                repo, credential, ..
+            } => {
+                if let Some(credential) = credential {
+                    out.push((repo.clone(), credential.clone()));
+                }
+            }
+            ConfigSource::GitOverlay { base, overlays } => {
+                walk(base, out);
+                for overlay in overlays {
+                    walk(overlay, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(source, &mut out);
+    out
 }
 
 fn load_with_depth(
@@ -200,6 +1038,7 @@ fn load_with_depth(
     inline_text: &str,
     fetch_ctx: &FetchContext,
     depth: usize,
+    revisions: &mut Vec<ResolvedRevision>,
 ) -> Result<String, ConfigSourceError> {
     if depth > MAX_RECURSION_DEPTH {
         return Err(ConfigSourceError::RecursionLimit);
@@ -210,11 +1049,27 @@ fn load_with_depth(
             repo,
             revision,
             path,
-        } => load_git(repo, revision.as_deref(), path, fetch_ctx),
+            credential,
+            verify_signature,
+            timeout_secs,
+            refresh_interval_secs: _,
+        } => {
+            let spec = GitSpec {
+                repo: repo.as_str(),
+                revision: revision.as_deref(),
+                path: path.as_str(),
+                credential: credential.as_deref(),
+                verify_signature: *verify_signature,
+                timeout: Duration::from_secs(*timeout_secs),
+            };
+            let (text, resolved) = load_git(&spec, fetch_ctx)?;
+            revisions.push(resolved);
+            Ok(text)
+        }
         ConfigSource::GitOverlay { base, overlays } => {
-            let mut acc = load_with_depth(base, inline_text, fetch_ctx, depth + 1)?;
+            let mut acc = load_with_depth(base, inline_text, fetch_ctx, depth + 1, revisions)?;
             for overlay in overlays {
-                let next = load_with_depth(overlay, inline_text, fetch_ctx, depth + 1)?;
+                let next = load_with_depth(overlay, inline_text, fetch_ctx, depth + 1, revisions)?;
                 acc = merge_yaml_text(&acc, &next)?;
             }
             Ok(acc)
@@ -222,23 +1077,101 @@ fn load_with_depth(
     }
 }
 
+/// One `Git` source, flattened so the loader is not passing seven
+/// arguments around.
+struct GitSpec<'a> {
+    repo: &'a str,
+    revision: Option<&'a str>,
+    path: &'a str,
+    credential: Option<&'a str>,
+    verify_signature: bool,
+    timeout: Duration,
+}
+
 fn load_git(
-    repo: &str,
-    revision: Option<&str>,
-    path: &str,
+    spec: &GitSpec<'_>,
     fetch_ctx: &FetchContext,
-) -> Result<String, ConfigSourceError> {
+) -> Result<(String, ResolvedRevision), ConfigSourceError> {
+    if spec.repo.trim().is_empty() {
+        return Err(ConfigSourceError::Invalid(
+            "source.repo must not be empty".to_string(),
+        ));
+    }
+    if spec.path.trim().is_empty() {
+        return Err(ConfigSourceError::Invalid(
+            "source.path must name the config file inside the repository".to_string(),
+        ));
+    }
+    if spec.timeout.is_zero() || spec.timeout > MAX_FETCH_TIMEOUT {
+        return Err(ConfigSourceError::Invalid(format!(
+            "source.timeout_secs must be between 1 and {}; a fetch with no timeout can hang \
+             startup, which this repository has already paid for once",
+            MAX_FETCH_TIMEOUT.as_secs()
+        )));
+    }
+    // A path that walks out of the checkout would read an arbitrary file
+    // off the proxy host, which is not what "a file inside the
+    // repository" means.
+    let relative = Path::new(spec.path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(ConfigSourceError::Invalid(format!(
+            "source.path '{}' must be a relative path inside the repository, with no `..` \
+             components",
+            spec.path
+        )));
+    }
+
+    // Preflight before the tempdir so a host with no git says so
+    // instead of leaving an empty directory behind.
+    fetch_ctx.cloner.preflight()?;
+
     let tempdir = fetch_ctx.new_tempdir()?;
     let dest = tempdir.path().join("repo");
+    let scratch = tempdir.path().join("scratch");
     std::fs::create_dir_all(&dest)
         .map_err(|e| ConfigSourceError::Clone(format!("mkdir target: {e}")))?;
-    fetch_ctx.cloner.clone_into(repo, revision, &dest)?;
-    let file_path = dest.join(path);
-    let text = std::fs::read_to_string(&file_path)
-        .map_err(|e| ConfigSourceError::Read(format!("{}: {e}", file_path.display())))?;
+    std::fs::create_dir_all(&scratch)
+        .map_err(|e| ConfigSourceError::Clone(format!("mkdir scratch: {e}")))?;
+
+    let resolved_credential = spec
+        .credential
+        .and_then(|_| fetch_ctx.credentials.get(spec.repo))
+        .map(String::as_str);
+    if spec.credential.is_some() && resolved_credential.is_none() {
+        return Err(ConfigSourceError::Invalid(format!(
+            "source.credential is set for {} but no resolved credential was supplied; the \
+             reference must resolve through a secret backend before the fetch runs",
+            redact_repo(spec.repo)
+        )));
+    }
+    let authenticated_repo = repo_with_credential(spec.repo, resolved_credential);
+
+    let request = FetchRequest {
+        repo: &authenticated_repo,
+        revision: spec.revision,
+        timeout: spec.timeout,
+        verify_signature: spec.verify_signature,
+        dest: &dest,
+        scratch: &scratch,
+    };
+    let resolved = fetch_ctx.cloner.fetch(&request)?;
+
+    let file_path = dest.join(relative);
+    let text = std::fs::read_to_string(&file_path).map_err(|e| {
+        ConfigSourceError::Read(format!(
+            "'{}' at {} in {}: {e}",
+            spec.path,
+            resolved.commit,
+            redact_repo(spec.repo)
+        ))
+    })?;
     // `tempdir` is dropped here, cleaning up the cloned tree.
     drop(tempdir);
-    Ok(text)
+    Ok((text, resolved))
 }
 
 /// Merge two YAML documents shallow-deep: maps are merged by key with
@@ -300,22 +1233,16 @@ mod tests {
     }
 
     impl Cloner for FixtureCloner {
-        fn clone_into(
-            &self,
-            repo: &str,
-            revision: Option<&str>,
-            dest: &Path,
-        ) -> Result<(), ConfigSourceError> {
-            self.calls
-                .lock()
-                .expect("calls lock")
-                .push((repo.to_string(), revision.map(str::to_string)));
-            let layout = self
-                .repos
-                .get(repo)
-                .ok_or_else(|| ConfigSourceError::Clone(format!("unknown fixture repo: {repo}")))?;
+        fn fetch(&self, request: &FetchRequest<'_>) -> Result<ResolvedRevision, ConfigSourceError> {
+            self.calls.lock().expect("calls lock").push((
+                request.repo.to_string(),
+                request.revision.map(str::to_string),
+            ));
+            let layout = self.repos.get(request.repo).ok_or_else(|| {
+                ConfigSourceError::Clone(format!("unknown fixture repo: {}", request.repo))
+            })?;
             for (rel, contents) in layout {
-                let target = dest.join(rel);
+                let target = request.dest.join(rel);
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| ConfigSourceError::Clone(format!("mkdir: {e}")))?;
@@ -323,7 +1250,11 @@ mod tests {
                 std::fs::write(&target, contents)
                     .map_err(|e| ConfigSourceError::Clone(format!("write: {e}")))?;
             }
-            Ok(())
+            Ok(ResolvedRevision {
+                repo: redact_repo(request.repo),
+                reference: request.revision.unwrap_or("HEAD").to_string(),
+                commit: "a".repeat(40),
+            })
         }
     }
 
@@ -340,23 +1271,41 @@ mod tests {
     struct ArcClonerProxy(Arc<FixtureCloner>);
 
     impl Cloner for ArcClonerProxy {
-        fn clone_into(
-            &self,
-            repo: &str,
-            revision: Option<&str>,
-            dest: &Path,
-        ) -> Result<(), ConfigSourceError> {
-            // Disambiguate against `ToOwned::clone_into`.
-            <FixtureCloner as Cloner>::clone_into(&self.0, repo, revision, dest)
+        fn fetch(&self, request: &FetchRequest<'_>) -> Result<ResolvedRevision, ConfigSourceError> {
+            self.0.fetch(request)
         }
+    }
+
+    /// A `Git` source with the loader's own defaults, so a test only
+    /// spells out the fields it cares about.
+    fn git_source(repo: &str, revision: Option<&str>, path: &str) -> ConfigSource {
+        ConfigSource::Git {
+            repo: repo.to_string(),
+            revision: revision.map(str::to_string),
+            path: path.to_string(),
+            credential: None,
+            verify_signature: false,
+            timeout_secs: 60,
+            refresh_interval_secs: 60,
+        }
+    }
+
+    fn load(
+        source: &ConfigSource,
+        inline: &str,
+        ctx: &FetchContext,
+    ) -> Result<ResolvedDocument, ConfigSourceError> {
+        load_source_blocking(source, inline, ctx)
     }
 
     #[test]
     fn local_round_trips_inline_text() {
         let ctx = FetchContext::with_git_binary();
         let inline = "proxy: {}\norigins: {}\n";
-        let result = load_with_depth(&ConfigSource::Local, inline, &ctx, 0).expect("local loads");
-        assert_eq!(result, inline);
+        let result = load(&ConfigSource::Local, inline, &ctx).expect("local loads");
+        assert_eq!(result.text, inline);
+        assert!(!result.is_remote());
+        assert_eq!(result.base_origin(), BaseOrigin::Local);
     }
 
     #[test]
@@ -367,13 +1316,18 @@ mod tests {
             vec![("sb.yml", "proxy:\n  listen: \":8080\"\n")],
         );
         let (ctx, cloner) = ctx_with(FixtureCloner::new(repos));
-        let source = ConfigSource::Git {
-            repo: "https://example.test/repo.git".into(),
-            revision: Some("main".into()),
-            path: "sb.yml".into(),
-        };
-        let result = load_with_depth(&source, "", &ctx, 0).expect("git loads");
-        assert!(result.contains("listen"));
+        let source = git_source("https://example.test/repo.git", Some("main"), "sb.yml");
+        let result = load(&source, "", &ctx).expect("git loads");
+        assert!(result.text.contains("listen"));
+        assert!(result.is_remote());
+        assert_eq!(
+            result.base_origin(),
+            BaseOrigin::Git {
+                repo: "https://example.test/repo.git".into(),
+                reference: "main".into(),
+                commit: "a".repeat(40),
+            }
+        );
         let calls = cloner.calls.lock().expect("calls lock");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "https://example.test/repo.git");
@@ -392,22 +1346,14 @@ mod tests {
             vec![("sb.yml", "proxy:\n  listen: \":9090\"\norigins:\n  b: {}\n")],
         );
         let (ctx, _cloner) = ctx_with(FixtureCloner::new(repos));
-        let base = ConfigSource::Git {
-            repo: "https://example.test/base.git".into(),
-            revision: None,
-            path: "sb.yml".into(),
-        };
-        let overlay = ConfigSource::Git {
-            repo: "https://example.test/overlay.git".into(),
-            revision: None,
-            path: "sb.yml".into(),
-        };
+        let base = git_source("https://example.test/base.git", None, "sb.yml");
+        let overlay = git_source("https://example.test/overlay.git", None, "sb.yml");
         let source = ConfigSource::GitOverlay {
             base: Box::new(base),
             overlays: vec![overlay],
         };
-        let merged = load_with_depth(&source, "", &ctx, 0).expect("overlay loads");
-        let parsed: YamlValue = serde_yaml::from_str(&merged).expect("parse merged");
+        let merged = load(&source, "", &ctx).expect("overlay loads");
+        let parsed: YamlValue = serde_yaml::from_str(&merged.text).expect("parse merged");
         let proxy = parsed.get("proxy").expect("proxy map");
         assert_eq!(
             proxy.get("listen").and_then(YamlValue::as_str),
@@ -417,6 +1363,10 @@ mod tests {
         let origins = parsed.get("origins").expect("origins map");
         assert!(origins.get("a").is_some(), "base map key survives");
         assert!(origins.get("b").is_some(), "overlay map key merges in");
+        // Both revisions are recorded, base first, so the fingerprint
+        // changes when either input moves.
+        assert_eq!(merged.revisions.len(), 2);
+        assert_eq!(merged.revisions[0].repo, "https://example.test/base.git");
     }
 
     #[test]
@@ -432,8 +1382,7 @@ mod tests {
             };
         }
         let ctx = FetchContext::with_git_binary();
-        let err =
-            load_with_depth(&inner, "x: 1\n", &ctx, 0).expect_err("9-deep overlay must error");
+        let err = load(&inner, "x: 1\n", &ctx).expect_err("9-deep overlay must error");
         assert!(matches!(err, ConfigSourceError::RecursionLimit));
     }
 
@@ -448,5 +1397,181 @@ mod tests {
         let b = parsed.get("b").expect("b");
         assert_eq!(b.get("c").and_then(YamlValue::as_i64), Some(9));
         assert_eq!(b.get("d").and_then(YamlValue::as_i64), Some(2));
+    }
+
+    #[test]
+    fn full_shas_are_pins_and_everything_else_is_a_reference() {
+        assert!(is_full_commit_sha(&"a".repeat(40)));
+        assert!(is_full_commit_sha(&"0".repeat(64)));
+        assert!(!is_full_commit_sha("abc1234"), "abbreviated sha");
+        assert!(!is_full_commit_sha("main"));
+        assert!(!is_full_commit_sha(&"z".repeat(40)), "not hex");
+    }
+
+    #[test]
+    fn repo_urls_are_redacted_before_they_reach_a_log_line() {
+        assert_eq!(
+            redact_repo("https://ghp_secrettoken@github.com/acme/config.git"),
+            "https://github.com/acme/config.git"
+        );
+        assert_eq!(
+            redact_repo("https://user:ghp_secrettoken@github.com/acme/config.git"),
+            "https://github.com/acme/config.git"
+        );
+        assert_eq!(
+            redact_repo("https://github.com/acme/config.git"),
+            "https://github.com/acme/config.git"
+        );
+        assert_eq!(
+            redact_repo("git@github.com:acme/config.git"),
+            "git@github.com:acme/config.git"
+        );
+    }
+
+    #[test]
+    fn captured_git_output_never_carries_a_credential() {
+        let noisy = "fatal: could not read from \
+                     https://x-access-token:ghp_secrettoken@github.com/acme/config.git/info/refs";
+        let scrubbed = scrub_credentials(noisy);
+        assert!(!scrubbed.contains("ghp_secrettoken"), "{scrubbed}");
+        assert!(
+            scrubbed.contains("github.com/acme/config.git"),
+            "{scrubbed}"
+        );
+    }
+
+    #[test]
+    fn credential_is_injected_as_userinfo_and_percent_encoded() {
+        let url = repo_with_credential("https://github.com/acme/c.git", Some("tok/en+x"));
+        assert!(url.contains("x-access-token:tok%2Fen%2Bx@"), "{url}");
+        // ssh is untouched: the credential there is the host's key.
+        assert_eq!(
+            repo_with_credential("git@github.com:acme/c.git", Some("tok")),
+            "git@github.com:acme/c.git"
+        );
+        assert_eq!(
+            repo_with_credential("https://github.com/acme/c.git", None),
+            "https://github.com/acme/c.git"
+        );
+    }
+
+    #[test]
+    fn source_head_parses_only_the_source_block() {
+        assert!(parse_source_head("proxy:\n  http_bind_port: 8080\n")
+            .expect("no source parses")
+            .is_none());
+        assert!(parse_source_head("source:\n  kind: local\n")
+            .expect("local parses")
+            .is_none());
+        for blank in ["", "   \n", "# just a comment\n", "---\n"] {
+            assert!(
+                parse_source_head(blank)
+                    .expect("a blank document has no source")
+                    .is_none(),
+                "{blank:?}"
+            );
+        }
+        let parsed = parse_source_head(
+            "source:\n  kind: git\n  repo: https://example.test/r.git\n  path: sb.yml\n",
+        )
+        .expect("git parses")
+        .expect("git source present");
+        assert!(matches!(parsed, ConfigSource::Git { .. }));
+        assert!(parse_source_head("source:\n  kind: nope\n").is_err());
+    }
+
+    #[test]
+    fn refresh_interval_is_the_shortest_any_git_node_asked_for() {
+        let mut fast = git_source("https://example.test/a.git", None, "sb.yml");
+        if let ConfigSource::Git {
+            refresh_interval_secs,
+            ..
+        } = &mut fast
+        {
+            *refresh_interval_secs = 15;
+        }
+        let mut off = git_source("https://example.test/b.git", None, "sb.yml");
+        if let ConfigSource::Git {
+            refresh_interval_secs,
+            ..
+        } = &mut off
+        {
+            *refresh_interval_secs = 0;
+        }
+        assert_eq!(refresh_interval(&ConfigSource::Local), None);
+        assert_eq!(refresh_interval(&off), None, "0 disables refresh");
+        let overlay = ConfigSource::GitOverlay {
+            base: Box::new(off),
+            overlays: vec![fast],
+        };
+        assert_eq!(refresh_interval(&overlay), Some(Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn a_path_escaping_the_checkout_is_refused() {
+        let (ctx, _cloner) = ctx_with(FixtureCloner::new(std::collections::HashMap::new()));
+        for bad in ["../../etc/passwd", "/etc/passwd", "a/../../b.yml"] {
+            let source = git_source("https://example.test/r.git", None, bad);
+            let err = load(&source, "", &ctx).expect_err("escaping path must be refused");
+            assert!(
+                matches!(err, ConfigSourceError::Invalid(_)),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unresolved_credential_reference_is_refused_rather_than_fetched_anonymously() {
+        let mut repos: HashMapOfRepos = std::collections::HashMap::new();
+        repos.insert(
+            "https://example.test/private.git".into(),
+            vec![("sb.yml", "proxy: {}\n")],
+        );
+        let (ctx, _cloner) = ctx_with(FixtureCloner::new(repos));
+        let source = ConfigSource::Git {
+            repo: "https://example.test/private.git".into(),
+            revision: None,
+            path: "sb.yml".into(),
+            credential: Some("env:SB_GIT_TOKEN".into()),
+            verify_signature: false,
+            timeout_secs: 60,
+            refresh_interval_secs: 60,
+        };
+        let err = load(&source, "", &ctx).expect_err("missing resolved credential");
+        assert!(matches!(err, ConfigSourceError::Invalid(_)), "{err:?}");
+    }
+
+    #[test]
+    fn credential_references_are_collected_from_the_whole_tree() {
+        let mut with_credential = git_source("https://example.test/a.git", None, "sb.yml");
+        if let ConfigSource::Git { credential, .. } = &mut with_credential {
+            *credential = Some("env:TOKEN_A".into());
+        }
+        let overlay = ConfigSource::GitOverlay {
+            base: Box::new(with_credential),
+            overlays: vec![git_source("https://example.test/b.git", None, "sb.yml")],
+        };
+        assert_eq!(
+            credential_references(&overlay),
+            vec![(
+                "https://example.test/a.git".to_string(),
+                "env:TOKEN_A".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_missing_git_binary_names_the_dependency() {
+        let ctx = FetchContext::with_git_binary_at("/nonexistent/sbproxy-test-git");
+        let err = ctx
+            .preflight()
+            .expect_err("missing git must fail preflight");
+        assert!(
+            matches!(err, ConfigSourceError::MissingGitBinary(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("git"), "{err}");
+        assert!(err.is_unreachable());
+        assert_eq!(err.metric_label(), "unreachable");
     }
 }

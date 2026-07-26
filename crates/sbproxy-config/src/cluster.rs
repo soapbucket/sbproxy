@@ -770,6 +770,104 @@ pub struct ClusterRestartFingerprint {
     pub replication: Option<ClusterReplicationConfig>,
 }
 
+impl ClusterRestartFingerprint {
+    /// Name every field that differs between two fingerprints, using the
+    /// config path an operator would edit.
+    ///
+    /// The generic "something in the cluster block changed" message this
+    /// replaces was survivable when a human had just edited the file and
+    /// knew what they touched. It stops being survivable when the
+    /// document arrives from a shared git repository: the first thing a
+    /// GitOps operator hits is a repository whose `proxy.cluster` block
+    /// does not match this node, and "restart to apply" without naming
+    /// the field leaves them diffing the whole block by hand.
+    #[must_use]
+    pub fn changed_fields(&self, other: &Self) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        let mut check = |differs: bool, name: &'static str| {
+            if differs {
+                changed.push(name);
+            }
+        };
+        check(self.cluster_id != other.cluster_id, "proxy.cluster.id");
+        check(self.node_id != other.node_id, "proxy.cluster.node_id");
+        check(self.roles != other.roles, "proxy.cluster.roles");
+        check(self.labels != other.labels, "proxy.cluster.labels");
+        check(self.seeds != other.seeds, "proxy.cluster.seeds");
+        check(
+            self.gossip_port != other.gossip_port,
+            "proxy.cluster.gossip_port",
+        );
+        check(
+            self.transport_port != other.transport_port,
+            "proxy.cluster.transport_port",
+        );
+        check(
+            self.advertise_addr != other.advertise_addr,
+            "proxy.cluster.advertise_addr",
+        );
+        check(
+            self.transport_advertise_addr != other.transport_advertise_addr,
+            "proxy.cluster.transport_advertise_addr",
+        );
+        check(
+            self.model_bind != other.model_bind,
+            "proxy.cluster.model_bind",
+        );
+        check(
+            self.model_endpoint != other.model_endpoint,
+            "proxy.cluster.model_endpoint",
+        );
+        check(self.state_dir != other.state_dir, "proxy.cluster.state_dir");
+        check(
+            self.dead_peer_gc_secs != other.dead_peer_gc_secs,
+            "proxy.cluster.dead_peer_gc",
+        );
+        check(self.security != other.security, "proxy.cluster.security");
+        check(
+            self.enrollment != other.enrollment,
+            "proxy.cluster.enrollment",
+        );
+        check(
+            self.deployment_authority != other.deployment_authority,
+            "proxy.cluster.deployment_authority",
+        );
+        check(
+            self.replication != other.replication,
+            "proxy.cluster.replication",
+        );
+        changed
+    }
+
+    /// Human-readable description of how `candidate` differs from the
+    /// fingerprint this process installed, for a reload refusal.
+    ///
+    /// Handles the two shapes the generic message hid worst: a candidate
+    /// that removed `proxy.cluster` entirely, and one that added it to a
+    /// process that had none. Both reject the reload, and neither is
+    /// obvious from a message that only says "changed".
+    #[must_use]
+    pub fn describe_change(installed: Option<&Self>, candidate: Option<&Self>) -> String {
+        match (installed, candidate) {
+            (Some(installed), Some(candidate)) => {
+                let fields = installed.changed_fields(candidate);
+                if fields.is_empty() {
+                    "the cluster fingerprint changed".to_string()
+                } else {
+                    format!("changed field(s): {}", fields.join(", "))
+                }
+            }
+            (Some(_), None) => "`proxy.cluster` was removed, and a clustered process cannot \
+                 become unclustered while it is running"
+                .to_string(),
+            (None, Some(_)) => "`proxy.cluster` was added, and an unclustered process cannot \
+                 join a cluster while it is running"
+                .to_string(),
+            (None, None) => "the cluster fingerprint changed".to_string(),
+        }
+    }
+}
+
 impl EffectiveClusterConfig {
     /// Return only the fields whose live replacement would split process state.
     pub fn restart_fingerprint(&self) -> ClusterRestartFingerprint {
