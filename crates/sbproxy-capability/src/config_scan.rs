@@ -376,9 +376,48 @@ fn normalize_crate_name(name: &str) -> String {
     name.replace('-', "_")
 }
 
+fn primitive_type_reference(reference: &TypeReference) -> Option<&str> {
+    let [name] = reference.segments.as_slice() else {
+        return None;
+    };
+    (!reference.leading_colon
+        && matches!(
+            name.as_str(),
+            "bool"
+                | "char"
+                | "str"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+                | "f32"
+                | "f64"
+        ))
+    .then_some(name)
+    .map(String::as_str)
+}
+
+fn resolved_type_identity(owner: String, arguments: &[String]) -> String {
+    if arguments.is_empty() {
+        owner
+    } else {
+        format!("{owner}<{}>", arguments.join(","))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TypeReference {
     segments: Vec<String>,
+    generic_arguments: Vec<TypeReference>,
+    has_unresolved_generic_arguments: bool,
     context: ModuleContext,
     leading_colon: bool,
 }
@@ -429,6 +468,13 @@ enum MethodReceiverResolution {
     SharedOrValue,
     Mutable,
     Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraitImplementationApplicability {
+    Rejected,
+    ExternallyConstrained,
+    Proven,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -635,12 +681,27 @@ impl RustTypeIndex {
             .get(owner)
             .and_then(|fields| fields.get(field))
             .and_then(Option::as_ref)
-            .and_then(|reference| self.resolve_type_reference(reference))
+            .and_then(|reference| self.resolve_exact_type_reference(reference))
     }
 
     fn resolve_type_reference(&self, reference: &TypeReference) -> Option<String> {
         self.resolve_symbol_reference(SymbolKind::Type, reference, &mut BTreeSet::new())
             .exact()
+    }
+
+    fn resolve_exact_type_reference(&self, reference: &TypeReference) -> Option<String> {
+        let owner = self
+            .resolve_type_reference(reference)
+            .or_else(|| primitive_type_reference(reference).map(str::to_string))?;
+        if reference.has_unresolved_generic_arguments {
+            return None;
+        }
+        let arguments: Option<Vec<_>> = reference
+            .generic_arguments
+            .iter()
+            .map(|argument| self.resolve_exact_type_reference(argument))
+            .collect();
+        Some(resolved_type_identity(owner, &arguments?))
     }
 
     fn resolve_symbol_reference(
@@ -661,6 +722,8 @@ impl RustTypeIndex {
 
         let namespace_reference = TypeReference {
             segments: reference.segments[..reference.segments.len() - 1].to_vec(),
+            generic_arguments: Vec::new(),
+            has_unresolved_generic_arguments: false,
             context: reference.context.clone(),
             leading_colon: reference.leading_colon,
         };
@@ -746,6 +809,8 @@ impl RustTypeIndex {
         }
         let namespace_reference = TypeReference {
             segments: binding.segments[..binding.segments.len() - 1].to_vec(),
+            generic_arguments: Vec::new(),
+            has_unresolved_generic_arguments: false,
             context: binding.context.clone(),
             leading_colon: binding.leading_colon,
         };
@@ -1134,23 +1199,57 @@ impl RustTypeIndex {
         implementation: &TraitImplementation,
         owner: &str,
         resolving: &mut BTreeSet<String>,
-    ) -> bool {
+    ) -> TraitImplementationApplicability {
         match &implementation.owner {
             TraitImplementationOwner::Blanket {
                 bounds,
                 has_unresolved_requirements,
             } => {
-                !has_unresolved_requirements
-                    && bounds.iter().all(|bound| {
-                        self.resolve_type_reference(bound).is_some_and(|bound| {
+                if *has_unresolved_requirements {
+                    return TraitImplementationApplicability::Rejected;
+                }
+                let mut applicability = TraitImplementationApplicability::Proven;
+                for bound in bounds {
+                    let bound_applicability =
+                        if let Some(bound) = self.resolve_type_reference(bound) {
                             self.owner_implements_trait(owner, &bound, resolving)
-                        })
-                    })
+                        } else if self.unresolved_trait_bound_is_external(bound) {
+                            TraitImplementationApplicability::ExternallyConstrained
+                        } else {
+                            TraitImplementationApplicability::Rejected
+                        };
+                    match bound_applicability {
+                        TraitImplementationApplicability::Rejected => {
+                            return TraitImplementationApplicability::Rejected;
+                        }
+                        TraitImplementationApplicability::ExternallyConstrained => {
+                            applicability = TraitImplementationApplicability::ExternallyConstrained;
+                        }
+                        TraitImplementationApplicability::Proven => {}
+                    }
+                }
+                applicability
             }
             TraitImplementationOwner::Exact(reference) => {
-                self.resolve_type_reference(reference).as_deref() == Some(owner)
+                if self.resolve_exact_type_reference(reference).as_deref() == Some(owner) {
+                    TraitImplementationApplicability::Proven
+                } else {
+                    TraitImplementationApplicability::Rejected
+                }
             }
         }
+    }
+
+    fn unresolved_trait_bound_is_external(&self, reference: &TypeReference) -> bool {
+        let Some(first) = reference.segments.first().map(String::as_str) else {
+            return false;
+        };
+        let Some(last) = reference.segments.last() else {
+            return false;
+        };
+        !self.types_by_name.contains_key(last)
+            && !matches!(first, "crate" | "self" | "super")
+            && !self.known_crates.contains(&normalize_crate_name(first))
     }
 
     fn owner_implements_trait(
@@ -1158,25 +1257,35 @@ impl RustTypeIndex {
         owner: &str,
         trait_owner: &str,
         resolving: &mut BTreeSet<String>,
-    ) -> bool {
+    ) -> TraitImplementationApplicability {
         let key = format!("{owner}:{trait_owner}");
         if !resolving.insert(key.clone()) {
-            return false;
+            return TraitImplementationApplicability::Rejected;
         }
-        let implemented = self
-            .trait_implementations_by_trait
-            .get(trait_owner)
-            .is_some_and(|implementations| {
-                implementations.iter().any(|implementation| {
-                    self.trait_implementation_applies(
+        let applicability = self.trait_implementations_by_trait.get(trait_owner).map_or(
+            TraitImplementationApplicability::Rejected,
+            |implementations| {
+                let mut applicability = TraitImplementationApplicability::Rejected;
+                for implementation in implementations {
+                    match self.trait_implementation_applies(
                         &self.trait_implementations[*implementation],
                         owner,
                         resolving,
-                    )
-                })
-            });
+                    ) {
+                        TraitImplementationApplicability::Proven => {
+                            return TraitImplementationApplicability::Proven;
+                        }
+                        TraitImplementationApplicability::ExternallyConstrained => {
+                            applicability = TraitImplementationApplicability::ExternallyConstrained;
+                        }
+                        TraitImplementationApplicability::Rejected => {}
+                    }
+                }
+                applicability
+            },
+        );
         resolving.remove(&key);
-        implemented
+        applicability
     }
 
     fn method_receiver(
@@ -1188,7 +1297,11 @@ impl RustTypeIndex {
         let mut receivers = BTreeSet::new();
         if let Some(signatures) = self.method_signatures.get(method) {
             for signature in signatures {
-                if self.resolve_type_reference(&signature.owner).as_deref() == Some(owner) {
+                if self
+                    .resolve_exact_type_reference(&signature.owner)
+                    .as_deref()
+                    == Some(owner)
+                {
                     receivers.insert(signature.receiver);
                 }
             }
@@ -1201,17 +1314,26 @@ impl RustTypeIndex {
             return MethodReceiverResolution::Missing;
         }
 
+        let mut externally_constrained_receivers = BTreeSet::new();
         for trait_owner in in_scope_traits {
             let Some(implementations) = self.trait_implementations_by_trait.get(trait_owner) else {
                 continue;
             };
             for implementation in implementations {
                 let implementation = &self.trait_implementations[*implementation];
-                if !self.trait_implementation_applies(implementation, owner, &mut BTreeSet::new()) {
-                    continue;
-                }
+                let target = match self.trait_implementation_applies(
+                    implementation,
+                    owner,
+                    &mut BTreeSet::new(),
+                ) {
+                    TraitImplementationApplicability::Rejected => continue,
+                    TraitImplementationApplicability::ExternallyConstrained => {
+                        &mut externally_constrained_receivers
+                    }
+                    TraitImplementationApplicability::Proven => &mut receivers,
+                };
                 if let Some(overrides) = implementation.method_signatures.get(method) {
-                    receivers.extend(overrides);
+                    target.extend(overrides);
                     continue;
                 }
                 let Some(signatures) = self
@@ -1221,7 +1343,7 @@ impl RustTypeIndex {
                 else {
                     continue;
                 };
-                receivers.extend(
+                target.extend(
                     signatures
                         .iter()
                         .filter(|signature| signature.has_default)
@@ -1229,7 +1351,11 @@ impl RustTypeIndex {
                 );
             }
         }
-        Self::receiver_resolution(&receivers)
+        let proven = Self::receiver_resolution(&receivers);
+        if proven != MethodReceiverResolution::Missing {
+            return proven;
+        }
+        Self::receiver_resolution(&externally_constrained_receivers)
     }
 }
 
@@ -1341,6 +1467,8 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
                 self.context.symbol(&alias),
                 TypeReference {
                     segments,
+                    generic_arguments: Vec::new(),
+                    has_unresolved_generic_arguments: false,
                     context: self.context.clone(),
                     leading_colon: node.leading_colon.is_some(),
                 },
@@ -1351,6 +1479,8 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
                 &self.context,
                 TypeReference {
                     segments,
+                    generic_arguments: Vec::new(),
+                    has_unresolved_generic_arguments: false,
                     context: self.context.clone(),
                     leading_colon: node.leading_colon.is_some(),
                 },
@@ -1361,6 +1491,8 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
                 &self.context,
                 TypeReference {
                     segments,
+                    generic_arguments: Vec::new(),
+                    has_unresolved_generic_arguments: false,
                     context: self.context.clone(),
                     leading_colon: node.leading_colon.is_some(),
                 },
@@ -1387,6 +1519,8 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
             self.context.symbol(&alias),
             TypeReference {
                 segments,
+                generic_arguments: Vec::new(),
+                has_unresolved_generic_arguments: false,
                 context: self.context.clone(),
                 leading_colon,
             },
@@ -1511,12 +1645,36 @@ fn direct_type_parameter_name(ty: &syn::Type, parameters: &BTreeSet<String>) -> 
 }
 
 fn path_reference(path: &syn::Path, context: &ModuleContext) -> Option<TypeReference> {
-    (!path.segments.is_empty()).then(|| TypeReference {
+    let segment = path.segments.last()?;
+    let mut generic_arguments = Vec::new();
+    let mut has_unresolved_generic_arguments = false;
+    match &segment.arguments {
+        syn::PathArguments::None => {}
+        syn::PathArguments::AngleBracketed(arguments) => {
+            for argument in &arguments.args {
+                match argument {
+                    syn::GenericArgument::Type(ty) => {
+                        if let Some(reference) = nominal_type_reference(ty, context) {
+                            generic_arguments.push(reference);
+                        } else {
+                            has_unresolved_generic_arguments = true;
+                        }
+                    }
+                    syn::GenericArgument::Lifetime(_) => {}
+                    _ => has_unresolved_generic_arguments = true,
+                }
+            }
+        }
+        syn::PathArguments::Parenthesized(_) => has_unresolved_generic_arguments = true,
+    }
+    Some(TypeReference {
         segments: path
             .segments
             .iter()
             .map(|segment| segment.ident.to_string())
             .collect(),
+        generic_arguments,
+        has_unresolved_generic_arguments,
         context: context.clone(),
         leading_colon: path.leading_colon.is_some(),
     })
@@ -1627,7 +1785,7 @@ impl<'a> FieldReadVisitor<'a> {
 
     fn resolve_type_scoped(&self, ty: &syn::Type) -> Option<String> {
         let reference = type_reference(ty, &self.context)?;
-        self.resolve_symbol_scoped(SymbolKind::Type, &reference)
+        self.resolve_exact_type_scoped_with_limit(&reference, self.local_scopes.len())
     }
 
     fn resolve_path_scoped(&self, path: &syn::Path) -> Option<String> {
@@ -1644,6 +1802,32 @@ impl<'a> FieldReadVisitor<'a> {
             &mut BTreeSet::new(),
         )
         .exact()
+    }
+
+    fn resolve_exact_type_scoped_with_limit(
+        &self,
+        reference: &TypeReference,
+        scope_limit: usize,
+    ) -> Option<String> {
+        let owner = self
+            .resolve_symbol_scoped_with_limit(
+                SymbolKind::Type,
+                reference,
+                scope_limit,
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new(),
+            )
+            .exact()
+            .or_else(|| primitive_type_reference(reference).map(str::to_string))?;
+        if reference.has_unresolved_generic_arguments {
+            return None;
+        }
+        let arguments: Option<Vec<_>> = reference
+            .generic_arguments
+            .iter()
+            .map(|argument| self.resolve_exact_type_scoped_with_limit(argument, scope_limit))
+            .collect();
+        Some(resolved_type_identity(owner, &arguments?))
     }
 
     fn resolve_symbol_scoped_with_limit(
@@ -1773,6 +1957,8 @@ impl<'a> FieldReadVisitor<'a> {
         for name in names {
             let reference = TypeReference {
                 segments: vec![name],
+                generic_arguments: Vec::new(),
+                has_unresolved_generic_arguments: false,
                 context: self.context.clone(),
                 leading_colon: false,
             };
@@ -1834,15 +2020,7 @@ impl<'a> FieldReadVisitor<'a> {
                 if returns.len() != 1 {
                     return None;
                 }
-                return self
-                    .resolve_symbol_scoped_with_limit(
-                        SymbolKind::Type,
-                        &returns[0],
-                        scope_index + 1,
-                        &mut BTreeSet::new(),
-                        &mut BTreeSet::new(),
-                    )
-                    .exact();
+                return self.resolve_exact_type_scoped_with_limit(&returns[0], scope_index + 1);
             }
         }
         let symbol = self.resolve_symbol_scoped(SymbolKind::Function, &reference)?;
@@ -1854,7 +2032,7 @@ impl<'a> FieldReadVisitor<'a> {
             .iter()
             .find(|candidate| candidate.symbol == symbol)?
             .result;
-        self.types.resolve_type_reference(result)
+        self.types.resolve_exact_type_reference(result)
     }
 
     fn block_symbol_scope(&self, block: &syn::Block) -> LocalSymbolScope {
@@ -1886,6 +2064,8 @@ impl<'a> FieldReadVisitor<'a> {
                             .push(LocalSymbolBinding {
                                 target: TypeReference {
                                     segments,
+                                    generic_arguments: Vec::new(),
+                                    has_unresolved_generic_arguments: false,
                                     context: self.context.clone(),
                                     leading_colon: item_use.leading_colon.is_some(),
                                 },
@@ -1895,6 +2075,8 @@ impl<'a> FieldReadVisitor<'a> {
                     for segments in globs {
                         scope.glob_imports.push(TypeReference {
                             segments,
+                            generic_arguments: Vec::new(),
+                            has_unresolved_generic_arguments: false,
                             context: self.context.clone(),
                             leading_colon: item_use.leading_colon.is_some(),
                         });
@@ -1902,6 +2084,8 @@ impl<'a> FieldReadVisitor<'a> {
                     for segments in anonymous {
                         scope.anonymous_imports.push(TypeReference {
                             segments,
+                            generic_arguments: Vec::new(),
+                            has_unresolved_generic_arguments: false,
                             context: self.context.clone(),
                             leading_colon: item_use.leading_colon.is_some(),
                         });
@@ -1941,6 +2125,8 @@ impl<'a> FieldReadVisitor<'a> {
                         .push(LocalSymbolBinding {
                             target: TypeReference {
                                 segments,
+                                generic_arguments: Vec::new(),
+                                has_unresolved_generic_arguments: false,
                                 context: self.context.clone(),
                                 leading_colon,
                             },
@@ -2029,11 +2215,9 @@ impl<'a> FieldReadVisitor<'a> {
     fn bind_pattern(&mut self, pattern: &syn::Pat, value: Option<&InferredValue>) {
         match pattern {
             syn::Pat::Ident(ident) => {
-                let name = ident.ident.to_string();
-                if let Some(value) = value {
-                    self.environment.insert(name, value.clone());
-                } else {
-                    self.environment.remove(&name);
+                self.bind_identifier(ident, value);
+                if let Some((_, subpattern)) = &ident.subpat {
+                    self.bind_pattern(subpattern, value);
                 }
             }
             syn::Pat::Reference(reference) => {
@@ -2103,6 +2287,48 @@ impl<'a> FieldReadVisitor<'a> {
         }
     }
 
+    fn bind_identifier(&mut self, ident: &syn::PatIdent, value: Option<&InferredValue>) {
+        let name = ident.ident.to_string();
+        if let Some(value) = value {
+            self.environment.insert(name, value.clone());
+        } else {
+            self.environment.remove(&name);
+        }
+    }
+
+    fn pattern_is_rest(pattern: &syn::Pat) -> bool {
+        match pattern {
+            syn::Pat::Ident(ident) => ident
+                .subpat
+                .as_ref()
+                .is_some_and(|(_, pattern)| Self::pattern_is_rest(pattern)),
+            syn::Pat::Paren(paren) => Self::pattern_is_rest(&paren.pat),
+            syn::Pat::Reference(reference) => Self::pattern_is_rest(&reference.pat),
+            syn::Pat::Rest(_) => true,
+            syn::Pat::Type(typed) => Self::pattern_is_rest(&typed.pat),
+            _ => false,
+        }
+    }
+
+    fn pattern_has_initializer_structure(pattern: &syn::Pat) -> bool {
+        match pattern {
+            syn::Pat::Ident(ident) => ident
+                .subpat
+                .as_ref()
+                .is_some_and(|(_, pattern)| Self::pattern_has_initializer_structure(pattern)),
+            syn::Pat::Paren(paren) => Self::pattern_has_initializer_structure(&paren.pat),
+            syn::Pat::Reference(reference) => {
+                Self::pattern_has_initializer_structure(&reference.pat)
+            }
+            syn::Pat::Slice(_)
+            | syn::Pat::Struct(_)
+            | syn::Pat::Tuple(_)
+            | syn::Pat::TupleStruct(_) => true,
+            syn::Pat::Type(typed) => Self::pattern_has_initializer_structure(&typed.pat),
+            _ => false,
+        }
+    }
+
     fn record_tagged_enum_match(&mut self, path: &syn::Path) {
         let Some(mut reference) = path_reference(path, &self.context) else {
             return;
@@ -2167,7 +2393,7 @@ impl<'a> FieldReadVisitor<'a> {
         let rest_positions: Vec<_> = patterns
             .iter()
             .enumerate()
-            .filter_map(|(index, pattern)| matches!(pattern, syn::Pat::Rest(_)).then_some(index))
+            .filter_map(|(index, pattern)| Self::pattern_is_rest(pattern).then_some(index))
             .collect();
 
         if rest_positions.is_empty() {
@@ -2197,7 +2423,11 @@ impl<'a> FieldReadVisitor<'a> {
 
         let suffix_len = patterns.len() - rest_index - 1;
         for expression in &expressions[rest_index..expressions.len() - suffix_len] {
-            self.visit_discarded_expr(expression);
+            if matches!(patterns[rest_index], syn::Pat::Rest(_)) {
+                self.visit_discarded_expr(expression);
+            } else if !self.visit_patterned_initializer(patterns[rest_index], expression) {
+                self.visit_expr(expression);
+            }
         }
         for (pattern, expression) in patterns[rest_index + 1..]
             .iter()
@@ -2218,7 +2448,7 @@ impl<'a> FieldReadVisitor<'a> {
         let rest_positions: Vec<_> = patterns
             .iter()
             .enumerate()
-            .filter_map(|(index, pattern)| matches!(pattern, syn::Pat::Rest(_)).then_some(index))
+            .filter_map(|(index, pattern)| Self::pattern_is_rest(pattern).then_some(index))
             .collect();
         if rest_positions.len() > 1 {
             return false;
@@ -2305,7 +2535,7 @@ impl<'a> FieldReadVisitor<'a> {
         let rest_positions: Vec<_> = patterns
             .iter()
             .enumerate()
-            .filter_map(|(index, pattern)| matches!(pattern, syn::Pat::Rest(_)).then_some(index))
+            .filter_map(|(index, pattern)| Self::pattern_is_rest(pattern).then_some(index))
             .collect();
         if rest_positions.is_empty() {
             if patterns.len() != expressions.len() {
@@ -2328,6 +2558,14 @@ impl<'a> FieldReadVisitor<'a> {
             self.bind_patterned_initializer(pattern, expression);
         }
         let suffix_len = patterns.len() - rest_index - 1;
+        if let Some(expression) = expressions
+            .get(rest_index..expressions.len() - suffix_len)
+            .and_then(|expressions| expressions.first())
+        {
+            self.bind_patterned_initializer(patterns[rest_index], expression);
+        } else {
+            self.bind_pattern(patterns[rest_index], None);
+        }
         for (pattern, expression) in patterns[rest_index + 1..]
             .iter()
             .zip(&expressions[expressions.len() - suffix_len..])
@@ -2344,7 +2582,7 @@ impl<'a> FieldReadVisitor<'a> {
     ) -> bool {
         if patterns
             .iter()
-            .filter(|pattern| matches!(pattern, syn::Pat::Rest(_)))
+            .filter(|pattern| Self::pattern_is_rest(pattern))
             .count()
             > 1
         {
@@ -2389,6 +2627,14 @@ impl<'a> FieldReadVisitor<'a> {
 
     fn bind_patterned_initializer(&mut self, pattern: &syn::Pat, expression: &syn::Expr) {
         let paired = match (pattern, expression) {
+            (syn::Pat::Ident(ident), _) if ident.subpat.is_some() => {
+                let inferred = self.infer_expr(expression);
+                self.bind_identifier(ident, inferred.as_ref());
+                if let Some((_, subpattern)) = &ident.subpat {
+                    self.bind_patterned_initializer(subpattern, expression);
+                }
+                true
+            }
             (syn::Pat::Paren(pattern), _) => {
                 self.bind_patterned_initializer(&pattern.pat, expression);
                 true
@@ -2451,6 +2697,13 @@ impl<'a> FieldReadVisitor<'a> {
 
     fn visit_patterned_initializer(&mut self, pattern: &syn::Pat, expression: &syn::Expr) -> bool {
         match (pattern, expression) {
+            (syn::Pat::Ident(ident), _) if ident.subpat.is_some() => {
+                self.visit_expr(expression);
+                if let Some((_, subpattern)) = &ident.subpat {
+                    let _ = self.visit_patterned_initializer(subpattern, expression);
+                }
+                true
+            }
             (syn::Pat::Paren(pattern), _) => {
                 self.visit_patterned_initializer(&pattern.pat, expression)
             }
@@ -3096,18 +3349,52 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
     }
 
     fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
-        let owner = self.infer_expr(&node.expr);
-        self.bind_pattern(&node.pat, owner.as_ref());
+        let saved_environment = self.environment.clone();
+        let patterned_initializer = self.visit_patterned_initializer(&node.pat, &node.expr);
+        let inferred = (!patterned_initializer)
+            .then(|| self.infer_expr(&node.expr))
+            .flatten();
+        self.environment = saved_environment;
+        if patterned_initializer {
+            self.bind_patterned_initializer(&node.pat, &node.expr);
+        } else {
+            self.bind_pattern(&node.pat, inferred.as_ref());
+        }
     }
 
     fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
-        let owner = self.infer_expr(&node.expr);
-        for arm in &node.arms {
+        let saved_environment = self.environment.clone();
+        let patterned_arms: Vec<_> = node
+            .arms
+            .iter()
+            .map(|arm| {
+                if attributes_are_test_only(&arm.attrs) {
+                    return false;
+                }
+                self.environment = saved_environment.clone();
+                self.visit_patterned_initializer(&arm.pat, &node.expr)
+            })
+            .collect();
+        self.environment = saved_environment.clone();
+        let has_patterned_arm = node
+            .arms
+            .iter()
+            .zip(&patterned_arms)
+            .any(|(arm, paired)| *paired && Self::pattern_has_initializer_structure(&arm.pat));
+        let inferred = (!has_patterned_arm)
+            .then(|| self.infer_expr(&node.expr))
+            .flatten();
+        self.environment = saved_environment.clone();
+        for (arm, patterned_initializer) in node.arms.iter().zip(patterned_arms) {
             if attributes_are_test_only(&arm.attrs) {
                 continue;
             }
             let saved_environment = self.environment.clone();
-            self.bind_pattern(&arm.pat, owner.as_ref());
+            if patterned_initializer {
+                self.bind_patterned_initializer(&arm.pat, &node.expr);
+            } else if !has_patterned_arm {
+                self.bind_pattern(&arm.pat, inferred.as_ref());
+            }
             if let Some((_, guard)) = &arm.guard {
                 self.visit_expr(guard);
             }
@@ -4809,6 +5096,96 @@ fn production(config: Option<&Config>) {
     }
 
     #[test]
+    fn if_let_structural_bindings_preserve_config_provenance() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &GuardConfig) {\n\
+                 if let Some(cfg) = Some(v) {\n\
+                     consume(cfg.enabled);\n\
+                 }\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "an if-let binding must retain structural initializer provenance: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn if_let_discarded_fields_are_not_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn ignore(v: &GuardConfig) {\n\
+                 if let Some(_) = Some(v.enabled) {}\n\
+             }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "an if-let wildcard must discard its paired field expression: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn match_structural_bindings_preserve_config_provenance() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &GuardConfig) {\n\
+                 match Some(v) {\n\
+                     Some(cfg) => consume(cfg.enabled),\n\
+                     None => {}\n\
+                 }\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "a match binding must retain structural scrutinee provenance: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn match_fallback_bindings_ignore_catch_all_arm_pairing() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn inspect(v: Option<&GuardConfig>) {\n\
+                 match v {\n\
+                     Some(cfg) if cfg.enabled => {},\n\
+                     _ => {}\n\
+                 }\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "a catch-all arm cannot suppress whole-scrutinee type inference: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn match_discarded_fields_are_not_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn ignore(v: &GuardConfig) {\n\
+                 match Some(v.enabled) {\n\
+                     Some(_) => {},\n\
+                     None => {}\n\
+                 }\n\
+             }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a match wildcard must discard its paired field expression: {errors:?}"
+        );
+    }
+
+    #[test]
     fn test_attributed_match_arms_are_not_reader_evidence() {
         let errors = guard_errors(&[source(
             "struct GuardConfig { enabled: bool }\n\
@@ -5661,6 +6038,58 @@ fn cfg_test(config: &Config) {
     }
 
     #[test]
+    fn at_subpatterns_preserve_nested_config_provenance() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &GuardConfig) {\n\
+                 let _outer @ Some(cfg) = Some(v) else { return; };\n\
+                 consume(cfg.enabled);\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "an identifier binding must not hide its nested @ subpattern: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn named_rest_keeps_discarded_prefix_fields_unread() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn consume<T>(_: T) {}\n\
+             fn ignore(v: &GuardConfig) {\n\
+                 let [_, tail @ ..] = [v.enabled, true, false];\n\
+                 consume(tail[0]);\n\
+             }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a named rest must not revive a field paired with a prefix wildcard: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn named_rest_bindings_preserve_element_provenance() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &GuardConfig, other: &GuardConfig) {\n\
+                 let [_, tail @ ..] = [other, v, other];\n\
+                 consume(tail[0].enabled);\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "a named rest binding must retain its element owner: {errors:?}"
+        );
+    }
+
+    #[test]
     fn ignored_repeat_initializer_elements_are_not_reader_evidence() {
         let errors = guard_errors(&[source(
             "struct GuardConfig { enabled: bool }\n\
@@ -5957,6 +6386,43 @@ fn cfg_test(config: &Config) {
     }
 
     #[test]
+    fn external_blanket_bounds_use_compiled_method_applicability() {
+        let errors = guard_errors(&[source(
+            "struct Flag;\n\
+             trait State { fn is_set(&self) -> bool { true } }\n\
+             impl<T: Send> State for T {}\n\
+             struct GuardConfig { enabled: Flag }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &GuardConfig) { consume(v.enabled.is_set()); }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "an unresolved standard-library bound must not hide a compiled method call: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn inapplicable_external_bounds_do_not_poison_proven_shared_methods() {
+        let errors = guard_errors(&[source(
+            "struct Flag(std::rc::Rc<()>);\n\
+             trait State { fn is_set(&self) -> bool { true } }\n\
+             trait Mutate { fn is_set(&mut self) -> bool { false } }\n\
+             impl State for Flag {}\n\
+             impl<T: Send> Mutate for T {}\n\
+             struct GuardConfig { enabled: Flag }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &mut GuardConfig) { consume(v.enabled.is_set()); }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "an external bound cannot conflict with a receiver already proven applicable: \
+             {errors:?}"
+        );
+    }
+
+    #[test]
     fn out_of_scope_blanket_traits_do_not_poison_shared_methods() {
         let errors = guard_errors(&[source(
             "mod hidden {\n\
@@ -6018,6 +6484,49 @@ fn cfg_test(config: &Config) {
                 "an imported mutable extension trait remains visible: {import}\n{errors:?}"
             );
         }
+    }
+
+    #[test]
+    fn generic_exact_impl_owners_keep_receiver_semantics_distinct() {
+        let errors = guard_errors(&[source(
+            "struct A;\n\
+             struct B;\n\
+             struct Wrap<T>(T);\n\
+             trait Observe { fn is_set(&self) -> bool { true } }\n\
+             trait Mutate { fn is_set(&mut self) -> bool { false } }\n\
+             impl Observe for Wrap<A> {}\n\
+             impl Mutate for Wrap<B> {}\n\
+             struct GuardConfig { enabled: Wrap<A> }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &mut GuardConfig) { consume(v.enabled.is_set()); }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "an impl for Wrap<B> cannot conflict with the Wrap<A> receiver: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn generic_exact_impl_owners_preserve_matching_mutable_receivers() {
+        let errors = guard_errors(&[source(
+            "struct A;\n\
+             struct B;\n\
+             struct Wrap<T>(T);\n\
+             trait Observe { fn is_set(&self) -> bool { true } }\n\
+             trait Mutate { fn is_set(&mut self) -> bool { false } }\n\
+             impl Observe for Wrap<A> {}\n\
+             impl Mutate for Wrap<B> {}\n\
+             struct GuardConfig { enabled: Wrap<B> }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &mut GuardConfig) { consume(v.enabled.is_set()); }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "the matching Wrap<B> impl must retain its mutable receiver: {errors:?}"
+        );
     }
 
     #[test]
