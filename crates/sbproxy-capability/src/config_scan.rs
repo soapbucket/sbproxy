@@ -385,18 +385,74 @@ struct FunctionReturn {
 struct RustTypeIndex {
     fields: BTreeMap<String, BTreeMap<String, Option<TypeReference>>>,
     types_by_name: BTreeMap<String, BTreeSet<String>>,
+    symbol_bindings: BTreeMap<String, Vec<TypeReference>>,
+    glob_imports: BTreeMap<ModuleContext, Vec<Vec<String>>>,
+    known_crates: BTreeSet<String>,
+    known_modules: BTreeSet<String>,
     enum_tags: BTreeMap<String, String>,
     enum_variants: BTreeMap<String, BTreeSet<String>>,
     function_returns: BTreeMap<String, Vec<FunctionReturn>>,
 }
 
 impl RustTypeIndex {
+    fn record_context(&mut self, context: &ModuleContext) {
+        self.known_crates.insert(context.crate_name.clone());
+        if !context.modules.is_empty() {
+            self.known_modules.insert(
+                std::iter::once(context.crate_name.as_str())
+                    .chain(context.modules.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join("::"),
+            );
+        }
+    }
+
     fn record_type(&mut self, owner: &str, simple_name: &str) {
         self.fields.entry(owner.to_string()).or_default();
         self.types_by_name
             .entry(simple_name.to_string())
             .or_default()
             .insert(owner.to_string());
+    }
+
+    fn record_symbol_binding(&mut self, alias: String, target: TypeReference) {
+        self.symbol_bindings.entry(alias).or_default().push(target);
+    }
+
+    fn record_glob_import(&mut self, context: &ModuleContext, target: Vec<String>) {
+        self.glob_imports
+            .entry(context.clone())
+            .or_default()
+            .push(target);
+    }
+
+    fn has_unresolved_external_glob(&self, context: &ModuleContext) -> bool {
+        self.glob_imports.get(context).is_some_and(|imports| {
+            imports
+                .iter()
+                .any(|segments| !self.glob_target_is_known(segments, context))
+        })
+    }
+
+    fn glob_target_is_known(&self, segments: &[String], context: &ModuleContext) -> bool {
+        let Some(first) = segments.first().map(String::as_str) else {
+            return false;
+        };
+        if matches!(first, "crate" | "self" | "super") {
+            return true;
+        }
+        if self.known_crates.contains(&normalize_crate_name(first)) {
+            return true;
+        }
+
+        (0..=context.modules.len()).rev().any(|depth| {
+            let candidate = std::iter::once(context.crate_name.as_str())
+                .chain(context.modules[..depth].iter().map(String::as_str))
+                .chain(segments.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join("::");
+            self.known_modules.contains(&candidate) || self.fields.contains_key(&candidate)
+        })
     }
 
     fn record_fields(&mut self, owner: &str, fields: &syn::Fields, context: &ModuleContext) {
@@ -478,102 +534,152 @@ impl RustTypeIndex {
         segments: &[String],
         context: &ModuleContext,
     ) -> Option<String> {
+        self.resolve_path_segments_inner(segments, context, &mut BTreeSet::new())
+    }
+
+    fn resolve_path_segments_inner(
+        &self,
+        segments: &[String],
+        context: &ModuleContext,
+        resolving: &mut BTreeSet<String>,
+    ) -> Option<String> {
         let simple_name = segments.last()?;
-        let candidates = self.types_by_name.get(simple_name)?;
 
         if segments.len() == 1 {
             let local = context.symbol(simple_name);
-            if candidates.contains(&local) {
+            if self
+                .types_by_name
+                .get(simple_name)
+                .is_some_and(|candidates| candidates.contains(&local))
+            {
                 return Some(local);
             }
-        } else {
-            let first = segments.first()?.as_str();
-            let mut prefixes = Vec::new();
-            match first {
-                "crate" => {
-                    prefixes.push(
-                        std::iter::once(context.crate_name.as_str())
-                            .chain(segments[1..segments.len() - 1].iter().map(String::as_str))
-                            .collect::<Vec<_>>()
-                            .join("::"),
-                    );
+
+            if let Some(bindings) = self.symbol_bindings.get(&local) {
+                if !resolving.insert(local.clone()) {
+                    return None;
                 }
-                "self" => {
-                    prefixes.push(
-                        std::iter::once(context.crate_name.as_str())
-                            .chain(context.modules.iter().map(String::as_str))
-                            .chain(segments[1..segments.len() - 1].iter().map(String::as_str))
-                            .collect::<Vec<_>>()
-                            .join("::"),
-                    );
+                let mut resolved = BTreeSet::new();
+                for binding in bindings {
+                    let Some(owner) = self.resolve_path_segments_inner(
+                        &binding.segments,
+                        &binding.context,
+                        resolving,
+                    ) else {
+                        resolving.remove(&local);
+                        return None;
+                    };
+                    resolved.insert(owner);
                 }
-                "super" => {
-                    let mut modules = context.modules.clone();
-                    let mut skip = 0usize;
-                    while segments.get(skip).is_some_and(|segment| segment == "super") {
-                        modules.pop();
-                        skip += 1;
-                    }
-                    prefixes.push(
-                        std::iter::once(context.crate_name.as_str())
-                            .chain(modules.iter().map(String::as_str))
-                            .chain(
-                                segments[skip..segments.len() - 1]
-                                    .iter()
-                                    .map(String::as_str),
-                            )
-                            .collect::<Vec<_>>()
-                            .join("::"),
-                    );
-                }
-                external => prefixes.push(
-                    std::iter::once(normalize_crate_name(external))
-                        .chain(segments[1..segments.len() - 1].iter().cloned())
+                resolving.remove(&local);
+                return (resolved.len() == 1)
+                    .then(|| resolved.into_iter().next())
+                    .flatten();
+            }
+
+            if self.has_unresolved_external_glob(context) {
+                return None;
+            }
+
+            let candidates = self.types_by_name.get(simple_name)?;
+            return (candidates.len() == 1)
+                .then(|| candidates.first().cloned())
+                .flatten();
+        }
+
+        let candidates = self.types_by_name.get(simple_name)?;
+        let first = segments.first()?.as_str();
+        let mut prefixes = Vec::new();
+        match first {
+            "crate" => {
+                prefixes.push(
+                    std::iter::once(context.crate_name.as_str())
+                        .chain(segments[1..segments.len() - 1].iter().map(String::as_str))
                         .collect::<Vec<_>>()
                         .join("::"),
-                ),
+                );
             }
-
-            let exact = prefixes
-                .iter()
-                .map(|prefix| {
-                    if prefix.is_empty() {
-                        simple_name.clone()
-                    } else {
-                        format!("{prefix}::{simple_name}")
-                    }
-                })
-                .filter(|candidate| candidates.contains(candidate))
-                .collect::<Vec<_>>();
-            if exact.len() == 1 {
-                return exact.into_iter().next();
+            "self" => {
+                prefixes.push(
+                    std::iter::once(context.crate_name.as_str())
+                        .chain(context.modules.iter().map(String::as_str))
+                        .chain(segments[1..segments.len() - 1].iter().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join("::"),
+                );
             }
-
-            // Public re-exports often omit the defining module
-            // (`sbproxy_config::Foo` vs `sbproxy_config::types::Foo`).
-            // An explicit crate path still resolves safely when that crate
-            // owns exactly one type with the requested simple name.
-            if !matches!(first, "crate" | "self" | "super") {
-                let crate_name = normalize_crate_name(first);
-                let in_crate: Vec<_> = candidates
-                    .iter()
-                    .filter(|candidate| {
-                        candidate
-                            .split("::")
-                            .next()
-                            .is_some_and(|owner| owner == crate_name)
-                    })
-                    .cloned()
-                    .collect();
-                if in_crate.len() == 1 {
-                    return in_crate.into_iter().next();
+            "super" => {
+                let mut modules = context.modules.clone();
+                let mut skip = 0usize;
+                while segments.get(skip).is_some_and(|segment| segment == "super") {
+                    modules.pop();
+                    skip += 1;
                 }
+                prefixes.push(
+                    std::iter::once(context.crate_name.as_str())
+                        .chain(modules.iter().map(String::as_str))
+                        .chain(
+                            segments[skip..segments.len() - 1]
+                                .iter()
+                                .map(String::as_str),
+                        )
+                        .collect::<Vec<_>>()
+                        .join("::"),
+                );
+            }
+            external => prefixes.push(
+                std::iter::once(normalize_crate_name(external))
+                    .chain(segments[1..segments.len() - 1].iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join("::"),
+            ),
+        }
+
+        let exact = prefixes
+            .iter()
+            .map(|prefix| {
+                if prefix.is_empty() {
+                    simple_name.clone()
+                } else {
+                    format!("{prefix}::{simple_name}")
+                }
+            })
+            .filter(|candidate| candidates.contains(candidate))
+            .collect::<Vec<_>>();
+        if exact.len() == 1 {
+            return exact.into_iter().next();
+        }
+
+        // Public re-exports often omit the defining module
+        // (`sbproxy_config::Foo` vs `sbproxy_config::types::Foo`).
+        // An explicit crate path still resolves safely when that crate
+        // owns exactly one type with the requested simple name.
+        if first == "crate" || !matches!(first, "self" | "super") {
+            let crate_name = if first == "crate" {
+                context.crate_name.clone()
+            } else {
+                normalize_crate_name(first)
+            };
+            let in_crate: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate
+                        .split("::")
+                        .next()
+                        .is_some_and(|owner| owner == crate_name)
+                })
+                .cloned()
+                .collect();
+            if in_crate.len() == 1 {
+                return in_crate.into_iter().next();
             }
         }
 
-        (candidates.len() == 1)
-            .then(|| candidates.first().cloned())
-            .flatten()
+        // A qualified path made an ownership claim. If neither that exact
+        // module nor a unique re-export from that explicit crate exists,
+        // fail closed rather than collapsing to an unrelated unique type
+        // with the same final segment.
+        None
     }
 
     fn schema_owner(&self, owner: &str) -> Option<String> {
@@ -615,38 +721,128 @@ impl RustTypeIndex {
     }
 
     fn function_return(&self, path: &syn::Path, context: &ModuleContext) -> Option<String> {
-        let name = path.segments.last()?.ident.to_string();
-        let candidates = self.function_returns.get(&name)?;
-        let symbol = if path.segments.len() == 1 {
-            let local = context.symbol(&name);
-            candidates
-                .iter()
-                .find(|candidate| candidate.symbol == local)
-                .map(|candidate| candidate.symbol.clone())
-                .or_else(|| (candidates.len() == 1).then(|| candidates[0].symbol.clone()))?
-        } else {
-            let path_segments: Vec<String> = path
-                .segments
-                .iter()
-                .map(|segment| segment.ident.to_string())
-                .collect();
-            let first = path_segments.first()?.as_str();
-            let crate_name = if first == "crate" {
-                context.crate_name.clone()
-            } else {
-                normalize_crate_name(first)
-            };
-            let in_crate: Vec<_> = candidates
-                .iter()
-                .filter(|candidate| candidate.symbol.starts_with(&format!("{crate_name}::")))
-                .collect();
-            (in_crate.len() == 1).then(|| in_crate[0].symbol.clone())?
-        };
+        let segments: Vec<String> = path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        let symbol = self.resolve_function_symbol(&segments, context, &mut BTreeSet::new())?;
+        let name = symbol.rsplit("::").next()?;
+        let candidates = self.function_returns.get(name)?;
         let result = &candidates
             .iter()
             .find(|candidate| candidate.symbol == symbol)?
             .result;
         self.resolve_path_segments(&result.segments, &result.context)
+    }
+
+    fn resolve_function_symbol(
+        &self,
+        segments: &[String],
+        context: &ModuleContext,
+        resolving: &mut BTreeSet<String>,
+    ) -> Option<String> {
+        let name = segments.last()?;
+
+        if segments.len() == 1 {
+            let local = context.symbol(name);
+            if self.function_returns.get(name).is_some_and(|candidates| {
+                candidates.iter().any(|candidate| candidate.symbol == local)
+            }) {
+                return Some(local);
+            }
+
+            if let Some(bindings) = self.symbol_bindings.get(&local) {
+                if !resolving.insert(local.clone()) {
+                    return None;
+                }
+                let mut resolved = BTreeSet::new();
+                for binding in bindings {
+                    let Some(symbol) = self.resolve_function_symbol(
+                        &binding.segments,
+                        &binding.context,
+                        resolving,
+                    ) else {
+                        resolving.remove(&local);
+                        return None;
+                    };
+                    resolved.insert(symbol);
+                }
+                resolving.remove(&local);
+                return (resolved.len() == 1)
+                    .then(|| resolved.into_iter().next())
+                    .flatten();
+            }
+
+            if self.has_unresolved_external_glob(context) {
+                return None;
+            }
+
+            let candidates = self.function_returns.get(name)?;
+            return (candidates.len() == 1).then(|| candidates[0].symbol.clone());
+        }
+
+        let candidates = self.function_returns.get(name)?;
+        let first = segments.first()?.as_str();
+        let prefix = match first {
+            "crate" => std::iter::once(context.crate_name.as_str())
+                .chain(segments[1..segments.len() - 1].iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join("::"),
+            "self" => std::iter::once(context.crate_name.as_str())
+                .chain(context.modules.iter().map(String::as_str))
+                .chain(segments[1..segments.len() - 1].iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join("::"),
+            "super" => {
+                let mut modules = context.modules.clone();
+                let mut skip = 0usize;
+                while segments.get(skip).is_some_and(|segment| segment == "super") {
+                    modules.pop();
+                    skip += 1;
+                }
+                std::iter::once(context.crate_name.as_str())
+                    .chain(modules.iter().map(String::as_str))
+                    .chain(
+                        segments[skip..segments.len() - 1]
+                            .iter()
+                            .map(String::as_str),
+                    )
+                    .collect::<Vec<_>>()
+                    .join("::")
+            }
+            external => std::iter::once(normalize_crate_name(external))
+                .chain(segments[1..segments.len() - 1].iter().cloned())
+                .collect::<Vec<_>>()
+                .join("::"),
+        };
+        let exact = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}::{name}")
+        };
+        if candidates.iter().any(|candidate| candidate.symbol == exact) {
+            return Some(exact);
+        }
+
+        if !matches!(first, "crate" | "self" | "super") {
+            let crate_name = normalize_crate_name(first);
+            let in_crate: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate
+                        .symbol
+                        .split("::")
+                        .next()
+                        .is_some_and(|owner| owner == crate_name)
+                })
+                .collect();
+            if in_crate.len() == 1 {
+                return Some(in_crate[0].symbol.clone());
+            }
+        }
+
+        None
     }
 }
 
@@ -666,6 +862,7 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
         if attributes_are_test_only(&node.attrs) {
             return;
         }
+        self.index.record_context(&self.context.child(&node.ident));
         let Some((_, items)) = &node.content else {
             return;
         };
@@ -700,6 +897,75 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
             self.index.record_function_return(&node.sig, &self.context);
         }
     }
+
+    fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+        if let Some(target) = type_reference(&node.ty, &self.context) {
+            self.index
+                .record_symbol_binding(self.context.symbol(&node.ident.to_string()), target);
+        }
+    }
+
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        let mut bindings = Vec::new();
+        let mut globs = Vec::new();
+        collect_use_bindings(&node.tree, &mut Vec::new(), &mut bindings, &mut globs);
+        for (alias, segments) in bindings {
+            self.index.record_symbol_binding(
+                self.context.symbol(&alias),
+                TypeReference {
+                    segments,
+                    context: self.context.clone(),
+                },
+            );
+        }
+        for target in globs {
+            self.index.record_glob_import(&self.context, target);
+        }
+    }
+}
+
+fn collect_use_bindings(
+    tree: &syn::UseTree,
+    prefix: &mut Vec<String>,
+    out: &mut Vec<(String, Vec<String>)>,
+    globs: &mut Vec<Vec<String>>,
+) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            collect_use_bindings(&path.tree, prefix, out, globs);
+            prefix.pop();
+        }
+        syn::UseTree::Name(name) => {
+            let ident = name.ident.to_string();
+            if ident == "self" {
+                if let Some(alias) = prefix.last().cloned() {
+                    out.push((alias, prefix.clone()));
+                }
+            } else {
+                let mut target = prefix.clone();
+                target.push(ident.clone());
+                out.push((ident, target));
+            }
+        }
+        syn::UseTree::Rename(rename) => {
+            let alias = rename.rename.to_string();
+            if alias != "_" {
+                let mut target = prefix.clone();
+                let ident = rename.ident.to_string();
+                if ident != "self" {
+                    target.push(ident);
+                }
+                out.push((alias, target));
+            }
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                collect_use_bindings(item, prefix, out, globs);
+            }
+        }
+        syn::UseTree::Glob(_) => globs.push(prefix.clone()),
+    }
 }
 
 fn rust_type_index(sources: &[&SourceFile]) -> RustTypeIndex {
@@ -708,6 +974,7 @@ fn rust_type_index(sources: &[&SourceFile]) -> RustTypeIndex {
         let Some(context) = ModuleContext::from_source_path(&source.path) else {
             continue;
         };
+        index.record_context(&context);
         if let Ok(file) = syn::parse_file(&source.raw_text) {
             let mut visitor = TypeIndexVisitor {
                 index: &mut index,
@@ -1118,16 +1385,19 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
     }
 
     fn visit_local(&mut self, node: &'ast syn::Local) {
+        let saved_environment = self.environment.clone();
         let inferred = node
             .init
             .as_ref()
             .and_then(|init| self.infer_expr(&init.expr));
-        self.bind_pattern(&node.pat, inferred.as_deref());
+        self.environment = saved_environment.clone();
         if let Some(init) = &node.init {
             if let Some((_, diverge)) = &init.diverge {
                 self.visit_expr(diverge);
+                self.environment = saved_environment;
             }
         }
+        self.bind_pattern(&node.pat, inferred.as_deref());
     }
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
@@ -1141,6 +1411,17 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
         let saved_environment = self.environment.clone();
         self.bind_pattern(&node.pat, owner.as_deref());
         self.visit_block(&node.body);
+        self.environment = saved_environment;
+    }
+
+    fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+        let saved_environment = self.environment.clone();
+        self.visit_expr(&node.cond);
+        self.visit_block(&node.then_branch);
+        self.environment = saved_environment.clone();
+        if let Some((_, otherwise)) = &node.else_branch {
+            self.visit_expr(otherwise);
+        }
         self.environment = saved_environment;
     }
 
@@ -1160,6 +1441,13 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
             self.visit_expr(&arm.body);
             self.environment = saved_environment;
         }
+    }
+
+    fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+        let saved_environment = self.environment.clone();
+        self.visit_expr(&node.cond);
+        self.visit_block(&node.body);
+        self.environment = saved_environment;
     }
 
     fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
@@ -1566,6 +1854,247 @@ fn production(existing: &ExistingFeature) {
                 .any(|error| error.subject == "proxy.guard.enabled"),
             "a runtime-local namesake must not prove the config type: {errors:?}"
         );
+    }
+
+    #[test]
+    fn unresolved_explicit_external_type_cannot_collapse_to_a_local_namesake() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        let sources = [
+            source_at(
+                "crates/config/src/types.rs",
+                "struct GuardConfig { enabled: bool }",
+            ),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                "fn runtime(v: external_crate::GuardConfig) { consume(v.enabled); }",
+            ),
+        ];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "an unresolved qualified type must fail closed: {errors:?}"
+        );
+        assert_eq!(errors[0].subject, "proxy.guard.enabled");
+    }
+
+    #[test]
+    fn external_imports_and_type_aliases_cannot_shadow_the_config_owner() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        for runtime in [
+            "use external_crate::GuardConfig;\n\
+             fn runtime(v: &GuardConfig) { consume(v.enabled); }",
+            "use external_crate::Something as GuardConfig;\n\
+             fn runtime(v: &GuardConfig) { consume(v.enabled); }",
+            "type GuardConfig = external_crate::Something;\n\
+             fn runtime(v: &GuardConfig) { consume(v.enabled); }",
+        ] {
+            let sources = [
+                source_at(
+                    "crates/config/src/types.rs",
+                    "struct GuardConfig { enabled: bool }",
+                ),
+                source_at("crates/runtime/src/lib.rs", runtime),
+            ];
+
+            let errors = verify_config_readers(&keys, &[], &sources);
+
+            assert_eq!(
+                errors.len(),
+                1,
+                "an external import or alias must fail closed: {errors:?}"
+            );
+            assert_eq!(errors[0].subject, "proxy.guard.enabled");
+        }
+    }
+
+    #[test]
+    fn unresolved_qualified_external_function_cannot_collapse_to_a_local_namesake() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        let sources = [
+            source_at(
+                "crates/config/src/lib.rs",
+                "struct GuardConfig { enabled: bool }\n\
+                 fn make_guard() -> GuardConfig { todo!() }",
+            ),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                "fn runtime() { consume(external_crate::make_guard().enabled); }",
+            ),
+        ];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "an unresolved qualified function must fail closed: {errors:?}"
+        );
+        assert_eq!(errors[0].subject, "proxy.guard.enabled");
+    }
+
+    #[test]
+    fn imported_external_function_cannot_collapse_to_a_unique_local_namesake() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        for runtime in [
+            "use external_crate::make_guard;\n\
+             fn runtime() { consume(make_guard().enabled); }",
+            "use external_crate::something as make_guard;\n\
+             fn runtime() { consume(make_guard().enabled); }",
+        ] {
+            let sources = [
+                source_at(
+                    "crates/config/src/lib.rs",
+                    "struct GuardConfig { enabled: bool }\n\
+                     fn make_guard() -> GuardConfig { todo!() }",
+                ),
+                source_at("crates/runtime/src/lib.rs", runtime),
+            ];
+
+            let errors = verify_config_readers(&keys, &[], &sources);
+
+            assert_eq!(
+                errors.len(),
+                1,
+                "an unresolved imported function must fail closed: {errors:?}"
+            );
+            assert_eq!(errors[0].subject, "proxy.guard.enabled");
+        }
+    }
+
+    #[test]
+    fn external_glob_import_cannot_collapse_to_a_unique_local_type_namesake() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        let sources = [
+            source_at(
+                "crates/config/src/types.rs",
+                "struct GuardConfig { enabled: bool }",
+            ),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                "use external_crate::*;\n\
+                 fn runtime(v: &GuardConfig) { consume(v.enabled); }",
+            ),
+        ];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "an unresolved external glob must make type provenance fail closed: {errors:?}"
+        );
+        assert_eq!(errors[0].subject, "proxy.guard.enabled");
+    }
+
+    #[test]
+    fn external_glob_import_cannot_collapse_to_a_unique_local_function_namesake() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        let sources = [
+            source_at(
+                "crates/config/src/lib.rs",
+                "struct GuardConfig { enabled: bool }\n\
+                 fn make_guard() -> GuardConfig { todo!() }",
+            ),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                "use external_crate::*;\n\
+                 fn runtime() { consume(make_guard().enabled); }",
+            ),
+        ];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "an unresolved external glob must make function provenance fail closed: {errors:?}"
+        );
+        assert_eq!(errors[0].subject, "proxy.guard.enabled");
+    }
+
+    #[test]
+    fn same_crate_root_reexport_preserves_type_provenance() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        let sources = [source_at(
+            "crates/config/src/lib.rs",
+            "mod types { struct GuardConfig { enabled: bool } }\n\
+             pub use types::*;\n\
+             use crate::GuardConfig;\n\
+             fn runtime(v: &GuardConfig) { consume(v.enabled); }",
+        )];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert!(
+            errors.is_empty(),
+            "a same-crate root re-export must retain exact provenance: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn legitimate_local_imports_and_aliases_preserve_provenance() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        for reader in [
+            "use crate::types::GuardConfig;\n\
+             fn runtime(v: &GuardConfig) { consume(v.enabled); }",
+            "type LocalGuard = crate::types::GuardConfig;\n\
+             fn runtime(v: &LocalGuard) { consume(v.enabled); }",
+            "use crate::factory::make_guard;\n\
+             fn runtime() { consume(make_guard().enabled); }",
+        ] {
+            let sources = [source_at(
+                "crates/config/src/lib.rs",
+                &format!(
+                    "mod types {{ struct GuardConfig {{ enabled: bool }} }}\n\
+                     mod factory {{\n\
+                         fn make_guard() -> crate::types::GuardConfig {{ todo!() }}\n\
+                     }}\n\
+                     {reader}"
+                ),
+            )];
+
+            let errors = verify_config_readers(&keys, &[], &sources);
+
+            assert!(
+                errors.is_empty(),
+                "a local import or alias must retain exact provenance: {errors:?}"
+            );
+        }
     }
 
     #[test]
@@ -2115,6 +2644,45 @@ fn cfg_test(config: &Config) {
                 errors.len(),
                 1,
                 "non-read syntax must not prove a reader: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_pattern_bindings_do_not_escape_their_rust_scopes() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        for text in [
+            "struct GuardConfig { enabled: bool }\n\
+             struct Existing { enabled: bool }\n\
+             fn f(value: &Existing, maybe: Option<&GuardConfig>) {\n\
+                 if let Some(value) = maybe { consume(value); }\n\
+                 consume(value.enabled);\n\
+             }",
+            "struct GuardConfig { enabled: bool }\n\
+             struct Existing { enabled: bool }\n\
+             fn f(value: &Existing, maybe: Option<&GuardConfig>) {\n\
+                 while let Some(value) = maybe { consume(value); break; }\n\
+                 consume(value.enabled);\n\
+             }",
+            "struct GuardConfig { enabled: bool }\n\
+             struct Existing { enabled: bool }\n\
+             fn f(value: &Existing, maybe: Option<&GuardConfig>) {\n\
+                 let Some(value) = maybe else {\n\
+                     consume(value.enabled);\n\
+                     return;\n\
+                 };\n\
+                 consume(value);\n\
+             }",
+        ] {
+            let errors = verify_config_readers(&keys, &[], &[source(text)]);
+            assert_eq!(
+                errors.len(),
+                1,
+                "a conditional binding must not retag an outer value: {errors:?}"
             );
         }
     }

@@ -938,7 +938,13 @@ fn main() {
     let log_filter = resolve_log_filter(&cli.globals);
     let log_format = cli.globals.log_format.unwrap_or_default();
     let runtime_telemetry = runtime_telemetry_config_for_cli(&cli);
-    init_tracing(log_filter, log_format, runtime_telemetry.as_ref());
+    let log_to_stderr = cli.check || !matches!(&cli.cmd, None | Some(Cmd::Serve(_)));
+    init_tracing(
+        log_filter,
+        log_format,
+        runtime_telemetry.as_ref(),
+        log_to_stderr,
+    );
 
     // Resolve secret references in the alert channels and hand the finished set
     // to the boot-time dispatcher in sbproxy-core (WOR-1884). Done here, in the
@@ -1646,13 +1652,18 @@ fn init_tracing(
     log_filter: String,
     format: LogFormat,
     telemetry: Option<&sbproxy_observe::TelemetryConfig>,
+    log_to_stderr: bool,
 ) {
     let logging = sbproxy_observe::LoggingConfig {
         level: log_filter,
         format: format.as_str().to_string(),
         sampling: sbproxy_observe::SamplingConfig::default(),
     };
-    logging.init_with_resolved_filter_and_telemetry(telemetry);
+    if log_to_stderr {
+        logging.init_with_resolved_filter_and_telemetry_to_stderr(telemetry);
+    } else {
+        logging.init_with_resolved_filter_and_telemetry(telemetry);
+    }
 }
 
 /// Honour `SB_DISABLE_SB_FLAGS=1|true|yes|on` (case-insensitive).

@@ -118,14 +118,14 @@ fn default_format() -> String {
 impl LoggingConfig {
     /// Initialize the global tracing subscriber.
     pub fn init(&self) {
-        self.init_inner(None, true);
+        self.init_inner(None, true, false);
     }
 
     /// Initialize the global tracing subscriber with an optional OTLP
     /// trace layer. `RUST_LOG` still overrides `self.level`, matching
     /// [`Self::init`].
     pub fn init_with_telemetry(&self, telemetry: Option<&crate::telemetry::TelemetryConfig>) {
-        self.init_inner(telemetry, true);
+        self.init_inner(telemetry, true, false);
     }
 
     /// Initialize with an already-resolved filter string. The binary
@@ -135,13 +135,24 @@ impl LoggingConfig {
         &self,
         telemetry: Option<&crate::telemetry::TelemetryConfig>,
     ) {
-        self.init_inner(telemetry, false);
+        self.init_inner(telemetry, false, false);
+    }
+
+    /// Initialize with an already-resolved filter and write tracing output to
+    /// stderr. CLI commands use this so their stdout remains a clean
+    /// machine-readable document.
+    pub fn init_with_resolved_filter_and_telemetry_to_stderr(
+        &self,
+        telemetry: Option<&crate::telemetry::TelemetryConfig>,
+    ) {
+        self.init_inner(telemetry, false, true);
     }
 
     fn init_inner(
         &self,
         telemetry: Option<&crate::telemetry::TelemetryConfig>,
         prefer_rust_log: bool,
+        write_to_stderr: bool,
     ) {
         let filter = if prefer_rust_log {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&self.level))
@@ -166,11 +177,16 @@ impl LoggingConfig {
                 }
             }
         });
+        let writer = if write_to_stderr {
+            fmt::writer::BoxMakeWriter::new(std::io::stderr)
+        } else {
+            fmt::writer::BoxMakeWriter::new(std::io::stdout)
+        };
         match self.format.as_str() {
             "json" => {
                 tracing_subscriber::registry()
                     .with(filter_layer)
-                    .with(fmt::layer().json())
+                    .with(fmt::layer().json().with_writer(writer))
                     .with(otlp.as_ref().map(|pipeline| {
                         tracing_opentelemetry::layer().with_tracer(pipeline.tracer.clone())
                     }))
@@ -179,7 +195,7 @@ impl LoggingConfig {
             "pretty" => {
                 tracing_subscriber::registry()
                     .with(filter_layer)
-                    .with(fmt::layer().pretty())
+                    .with(fmt::layer().pretty().with_writer(writer))
                     .with(otlp.as_ref().map(|pipeline| {
                         tracing_opentelemetry::layer().with_tracer(pipeline.tracer.clone())
                     }))
@@ -188,7 +204,7 @@ impl LoggingConfig {
             _ => {
                 tracing_subscriber::registry()
                     .with(filter_layer)
-                    .with(fmt::layer().compact())
+                    .with(fmt::layer().compact().with_writer(writer))
                     .with(otlp.as_ref().map(|pipeline| {
                         tracing_opentelemetry::layer().with_tracer(pipeline.tracer.clone())
                     }))
