@@ -612,7 +612,10 @@ origins:
 "#,
         upstream.base_url()
     );
-    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+    // Keep this stateful cache test's config watcher isolated from temp-file
+    // events created by parallel harnesses, which would trigger a reload.
+    let proxy =
+        ProxyHarness::start_with_workspace(&yaml, &[]).expect("start isolated-workspace proxy");
 
     let first = proxy
         .post_bytes(
