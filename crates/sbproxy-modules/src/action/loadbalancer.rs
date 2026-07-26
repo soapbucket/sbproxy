@@ -661,7 +661,13 @@ impl LoadBalancerAction {
     ) -> Result<TargetSelection> {
         enrich_routing_request(&mut request);
         let client_ip = request.client_ip.as_deref();
-        let uri = request.path.as_str();
+        // Registry strategies receive the full path plus query above. Legacy
+        // URI hashing used Pingora's path-only projection, so keep a separate
+        // fallback key when no strategy selects a target.
+        let fallback_uri = request
+            .path
+            .split_once('?')
+            .map_or(request.path.as_str(), |(path, _)| path);
         let headers = &request.headers;
 
         // --- Outlier / active-health / circuit-breaker filter ---
@@ -843,7 +849,7 @@ impl LoadBalancerAction {
         let (idx, selection_method) = match strategy_selection {
             Some(selection) => selection,
             None => (
-                self.select_with_algorithm(&active_targets, client_ip, uri, headers),
+                self.select_with_algorithm(&active_targets, client_ip, fallback_uri, headers),
                 algorithm_name(&self.algorithm).to_string(),
             ),
         };
@@ -1232,6 +1238,24 @@ mod tests {
 
         fn name(&self) -> &str {
             "deferring-test"
+        }
+    }
+
+    struct PathCapturingDeferringStrategy {
+        paths: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RoutingStrategy for PathCapturingDeferringStrategy {
+        fn select(&self, request: &RoutingRequest, _targets: &[TargetState]) -> Option<usize> {
+            self.paths
+                .lock()
+                .expect("path capture lock")
+                .push(request.path.clone());
+            None
+        }
+
+        fn name(&self) -> &str {
+            "path-capturing-deferring-test"
         }
     }
 
@@ -1624,6 +1648,65 @@ mod tests {
             let (_, _, _, idx) = lb.select_target(None, "/api/users", &headers).unwrap();
             assert_eq!(idx, first, "uri_hash must be consistent for the same URI");
         }
+    }
+
+    #[test]
+    fn uri_hash_fallback_ignores_query_without_strategy() {
+        let lb = make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://a:8080"},
+                {"url": "http://b:8080"},
+                {"url": "http://c:8080"},
+                {"url": "http://d:8080"},
+                {"url": "http://e:8080"}
+            ],
+            "algorithm": "uri_hash"
+        }));
+
+        let first = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/resource?a=1", "example.com"))
+            .expect("first URI hash selection");
+        let second = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/resource?a=2", "example.com"))
+            .expect("second URI hash selection");
+
+        assert_eq!(first.target_index, second.target_index);
+        assert_eq!(first.selection_method, "uri_hash");
+        assert_eq!(second.selection_method, "uri_hash");
+    }
+
+    #[test]
+    fn uri_hash_fallback_ignores_query_after_strategy_deferral() {
+        let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut lb = make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://a:8080"},
+                {"url": "http://b:8080"},
+                {"url": "http://c:8080"},
+                {"url": "http://d:8080"},
+                {"url": "http://e:8080"}
+            ],
+            "algorithm": "uri_hash"
+        }));
+        lb.strategy_name = Some("path-capturing-deferring-test");
+        lb.strategy = Some(Arc::new(PathCapturingDeferringStrategy {
+            paths: Arc::clone(&paths),
+        }));
+
+        let first = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/resource?a=1", "example.com"))
+            .expect("first deferred URI hash selection");
+        let second = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/resource?a=2", "example.com"))
+            .expect("second deferred URI hash selection");
+
+        assert_eq!(first.target_index, second.target_index);
+        assert_eq!(first.selection_method, "uri_hash");
+        assert_eq!(second.selection_method, "uri_hash");
+        assert_eq!(
+            *paths.lock().expect("path capture lock"),
+            vec!["/resource?a=1", "/resource?a=2"]
+        );
     }
 
     // --- least_connections tests ---

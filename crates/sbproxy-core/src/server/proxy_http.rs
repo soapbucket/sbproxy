@@ -179,6 +179,22 @@ fn record_load_balancer_outcome(
     );
 }
 
+fn record_load_balancer_response_outcome(
+    ctx: &mut RequestContext,
+    target_index: usize,
+    status: u16,
+    retrying: bool,
+    elapsed: std::time::Duration,
+    record: impl FnOnce(usize, sbproxy_modules::RoutingOutcome),
+) {
+    // A sub-500 response is not successful until its body finishes without a
+    // transport error. Leave it pending for logging unless Pingora is
+    // discarding it for an immediate retry.
+    if status >= 500 || retrying {
+        record_load_balancer_outcome(ctx, target_index, false, elapsed, record);
+    }
+}
+
 /// Scheme-agnostic host + path of an upstream URL (WOR-1698).
 struct ParsedUpstreamUrl {
     /// `Url::host_str()` of the upstream, or `None` when the URL has no
@@ -316,9 +332,14 @@ async fn maybe_retry_upstream_status(
             .lb_attempt_started_at
             .map(|started| started.elapsed())
             .unwrap_or_default();
-        record_load_balancer_outcome(ctx, target_idx, status < 500, elapsed, |index, outcome| {
-            lb.record_strategy_outcome(index, outcome)
-        });
+        record_load_balancer_response_outcome(
+            ctx,
+            target_idx,
+            status,
+            false,
+            elapsed,
+            |index, outcome| lb.record_strategy_outcome(index, outcome),
+        );
     }
     let cfg = retry_config_for_action(action)?;
     if !cfg.enabled() || !cfg.allows_status(status) {
@@ -351,6 +372,18 @@ async fn maybe_retry_upstream_status(
 
     let backoff_ms = cfg.backoff_for_attempt(ctx.retry_count);
     if let (Action::LoadBalancer(lb), Some(target_idx)) = (action, ctx.lb_target_idx) {
+        let elapsed = ctx
+            .lb_attempt_started_at
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        record_load_balancer_response_outcome(
+            ctx,
+            target_idx,
+            status,
+            true,
+            elapsed,
+            |index, outcome| lb.record_strategy_outcome(index, outcome),
+        );
         lb.record_target_failure(target_idx);
         lb.record_breaker_failure(target_idx);
         ctx.lb_target_idx = None;
@@ -4953,6 +4986,24 @@ mod tests {
         );
     }
 
+    fn capture_response_outcome(
+        ctx: &mut RequestContext,
+        target_index: usize,
+        status: u16,
+        retrying: bool,
+        latency_ms: u64,
+        outcomes: &mut Vec<(usize, sbproxy_modules::RoutingOutcome)>,
+    ) {
+        record_load_balancer_response_outcome(
+            ctx,
+            target_index,
+            status,
+            retrying,
+            std::time::Duration::from_millis(latency_ms),
+            |index, outcome| outcomes.push((index, outcome)),
+        );
+    }
+
     fn pending_compression_value() -> sbproxy_ai::PendingCompressionValue {
         let run = sbproxy_ai::compression::CompressionRun {
             messages: Vec::new(),
@@ -4991,13 +5042,29 @@ mod tests {
         let mut outcomes = Vec::new();
         apply_load_balancer_selection(&mut ctx, &target_selection(0, "bandit"));
 
-        capture_outcome(&mut ctx, 0, true, 12, &mut outcomes);
+        capture_response_outcome(&mut ctx, 0, 200, false, 12, &mut outcomes);
         capture_outcome(&mut ctx, 0, true, 20, &mut outcomes);
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].0, 0);
         assert!(outcomes[0].1.success);
-        assert_eq!(outcomes[0].1.latency, std::time::Duration::from_millis(12));
+        assert_eq!(outcomes[0].1.latency, std::time::Duration::from_millis(20));
+    }
+
+    #[test]
+    fn successful_headers_then_read_timeout_and_logging_records_one_failure() {
+        let mut ctx = RequestContext::default();
+        let mut outcomes = Vec::new();
+        apply_load_balancer_selection(&mut ctx, &target_selection(0, "bandit"));
+
+        capture_response_outcome(&mut ctx, 0, 200, false, 12, &mut outcomes);
+        capture_outcome(&mut ctx, 0, false, 20, &mut outcomes);
+        capture_outcome(&mut ctx, 0, false, 21, &mut outcomes);
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, 0);
+        assert!(!outcomes[0].1.success);
+        assert_eq!(outcomes[0].1.latency, std::time::Duration::from_millis(20));
     }
 
     #[test]
@@ -5006,7 +5073,8 @@ mod tests {
         let mut outcomes = Vec::new();
         apply_load_balancer_selection(&mut ctx, &target_selection(0, "bandit"));
 
-        capture_outcome(&mut ctx, 0, false, 15, &mut outcomes);
+        capture_response_outcome(&mut ctx, 0, 503, false, 15, &mut outcomes);
+        capture_response_outcome(&mut ctx, 0, 503, true, 16, &mut outcomes);
         apply_load_balancer_selection(&mut ctx, &target_selection(1, "bandit"));
 
         assert_eq!(outcomes.len(), 1);
