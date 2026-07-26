@@ -363,6 +363,13 @@ impl ModuleContext {
             .collect::<Vec<_>>()
             .join("::")
     }
+
+    fn path(&self) -> String {
+        std::iter::once(self.crate_name.as_str())
+            .chain(self.modules.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join("::")
+    }
 }
 
 fn normalize_crate_name(name: &str) -> String {
@@ -373,6 +380,7 @@ fn normalize_crate_name(name: &str) -> String {
 struct TypeReference {
     segments: Vec<String>,
     context: ModuleContext,
+    leading_colon: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -381,12 +389,71 @@ struct FunctionReturn {
     result: TypeReference,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SymbolKind {
+    Type,
+    Function,
+}
+
+#[derive(Default)]
+struct SymbolResolution {
+    symbols: BTreeSet<String>,
+    tainted: bool,
+}
+
+impl SymbolResolution {
+    fn found(symbol: String) -> Self {
+        Self {
+            symbols: BTreeSet::from([symbol]),
+            tainted: false,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.symbols.extend(other.symbols);
+        self.tainted |= other.tainted;
+    }
+
+    fn exact(self) -> Option<String> {
+        (!self.tainted && self.symbols.len() == 1)
+            .then(|| self.symbols.into_iter().next())
+            .flatten()
+    }
+}
+
+#[derive(Default)]
+struct NamespaceResolution {
+    namespaces: BTreeSet<ModuleContext>,
+    tainted: bool,
+}
+
+impl NamespaceResolution {
+    fn known(namespace: ModuleContext) -> Self {
+        Self {
+            namespaces: BTreeSet::from([namespace]),
+            tainted: false,
+        }
+    }
+
+    fn tainted() -> Self {
+        Self {
+            namespaces: BTreeSet::new(),
+            tainted: true,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.namespaces.extend(other.namespaces);
+        self.tainted |= other.tainted;
+    }
+}
+
 #[derive(Default)]
 struct RustTypeIndex {
     fields: BTreeMap<String, BTreeMap<String, Option<TypeReference>>>,
     types_by_name: BTreeMap<String, BTreeSet<String>>,
     symbol_bindings: BTreeMap<String, Vec<TypeReference>>,
-    glob_imports: BTreeMap<ModuleContext, Vec<Vec<String>>>,
+    glob_imports: BTreeMap<ModuleContext, Vec<TypeReference>>,
     known_crates: BTreeSet<String>,
     known_modules: BTreeSet<String>,
     enum_tags: BTreeMap<String, String>,
@@ -398,12 +465,7 @@ impl RustTypeIndex {
     fn record_context(&mut self, context: &ModuleContext) {
         self.known_crates.insert(context.crate_name.clone());
         if !context.modules.is_empty() {
-            self.known_modules.insert(
-                std::iter::once(context.crate_name.as_str())
-                    .chain(context.modules.iter().map(String::as_str))
-                    .collect::<Vec<_>>()
-                    .join("::"),
-            );
+            self.known_modules.insert(context.path());
         }
     }
 
@@ -419,40 +481,19 @@ impl RustTypeIndex {
         self.symbol_bindings.entry(alias).or_default().push(target);
     }
 
-    fn record_glob_import(&mut self, context: &ModuleContext, target: Vec<String>) {
+    fn record_glob_import(&mut self, context: &ModuleContext, target: TypeReference) {
         self.glob_imports
             .entry(context.clone())
             .or_default()
             .push(target);
     }
 
-    fn has_unresolved_external_glob(&self, context: &ModuleContext) -> bool {
-        self.glob_imports.get(context).is_some_and(|imports| {
-            imports
-                .iter()
-                .any(|segments| !self.glob_target_is_known(segments, context))
-        })
-    }
-
-    fn glob_target_is_known(&self, segments: &[String], context: &ModuleContext) -> bool {
-        let Some(first) = segments.first().map(String::as_str) else {
-            return false;
-        };
-        if matches!(first, "crate" | "self" | "super") {
-            return true;
+    fn namespace_exists(&self, context: &ModuleContext) -> bool {
+        if context.modules.is_empty() {
+            self.known_crates.contains(&context.crate_name)
+        } else {
+            self.known_modules.contains(&context.path())
         }
-        if self.known_crates.contains(&normalize_crate_name(first)) {
-            return true;
-        }
-
-        (0..=context.modules.len()).rev().any(|depth| {
-            let candidate = std::iter::once(context.crate_name.as_str())
-                .chain(context.modules[..depth].iter().map(String::as_str))
-                .chain(segments.iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join("::");
-            self.known_modules.contains(&candidate) || self.fields.contains_key(&candidate)
-        })
     }
 
     fn record_fields(&mut self, owner: &str, fields: &syn::Fields, context: &ModuleContext) {
@@ -485,201 +526,278 @@ impl RustTypeIndex {
         }
     }
 
-    fn enum_tag_for_variant_path(
-        &self,
-        path: &syn::Path,
-        context: &ModuleContext,
-    ) -> Option<(&str, &str)> {
-        let mut segments: Vec<String> = path
-            .segments
-            .iter()
-            .map(|segment| segment.ident.to_string())
-            .collect();
-        let variant = segments.pop()?;
-        let owner = self.resolve_path_segments(&segments, context)?;
-        self.enum_variants
-            .get(&owner)?
-            .contains(&variant)
-            .then_some(())?;
-        let (owner, tag) = self.enum_tags.get_key_value(&owner)?;
-        Some((owner.as_str(), tag.as_str()))
-    }
-
     fn field_type(&self, owner: &str, field: &str) -> Option<String> {
         self.fields
             .get(owner)
             .and_then(|fields| fields.get(field))
             .and_then(Option::as_ref)
-            .and_then(|reference| {
-                self.resolve_path_segments(&reference.segments, &reference.context)
-            })
+            .and_then(|reference| self.resolve_type_reference(reference))
     }
 
-    fn resolve_type(&self, ty: &syn::Type, context: &ModuleContext) -> Option<String> {
-        let reference = type_reference(ty, context)?;
-        self.resolve_path_segments(&reference.segments, &reference.context)
+    fn resolve_type_reference(&self, reference: &TypeReference) -> Option<String> {
+        self.resolve_symbol_reference(SymbolKind::Type, reference, &mut BTreeSet::new())
+            .exact()
     }
 
-    fn resolve_path(&self, path: &syn::Path, context: &ModuleContext) -> Option<String> {
-        let segments: Vec<String> = path
-            .segments
-            .iter()
-            .map(|segment| segment.ident.to_string())
-            .collect();
-        self.resolve_path_segments(&segments, context)
-    }
-
-    fn resolve_path_segments(
+    fn resolve_symbol_reference(
         &self,
-        segments: &[String],
-        context: &ModuleContext,
-    ) -> Option<String> {
-        self.resolve_path_segments_inner(segments, context, &mut BTreeSet::new())
-    }
-
-    fn resolve_path_segments_inner(
-        &self,
-        segments: &[String],
-        context: &ModuleContext,
+        kind: SymbolKind,
+        reference: &TypeReference,
         resolving: &mut BTreeSet<String>,
-    ) -> Option<String> {
-        let simple_name = segments.last()?;
-
-        if segments.len() == 1 {
-            let local = context.symbol(simple_name);
-            if self
-                .types_by_name
-                .get(simple_name)
-                .is_some_and(|candidates| candidates.contains(&local))
-            {
-                return Some(local);
-            }
-
-            if let Some(bindings) = self.symbol_bindings.get(&local) {
-                if !resolving.insert(local.clone()) {
-                    return None;
-                }
-                let mut resolved = BTreeSet::new();
-                for binding in bindings {
-                    let Some(owner) = self.resolve_path_segments_inner(
-                        &binding.segments,
-                        &binding.context,
-                        resolving,
-                    ) else {
-                        resolving.remove(&local);
-                        return None;
-                    };
-                    resolved.insert(owner);
-                }
-                resolving.remove(&local);
-                return (resolved.len() == 1)
-                    .then(|| resolved.into_iter().next())
-                    .flatten();
-            }
-
-            if self.has_unresolved_external_glob(context) {
-                return None;
-            }
-
-            let candidates = self.types_by_name.get(simple_name)?;
-            return (candidates.len() == 1)
-                .then(|| candidates.first().cloned())
-                .flatten();
-        }
-
-        let candidates = self.types_by_name.get(simple_name)?;
-        let first = segments.first()?.as_str();
-        let mut prefixes = Vec::new();
-        match first {
-            "crate" => {
-                prefixes.push(
-                    std::iter::once(context.crate_name.as_str())
-                        .chain(segments[1..segments.len() - 1].iter().map(String::as_str))
-                        .collect::<Vec<_>>()
-                        .join("::"),
-                );
-            }
-            "self" => {
-                prefixes.push(
-                    std::iter::once(context.crate_name.as_str())
-                        .chain(context.modules.iter().map(String::as_str))
-                        .chain(segments[1..segments.len() - 1].iter().map(String::as_str))
-                        .collect::<Vec<_>>()
-                        .join("::"),
-                );
-            }
-            "super" => {
-                let mut modules = context.modules.clone();
-                let mut skip = 0usize;
-                while segments.get(skip).is_some_and(|segment| segment == "super") {
-                    modules.pop();
-                    skip += 1;
-                }
-                prefixes.push(
-                    std::iter::once(context.crate_name.as_str())
-                        .chain(modules.iter().map(String::as_str))
-                        .chain(
-                            segments[skip..segments.len() - 1]
-                                .iter()
-                                .map(String::as_str),
-                        )
-                        .collect::<Vec<_>>()
-                        .join("::"),
-                );
-            }
-            external => prefixes.push(
-                std::iter::once(normalize_crate_name(external))
-                    .chain(segments[1..segments.len() - 1].iter().cloned())
-                    .collect::<Vec<_>>()
-                    .join("::"),
-            ),
-        }
-
-        let exact = prefixes
-            .iter()
-            .map(|prefix| {
-                if prefix.is_empty() {
-                    simple_name.clone()
-                } else {
-                    format!("{prefix}::{simple_name}")
-                }
-            })
-            .filter(|candidate| candidates.contains(candidate))
-            .collect::<Vec<_>>();
-        if exact.len() == 1 {
-            return exact.into_iter().next();
-        }
-
-        // Public re-exports often omit the defining module
-        // (`sbproxy_config::Foo` vs `sbproxy_config::types::Foo`).
-        // An explicit crate path still resolves safely when that crate
-        // owns exactly one type with the requested simple name.
-        if first == "crate" || !matches!(first, "self" | "super") {
-            let crate_name = if first == "crate" {
-                context.crate_name.clone()
-            } else {
-                normalize_crate_name(first)
+    ) -> SymbolResolution {
+        let Some(name) = reference.segments.last() else {
+            return SymbolResolution {
+                tainted: true,
+                ..SymbolResolution::default()
             };
-            let in_crate: Vec<_> = candidates
-                .iter()
-                .filter(|candidate| {
-                    candidate
-                        .split("::")
-                        .next()
-                        .is_some_and(|owner| owner == crate_name)
-                })
-                .cloned()
-                .collect();
-            if in_crate.len() == 1 {
-                return in_crate.into_iter().next();
+        };
+        if reference.segments.len() == 1 && !reference.leading_colon {
+            return self.resolve_symbol_in_namespace(kind, &reference.context, name, resolving);
+        }
+
+        let namespace_reference = TypeReference {
+            segments: reference.segments[..reference.segments.len() - 1].to_vec(),
+            context: reference.context.clone(),
+            leading_colon: reference.leading_colon,
+        };
+        let namespaces = self.resolve_namespace_reference(&namespace_reference, resolving);
+        let mut result = SymbolResolution {
+            tainted: namespaces.tainted,
+            ..SymbolResolution::default()
+        };
+        for namespace in namespaces.namespaces {
+            result.merge(self.resolve_symbol_in_namespace(kind, &namespace, name, resolving));
+        }
+        result
+    }
+
+    fn resolve_symbol_in_namespace(
+        &self,
+        kind: SymbolKind,
+        namespace: &ModuleContext,
+        name: &str,
+        resolving: &mut BTreeSet<String>,
+    ) -> SymbolResolution {
+        let resolution_key = format!("{kind:?}:{}::{name}", namespace.path());
+        if !resolving.insert(resolution_key.clone()) {
+            return SymbolResolution::default();
+        }
+
+        let exact = namespace.symbol(name);
+        let direct = match kind {
+            SymbolKind::Type => self
+                .types_by_name
+                .get(name)
+                .is_some_and(|candidates| candidates.contains(&exact)),
+            SymbolKind::Function => self.function_returns.get(name).is_some_and(|candidates| {
+                candidates.iter().any(|candidate| candidate.symbol == exact)
+            }),
+        };
+        if direct {
+            resolving.remove(&resolution_key);
+            return SymbolResolution::found(exact);
+        }
+
+        if let Some(bindings) = self.symbol_bindings.get(&exact) {
+            let mut result = SymbolResolution::default();
+            let mut resolved_binding = false;
+            for binding in bindings {
+                if self.binding_targets_same_symbol(binding, namespace, name, resolving) {
+                    continue;
+                }
+                resolved_binding = true;
+                result.merge(self.resolve_symbol_reference(kind, binding, resolving));
+            }
+            if resolved_binding {
+                resolving.remove(&resolution_key);
+                return result;
             }
         }
 
-        // A qualified path made an ownership claim. If neither that exact
-        // module nor a unique re-export from that explicit crate exists,
-        // fail closed rather than collapsing to an unrelated unique type
-        // with the same final segment.
-        None
+        let mut result = SymbolResolution::default();
+        if let Some(globs) = self.glob_imports.get(namespace) {
+            for glob in globs {
+                let targets = self.resolve_namespace_reference(glob, resolving);
+                if targets.tainted || targets.namespaces.is_empty() {
+                    result.tainted = true;
+                }
+                for target in targets.namespaces {
+                    result.merge(self.resolve_symbol_in_namespace(kind, &target, name, resolving));
+                }
+            }
+        }
+        resolving.remove(&resolution_key);
+        result
+    }
+
+    fn binding_targets_same_symbol(
+        &self,
+        binding: &TypeReference,
+        namespace: &ModuleContext,
+        name: &str,
+        resolving: &mut BTreeSet<String>,
+    ) -> bool {
+        if binding.segments.len() < 2 || binding.segments.last().map(String::as_str) != Some(name) {
+            return false;
+        }
+        let namespace_reference = TypeReference {
+            segments: binding.segments[..binding.segments.len() - 1].to_vec(),
+            context: binding.context.clone(),
+            leading_colon: binding.leading_colon,
+        };
+        let target = self.resolve_namespace_reference(&namespace_reference, resolving);
+        !target.tainted && target.namespaces.len() == 1 && target.namespaces.contains(namespace)
+    }
+
+    fn resolve_namespace_reference(
+        &self,
+        reference: &TypeReference,
+        resolving: &mut BTreeSet<String>,
+    ) -> NamespaceResolution {
+        let Some(first) = reference.segments.first().map(String::as_str) else {
+            return NamespaceResolution::tainted();
+        };
+
+        let (mut namespaces, consumed) = if reference.leading_colon {
+            let crate_name = normalize_crate_name(first);
+            if self.known_crates.contains(&crate_name) {
+                (
+                    NamespaceResolution::known(ModuleContext {
+                        crate_name,
+                        modules: Vec::new(),
+                    }),
+                    1,
+                )
+            } else {
+                return NamespaceResolution::tainted();
+            }
+        } else {
+            match first {
+                "crate" => (
+                    NamespaceResolution::known(ModuleContext {
+                        crate_name: reference.context.crate_name.clone(),
+                        modules: Vec::new(),
+                    }),
+                    1,
+                ),
+                "self" => (NamespaceResolution::known(reference.context.clone()), 1),
+                "super" => {
+                    let mut parent = reference.context.clone();
+                    let mut consumed = 0;
+                    while reference
+                        .segments
+                        .get(consumed)
+                        .is_some_and(|segment| segment == "super")
+                    {
+                        if parent.modules.pop().is_none() {
+                            return NamespaceResolution::tainted();
+                        }
+                        consumed += 1;
+                    }
+                    (NamespaceResolution::known(parent), consumed)
+                }
+                name => (
+                    self.resolve_namespace_name_in_scope(&reference.context, name, resolving),
+                    1,
+                ),
+            }
+        };
+
+        for segment in &reference.segments[consumed..] {
+            let mut next = NamespaceResolution {
+                tainted: namespaces.tainted,
+                ..NamespaceResolution::default()
+            };
+            for namespace in namespaces.namespaces {
+                next.merge(self.resolve_namespace_member(&namespace, segment, resolving));
+            }
+            namespaces = next;
+        }
+        namespaces
+    }
+
+    fn resolve_namespace_name_in_scope(
+        &self,
+        context: &ModuleContext,
+        name: &str,
+        resolving: &mut BTreeSet<String>,
+    ) -> NamespaceResolution {
+        let resolution_key = format!("scope-namespace:{}::{name}", context.path());
+        if !resolving.insert(resolution_key.clone()) {
+            return NamespaceResolution::default();
+        }
+
+        let binding_name = context.symbol(name);
+        if let Some(bindings) = self.symbol_bindings.get(&binding_name) {
+            let mut result = NamespaceResolution::default();
+            for binding in bindings {
+                result.merge(self.resolve_namespace_reference(binding, resolving));
+            }
+            resolving.remove(&resolution_key);
+            return result;
+        }
+
+        let mut child = context.clone();
+        child.modules.push(name.to_string());
+        if self.namespace_exists(&child) {
+            resolving.remove(&resolution_key);
+            return NamespaceResolution::known(child);
+        }
+
+        let crate_name = normalize_crate_name(name);
+        if self.known_crates.contains(&crate_name) {
+            resolving.remove(&resolution_key);
+            return NamespaceResolution::known(ModuleContext {
+                crate_name,
+                modules: Vec::new(),
+            });
+        }
+        resolving.remove(&resolution_key);
+        NamespaceResolution::tainted()
+    }
+
+    fn resolve_namespace_member(
+        &self,
+        context: &ModuleContext,
+        name: &str,
+        resolving: &mut BTreeSet<String>,
+    ) -> NamespaceResolution {
+        let resolution_key = format!("namespace:{}::{name}", context.path());
+        if !resolving.insert(resolution_key.clone()) {
+            return NamespaceResolution::default();
+        }
+
+        let binding_name = context.symbol(name);
+        if let Some(bindings) = self.symbol_bindings.get(&binding_name) {
+            let mut result = NamespaceResolution::default();
+            for binding in bindings {
+                result.merge(self.resolve_namespace_reference(binding, resolving));
+            }
+            resolving.remove(&resolution_key);
+            return result;
+        }
+
+        let mut child = context.clone();
+        child.modules.push(name.to_string());
+        if self.namespace_exists(&child) {
+            resolving.remove(&resolution_key);
+            return NamespaceResolution::known(child);
+        }
+
+        let mut result = NamespaceResolution::default();
+        if let Some(globs) = self.glob_imports.get(context) {
+            for glob in globs {
+                let targets = self.resolve_namespace_reference(glob, resolving);
+                if targets.tainted || targets.namespaces.is_empty() {
+                    result.tainted = true;
+                }
+                for target in targets.namespaces {
+                    result.merge(self.resolve_namespace_member(&target, name, resolving));
+                }
+            }
+        }
+        resolving.remove(&resolution_key);
+        result
     }
 
     fn schema_owner(&self, owner: &str) -> Option<String> {
@@ -719,131 +837,6 @@ impl RustTypeIndex {
                 result,
             });
     }
-
-    fn function_return(&self, path: &syn::Path, context: &ModuleContext) -> Option<String> {
-        let segments: Vec<String> = path
-            .segments
-            .iter()
-            .map(|segment| segment.ident.to_string())
-            .collect();
-        let symbol = self.resolve_function_symbol(&segments, context, &mut BTreeSet::new())?;
-        let name = symbol.rsplit("::").next()?;
-        let candidates = self.function_returns.get(name)?;
-        let result = &candidates
-            .iter()
-            .find(|candidate| candidate.symbol == symbol)?
-            .result;
-        self.resolve_path_segments(&result.segments, &result.context)
-    }
-
-    fn resolve_function_symbol(
-        &self,
-        segments: &[String],
-        context: &ModuleContext,
-        resolving: &mut BTreeSet<String>,
-    ) -> Option<String> {
-        let name = segments.last()?;
-
-        if segments.len() == 1 {
-            let local = context.symbol(name);
-            if self.function_returns.get(name).is_some_and(|candidates| {
-                candidates.iter().any(|candidate| candidate.symbol == local)
-            }) {
-                return Some(local);
-            }
-
-            if let Some(bindings) = self.symbol_bindings.get(&local) {
-                if !resolving.insert(local.clone()) {
-                    return None;
-                }
-                let mut resolved = BTreeSet::new();
-                for binding in bindings {
-                    let Some(symbol) = self.resolve_function_symbol(
-                        &binding.segments,
-                        &binding.context,
-                        resolving,
-                    ) else {
-                        resolving.remove(&local);
-                        return None;
-                    };
-                    resolved.insert(symbol);
-                }
-                resolving.remove(&local);
-                return (resolved.len() == 1)
-                    .then(|| resolved.into_iter().next())
-                    .flatten();
-            }
-
-            if self.has_unresolved_external_glob(context) {
-                return None;
-            }
-
-            let candidates = self.function_returns.get(name)?;
-            return (candidates.len() == 1).then(|| candidates[0].symbol.clone());
-        }
-
-        let candidates = self.function_returns.get(name)?;
-        let first = segments.first()?.as_str();
-        let prefix = match first {
-            "crate" => std::iter::once(context.crate_name.as_str())
-                .chain(segments[1..segments.len() - 1].iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join("::"),
-            "self" => std::iter::once(context.crate_name.as_str())
-                .chain(context.modules.iter().map(String::as_str))
-                .chain(segments[1..segments.len() - 1].iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join("::"),
-            "super" => {
-                let mut modules = context.modules.clone();
-                let mut skip = 0usize;
-                while segments.get(skip).is_some_and(|segment| segment == "super") {
-                    modules.pop();
-                    skip += 1;
-                }
-                std::iter::once(context.crate_name.as_str())
-                    .chain(modules.iter().map(String::as_str))
-                    .chain(
-                        segments[skip..segments.len() - 1]
-                            .iter()
-                            .map(String::as_str),
-                    )
-                    .collect::<Vec<_>>()
-                    .join("::")
-            }
-            external => std::iter::once(normalize_crate_name(external))
-                .chain(segments[1..segments.len() - 1].iter().cloned())
-                .collect::<Vec<_>>()
-                .join("::"),
-        };
-        let exact = if prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{prefix}::{name}")
-        };
-        if candidates.iter().any(|candidate| candidate.symbol == exact) {
-            return Some(exact);
-        }
-
-        if !matches!(first, "crate" | "self" | "super") {
-            let crate_name = normalize_crate_name(first);
-            let in_crate: Vec<_> = candidates
-                .iter()
-                .filter(|candidate| {
-                    candidate
-                        .symbol
-                        .split("::")
-                        .next()
-                        .is_some_and(|owner| owner == crate_name)
-                })
-                .collect();
-            if in_crate.len() == 1 {
-                return Some(in_crate[0].symbol.clone());
-            }
-        }
-
-        None
-    }
 }
 
 struct TypeIndexVisitor<'a> {
@@ -852,6 +845,12 @@ struct TypeIndexVisitor<'a> {
 }
 
 impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
+    fn visit_block(&mut self, _node: &'ast syn::Block) {
+        // Block-local imports are resolved by `FieldReadVisitor` with their
+        // lexical scope; indexing them as module imports would leak aliases
+        // into unrelated functions.
+    }
+
     fn visit_item(&mut self, node: &'ast syn::Item) {
         if !item_attributes(node).is_some_and(attributes_are_test_only) {
             syn::visit::visit_item(self, node);
@@ -915,12 +914,45 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
                 TypeReference {
                     segments,
                     context: self.context.clone(),
+                    leading_colon: node.leading_colon.is_some(),
                 },
             );
         }
-        for target in globs {
-            self.index.record_glob_import(&self.context, target);
+        for segments in globs {
+            self.index.record_glob_import(
+                &self.context,
+                TypeReference {
+                    segments,
+                    context: self.context.clone(),
+                    leading_colon: node.leading_colon.is_some(),
+                },
+            );
         }
+    }
+
+    fn visit_item_extern_crate(&mut self, node: &'ast syn::ItemExternCrate) {
+        if attributes_are_test_only(&node.attrs) {
+            return;
+        }
+        let alias = node
+            .rename
+            .as_ref()
+            .map(|(_, alias)| alias.to_string())
+            .unwrap_or_else(|| node.ident.to_string());
+        let ident = node.ident.to_string();
+        let (segments, leading_colon) = if ident == "self" {
+            (vec!["crate".to_string()], false)
+        } else {
+            (vec![ident], true)
+        };
+        self.index.record_symbol_binding(
+            self.context.symbol(&alias),
+            TypeReference {
+                segments,
+                context: self.context.clone(),
+                leading_colon,
+            },
+        );
     }
 }
 
@@ -1006,13 +1038,18 @@ fn serde_enum_tag(attributes: &[syn::Attribute]) -> Option<String> {
 
 fn type_reference(ty: &syn::Type, context: &ModuleContext) -> Option<TypeReference> {
     let path = innermost_type_path(ty)?;
-    Some(TypeReference {
+    path_reference(path, context)
+}
+
+fn path_reference(path: &syn::Path, context: &ModuleContext) -> Option<TypeReference> {
+    (!path.segments.is_empty()).then(|| TypeReference {
         segments: path
             .segments
             .iter()
             .map(|segment| segment.ident.to_string())
             .collect(),
         context: context.clone(),
+        leading_colon: path.leading_colon.is_some(),
     })
 }
 
@@ -1052,10 +1089,28 @@ fn innermost_type_path(ty: &syn::Type) -> Option<&syn::Path> {
     }
 }
 
+fn type_is_mutable_reference(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Group(group) => type_is_mutable_reference(&group.elem),
+        syn::Type::Paren(paren) => type_is_mutable_reference(&paren.elem),
+        syn::Type::Reference(reference) => reference.mutability.is_some(),
+        _ => false,
+    }
+}
+
+#[derive(Clone)]
+struct InferredValue {
+    owner: String,
+    mutable_place: bool,
+}
+
 struct FieldReadVisitor<'a> {
     types: &'a RustTypeIndex,
     reads: BTreeSet<(String, String)>,
-    environment: BTreeMap<String, String>,
+    environment: BTreeMap<String, InferredValue>,
+    local_symbol_bindings: BTreeMap<String, Vec<TypeReference>>,
+    local_glob_imports: Vec<TypeReference>,
+    in_function: bool,
     impl_owner: Option<String>,
     context: ModuleContext,
 }
@@ -1066,9 +1121,82 @@ impl<'a> FieldReadVisitor<'a> {
             types,
             reads: BTreeSet::new(),
             environment: BTreeMap::new(),
+            local_symbol_bindings: BTreeMap::new(),
+            local_glob_imports: Vec::new(),
+            in_function: false,
             impl_owner: None,
             context,
         }
+    }
+
+    fn resolve_type_scoped(&self, ty: &syn::Type) -> Option<String> {
+        let reference = type_reference(ty, &self.context)?;
+        self.resolve_symbol_scoped(SymbolKind::Type, &reference)
+    }
+
+    fn resolve_path_scoped(&self, path: &syn::Path) -> Option<String> {
+        let reference = path_reference(path, &self.context)?;
+        self.resolve_symbol_scoped(SymbolKind::Type, &reference)
+    }
+
+    fn resolve_symbol_scoped(&self, kind: SymbolKind, reference: &TypeReference) -> Option<String> {
+        let mut resolving = BTreeSet::new();
+        if !reference.leading_colon {
+            if let Some(first) = reference.segments.first() {
+                if let Some(bindings) = self.local_symbol_bindings.get(first) {
+                    let mut result = SymbolResolution::default();
+                    for binding in bindings {
+                        let mut expanded = binding.clone();
+                        expanded
+                            .segments
+                            .extend_from_slice(&reference.segments[1..]);
+                        result.merge(self.types.resolve_symbol_reference(
+                            kind,
+                            &expanded,
+                            &mut resolving,
+                        ));
+                    }
+                    return result.exact();
+                }
+            }
+        }
+
+        let global = self
+            .types
+            .resolve_symbol_reference(kind, reference, &mut resolving);
+        if reference.leading_colon
+            || reference.segments.len() != 1
+            || self.local_glob_imports.is_empty()
+            || (!global.tainted && global.symbols.len() == 1)
+        {
+            return global.exact();
+        }
+
+        let name = reference.segments.first()?;
+        let mut result = global;
+        for glob in &self.local_glob_imports {
+            let mut expanded = glob.clone();
+            expanded.segments.push(name.clone());
+            result.merge(
+                self.types
+                    .resolve_symbol_reference(kind, &expanded, &mut resolving),
+            );
+        }
+        result.exact()
+    }
+
+    fn function_return_scoped(&self, path: &syn::Path) -> Option<String> {
+        let reference = path_reference(path, &self.context)?;
+        let symbol = self.resolve_symbol_scoped(SymbolKind::Function, &reference)?;
+        let name = symbol.rsplit("::").next()?;
+        let result = &self
+            .types
+            .function_returns
+            .get(name)?
+            .iter()
+            .find(|candidate| candidate.symbol == symbol)?
+            .result;
+        self.types.resolve_type_reference(result)
     }
 
     fn visit_function(
@@ -1077,68 +1205,102 @@ impl<'a> FieldReadVisitor<'a> {
         block: &syn::Block,
     ) {
         let saved_environment = std::mem::take(&mut self.environment);
+        let saved_symbol_bindings = std::mem::take(&mut self.local_symbol_bindings);
+        let saved_glob_imports = std::mem::take(&mut self.local_glob_imports);
+        let saved_in_function = self.in_function;
+        self.in_function = true;
         for input in inputs {
             match input {
-                syn::FnArg::Receiver(_) => {
+                syn::FnArg::Receiver(receiver) => {
                     if let Some(owner) = &self.impl_owner {
-                        self.environment
-                            .insert("self".to_string(), owner.to_string());
+                        self.environment.insert(
+                            "self".to_string(),
+                            InferredValue {
+                                owner: owner.to_string(),
+                                mutable_place: receiver.mutability.is_some(),
+                            },
+                        );
                     }
                 }
                 syn::FnArg::Typed(typed) => {
-                    let owner = self.types.resolve_type(&typed.ty, &self.context);
-                    self.bind_pattern(&typed.pat, owner.as_deref());
+                    let value = self
+                        .resolve_type_scoped(&typed.ty)
+                        .map(|owner| InferredValue {
+                            owner,
+                            mutable_place: type_is_mutable_reference(&typed.ty),
+                        });
+                    self.bind_pattern(&typed.pat, value.as_ref());
                 }
             }
         }
         self.visit_block(block);
         self.environment = saved_environment;
+        self.local_symbol_bindings = saved_symbol_bindings;
+        self.local_glob_imports = saved_glob_imports;
+        self.in_function = saved_in_function;
     }
 
-    fn bind_pattern(&mut self, pattern: &syn::Pat, owner: Option<&str>) {
+    fn bind_pattern(&mut self, pattern: &syn::Pat, value: Option<&InferredValue>) {
         match pattern {
             syn::Pat::Ident(ident) => {
                 let name = ident.ident.to_string();
-                if let Some(owner) = owner {
-                    self.environment.insert(name, owner.to_string());
+                if let Some(value) = value {
+                    self.environment.insert(name, value.clone());
                 } else {
                     self.environment.remove(&name);
                 }
             }
-            syn::Pat::Reference(reference) => self.bind_pattern(&reference.pat, owner),
+            syn::Pat::Reference(reference) => {
+                let referenced = value.cloned().map(|mut value| {
+                    value.mutable_place |= reference.mutability.is_some();
+                    value
+                });
+                self.bind_pattern(&reference.pat, referenced.as_ref());
+            }
             syn::Pat::Type(typed) => {
-                let explicit = self.types.resolve_type(&typed.ty, &self.context);
-                self.bind_pattern(&typed.pat, explicit.as_deref().or(owner));
+                let explicit = self
+                    .resolve_type_scoped(&typed.ty)
+                    .map(|owner| InferredValue {
+                        owner,
+                        mutable_place: type_is_mutable_reference(&typed.ty)
+                            || value.is_some_and(|value| value.mutable_place),
+                    });
+                self.bind_pattern(&typed.pat, explicit.as_ref().or(value));
             }
             syn::Pat::Tuple(tuple) => {
                 for element in &tuple.elems {
-                    self.bind_pattern(element, owner);
+                    self.bind_pattern(element, value);
                 }
             }
             syn::Pat::TupleStruct(tuple) => {
                 self.record_tagged_enum_match(&tuple.path);
                 for element in &tuple.elems {
-                    self.bind_pattern(element, owner);
+                    self.bind_pattern(element, value);
                 }
             }
             syn::Pat::Struct(record) => {
                 self.record_tagged_enum_match(&record.path);
                 let pattern_owner = self
-                    .types
-                    .resolve_path(&record.path, &self.context)
-                    .or_else(|| owner.map(str::to_string));
+                    .resolve_path_scoped(&record.path)
+                    .or_else(|| value.map(|value| value.owner.clone()));
                 if let Some(pattern_owner) = pattern_owner {
                     for field in &record.fields {
                         if matches!(field.pat.as_ref(), syn::Pat::Wild(_)) {
                             continue;
                         }
                         if let Some(member) = Self::named_member(&field.member) {
-                            self.reads.insert((pattern_owner.clone(), member.clone()));
-                            let target = self
-                                .types
-                                .field_type(&pattern_owner, &member)
-                                .map(|target| target.to_string());
-                            self.bind_pattern(&field.pat, target.as_deref());
+                            if !value.is_some_and(|value| value.mutable_place) {
+                                self.reads.insert((pattern_owner.clone(), member.clone()));
+                            }
+                            let target =
+                                self.types.field_type(&pattern_owner, &member).map(|owner| {
+                                    InferredValue {
+                                        owner,
+                                        mutable_place: value
+                                            .is_some_and(|value| value.mutable_place),
+                                    }
+                                });
+                            self.bind_pattern(&field.pat, target.as_ref());
                         }
                     }
                 }
@@ -1149,8 +1311,25 @@ impl<'a> FieldReadVisitor<'a> {
     }
 
     fn record_tagged_enum_match(&mut self, path: &syn::Path) {
-        if let Some((owner, tag)) = self.types.enum_tag_for_variant_path(path, &self.context) {
-            self.reads.insert((owner.to_string(), tag.to_string()));
+        let Some(mut reference) = path_reference(path, &self.context) else {
+            return;
+        };
+        let Some(variant) = reference.segments.pop() else {
+            return;
+        };
+        let Some(owner) = self.resolve_symbol_scoped(SymbolKind::Type, &reference) else {
+            return;
+        };
+        if !self
+            .types
+            .enum_variants
+            .get(&owner)
+            .is_some_and(|variants| variants.contains(&variant))
+        {
+            return;
+        }
+        if let Some(tag) = self.types.enum_tags.get(&owner) {
+            self.reads.insert((owner, tag.clone()));
         }
     }
 
@@ -1163,11 +1342,21 @@ impl<'a> FieldReadVisitor<'a> {
         }
     }
 
+    fn pattern_discards_value(pattern: &syn::Pat) -> bool {
+        match pattern {
+            syn::Pat::Paren(paren) => Self::pattern_discards_value(&paren.pat),
+            syn::Pat::Reference(reference) => Self::pattern_discards_value(&reference.pat),
+            syn::Pat::Type(typed) => Self::pattern_discards_value(&typed.pat),
+            syn::Pat::Wild(_) => true,
+            _ => false,
+        }
+    }
+
     fn infer_item_closure(
         &mut self,
         closure: &syn::ExprClosure,
-        item_owner: Option<&str>,
-    ) -> Option<String> {
+        item_owner: Option<&InferredValue>,
+    ) -> Option<InferredValue> {
         let saved_environment = self.environment.clone();
         for (index, input) in closure.inputs.iter().enumerate() {
             self.bind_pattern(input, (index == 0).then_some(item_owner).flatten());
@@ -1177,7 +1366,7 @@ impl<'a> FieldReadVisitor<'a> {
         result
     }
 
-    fn infer_expr(&mut self, expression: &syn::Expr) -> Option<String> {
+    fn infer_expr(&mut self, expression: &syn::Expr) -> Option<InferredValue> {
         match expression {
             syn::Expr::Await(awaited) => self.infer_expr(&awaited.base),
             syn::Expr::Call(call) => {
@@ -1188,16 +1377,23 @@ impl<'a> FieldReadVisitor<'a> {
                 let syn::Expr::Path(path) = call.func.as_ref() else {
                     return None;
                 };
-                self.types.function_return(&path.path, &self.context)
+                self.function_return_scoped(&path.path)
+                    .map(|owner| InferredValue {
+                        owner,
+                        mutable_place: false,
+                    })
             }
             syn::Expr::Field(field) => {
-                let owner = self.infer_expr(&field.base)?;
                 let member = Self::named_member(&field.member)?;
-                let target = self.types.field_type(&owner, &member);
-                if self.types.fields.contains_key(&owner) {
-                    self.reads.insert((owner, member));
+                let owner = self.infer_expr(&field.base)?;
+                let target = self.types.field_type(&owner.owner, &member);
+                if self.types.fields.contains_key(&owner.owner) {
+                    self.reads.insert((owner.owner, member));
                 }
-                target
+                target.map(|owner| InferredValue {
+                    owner,
+                    mutable_place: false,
+                })
             }
             syn::Expr::Group(group) => self.infer_expr(&group.expr),
             syn::Expr::Index(index) => {
@@ -1206,8 +1402,16 @@ impl<'a> FieldReadVisitor<'a> {
                 owner
             }
             syn::Expr::MethodCall(call) => {
-                let owner = self.infer_expr(&call.receiver);
                 let method = call.method.to_string();
+                let mutates_receiver = matches!(
+                    method.as_str(),
+                    "clone_from" | "clone_from_slice" | "copy_from_slice"
+                );
+                let owner = if mutates_receiver {
+                    self.infer_place_expr(&call.receiver)
+                } else {
+                    self.infer_expr(&call.receiver)
+                };
                 let passes_item_to_closure = matches!(
                     method.as_str(),
                     "all"
@@ -1237,11 +1441,14 @@ impl<'a> FieldReadVisitor<'a> {
                 for argument in &call.args {
                     if passes_item_to_closure {
                         if let syn::Expr::Closure(closure) = argument {
-                            closure_result = self.infer_item_closure(closure, owner.as_deref());
+                            closure_result = self.infer_item_closure(closure, owner.as_ref());
                             continue;
                         }
                     }
                     self.visit_expr(argument);
+                }
+                if mutates_receiver {
+                    return None;
                 }
                 if matches!(method.as_str(), "and_then" | "filter_map" | "map") {
                     return closure_result;
@@ -1291,12 +1498,22 @@ impl<'a> FieldReadVisitor<'a> {
                 .path
                 .get_ident()
                 .and_then(|ident| self.environment.get(&ident.to_string()).cloned()),
-            syn::Expr::Reference(reference) => self.infer_expr(&reference.expr),
+            syn::Expr::Reference(reference) => {
+                if reference.mutability.is_some() {
+                    self.infer_place_expr(&reference.expr)
+                } else {
+                    self.infer_expr(&reference.expr)
+                }
+            }
             syn::Expr::Struct(record) => {
                 for field in &record.fields {
                     self.visit_expr(&field.expr);
                 }
-                self.types.resolve_path(&record.path, &self.context)
+                self.resolve_path_scoped(&record.path)
+                    .map(|owner| InferredValue {
+                        owner,
+                        mutable_place: false,
+                    })
             }
             syn::Expr::Try(tried) => self.infer_expr(&tried.expr),
             syn::Expr::Unary(unary) => self.infer_expr(&unary.expr),
@@ -1304,6 +1521,51 @@ impl<'a> FieldReadVisitor<'a> {
                 syn::visit::visit_expr(self, expression);
                 None
             }
+        }
+    }
+
+    fn infer_place_expr(&mut self, expression: &syn::Expr) -> Option<InferredValue> {
+        match expression {
+            syn::Expr::Field(field) => {
+                let owner = self.infer_place_expr(&field.base)?;
+                let member = Self::named_member(&field.member)?;
+                self.types
+                    .field_type(&owner.owner, &member)
+                    .map(|target| InferredValue {
+                        owner: target,
+                        mutable_place: true,
+                    })
+            }
+            syn::Expr::Group(group) => self.infer_place_expr(&group.expr),
+            syn::Expr::Index(index) => {
+                let owner = self.infer_place_expr(&index.expr);
+                self.visit_expr(&index.index);
+                owner
+            }
+            syn::Expr::Paren(paren) => self.infer_place_expr(&paren.expr),
+            syn::Expr::Path(path) => path
+                .path
+                .get_ident()
+                .and_then(|ident| self.environment.get(&ident.to_string()).cloned()),
+            syn::Expr::Reference(reference) => self.infer_place_expr(&reference.expr),
+            syn::Expr::Try(tried) => self.infer_place_expr(&tried.expr),
+            syn::Expr::Unary(unary) => self.infer_place_expr(&unary.expr),
+            _ => None,
+        }
+    }
+
+    fn visit_discarded_expr(&mut self, expression: &syn::Expr) {
+        match expression {
+            syn::Expr::Field(_)
+            | syn::Expr::Path(_)
+            | syn::Expr::Reference(_)
+            | syn::Expr::Unary(_) => {
+                let _ = self.infer_place_expr(expression);
+            }
+            syn::Expr::Group(group) => self.visit_discarded_expr(&group.expr),
+            syn::Expr::Paren(paren) => self.visit_discarded_expr(&paren.expr),
+            syn::Expr::Try(tried) => self.visit_discarded_expr(&tried.expr),
+            _ => self.visit_expr(expression),
         }
     }
 }
@@ -1348,12 +1610,38 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
         self.context = saved_context;
     }
 
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        if !self.in_function {
+            return;
+        }
+        let mut bindings = Vec::new();
+        let mut globs = Vec::new();
+        collect_use_bindings(&node.tree, &mut Vec::new(), &mut bindings, &mut globs);
+        for (alias, segments) in bindings {
+            self.local_symbol_bindings
+                .entry(alias)
+                .or_default()
+                .push(TypeReference {
+                    segments,
+                    context: self.context.clone(),
+                    leading_colon: node.leading_colon.is_some(),
+                });
+        }
+        for segments in globs {
+            self.local_glob_imports.push(TypeReference {
+                segments,
+                context: self.context.clone(),
+                leading_colon: node.leading_colon.is_some(),
+            });
+        }
+    }
+
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
         if attributes_are_test_only(&node.attrs) {
             return;
         }
         let saved_owner = self.impl_owner.clone();
-        self.impl_owner = self.types.resolve_type(&node.self_ty, &self.context);
+        self.impl_owner = self.resolve_type_scoped(&node.self_ty);
         syn::visit::visit_item_impl(self, node);
         self.impl_owner = saved_owner;
     }
@@ -1380,16 +1668,30 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
         self.visit_expr(&node.right);
     }
 
+    fn visit_expr_reference(&mut self, node: &'ast syn::ExprReference) {
+        if node.mutability.is_some() {
+            let _ = self.infer_place_expr(&node.expr);
+        } else {
+            self.visit_expr(&node.expr);
+        }
+    }
+
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         let _ = self.infer_expr(&syn::Expr::MethodCall(node.clone()));
     }
 
     fn visit_local(&mut self, node: &'ast syn::Local) {
         let saved_environment = self.environment.clone();
-        let inferred = node
-            .init
-            .as_ref()
-            .and_then(|init| self.infer_expr(&init.expr));
+        let inferred = if Self::pattern_discards_value(&node.pat) {
+            if let Some(init) = &node.init {
+                self.visit_discarded_expr(&init.expr);
+            }
+            None
+        } else {
+            node.init
+                .as_ref()
+                .and_then(|init| self.infer_expr(&init.expr))
+        };
         self.environment = saved_environment.clone();
         if let Some(init) = &node.init {
             if let Some((_, diverge)) = &init.diverge {
@@ -1397,19 +1699,23 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
                 self.environment = saved_environment;
             }
         }
-        self.bind_pattern(&node.pat, inferred.as_deref());
+        self.bind_pattern(&node.pat, inferred.as_ref());
     }
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
         let saved_environment = self.environment.clone();
+        let saved_symbol_bindings = self.local_symbol_bindings.clone();
+        let saved_glob_imports = self.local_glob_imports.clone();
         syn::visit::visit_block(self, node);
         self.environment = saved_environment;
+        self.local_symbol_bindings = saved_symbol_bindings;
+        self.local_glob_imports = saved_glob_imports;
     }
 
     fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
         let owner = self.infer_expr(&node.expr);
         let saved_environment = self.environment.clone();
-        self.bind_pattern(&node.pat, owner.as_deref());
+        self.bind_pattern(&node.pat, owner.as_ref());
         self.visit_block(&node.body);
         self.environment = saved_environment;
     }
@@ -1427,14 +1733,14 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
 
     fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
         let owner = self.infer_expr(&node.expr);
-        self.bind_pattern(&node.pat, owner.as_deref());
+        self.bind_pattern(&node.pat, owner.as_ref());
     }
 
     fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
         let owner = self.infer_expr(&node.expr);
         for arm in &node.arms {
             let saved_environment = self.environment.clone();
-            self.bind_pattern(&arm.pat, owner.as_deref());
+            self.bind_pattern(&arm.pat, owner.as_ref());
             if let Some((_, guard)) = &arm.guard {
                 self.visit_expr(guard);
             }
@@ -1614,6 +1920,18 @@ mod tests {
             rust_field: field.to_string(),
             rust_owner: Some("Config".to_string()),
         }
+    }
+
+    fn guard_key() -> ConfigSchemaKey {
+        ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }
+    }
+
+    fn guard_errors(sources: &[SourceFile]) -> Vec<RegistryError> {
+        verify_config_readers(&[guard_key()], &[], sources)
     }
 
     #[test]
@@ -2037,6 +2355,687 @@ fn production(existing: &ExistingFeature) {
             "an unresolved external glob must make function provenance fail closed: {errors:?}"
         );
         assert_eq!(errors[0].subject, "proxy.guard.enabled");
+    }
+
+    #[test]
+    fn external_glob_reexported_by_local_facade_taints_type_provenance() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        let sources = [
+            source_at(
+                "crates/config/src/types.rs",
+                "struct GuardConfig { enabled: bool }",
+            ),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                "mod facade { pub use external_crate::*; }\n\
+                 use facade::*;\n\
+                 fn runtime(v: &GuardConfig) { consume(v.enabled); }",
+            ),
+        ];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a local facade must propagate unresolved external glob taint: {errors:?}"
+        );
+        assert_eq!(errors[0].subject, "proxy.guard.enabled");
+    }
+
+    #[test]
+    fn external_glob_reexported_by_local_facade_taints_function_provenance() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        let sources = [
+            source_at(
+                "crates/config/src/lib.rs",
+                "struct GuardConfig { enabled: bool }\n\
+                 fn make_guard() -> GuardConfig { todo!() }",
+            ),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                "mod facade { pub use external_crate::*; }\n\
+                 use facade::*;\n\
+                 fn runtime() { consume(make_guard().enabled); }",
+            ),
+        ];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a local facade must taint an unresolved external function glob: {errors:?}"
+        );
+        assert_eq!(errors[0].subject, "proxy.guard.enabled");
+    }
+
+    #[test]
+    fn parent_external_glob_inherited_with_super_taints_type_provenance() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        let sources = [
+            source_at(
+                "crates/config/src/types.rs",
+                "struct GuardConfig { enabled: bool }",
+            ),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                "use external_crate::*;\n\
+                 mod child {\n\
+                     use super::*;\n\
+                     fn runtime(v: &GuardConfig) { consume(v.enabled); }\n\
+                 }",
+            ),
+        ];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a child `use super::*` must inherit unresolved glob taint: {errors:?}"
+        );
+        assert_eq!(errors[0].subject, "proxy.guard.enabled");
+    }
+
+    #[test]
+    fn parent_external_glob_inherited_with_super_taints_function_provenance() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        let sources = [
+            source_at(
+                "crates/config/src/lib.rs",
+                "struct GuardConfig { enabled: bool }\n\
+                 fn make_guard() -> GuardConfig { todo!() }",
+            ),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                "use external_crate::*;\n\
+                 mod child {\n\
+                     use super::*;\n\
+                     fn runtime() { consume(make_guard().enabled); }\n\
+                 }",
+            ),
+        ];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a child `use super::*` must inherit unresolved function glob taint: {errors:?}"
+        );
+        assert_eq!(errors[0].subject, "proxy.guard.enabled");
+    }
+
+    #[test]
+    fn qualified_external_aliases_cannot_impersonate_the_config_type_prefix() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        for runtime in [
+            "use external_crate as sbproxy_config;\n\
+             fn runtime(v: &sbproxy_config::GuardConfig) { consume(v.enabled); }",
+            "use external_crate::types as sbproxy_config;\n\
+             fn runtime(v: &sbproxy_config::GuardConfig) { consume(v.enabled); }",
+            "extern crate external_crate as sbproxy_config;\n\
+             fn runtime(v: &sbproxy_config::GuardConfig) { consume(v.enabled); }",
+            "mod sbproxy_config {\n\
+                 pub use external_crate::GuardConfig;\n\
+             }\n\
+             fn runtime(v: &sbproxy_config::GuardConfig) { consume(v.enabled); }",
+        ] {
+            let sources = [
+                source_at(
+                    "crates/sbproxy-config/src/lib.rs",
+                    "struct GuardConfig { enabled: bool }",
+                ),
+                source_at("crates/runtime/src/lib.rs", runtime),
+            ];
+
+            let errors = verify_config_readers(&keys, &[], &sources);
+
+            assert_eq!(
+                errors.len(),
+                1,
+                "a lexical external alias must override crate-name spelling: {runtime}\n{errors:?}"
+            );
+            assert_eq!(errors[0].subject, "proxy.guard.enabled");
+        }
+    }
+
+    #[test]
+    fn qualified_external_aliases_cannot_impersonate_the_config_function_prefix() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        for runtime in [
+            "use external_crate as sbproxy_config;\n\
+             fn runtime() { consume(sbproxy_config::make_guard().enabled); }",
+            "use external_crate::factory as sbproxy_config;\n\
+             fn runtime() { consume(sbproxy_config::make_guard().enabled); }",
+            "extern crate external_crate as sbproxy_config;\n\
+             fn runtime() { consume(sbproxy_config::make_guard().enabled); }",
+            "mod sbproxy_config {\n\
+                 pub use external_crate::make_guard;\n\
+             }\n\
+             fn runtime() { consume(sbproxy_config::make_guard().enabled); }",
+        ] {
+            let sources = [
+                source_at(
+                    "crates/sbproxy-config/src/lib.rs",
+                    "struct GuardConfig { enabled: bool }\n\
+                     fn make_guard() -> GuardConfig { todo!() }",
+                ),
+                source_at("crates/runtime/src/lib.rs", runtime),
+            ];
+
+            let errors = verify_config_readers(&keys, &[], &sources);
+
+            assert_eq!(
+                errors.len(),
+                1,
+                "a lexical external alias must override function crate spelling: \
+                 {runtime}\n{errors:?}"
+            );
+            assert_eq!(errors[0].subject, "proxy.guard.enabled");
+        }
+    }
+
+    #[test]
+    fn legitimate_local_qualified_aliases_preserve_type_provenance() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        for source_text in [
+            "struct GuardConfig { enabled: bool }\n\
+             use crate as config_alias;\n\
+             fn runtime(v: &config_alias::GuardConfig) { consume(v.enabled); }",
+            "mod types { struct GuardConfig { enabled: bool } }\n\
+             use crate::types as config_alias;\n\
+             fn runtime(v: &config_alias::GuardConfig) { consume(v.enabled); }",
+        ] {
+            let sources = [source_at("crates/config/src/lib.rs", source_text)];
+
+            let errors = verify_config_readers(&keys, &[], &sources);
+
+            assert!(
+                errors.is_empty(),
+                "a local crate or module alias must retain type provenance: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legitimate_local_qualified_aliases_preserve_function_provenance() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        for source_text in [
+            "struct GuardConfig { enabled: bool }\n\
+             fn make_guard() -> GuardConfig { todo!() }\n\
+             use crate as config_alias;\n\
+             fn runtime() { consume(config_alias::make_guard().enabled); }",
+            "struct GuardConfig { enabled: bool }\n\
+             mod factory {\n\
+                 fn make_guard() -> crate::GuardConfig { todo!() }\n\
+             }\n\
+             use crate::factory as config_alias;\n\
+             fn runtime() { consume(config_alias::make_guard().enabled); }",
+        ] {
+            let sources = [source_at("crates/config/src/lib.rs", source_text)];
+
+            let errors = verify_config_readers(&keys, &[], &sources);
+
+            assert!(
+                errors.is_empty(),
+                "a local crate or module alias must retain function provenance: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legitimate_local_glob_facade_preserves_type_provenance() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        let sources = [source_at(
+            "crates/config/src/lib.rs",
+            "mod types { struct GuardConfig { enabled: bool } }\n\
+             mod facade { pub use crate::types::*; }\n\
+             use facade::*;\n\
+             fn runtime(v: &GuardConfig) { consume(v.enabled); }",
+        )];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert!(
+            errors.is_empty(),
+            "a local glob facade must retain type provenance: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn legitimate_local_glob_facade_preserves_function_provenance() {
+        let keys = [ConfigSchemaKey {
+            path: "proxy.guard.enabled".to_string(),
+            rust_field: "enabled".to_string(),
+            rust_owner: Some("GuardConfig".to_string()),
+        }];
+        let sources = [source_at(
+            "crates/config/src/lib.rs",
+            "struct GuardConfig { enabled: bool }\n\
+             mod factory {\n\
+                 fn make_guard() -> crate::GuardConfig { todo!() }\n\
+             }\n\
+             mod facade { pub use crate::factory::*; }\n\
+             use facade::*;\n\
+             fn runtime() { consume(make_guard().enabled); }",
+        )];
+
+        let errors = verify_config_readers(&keys, &[], &sources);
+
+        assert!(
+            errors.is_empty(),
+            "a local glob facade must retain function provenance: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn transitive_named_and_two_hop_external_reexports_fail_closed() {
+        let config = || {
+            source_at(
+                "crates/config/src/lib.rs",
+                "struct GuardConfig { enabled: bool }\n\
+             fn make_guard() -> GuardConfig { todo!() }",
+            )
+        };
+        for runtime in [
+            "mod facade { pub use external_crate::GuardConfig; }\n\
+             use facade::*;\n\
+             fn runtime(v: &GuardConfig) { consume(v.enabled); }",
+            "mod facade { pub use external_crate::make_guard; }\n\
+             use facade::*;\n\
+             fn runtime() { consume(make_guard().enabled); }",
+            "use external_crate::GuardConfig;\n\
+             mod child {\n\
+                 use super::*;\n\
+                 fn runtime(v: &GuardConfig) { consume(v.enabled); }\n\
+             }",
+            "use external_crate::make_guard;\n\
+             mod child {\n\
+                 use super::*;\n\
+                 fn runtime() { consume(make_guard().enabled); }\n\
+             }",
+            "mod first { pub use external_crate::*; }\n\
+             mod second { pub use crate::first::*; }\n\
+             use second::*;\n\
+             fn runtime(v: &GuardConfig) { consume(v.enabled); }",
+            "mod first { pub use external_crate::*; }\n\
+             mod second { pub use crate::first::*; }\n\
+             use second::*;\n\
+             fn runtime() { consume(make_guard().enabled); }",
+        ] {
+            let errors = guard_errors(&[config(), source_at("crates/runtime/src/lib.rs", runtime)]);
+            assert_eq!(
+                errors.len(),
+                1,
+                "transitive external provenance must fail closed: {runtime}\n{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lexical_module_collisions_override_extern_crate_spelling() {
+        let config = || {
+            source_at(
+                "crates/sbproxy-config/src/lib.rs",
+                "struct GuardConfig { enabled: bool }\n\
+             fn make_guard() -> GuardConfig { todo!() }",
+            )
+        };
+        for runtime in [
+            "mod sbproxy_config { pub struct GuardConfig { pub enabled: bool } }\n\
+             fn runtime(v: &sbproxy_config::GuardConfig) { consume(v.enabled); }",
+            "mod outer {\n\
+                 mod sbproxy_config { pub struct GuardConfig { pub enabled: bool } }\n\
+                 fn runtime(v: &sbproxy_config::GuardConfig) { consume(v.enabled); }\n\
+             }",
+            "mod sbproxy_config {\n\
+                 pub struct GuardConfig { pub enabled: bool }\n\
+                 pub fn make_guard() -> GuardConfig { todo!() }\n\
+             }\n\
+             fn runtime() { consume(sbproxy_config::make_guard().enabled); }",
+            "mod outer {\n\
+                 mod sbproxy_config {\n\
+                     pub struct GuardConfig { pub enabled: bool }\n\
+                     pub fn make_guard() -> GuardConfig { todo!() }\n\
+                 }\n\
+                 fn runtime() { consume(sbproxy_config::make_guard().enabled); }\n\
+             }",
+        ] {
+            let errors = guard_errors(&[config(), source_at("crates/runtime/src/lib.rs", runtime)]);
+            assert_eq!(
+                errors.len(),
+                1,
+                "a lexical module must shadow extern-prelude spelling: {runtime}\n{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_module_paths_and_exact_globs_preserve_provenance() {
+        for sources in [
+            vec![source_at(
+                "crates/config/src/lib.rs",
+                "mod types { pub struct GuardConfig { pub enabled: bool } }\n\
+                 fn runtime(v: &types::GuardConfig) { consume(v.enabled); }",
+            )],
+            vec![
+                source_at(
+                    "crates/sbproxy-config/src/types.rs",
+                    "pub struct GuardConfig { pub enabled: bool }",
+                ),
+                source_at(
+                    "crates/runtime/src/lib.rs",
+                    "mod unrelated { struct GuardConfig { enabled: bool } }\n\
+                     use sbproxy_config::types::*;\n\
+                     fn runtime(v: &GuardConfig) { consume(v.enabled); }",
+                ),
+            ],
+            vec![
+                source_at(
+                    "crates/sbproxy-config/src/lib.rs",
+                    "struct GuardConfig { enabled: bool }\n\
+                     fn make_guard() -> GuardConfig { todo!() }",
+                ),
+                source_at(
+                    "crates/runtime/src/lib.rs",
+                    "use sbproxy_config::*;\n\
+                     fn runtime(v: &GuardConfig) { consume(v.enabled); }\n\
+                     fn runtime_fn() { consume(make_guard().enabled); }",
+                ),
+            ],
+            vec![source_at(
+                "crates/config/src/lib.rs",
+                "struct GuardConfig { enabled: bool }\n\
+                 fn make_guard() -> GuardConfig { todo!() }\n\
+                 mod child {\n\
+                     use super::*;\n\
+                     fn runtime(v: &GuardConfig) { consume(v.enabled); }\n\
+                     fn runtime_fn() { consume(make_guard().enabled); }\n\
+                 }",
+            )],
+        ] {
+            let errors = guard_errors(&sources);
+            assert!(
+                errors.is_empty(),
+                "exact local/glob provenance must remain usable: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn macro_generated_names_do_not_use_global_unique_fallbacks() {
+        let config = || {
+            source_at(
+                "crates/config/src/lib.rs",
+                "struct GuardConfig { enabled: bool }\n\
+             fn make_guard() -> GuardConfig { todo!() }",
+            )
+        };
+        for runtime in [
+            "macro_rules! define_guard {\n\
+                 () => { struct GuardConfig { enabled: bool } };\n\
+             }\n\
+             define_guard!();\n\
+             fn runtime(v: &GuardConfig) { consume(v.enabled); }",
+            "macro_rules! define_guard {\n\
+                 () => {\n\
+                     struct GuardConfig { enabled: bool }\n\
+                     fn make_guard() -> GuardConfig { todo!() }\n\
+                 };\n\
+             }\n\
+             define_guard!();\n\
+             fn runtime() { consume(make_guard().enabled); }",
+        ] {
+            let errors = guard_errors(&[config(), source_at("crates/runtime/src/lib.rs", runtime)]);
+            assert_eq!(
+                errors.len(),
+                1,
+                "unexpanded macro names must not fall back globally: {runtime}\n{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn module_aliases_resolve_their_exact_lexical_targets() {
+        let config = || {
+            source_at(
+                "crates/sbproxy-config/src/types.rs",
+                "pub struct GuardConfig { pub enabled: bool }",
+            )
+        };
+        for runtime in [
+            "use sbproxy_config::types;\n\
+             fn runtime(v: &types::GuardConfig) { consume(v.enabled); }",
+            "use sbproxy_config::types as cfg;\n\
+             fn runtime(v: &cfg::GuardConfig) { consume(v.enabled); }",
+        ] {
+            let errors = guard_errors(&[config(), source_at("crates/runtime/src/lib.rs", runtime)]);
+            assert!(
+                errors.is_empty(),
+                "a config module alias must preserve provenance: {runtime}\n{errors:?}"
+            );
+        }
+
+        for runtime in [
+            "use external_crate::types;\n\
+             fn runtime(v: &types::GuardConfig) { consume(v.enabled); }",
+            "use external_crate::types as cfg;\n\
+             fn runtime(v: &cfg::GuardConfig) { consume(v.enabled); }",
+        ] {
+            let errors = guard_errors(&[config(), source_at("crates/runtime/src/lib.rs", runtime)]);
+            assert_eq!(
+                errors.len(),
+                1,
+                "an external module alias must fail closed: {runtime}\n{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leading_colon_selects_the_extern_root_before_lexical_modules() {
+        let config = || {
+            source_at(
+                "crates/sbproxy-config/src/lib.rs",
+                "pub struct GuardConfig { pub enabled: bool }",
+            )
+        };
+        let local_module = "mod sbproxy_config { pub struct GuardConfig { pub enabled: bool } }\n";
+
+        let bare = guard_errors(&[
+            config(),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                &format!(
+                    "{local_module}\
+                     fn runtime(v: &sbproxy_config::GuardConfig) {{ consume(v.enabled); }}"
+                ),
+            ),
+        ]);
+        assert_eq!(
+            bare.len(),
+            1,
+            "a bare prefix must select the lexical module: {bare:?}"
+        );
+
+        let absolute = guard_errors(&[
+            config(),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                &format!(
+                    "{local_module}\
+                     fn runtime(v: &::sbproxy_config::GuardConfig) {{ consume(v.enabled); }}"
+                ),
+            ),
+        ]);
+        assert!(
+            absolute.is_empty(),
+            "a leading colon must select the extern root: {absolute:?}"
+        );
+    }
+
+    #[test]
+    fn exact_external_root_binding_wins_over_local_namesake() {
+        let errors = guard_errors(&[source_at(
+            "crates/config/src/lib.rs",
+            "mod types { pub struct GuardConfig { pub enabled: bool } }\n\
+             pub use external_crate::GuardConfig;\n\
+             fn runtime(v: &crate::GuardConfig) { consume(v.enabled); }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "an exact external root re-export must fail closed: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn block_local_imports_are_resolved_without_leaking_between_functions() {
+        let config = || {
+            source_at(
+                "crates/sbproxy-config/src/lib.rs",
+                "pub mod types { pub struct GuardConfig { pub enabled: bool } }\n\
+                 pub fn make_guard() -> types::GuardConfig { todo!() }",
+            )
+        };
+        for runtime in [
+            "fn runtime() {\n\
+                 use sbproxy_config::types::GuardConfig;\n\
+                 let value: &GuardConfig = todo!();\n\
+                 consume(value.enabled);\n\
+             }",
+            "fn runtime() {\n\
+                 use sbproxy_config::types::*;\n\
+                 let value: &GuardConfig = todo!();\n\
+                 consume(value.enabled);\n\
+             }",
+            "fn runtime() {\n\
+                 use sbproxy_config::make_guard;\n\
+                 consume(make_guard().enabled);\n\
+             }",
+        ] {
+            let errors = guard_errors(&[config(), source_at("crates/runtime/src/lib.rs", runtime)]);
+            assert!(
+                errors.is_empty(),
+                "a block-local config import must retain provenance: {runtime}\n{errors:?}"
+            );
+        }
+
+        let errors = guard_errors(&[
+            config(),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                "fn unrelated() { use sbproxy_config::types::GuardConfig; }\n\
+                 macro_rules! define_guard {\n\
+                     () => { struct GuardConfig { enabled: bool } };\n\
+                 }\n\
+                 define_guard!();\n\
+                 fn runtime(value: &GuardConfig) { consume(value.enabled); }",
+            ),
+        ]);
+        assert_eq!(
+            errors.len(),
+            1,
+            "an import in another function must not tag a macro-generated namesake: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn recursive_local_glob_cycles_preserve_exact_results_and_external_taint() {
+        let local = guard_errors(&[source_at(
+            "crates/config/src/lib.rs",
+            "mod types { pub struct GuardConfig { pub enabled: bool } }\n\
+             mod first { pub use crate::second::*; }\n\
+             mod second {\n\
+                 pub use crate::first::*;\n\
+                 pub use crate::types::*;\n\
+             }\n\
+             use first::*;\n\
+             fn runtime(value: &GuardConfig) { consume(value.enabled); }",
+        )]);
+        assert!(
+            local.is_empty(),
+            "a cyclic local facade may still export one exact owner: {local:?}"
+        );
+
+        let external = guard_errors(&[
+            source_at(
+                "crates/config/src/types.rs",
+                "struct GuardConfig { enabled: bool }",
+            ),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                "mod first { pub use crate::second::*; }\n\
+                 mod second {\n\
+                     pub use crate::first::*;\n\
+                     pub use external_crate::*;\n\
+                 }\n\
+                 use first::*;\n\
+                 fn runtime(value: &GuardConfig) { consume(value.enabled); }",
+            ),
+        ]);
+        assert_eq!(
+            external.len(),
+            1,
+            "a cyclic facade must retain unresolved external taint: {external:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_root_reimports_do_not_taint_an_exact_local_reexport() {
+        let errors = guard_errors(&[source_at(
+            "crates/config/src/lib.rs",
+            "mod types { pub struct GuardConfig { pub enabled: bool } }\n\
+             pub use types::*;\n\
+             mod sibling {\n\
+                 use crate::GuardConfig;\n\
+                 pub fn inspect(value: &GuardConfig) { consume(value.enabled); }\n\
+             }\n\
+             pub use sibling::*;",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "a sibling's import of a root re-export is a cycle, not external taint: {errors:?}"
+        );
     }
 
     #[test]
@@ -2628,6 +3627,17 @@ fn cfg_test(config: &Config) {
             "struct GuardConfig { enabled: bool }\n\
              fn normalize(v: &mut GuardConfig) { v.enabled = false; }",
             "struct GuardConfig { enabled: bool }\n\
+             fn normalize(v: &mut GuardConfig) { overwrite(&mut v.enabled); }",
+            "struct GuardConfig { enabled: bool }\n\
+             fn normalize(v: &mut GuardConfig) { v.enabled.clone_from(&false); }",
+            "struct GuardConfig { enabled: bool }\n\
+             fn ignore(v: &GuardConfig) { let _ = v.enabled; }",
+            "struct GuardConfig { enabled: bool }\n\
+             fn normalize(v: &mut GuardConfig) {\n\
+                 let GuardConfig { enabled, .. } = v;\n\
+                 *enabled = false;\n\
+             }",
+            "struct GuardConfig { enabled: bool }\n\
              fn ignore(v: &GuardConfig) {\n\
                  let GuardConfig { enabled: _, .. } = v;\n\
              }",
@@ -2644,6 +3654,27 @@ fn cfg_test(config: &Config) {
                 errors.len(),
                 1,
                 "non-read syntax must not prove a reader: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn immutable_borrows_and_destructuring_remain_reader_evidence() {
+        for text in [
+            "struct GuardConfig { enabled: bool }\n\
+             fn inspect(v: &GuardConfig) { consume(&v.enabled); }",
+            "struct GuardConfig { enabled: bool }\n\
+             fn inspect(v: &GuardConfig) { let _ = consume(v.enabled); }",
+            "struct GuardConfig { enabled: bool }\n\
+             fn inspect(v: &GuardConfig) {\n\
+                 let GuardConfig { enabled, .. } = v;\n\
+                 consume(enabled);\n\
+             }",
+        ] {
+            let errors = guard_errors(&[source(text)]);
+            assert!(
+                errors.is_empty(),
+                "an immutable value use remains reader evidence: {errors:?}"
             );
         }
     }
