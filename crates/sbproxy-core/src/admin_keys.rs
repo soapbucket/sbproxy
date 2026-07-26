@@ -206,6 +206,9 @@ struct KeyMutation {
     /// Free-form string metadata; replaces the record's map wholesale.
     metadata: Patch<std::collections::BTreeMap<String, String>>,
     tenant: Patch<String>,
+    /// Upstream credential this key presents. JSON `null` clears the
+    /// binding and returns the key to the origin's own resolver.
+    credential_id: Patch<String>,
     /// RFC 3339 expiry. JSON `null` clears it.
     expires_at: Patch<DateTime<Utc>>,
 }
@@ -344,7 +347,63 @@ fn apply_key_mutation(rec: &mut KeyRecord, m: &KeyMutation) {
     apply_replacement(&mut rec.tags, &m.tags);
     apply_replacement(&mut rec.metadata, &m.metadata);
     apply_nullable(&mut rec.tenant_id, &m.tenant);
+    apply_nullable(&mut rec.credential_id, &m.credential_id);
     apply_nullable(&mut rec.expires_at, &m.expires_at);
+}
+
+/// Reject a `credential_id` binding that names a credential which does not
+/// exist, is not active, or belongs to another tenant.
+///
+/// Checked here AND again at resolution time in
+/// [`crate::key_plane::KeyPlane::resolve_credential_secret`], because either
+/// record's tenant can be patched after the binding was made. One check is not
+/// enough.
+///
+/// `key_tenant` is the tenant the key will have once the mutation applies.
+fn validate_credential_binding(
+    plane: &KeyPlane,
+    m: &KeyMutation,
+    key_tenant: Option<&str>,
+) -> Result<(), Resp> {
+    let Patch::Value(credential_id) = &m.credential_id else {
+        return Ok(());
+    };
+    // An older node in the fleet drops `credential_id` when it replicates the
+    // record, resolves the key without a binding, and dispatches on the
+    // origin's shared credential. Refuse to create such a record until every
+    // node has declared it understands the field.
+    match crate::key_capability::check_fleet_capability(
+        crate::key_capability::CAP_CREDENTIAL_BINDING,
+    ) {
+        crate::key_capability::FleetCapability::Satisfied => {}
+        crate::key_capability::FleetCapability::Missing(nodes) => {
+            return Err(conflict(&format!(
+                "credential binding needs every node upgraded; these have not declared \
+                 support: {}",
+                nodes.join(", ")
+            )));
+        }
+        crate::key_capability::FleetCapability::Unknown(reason) => {
+            return Err(conflict(&format!(
+                "cannot confirm every node supports credential binding: {reason}"
+            )));
+        }
+    }
+    match load_credential(plane, credential_id) {
+        Ok(Some(cred)) => {
+            if !cred.is_usable() {
+                return Err(bad_request(
+                    "credential_id names a credential that is not active",
+                ));
+            }
+            if cred.tenant_id.is_some() && cred.tenant_id.as_deref() != key_tenant {
+                return Err(bad_request("credential_id belongs to a different tenant"));
+            }
+            Ok(())
+        }
+        Ok(None) => Err(bad_request("credential_id names an unknown credential")),
+        Err(e) => Err(internal_error(&e)),
+    }
 }
 
 fn create_key(body: Option<&str>) -> Resp {
@@ -361,6 +420,13 @@ fn create_key(body: Option<&str>) -> Resp {
     }
     if m.expected_revision.is_some() {
         return bad_request("expected_revision is only valid for key mutation");
+    }
+    let new_tenant = match &m.tenant {
+        Patch::Value(t) => Some(t.as_str()),
+        _ => None,
+    };
+    if let Err(resp) = validate_credential_binding(&plane, &m, new_tenant) {
+        return resp;
     }
     let minted = plane.crypto().mint_key();
     let now = Utc::now();
@@ -1130,6 +1196,16 @@ fn update_key(id: &str, body: Option<&str>) -> Resp {
         Ok(None) => return not_found("key not found"),
         Err(e) => return internal_error(&e),
     };
+    // The tenant the key will have AFTER this mutation: an explicit value
+    // wins, otherwise the one already stored.
+    let effective_tenant = match &m.tenant {
+        Patch::Value(t) => Some(t.clone()),
+        Patch::Null => None,
+        Patch::Missing => rec.tenant_id.clone(),
+    };
+    if let Err(resp) = validate_credential_binding(&plane, &m, effective_tenant.as_deref()) {
+        return resp;
+    }
     if rec.policy_revision != expected_revision {
         return revision_conflict(id, expected_revision, rec.policy_revision);
     }
@@ -1408,6 +1484,29 @@ fn delete_credential(id: &str) -> Resp {
         Ok(p) => p,
         Err(e) => return e,
     };
+    // Refuse while keys still bind this credential. Deleting it would leave
+    // those keys resolving to nothing, and since a bound key fails closed
+    // rather than falling back, every request on them would start returning
+    // 503 with no obvious cause. Name the keys so the operator can unbind
+    // them (PATCH with `"credential_id": null`) and retry.
+    let bound = {
+        let store = plane.cache().store().clone();
+        match block_on_keystore(async move { store.list_keys().await }) {
+            Ok(keys) => keys
+                .into_iter()
+                .filter(|k| k.credential_id.as_deref() == Some(id))
+                .map(|k| k.key_id)
+                .collect::<Vec<_>>(),
+            Err(e) => return internal_error(&format!("list keys: {e:#}")),
+        }
+    };
+    if !bound.is_empty() {
+        return conflict(&format!(
+            "credential is bound by {} key(s): {}. Clear credential_id on them first.",
+            bound.len(),
+            bound.join(", ")
+        ));
+    }
     let store = plane.cache().store().clone();
     let owned = id.to_string();
     if let Err(e) = block_on_keystore(async move { store.delete_credential(&owned).await }) {
@@ -1699,6 +1798,11 @@ fn bad_request(msg: &str) -> Resp {
     (400, "application/json", json!({ "error": msg }).to_string())
 }
 
+/// A mutation refused because it would break something still in use.
+fn conflict(msg: &str) -> Resp {
+    (409, "application/json", json!({ "error": msg }).to_string())
+}
+
 fn revision_conflict(key_id: &str, expected_revision: u64, current_revision: u64) -> Resp {
     (
         409,
@@ -1917,6 +2021,108 @@ mod tests {
 
     fn parse(resp: &Resp) -> serde_json::Value {
         serde_json::from_str(&resp.2).unwrap()
+    }
+
+    #[test]
+    fn binding_a_key_to_a_missing_credential_is_rejected() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        let resp = create_key(Some(r#"{"credential_id":"does-not-exist"}"#));
+        assert_eq!(resp.0, 400, "{}", resp.2);
+        assert!(resp.2.contains("unknown credential"), "{}", resp.2);
+    }
+
+    #[test]
+    fn binding_across_tenants_is_rejected_but_within_one_is_accepted() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        assert_eq!(
+            dispatch(
+                "POST",
+                "/admin/credentials",
+                Some(r#"{"id":"cred-a","secret":"s","tenant":"tenant-a"}"#),
+            )
+            .unwrap()
+            .0,
+            201
+        );
+
+        let wrong = create_key(Some(r#"{"credential_id":"cred-a","tenant":"tenant-b"}"#));
+        assert_eq!(wrong.0, 400, "{}", wrong.2);
+        assert!(wrong.2.contains("different tenant"), "{}", wrong.2);
+
+        let right = create_key(Some(r#"{"credential_id":"cred-a","tenant":"tenant-a"}"#));
+        assert_eq!(right.0, 201, "{}", right.2);
+    }
+
+    #[test]
+    fn binding_to_a_revoked_credential_is_rejected() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        assert_eq!(
+            dispatch(
+                "POST",
+                "/admin/credentials",
+                Some(r#"{"id":"cred-r","secret":"s"}"#),
+            )
+            .unwrap()
+            .0,
+            201
+        );
+        assert_eq!(
+            dispatch("POST", "/admin/credentials/cred-r/revoke", None)
+                .unwrap()
+                .0,
+            200
+        );
+        let resp = create_key(Some(r#"{"credential_id":"cred-r"}"#));
+        assert_eq!(resp.0, 400, "{}", resp.2);
+        assert!(resp.2.contains("not active"), "{}", resp.2);
+    }
+
+    #[test]
+    fn deleting_a_bound_credential_is_refused_and_names_the_keys() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        assert_eq!(
+            dispatch(
+                "POST",
+                "/admin/credentials",
+                Some(r#"{"id":"cred-b","secret":"s"}"#),
+            )
+            .unwrap()
+            .0,
+            201
+        );
+        let created = create_key(Some(r#"{"credential_id":"cred-b"}"#));
+        assert_eq!(created.0, 201, "{}", created.2);
+        let key_id = parse(&created)["key"]["key_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let refused = dispatch("DELETE", "/admin/credentials/cred-b", None).unwrap();
+        assert_eq!(refused.0, 409, "{}", refused.2);
+        assert!(
+            refused.2.contains(&key_id),
+            "the refusal must name the bound key so an operator can act: {}",
+            refused.2
+        );
+
+        // Unbind, then the delete goes through.
+        let unbound = dispatch(
+            "PATCH",
+            &format!("/admin/keys/{key_id}"),
+            Some(r#"{"expected_revision":1,"credential_id":null}"#),
+        )
+        .unwrap();
+        assert_eq!(unbound.0, 200, "{}", unbound.2);
+        assert_eq!(
+            dispatch("DELETE", "/admin/credentials/cred-b", None)
+                .unwrap()
+                .0,
+            200
+        );
     }
 
     #[test]

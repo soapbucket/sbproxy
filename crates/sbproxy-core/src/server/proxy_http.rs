@@ -1305,7 +1305,60 @@ impl ProxyHttp for SbProxy {
         // failure we fail open: the request goes upstream without the
         // minted credential (the upstream rejects it) rather than the
         // proxy 500ing; a fail-closed flag can follow.
-        if let Some(cred_cfg) = outbound_cred.as_ref() {
+        // A credential bound to the resolved minted key wins, and SUPPRESSES
+        // the origin-level resolver rather than running it and overwriting the
+        // result. Two concrete reasons: the origin's `token_exchange` mode
+        // makes a network round-trip per request, and it reads the inbound
+        // bearer as the RFC 8693 subject token, which the inbound-key phase
+        // may have just stripped. Running it here would burn a call and
+        // exchange against a subject that is no longer present.
+        let bound_credential_id = ctx
+            .resolved_inbound_key
+            .as_deref()
+            .and_then(|record| record.credential_id.clone());
+
+        if let Some(credential_id) = bound_credential_id {
+            let Some(plane) = crate::key_plane::current_key_plane() else {
+                warn!(
+                    credential_id = %credential_id,
+                    "a key binds a credential but no key plane is installed"
+                );
+                return Err(pingora_error::Error::explain(
+                    pingora_error::ErrorType::HTTPStatus(503),
+                    "credential resolution unavailable",
+                ));
+            };
+            let tenant = ctx
+                .resolved_inbound_key
+                .as_deref()
+                .and_then(|record| record.tenant_id.clone());
+            match plane
+                .resolve_credential_secret(&credential_id, tenant.as_deref())
+                .await
+            {
+                Ok(resolved) => {
+                    let _ = upstream_request.insert_header(resolved.header, &resolved.value);
+                }
+                Err(e) => {
+                    // Fail CLOSED, unlike the origin-level resolver below.
+                    // That one fails open because a failed mint there just
+                    // means the upstream rejects the request. Here a
+                    // wrong-credential path is available, and taking it would
+                    // hand this key an upstream identity it was never bound
+                    // to.
+                    warn!(
+                        origin = %ctx.hostname,
+                        credential_id = %credential_id,
+                        error = %e,
+                        "bound credential could not be resolved; refusing the request"
+                    );
+                    return Err(pingora_error::Error::explain(
+                        pingora_error::ErrorType::HTTPStatus(503),
+                        "bound credential unavailable",
+                    ));
+                }
+            }
+        } else if let Some(cred_cfg) = outbound_cred.as_ref() {
             let inbound_bearer: Option<String> = session
                 .req_header()
                 .headers

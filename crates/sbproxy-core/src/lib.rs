@@ -87,8 +87,11 @@ pub mod governance_runtime;
 pub mod hook_registry;
 pub mod hooks;
 pub mod identity;
-/// WOR-1546: dynamic key plane assembly + process-global handle.
+/// Extraction of a minted virtual key from configured inbound headers.
 pub mod inbound_key;
+/// Fleet capability gate for record fields older nodes silently drop.
+pub mod key_capability;
+/// WOR-1546: dynamic key plane assembly + process-global handle.
 pub mod key_plane;
 /// Canonical, secret-free lowering for governed key policy.
 pub mod key_policy;

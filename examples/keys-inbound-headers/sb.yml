@@ -1,0 +1,85 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Minted keys presented in whatever header a tool already sends.
+#
+# A minted key normally rides in `Authorization: Bearer`. Plenty of tools do
+# not send that: an Anthropic SDK sends `x-api-key`, Azure OpenAI sends
+# `api-key`, and internal tools send whatever their author picked. Rather than
+# rewrite those tools, sweep the headers they already use.
+#
+# A minted token is `sbp_<16 hex>_<64 hex>`, a fixed 85 characters over a fixed
+# alphabet, so a swept header is accepted or rejected without a store lookup.
+# A caller's own `sk-proj-...` or `sk-ant-...` provider key is not a minted
+# token and passes straight through to the upstream that owns it. That is what
+# lets minted keys and existing keys work side by side on the same header.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#   export SBPROXY_KEY_PEPPER=a-long-random-server-pepper
+#   export SBPROXY_KEY_MASTER=a-long-random-master-key
+#   make run CONFIG=examples/keys-inbound-headers/sb.yml
+#
+# Mint a key (the plaintext token is returned exactly once):
+#   TOKEN=$(curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/keys \
+#     -H 'Content-Type: application/json' \
+#     -d '{"name":"anthropic-sdk"}' | jq -r .token)
+#
+# Present it the way the Anthropic SDK would, in x-api-key:
+#   curl -s http://127.0.0.1:8080/v1/messages \
+#     -H 'Host: anthropic.local' \
+#     -H "x-api-key: $TOKEN" \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"claude-3-5-sonnet-20241022","max_tokens":64,
+#          "messages":[{"role":"user","content":"hi"}]}'
+#
+# The proxy consumes x-api-key and never forwards it upstream.
+#
+# Sidecar instead: keep sending your own upstream credential and put the
+# minted key in x-sb-api. SBproxy governs the request without holding the
+# upstream secret.
+#   curl -s http://127.0.0.1:8080/v1/messages \
+#     -H 'Host: anthropic.local' \
+#     -H 'Authorization: Bearer <your own upstream key>' \
+#     -H "x-sb-api: $TOKEN" \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"claude-3-5-sonnet-20241022","max_tokens":64,
+#          "messages":[{"role":"user","content":"hi"}]}'
+
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: /tmp/sbproxy-keys-inbound-headers.redb
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: env:SBPROXY_KEY_MASTER
+    failure_mode_allow: false
+    inbound:
+      # Swept in the order listed; the first well-shaped token wins. Two
+      # different tokens in two headers is a 400 rather than a silent pick.
+      headers:
+        - name: authorization
+          scheme: "Bearer "
+        - name: x-api-key
+          scheme: ""
+        - name: x-sb-api
+          scheme: ""
+      # Leave false unless this origin has no other auth provider. When true a
+      # request carrying no minted key is refused with a 401.
+      require: false
+
+origins:
+  anthropic.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: env:OPENAI_API_KEY

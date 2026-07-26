@@ -3533,6 +3533,31 @@
             }
           ]
         },
+        "inbound": {
+          "description": "Which inbound headers carry a minted key, and whether one is required.",
+          "default": {
+            "headers": [
+              {
+                "name": "authorization",
+                "scheme": "Bearer "
+              },
+              {
+                "name": "x-api-key",
+                "scheme": ""
+              },
+              {
+                "name": "x-sb-api",
+                "scheme": ""
+              }
+            ],
+            "require": false
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeyInboundConfig"
+            }
+          ]
+        },
         "allow_api_override": {
           "description": "Allow the admin API to override config-seeded records on reload. When false (default), config-seeded records are authoritative and re-asserted on every reload.",
           "default": false,
@@ -4087,6 +4112,56 @@
             "string",
             "null"
           ]
+        }
+      }
+    },
+    "KeyInboundConfig": {
+      "description": "`key_management.inbound:` block. Controls which request headers are swept for a minted key, and whether a route refuses requests that carry none.\n\nThe header a key arrives in is a property of the calling tool, not of the key: to know which header holds the key you would have to have resolved it already. So extraction is configured per route here rather than per key.",
+      "type": "object",
+      "properties": {
+        "headers": {
+          "description": "Ordered candidate headers. The first value whose shape parses wins. An empty list disables the sweep and leaves the legacy `authorization` path as the only front door.",
+          "default": [
+            {
+              "name": "authorization",
+              "scheme": "Bearer "
+            },
+            {
+              "name": "x-api-key",
+              "scheme": ""
+            },
+            {
+              "name": "x-sb-api",
+              "scheme": ""
+            }
+          ],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/InboundHeaderConfig"
+          }
+        },
+        "require": {
+          "description": "Deny with 401 when no minted key resolved. Off by default, so an upgrade changes nothing. Set per origin to make the proxy the only door on a route that has no other auth provider.",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
+    "InboundHeaderConfig": {
+      "description": "One entry in `key_management.inbound.headers:`.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "description": "Header name, matched case-insensitively.",
+          "type": "string"
+        },
+        "scheme": {
+          "description": "Prefix stripped from the value before the token shape is tested, matched case-insensitively. Empty for raw-value headers such as `x-api-key`.",
+          "default": "",
+          "type": "string"
         }
       }
     },
