@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-07-21*
+*Last modified: 2026-07-25*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -57,6 +57,11 @@ and every route below is unreachable. The server binds on
 `127.0.0.1:<port>` so the admin surface is loopback-only by default;
 expose it via a reverse proxy or sidecar with an IP allowlist when an
 operator console needs remote access.
+
+The credentials default to `admin` / `changeme`, which validation refuses
+once the surface is reachable off loopback (a non-loopback `bind`, or an
+`allow_ips` entry outside loopback). See
+[admin.md](admin.md#the-default-credentials-are-refused-off-loopback).
 
 ## Authentication
 

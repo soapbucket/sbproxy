@@ -1,6 +1,6 @@
 # Admin server
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-07-25*
 
 sbproxy has a built-in admin server: a small control-plane HTTP endpoint,
 separate from the data plane, for operating a running proxy. It exposes
@@ -32,11 +32,11 @@ proxy:
 |---|---|---|
 | `enabled` | `false` | Turn the admin server on. |
 | `port` | `9090` | Port it binds. |
-| `username` / `password` | `admin` / `changeme` | The top-level admin's HTTP Basic credentials. Change them. |
+| `username` / `password` | `admin` / `changeme` | The top-level admin's HTTP Basic credentials. Refused once the surface is reachable off loopback (see below). |
 | `max_log_entries` | `1000` | Size of the in-memory recent-request ring buffer. |
 | `prompt_persistence_path` | unset | redb file that persists prompt-version edits across restarts. |
 | `tls` | unset | Serve HTTPS instead of plaintext (see [TLS](#tls)). |
-| `bind` | `127.0.0.1` | Address to bind. Set to `0.0.0.0` or an interface for remote admin. |
+| `bind` | `127.0.0.1` | Address to bind. Set to `0.0.0.0` or an interface for remote admin. Must be an IP address, not a hostname. |
 | `allow_ips` | empty | IP / CIDR allowlist. Empty keeps the loopback-only default. |
 | `cors_origins` | empty | Allowed CORS origins for a separately hosted UI. Empty emits no CORS. |
 | `operators` | empty | Additional login identities with roles (see [Authentication and roles](#authentication-and-roles)). |
@@ -46,6 +46,51 @@ clients, so it is reachable only from the same host; a per-IP and global
 rate limit protects it from a local flood. To reach it from another
 machine, set `bind`, an `allow_ips` allowlist, and `tls` (see [Remote
 access and CORS](#remote-access-and-cors)).
+
+### The default credentials are refused off loopback
+
+The credentials default to `admin` / `changeme` so a first run works with
+no setup. Those two strings are published in this file, in the config
+reference, and in the source, so an admin server carrying them is
+authenticated in form only. The admin API mints and revokes API keys,
+reads and rewrites `sb.yml`, and drives the model host, so an open one is
+not a smaller problem than an open data plane.
+
+`sbproxy validate` and startup therefore reject the default password once
+the admin surface is reachable from another host, meaning either of:
+
+- `bind` is not a loopback address (`0.0.0.0`, a LAN interface, a public
+  address), or
+- `allow_ips` contains an entry outside loopback (`10.0.0.0/8`,
+  `192.168.1.50`, `0.0.0.0/0`).
+
+The error names which of the two tripped. Set a real password to clear
+it, ideally out of the environment or a secret backend rather than in the
+file:
+
+```yaml
+proxy:
+  admin:
+    enabled: true
+    bind: 0.0.0.0
+    allow_ips: ["10.0.0.0/8"]
+    username: admin
+    password: ${ADMIN_PASSWORD}
+```
+
+Loopback with the defaults stays valid, because that is the first-run and
+local-development path: the credentials there guard nothing the local
+user does not already have. The check is on the password alone, so a
+different `username` does not clear it. An unresolved `${ADMIN_PASSWORD}`
+does not clear it either: a reference whose variable is not exported is
+rejected on its own, so it never becomes literal login text. See
+[secrets.md](secrets.md).
+
+A `bind` value that is not an IP address is also a validation error.
+Startup used to fall back to `127.0.0.1` on a value it could not parse,
+so a typo in a wide bind looked like it had worked while the server sat
+on loopback, which is exactly the wrong conclusion to hand an operator
+about what is exposed. Hostnames are not resolved; use an address.
 
 ## TLS
 
@@ -139,11 +184,23 @@ proxy:
     cors_origins: ["https://admin.example.com"]   # for a separately hosted UI
     tls: { cert: /etc/sbproxy/admin-cert.pem, key: /etc/sbproxy/admin-key.pem }
     username: admin
-    password: change-this
+    password: ${ADMIN_PASSWORD}
 ```
 
+Either of those two lines (a non-loopback `bind`, an off-loopback
+`allow_ips` entry) makes the default password a validation error, so a
+remote admin server has a real credential by construction. See [The
+default credentials are refused off
+loopback](#the-default-credentials-are-refused-off-loopback).
+
 `allow_ips` matches exact addresses and CIDR networks; leaving it empty
-keeps the loopback-only default (never the permit-all path). When
+keeps the loopback-only default (never the permit-all path). That default
+lives in the filter itself rather than at its call site, so an empty list
+denies every non-loopback peer, and so does a list whose entries are all
+unparseable: a typo in the allowlist narrows the surface instead of
+opening it. Loopback is matched by asking the address, not by comparing
+text, so the IPv4-mapped form a dual-stack listener reports
+(`::ffff:127.0.0.1`) is admitted like the `127.0.0.1` it is. When
 `cors_origins` lists an origin, the server answers preflight `OPTIONS`
 and echoes the CORS headers (with credentials) so a browser SPA on that
 origin can call the API cross-origin.
@@ -162,13 +219,13 @@ walkthrough with a curl cookbook lives in
 
 | Family | Covers |
 |---|---|
-| Health and readiness | `/healthz`, `/health`, `/readyz`, `/livez` — unauthenticated probes. |
-| Session | `/admin/login`, `/admin/logout`, `/admin/session` — browser-session establishment and CSRF. |
+| Health and readiness | `/healthz`, `/health`, `/readyz`, `/livez`. Unauthenticated probes. |
+| Session | `/admin/login`, `/admin/logout`, `/admin/session`. Browser-session establishment and CSRF. |
 | Config and pipeline | `/admin/config`, `/admin/reload`, `/admin/drift`, `/admin/log-level`, `/api/health/targets`, the OpenAPI mirror. |
 | API keys and credentials | Full virtual-key and upstream-credential lifecycle: mint, list, edit policy, revoke, block, rotate, delete. |
 | Model host | Catalog, desired-state deployments, runtime status, lifecycle (load/stop/reset), the artifact cache, and the local-serving + compression value report. |
 | Cluster | Roster and health, signed deployment publication, one-time enrollment, fleet metrics, the replicated-state substrate. |
-| AI compression session state | Content-free session metadata, admin-gated content inspection, delete, and bounded purge — see [ai-context-compression.md](ai-context-compression.md). |
+| AI compression session state | Content-free session metadata, admin-gated content inspection, delete, and bounded purge. See [ai-context-compression.md](ai-context-compression.md). |
 | Cache | Response-cache status/purge, semantic-cache decisions, key-policy cache invalidation. |
 | Prompts | The runtime prompt-overlay snapshot, versioning, and pinning. |
 | Observability | `/metrics`, the request log and its live stream, spend, audit, and rate-limit budget state. |
@@ -183,7 +240,7 @@ reference below:
   [key-management.md](key-management.md).
 - **`/admin/config`** reads and writes the raw config text, so
   environment-variable interpolation (`${ENV_VAR}`) and secret-backend
-  references are stored and shown exactly as written — a secret is never
+  references are stored and shown exactly as written. A secret is never
   resolved into the saved config or exposed in the editor. See
   [secrets.md](secrets.md).
 - **Model host and cluster deployment mutations** are authority-gated:
@@ -230,9 +287,18 @@ the seventeen pages shows, what it can mutate, and which API paths back it.
 ## Security notes
 
 - Change the default `username` and `password`. The defaults exist for a
-  first run, not for anything reachable.
+  first run, not for anything reachable, and validation refuses the
+  default password once `bind` or `allow_ips` makes the surface reachable
+  from another host.
 - Keep the server on loopback (the default) unless it is behind TLS with
-  an `allow_ips` allowlist.
+  an `allow_ips` allowlist. Nothing forces TLS on a remote admin bind
+  today, so that one is still on you.
+- Changing anything under `proxy.admin` needs a process restart, not a
+  reload. The admin server reads its whole config once at startup,
+  credentials and TLS included, so a rotated password or a swapped
+  certificate does not take effect on `SIGHUP` or `POST /admin/reload`.
+  `sbproxy plan` classifies `proxy.admin.**` as `restart` for that
+  reason.
 - Give day-to-day operators the `read_only` role and reserve `admin` for
   the accounts that actually change state; every mutation emits an audit event
   with the operator's identity.

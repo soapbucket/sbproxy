@@ -1,6 +1,6 @@
 # Admin API guide
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-07-25*
 
 This is the task-oriented "how do I call it" guide to the embedded admin
 server: enabling it, authenticating, and a curl cookbook for the routes
@@ -69,9 +69,13 @@ Passwords resolve from the environment at config load
 (`export ADMIN_PASSWORD=...`); a bare literal also works for local
 testing. Drop `tls` to serve plaintext on loopback while developing;
 add it back before setting `bind: 0.0.0.0` or listing `allow_ips` for
-anything reachable off the local machine. See [admin.md](admin.md#tls)
-and [admin.md](admin.md#remote-access-and-cors) for the full field
-reference.
+anything reachable off the local machine. Those same two fields decide
+whether the default password is allowed: `admin` / `changeme` works on
+loopback and is refused once either one makes the surface reachable from
+another host. See [admin.md](admin.md#tls),
+[admin.md](admin.md#remote-access-and-cors), and
+[admin.md](admin.md#the-default-credentials-are-refused-off-loopback) for
+the full field reference.
 
 With this config running, every example below targets
 `http://127.0.0.1:9090` (swap in `https://` and your `bind`/port when
@@ -89,7 +93,7 @@ route:
 
 1. **HTTP Basic**, using the top-level `username`/`password` or an
    `operators[]` entry. This is the right shape for curl, CI, and
-   scripts — send it on every request, no state to manage:
+   scripts. Send it on every request, no state to manage:
 
    ```bash
    curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" "${SB_ADMIN_URL}/admin/keys"
@@ -97,8 +101,8 @@ route:
 
 2. **A browser session**, for the UI (or any client that would rather
    not resend a password on every call). `POST /admin/login` verifies
-   credentials — a Basic header, or a JSON `{"username","password"}`
-   body — and responds with:
+   credentials (a Basic header, or a JSON `{"username","password"}`
+   body) and responds with:
 
    - A `Set-Cookie: sb_admin_session=...` header: `HttpOnly`,
      `SameSite=Strict`, `Secure` when TLS is on, good for 8 hours.
@@ -108,7 +112,7 @@ route:
      {"role": "admin", "csrf_token": "3f9c...", "username": "admin"}
      ```
 
-   Because the cookie is `HttpOnly`, JavaScript cannot read it back —
+   Because the cookie is `HttpOnly`, JavaScript cannot read it back, so
    that is the point, it defeats simple cookie theft via XSS. But it
    also means a state-changing request authenticated by the cookie
    must prove it is the same client that logged in, by echoing the
@@ -137,7 +141,7 @@ route:
    UI recovers its identity and CSRF token after a page reload without
    forcing a fresh login.
 
-Basic-auth requests are **CSRF-exempt** — there is no cookie to forge,
+Basic-auth requests are **CSRF-exempt**: there is no cookie to forge,
 so the header requirement does not apply. `POST /admin/login`,
 `POST /admin/logout`, and `GET /admin/session` all run before the
 general auth gate, so they work without an existing session (you need
@@ -148,8 +152,8 @@ login.
 
 ## Roles: `admin` vs. `read_only`
 
-Every operator identity — the top-level `username`/`password`, and
-each `operators[]` entry — has a role:
+Every operator identity, the top-level `username`/`password` and
+each `operators[]` entry, has a role:
 
 - **`admin`**: every route, read and write.
 - **`read_only`**: GET / read routes only. A `read_only` operator that
@@ -168,7 +172,7 @@ emits a structured event on the `sbproxy::admin::audit` tracing
 target naming the operator, so a shared `admin` account still leaves
 an attributable trail per request, but per-operator credentials with
 the right role make that trail meaningful. A handful of routes carry
-their own stricter or different rule instead of the general split —
+their own stricter or different rule instead of the general split;
 compression content inspection is `admin`-only *and* requires handler
 opt-in, and cluster enrollment authenticates a one-time token instead
 of an operator at all. Those are called out where they apply in
@@ -187,9 +191,9 @@ credentials, `403` insufficient role or bad/missing CSRF, `404`
 unknown route or record, `405` wrong method, `409` conflict (a
 revision mismatch, an in-flight reload, a terminal record), `429`
 rate-limited, `5xx` server-side failure. Some families (keys,
-credentials, model-host) add fields alongside `error` — e.g. a
+credentials, model-host) add fields alongside `error`, for example a
 revision conflict on a key returns `expected_revision` and
-`current_revision` — see the per-route sections in
+`current_revision`. See the per-route sections in
 [admin-api-reference.md](admin-api-reference.md) for the exact shape.
 
 ## Rate limiting
@@ -217,7 +221,7 @@ curl -fsS "${SB_ADMIN_URL}/healthz"
 curl -fsS "${SB_ADMIN_URL}/health" | jq '{status,version,checks}'
 ```
 
-**Mint a key** (the plaintext token is returned once, on creation —
+**Mint a key** (the plaintext token is returned once, on creation;
 save it now):
 
 ```bash
@@ -240,7 +244,7 @@ curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" "${SB_ADMIN_URL}/admin/keys" \
 ```
 
 **Run a chat completion through the playground** (the same AI client
-the data plane uses, bypassing per-origin policy — see
+the data plane uses, bypassing per-origin policy. See
 [admin-api-reference.md](admin-api-reference.md#chat-playground)):
 
 ```bash

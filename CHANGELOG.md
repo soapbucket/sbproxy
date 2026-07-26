@@ -85,6 +85,26 @@ the next version cut.
   identity change already was. Rotating a secret inside your vault still
   needs no restart; only changing where SBproxy looks does. See
   [`docs/secrets.md`](docs/secrets.md).
+- **The admin server no longer boots wide open on default credentials.**
+  `admin` / `changeme` exists so a first run works, but nothing stopped
+  it from being the credential on an admin API bound to `0.0.0.0` with a
+  private-range allowlist and no TLS, which is a published password in
+  front of key minting and config writes. Validation now refuses the
+  default password when the surface is reachable from another host,
+  meaning `bind` is not a loopback address or `allow_ips` contains an
+  entry outside loopback, and the error names which of the two tripped.
+  Loopback with the defaults is untouched, since that is the local
+  development path. Three related soft spots went with it: an empty
+  `allow_ips` denied nothing at the type level (the safe loopback-only
+  default lived in an `if` at the one call site, so the filter itself
+  was fail-open), loopback was matched by comparing text so an
+  IPv4-mapped peer such as `::ffff:127.0.0.1` was turned away from a
+  loopback-only server, and an unparseable `bind` silently fell back to
+  `127.0.0.1` rather than failing, which made a typo in a wide bind look
+  like it had worked. `sbproxy plan` also stops describing
+  `proxy.admin.**` as a reload: `AdminConfig` is read once at startup, so
+  a rotated admin password or a swapped certificate needs a restart, and
+  the plan now says so. See [`docs/admin.md`](docs/admin.md).
 
 ### Fixed
 

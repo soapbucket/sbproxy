@@ -10,7 +10,11 @@
 //! proxy.admin.enabled: true
 //! proxy.admin.port: 9090
 //! proxy.admin.username: admin
-//! proxy.admin.password: changeme
+//! proxy.admin.password: ${ADMIN_PASSWORD}
+//!
+//! The credentials default to `admin` / `changeme`, which is fine on the
+//! loopback default and refused by `compile_config` once `bind` or
+//! `allow_ips` makes the surface reachable from another host.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -48,8 +52,13 @@ pub struct AdminConfig {
     /// of plaintext HTTP.
     pub tls: Option<AdminTls>,
     /// WOR-1717: bind address. Defaults to `127.0.0.1` (loopback only).
+    /// Must be an IP address literal, not a hostname; `compile_config`
+    /// rejects anything that does not parse, and the admin server
+    /// declines to start rather than fall back to loopback.
     pub bind: String,
-    /// WOR-1717: IP / CIDR allowlist. Empty means loopback-only.
+    /// WOR-1717: IP / CIDR allowlist. Empty means loopback-only, which
+    /// [`AdminIpFilter::new`] enforces so the empty case cannot be read
+    /// as permit-all.
     pub allow_ips: Vec<String>,
     /// WOR-1717: allowed CORS origins. Empty means no CORS headers.
     pub cors_origins: Vec<String>,
@@ -87,8 +96,8 @@ impl Default for AdminConfig {
         Self {
             enabled: false,
             port: 9090,
-            username: "admin".to_string(),
-            password: "changeme".to_string(),
+            username: sbproxy_config::types::DEFAULT_ADMIN_USERNAME.to_string(),
+            password: sbproxy_config::types::DEFAULT_ADMIN_PASSWORD.to_string(),
             max_log_entries: 1000,
             rate_limit_per_minute: 240,
             tls: None,
@@ -209,45 +218,93 @@ impl AdminRateLimiter {
 
 // --- IP Filter ---
 
+/// One parsed entry of the admin IP allowlist.
+enum AdminIpRule {
+    /// Any loopback peer, in either address family. Matched by asking the
+    /// address, not by comparing text, so the IPv4-mapped IPv6 form a
+    /// dual-stack listener reports (`::ffff:127.0.0.1`) counts too.
+    Loopback,
+    /// A single exact address, stored canonicalised.
+    Exact(std::net::IpAddr),
+    /// A CIDR network containing the permitted addresses.
+    Network(ipnetwork::IpNetwork),
+}
+
 /// Configurable IP allowlist for the admin endpoint.
 ///
-/// When the allowlist is empty, all IPs are permitted. When non-empty, only
-/// IPs present in the list are allowed.
+/// Fail-closed by construction: the rule list is never empty, so there is
+/// no permit-all state to represent. An empty configured allowlist (the
+/// default) collapses to loopback-only inside the constructor rather than
+/// relying on each call site to remember the special case.
 pub struct AdminIpFilter {
-    allowed_ips: Vec<String>,
+    /// Never empty; see [`AdminIpFilter::new`].
+    rules: Vec<AdminIpRule>,
 }
 
 impl AdminIpFilter {
-    /// Create an IP filter with an explicit allowlist.
+    /// Create an IP filter from configured `allow_ips` entries, each
+    /// either an exact IP address or a CIDR network (WOR-1717).
+    ///
+    /// An empty list yields [`AdminIpFilter::localhost_only`], which is
+    /// the documented meaning of an empty `proxy.admin.allow_ips`.
+    /// Entries that parse as neither an address nor a network are logged
+    /// and dropped; if that leaves nothing, the filter is loopback-only,
+    /// because a typo in the allowlist has to narrow the admin surface
+    /// rather than widen it.
     pub fn new(allowed_ips: Vec<String>) -> Self {
-        Self { allowed_ips }
+        let mut rules = Vec::with_capacity(allowed_ips.len());
+        for entry in &allowed_ips {
+            let trimmed = entry.trim();
+            if let Ok(addr) = trimmed.parse::<std::net::IpAddr>() {
+                rules.push(AdminIpRule::Exact(addr.to_canonical()));
+            } else if let Ok(net) = trimmed.parse::<ipnetwork::IpNetwork>() {
+                rules.push(AdminIpRule::Network(net));
+            } else {
+                tracing::warn!(
+                    entry = %entry,
+                    "proxy.admin.allow_ips entry is neither an IP address nor a CIDR \
+                     network; ignoring it"
+                );
+            }
+        }
+        if rules.is_empty() {
+            return Self::localhost_only();
+        }
+        Self { rules }
     }
 
     /// Create a filter that only permits loopback addresses.
     pub fn localhost_only() -> Self {
         Self {
-            allowed_ips: vec!["127.0.0.1".to_string(), "::1".to_string()],
+            rules: vec![AdminIpRule::Loopback],
         }
     }
 
-    /// Returns `true` if `ip` is permitted. An empty allowlist permits all
-    /// IPs (callers pass a non-empty list, or use `localhost_only`, so the
-    /// safe default is never the permit-all path). Each entry matches
-    /// either as an exact address or, when it parses as a CIDR, as a
-    /// network containing `ip` (WOR-1717).
+    /// Returns `true` if `ip` is permitted.
+    ///
+    /// The peer is parsed as an address and compared semantically rather
+    /// than as text, so `::ffff:127.0.0.1` (what a dual-stack listener
+    /// reports for an IPv4 client) is recognised as the same peer as
+    /// `127.0.0.1` and matches the same rules. A value that does not
+    /// parse as an address is denied: a peer we cannot identify cannot be
+    /// shown to be on the list.
     pub fn is_allowed(&self, ip: &str) -> bool {
-        if self.allowed_ips.is_empty() {
-            return true;
-        }
-        let parsed: Option<std::net::IpAddr> = ip.parse().ok();
-        self.allowed_ips.iter().any(|a| {
-            if a == ip {
-                return true;
+        let Ok(peer) = ip.trim().parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        let peer = peer.to_canonical();
+        // A CIDR entry may itself be written in the v4-mapped v6 space,
+        // so try the peer in both spellings before rejecting it.
+        let peer_mapped = match peer {
+            std::net::IpAddr::V4(v4) => Some(std::net::IpAddr::V6(v4.to_ipv6_mapped())),
+            std::net::IpAddr::V6(_) => None,
+        };
+        self.rules.iter().any(|rule| match rule {
+            AdminIpRule::Loopback => peer.is_loopback(),
+            AdminIpRule::Exact(addr) => *addr == peer,
+            AdminIpRule::Network(net) => {
+                net.contains(peer) || peer_mapped.is_some_and(|mapped| net.contains(mapped))
             }
-            if let (Some(addr), Ok(net)) = (parsed, a.parse::<ipnetwork::IpNetwork>()) {
-                return net.contains(addr);
-            }
-            false
         })
     }
 }
@@ -2501,11 +2558,14 @@ pub fn record_loaded_config_content_hash(hex: &str) {
     }
 }
 
-/// Spawn the admin server bound to `127.0.0.1:<config.port>`.
+/// Spawn the admin server bound to `<config.bind>:<config.port>`
+/// (`127.0.0.1` unless the operator set `bind`).
 ///
-/// No-ops when `config.enabled` is false. The returned join handle
-/// can be ignored; the task lives for the duration of the process
-/// and shares the `AdminState` with the rest of the proxy.
+/// Returns `None`, having logged why, when `config.enabled` is false,
+/// when configured TLS material cannot be loaded, or when `bind` is not
+/// an IP address. Otherwise the returned join handle can be ignored; the
+/// task lives for the duration of the process and shares the
+/// `AdminState` with the rest of the proxy.
 pub fn spawn_admin_server(
     state: std::sync::Arc<AdminState>,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -2526,13 +2586,24 @@ pub fn spawn_admin_server(
         None => None,
     };
     // WOR-1717: bind address from config (default loopback), and an IP
-    // allowlist. An empty allowlist keeps the safe loopback-only default;
-    // a configured list (CIDRs) permits remote admin from known networks.
-    let bind_ip: std::net::IpAddr = state
-        .config
-        .bind
-        .parse()
-        .unwrap_or_else(|_| std::net::IpAddr::from([127, 0, 0, 1]));
+    // allowlist. An empty allowlist keeps the safe loopback-only default
+    // (enforced inside `AdminIpFilter::new`); a configured list (CIDRs)
+    // permits remote admin from known networks.
+    //
+    // An unparseable bind is rejected by `compile_config`, so it cannot
+    // reach here. Declining to start beats the old silent fall back to
+    // loopback, which made a typo look like it had worked.
+    let bind_ip: std::net::IpAddr = match state.config.bind.trim().parse() {
+        Ok(ip) => ip,
+        Err(e) => {
+            tracing::error!(
+                bind = %state.config.bind,
+                error = %e,
+                "proxy.admin.bind is not an IP address; admin server not started"
+            );
+            return None;
+        }
+    };
     let allow_ips = state.config.allow_ips.clone();
     Some(tokio::spawn(async move {
         let addr = std::net::SocketAddr::new(bind_ip, port);
@@ -2549,11 +2620,9 @@ pub fn spawn_admin_server(
         };
         tracing::info!(addr = %addr, tls = acceptor.is_some(), "admin server listening");
         let rate_limiter = std::sync::Arc::new(build_rate_limiter(&state.config));
-        let ip_filter = std::sync::Arc::new(if allow_ips.is_empty() {
-            AdminIpFilter::localhost_only()
-        } else {
-            AdminIpFilter::new(allow_ips)
-        });
+        // Empty means loopback-only: the constructor owns that, so this
+        // call site cannot forget it (and cannot ask for permit-all).
+        let ip_filter = std::sync::Arc::new(AdminIpFilter::new(allow_ips));
         loop {
             let (sock, peer) = match listener.accept().await {
                 Ok(p) => p,
@@ -5128,6 +5197,31 @@ origins:
     }
 
     #[test]
+    fn ip_filter_localhost_only_allows_ipv4_mapped_loopback() {
+        // A dual-stack listener reports an IPv4 client as
+        // `::ffff:127.0.0.1`. The old string-matching filter rejected
+        // that peer, which locked an operator out of a loopback-only
+        // admin server for reasons nothing in the config explained.
+        let filter = AdminIpFilter::localhost_only();
+        assert!(filter.is_allowed("::ffff:127.0.0.1"), "v4-mapped loopback");
+        assert!(filter.is_allowed("127.0.0.2"), "all of 127.0.0.0/8");
+        assert!(
+            !filter.is_allowed("::ffff:10.0.0.1"),
+            "v4-mapped non-loopback stays out"
+        );
+    }
+
+    #[test]
+    fn ip_filter_denies_an_unparseable_peer() {
+        // Not reachable from a real socket address, but a peer we cannot
+        // identify must not be treated as allowed.
+        let filter = AdminIpFilter::new(vec!["10.1.2.3".to_string()]);
+        assert!(!filter.is_allowed(""));
+        assert!(!filter.is_allowed("not-an-ip"));
+        assert!(!AdminIpFilter::localhost_only().is_allowed("localhost"));
+    }
+
+    #[test]
     fn ip_filter_custom_list() {
         let filter = AdminIpFilter::new(vec!["10.1.2.3".to_string(), "10.1.2.4".to_string()]);
         assert!(filter.is_allowed("10.1.2.3"));
@@ -5136,12 +5230,30 @@ origins:
         assert!(!filter.is_allowed("127.0.0.1"));
     }
 
+    // Renamed from `ip_filter_empty_allows_all`, which pinned the old
+    // fail-open behaviour: an empty allowlist used to permit every peer,
+    // and the safe default lived in an `is_empty()` branch at the single
+    // call site instead of in the type. An empty list now denies, so the
+    // permit-all state cannot be constructed at all.
     #[test]
-    fn ip_filter_empty_allows_all() {
+    fn ip_filter_empty_denies_non_loopback() {
         let filter = AdminIpFilter::new(vec![]);
-        assert!(filter.is_allowed("192.168.1.1"));
-        assert!(filter.is_allowed("10.0.0.1"));
-        assert!(filter.is_allowed("::1"));
+        assert!(!filter.is_allowed("192.168.1.1"));
+        assert!(!filter.is_allowed("10.0.0.1"));
+        assert!(filter.is_allowed("::1"), "loopback is the safe default");
+        assert!(
+            filter.is_allowed("127.0.0.1"),
+            "loopback is the safe default"
+        );
+    }
+
+    #[test]
+    fn ip_filter_all_unparseable_entries_deny_rather_than_widen() {
+        // A typo'd allowlist leaves no usable rule. Falling back to
+        // loopback-only keeps a mistake from opening the surface.
+        let filter = AdminIpFilter::new(vec!["10.0.0/8".to_string(), "nonsense".to_string()]);
+        assert!(!filter.is_allowed("10.0.0.1"));
+        assert!(filter.is_allowed("127.0.0.1"));
     }
 
     #[test]
@@ -5153,6 +5265,16 @@ origins:
         assert!(!filter.is_allowed("10.2.0.1"), "outside CIDR");
         assert!(filter.is_allowed("192.168.1.5"), "exact");
         assert!(!filter.is_allowed("192.168.1.6"), "exact miss");
+    }
+
+    #[test]
+    fn ip_filter_matches_ipv4_mapped_peers_against_v4_rules() {
+        // Same peer, two spellings: an operator writes the v4 address or
+        // CIDR, and a dual-stack listener hands us the mapped form.
+        let filter = AdminIpFilter::new(vec!["10.1.0.0/16".to_string(), "192.168.1.5".to_string()]);
+        assert!(filter.is_allowed("::ffff:10.1.2.3"), "mapped, in CIDR");
+        assert!(filter.is_allowed("::ffff:192.168.1.5"), "mapped, exact");
+        assert!(!filter.is_allowed("::ffff:10.2.0.1"), "mapped, outside");
     }
 
     #[test]

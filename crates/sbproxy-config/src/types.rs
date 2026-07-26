@@ -2552,12 +2552,26 @@ fn default_admin_port() -> u16 {
     9090
 }
 
+/// The shipped default admin username, so a first run works without any
+/// credential config. Public so every consumer of the default reads this
+/// constant instead of repeating the literal; the same string used to be
+/// hardcoded in three places, which is how such a default drifts.
+pub const DEFAULT_ADMIN_USERNAME: &str = "admin";
+
+/// The shipped default admin password, the counterpart to
+/// [`DEFAULT_ADMIN_USERNAME`]. Public for the same reason, plus one of
+/// its own: because it is a published constant, a config that still uses
+/// it is unauthenticated in practice, so `compile_config` compares
+/// against this value and rejects it whenever the admin surface is
+/// reachable off loopback.
+pub const DEFAULT_ADMIN_PASSWORD: &str = "changeme";
+
 fn default_admin_user() -> String {
-    "admin".to_string()
+    DEFAULT_ADMIN_USERNAME.to_string()
 }
 
 fn default_admin_pass() -> String {
-    "changeme".to_string()
+    DEFAULT_ADMIN_PASSWORD.to_string()
 }
 
 fn default_max_log() -> usize {
@@ -6794,10 +6808,10 @@ fn default_signature_clock_skew_seconds() -> u64 {
 /// When set, the proxy stands up two well-known endpoints on the
 /// origin:
 ///
-/// - `POST /.well-known/olp/token` — issues a license token signed
+/// - `POST /.well-known/olp/token` issues a license token signed
 ///   with the configured Ed25519 key, body shaped per RFC 6749
 ///   (`access_token` + `token_type: "License"` + `expires_in`).
-/// - `GET /.well-known/olp/key` — publishes the verification JWK
+/// - `GET /.well-known/olp/key` publishes the verification JWK
 ///   set (RFC 7517) so external introspectors can verify tokens
 ///   without contacting the issuer per-token.
 ///
@@ -6805,13 +6819,13 @@ fn default_signature_clock_skew_seconds() -> u64 {
 /// proxy serves two unauthenticated well-known endpoints on this
 /// origin:
 ///
-/// * `GET /.well-known/http-message-signatures-directory` — JWKS
+/// * `GET /.well-known/http-message-signatures-directory`: JWKS
 ///   document carrying SBproxy's own Ed25519 signing-key public
 ///   key. Verifiers (Cloudflare, AWS WAF, any third-party origin
 ///   that runs a Web Bot Auth verifier) fetch this to verify the
 ///   `Signature-Input` + `Signature` headers SBproxy attaches to
 ///   outbound requests.
-/// * `GET /.well-known/web-bot-auth/agent-card` — the discovery
+/// * `GET /.well-known/web-bot-auth/agent-card`: the discovery
 ///   document that points verifiers at the directory; carries the
 ///   operator-facing agent name, description, and contact URL.
 ///
@@ -6912,13 +6926,13 @@ pub struct OlpConfig {
 ///
 /// When this block is present the proxy exposes:
 ///
-/// * `POST /.well-known/olp/introspect` — RFC 7662 §2 introspection.
+/// * `POST /.well-known/olp/introspect`: RFC 7662 §2 introspection.
 ///   Returns `{ "active": true, ... }` for valid + un-revoked tokens
 ///   issued by this origin's signing key, mirroring every OLP claim.
 ///   Returns `{ "active": false }` for any token that does not
 ///   verify, has expired, or has been revoked (§2.2 forbids leaking
 ///   the reason).
-/// * `POST /.well-known/olp/revoke` — RFC 7009 §2. Writes the token's
+/// * `POST /.well-known/olp/revoke`: RFC 7009 §2. Writes the token's
 ///   `jti` to the configured revocation store with a TTL that matches
 ///   the token's remaining lifetime, so subsequent introspections
 ///   return `active: false`.
@@ -6994,16 +7008,16 @@ fn default_olp_introspect_mirror_cnf() -> bool {
 
 /// Auth policy for the introspect + revoke endpoints. Three modes:
 ///
-/// * `self` (default) — the caller proves possession of the token by
+/// * `self` (default): the caller proves possession of the token by
 ///   sending the same value in `Authorization: License <token>`
 ///   *and* in the `token=` form parameter. Reasonable for the common
 ///   "RP introspects tokens it already holds" case and requires no
 ///   operator credential management.
-/// * `basic` — HTTP Basic with operator-managed credentials. Pass
+/// * `basic`: HTTP Basic with operator-managed credentials. Pass
 ///   `{ username, password_hash }` pairs in `clients`; passwords are
 ///   stored as Argon2id hashes. RFC 7662 §2.1's "client
 ///   authentication" path.
-/// * `none` — no auth. ONLY appropriate for fully-private deployments
+/// * `none`: no auth. ONLY appropriate for fully-private deployments
 ///   behind a service mesh that already authenticates the caller.
 ///   The proxy logs a `warn!` at startup when this is selected.
 #[derive(

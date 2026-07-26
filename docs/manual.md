@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-07-20*
+*Last modified: 2026-07-25*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -1577,7 +1577,11 @@ admin server and make it reachable from the kubelet: set
 `proxy.admin.enabled: true`, `bind: "0.0.0.0"`, and an `allow_ips`
 list covering the node network (the probe endpoints themselves are
 unauthenticated, but the admin listener's IP allowlist applies to
-every connection). Then point the probes at port `9090`:
+every connection). Both of those fields make the admin surface
+reachable off loopback, so the same config needs a real `password`:
+the default `changeme` is a validation error once either one is set
+(see [admin.md](admin.md#the-default-credentials-are-refused-off-loopback)).
+Then point the probes at port `9090`:
 
 ```yaml
 livenessProbe:

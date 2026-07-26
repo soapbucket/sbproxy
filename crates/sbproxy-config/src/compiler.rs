@@ -970,6 +970,131 @@ fn validate_custom_log_fields(fields: &[crate::CustomLogFieldConfig]) -> Result<
     Ok(())
 }
 
+/// Reject a `proxy.admin.bind` value that is not an IP address.
+///
+/// The admin server used to fall back to `127.0.0.1` when the bind
+/// string failed to parse, so `bind: 0.0.0..1` (or a hostname, which is
+/// also not accepted) looked like it worked while quietly serving
+/// somewhere else than asked. An operator who typed a wide bind and got
+/// loopback would have drawn exactly the wrong conclusion about what is
+/// exposed, so a typo fails the compile instead.
+fn validate_admin_bind(bind: Option<&str>) -> Result<()> {
+    let Some(bind) = bind else {
+        return Ok(());
+    };
+    let trimmed = bind.trim();
+    if trimmed.parse::<std::net::IpAddr>().is_err() {
+        anyhow::bail!(
+            "proxy.admin.bind is `{bind}`, which is not an IP address. Use an address \
+             literal such as `127.0.0.1`, `::1`, or `0.0.0.0` (hostnames are not \
+             resolved). Startup used to fall back to loopback on a value it could not \
+             parse, which hid the typo behind an admin server bound somewhere other \
+             than the one you asked for."
+        );
+    }
+    Ok(())
+}
+
+/// True when `entry` (an exact IP or a CIDR from `proxy.admin.allow_ips`)
+/// admits nothing but loopback peers.
+///
+/// Both `127.0.0.1` and `127.0.0.0/8` are loopback-only; `10.0.0.0/8` is
+/// not, and neither is `127.0.0.0/7`, which spans `126.0.0.0` upward. An
+/// entry that parses as neither an address nor a CIDR cannot be proven
+/// loopback-only, so it counts as reachable: the point of the check is to
+/// be sure, not to be lenient.
+///
+/// Parsed by hand rather than with a CIDR crate because `sbproxy-config`
+/// deliberately carries no network-address dependency; the runtime filter
+/// in `sbproxy-core` does the real matching.
+fn admin_allow_entry_is_loopback_only(entry: &str) -> bool {
+    let trimmed = entry.trim();
+    let (addr_part, prefix_part) = match trimmed.split_once('/') {
+        Some((addr, prefix)) => (addr, Some(prefix)),
+        None => (trimmed, None),
+    };
+    let Ok(addr) = addr_part.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    // `::ffff:127.0.0.1` is a loopback peer wearing IPv6 clothing;
+    // canonicalising first means it is judged as the v4 address it is.
+    let canonical = addr.to_canonical();
+    if !canonical.is_loopback() {
+        return false;
+    }
+    let Some(prefix) = prefix_part else {
+        return true;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    // The whole network has to sit inside the loopback space: 127.0.0.0/8
+    // for v4, and only the single `::1` for v6.
+    match canonical {
+        std::net::IpAddr::V4(_) => prefix >= 8,
+        std::net::IpAddr::V6(_) => prefix >= 128,
+    }
+}
+
+/// Refuse the shipped default admin credentials on an admin surface that
+/// is reachable from off the local machine.
+///
+/// `admin` / `changeme` is a published constant, so a reachable admin
+/// server carrying it is effectively unauthenticated, and the admin API
+/// mints API keys, reads and rewrites the config, and drives the model
+/// host. The surface counts as reachable when either `bind` is not a
+/// loopback address or `allow_ips` admits a peer outside loopback. The
+/// error names whichever of the two tripped.
+///
+/// Loopback-only with the defaults stays valid on purpose: that is the
+/// first-run and local-development path, where the credentials guard
+/// nothing that the local user does not already have.
+fn validate_admin_reachable_credentials(admin: &crate::types::AdminConfig) -> Result<()> {
+    if admin.password != crate::types::DEFAULT_ADMIN_PASSWORD {
+        return Ok(());
+    }
+    let mut reasons: Vec<String> = Vec::new();
+    if let Some(bind) = admin.bind.as_deref() {
+        // A bind that does not parse is already rejected by
+        // `validate_admin_bind`; treat it as reachable here so the two
+        // checks cannot disagree about what an unparseable value means.
+        let loopback = bind
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|addr| addr.to_canonical().is_loopback());
+        if !loopback {
+            reasons.push(format!(
+                "proxy.admin.bind is `{bind}`, which is not a loopback address"
+            ));
+        }
+    }
+    let off_loopback: Vec<&str> = admin
+        .allow_ips
+        .iter()
+        .map(String::as_str)
+        .filter(|entry| !admin_allow_entry_is_loopback_only(entry))
+        .collect();
+    if !off_loopback.is_empty() {
+        reasons.push(format!(
+            "proxy.admin.allow_ips admits peers outside loopback ({})",
+            off_loopback.join(", ")
+        ));
+    }
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "proxy.admin.password is still the shipped default `{}`, and the admin surface is \
+         reachable off loopback: {}. Set a real password (`password: ${{ADMIN_PASSWORD}}` \
+         with the variable exported, or a secret reference), or keep the admin server on \
+         loopback. The default is a published constant, so a reachable admin server using \
+         it is open to anyone who can route to the port, and the admin API mints API keys \
+         and rewrites config.",
+        crate::types::DEFAULT_ADMIN_PASSWORD,
+        reasons.join("; ")
+    );
+}
+
 /// Compile a raw YAML config string into a `CompiledConfig`.
 ///
 /// # Errors
@@ -1078,6 +1203,8 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
                     );
                 }
             }
+            validate_admin_bind(admin.bind.as_deref())?;
+            validate_admin_reachable_credentials(admin)?;
         }
         // 0 is rejected rather than treated as "off": the admin rate
         // limiter is a DDoS bound on an authenticated control surface
@@ -1791,6 +1918,145 @@ origins:
         let compiled = compile_config(yaml).expect("should compile");
         let admin = compiled.server.admin.as_ref().expect("admin block");
         assert_eq!(admin.rate_limit_per_minute, 500);
+    }
+
+    /// Build a config with an admin block whose body is `body`, so the
+    /// default-credential tests differ only in the lines under test.
+    fn admin_config_yaml(body: &str) -> String {
+        format!(
+            r#"
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+{body}
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#
+        )
+    }
+
+    #[test]
+    fn default_admin_credentials_off_loopback_bind_are_refused() {
+        let yaml =
+            admin_config_yaml("    bind: 0.0.0.0\n    username: admin\n    password: changeme");
+        let err = compile_config(&yaml)
+            .err()
+            .expect("default credentials on a wide bind must fail compile");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("proxy.admin.password") && msg.contains("shipped default"),
+            "error must name the credential: {msg}"
+        );
+        assert!(
+            msg.contains("proxy.admin.bind is `0.0.0.0`"),
+            "error must name the condition that tripped: {msg}"
+        );
+        assert!(
+            msg.contains("Set a real password"),
+            "error must say what to do: {msg}"
+        );
+    }
+
+    #[test]
+    fn default_admin_credentials_with_wide_allow_ips_are_refused() {
+        // Loopback bind, but the allowlist admits a whole private range,
+        // so the surface is reachable from other hosts on that network.
+        let yaml = admin_config_yaml(
+            "    bind: 127.0.0.1\n    password: changeme\n    allow_ips: [\"127.0.0.1\", \"10.0.0.0/8\"]",
+        );
+        let err = compile_config(&yaml)
+            .err()
+            .expect("default credentials with a wide allow_ips must fail compile");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("proxy.admin.allow_ips admits peers outside loopback (10.0.0.0/8)"),
+            "error must name the offending entry, and only that entry: {msg}"
+        );
+        assert!(
+            msg.contains("Set a real password"),
+            "error must say what to do: {msg}"
+        );
+    }
+
+    #[test]
+    fn default_admin_credentials_on_loopback_still_compile() {
+        // The local-development path. Both the implicit default bind and
+        // an explicit loopback bind (with a loopback-only allowlist) stay
+        // valid with the shipped credentials.
+        for body in [
+            "    username: admin\n    password: changeme",
+            "    bind: 127.0.0.1\n    password: changeme",
+            "    bind: \"::1\"\n    password: changeme",
+            "    password: changeme\n    allow_ips: [\"127.0.0.0/8\", \"::1\"]",
+        ] {
+            let yaml = admin_config_yaml(body);
+            compile_config(&yaml)
+                .unwrap_or_else(|e| panic!("loopback default credentials must compile: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn real_admin_password_off_loopback_compiles() {
+        let yaml = admin_config_yaml(
+            "    bind: 0.0.0.0\n    username: admin\n    password: not-the-default\n    allow_ips: [\"10.0.0.0/8\"]",
+        );
+        let compiled = compile_config(&yaml)
+            .unwrap_or_else(|e| panic!("a real password off loopback must compile: {e:#}"));
+        let admin = compiled.server.admin.as_ref().expect("admin block");
+        assert_eq!(admin.bind.as_deref(), Some("0.0.0.0"));
+    }
+
+    #[test]
+    fn unparseable_admin_bind_is_refused() {
+        for bad in ["0.0.0..1", "localhost", "127.0.0.1:9090", ""] {
+            let yaml = admin_config_yaml(&format!(
+                "    bind: \"{bad}\"\n    password: not-the-default"
+            ));
+            let err = compile_config(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("bind `{bad}` must fail compile"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("proxy.admin.bind") && msg.contains("not an IP address"),
+                "error must name the field and the reason: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_allow_entry_loopback_classification() {
+        for loopback in [
+            "127.0.0.1",
+            " 127.0.0.1 ",
+            "127.0.0.1/32",
+            "127.0.0.0/8",
+            "::1",
+            "::1/128",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                admin_allow_entry_is_loopback_only(loopback),
+                "{loopback} is loopback-only"
+            );
+        }
+        for reachable in [
+            "0.0.0.0/0",
+            "10.0.0.0/8",
+            "192.168.1.50",
+            // Spans 126.0.0.0 upward, so it is not inside 127.0.0.0/8.
+            "127.0.0.0/7",
+            "::/0",
+            "not-an-address",
+        ] {
+            assert!(
+                !admin_allow_entry_is_loopback_only(reachable),
+                "{reachable} reaches beyond loopback"
+            );
+        }
     }
 
     // WOR-1140: unknown-config-key handling.

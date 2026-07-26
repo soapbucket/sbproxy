@@ -1573,16 +1573,23 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         let admin_cfg = crate::admin::AdminConfig {
             enabled: true,
             port: server_config.admin.as_ref().map(|a| a.port).unwrap_or(9090),
+            // The `unwrap_or_else` arms are unreachable (this branch only
+            // runs when `admin` is Some), but they must still read the
+            // shared default constants rather than repeat the literals:
+            // `compile_config` compares credentials against those
+            // constants to refuse a reachable admin surface that still
+            // carries the shipped defaults, and a second copy of the
+            // string here is how the two drift apart.
             username: server_config
                 .admin
                 .as_ref()
                 .map(|a| a.username.clone())
-                .unwrap_or_else(|| "admin".to_string()),
+                .unwrap_or_else(|| sbproxy_config::types::DEFAULT_ADMIN_USERNAME.to_string()),
             password: server_config
                 .admin
                 .as_ref()
                 .map(|a| a.password.clone())
-                .unwrap_or_else(|| "changeme".to_string()),
+                .unwrap_or_else(|| sbproxy_config::types::DEFAULT_ADMIN_PASSWORD.to_string()),
             max_log_entries: server_config
                 .admin
                 .as_ref()

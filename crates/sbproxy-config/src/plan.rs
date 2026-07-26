@@ -218,7 +218,7 @@ pub struct BlastRadiusRule {
 /// 2. `proxy.https_bind_port` -> `Restart`
 /// 3. `proxy.http3.**` -> `Restart`
 /// 4. `proxy.admin.port` -> `Restart`
-/// 5. `proxy.admin.bind_addr` -> `Restart`
+/// 5. `proxy.admin.bind` -> `Restart`
 /// 6. `proxy.tls_cert_file` -> `Reload`
 /// 7. `proxy.tls_key_file` -> `Reload`
 /// 8. `proxy.l2_cache.driver` -> `Restart`
@@ -256,14 +256,20 @@ pub const BLAST_RADIUS_MATRIX: &[BlastRadiusRule] = &[
         radius: BlastRadius::Restart,
         reason: "HTTP/3 listener is bound once at startup",
     },
-    // --- Admin server: same OnceLock listener story ---
+    // --- Admin server: same OnceLock listener story, and the rest of
+    //     the block is no better off. `AdminConfig` is assembled once in
+    //     `run()` and moved into the admin task, so nothing under
+    //     `proxy.admin` is re-read on reload: not the credentials, not
+    //     the TLS paths, not the allowlist. The subtree rule below used
+    //     to say Reload, which told operators a rotated admin password
+    //     had taken effect when it had not ---
     BlastRadiusRule {
         pattern: "proxy.admin.port",
         radius: BlastRadius::Restart,
         reason: "admin server listener is bound once at startup",
     },
     BlastRadiusRule {
-        pattern: "proxy.admin.bind_addr",
+        pattern: "proxy.admin.bind",
         radius: BlastRadius::Restart,
         reason: "admin server listener is bound once at startup",
     },
@@ -274,8 +280,9 @@ pub const BLAST_RADIUS_MATRIX: &[BlastRadiusRule] = &[
     },
     BlastRadiusRule {
         pattern: "proxy.admin.**",
-        radius: BlastRadius::Reload,
-        reason: "admin auth / TLS settings re-read on reload",
+        radius: BlastRadius::Restart,
+        reason: "the admin server reads its whole config once at startup, \
+                 credentials and TLS included",
     },
     // --- TLS material: cert / key hot-swap is supported ---
     BlastRadiusRule {
@@ -1503,10 +1510,32 @@ origins:
         assert_eq!(r, BlastRadius::Restart);
     }
 
+    // The whole admin subtree is Restart, not just the listener fields.
+    // `AdminConfig` is built once in `run()` and handed to the admin task;
+    // nothing re-reads it, so a plan that promised Reload for credentials
+    // or TLS was telling operators a change had taken effect when it had
+    // not. Making the listener rebindable is the alternative fix and a
+    // much larger change; until then the plan says Restart.
     #[test]
-    fn matrix_lookup_admin_other_field_is_reload() {
-        let (r, _) = lookup_blast_radius("proxy.admin.basic_auth_users");
-        assert_eq!(r, BlastRadius::Reload);
+    fn matrix_lookup_admin_other_field_is_restart() {
+        for path in [
+            "proxy.admin.username",
+            "proxy.admin.password",
+            "proxy.admin.tls.cert",
+            "proxy.admin.allow_ips.*",
+            "proxy.admin.operators.*.role",
+            "proxy.admin.basic_auth_users",
+        ] {
+            let (radius, reason) = lookup_blast_radius(path);
+            assert_eq!(radius, BlastRadius::Restart, "{path}");
+            assert!(!reason.is_empty(), "{path}");
+        }
+    }
+
+    #[test]
+    fn matrix_lookup_admin_bind_is_restart() {
+        let (r, _) = lookup_blast_radius("proxy.admin.bind");
+        assert_eq!(r, BlastRadius::Restart);
     }
 
     #[test]
