@@ -153,22 +153,41 @@ const MAX_RESPONSE_BYTES: usize = 2 * MAX_CONFIG_YAML_BYTES + 64 * 1024;
 /// The payload was verified before it was applied, so re-merging it
 /// needs no signature check. Only the payload is kept, never a key.
 #[derive(Debug, Clone)]
-struct AppliedBundle {
-    config_yaml: String,
-    merge_mode: MergeMode,
-    revision: u64,
-    authority_id: String,
+pub struct AppliedAuthority {
+    /// The authority document, as published and verified.
+    pub config_yaml: String,
+    /// How the document combines with the base document.
+    pub merge_mode: MergeMode,
+    /// Revision of the payload, as the authority numbered it.
+    pub revision: u64,
+    /// Identifier the authority published under.
+    pub authority_id: String,
 }
 
 /// The authority payload currently applied on this node, if any.
-static APPLIED_BUNDLE: std::sync::Mutex<Option<AppliedBundle>> = std::sync::Mutex::new(None);
+static APPLIED_BUNDLE: std::sync::Mutex<Option<AppliedAuthority>> = std::sync::Mutex::new(None);
+
+/// The authority payload this node has applied, if any.
+///
+/// `None` on a node with no upstream authority, which includes a node that
+/// has one configured but has not yet completed a poll. A caller reporting
+/// on configuration ownership wants exactly this distinction: an authority
+/// that is configured but has never been reached owns nothing yet, and the
+/// node's own file is still the whole story.
+#[must_use]
+pub fn applied_authority() -> Option<AppliedAuthority> {
+    APPLIED_BUNDLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
 
 /// Record the authority payload this node has applied.
 fn record_applied_bundle(bundle: &ConfigBundle) {
     let mut slot = APPLIED_BUNDLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *slot = Some(AppliedBundle {
+    *slot = Some(AppliedAuthority {
         config_yaml: bundle.config_yaml.clone(),
         merge_mode: match bundle.mode {
             BundleMode::Overlay => MergeMode::Overlay,
@@ -177,6 +196,16 @@ fn record_applied_bundle(bundle: &ConfigBundle) {
         revision: bundle.revision,
         authority_id: bundle.authority_id.clone(),
     });
+}
+
+/// Install an applied authority payload directly. Test-only; a running
+/// node only ever reaches this state by verifying and applying a bundle.
+#[doc(hidden)]
+pub fn set_applied_authority(applied: AppliedAuthority) {
+    let mut slot = APPLIED_BUNDLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = Some(applied);
 }
 
 /// Merge the authority payload this node already applied over a freshly
@@ -653,6 +682,73 @@ impl ConfigSubscriber {
         }
     }
 
+    /// Re-read the verifying-key file, keeping the current keys if the read
+    /// fails.
+    ///
+    /// Called once per cycle so the trust file is the trust anchor rather
+    /// than a snapshot of it at boot. Before this, keys were loaded once at
+    /// startup and re-read only when the file had failed to load entirely,
+    /// which broke both halves of the rotation the docs promise:
+    ///
+    /// - **Adding** a key ID never took effect. An operator who added a
+    ///   second entry to a working file saw every bundle signed by it refused
+    ///   indefinitely, with `key ID ... is not in the verifying key set`.
+    /// - **Removing** one never took effect either, which is the half that
+    ///   matters more. A key revoked because it leaked kept verifying bundles
+    ///   until every node had been restarted, so revocation was a rolling
+    ///   restart rather than an edit.
+    ///
+    /// Both were found by the two-process rotation drill. No unit test could
+    /// see either, because they all construct the key set directly and never
+    /// go through the file.
+    ///
+    /// A failed read keeps the keys already loaded instead of dropping to
+    /// none. A file being rewritten is briefly unreadable or truncated, and
+    /// treating that instant as "trust nothing" would turn an ordinary
+    /// rotation into a window where every bundle is refused. The error is
+    /// logged on every cycle it persists, so a genuinely broken file is loud.
+    ///
+    /// The cost is one small read per poll interval, which is at least five
+    /// seconds. That is the right trade against a trust anchor that cannot be
+    /// revoked without a restart.
+    fn refresh_keys(&mut self) {
+        match VerifyingKeySet::from_file(&self.verifying_keys_file) {
+            Ok(keys) => {
+                let keys = keys.allow_shared_secret(self.allow_shared_secret_keys);
+                if keys.is_empty() {
+                    tracing::error!(
+                        path = %self.verifying_keys_file.display(),
+                        "config authority verifying-key file declares no keys; every bundle \
+                         will be refused until it does",
+                    );
+                }
+                let changed = self
+                    .keys
+                    .as_ref()
+                    .is_none_or(|current| current.len() != keys.len());
+                if changed {
+                    tracing::info!(
+                        keys_before = self.keys.as_ref().map_or(0, VerifyingKeySet::len),
+                        keys_after = keys.len(),
+                        path = %self.verifying_keys_file.display(),
+                        "config authority verifying-key set changed on disk and is now in \
+                         effect without a restart",
+                    );
+                }
+                self.keys = Some(keys);
+            }
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    path = %self.verifying_keys_file.display(),
+                    kept_keys = self.keys.as_ref().map_or(0, VerifyingKeySet::len),
+                    "config authority verifying-key file could not be re-read; keeping the \
+                     key set already loaded",
+                );
+            }
+        }
+    }
+
     /// Whether `bundle` is the exact revision and content this node
     /// already serves, which makes the cycle a no-op.
     ///
@@ -1069,6 +1165,12 @@ impl ConfigSubscriber {
         // live until the end of the match, which would put that borrow in
         // the way of the `&mut self` apply below.
         let fetched = self.fetch().await;
+        // Re-read the trust file before verifying, so an added key ID takes
+        // effect and a removed one stops working, both without a restart.
+        // Only worth doing when there is something to verify.
+        if matches!(fetched, FetchResult::Bundle(_)) {
+            self.refresh_keys();
+        }
         let result = match fetched {
             FetchResult::NotModified => CycleResult::NotModified,
             FetchResult::Unreachable(reason) => {
@@ -1520,5 +1622,101 @@ mod tests {
         );
         std::env::remove_var("SB_TEST_CONFIG_AUTHORITY_TOKEN");
         assert!(resolve_credential("env:SB_TEST_CONFIG_AUTHORITY_TOKEN").is_err());
+    }
+
+    /// One ed25519 verifying-key file entry per requested id, all sharing a
+    /// key. The ids are what matter here, not the key material.
+    fn write_key_file(path: &Path, ids: &[&str]) {
+        use base64::Engine as _;
+        let key = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        let entries: Vec<String> = ids
+            .iter()
+            .map(|id| format!("  \"{id}\": {{ \"algorithm\": \"ed25519\", \"key\": \"{key}\" }}"))
+            .collect();
+        std::fs::write(path, format!("{{\n{}\n}}\n", entries.join(",\n"))).expect("write keys");
+    }
+
+    fn subscriber_for_keys(dir: &Path, keys_file: &Path) -> ConfigSubscriber {
+        let upstream: ConfigAuthorityUpstreamConfig = serde_yaml::from_str(&format!(
+            "url: http://127.0.0.1:1\n\
+             mode: overlay\n\
+             subscriber_id: edge-01\n\
+             verifying_keys_file: {keys}\n\
+             cache_path: {cache}\n\
+             allow_insecure_http: true\n",
+            keys = keys_file.display(),
+            cache = dir.join("cache.json").display(),
+        ))
+        .expect("upstream config parses");
+        ConfigSubscriber::new(&dir.join("sb.yml").display().to_string(), &upstream)
+            .expect("subscriber constructs")
+    }
+
+    /// The verifying-key file is the trust anchor, not a snapshot of it taken
+    /// at boot.
+    ///
+    /// Both halves of this were broken until a two-process rotation drill
+    /// caught them. Keys were read once at startup and re-read only if the
+    /// file had failed to load entirely, so adding an id never started
+    /// verifying and removing one never stopped. The removal is the half that
+    /// matters: a key revoked because it leaked kept working until every node
+    /// had been restarted.
+    ///
+    /// Pinned here, in the required test lane, because the drill that found it
+    /// is deliberately outside CI.
+    #[test]
+    fn refreshing_keys_picks_up_an_added_id_and_drops_a_removed_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let keys_file = dir.path().join("keys.json");
+
+        write_key_file(&keys_file, &["key-1"]);
+        let mut subscriber = subscriber_for_keys(dir.path(), &keys_file);
+        assert_eq!(
+            subscriber.keys.as_ref().map(VerifyingKeySet::len),
+            Some(1),
+            "the constructor loads the file once"
+        );
+
+        // Rotation, first half: a new id is trusted without a restart.
+        write_key_file(&keys_file, &["key-1", "key-2"]);
+        subscriber.refresh_keys();
+        let keys = subscriber.keys.as_ref().expect("keys loaded");
+        assert_eq!(keys.len(), 2);
+        assert!(keys.get("key-2").is_some(), "the added id must be trusted");
+
+        // Rotation, second half: retiring an id stops it verifying, also
+        // without a restart. This is the security-relevant direction.
+        write_key_file(&keys_file, &["key-2"]);
+        subscriber.refresh_keys();
+        let keys = subscriber.keys.as_ref().expect("keys loaded");
+        assert_eq!(keys.len(), 1);
+        assert!(
+            keys.get("key-1").is_none(),
+            "a retired id must stop verifying immediately, not at the next restart"
+        );
+    }
+
+    /// A file being rewritten is briefly unreadable, and treating that instant
+    /// as "trust nothing" would turn an ordinary rotation into a window where
+    /// every bundle is refused.
+    #[test]
+    fn a_failed_key_reread_keeps_the_keys_already_loaded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let keys_file = dir.path().join("keys.json");
+        write_key_file(&keys_file, &["key-1"]);
+        let mut subscriber = subscriber_for_keys(dir.path(), &keys_file);
+
+        std::fs::remove_file(&keys_file).expect("remove keys file");
+        subscriber.refresh_keys();
+        assert_eq!(
+            subscriber.keys.as_ref().map(VerifyingKeySet::len),
+            Some(1),
+            "an unreadable file must not drop the trusted set"
+        );
+
+        // And a file that comes back is picked up on the next cycle.
+        write_key_file(&keys_file, &["key-1", "key-3"]);
+        subscriber.refresh_keys();
+        assert_eq!(subscriber.keys.as_ref().map(VerifyingKeySet::len), Some(2));
     }
 }

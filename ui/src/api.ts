@@ -1171,6 +1171,49 @@ export interface Credential {
   [k: string]: unknown;
 }
 
+/// Where one leaf of the running config came from. `local` and
+/// `authority` arrive as bare strings; a git leaf carries the resolved
+/// commit, which is the part worth showing an operator.
+export type ConfigProvenance =
+  | "local"
+  | "authority"
+  | { git: { repo: string; reference: string; commit: string } };
+
+export interface ConfigLayers {
+  base?:
+    | { kind: "local" }
+    | { kind: "git"; repo: string; reference: string; commit: string };
+  authority?: {
+    authority_id: string;
+    revision: number;
+    mode: "overlay" | "replace";
+  } | null;
+}
+
+export interface EffectiveConfigResponse {
+  // GET /admin/config/effective.
+  yaml?: string;
+  provenance?: Record<string, ConfigProvenance>;
+  layers?: ConfigLayers;
+  // True only when this node's own file is the whole configuration, which
+  // is the condition under which the editor may offer a write.
+  locally_owned?: boolean;
+  locally_owned_leaves?: number;
+  total_leaves?: number;
+  [k: string]: unknown;
+}
+
+/// Body of a 409 the write guard produced. Distinguished from a revision
+/// mismatch by `code`, because the two need different advice: one says
+/// reload and reapply, the other says this is not your config to edit.
+export interface ConfigWriteConflict {
+  code?: string;
+  error?: string;
+  conflicts?: { path: string; owner: ConfigProvenance | "suppressed" }[];
+  layers?: ConfigLayers;
+  remedy?: string;
+}
+
 export interface DriftResponse {
   // Real server shape (GET /admin/drift).
   drift?: boolean;
@@ -2028,6 +2071,16 @@ export const api = {
       ifMatch ? `/admin/config?if_match=${encodeURIComponent(ifMatch)}` : "/admin/config",
       yaml,
     ),
+
+  // What is actually running, and who owns each part of it. `config` above
+  // returns this node's own file, which on a git-sourced node is nothing
+  // but the pointer that selected the repository.
+  effectiveConfig: () =>
+    getJson<EffectiveConfigResponse>("/admin/config/effective"),
+
+  // The config JSON Schema, generated from the running binary's own types.
+  // Around 300KB, so it is fetched once per page load and not per edit.
+  configSchema: () => getJson<Record<string, unknown>>("/admin/config/schema"),
 
   // Rate-limit budget audit trail (WOR-1761) + fleet metrics (WOR-1762).
   auditRecent: (limit = 100) => getJson<AuditRow[]>(`/api/audit/recent?limit=${limit}`),

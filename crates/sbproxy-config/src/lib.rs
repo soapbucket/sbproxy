@@ -14,6 +14,8 @@
 //!   ([`config_merge`])
 //! - Resolving a `source:` block, including a git repository, into the
 //!   config document that actually compiles ([`source`])
+//! - The JSON Schema for the config file, generated from the same types
+//!   the binary parses with ([`schema`])
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -30,6 +32,7 @@ pub mod litellm;
 pub mod model_host;
 pub mod plan;
 pub mod raw;
+pub mod schema;
 pub mod snapshot;
 pub mod source;
 pub mod types;
@@ -49,8 +52,8 @@ pub use config_bundle::{
     CONFIG_BUNDLE_SCHEMA_VERSION, MAX_CONFIG_YAML_BYTES,
 };
 pub use config_merge::{
-    denied_paths_in, merge_config, BaseOrigin, MergeError, MergeMode, MergeOutcome, Provenance,
-    ProvenanceMap, AUTHORITY_DENIED_PATHS,
+    changed_leaf_paths, denied_paths_in, merge_config, BaseOrigin, MergeError, MergeMode,
+    MergeOutcome, Provenance, ProvenanceMap, AUTHORITY_DENIED_PATHS,
 };
 pub use listing::{
     is_well_placed_skill_url, load_listing_file, load_listings_from_repo, validate_listings,
@@ -65,6 +68,7 @@ pub use plan::{
     PlanEntry, PlanFile, PlanKind, PlanReport, PlanSummary, BLAST_RADIUS_MATRIX,
 };
 pub use raw::*;
+pub use schema::{config_json_schema, CONFIG_SCHEMA_FILE};
 pub use snapshot::*;
 pub use source::{
     credential_references, is_full_commit_sha, load_from_source, load_source_blocking,
