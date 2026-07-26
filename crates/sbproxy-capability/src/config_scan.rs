@@ -481,19 +481,31 @@ struct TypeAliasDefinition {
 }
 
 #[derive(Debug, Clone)]
+struct ValueTypeAliasParameter {
+    name: String,
+    default: Option<ValueTypeReference>,
+}
+
+#[derive(Debug, Clone)]
 struct ValueTypeAliasDefinition {
-    parameters: Vec<String>,
+    parameters: Vec<ValueTypeAliasParameter>,
     target: ValueTypeReference,
 }
 
 impl ValueTypeAliasDefinition {
-    fn new(generics: &syn::Generics, target: ValueTypeReference) -> Self {
+    fn new(generics: &syn::Generics, target: ValueTypeReference, context: &ModuleContext) -> Self {
         Self {
             parameters: generics
                 .params
                 .iter()
                 .filter_map(|parameter| match parameter {
-                    syn::GenericParam::Type(parameter) => Some(parameter.ident.to_string()),
+                    syn::GenericParam::Type(parameter) => Some(ValueTypeAliasParameter {
+                        name: parameter.ident.to_string(),
+                        default: parameter
+                            .default
+                            .as_ref()
+                            .and_then(|default| value_type_reference(default, context)),
+                    }),
                     syn::GenericParam::Const(_) | syn::GenericParam::Lifetime(_) => None,
                 })
                 .collect(),
@@ -666,6 +678,7 @@ struct RustTypeIndex {
     symbol_bindings: BTreeMap<String, Vec<TypeReference>>,
     glob_imports: BTreeMap<ModuleContext, Vec<TypeReference>>,
     anonymous_imports: BTreeMap<ModuleContext, Vec<TypeReference>>,
+    unexpanded_item_macro_namespaces: BTreeSet<ModuleContext>,
     known_crates: BTreeSet<String>,
     known_modules: BTreeSet<String>,
     enum_tags: BTreeMap<String, String>,
@@ -751,11 +764,12 @@ impl RustTypeIndex {
         alias: String,
         generics: &syn::Generics,
         target: ValueTypeReference,
+        context: &ModuleContext,
     ) {
         self.value_type_aliases
             .entry(alias)
             .or_default()
-            .push(ValueTypeAliasDefinition::new(generics, target));
+            .push(ValueTypeAliasDefinition::new(generics, target, context));
     }
 
     fn record_generic_type_parameters(&mut self, owner: &str, generics: &syn::Generics) {
@@ -1143,16 +1157,19 @@ impl RustTypeIndex {
         alias: &ValueTypeAliasDefinition,
         arguments: &[Option<ValueTypeReference>],
     ) -> Option<ValueTypeReference> {
-        if alias.parameters.len() != arguments.len() {
+        if arguments.len() > alias.parameters.len() {
             return None;
         }
-        let bindings: Option<BTreeMap<_, _>> = alias
-            .parameters
-            .iter()
-            .zip(arguments)
-            .map(|(parameter, argument)| Some((parameter.clone(), argument.as_ref()?.clone())))
-            .collect();
-        Self::substitute_value_type_reference(&alias.target, &bindings?)
+        let mut bindings = BTreeMap::new();
+        for (index, parameter) in alias.parameters.iter().enumerate() {
+            let argument = if let Some(argument) = arguments.get(index) {
+                argument.as_ref()?.clone()
+            } else {
+                Self::substitute_value_type_reference(parameter.default.as_ref()?, &bindings)?
+            };
+            bindings.insert(parameter.name.clone(), argument);
+        }
+        Self::substitute_value_type_reference(&alias.target, &bindings)
     }
 
     fn substitute_value_type_reference(
@@ -1220,62 +1237,202 @@ impl RustTypeIndex {
         reference: &TypeReference,
         resolving: &mut BTreeSet<String>,
     ) -> Option<usize> {
-        if let Some(index) = syntactic_transparent_wrapper_argument_index(reference, false) {
-            return Some(index);
-        }
-        let name = reference.segments.last()?;
-        let (exact, allow_unqualified) =
-            if reference.segments.len() == 1 && !reference.leading_colon {
-                (reference.context.symbol(name), true)
-            } else {
-                let namespace_reference = TypeReference {
-                    segments: reference.segments[..reference.segments.len() - 1].to_vec(),
-                    generic_arguments: Vec::new(),
-                    has_unresolved_generic_arguments: false,
-                    context: reference.context.clone(),
-                    leading_colon: reference.leading_colon,
-                };
-                let namespaces =
-                    self.resolve_namespace_reference(&namespace_reference, &mut BTreeSet::new());
-                if namespaces.tainted || namespaces.namespaces.len() != 1 {
-                    return None;
-                }
-                let namespace = namespaces.namespaces.first()?;
-                (namespace.symbol(name), false)
-            };
-        let key = format!("transparent-wrapper:{exact}");
+        self.transparent_wrapper_argument_index_inner(reference, true, resolving)
+    }
+
+    fn transparent_wrapper_argument_index_inner(
+        &self,
+        reference: &TypeReference,
+        allow_unqualified_fallback: bool,
+        resolving: &mut BTreeSet<String>,
+    ) -> Option<usize> {
+        let key = format!(
+            "transparent-wrapper:{}:{}:{}:{}",
+            reference.context.path(),
+            reference.leading_colon,
+            allow_unqualified_fallback,
+            reference.segments.join("::")
+        );
         if !resolving.insert(key.clone()) {
             return None;
         }
-        if self.value_type_aliases.contains_key(&exact) {
-            resolving.remove(&key);
-            return None;
-        }
-        if let Some(bindings) = self.symbol_bindings.get(&exact) {
-            let indices: Vec<_> = bindings
-                .iter()
-                .map(|binding| self.transparent_wrapper_argument_index(binding, resolving))
-                .collect();
-            resolving.remove(&key);
-            let [Some(first), rest @ ..] = indices.as_slice() else {
+        let result = (|| {
+            let first = reference.segments.first()?;
+            let name = reference.segments.last()?;
+
+            if !reference.leading_colon && !matches!(first.as_str(), "crate" | "self" | "super") {
+                let exact = reference.context.symbol(first);
+                if let Some(bindings) = self.symbol_bindings.get(&exact) {
+                    let indices: Vec<_> = bindings
+                        .iter()
+                        .map(|binding| {
+                            let mut expanded = binding.clone();
+                            expanded
+                                .segments
+                                .extend_from_slice(&reference.segments[1..]);
+                            if !expanded.leading_colon && expanded.segments.first() == Some(first) {
+                                expanded.leading_colon = true;
+                            }
+                            self.transparent_wrapper_argument_index_inner(
+                                &expanded, false, resolving,
+                            )
+                        })
+                        .collect();
+                    let [Some(first), rest @ ..] = indices.as_slice() else {
+                        return None;
+                    };
+                    return rest
+                        .iter()
+                        .all(|candidate| candidate == &Some(*first))
+                        .then_some(*first);
+                }
+            }
+
+            if reference.segments.len() > 1 {
+                for split in (1..reference.segments.len()).rev() {
+                    let namespace_reference = TypeReference {
+                        segments: reference.segments[..split].to_vec(),
+                        generic_arguments: Vec::new(),
+                        has_unresolved_generic_arguments: false,
+                        context: reference.context.clone(),
+                        leading_colon: reference.leading_colon,
+                    };
+                    let namespaces = self
+                        .resolve_namespace_reference(&namespace_reference, &mut BTreeSet::new());
+                    if namespaces.tainted {
+                        if !namespaces.namespaces.is_empty() {
+                            return None;
+                        }
+                        continue;
+                    }
+                    let Some(namespace) = namespaces.namespaces.first() else {
+                        continue;
+                    };
+                    if namespaces.namespaces.len() != 1 {
+                        return None;
+                    }
+                    let nested = TypeReference {
+                        segments: reference.segments[split..].to_vec(),
+                        generic_arguments: reference.generic_arguments.clone(),
+                        has_unresolved_generic_arguments: reference
+                            .has_unresolved_generic_arguments,
+                        context: namespace.clone(),
+                        leading_colon: false,
+                    };
+                    return self
+                        .transparent_wrapper_argument_index_inner(&nested, false, resolving);
+                }
+
+                let index = syntactic_transparent_wrapper_argument_index(reference, false)?;
+                if !self.trusted_wrapper_root_is_unshadowed(reference, allow_unqualified_fallback) {
+                    return None;
+                }
+                return Some(index);
+            }
+
+            let exact = reference.context.symbol(name);
+            if self.value_type_aliases.contains_key(&exact) {
                 return None;
-            };
-            return rest
-                .iter()
-                .all(|candidate| candidate == &Some(*first))
-                .then_some(*first);
-        }
-        if !allow_unqualified {
-            resolving.remove(&key);
-            return None;
-        }
-        let resolution =
-            self.resolve_symbol_reference(SymbolKind::Type, reference, &mut BTreeSet::new());
+            }
+
+            let resolution =
+                self.resolve_symbol_reference(SymbolKind::Type, reference, &mut BTreeSet::new());
+            if !resolution.symbols.is_empty() {
+                return None;
+            }
+
+            let mut glob_indices = Vec::new();
+            if let Some(globs) = self.glob_imports.get(&reference.context) {
+                for glob in globs {
+                    let mut expanded = glob.clone();
+                    expanded.segments.push(name.clone());
+                    if let Some(index) =
+                        self.transparent_wrapper_argument_index_inner(&expanded, false, resolving)
+                    {
+                        glob_indices.push(index);
+                        continue;
+                    }
+                    let targets = self.resolve_namespace_reference(glob, &mut BTreeSet::new());
+                    if targets.tainted || targets.namespaces.is_empty() {
+                        return None;
+                    }
+                    let member = self.resolve_symbol_reference(
+                        SymbolKind::Type,
+                        &expanded,
+                        &mut BTreeSet::new(),
+                    );
+                    if member.tainted || !member.symbols.is_empty() {
+                        return None;
+                    }
+                }
+            }
+            if let [first, rest @ ..] = glob_indices.as_slice() {
+                return rest
+                    .iter()
+                    .all(|candidate| candidate == first)
+                    .then_some(*first);
+            }
+
+            if resolution.tainted
+                || !allow_unqualified_fallback
+                || self
+                    .unexpanded_item_macro_namespaces
+                    .contains(&reference.context)
+            {
+                return None;
+            }
+            syntactic_transparent_wrapper_argument_index(reference, true)
+        })();
         resolving.remove(&key);
-        if resolution.tainted || !resolution.symbols.is_empty() {
-            return None;
+        result
+    }
+
+    fn trusted_wrapper_root_is_unshadowed(
+        &self,
+        reference: &TypeReference,
+        consider_glob_imports: bool,
+    ) -> bool {
+        if reference.leading_colon {
+            return true;
         }
-        syntactic_transparent_wrapper_argument_index(reference, true)
+        let Some(first) = reference.segments.first() else {
+            return false;
+        };
+        if self
+            .unexpanded_item_macro_namespaces
+            .contains(&reference.context)
+        {
+            return false;
+        }
+        let exact = reference.context.symbol(first);
+        if self
+            .types_by_name
+            .get(first)
+            .is_some_and(|owners| owners.contains(&exact))
+            || self.type_aliases.contains_key(&exact)
+            || self.value_type_aliases.contains_key(&exact)
+        {
+            return false;
+        }
+        if !consider_glob_imports {
+            return true;
+        }
+        let Some(globs) = self.glob_imports.get(&reference.context) else {
+            return true;
+        };
+        for glob in globs {
+            let targets = self.resolve_namespace_reference(glob, &mut BTreeSet::new());
+            if targets.tainted || targets.namespaces.is_empty() {
+                return false;
+            }
+            for namespace in targets.namespaces {
+                let member = self.resolve_namespace_member(&namespace, first, &mut BTreeSet::new());
+                if member.tainted || !member.namespaces.is_empty() {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn instantiate_type_alias(
@@ -2508,6 +2665,14 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
         self.context = saved_context;
     }
 
+    fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+        if node.ident.is_none() && !attributes_exclude_production(&node.attrs) {
+            self.index
+                .unexpanded_item_macro_namespaces
+                .insert(self.context.clone());
+        }
+    }
+
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
         if attributes_exclude_production(&node.attrs) {
             return;
@@ -2577,8 +2742,12 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
     fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
         let alias = self.context.symbol(&node.ident.to_string());
         if let Some(target) = value_type_reference(&node.ty, &self.context) {
-            self.index
-                .record_value_type_alias(alias.clone(), &node.generics, target);
+            self.index.record_value_type_alias(
+                alias.clone(),
+                &node.generics,
+                target,
+                &self.context,
+            );
         }
         if let Some(target) = type_reference(&node.ty, &self.context) {
             self.index
@@ -3315,6 +3484,29 @@ impl InferredValue {
         value.mutable_place |= mutable_place;
         value
     }
+
+    fn fill_missing(primary: Option<Self>, fallback: Option<Self>) -> Option<Self> {
+        match (primary, fallback) {
+            (None, fallback) => fallback,
+            (primary, None) => primary,
+            (Some(mut primary), Some(fallback)) => {
+                if let (
+                    InferredValueKind::Tuple(primary_elements),
+                    InferredValueKind::Tuple(fallback_elements),
+                ) = (&mut primary.kind, fallback.kind)
+                {
+                    if primary_elements.len() == fallback_elements.len() {
+                        for (primary, fallback) in
+                            primary_elements.iter_mut().zip(fallback_elements)
+                        {
+                            *primary = Self::fill_missing(primary.take(), fallback);
+                        }
+                    }
+                }
+                Some(primary)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -3328,6 +3520,7 @@ struct LocalSymbolScope {
     function_returns: BTreeMap<String, Vec<ValueTypeReference>>,
     value_type_aliases: BTreeMap<String, Vec<ValueTypeAliasDefinition>>,
     namespace_declarations: BTreeSet<String>,
+    has_unexpanded_item_macro: bool,
 }
 
 #[derive(Clone)]
@@ -3677,7 +3870,7 @@ impl<'a> FieldReadVisitor<'a> {
         reference: &TypeReference,
         scope_limit: usize,
         resolving: &mut BTreeSet<String>,
-    ) -> Option<usize> {
+    ) -> Option<(usize, usize)> {
         if !reference.leading_colon {
             let first = reference.segments.first()?;
             for scope_index in (0..scope_limit).rev() {
@@ -3720,15 +3913,41 @@ impl<'a> FieldReadVisitor<'a> {
                         resolving,
                     );
                     resolving.remove(&key);
-                    return index;
+                    return index.map(|(index, _)| (index, scope_limit));
+                }
+                if scope.has_unexpanded_item_macro {
+                    return None;
                 }
                 if !scope.glob_imports.is_empty() {
-                    return None;
+                    if reference.segments.len() != 1 {
+                        return None;
+                    }
+                    let indices: Vec<_> = scope
+                        .glob_imports
+                        .iter()
+                        .map(|glob| {
+                            let mut expanded = glob.clone();
+                            expanded.segments.push(first.clone());
+                            self.transparent_wrapper_argument_index_scoped(
+                                &expanded,
+                                scope_index,
+                                resolving,
+                            )
+                        })
+                        .collect();
+                    let [Some(first), rest @ ..] = indices.as_slice() else {
+                        return None;
+                    };
+                    return rest
+                        .iter()
+                        .all(|candidate| candidate == &Some(*first))
+                        .then_some((first.0, scope_index));
                 }
             }
         }
         self.types
             .transparent_wrapper_argument_index(reference, &mut BTreeSet::new())
+            .map(|index| (index, scope_limit))
     }
 
     fn resolve_value_type_scoped_with_limit(
@@ -3736,10 +3955,42 @@ impl<'a> FieldReadVisitor<'a> {
         reference: &ValueTypeReference,
         scope_limit: usize,
     ) -> Option<InferredValue> {
+        self.resolve_value_type_scoped_inner(reference, scope_limit, &mut BTreeSet::new())
+    }
+
+    fn resolve_value_type_scoped_inner(
+        &self,
+        reference: &ValueTypeReference,
+        scope_limit: usize,
+        resolving_aliases: &mut BTreeSet<String>,
+    ) -> Option<InferredValue> {
         match reference {
-            ValueTypeReference::Nominal(reference) => self
-                .resolve_exact_type_scoped_with_limit(reference, scope_limit)
-                .map(|owner| InferredValue::nominal(owner, false)),
+            ValueTypeReference::Nominal(reference) => {
+                if let Some((target, target_scope_limit)) = self.value_type_alias_target_scoped(
+                    reference,
+                    &[],
+                    scope_limit,
+                    &mut BTreeSet::new(),
+                ) {
+                    let key = format!(
+                        "scoped-value-alias:{scope_limit}:{}:{}",
+                        reference.context.path(),
+                        reference.segments.join("::")
+                    );
+                    if !resolving_aliases.insert(key.clone()) {
+                        return None;
+                    }
+                    let result = self.resolve_value_type_scoped_inner(
+                        &target,
+                        target_scope_limit,
+                        resolving_aliases,
+                    );
+                    resolving_aliases.remove(&key);
+                    return result;
+                }
+                self.resolve_exact_type_scoped_with_limit(reference, scope_limit)
+                    .map(|owner| InferredValue::nominal(owner, false))
+            }
             ValueTypeReference::Parameterized { wrapper, arguments } => {
                 if let Some((target, target_scope_limit)) = self.value_type_alias_target_scoped(
                     wrapper,
@@ -3747,16 +3998,44 @@ impl<'a> FieldReadVisitor<'a> {
                     scope_limit,
                     &mut BTreeSet::new(),
                 ) {
-                    return self.resolve_value_type_scoped_with_limit(&target, target_scope_limit);
+                    let key = format!(
+                        "scoped-value-alias:{scope_limit}:{}:{}",
+                        wrapper.context.path(),
+                        wrapper.segments.join("::")
+                    );
+                    if !resolving_aliases.insert(key.clone()) {
+                        return None;
+                    }
+                    let result = self.resolve_value_type_scoped_inner(
+                        &target,
+                        target_scope_limit,
+                        resolving_aliases,
+                    );
+                    resolving_aliases.remove(&key);
+                    return result;
                 }
-                if let Some(index) = self.transparent_wrapper_argument_index_scoped(
-                    wrapper,
-                    scope_limit,
-                    &mut BTreeSet::new(),
-                ) {
-                    return arguments.get(index)?.as_ref().and_then(|argument| {
-                        self.resolve_value_type_scoped_with_limit(argument, scope_limit)
-                    });
+                if let Some((index, argument_scope_limit)) = self
+                    .transparent_wrapper_argument_index_scoped(
+                        wrapper,
+                        scope_limit,
+                        &mut BTreeSet::new(),
+                    )
+                {
+                    let argument = arguments.get(index)?.as_ref()?;
+                    let primary = self.resolve_value_type_scoped_inner(
+                        argument,
+                        scope_limit,
+                        resolving_aliases,
+                    );
+                    if argument_scope_limit == scope_limit {
+                        return primary;
+                    }
+                    let fallback = self.resolve_value_type_scoped_inner(
+                        argument,
+                        argument_scope_limit,
+                        resolving_aliases,
+                    );
+                    return InferredValue::fill_missing(primary, fallback);
                 }
                 self.resolve_exact_type_scoped_with_limit(wrapper, scope_limit)
                     .map(|owner| InferredValue::nominal(owner, false))
@@ -3766,7 +4045,11 @@ impl<'a> FieldReadVisitor<'a> {
                     .iter()
                     .map(|element| {
                         element.as_ref().and_then(|element| {
-                            self.resolve_value_type_scoped_with_limit(element, scope_limit)
+                            self.resolve_value_type_scoped_inner(
+                                element,
+                                scope_limit,
+                                resolving_aliases,
+                            )
                         })
                     })
                     .collect(),
@@ -3775,23 +4058,54 @@ impl<'a> FieldReadVisitor<'a> {
     }
 
     fn resolve_value_type(&self, reference: &ValueTypeReference) -> Option<InferredValue> {
+        self.resolve_value_type_inner(reference, &mut BTreeSet::new())
+    }
+
+    fn resolve_value_type_inner(
+        &self,
+        reference: &ValueTypeReference,
+        resolving_aliases: &mut BTreeSet<String>,
+    ) -> Option<InferredValue> {
         match reference {
-            ValueTypeReference::Nominal(reference) => self
-                .types
-                .resolve_exact_type_reference(reference)
-                .map(|owner| InferredValue::nominal(owner, false)),
+            ValueTypeReference::Nominal(reference) => {
+                if let Some(target) = self.types.value_type_alias_target(reference, &[]) {
+                    let key = format!(
+                        "value-alias:{}:{}",
+                        reference.context.path(),
+                        reference.segments.join("::")
+                    );
+                    if !resolving_aliases.insert(key.clone()) {
+                        return None;
+                    }
+                    let result = self.resolve_value_type_inner(&target, resolving_aliases);
+                    resolving_aliases.remove(&key);
+                    return result;
+                }
+                self.types
+                    .resolve_exact_type_reference(reference)
+                    .map(|owner| InferredValue::nominal(owner, false))
+            }
             ValueTypeReference::Parameterized { wrapper, arguments } => {
                 if let Some(target) = self.types.value_type_alias_target(wrapper, arguments) {
-                    return self.resolve_value_type(&target);
+                    let key = format!(
+                        "value-alias:{}:{}",
+                        wrapper.context.path(),
+                        wrapper.segments.join("::")
+                    );
+                    if !resolving_aliases.insert(key.clone()) {
+                        return None;
+                    }
+                    let result = self.resolve_value_type_inner(&target, resolving_aliases);
+                    resolving_aliases.remove(&key);
+                    return result;
                 }
                 if let Some(index) = self
                     .types
                     .transparent_wrapper_argument_index(wrapper, &mut BTreeSet::new())
                 {
-                    return arguments
-                        .get(index)?
-                        .as_ref()
-                        .and_then(|argument| self.resolve_value_type(argument));
+                    return arguments.get(index)?.as_ref().and_then(|argument| {
+                        self.resolve_value_type_inner(argument, resolving_aliases)
+                    });
                 }
                 self.types
                     .resolve_exact_type_reference(wrapper)
@@ -3801,9 +4115,9 @@ impl<'a> FieldReadVisitor<'a> {
                 elements
                     .iter()
                     .map(|element| {
-                        element
-                            .as_ref()
-                            .and_then(|element| self.resolve_value_type(element))
+                        element.as_ref().and_then(|element| {
+                            self.resolve_value_type_inner(element, resolving_aliases)
+                        })
                     })
                     .collect(),
             )),
@@ -3841,6 +4155,12 @@ impl<'a> FieldReadVisitor<'a> {
     fn block_symbol_scope(&self, block: &syn::Block) -> LocalSymbolScope {
         let mut scope = LocalSymbolScope::default();
         for statement in &block.stmts {
+            if let syn::Stmt::Macro(statement_macro) = statement {
+                if !attributes_exclude_production(&statement_macro.attrs) {
+                    scope.has_unexpanded_item_macro = true;
+                }
+                continue;
+            }
             let syn::Stmt::Item(item) = statement else {
                 continue;
             };
@@ -3901,7 +4221,11 @@ impl<'a> FieldReadVisitor<'a> {
                             .value_type_aliases
                             .entry(name.clone())
                             .or_default()
-                            .push(ValueTypeAliasDefinition::new(&item_type.generics, target));
+                            .push(ValueTypeAliasDefinition::new(
+                                &item_type.generics,
+                                target,
+                                &self.context,
+                            ));
                     }
                     if let Some(target) = type_reference(&item_type.ty, &self.context) {
                         scope
@@ -3973,6 +4297,9 @@ impl<'a> FieldReadVisitor<'a> {
                             scope.function_returns.entry(name).or_default().push(result);
                         }
                     }
+                }
+                syn::Item::Macro(item_macro) if item_macro.ident.is_none() => {
+                    scope.has_unexpanded_item_macro = true;
                 }
                 _ => {}
             }
@@ -7759,8 +8086,108 @@ fn production(config: Config) {
             errors.len(),
             1,
             "an imported external custom Result must not expose its first generic owner: \
-             {errors:?}"
+            {errors:?}"
         );
+    }
+
+    #[test]
+    fn qualified_wrapper_names_cannot_be_spoofed_by_lexical_modules_or_aliases() {
+        for text in [
+            "mod anyhow {\n\
+                 pub struct Result<T, E> { pub first: T, pub second: E, pub live: bool }\n\
+             }\n\
+             struct Config { live: bool }\n\
+             struct Other { live: bool }\n\
+             fn fold(c: Config, o: Other) -> anyhow::Result<Config, Other> {\n\
+                 anyhow::Result { first: c, second: o, live: false }\n\
+             }\n\
+             fn run(c: Config, o: Other) { consume(fold(c, o).live); }",
+            "use opaque as anyhow;\n\
+             struct Config { live: bool }\n\
+             struct Other { live: bool }\n\
+             fn fold(c: Config, o: Other) -> anyhow::Result<Config, Other> { todo!() }\n\
+             fn run(c: Config, o: Other) { consume(fold(c, o).live); }",
+            "mod hashbrown {\n\
+                 pub struct HashMap<K, V> { pub key: K, pub value: V, pub live: bool }\n\
+             }\n\
+             struct Config { live: bool }\n\
+             struct Other { live: bool }\n\
+             fn fold(c: Config, o: Other) -> hashbrown::HashMap<Other, Config> {\n\
+                 hashbrown::HashMap { key: o, value: c, live: false }\n\
+             }\n\
+             fn run(c: Config, o: Other) { consume(fold(c, o).live); }",
+            "mod std {\n\
+                 pub mod result {\n\
+                     pub struct Result<T, E> { pub first: T, pub second: E, pub live: bool }\n\
+                 }\n\
+             }\n\
+             struct Config { live: bool }\n\
+             struct Other { live: bool }\n\
+             fn fold(c: Config, o: Other) -> std::result::Result<Config, Other> {\n\
+                 std::result::Result { first: c, second: o, live: false }\n\
+             }\n\
+             fn run(c: Config, o: Other) { consume(fold(c, o).live); }",
+            "mod std {\n\
+                 pub mod boxed {\n\
+                     pub struct Box<T> { pub inner: T, pub live: bool }\n\
+                 }\n\
+             }\n\
+             struct Config { live: bool }\n\
+             fn fold(c: Config) -> std::boxed::Box<Config> {\n\
+                 std::boxed::Box { inner: c, live: false }\n\
+             }\n\
+             fn run(c: Config) { consume(fold(c).live); }",
+        ] {
+            let errors = verify_config_readers(&[key("proxy.live", "live")], &[], &[source(text)]);
+
+            assert_eq!(
+                errors.len(),
+                1,
+                "a lexical module or alias must override a trusted wrapper spelling: \
+                 {errors:?}\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn macro_generated_bare_wrapper_names_fail_closed() {
+        for text in [
+            "macro_rules! define_result {\n\
+                 () => {\n\
+                     struct Result<T, E> { first: T, second: E, live: bool }\n\
+                 }\n\
+             }\n\
+             define_result!();\n\
+             struct Config { live: bool }\n\
+             struct Other { live: bool }\n\
+             fn fold(c: Config, o: Other) -> Result<Config, Other> {\n\
+                 Result { first: c, second: o, live: false }\n\
+             }\n\
+             fn run(c: Config, o: Other) { consume(fold(c, o).live); }",
+            "struct Config { live: bool }\n\
+             struct Other { live: bool }\n\
+             fn run(c: Config, o: Other) {\n\
+                 macro_rules! define_result {\n\
+                     () => {\n\
+                         struct Result<T, E> { first: T, second: E, live: bool }\n\
+                     }\n\
+                 }\n\
+                 define_result!();\n\
+                 fn fold(c: Config, o: Other) -> Result<Config, Other> {\n\
+                     Result { first: c, second: o, live: false }\n\
+                 }\n\
+                 consume(fold(c, o).live);\n\
+             }",
+        ] {
+            let errors = verify_config_readers(&[key("proxy.live", "live")], &[], &[source(text)]);
+
+            assert_eq!(
+                errors.len(),
+                1,
+                "an unexpanded macro may define a custom bare wrapper and must fail closed: \
+                 {errors:?}\n{text}"
+            );
+        }
     }
 
     #[test]
@@ -7799,6 +8226,114 @@ fn production(config: Config) {
             assert!(
                 errors.is_empty(),
                 "a renamed or aliased standard Result remains transparent: {errors:?}\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapper_module_aliases_and_glob_reexports_preserve_provenance() {
+        for text in [
+            "use std::result::*;\n\
+             struct Config { live: bool }\n\
+             struct Other { live: bool }\n\
+             fn fold(c: Config) -> Result<(Other, Config, bool), ()> { todo!() }\n\
+             fn run(c: Config) -> Result<(), ()> {\n\
+                 let (_, selected, ..) = fold(c)?;\n\
+                 consume(selected.live);\n\
+                 Ok(())\n\
+             }",
+            "mod facade { pub use std::result::Result; }\n\
+             use facade::*;\n\
+             struct Config { live: bool }\n\
+             struct Other { live: bool }\n\
+             fn fold(c: Config) -> Result<(Other, Config, bool), ()> { todo!() }\n\
+             fn run(c: Config) -> Result<(), ()> {\n\
+                 let (_, selected, ..) = fold(c)?;\n\
+                 consume(selected.live);\n\
+                 Ok(())\n\
+             }",
+            "use std::result as r;\n\
+             struct Config { live: bool }\n\
+             struct Other { live: bool }\n\
+             fn fold(c: Config) -> r::Result<(Other, Config, bool), ()> { todo!() }\n\
+             fn run(c: Config) -> r::Result<(), ()> {\n\
+                 let (_, selected, ..) = fold(c)?;\n\
+                 consume(selected.live);\n\
+                 Ok(())\n\
+             }",
+            "use std as s;\n\
+             struct Config { live: bool }\n\
+             struct Other { live: bool }\n\
+             fn fold(c: Config) -> s::result::Result<(Other, Config, bool), ()> { todo!() }\n\
+             fn run(c: Config) -> s::result::Result<(), ()> {\n\
+                 let (_, selected, ..) = fold(c)?;\n\
+                 consume(selected.live);\n\
+                 Ok(())\n\
+             }",
+            "mod facade { pub use std::result as r; }\n\
+             struct Config { live: bool }\n\
+             struct Other { live: bool }\n\
+             fn fold(c: Config) -> facade::r::Result<(Other, Config, bool), ()> { todo!() }\n\
+             fn run(c: Config) -> facade::r::Result<(), ()> {\n\
+                 let (_, selected, ..) = fold(c)?;\n\
+                 consume(selected.live);\n\
+                 Ok(())\n\
+             }",
+            "struct Config { live: bool }\n\
+             struct Other { live: bool }\n\
+             fn run(c: Config) -> std::result::Result<(), ()> {\n\
+                 use std::result::*;\n\
+                 fn fold(c: Config) -> Result<(Other, Config, bool), ()> { todo!() }\n\
+                 let (_, selected, ..) = fold(c)?;\n\
+                 consume(selected.live);\n\
+                 Ok(())\n\
+             }",
+            "struct Config { live: bool }\n\
+             struct Other { live: bool }\n\
+             fn run(c: Config) -> std::result::Result<(), ()> {\n\
+                 use std as s;\n\
+                 fn fold(c: Config) -> s::result::Result<(Other, Config, bool), ()> { todo!() }\n\
+                 let (_, selected, ..) = fold(c)?;\n\
+                 consume(selected.live);\n\
+                 Ok(())\n\
+             }",
+        ] {
+            let errors = verify_config_readers(&[key("proxy.live", "live")], &[], &[source(text)]);
+
+            assert!(
+                errors.is_empty(),
+                "wrapper module aliases and glob reexports remain transparent: {errors:?}\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_generic_and_defaulted_result_aliases_preserve_tuple_provenance() {
+        for text in [
+            "type FoldResult = Result<(Other, Config, bool), ()>;\n\
+             struct Config { live: bool }\n\
+             struct Other { live: bool }\n\
+             fn fold(c: Config) -> FoldResult { todo!() }\n\
+             fn run(c: Config) -> Result<(), ()> {\n\
+                 let (_, selected, ..) = fold(c)?;\n\
+                 consume(selected.live);\n\
+                 Ok(())\n\
+             }",
+            "type AppResult<T, E = ()> = Result<T, E>;\n\
+             struct Config { live: bool }\n\
+             struct Other { live: bool }\n\
+             fn fold(c: Config) -> AppResult<(Other, Config, bool)> { todo!() }\n\
+             fn run(c: Config) -> AppResult<()> {\n\
+                 let (_, selected, ..) = fold(c)?;\n\
+                 consume(selected.live);\n\
+                 Ok(())\n\
+             }",
+        ] {
+            let errors = verify_config_readers(&[key("proxy.live", "live")], &[], &[source(text)]);
+
+            assert!(
+                errors.is_empty(),
+                "zero-generic and defaulted aliases remain transparent: {errors:?}\n{text}"
             );
         }
     }
