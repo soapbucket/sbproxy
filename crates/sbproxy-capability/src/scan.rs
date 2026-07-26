@@ -78,25 +78,12 @@ pub struct SourceFile {
     pub text: String,
 }
 
-/// Whether an item's attributes make it reachable only in test builds.
-///
-/// A conjunctive predicate containing `test` (for example,
-/// `cfg(all(test, unix))`) is test-only. A disjunction is test-only only when
-/// every branch requires `test`; `cfg(any(test, feature = "fixtures"))` still
-/// has a production-feature build and must remain visible.
-pub(crate) fn attributes_are_test_only(attributes: &[syn::Attribute]) -> bool {
-    attributes.iter().any(|attribute| {
+/// Whether an item's attributes make it unreachable in every production build.
+pub(crate) fn attributes_exclude_production(attributes: &[syn::Attribute]) -> bool {
+    if attributes.iter().any(|attribute| {
         let path = attribute.path();
         if path.is_ident("test") {
             return true;
-        }
-        if path.is_ident("cfg") {
-            return match &attribute.meta {
-                syn::Meta::List(list) => list
-                    .parse_args::<syn::Meta>()
-                    .is_ok_and(|predicate| cfg_predicate_requires_test(&predicate)),
-                _ => false,
-            };
         }
         let mut segments = path
             .segments
@@ -110,24 +97,389 @@ pub(crate) fn attributes_are_test_only(attributes: &[syn::Attribute]) -> bool {
             ),
             (Some("tokio" | "async_std"), Some("test"), None)
         )
+    }) {
+        return true;
+    }
+
+    let predicates: Option<Vec<_>> = attributes
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("cfg"))
+        .map(|attribute| match &attribute.meta {
+            syn::Meta::List(list) => list.parse_args::<syn::Meta>().ok(),
+            _ => None,
+        })
+        .collect();
+    predicates.is_some_and(|predicates| {
+        !predicates.is_empty() && !cfg_predicates_can_be_production(&predicates)
     })
 }
 
-fn cfg_predicate_requires_test(predicate: &syn::Meta) -> bool {
-    match predicate {
-        syn::Meta::Path(path) => path.is_ident("test"),
-        syn::Meta::List(list) if list.path.is_ident("all") => parse_meta_items(list)
-            .is_some_and(|items| items.iter().any(cfg_predicate_requires_test)),
-        syn::Meta::List(list) if list.path.is_ident("any") => {
-            parse_meta_items(list).is_some_and(|items| {
-                !items.is_empty() && items.iter().all(cfg_predicate_requires_test)
-            })
-        }
-        // Negation can make a predicate production-only, but it never proves
-        // the item requires a test build.
-        syn::Meta::List(list) if list.path.is_ident("not") => false,
-        syn::Meta::List(_) | syn::Meta::NameValue(_) => false,
+#[derive(Clone, Copy)]
+struct CfgPossibility {
+    can_be_true: bool,
+    can_be_false: bool,
+}
+
+impl CfgPossibility {
+    const UNKNOWN: Self = Self {
+        can_be_true: true,
+        can_be_false: true,
+    };
+}
+
+fn cfg_predicates_can_be_production(predicates: &[syn::Meta]) -> bool {
+    if cfg_conjunction_has_direct_contradiction(predicates) {
+        return false;
     }
+    let mut atoms = BTreeSet::new();
+    for predicate in predicates {
+        collect_cfg_atoms(predicate, &mut atoms);
+    }
+    atoms.remove("test");
+    let mut polarities = BTreeMap::<String, CfgAtomPolarity>::new();
+    for predicate in predicates {
+        collect_cfg_atom_polarities(predicate, true, &mut polarities);
+    }
+    let mut atoms: Vec<_> = atoms.into_iter().collect();
+    atoms.sort_by(|left, right| {
+        cfg_atom_search_priority(left, &polarities)
+            .cmp(&cfg_atom_search_priority(right, &polarities))
+            .then_with(|| left.cmp(right))
+    });
+    cfg_assignment_can_satisfy(predicates, &atoms, 0, &mut BTreeMap::<&str, bool>::new())
+}
+
+fn cfg_atom_search_priority(atom: &str, polarities: &BTreeMap<String, CfgAtomPolarity>) -> u8 {
+    if atom == "unix"
+        || atom == "windows"
+        || atom
+            .split_once('=')
+            .is_some_and(|(key, _)| cfg_key_has_single_value(key))
+    {
+        return 0;
+    }
+    if polarities
+        .get(atom)
+        .is_some_and(|polarity| polarity.positive && polarity.negative)
+    {
+        return 1;
+    }
+    2
+}
+
+fn cfg_assignment_can_satisfy<'a>(
+    predicates: &[syn::Meta],
+    atoms: &'a [String],
+    index: usize,
+    values: &mut BTreeMap<&'a str, bool>,
+) -> bool {
+    if predicates
+        .iter()
+        .any(|predicate| !evaluate_cfg_predicate(predicate, values).can_be_true)
+    {
+        return false;
+    }
+    let Some(atom) = atoms.get(index).map(String::as_str) else {
+        return true;
+    };
+    for value in [false, true] {
+        if value && !cfg_true_assignment_is_compatible(atom, values) {
+            continue;
+        }
+        values.insert(atom, value);
+        if cfg_assignment_can_satisfy(predicates, atoms, index + 1, values) {
+            values.remove(atom);
+            return true;
+        }
+        values.remove(atom);
+    }
+    false
+}
+
+#[derive(Default)]
+struct CfgAtomPolarity {
+    positive: bool,
+    negative: bool,
+}
+
+fn collect_cfg_atom_polarities(
+    predicate: &syn::Meta,
+    positive: bool,
+    polarities: &mut BTreeMap<String, CfgAtomPolarity>,
+) {
+    match predicate {
+        syn::Meta::Path(path) => {
+            record_cfg_atom_polarity(meta_path_key(path), positive, polarities);
+        }
+        syn::Meta::NameValue(name_value) => {
+            if let Some(atom) = cfg_name_value_key(name_value) {
+                record_cfg_atom_polarity(atom, positive, polarities);
+            }
+        }
+        syn::Meta::List(list) if list.path.is_ident("not") => {
+            let Some(items) = parse_meta_items(list) else {
+                return;
+            };
+            let [item] = items.as_slice() else {
+                return;
+            };
+            collect_cfg_atom_polarities(item, !positive, polarities);
+        }
+        syn::Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
+            if let Some(items) = parse_meta_items(list) {
+                for item in &items {
+                    collect_cfg_atom_polarities(item, positive, polarities);
+                }
+            }
+        }
+        syn::Meta::List(_) => {}
+    }
+}
+
+fn record_cfg_atom_polarity(
+    atom: String,
+    positive: bool,
+    polarities: &mut BTreeMap<String, CfgAtomPolarity>,
+) {
+    let polarity = polarities.entry(atom).or_default();
+    if positive {
+        polarity.positive = true;
+    } else {
+        polarity.negative = true;
+    }
+}
+
+fn cfg_true_assignment_is_compatible(atom: &str, values: &BTreeMap<&str, bool>) -> bool {
+    if atom == "unix" && values.get("windows") == Some(&true)
+        || atom == "windows" && values.get("unix") == Some(&true)
+    {
+        return false;
+    }
+    let Some((key, _)) = atom.split_once('=') else {
+        return true;
+    };
+    !cfg_key_has_single_value(key)
+        || values.iter().all(|(assigned, value)| {
+            !*value
+                || assigned
+                    .split_once('=')
+                    .is_none_or(|(assigned_key, _)| assigned_key != key || *assigned == atom)
+        })
+}
+
+#[derive(Default)]
+struct RequiredCfgValues {
+    positive: BTreeSet<String>,
+    negative: BTreeSet<String>,
+    single_values: BTreeMap<String, String>,
+    impossible: bool,
+}
+
+fn cfg_conjunction_has_direct_contradiction(predicates: &[syn::Meta]) -> bool {
+    let mut required = RequiredCfgValues::default();
+    for predicate in predicates {
+        collect_required_cfg_values(predicate, true, &mut required);
+    }
+    required.impossible
+        || required.positive.contains("unix") && required.positive.contains("windows")
+}
+
+fn collect_required_cfg_values(
+    predicate: &syn::Meta,
+    positive: bool,
+    required: &mut RequiredCfgValues,
+) {
+    if required.impossible {
+        return;
+    }
+    match predicate {
+        syn::Meta::List(list) if positive && list.path.is_ident("all") => {
+            if let Some(items) = parse_meta_items(list) {
+                for item in &items {
+                    collect_required_cfg_values(item, true, required);
+                }
+            }
+        }
+        syn::Meta::List(list) if !positive && list.path.is_ident("any") => {
+            if let Some(items) = parse_meta_items(list) {
+                for item in &items {
+                    collect_required_cfg_values(item, false, required);
+                }
+            }
+        }
+        syn::Meta::List(list) if list.path.is_ident("not") => {
+            let Some(items) = parse_meta_items(list) else {
+                return;
+            };
+            let [item] = items.as_slice() else {
+                return;
+            };
+            collect_required_cfg_values(item, !positive, required);
+        }
+        syn::Meta::Path(path) => {
+            record_required_cfg_atom(meta_path_key(path), positive, required);
+        }
+        syn::Meta::NameValue(name_value) => {
+            let Some((key, value)) = cfg_name_value_parts(name_value) else {
+                return;
+            };
+            let atom = format!("{key}={value}");
+            record_required_cfg_atom(atom, positive, required);
+            if positive
+                && cfg_key_has_single_value(&key)
+                && required
+                    .single_values
+                    .insert(key, value.clone())
+                    .is_some_and(|existing| existing != value)
+            {
+                required.impossible = true;
+            }
+        }
+        syn::Meta::List(_) => {}
+    }
+}
+
+fn record_required_cfg_atom(atom: String, positive: bool, required: &mut RequiredCfgValues) {
+    let (same, opposite) = if positive {
+        (&mut required.positive, &required.negative)
+    } else {
+        (&mut required.negative, &required.positive)
+    };
+    if opposite.contains(&atom) {
+        required.impossible = true;
+    }
+    same.insert(atom);
+}
+
+fn cfg_key_has_single_value(key: &str) -> bool {
+    matches!(
+        key,
+        "panic"
+            | "target_arch"
+            | "target_endian"
+            | "target_env"
+            | "target_os"
+            | "target_pointer_width"
+            | "target_vendor"
+    )
+}
+
+fn collect_cfg_atoms(predicate: &syn::Meta, atoms: &mut BTreeSet<String>) {
+    match predicate {
+        syn::Meta::Path(path) => {
+            atoms.insert(meta_path_key(path));
+        }
+        syn::Meta::NameValue(name_value) => {
+            if let Some(key) = cfg_name_value_key(name_value) {
+                atoms.insert(key);
+            }
+        }
+        syn::Meta::List(list)
+            if list.path.is_ident("all")
+                || list.path.is_ident("any")
+                || list.path.is_ident("not") =>
+        {
+            if let Some(items) = parse_meta_items(list) {
+                for item in &items {
+                    collect_cfg_atoms(item, atoms);
+                }
+            }
+        }
+        syn::Meta::List(_) => {}
+    }
+}
+
+fn evaluate_cfg_predicate(predicate: &syn::Meta, values: &BTreeMap<&str, bool>) -> CfgPossibility {
+    match predicate {
+        syn::Meta::Path(path) if path.is_ident("test") => CfgPossibility {
+            can_be_true: false,
+            can_be_false: true,
+        },
+        syn::Meta::Path(path) => assigned_cfg_atom(&meta_path_key(path), values),
+        syn::Meta::NameValue(name_value) => cfg_name_value_key(name_value)
+            .map(|key| assigned_cfg_atom(&key, values))
+            .unwrap_or(CfgPossibility::UNKNOWN),
+        syn::Meta::List(list) if list.path.is_ident("all") => {
+            let Some(items) = parse_meta_items(list) else {
+                return CfgPossibility::UNKNOWN;
+            };
+            CfgPossibility {
+                can_be_true: items
+                    .iter()
+                    .all(|item| evaluate_cfg_predicate(item, values).can_be_true),
+                can_be_false: items
+                    .iter()
+                    .any(|item| evaluate_cfg_predicate(item, values).can_be_false),
+            }
+        }
+        syn::Meta::List(list) if list.path.is_ident("any") => {
+            let Some(items) = parse_meta_items(list) else {
+                return CfgPossibility::UNKNOWN;
+            };
+            CfgPossibility {
+                can_be_true: items
+                    .iter()
+                    .any(|item| evaluate_cfg_predicate(item, values).can_be_true),
+                can_be_false: items
+                    .iter()
+                    .all(|item| evaluate_cfg_predicate(item, values).can_be_false),
+            }
+        }
+        syn::Meta::List(list) if list.path.is_ident("not") => {
+            let Some(items) = parse_meta_items(list) else {
+                return CfgPossibility::UNKNOWN;
+            };
+            let [item] = items.as_slice() else {
+                return CfgPossibility::UNKNOWN;
+            };
+            let possibility = evaluate_cfg_predicate(item, values);
+            CfgPossibility {
+                can_be_true: possibility.can_be_false,
+                can_be_false: possibility.can_be_true,
+            }
+        }
+        syn::Meta::List(_) => CfgPossibility::UNKNOWN,
+    }
+}
+
+fn assigned_cfg_atom(key: &str, values: &BTreeMap<&str, bool>) -> CfgPossibility {
+    values
+        .get(key)
+        .map_or(CfgPossibility::UNKNOWN, |value| CfgPossibility {
+            can_be_true: *value,
+            can_be_false: !value,
+        })
+}
+
+fn meta_path_key(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+fn cfg_name_value_key(name_value: &syn::MetaNameValue) -> Option<String> {
+    let (key, value) = cfg_name_value_parts(name_value)?;
+    Some(format!("{key}={value}"))
+}
+
+fn cfg_name_value_parts(name_value: &syn::MetaNameValue) -> Option<(String, String)> {
+    let value = match &name_value.value {
+        syn::Expr::Lit(expression) => match &expression.lit {
+            syn::Lit::Bool(value) => value.value.to_string(),
+            syn::Lit::Byte(value) => value.value().to_string(),
+            syn::Lit::ByteStr(value) => format!("{:?}", value.value()),
+            syn::Lit::Char(value) => value.value().escape_default().to_string(),
+            syn::Lit::Float(value) => value.base10_digits().to_string(),
+            syn::Lit::Int(value) => value.base10_digits().to_string(),
+            syn::Lit::Str(value) => format!("{:?}", value.value()),
+            syn::Lit::CStr(_) | syn::Lit::Verbatim(_) => return None,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some((meta_path_key(&name_value.path), value))
 }
 
 fn parse_meta_items(list: &syn::MetaList) -> Option<Vec<syn::Meta>> {
@@ -244,7 +596,7 @@ fn collect_external_modules(
         let syn::Item::Mod(module) = item else {
             continue;
         };
-        if attributes_are_test_only(&module.attrs) {
+        if attributes_exclude_production(&module.attrs) {
             continue;
         }
         if let Some((_, inline_items)) = &module.content {
@@ -1261,6 +1613,90 @@ pub fn live() { record_thing("live"); }
 
         assert_eq!(count_tokens(&stripped, "record_thing("), 1);
         assert!(!stripped.contains("only_test"));
+    }
+
+    #[test]
+    fn impossible_cfg_predicates_are_not_production_attributes() {
+        for predicate in [
+            "all(unix, windows)",
+            "all(feature = \"x\", not(feature = \"x\"))",
+        ] {
+            let item: syn::ItemFn =
+                syn::parse_str(&format!("#[cfg({predicate})] fn impossible() {{}}"))
+                    .expect("probe must be valid Rust syntax");
+
+            assert!(
+                attributes_exclude_production(&item.attrs),
+                "cfg({predicate}) cannot exist in any production build"
+            );
+        }
+    }
+
+    #[test]
+    fn single_valued_builtin_cfg_keys_cannot_take_competing_values() {
+        let item: syn::ItemFn = syn::parse_str(
+            "#[cfg(all(target_os = \"linux\", target_os = \"windows\"))] fn impossible() {}",
+        )
+        .expect("probe must be valid Rust syntax");
+
+        assert!(
+            attributes_exclude_production(&item.attrs),
+            "target_os cannot equal linux and windows in one build"
+        );
+    }
+
+    #[test]
+    fn contradictions_remain_impossible_above_the_search_threshold() {
+        let item: syn::ItemFn = syn::parse_str(
+            "#[cfg(all(feature = \"x\", not(feature = \"x\"), \
+             feature = \"a\", feature = \"b\", feature = \"c\", feature = \"d\", \
+             feature = \"e\", feature = \"f\", feature = \"g\", feature = \"h\", \
+             feature = \"i\", feature = \"j\", feature = \"k\", feature = \"l\", \
+             feature = \"m\"))] fn impossible() {}",
+        )
+        .expect("probe must be valid Rust syntax");
+
+        assert!(
+            attributes_exclude_production(&item.attrs),
+            "an atom-count guard cannot hide a direct contradiction"
+        );
+    }
+
+    #[test]
+    fn nested_exclusivity_remains_impossible_with_many_atoms() {
+        let item: syn::ItemFn = syn::parse_str(
+            "#[cfg(all(target_os = \"windows\", not(feature = \"x\"), \
+             any(target_os = \"linux\", feature = \"x\"), \
+             any(feature = \"a\", feature = \"b\", feature = \"c\", feature = \"d\", \
+             feature = \"e\", feature = \"f\", feature = \"g\", feature = \"h\", \
+             feature = \"i\", feature = \"j\", feature = \"k\", feature = \"l\", \
+             feature = \"m\")))] fn impossible() {}",
+        )
+        .expect("probe must be valid Rust syntax");
+
+        assert!(
+            attributes_exclude_production(&item.attrs),
+            "nested target exclusivity cannot fail open above an atom-count threshold"
+        );
+    }
+
+    #[test]
+    fn possible_cfg_predicates_remain_production_attributes() {
+        for predicate in [
+            "any(unix, windows)",
+            "any(test, feature = \"fixtures\")",
+            "all(feature = \"x\", unix)",
+            "all(custom_cfg(foo), not(custom_cfg(bar)))",
+        ] {
+            let item: syn::ItemFn =
+                syn::parse_str(&format!("#[cfg({predicate})] fn possible() {{}}"))
+                    .expect("probe must be valid Rust syntax");
+
+            assert!(
+                !attributes_exclude_production(&item.attrs),
+                "cfg({predicate}) has at least one production assignment"
+            );
+        }
     }
 
     #[test]
