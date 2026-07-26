@@ -353,13 +353,13 @@ mod tests {
     fn verify_secret_accepts_current_and_graced_prev() {
         let pepper = b"pep";
         let minted = mint_key(pepper);
-        let (_, secret) = crate::crypto::parse_token(&minted.token).unwrap();
+        let (_, secret) = crate::crypto::parse_minted_token(&minted.token).unwrap();
         let mut r = KeyRecord::new(&minted.key_id, &minted.secret_hash, now());
         assert!(r.verify_secret(secret, pepper, now()));
 
         // Rotate: the old secret becomes prev with a grace window.
         let rotated = mint_key(pepper);
-        let (_, new_secret) = crate::crypto::parse_token(&rotated.token).unwrap();
+        let (_, new_secret) = crate::crypto::parse_minted_token(&rotated.token).unwrap();
         r.prev_secret_hash = Some(r.secret_hash.clone());
         r.prev_hash_expires_at = Some(now() + Duration::seconds(60));
         r.secret_hash = rotated.secret_hash.clone();

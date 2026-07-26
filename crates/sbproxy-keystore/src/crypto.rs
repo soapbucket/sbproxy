@@ -27,13 +27,30 @@ const SECRET_BYTES: usize = 32;
 /// Length in bytes of a minted public key id.
 const KEY_ID_BYTES: usize = 8;
 
+/// Prefix on every token minted by [`mint_key`].
+///
+/// Chosen so a token is distinguishable from an upstream provider key
+/// (`sk-proj-...`, `sk-ant-...`, `sk-or-v1-...`) by prefix and length alone.
+/// The inbound header sweep tests a candidate value with no store lookup, so
+/// an unrelated header can never become a cache miss or an audit event.
+pub const TOKEN_PREFIX: &str = "sbp_";
+
+/// Hex character count of the public key id half of a token.
+const KEY_ID_HEX_LEN: usize = KEY_ID_BYTES * 2;
+
+/// Hex character count of the secret half of a token.
+const SECRET_HEX_LEN: usize = SECRET_BYTES * 2;
+
+/// Total character length of a minted token: prefix, id, separator, secret.
+pub const TOKEN_LEN: usize = TOKEN_PREFIX.len() + KEY_ID_HEX_LEN + 1 + SECRET_HEX_LEN;
+
 /// A minted virtual key: the public id, the one-time plaintext token shown to
 /// the operator exactly once, and the at-rest hash that is persisted.
 #[derive(Debug, Clone)]
 pub struct MintedKey {
     /// Stable public identifier, the prefix of the token.
     pub key_id: String,
-    /// The full bearer token `sk-<key_id>-<secret>`. Shown once, never stored.
+    /// The full bearer token `sbp_<key_id>_<secret>`. Shown once, never stored.
     pub token: String,
     /// `HMAC-SHA256(secret, pepper)`, hex-encoded. This is what is persisted.
     pub secret_hash: String,
@@ -55,7 +72,7 @@ pub fn mint_key(pepper: &[u8]) -> MintedKey {
     let key_id = random_hex(KEY_ID_BYTES);
     let secret = random_hex(SECRET_BYTES);
     let secret_hash = hash_secret(&secret, pepper);
-    let token = format!("sk-{key_id}-{secret}");
+    let token = format!("{TOKEN_PREFIX}{key_id}_{secret}");
     MintedKey {
         key_id,
         token,
@@ -65,6 +82,12 @@ pub fn mint_key(pepper: &[u8]) -> MintedKey {
 
 /// Parse a bearer token of the form `sk-<key_id>-<secret>` into its public id
 /// and secret halves. Returns `None` for any other shape.
+///
+/// This is the legacy shape, kept for tokens minted before [`TOKEN_PREFIX`] and
+/// for config-seeded keys. It is deliberately loose: `sk-proj-abc` parses with
+/// a `key_id` of `proj`, which is why callers must not treat a parse as proof
+/// the token is ours. Prefer [`parse_minted_token`], and see
+/// [`is_conforming_key_id`] for the discriminator the resolver uses.
 pub fn parse_token(token: &str) -> Option<(&str, &str)> {
     let rest = token.strip_prefix("sk-")?;
     let (key_id, secret) = rest.split_once('-')?;
@@ -72,6 +95,46 @@ pub fn parse_token(token: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((key_id, secret))
+}
+
+/// Parse a token minted by [`mint_key`]: `sbp_<16 hex>_<64 hex>`.
+///
+/// Rejects on length, ASCII-ness, prefix, separator position, and alphabet
+/// before any allocation, so testing an unrelated header value costs one
+/// length comparison. Returns `None` for the legacy `sk-` shape, which
+/// [`parse_token`] still handles on the `authorization` path.
+pub fn parse_minted_token(token: &str) -> Option<(&str, &str)> {
+    // The ASCII check makes every byte index below a valid char boundary, so a
+    // multibyte value of the same byte length cannot panic on a slice.
+    if token.len() != TOKEN_LEN || !token.is_ascii() {
+        return None;
+    }
+    let rest = token.strip_prefix(TOKEN_PREFIX)?;
+    if rest.as_bytes()[KEY_ID_HEX_LEN] != b'_' {
+        return None;
+    }
+    let key_id = &rest[..KEY_ID_HEX_LEN];
+    let secret = &rest[KEY_ID_HEX_LEN + 1..];
+    if !is_lower_hex(key_id) || !is_lower_hex(secret) {
+        return None;
+    }
+    Some((key_id, secret))
+}
+
+/// Whether `key_id` has the exact shape [`mint_key`] produces.
+///
+/// The legacy [`parse_token`] rule is loose enough to swallow a genuine
+/// provider key, so an unknown id only denies when it could plausibly have
+/// been minted here. A non-conforming id was never ours and falls through to
+/// whichever provider owns it.
+pub fn is_conforming_key_id(key_id: &str) -> bool {
+    key_id.len() == KEY_ID_HEX_LEN && is_lower_hex(key_id)
+}
+
+/// Whether every byte is a lowercase hex digit, the alphabet [`random_hex`]
+/// emits.
+fn is_lower_hex(s: &str) -> bool {
+    s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Compute the at-rest hash for a secret: `HMAC-SHA256(secret, pepper)`,
@@ -293,7 +356,7 @@ mod tests {
     fn mint_then_verify_roundtrips() {
         let pepper = b"server-pepper";
         let minted = mint_key(pepper);
-        let (key_id, secret) = parse_token(&minted.token).expect("token parses");
+        let (key_id, secret) = parse_minted_token(&minted.token).expect("token parses");
         assert_eq!(key_id, minted.key_id);
         assert!(verify_secret(secret, pepper, &minted.secret_hash));
     }
@@ -312,7 +375,7 @@ mod tests {
     #[test]
     fn verify_rejects_wrong_pepper() {
         let minted = mint_key(b"pepper-a");
-        let (_, secret) = parse_token(&minted.token).unwrap();
+        let (_, secret) = parse_minted_token(&minted.token).unwrap();
         assert!(!verify_secret(secret, b"pepper-b", &minted.secret_hash));
     }
 
@@ -380,11 +443,89 @@ mod tests {
     fn key_crypto_handle_combines_hash_and_envelope() {
         let kc = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
         let minted = kc.mint_key();
-        let (_, secret) = parse_token(&minted.token).unwrap();
+        let (_, secret) = parse_minted_token(&minted.token).unwrap();
         assert!(kc.verify_secret(secret, &minted.secret_hash));
         assert!(!kc.verify_secret("wrong", &minted.secret_hash));
 
         let env = kc.seal("cred-1", b"api-key").unwrap();
         assert_eq!(kc.open("cred-1", &env).unwrap(), b"api-key");
+    }
+
+    #[test]
+    fn minted_token_round_trips_through_the_strict_parser() {
+        let minted = mint_key(b"pepper");
+        assert_eq!(minted.token.len(), TOKEN_LEN);
+        assert!(minted.token.starts_with(TOKEN_PREFIX));
+        let (key_id, secret) = parse_minted_token(&minted.token).expect("minted token parses");
+        assert_eq!(key_id, minted.key_id);
+        assert_eq!(secret.len(), 64);
+        assert_eq!(minted.secret_hash, hash_secret(secret, b"pepper"));
+        assert!(is_conforming_key_id(key_id));
+    }
+
+    #[test]
+    fn strict_parser_rejects_provider_keys() {
+        // The bug this closes: under the loose legacy rule a genuine OpenAI
+        // project key parses with a key_id of "proj", so the resolver treated
+        // it as one of ours and returned 401 instead of passing it through.
+        for provider in [
+            "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwx",
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqr",
+            "sk-or-v1-abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuv",
+        ] {
+            assert!(parse_minted_token(provider).is_none(), "{provider}");
+            // The legacy rule still parses these, which is exactly why the
+            // resolver needs the conformance check rather than the parse alone.
+            let (key_id, _) = parse_token(provider).expect("legacy rule is loose");
+            assert!(!is_conforming_key_id(key_id), "{provider} -> {key_id}");
+        }
+    }
+
+    #[test]
+    fn strict_parser_rejects_malformed_shapes() {
+        let good = mint_key(b"pepper").token;
+
+        // Wrong length, one either side.
+        assert!(parse_minted_token(&good[..good.len() - 1]).is_none());
+        assert!(parse_minted_token(&format!("{good}a")).is_none());
+        // Right length, wrong prefix.
+        assert!(parse_minted_token(&good.replacen(TOKEN_PREFIX, "sbx_", 1)).is_none());
+        // Uppercase is not the minted alphabet.
+        assert!(parse_minted_token(&good.to_uppercase()).is_none());
+        // Separator moved off its fixed offset.
+        let mut moved = good.clone();
+        moved.replace_range(
+            TOKEN_PREFIX.len() + KEY_ID_HEX_LEN..TOKEN_PREFIX.len() + KEY_ID_HEX_LEN + 1,
+            "a",
+        );
+        moved.replace_range(TOKEN_PREFIX.len()..TOKEN_PREFIX.len() + 1, "_");
+        assert!(parse_minted_token(&moved).is_none());
+        // Non-ASCII of the same BYTE length must be rejected, not panic. The
+        // body is 81 bytes, which is odd, so it is 40 two-byte chars plus one
+        // ASCII byte. Without the is_ascii guard this slices mid-codepoint.
+        let body_bytes = TOKEN_LEN - TOKEN_PREFIX.len();
+        let multibyte = format!("{TOKEN_PREFIX}{}a", "é".repeat((body_bytes - 1) / 2));
+        assert_eq!(
+            multibyte.len(),
+            TOKEN_LEN,
+            "same byte length as a real token"
+        );
+        assert!(
+            multibyte.chars().count() < TOKEN_LEN,
+            "fewer chars than bytes"
+        );
+        assert!(parse_minted_token(&multibyte).is_none());
+    }
+
+    #[test]
+    fn legacy_parse_cannot_resolve_a_seeded_key_id_containing_a_dash() {
+        // `parse_token` splits on the FIRST dash, so a config-seeded key_id
+        // with a dash in it can never round-trip. Latent today because the
+        // shipped examples use `ci0001` / `seed0001`; pinned so it stays that
+        // way rather than becoming a silent auth failure later.
+        let (key_id, secret) = parse_token("sk-team-alpha-secretvalue").unwrap();
+        assert_eq!(key_id, "team", "splits on the first dash, not the last");
+        assert_eq!(secret, "alpha-secretvalue");
+        assert!(!is_conforming_key_id("team-alpha"));
     }
 }
