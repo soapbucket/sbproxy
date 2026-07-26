@@ -16,8 +16,9 @@ use sbproxy_platform::circuitbreaker::CircuitBreaker;
 use sbproxy_platform::outlier::{OutlierDetector, OutlierDetectorConfig};
 use serde::Deserialize;
 
+use super::routing::build_routing_strategy_with_name;
 use super::ForwardingHeaderControls;
-use super::{build_routing_strategy, RoutingOutcome, RoutingRequest, RoutingStrategy, TargetState};
+use super::{RoutingOutcome, RoutingRequest, RoutingStrategy, TargetState};
 
 // --- Configuration types ---
 
@@ -71,6 +72,7 @@ pub struct LoadBalancerAction {
     /// `upstream_peer`, which routes traffic to a different healthy
     /// target via outlier / breaker / health filtering.
     pub retry: Option<crate::action::RetryConfig>,
+    strategy_name: Option<&'static str>,
     strategy: Option<Arc<dyn RoutingStrategy>>,
     state: LoadBalancerState,
 }
@@ -103,10 +105,7 @@ impl std::fmt::Debug for LoadBalancerAction {
                 &self.circuit_breakers.as_ref().map(|v| v.len()),
             )
             .field("retry", &self.retry.is_some())
-            .field(
-                "strategy",
-                &self.strategy.as_ref().map(|strategy| strategy.name()),
-            )
+            .field("strategy", &self.strategy_name)
             .field("state", &self.state)
             .finish()
     }
@@ -420,7 +419,7 @@ impl LoadBalancerAction {
             "strategy_config must be an object"
         );
         let num_targets = config.targets.len();
-        let strategy = match config.strategy.as_deref() {
+        let (strategy_name, strategy) = match config.strategy.as_deref() {
             Some(name) => {
                 let mut strategy_config = config
                     .strategy_config
@@ -441,9 +440,11 @@ impl LoadBalancerAction {
                     "state_namespace".to_string(),
                     serde_json::Value::String(namespace),
                 );
-                Some(build_routing_strategy(name, &strategy_config)?)
+                let (registered_name, strategy) =
+                    build_routing_strategy_with_name(name, &strategy_config)?;
+                (Some(registered_name), Some(strategy))
             }
-            None => None,
+            None => (None, None),
         };
 
         // Build the outlier detector when the user has configured it.
@@ -484,6 +485,7 @@ impl LoadBalancerAction {
             outlier_detector,
             circuit_breakers,
             retry: config.retry,
+            strategy_name,
             strategy,
             state: LoadBalancerState {
                 round_robin_counter: AtomicU64::new(0),
@@ -759,16 +761,16 @@ impl LoadBalancerAction {
         // back to the unfiltered list when every active target is
         // ejected (better to send traffic to a flaky upstream than to
         // 502 the client).
-        let active_targets: Vec<(usize, &Target)> = {
+        let (active_targets, has_strictly_eligible_targets): (Vec<(usize, &Target)>, bool) = {
             let kept: Vec<(usize, &Target)> = active_targets
                 .iter()
                 .filter(|(idx, _)| !is_ejected(*idx))
                 .cloned()
                 .collect();
             if kept.is_empty() {
-                active_targets
+                (active_targets, false)
             } else {
-                kept
+                (kept, true)
             }
         };
 
@@ -804,28 +806,39 @@ impl LoadBalancerAction {
 
         let active_targets = priority_filtered;
 
-        let strategy_selection = self.strategy.as_ref().and_then(|strategy| {
-            let projection: Vec<TargetState> = active_targets
-                .iter()
-                .map(|(index, target)| TargetState {
-                    index: *index,
-                    url: target.url.clone(),
-                    healthy: true,
-                    active_connections: self
-                        .state
-                        .connections
-                        .get(*index)
-                        .map(|count| u64::from(count.load(Ordering::Relaxed)))
-                        .unwrap_or_default(),
-                    weight: target.weight,
-                    metadata: target.metadata.clone(),
-                })
-                .collect();
-            strategy
-                .select(&request, &projection)
-                .and_then(|slice_index| active_targets.get(slice_index))
-                .map(|(index, _)| (*index, strategy.name().to_string()))
-        });
+        let strategy_selection = self
+            .strategy
+            .as_ref()
+            .filter(|_| has_strictly_eligible_targets)
+            .and_then(|strategy| {
+                let projection: Vec<TargetState> = active_targets
+                    .iter()
+                    .map(|(index, target)| TargetState {
+                        index: *index,
+                        url: target.url.clone(),
+                        healthy: true,
+                        active_connections: self
+                            .state
+                            .connections
+                            .get(*index)
+                            .map(|count| u64::from(count.load(Ordering::Relaxed)))
+                            .unwrap_or_default(),
+                        weight: target.weight,
+                        metadata: target.metadata.clone(),
+                    })
+                    .collect();
+                strategy
+                    .select(&request, &projection)
+                    .and_then(|slice_index| active_targets.get(slice_index))
+                    .map(|(index, _)| {
+                        (
+                            *index,
+                            self.strategy_name
+                                .expect("compiled strategy must retain its registry name")
+                                .to_string(),
+                        )
+                    })
+            });
 
         let (idx, selection_method) = match strategy_selection {
             Some(selection) => selection,
@@ -1252,6 +1265,21 @@ mod tests {
 
         fn name(&self) -> &str {
             "projection-guard-test"
+        }
+    }
+
+    struct InvocationTrackingStrategy {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RoutingStrategy for InvocationTrackingStrategy {
+        fn select(&self, _request: &RoutingRequest, _targets: &[TargetState]) -> Option<usize> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Some(0)
+        }
+
+        fn name(&self) -> &str {
+            "invocation-tracking-test"
         }
     }
 
@@ -1713,6 +1741,24 @@ mod tests {
     }
 
     #[test]
+    fn selection_method_uses_closed_registry_name() {
+        let lb = make_lb(serde_json::json!({
+            "targets": [{"url": "http://first:8080"}],
+            "strategy": "bandit",
+            "strategy_config": {
+                "name": "tenant-controlled-label",
+                "epsilon": 0.0
+            }
+        }));
+
+        let selection = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/", "example.com"))
+            .expect("bandit selection should succeed");
+
+        assert_eq!(selection.selection_method, "bandit");
+    }
+
+    #[test]
     fn lora_aware_strategy_reads_adapter_header_and_selects_warm_target() {
         let lb = make_lb(serde_json::json!({
             "targets": [
@@ -1749,6 +1795,7 @@ mod tests {
             ],
             "algorithm": "least_connections"
         }));
+        lb.strategy_name = Some("deferring-test");
         lb.strategy = Some(Arc::new(DeferringStrategy));
         lb.record_connect(0);
 
@@ -1769,6 +1816,7 @@ mod tests {
             ],
             "algorithm": "least_connections"
         }));
+        lb.strategy_name = Some("out-of-range-test");
         lb.strategy = Some(Arc::new(OutOfRangeStrategy));
         lb.record_connect(0);
 
@@ -1789,6 +1837,7 @@ mod tests {
                 {"url": "http://eligible:8080"}
             ]
         }));
+        lb.strategy_name = Some("projection-guard-test");
         lb.strategy = Some(Arc::new(ProjectionGuardStrategy {
             forbidden_url: "http://backup:8080",
             saw_forbidden: Arc::clone(&saw_filtered),
@@ -1803,6 +1852,78 @@ mod tests {
             !saw_filtered.load(Ordering::Relaxed),
             "backup target must be removed before strategy projection"
         );
+    }
+
+    #[test]
+    fn strategy_is_skipped_when_strict_eligibility_filter_rejects_every_target() {
+        #[derive(Debug, Clone, Copy)]
+        enum Rejection {
+            Health,
+            Breaker,
+            Outlier,
+        }
+
+        for rejection in [Rejection::Health, Rejection::Breaker, Rejection::Outlier] {
+            let mut config = serde_json::json!({
+                "targets": [
+                    {"url": "http://first:8080"},
+                    {"url": "http://second:8080"}
+                ]
+            });
+            match rejection {
+                Rejection::Health => {}
+                Rejection::Breaker => {
+                    config["circuit_breaker"] = serde_json::json!({
+                        "failure_threshold": 1,
+                        "success_threshold": 1,
+                        "open_duration_secs": 60
+                    });
+                }
+                Rejection::Outlier => {
+                    config["outlier_detection"] = serde_json::json!({
+                        "threshold": 0.0,
+                        "window_secs": 60,
+                        "min_requests": 1,
+                        "ejection_duration_secs": 60
+                    });
+                }
+            }
+
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut lb = make_lb(config);
+            lb.strategy_name = Some("invocation-tracking-test");
+            lb.strategy = Some(Arc::new(InvocationTrackingStrategy {
+                calls: Arc::clone(&calls),
+            }));
+            match rejection {
+                Rejection::Health => {
+                    lb.set_target_health(0, false);
+                    lb.set_target_health(1, false);
+                }
+                Rejection::Breaker => {
+                    lb.record_breaker_failure(0);
+                    lb.record_breaker_failure(1);
+                }
+                Rejection::Outlier => {
+                    lb.record_target_failure(0);
+                    lb.record_target_failure(1);
+                }
+            }
+
+            let selection = lb
+                .select_target_for_request(RoutingRequest::new("GET", "/", "example.com"))
+                .expect("legacy algorithm fallback should select a target");
+
+            assert_eq!(
+                selection.selection_method, "round_robin",
+                "{rejection:?} must preserve legacy algorithm fallback"
+            );
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                0,
+                "strategy must not see a pool rejected by {rejection:?}"
+            );
+        }
     }
 
     #[test]

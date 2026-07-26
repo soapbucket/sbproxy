@@ -245,10 +245,17 @@ pub fn build_routing_strategy(
     name: &str,
     config: &serde_json::Value,
 ) -> Result<Arc<dyn RoutingStrategy>> {
+    build_routing_strategy_with_name(name, config).map(|(_, strategy)| strategy)
+}
+
+pub(super) fn build_routing_strategy_with_name(
+    name: &str,
+    config: &serde_json::Value,
+) -> Result<(&'static str, Arc<dyn RoutingStrategy>)> {
     let reg = inventory::iter::<RoutingStrategyRegistration>()
         .find(|r| r.name == name)
         .ok_or_else(|| anyhow!("unknown routing strategy: {}", name))?;
-    (reg.build)(config)
+    (reg.build)(config).map(|strategy| (reg.name, strategy))
 }
 
 /// List the names of every registered routing strategy. Useful for
