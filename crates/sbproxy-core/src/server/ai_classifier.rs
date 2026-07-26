@@ -14,14 +14,15 @@
 //! Embeddings from `OnnxEmbedder::embed` are already L2-normalized, so a
 //! dot product is the cosine similarity and no extra division is needed.
 
+#[cfg(any(feature = "inprocess-classify", test))]
 use sbproxy_ai::guardrails::ClassifierVerdict;
 
+// The centroid scoring path is only reachable when the embedder is
+// compiled in, and every caller sits behind `inprocess-classify`. Gating
+// these to match says that plainly, rather than suppressing the lint and
+// leaving a reader to wonder whether the code is reachable at all.
 /// Dot product of two equal-length vectors.
-// Reachable only from this module's tests today: the centroid scoring
-// path below is written and covered but nothing in the request path calls
-// it yet, so the lib target sees it as dead. Drop this allow the moment a
-// caller lands.
-#[allow(dead_code)]
+#[cfg(any(feature = "inprocess-classify", test))]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
@@ -34,7 +35,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// Summing and then normalizing is equivalent to averaging and then
 /// normalizing, so the element count never enters the arithmetic.
-#[allow(dead_code)]
+#[cfg(any(feature = "inprocess-classify", test))]
 pub(super) fn build_centroid(vectors: &[Vec<f32>]) -> Option<Vec<f32>> {
     let dim = vectors.first()?.len();
     if dim == 0 {
@@ -68,7 +69,7 @@ pub(super) fn build_centroid(vectors: &[Vec<f32>]) -> Option<Vec<f32>> {
 /// runner-up by at least `min_margin`. The margin check is what keeps a
 /// prompt sitting between two classes from being labeled arbitrarily; a
 /// single configured class has no runner-up and so skips that check.
-#[allow(dead_code)]
+#[cfg(any(feature = "inprocess-classify", test))]
 pub(super) fn nearest_centroid(
     embedding: &[f32],
     centroids: &[(String, Vec<f32>)],

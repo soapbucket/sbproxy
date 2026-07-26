@@ -222,6 +222,12 @@ struct ValidateArgs {
     /// emits a single structured object for CI consumption.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+    /// Do not resolve a `source:` block. Validates the pointer file
+    /// alone, which is what you want on a machine with no network or no
+    /// credential for the repository, and a lie about a git-sourced
+    /// config anywhere else.
+    #[arg(long = "no-fetch")]
+    no_fetch: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -229,6 +235,11 @@ struct PlanArgs {
     /// Proposed config file. Required.
     #[arg(short = 'f', long = "config")]
     config: Option<PathBuf>,
+    /// Do not resolve a `source:` block on either side of the diff.
+    /// Without it, a git-sourced config is planned against the document
+    /// the repository actually serves.
+    #[arg(long = "no-fetch")]
+    no_fetch: bool,
     /// Baseline config file. Default: empty baseline (every origin
     /// in the proposed config surfaces as `added`).
     #[arg(long = "against")]
@@ -301,6 +312,218 @@ enum ConfigSub {
     /// interpolation, with secret values masked. Shows what this box
     /// will actually do.
     Print(ConfigPrintArgs),
+    /// Operate a config authority: generate its signing key, publish a
+    /// configuration to the fleet, watch the rollout, roll back, and
+    /// manage subscriber credentials.
+    Authority(ConfigAuthorityCmd),
+    /// Preview the configuration this node's authority would apply next,
+    /// without applying it.
+    Pull(ConfigPullArgs),
+}
+
+impl ConfigCmd {
+    /// Whether this subcommand reports through `plan`'s exit-code
+    /// convention, where 2 means "changes present" and is not an error.
+    ///
+    /// The older `config` subcommands exit 2 on a CLI error. The two that
+    /// print a plan-style diff cannot, or a diff would be
+    /// indistinguishable from a broken invocation, so their CLI-error code
+    /// is 1 like `plan`'s.
+    fn uses_plan_exit_codes(&self) -> bool {
+        matches!(self.sub, ConfigSub::Authority(_) | ConfigSub::Pull(_))
+    }
+}
+
+#[derive(clap::Args, Debug)]
+struct ConfigAuthorityCmd {
+    #[command(subcommand)]
+    sub: ConfigAuthoritySub,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigAuthoritySub {
+    /// Generate an Ed25519 signing key and the verifying-key file
+    /// subscribers install, then print what to copy where. Local: writes
+    /// files, contacts nothing.
+    Init(AuthorityInitArgs),
+    /// Validate a payload locally, then publish it. Prints the revision
+    /// and digest the authority assigned.
+    Publish(AuthorityPublishArgs),
+    /// Show the current revision, the signing key id, and the revision
+    /// each subscriber was last seen holding.
+    Status(AuthorityStatusArgs),
+    /// Republish the previous revision's payload under a new revision
+    /// number.
+    Rollback(AuthorityRollbackArgs),
+    /// Register, list, and revoke subscriber credentials.
+    Subscriber(AuthoritySubscriberCmd),
+}
+
+/// `sbproxy config authority init`: generate this authority's key material.
+#[derive(clap::Args, Debug)]
+struct AuthorityInitArgs {
+    /// Directory to write the key material into. Created when absent,
+    /// owner-only.
+    #[arg(long = "dir")]
+    directory: PathBuf,
+    /// Key id stamped into every bundle and keyed in the verifying-key
+    /// file. Defaults to a name derived from the new public key, so a
+    /// rotation never collides with the key it replaces.
+    #[arg(long = "key-id")]
+    key_id: Option<String>,
+    /// Authority id shown in the printed config snippet. Does not affect
+    /// the generated key material.
+    #[arg(long = "authority-id", default_value = "control-plane")]
+    authority_id: String,
+    /// Replace an existing signing key. The new verifying key is added to
+    /// the existing map rather than replacing it, so subscribers that
+    /// still trust the old key keep verifying while they are updated.
+    #[arg(long = "force", action = ArgAction::SetTrue)]
+    force: bool,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config authority publish`: validate a payload, then publish it.
+#[derive(clap::Args, Debug)]
+struct AuthorityPublishArgs {
+    /// The payload to publish: the document subscribers apply, not this
+    /// node's own config file.
+    #[arg(short = 'f', long = "config")]
+    config: Option<PathBuf>,
+    /// How subscribers apply it. Must match the `mode` each subscriber is
+    /// configured for, or they refuse the bundle rather than guess.
+    #[arg(long = "mode", value_enum, default_value_t = BundleModeArg::Overlay)]
+    mode: BundleModeArg,
+    /// Run every validation the authority runs and stop. Contacts no
+    /// authority and publishes nothing. For CI.
+    #[arg(long = "validate-only", action = ArgAction::SetTrue)]
+    validate_only: bool,
+    /// Admin endpoint and Basic Auth credentials of the authority.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config authority status`: what is published, and who has it.
+#[derive(clap::Args, Debug)]
+struct AuthorityStatusArgs {
+    /// Admin endpoint and Basic Auth credentials of the authority.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config authority rollback`: republish the previous revision.
+#[derive(clap::Args, Debug)]
+struct AuthorityRollbackArgs {
+    /// Admin endpoint and Basic Auth credentials of the authority.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct AuthoritySubscriberCmd {
+    #[command(subcommand)]
+    sub: AuthoritySubscriberSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum AuthoritySubscriberSub {
+    /// Register a subscriber and mint its credential. The credential is
+    /// printed here, once, and is not recoverable afterwards.
+    Add(AuthoritySubscriberAddArgs),
+    /// List registered subscribers and the revision each last took.
+    List(AuthoritySubscriberListArgs),
+    /// Revoke one credential, or every credential one subscriber holds.
+    Revoke(AuthoritySubscriberRevokeArgs),
+}
+
+/// `sbproxy config authority subscriber add`.
+#[derive(clap::Args, Debug)]
+struct AuthoritySubscriberAddArgs {
+    /// Subscriber id, matching the `subscriber_id` that node sets under
+    /// `proxy.config_authority.upstream`.
+    subscriber_id: String,
+    /// Admin endpoint and Basic Auth credentials of the authority.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config authority subscriber list`.
+#[derive(clap::Args, Debug)]
+struct AuthoritySubscriberListArgs {
+    /// Admin endpoint and Basic Auth credentials of the authority.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config authority subscriber revoke`.
+#[derive(clap::Args, Debug)]
+struct AuthoritySubscriberRevokeArgs {
+    /// Revoke exactly this credential, leaving any other credential the
+    /// same subscriber holds alive. This is the half of a rotation that
+    /// retires the old credential.
+    #[arg(long = "credential-id", conflicts_with = "subscriber_id")]
+    credential_id: Option<String>,
+    /// Revoke every credential this subscriber holds. The node stops
+    /// receiving updates; it keeps serving what it already applied.
+    #[arg(long = "subscriber-id")]
+    subscriber_id: Option<String>,
+    /// Admin endpoint and Basic Auth credentials of the authority.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config pull`: preview what the next poll would apply.
+#[derive(clap::Args, Debug)]
+struct ConfigPullArgs {
+    /// This node's config file, which is the merge base. Defaults to
+    /// `-f/--config` or `SB_CONFIG_FILE`.
+    config_path: Option<PathBuf>,
+    /// Required. Fetch, verify, and merge, then print the diff. Applies
+    /// nothing, writes no cache, advances no cursor, reloads nothing.
+    #[arg(long = "dry-run", action = ArgAction::SetTrue)]
+    dry_run: bool,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// How a published bundle declares subscribers should apply it.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum BundleModeArg {
+    /// Merge over each subscriber's local document.
+    Overlay,
+    /// Become the whole document on each subscriber.
+    Replace,
+}
+
+impl BundleModeArg {
+    /// The wire value the `?mode=` query parameter takes.
+    fn as_str(self) -> &'static str {
+        match self {
+            BundleModeArg::Overlay => "overlay",
+            BundleModeArg::Replace => "replace",
+        }
+    }
 }
 
 #[derive(clap::Args, Debug)]
@@ -991,6 +1214,7 @@ fn main() {
         let args = ValidateArgs {
             config_path: path,
             format: OutputFormat::Text,
+            no_fetch: false,
         };
         run_subcommand("validate", 2, handle_validate_subcommand(&args));
     }
@@ -1009,7 +1233,16 @@ fn main() {
             run_subcommand("apply", 1, handle_apply_subcommand(&args));
         }
         Some(Cmd::Config(cmd)) => {
-            run_subcommand("config", 2, handle_config_subcommand(&cmd));
+            // `config authority` and `config pull` print plan-style
+            // diffs, where exit 2 means "changes present" rather than an
+            // error, so their CLI-error code is 1. The older `config`
+            // subcommands keep the 2 they have always used.
+            let err_code = if cmd.uses_plan_exit_codes() { 1 } else { 2 };
+            run_subcommand(
+                "config",
+                err_code,
+                handle_config_subcommand(&cmd, global_config_path.as_deref()),
+            );
         }
         Some(Cmd::Cluster(cmd)) => {
             run_subcommand("cluster", 2, handle_cluster_subcommand(&cmd));
@@ -1732,6 +1965,11 @@ fn handle_validate_subcommand(args: &ValidateArgs) -> anyhow::Result<i32> {
     let outcome = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read config '{path_str}': {e}"))
         .and_then(|yaml| {
+            // Validate what would actually boot. A `source:` block means
+            // the file on disk is a pointer, and compiling the pointer
+            // would report a config valid without ever looking at the
+            // document that serves traffic.
+            let yaml = resolve_source_for_cli(&yaml, args.no_fetch, &path_str)?;
             let compiled = sbproxy_config::compile_config(&yaml)
                 .map_err(|e| anyhow::anyhow!("config '{path_str}' did not compile:\n{e:#}"))?;
             let pipeline =
@@ -1777,6 +2015,35 @@ fn handle_validate_subcommand(args: &ValidateArgs) -> anyhow::Result<i32> {
             Ok(2)
         }
     }
+}
+
+/// Resolve a `source:` block for a CLI subcommand that is about to
+/// validate or diff a config document.
+///
+/// With `--no-fetch`, the pointer file stands and a remote source is
+/// reported on stderr rather than silently ignored. Silence is what the
+/// old behaviour was, and it is why `validate` used to pass on a config
+/// whose real content nobody had looked at.
+///
+/// # Errors
+///
+/// Returns an error when the `source:` block is malformed or cannot be
+/// resolved.
+fn resolve_source_for_cli(yaml: &str, no_fetch: bool, path_str: &str) -> anyhow::Result<String> {
+    if !no_fetch {
+        return Ok(sbproxy_core::config_source::resolve(yaml)?.text);
+    }
+    let declares_remote_source = sbproxy_config::source::parse_source_head(yaml)
+        .map_err(|e| anyhow::anyhow!("config '{path_str}': {e}"))?
+        .is_some();
+    if declares_remote_source {
+        eprintln!(
+            "note: '{path_str}' declares a `source:` block and --no-fetch was passed, so only \
+             the pointer file was checked. The document this proxy would actually serve was not \
+             looked at."
+        );
+    }
+    Ok(yaml.to_string())
 }
 
 // --- `doctor` handler ---
@@ -2952,7 +3219,9 @@ fn admin_request_json(
     Ok(value)
 }
 
-fn models_command_envelope(command: &'static str, value: serde_json::Value) -> serde_json::Value {
+/// Wrap one subcommand's JSON result in the shared `{command,
+/// schema_version, ...}` envelope every `--format json` surface prints.
+fn cli_command_envelope(command: &'static str, value: serde_json::Value) -> serde_json::Value {
     let mut object = match value {
         serde_json::Value::Object(object) => object,
         value => serde_json::Map::from_iter([("result".to_string(), value)]),
@@ -2994,7 +3263,7 @@ fn handle_models_ps(args: &ModelsPsArgs) -> anyhow::Result<i32> {
     match args.format {
         OutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&models_command_envelope("models.ps", status))?
+            serde_json::to_string_pretty(&cli_command_envelope("models.ps", status))?
         ),
         OutputFormat::Text => {
             let deployments = status
@@ -3053,7 +3322,7 @@ fn handle_models_stop(args: &ModelsStopArgs) -> anyhow::Result<i32> {
     match args.format {
         OutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&models_command_envelope("models.stop", stopped))?
+            serde_json::to_string_pretty(&cli_command_envelope("models.stop", stopped))?
         ),
         OutputFormat::Text => println!("{} stopped", args.deployment),
     }
@@ -3543,7 +3812,7 @@ fn handle_models_prune(
         std::sync::Arc::new(sbproxy_model_host::UnavailableArtifactTransport),
     )?;
     let report = manager.prune(args.dry_run)?;
-    let output = models_command_envelope(
+    let output = cli_command_envelope(
         "models.prune",
         serde_json::json!({
             "dry_run": report.dry_run,
@@ -3626,7 +3895,7 @@ fn handle_models_remove(
         .build()
         .map_err(|error| anyhow::anyhow!("build models remove runtime: {error}"))?;
     let removed = executor.block_on(manager.remove(&artifact.artifact_digest, &protection))?;
-    let output = models_command_envelope(
+    let output = cli_command_envelope(
         "models.remove",
         serde_json::json!({
             "model": args.model,
@@ -3879,7 +4148,7 @@ fn handle_models_list(
     match args.format {
         OutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&models_command_envelope(
+            serde_json::to_string_pretty(&cli_command_envelope(
                 "models.list",
                 serde_json::json!({ "models": rows }),
             ))?
@@ -3998,7 +4267,7 @@ fn handle_models_show(
     match args.format {
         OutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&models_command_envelope(
+            serde_json::to_string_pretty(&cli_command_envelope(
                 "models.show",
                 serde_json::to_value(&detail)?,
             ))?
@@ -5011,11 +5280,32 @@ fn handle_projections_render(args: &RenderArgs) -> anyhow::Result<()> {
 
 // --- `config` handler ---
 
-fn handle_config_subcommand(cmd: &ConfigCmd) -> anyhow::Result<i32> {
+/// Dispatch `sbproxy config <sub>`.
+///
+/// `global_config` is `-f/--config` (or `SB_CONFIG_FILE`) as parsed at the
+/// top level. It is threaded in because `-f` is a global flag, so a
+/// subcommand that documents "defaults to `-f/--config`" cannot see it from
+/// its own args struct.
+fn handle_config_subcommand(
+    cmd: &ConfigCmd,
+    global_config: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
     match &cmd.sub {
         ConfigSub::Migrate(args) => handle_config_migrate(args),
         ConfigSub::ImportLitellm(args) => handle_config_import_litellm(args),
-        ConfigSub::Print(args) => handle_config_print(args),
+        ConfigSub::Print(args) => handle_config_print(args, global_config),
+        ConfigSub::Authority(cmd) => match &cmd.sub {
+            ConfigAuthoritySub::Init(args) => handle_authority_init(args),
+            ConfigAuthoritySub::Publish(args) => handle_authority_publish(args),
+            ConfigAuthoritySub::Status(args) => handle_authority_status(args),
+            ConfigAuthoritySub::Rollback(args) => handle_authority_rollback(args),
+            ConfigAuthoritySub::Subscriber(cmd) => match &cmd.sub {
+                AuthoritySubscriberSub::Add(args) => handle_authority_subscriber_add(args),
+                AuthoritySubscriberSub::List(args) => handle_authority_subscriber_list(args),
+                AuthoritySubscriberSub::Revoke(args) => handle_authority_subscriber_revoke(args),
+            },
+        },
+        ConfigSub::Pull(args) => handle_config_pull(args, global_config),
     }
 }
 
@@ -5310,14 +5600,11 @@ fn parse_cluster_labels(labels: &[String]) -> anyhow::Result<BTreeMap<String, St
 /// `sbproxy config print`: the effective config after built-in defaults +
 /// the file + `${ENV}` interpolation, with secret values masked. Makes
 /// it obvious what a box will actually do (WOR-1805).
-fn handle_config_print(args: &ConfigPrintArgs) -> anyhow::Result<i32> {
-    let path = args
-        .config_path
-        .clone()
-        .or_else(|| std::env::var_os("SB_CONFIG_FILE").map(PathBuf::from))
-        .ok_or_else(|| {
-            anyhow::anyhow!("no config file: pass a path or set -f/--config / SB_CONFIG_FILE")
-        })?;
+fn handle_config_print(
+    args: &ConfigPrintArgs,
+    global_config: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    let path = resolve_config_path(args.config_path.as_deref(), global_config)?;
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("read config '{}': {e}", path.display()))?;
     // Apply the same `${ENV}` interpolation the compiler does, so an
@@ -5335,6 +5622,1142 @@ fn handle_config_print(args: &ConfigPrintArgs) -> anyhow::Result<i32> {
         print!("{}", serde_yaml::to_string(&value)?);
     }
     Ok(0)
+}
+
+// --- `config authority` + `config pull` handlers ---
+//
+// Every command here that changes what the fleet sees goes over the admin
+// API and reports what the server returned. None of them reaches for an
+// in-process primitive: `sbproxy apply` used to do that, compiling the
+// config into the short-lived CLI process, swapping that process's own
+// pipeline, and printing success without ever contacting the proxy, so its
+// exit code meant nothing. `config pull --dry-run` is the one local command,
+// and it is local because it applies nothing at all.
+
+/// File the generated Ed25519 signing seed is written to, inside `--dir`.
+const AUTHORITY_SIGNING_KEY_FILE: &str = "authority-signing.key";
+
+/// File the verifying-key map subscribers install is written to.
+const AUTHORITY_VERIFYING_KEYS_FILE: &str = "authority-keys.json";
+
+/// Resolve the config path for a subcommand that takes it positionally.
+///
+/// Priority: the positional path, then the global `-f/--config`, then
+/// `SB_CONFIG_FILE`. Matches the order `serve` resolves its own path in.
+fn resolve_config_path(
+    positional: Option<&std::path::Path>,
+    global_config: Option<&std::path::Path>,
+) -> anyhow::Result<PathBuf> {
+    positional
+        .or(global_config)
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::var_os("SB_CONFIG_FILE").map(PathBuf::from))
+        .ok_or_else(|| {
+            anyhow::anyhow!("no config file: pass a path or set -f/--config / SB_CONFIG_FILE")
+        })
+}
+
+/// Body for one admin request that carries one.
+enum AdminRequestBody {
+    /// A JSON document, sent as `application/json`.
+    Json(serde_json::Value),
+    /// A verbatim YAML document, sent as `application/yaml`.
+    ///
+    /// The publish route takes the payload as the request body rather than
+    /// wrapped in a JSON field, so the bytes that get signed are the bytes
+    /// the operator wrote.
+    Yaml(String),
+}
+
+/// What one admin request produced.
+enum AdminOutcome {
+    /// The admin API answered. Carries the status and the decoded body
+    /// (`Null` when the answer was not JSON).
+    Answered {
+        /// HTTP status the admin API returned.
+        status: reqwest::StatusCode,
+        /// Decoded response body.
+        body: serde_json::Value,
+    },
+    /// Nothing answered at the admin URL, so nothing happened. Carries the
+    /// transport reason for the operator-facing line.
+    Unreachable(String),
+}
+
+/// Send one admin request, returning the status alongside the body.
+///
+/// `admin_request_json` collapses every non-2xx into an error, which is
+/// right for the commands whose only useful answer is the happy path. These
+/// commands have to tell an authority that refused (exit 4) apart from one
+/// that never answered (exit 7): an exit code that conflates the two is
+/// exactly the defect that made `apply`'s old exit code worthless.
+fn admin_request_parts(
+    args: &ModelsAdminArgs,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<AdminRequestBody>,
+) -> anyhow::Result<AdminOutcome> {
+    use zeroize::Zeroize;
+
+    let base_url = args.admin_url.as_deref().unwrap_or(DEFAULT_ADMIN_URL);
+    let username = args.username.as_deref().unwrap_or("admin");
+    let mut password = args.password.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "admin password is required via --password or SB_ADMIN_PASSWORD. A publishing node \
+             refuses the shipped default password, so an authority always has a real one"
+        )
+    })?;
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        // Publishing runs the full boot-equivalent validation on the
+        // server, so the read budget matches `apply`'s rather than the
+        // 30s the read-only model-host routes use.
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+    let mut request = client
+        .request(method, &url)
+        .basic_auth(username, Some(password.as_str()));
+    match body {
+        Some(AdminRequestBody::Json(value)) => request = request.json(&value),
+        Some(AdminRequestBody::Yaml(document)) => {
+            request = request
+                .header(reqwest::header::CONTENT_TYPE, "application/yaml")
+                .body(document);
+        }
+        None => {}
+    }
+    let request = request.build();
+    // Cleared as soon as the Authorization header exists, matching
+    // `admin_request_json` and `apply_to_running_proxy`.
+    password.zeroize();
+    let response = match client.execute(request?) {
+        Ok(response) => response,
+        Err(error) => return Ok(AdminOutcome::Unreachable(error.to_string())),
+    };
+    let status = response.status();
+    let body = response.json().unwrap_or(serde_json::Value::Null);
+    Ok(AdminOutcome::Answered { status, body })
+}
+
+/// Report an admin API that refused, and return the documented exit code 4.
+fn report_admin_refusal(
+    command: &str,
+    status: reqwest::StatusCode,
+    body: &serde_json::Value,
+) -> i32 {
+    let error = body
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("the admin API gave no reason");
+    let code = body
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    eprintln!("{command}: the authority refused (HTTP {status}, {code}): {error}");
+    eprintln!("{command}: nothing changed on the authority.");
+    4
+}
+
+/// Report an unreachable admin API, and return the documented exit code 7.
+///
+/// Deliberately never followed by a local fallback. A command that cannot
+/// reach the authority has not published, rolled back, or revoked anything,
+/// and saying otherwise is worse than saying nothing.
+fn report_admin_unreachable(command: &str, args: &ModelsAdminArgs, reason: &str) -> i32 {
+    let base_url = args.admin_url.as_deref().unwrap_or(DEFAULT_ADMIN_URL);
+    eprintln!("{command}: could not reach the admin API at {base_url}: {reason}");
+    eprintln!(
+        "{command}: nothing was changed. Point --admin-url (or SB_ADMIN_URL) at the running \
+         authority's admin listener."
+    );
+    7
+}
+
+/// Name a generated key after its own public key: `authority-` plus the
+/// first twelve alphanumeric characters of the base64 public material,
+/// lowercased.
+///
+/// Derived rather than dated because rotation is additive: an operator
+/// generating a second key wants a second name, and two keys made in the
+/// same month would collide on a date-shaped default. Derived from the
+/// public half and never from the seed, because the seed's entropy must not
+/// show up in a value the verifying-key file publishes.
+fn derived_key_id(verifying_material_base64: &str) -> String {
+    let suffix: String = verifying_material_base64
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(12)
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    format!("authority-{suffix}")
+}
+
+/// Set a directory this command just created to owner-only.
+///
+/// Best effort: a failure is reported and does not abort, because the
+/// signing key inside it carries its own mode and its own refusal to load
+/// when that mode is wrong.
+#[cfg(unix)]
+fn tighten_directory_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+        eprintln!(
+            "config authority init: warning: could not set '{}' to owner-only (0700): {error}",
+            path.display()
+        );
+    }
+}
+
+/// Windows has no mode bits to set, so this is a no-op there rather than a
+/// false assurance.
+#[cfg(not(unix))]
+fn tighten_directory_permissions(_path: &std::path::Path) {}
+
+/// Warn when the directory holding a signing key can be reached by another
+/// account on the box.
+///
+/// A warning and not a refusal: the key file itself is owner-only and
+/// `ConfigBundleSigner` refuses to load one that is not, so a loose
+/// directory mode is a risk to whatever else lives there rather than to the
+/// key. Worth saying out loud all the same, because an operator who ran
+/// `chmod 755` on a parent path has no other prompt to notice.
+#[cfg(unix)]
+fn warn_if_directory_is_reachable_by_others(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        eprintln!(
+            "config authority init: warning: '{}' is mode {:o}, so other accounts on this host \
+             can reach it. Run `chmod 700 {}`.",
+            path.display(),
+            mode & 0o777,
+            path.display(),
+        );
+    }
+}
+
+/// Windows has no mode bits to check.
+#[cfg(not(unix))]
+fn warn_if_directory_is_reachable_by_others(_path: &std::path::Path) {}
+
+/// Write private key material with owner-only permissions.
+///
+/// The mode is requested in the open and set again afterwards: the first
+/// covers a file this call creates, so it is never briefly world-readable,
+/// and the second covers `--force` over a file that already exists with a
+/// looser mode. Getting either wrong would also mean an authority that
+/// cannot start, since the loader refuses a group-readable signing key.
+fn write_owner_only(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("write '{}': {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "set owner-only permissions on '{}': {error}",
+                    path.display()
+                )
+            },
+        )?;
+    }
+    file.write_all(contents.as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all())
+        .map_err(|error| anyhow::anyhow!("write '{}': {error}", path.display()))?;
+    Ok(())
+}
+
+/// Fold one signer's verifying-key entry into the map at `path`, keeping
+/// whatever is already there.
+///
+/// Rotation is additive: subscribers trust the old key and the new one at
+/// once, then drop the old entry a window later. Replacing the file
+/// wholesale would withdraw the old key's trust at the same instant the new
+/// key starts signing, which is the window rotation exists to avoid.
+fn merge_verifying_keys(path: &std::path::Path, entry: &str) -> anyhow::Result<String> {
+    let mut merged = match std::fs::read_to_string(path) {
+        Ok(existing) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+            &existing,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "'{}' exists but is not a verifying-key object ({error}). Move it aside or fix \
+                 it, rather than having this overwrite keys subscribers may still be trusting",
+                path.display()
+            )
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+        Err(error) => {
+            return Err(anyhow::anyhow!("read '{}': {error}", path.display()));
+        }
+    };
+    let generated: serde_json::Map<String, serde_json::Value> = serde_json::from_str(entry)
+        .map_err(|error| anyhow::anyhow!("decode the generated verifying-key entry: {error}"))?;
+    merged.extend(generated);
+    serde_json::to_string_pretty(&serde_json::Value::Object(merged))
+        .map_err(|error| anyhow::anyhow!("encode the verifying-key file: {error}"))
+}
+
+/// `sbproxy config authority init`: generate the authority's key pair, write
+/// the signing key owner-only, write the verifying-key file subscribers
+/// install, and print what to copy where.
+///
+/// Local by definition: a signing key that travelled over a network to get
+/// to its own authority is a signing key that has been somewhere else.
+///
+/// Exit codes: 0 generated, 1 CLI or IO error, 3 refused because a signing
+/// key already exists and `--force` was not given.
+fn handle_authority_init(args: &AuthorityInitArgs) -> anyhow::Result<i32> {
+    use rand::RngCore as _;
+    use sbproxy_config::config_bundle::{
+        encode_signing_key_seed, ConfigBundleSigner, ED25519_KEY_BYTES,
+    };
+    use zeroize::Zeroize as _;
+
+    let directory = args.directory.as_path();
+    let created = !directory.exists();
+    std::fs::create_dir_all(directory).map_err(|error| {
+        anyhow::anyhow!(
+            "create authority directory '{}': {error}",
+            directory.display()
+        )
+    })?;
+    if created {
+        tighten_directory_permissions(directory);
+    }
+    warn_if_directory_is_reachable_by_others(directory);
+
+    let key_path = directory.join(AUTHORITY_SIGNING_KEY_FILE);
+    let keys_path = directory.join(AUTHORITY_VERIFYING_KEYS_FILE);
+    if key_path.exists() && !args.force {
+        eprintln!(
+            "config authority init: '{}' already exists. Overwriting a signing key means every \
+             bundle it signed stops verifying for any subscriber that has not installed the new \
+             verifying key yet, so this refuses rather than guess.",
+            key_path.display()
+        );
+        eprintln!(
+            "config authority init: pass --force to rotate (the new verifying key is added to \
+             '{}' alongside the old one), or point --dir somewhere else.",
+            keys_path.display()
+        );
+        return Ok(3);
+    }
+
+    let mut seed = [0u8; ED25519_KEY_BYTES];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    // The key id we want names the key's own public half, and the signer is
+    // what computes that, so the pair is built twice: once to learn the
+    // public key, once under the name that describes it. Cheap, and it
+    // keeps the id derivation out of the crypto crate.
+    let key_id = match args.key_id.as_deref() {
+        Some(key_id) => key_id.to_string(),
+        None => {
+            let probe = ConfigBundleSigner::ed25519_from_seed_bytes("authority-pending", &seed)
+                .map_err(|error| anyhow::anyhow!("derive the authority key id: {error}"))?;
+            derived_key_id(&probe.verifying_material_base64())
+        }
+    };
+    let signer = ConfigBundleSigner::ed25519_from_seed_bytes(&key_id, &seed).map_err(|error| {
+        anyhow::anyhow!("build a signer for key id {key_id:?}: {error}. Key ids accept letters, digits, and . - _ :")
+    })?;
+    let verifying_material = signer.verifying_material_base64();
+    let entry = signer
+        .verifying_key_file_json()
+        .map_err(|error| anyhow::anyhow!("render the verifying-key entry: {error}"))?;
+    let keys_body = merge_verifying_keys(&keys_path, &entry)?;
+
+    let mut signing_body = encode_signing_key_seed(&seed);
+    seed.zeroize();
+    let write_result = write_owner_only(&key_path, &signing_body);
+    // Cleared whether or not the write succeeded: the failure path is
+    // exactly where a copy of a signing key should not linger.
+    signing_body.zeroize();
+    write_result?;
+    std::fs::write(&keys_path, &keys_body)
+        .map_err(|error| anyhow::anyhow!("write '{}': {error}", keys_path.display()))?;
+
+    match args.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "command": "config.authority.init",
+                "directory": directory,
+                "authority_id": args.authority_id,
+                "key_id": key_id,
+                "algorithm": "ed25519",
+                "signing_key_file": key_path,
+                "verifying_keys_file": keys_path,
+                // The public half, safe to publish. The seed appears in no
+                // output, in either format.
+                "verifying_material": verifying_material,
+                "rotated": args.force,
+            }))?
+        ),
+        OutputFormat::Text => {
+            println!(
+                "config authority init: wrote {} (owner-only) and {}",
+                key_path.display(),
+                keys_path.display()
+            );
+            println!("config authority init: key id {key_id}");
+            println!();
+            println!("On the authority, under proxy.config_authority.publish:");
+            println!("  authority_id: {}", args.authority_id);
+            println!("  key_id: {key_id}");
+            println!("  signing_key_file: {}", key_path.display());
+            println!("  store_dir: {}", directory.join("store").display());
+            println!();
+            println!("On every subscriber, under proxy.config_authority.upstream:");
+            println!("  verifying_keys_file: <this node's copy of authority-keys.json>");
+            println!();
+            println!(
+                "Copy {AUTHORITY_VERIFYING_KEYS_FILE} to each subscriber. Never copy \
+                 {AUTHORITY_SIGNING_KEY_FILE} anywhere: it is the key that mints configuration \
+                 for the whole fleet."
+            );
+            println!(
+                "Then register each subscriber with `sbproxy config authority subscriber add \
+                 <subscriber-id>`."
+            );
+        }
+    }
+    Ok(0)
+}
+
+/// `sbproxy config authority publish`: validate the payload the way the
+/// authority will, then publish it over the admin API.
+///
+/// The local validation is the same function the server route runs, so a
+/// payload that would be refused is refused here, before a revision number
+/// is spent on it.
+///
+/// Exit codes: 0 published (or validated under `--validate-only`), 1 CLI or
+/// IO error, 3 the payload was refused locally and nothing was sent, 4 the
+/// authority refused it, 7 the authority was unreachable.
+fn handle_authority_publish(args: &AuthorityPublishArgs) -> anyhow::Result<i32> {
+    let path = args.config.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing -f / --config: publish takes the payload document subscribers should apply, \
+             not this node's own config file"
+        )
+    })?;
+    let yaml = std::fs::read_to_string(path)
+        .map_err(|error| anyhow::anyhow!("read payload '{}': {error}", path.display()))?;
+    // Relative model-host paths in a payload resolve on each subscriber,
+    // not here, so the directory holding the payload is the best available
+    // stand-in. That axis of the check is advisory; the rest is not.
+    let validation_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let unresolved =
+        match sbproxy_core::config_authority::validate_publish_payload(&yaml, validation_dir) {
+            Ok(unresolved) => unresolved,
+            Err(error) => {
+                eprintln!("config authority publish: {error}");
+                eprintln!(
+                    "config authority publish: nothing was published and no revision was \
+                     consumed. Fix the payload and run it again."
+                );
+                return Ok(3);
+            }
+        };
+    if !unresolved.is_empty() {
+        eprintln!(
+            "config authority publish: warning: the payload carries ${{VAR}} reference(s) this \
+             host cannot resolve: {}",
+            unresolved.join(", ")
+        );
+        eprintln!(
+            "config authority publish: warning: a subscriber that cannot resolve them either \
+             refuses the bundle rather than applying the literal text."
+        );
+    }
+    if args.validate_only {
+        println!(
+            "config authority publish: {} passes every check the authority runs. Nothing was \
+             published (--validate-only).",
+            path.display()
+        );
+        return Ok(0);
+    }
+
+    let route = format!(
+        "{}?mode={}",
+        sbproxy_core::config_authority::PUBLISH_PATH,
+        args.mode.as_str()
+    );
+    let outcome = admin_request_parts(
+        &args.admin,
+        reqwest::Method::POST,
+        &route,
+        Some(AdminRequestBody::Yaml(yaml)),
+    )?;
+    let body = match outcome {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config authority publish",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal(
+                "config authority publish",
+                status,
+                &body,
+            ));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    match args.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&cli_command_envelope("config.authority.publish", body))?
+        ),
+        OutputFormat::Text => {
+            println!(
+                "config authority publish: published revision {} (mode {}, key {}, digest {})",
+                json_u64(&body, "revision"),
+                body.get("mode")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(args.mode.as_str()),
+                body.get("key_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                body.get("content_digest")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+            );
+            println!(
+                "config authority publish: subscribers take it on their next poll. Watch the \
+                 rollout with `sbproxy config authority status`."
+            );
+        }
+    }
+    Ok(0)
+}
+
+/// `sbproxy config authority status`: what is published, under which key,
+/// and which subscribers have taken it.
+///
+/// Read-only, and the document it prints carries no secret: subscriber
+/// records name a credential id, never the credential, and the verifying
+/// material is the public half of the signing key by construction.
+///
+/// Exit codes: 0 reported, 1 CLI or IO error, 4 the authority refused, 7 the
+/// authority was unreachable.
+fn handle_authority_status(args: &AuthorityStatusArgs) -> anyhow::Result<i32> {
+    let body = match admin_request_parts(
+        &args.admin,
+        reqwest::Method::GET,
+        sbproxy_core::config_authority::STATUS_PATH,
+        None,
+    )? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config authority status",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal(
+                "config authority status",
+                status,
+                &body,
+            ));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&body)?),
+        OutputFormat::Text => {
+            let current_revision = json_u64(&body, "current_revision");
+            println!(
+                "authority {} key {} ({})",
+                body.get("authority_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                body.get("key_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                body.get("algorithm")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+            );
+            if current_revision == 0 {
+                println!("revision: none published yet");
+            } else {
+                println!(
+                    "revision: {current_revision} (digest {}, previous {}, highest reserved {})",
+                    body.get("current_content_digest")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown"),
+                    body.get("previous_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        .map_or_else(|| "none".to_string(), |revision| revision.to_string()),
+                    json_u64(&body, "high_water_revision"),
+                );
+            }
+            println!(
+                "subscribers: {} registered, {} live",
+                json_u64(&body, "subscriber_count"),
+                json_u64(&body, "live_subscriber_count"),
+            );
+            if let Some(subscribers) = body
+                .get("subscribers")
+                .and_then(serde_json::Value::as_array)
+            {
+                for subscriber in subscribers {
+                    let last_seen = json_u64(subscriber, "last_seen_revision");
+                    let state = if subscriber
+                        .get("revoked")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        "revoked"
+                    } else if subscriber
+                        .get("up_to_date")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        "current"
+                    } else if last_seen == 0 {
+                        "never fetched"
+                    } else {
+                        "behind"
+                    };
+                    println!(
+                        "{}\tcredential={}\tlast_seen_revision={last_seen}\t{state}",
+                        subscriber
+                            .get("subscriber_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown"),
+                        subscriber
+                            .get("credential_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown"),
+                    );
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// `sbproxy config authority rollback`: republish the previous revision's
+/// payload.
+///
+/// The new revision number is above the one it replaces, because a
+/// subscriber's anti-replay cursor refuses anything that is not. A rollback
+/// that re-served the old number would reach only the nodes that had not yet
+/// taken the revision being undone, which is the opposite of what an
+/// operator wants at that moment.
+///
+/// Exit codes: 0 rolled back, 1 CLI or IO error, 4 the authority refused
+/// (typically no previous revision to return to), 7 unreachable.
+fn handle_authority_rollback(args: &AuthorityRollbackArgs) -> anyhow::Result<i32> {
+    let body = match admin_request_parts(
+        &args.admin,
+        reqwest::Method::POST,
+        sbproxy_core::config_authority::ROLLBACK_PATH,
+        None,
+    )? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config authority rollback",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal(
+                "config authority rollback",
+                status,
+                &body,
+            ));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    match args.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&cli_command_envelope("config.authority.rollback", body))?
+        ),
+        OutputFormat::Text => {
+            println!(
+                "config authority rollback: republished revision {}'s payload as revision {}, \
+                 replacing revision {}",
+                json_u64(&body, "restored_from_revision"),
+                json_u64(&body, "revision"),
+                json_u64(&body, "replaced_revision"),
+            );
+            println!(
+                "config authority rollback: the number moves forward because a subscriber refuses \
+                 a revision that is not greater than the one it applied. Subscribers take it on \
+                 their next poll."
+            );
+        }
+    }
+    Ok(0)
+}
+
+/// `sbproxy config authority subscriber add`: register a subscriber and mint
+/// its credential.
+///
+/// The authority stores only a SHA-256 fingerprint of the credential, so the
+/// clear token printed here is the only copy that will ever exist. Text mode
+/// prints it alone on stdout, the way `cluster token create` does, so
+/// `export SB_CONFIG_AUTHORITY_TOKEN="$(...)"` works; the note saying it is
+/// shown once goes to stderr so it cannot end up inside that variable.
+///
+/// Exit codes: 0 registered, 1 CLI or IO error, 4 the authority refused, 7
+/// unreachable.
+fn handle_authority_subscriber_add(args: &AuthoritySubscriberAddArgs) -> anyhow::Result<i32> {
+    let body = match admin_request_parts(
+        &args.admin,
+        reqwest::Method::POST,
+        sbproxy_core::config_authority::SUBSCRIBERS_PATH,
+        Some(AdminRequestBody::Json(serde_json::json!({
+            "subscriber_id": args.subscriber_id,
+        }))),
+    )? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config authority subscriber add",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal(
+                "config authority subscriber add",
+                status,
+                &body,
+            ));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    let credential = body
+        .get("credential")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the authority registered the subscriber but returned no credential; register \
+                 again once you know why, since this one cannot be recovered"
+            )
+        })?;
+    match args.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&cli_command_envelope(
+                "config.authority.subscriber.add",
+                body.clone()
+            ))?
+        ),
+        OutputFormat::Text => println!("{credential}"),
+    }
+    eprintln!(
+        "config authority subscriber add: registered {} (credential id {}).",
+        args.subscriber_id,
+        body.get("credential_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown"),
+    );
+    eprintln!(
+        "config authority subscriber add: the credential above is shown once and never again. \
+         The authority keeps only a SHA-256 fingerprint of it."
+    );
+    eprintln!(
+        "config authority subscriber add: give it to that node as \
+         proxy.config_authority.upstream.credential, by secret reference (env:NAME, file:/path, \
+         secret://backend/name) rather than inline."
+    );
+    Ok(0)
+}
+
+/// `sbproxy config authority subscriber list`: the roster and each node's
+/// last-seen revision.
+///
+/// Exit codes: as `config authority status`.
+fn handle_authority_subscriber_list(args: &AuthoritySubscriberListArgs) -> anyhow::Result<i32> {
+    let body = match admin_request_parts(
+        &args.admin,
+        reqwest::Method::GET,
+        sbproxy_core::config_authority::SUBSCRIBERS_PATH,
+        None,
+    )? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config authority subscriber list",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal(
+                "config authority subscriber list",
+                status,
+                &body,
+            ));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&body)?),
+        OutputFormat::Text => {
+            println!(
+                "{} subscriber(s) registered, {} live",
+                json_u64(&body, "subscriber_count"),
+                json_u64(&body, "live_subscriber_count"),
+            );
+            if let Some(subscribers) = body
+                .get("subscribers")
+                .and_then(serde_json::Value::as_array)
+            {
+                for subscriber in subscribers {
+                    println!(
+                        "{}\tcredential={}\tlast_seen_revision={}\trevoked={}",
+                        subscriber
+                            .get("subscriber_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown"),
+                        subscriber
+                            .get("credential_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown"),
+                        json_u64(subscriber, "last_seen_revision"),
+                        subscriber
+                            .get("revoked")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
+                    );
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// `sbproxy config authority subscriber revoke`: retire one credential, or
+/// every credential one node holds.
+///
+/// Exit codes: 0 the authority answered, 1 CLI or IO error (including
+/// naming neither selector), 4 the authority refused, 7 unreachable. A
+/// selector that matches nothing is a successful answer reporting
+/// `revoked: false`, not an error: the operator's goal (that credential
+/// cannot fetch) holds either way.
+fn handle_authority_subscriber_revoke(args: &AuthoritySubscriberRevokeArgs) -> anyhow::Result<i32> {
+    let selector = match (args.credential_id.as_deref(), args.subscriber_id.as_deref()) {
+        (Some(credential_id), _) => serde_json::json!({"credential_id": credential_id}),
+        (None, Some(subscriber_id)) => serde_json::json!({"subscriber_id": subscriber_id}),
+        (None, None) => {
+            anyhow::bail!(
+                "name what to revoke: --credential-id <id> for one credential, or \
+                 --subscriber-id <id> for every credential that node holds"
+            )
+        }
+    };
+    let body = match admin_request_parts(
+        &args.admin,
+        reqwest::Method::POST,
+        sbproxy_core::config_authority::SUBSCRIBER_REVOKE_PATH,
+        Some(AdminRequestBody::Json(selector)),
+    )? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config authority subscriber revoke",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal(
+                "config authority subscriber revoke",
+                status,
+                &body,
+            ));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    match args.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&cli_command_envelope(
+                "config.authority.subscriber.revoke",
+                body
+            ))?
+        ),
+        OutputFormat::Text => {
+            // The route answers `true`/`false` for a credential and a count
+            // for a subscriber, so both shapes get read.
+            let revoked = body.get("revoked");
+            let described = match revoked {
+                Some(serde_json::Value::Bool(true)) => "revoked".to_string(),
+                Some(serde_json::Value::Bool(false)) => {
+                    "already revoked or not known to this authority".to_string()
+                }
+                Some(serde_json::Value::Number(count)) => {
+                    format!("{count} credential(s) revoked")
+                }
+                _ => "the authority gave no revocation count".to_string(),
+            };
+            println!(
+                "config authority subscriber revoke: {}: {described}",
+                args.credential_id
+                    .as_deref()
+                    .or(args.subscriber_id.as_deref())
+                    .unwrap_or("unknown"),
+            );
+            println!(
+                "config authority subscriber revoke: a revoked node keeps serving what it \
+                 already applied; it stops receiving updates."
+            );
+        }
+    }
+    Ok(0)
+}
+
+/// One line naming what an operator can do about a bundle the subscriber
+/// refused.
+fn pull_refusal_hint(result: sbproxy_core::config_subscriber::CycleResult) -> &'static str {
+    use sbproxy_core::config_subscriber::CycleResult;
+
+    match result {
+        CycleResult::VerifyFailed => {
+            "the signature, schema, digest, expiry, declared mode, or replay cursor rejected it. \
+             Check that verifying_keys_file holds the authority's current key and that `mode` \
+             here matches the mode the bundle was published under."
+        }
+        CycleResult::CompileFailed => {
+            "the merged document could not be produced or carries an unresolved ${VAR}. Export \
+             the variables this node is expected to provide, or fix the payload."
+        }
+        CycleResult::DeniedPath => {
+            "the bundle names a path every subscriber owns outright (listeners, TLS, admin, \
+             secrets, cluster, model_host, config_authority, source). The whole bundle is \
+             refused, not the offending keys."
+        }
+        // Not reachable from `evaluate`, which neither fetches nor reloads.
+        // Named anyway so a new variant cannot be added without deciding
+        // what it means here.
+        CycleResult::Applied
+        | CycleResult::NotModified
+        | CycleResult::Unreachable
+        | CycleResult::ReloadBusy => "see the log line above for the reason.",
+    }
+}
+
+/// Diff the merged authority document against the local one.
+///
+/// The baseline is this node's file and the proposal is the merged document,
+/// which is exactly the change one poll cycle would make. A boot-time
+/// construction failure folds in as an error finding, the same channel
+/// `plan` and `apply` use, so it reaches exit 3 rather than being reported
+/// as a clean diff.
+fn merged_plan_report(
+    local_yaml: &str,
+    merged_yaml: &str,
+) -> anyhow::Result<sbproxy_config::PlanReport> {
+    let baseline = serde_yaml::from_str::<sbproxy_config::ConfigFile>(local_yaml)
+        .map_err(|error| anyhow::anyhow!("parse the local document as ConfigFile: {error}"))?;
+    let compiled = sbproxy_config::compile_config(merged_yaml)
+        .map_err(|error| anyhow::anyhow!("the merged document does not compile:\n{error:#}"))?;
+    let construction_error =
+        sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .err()
+            .map(|error| format!("{error:#}"));
+    let proposed = serde_yaml::from_str::<sbproxy_config::ConfigFile>(merged_yaml)
+        .map_err(|error| anyhow::anyhow!("parse the merged document as ConfigFile: {error}"))?;
+    let mut report = sbproxy_config::plan(&baseline, &proposed);
+    if let Some(message) = construction_error.as_deref() {
+        push_construction_finding(&mut report, message);
+    }
+    Ok(report)
+}
+
+/// `sbproxy config pull --dry-run`: run a real poll cycle up to the point of
+/// applying, and print the diff it would have applied.
+///
+/// The one command in this group that is deliberately local, because it
+/// applies nothing. `ConfigSubscriber::fetch` is the only transport and
+/// `ConfigSubscriber::evaluate` is pure (verify, mode check, cursor probe on
+/// a clone, merge, unresolved-`${VAR}` screen), so the interesting half of a
+/// cycle runs here with the bundle cache, the replay cursor, and the running
+/// pipeline all untouched. Applying is the running proxy's own poll loop's
+/// job: a short-lived CLI process cannot swap a server's pipeline, and
+/// pretending otherwise is the defect that made `apply`'s exit code
+/// worthless before #764.
+///
+/// Exit codes: 0 nothing to apply, 1 CLI or IO error, 2 changes present, 3
+/// the bundle or the merged document was refused, 7 the authority was
+/// unreachable.
+fn handle_config_pull(
+    args: &ConfigPullArgs,
+    global_config: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    if !args.dry_run {
+        anyhow::bail!(
+            "config pull requires --dry-run. There is no local apply: a node takes its \
+             authority's bundles through its own poll loop, and a short-lived CLI process cannot \
+             swap a running proxy's pipeline. Use --dry-run to preview what the next poll would \
+             apply."
+        );
+    }
+    let path = resolve_config_path(args.config_path.as_deref(), global_config)?;
+    let local_yaml = std::fs::read_to_string(&path)
+        .map_err(|error| anyhow::anyhow!("read config '{}': {error}", path.display()))?;
+    let compiled = sbproxy_config::compile_config(&local_yaml).map_err(|error| {
+        anyhow::anyhow!("config '{}' did not compile:\n{error:#}", path.display())
+    })?;
+    let upstream = compiled
+        .server
+        .config_authority
+        .as_ref()
+        .and_then(|authority| authority.upstream.as_ref())
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "'{}' sets no proxy.config_authority.upstream, so there is no authority to pull \
+                 from. A node that publishes rather than subscribes uses `config authority \
+                 status` instead.",
+                path.display()
+            )
+        })?;
+    // Secret references in the credential resolve through the process
+    // resolver, exactly as they do at boot, so `secret://` works here and
+    // not only in the server.
+    install_secret_resolver(&path);
+    let path_str = path.to_string_lossy().into_owned();
+    let subscriber = sbproxy_core::config_subscriber::ConfigSubscriber::new(&path_str, &upstream)?;
+    if !subscriber.has_keys() {
+        eprintln!(
+            "config pull: warning: no verifying key set loaded from {}, so no bundle can be \
+             verified and none would be applied.",
+            upstream.verifying_keys_file
+        );
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let fetched = runtime.block_on(subscriber.fetch());
+    let signed = match fetched {
+        sbproxy_core::config_subscriber::FetchResult::Unreachable(reason) => {
+            eprintln!(
+                "config pull: the authority at {} could not be reached: {reason}",
+                upstream.url
+            );
+            eprintln!(
+                "config pull: nothing was applied. A running node in this state keeps serving \
+                 the configuration it already applied."
+            );
+            return Ok(7);
+        }
+        sbproxy_core::config_subscriber::FetchResult::NotModified => {
+            println!(
+                "config pull: the authority is serving revision {}, which this node already \
+                 holds. No changes, and nothing was applied.",
+                subscriber.revision()
+            );
+            return Ok(0);
+        }
+        sbproxy_core::config_subscriber::FetchResult::Bundle(signed) => signed,
+    };
+    // Mirrors the poll loop, which short-circuits before evaluating: an
+    // authority that does not implement `If-None-Match` re-serves the
+    // applied revision every interval, and that is a no-op rather than a
+    // change.
+    if subscriber.holds_revision(&signed.bundle) {
+        println!(
+            "config pull: the authority re-served revision {}, which this node already holds. No \
+             changes, and nothing was applied.",
+            signed.bundle.revision
+        );
+        return Ok(0);
+    }
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let candidate = match subscriber.evaluate(&signed, &local_yaml, now_unix_ms) {
+        Ok(candidate) => candidate,
+        Err(result) => {
+            eprintln!(
+                "config pull: revision {} was refused ({}): {}",
+                signed.bundle.revision,
+                result.as_str(),
+                pull_refusal_hint(result),
+            );
+            eprintln!(
+                "config pull: nothing was applied. The bundle cache, the replay cursor, and the \
+                 running configuration are all untouched."
+            );
+            return Ok(3);
+        }
+    };
+    let report = match merged_plan_report(&local_yaml, candidate.merged_yaml()) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!(
+                "config pull: revision {} verified, but the merged document would be refused: \
+                 {error:#}",
+                candidate.revision()
+            );
+            eprintln!("config pull: nothing was applied.");
+            return Ok(3);
+        }
+    };
+    match args.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "command": "config.pull",
+                // Load-bearing, not decoration: this command never applies
+                // anything, and a consumer should not have to infer that.
+                "applied": false,
+                "dry_run": true,
+                "authority_url": upstream.url,
+                "mode": upstream.mode,
+                "offered_revision": candidate.revision(),
+                "applied_revision": subscriber.revision(),
+                "plan": report,
+            }))?
+        ),
+        OutputFormat::Text => {
+            println!(
+                "config pull: authority offers revision {}; this node has applied {}. Dry run: \
+                 nothing is applied.",
+                candidate.revision(),
+                subscriber.revision(),
+            );
+            print!("{}", sbproxy_config::render_text(&report));
+            println!(
+                "config pull: nothing was applied. The bundle cache, the replay cursor, and the \
+                 running configuration are all untouched. The proxy's own poll loop is what \
+                 applies a bundle."
+            );
+        }
+    }
+    Ok(plan_exit_code(&report))
 }
 
 /// `${VAR}` interpolation matching the config compiler: a set variable
@@ -5596,9 +7019,25 @@ fn lookup_projection<'a>(
 fn load_and_validate(
     path: &std::path::Path,
 ) -> anyhow::Result<(sbproxy_config::ConfigFile, Option<String>)> {
+    load_and_validate_with(path, false)
+}
+
+/// [`load_and_validate`] with control over whether a `source:` block is
+/// resolved.
+///
+/// `plan` exposes the choice as `--no-fetch`; `apply` always resolves,
+/// because the document it is about to push is the resolved one.
+fn load_and_validate_with(
+    path: &std::path::Path,
+    no_fetch: bool,
+) -> anyhow::Result<(sbproxy_config::ConfigFile, Option<String>)> {
     let path_str = path.to_string_lossy();
     let yaml = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read config '{path_str}': {e}"))?;
+    // Diff and validate the document that would boot, not the pointer at
+    // it. Both sides of a plan go through here, so an `--against`
+    // baseline that is itself git-sourced resolves too.
+    let yaml = resolve_source_for_cli(&yaml, no_fetch, &path_str)?;
     let compiled = sbproxy_config::compile_config(&yaml)
         .map_err(|e| anyhow::anyhow!("config '{path_str}' did not compile:\n{e:#}"))?;
     // WOR-1815: run the boot-time module constructors too, so `plan`
@@ -5651,11 +7090,11 @@ fn load_plan_inputs(
         .config
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("missing -f / --config"))?;
-    let (proposed, construction_error) = load_and_validate(config)?;
+    let (proposed, construction_error) = load_and_validate_with(config, args.no_fetch)?;
     // The baseline is the operator's current state; only the proposed
     // side's construction result gates the plan.
     let baseline = match args.against.as_deref() {
-        Some(p) => load_and_validate(p)?.0,
+        Some(p) => load_and_validate_with(p, args.no_fetch)?.0,
         None => empty_config_file(),
     };
     Ok((baseline, proposed, construction_error))
@@ -6869,6 +8308,246 @@ mod tests {
         );
     }
 
+    // --- config authority ---
+
+    /// Every config-authority command carries an admin password, so every one
+    /// of their args structs has to redact it. They flatten `ModelsAdminArgs`
+    /// rather than declaring the three flags again precisely so its
+    /// hand-written `Debug` covers them, and this is what keeps a future
+    /// command from declaring its own field and losing the redaction.
+    #[test]
+    fn config_authority_args_debug_redacts_the_password() {
+        let admin = ModelsAdminArgs {
+            admin_url: Some("http://127.0.0.1:9090".to_string()),
+            username: Some("admin".to_string()),
+            password: Some("test-password".to_string()),
+        };
+        let rendered = [
+            format!(
+                "{:?}",
+                AuthorityPublishArgs {
+                    config: Some(PathBuf::from("payload.yml")),
+                    mode: BundleModeArg::Overlay,
+                    validate_only: false,
+                    admin: admin.clone(),
+                    format: OutputFormat::Text,
+                }
+            ),
+            format!(
+                "{:?}",
+                AuthorityStatusArgs {
+                    admin: admin.clone(),
+                    format: OutputFormat::Text,
+                }
+            ),
+            format!(
+                "{:?}",
+                AuthorityRollbackArgs {
+                    admin: admin.clone(),
+                    format: OutputFormat::Text,
+                }
+            ),
+            format!(
+                "{:?}",
+                AuthoritySubscriberAddArgs {
+                    subscriber_id: "edge-01".to_string(),
+                    admin: admin.clone(),
+                    format: OutputFormat::Text,
+                }
+            ),
+            format!(
+                "{:?}",
+                AuthoritySubscriberListArgs {
+                    admin: admin.clone(),
+                    format: OutputFormat::Text,
+                }
+            ),
+            format!(
+                "{:?}",
+                AuthoritySubscriberRevokeArgs {
+                    credential_id: Some("0lJ8kQ2vTn5mAqRt".to_string()),
+                    subscriber_id: None,
+                    admin,
+                    format: OutputFormat::Text,
+                }
+            ),
+        ];
+        for rendered in rendered {
+            assert!(
+                !rendered.contains("test-password"),
+                "a config-authority args Debug leaked the admin password: {rendered}"
+            );
+            assert!(
+                rendered.contains("<redacted>"),
+                "expected a redaction marker: {rendered}"
+            );
+        }
+    }
+
+    /// The whole surface parses, including the two nested subcommand levels
+    /// and the flags that pick the wire behaviour.
+    #[test]
+    fn config_authority_cli_surface_parses() {
+        let cli = Cli::try_parse_from([
+            "sbproxy",
+            "config",
+            "authority",
+            "publish",
+            "-f",
+            "payload.yml",
+            "--mode",
+            "replace",
+            "--format",
+            "json",
+        ])
+        .expect("publish parses");
+        let Some(Cmd::Config(ConfigCmd {
+            sub:
+                ConfigSub::Authority(ConfigAuthorityCmd {
+                    sub: ConfigAuthoritySub::Publish(args),
+                }),
+        })) = cli.cmd
+        else {
+            panic!("config authority publish parsed to the wrong command");
+        };
+        assert_eq!(args.config, Some(PathBuf::from("payload.yml")));
+        assert_eq!(args.mode, BundleModeArg::Replace);
+        assert_eq!(args.mode.as_str(), "replace");
+
+        let cli = Cli::try_parse_from([
+            "sbproxy",
+            "config",
+            "authority",
+            "subscriber",
+            "add",
+            "edge-01",
+        ])
+        .expect("subscriber add parses");
+        let Some(Cmd::Config(ConfigCmd {
+            sub:
+                ConfigSub::Authority(ConfigAuthorityCmd {
+                    sub:
+                        ConfigAuthoritySub::Subscriber(AuthoritySubscriberCmd {
+                            sub: AuthoritySubscriberSub::Add(args),
+                        }),
+                }),
+        })) = cli.cmd
+        else {
+            panic!("subscriber add parsed to the wrong command");
+        };
+        assert_eq!(args.subscriber_id, "edge-01");
+
+        // The two selectors are mutually exclusive: revoking one credential
+        // and revoking every credential a node holds are different acts.
+        assert!(Cli::try_parse_from([
+            "sbproxy",
+            "config",
+            "authority",
+            "subscriber",
+            "revoke",
+            "--credential-id",
+            "one",
+            "--subscriber-id",
+            "edge-01",
+        ])
+        .is_err());
+    }
+
+    /// `config authority` and `config pull` report through `plan`'s exit
+    /// codes, where 2 is "changes present". Their CLI-error code therefore
+    /// has to be 1, or a diff would be indistinguishable from a broken
+    /// invocation.
+    #[test]
+    fn config_subcommands_that_print_a_diff_use_plans_error_code() {
+        let plan_style = [
+            vec!["sbproxy", "config", "pull", "sb.yml", "--dry-run"],
+            vec!["sbproxy", "config", "authority", "status"],
+        ];
+        for argv in plan_style {
+            let cli = Cli::try_parse_from(&argv).expect("parses");
+            let Some(Cmd::Config(cmd)) = cli.cmd else {
+                panic!("{argv:?} parsed to the wrong command");
+            };
+            assert!(cmd.uses_plan_exit_codes(), "{argv:?}");
+        }
+        let cli = Cli::try_parse_from(["sbproxy", "config", "print", "sb.yml"]).expect("parses");
+        let Some(Cmd::Config(cmd)) = cli.cmd else {
+            panic!("config print parsed to the wrong command");
+        };
+        assert!(
+            !cmd.uses_plan_exit_codes(),
+            "the older config subcommands keep the exit 2 they have always used for errors"
+        );
+    }
+
+    /// A generated key id names its own public half, so two keys never
+    /// collide in a verifying-key file during an additive rotation.
+    #[test]
+    fn derived_key_ids_are_readable_valid_and_key_specific() {
+        let first = derived_key_id("3p8Q0mB1yV4kX7wR2tL6nS9cF5jH0dA8gZ2eK4uY1oM=");
+        let second = derived_key_id("9kL2xP7bT4mV1nQ8wR5tY6sF3jH0dA8gZ2eK4uY1oM=");
+        assert_ne!(first, second);
+        assert!(first.starts_with("authority-"), "{first}");
+        // Only characters a bundle identifier accepts: the base64 alphabet's
+        // `+` and `/` would be refused by the signer.
+        assert!(
+            first
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-'),
+            "{first}"
+        );
+        assert_eq!(first.len(), "authority-".len() + 12);
+    }
+
+    /// A rotation adds a key rather than replacing the file, because the old
+    /// key has to keep verifying while subscribers are updated.
+    #[test]
+    fn merging_verifying_keys_keeps_the_entries_already_there() {
+        let path = temp_config(
+            "{\n  \"authority-old\": {\"algorithm\": \"ed25519\", \"key\": \"AAA=\"}\n}\n",
+        );
+        let merged = merge_verifying_keys(
+            &path,
+            "{\n  \"authority-new\": {\"algorithm\": \"ed25519\", \"key\": \"BBB=\"}\n}\n",
+        )
+        .expect("merge");
+        let merged: serde_json::Value = serde_json::from_str(&merged).expect("merged JSON");
+        assert_eq!(merged["authority-old"]["key"], "AAA=");
+        assert_eq!(merged["authority-new"]["key"], "BBB=");
+
+        // A file that is not a key map is a refusal, not something to
+        // overwrite: subscribers may be trusting whatever is in it.
+        let garbage = temp_config("not json at all\n");
+        assert!(merge_verifying_keys(&garbage, "{}").is_err());
+
+        // A missing file is the first-run case, not an error.
+        let absent = path.with_extension("absent");
+        assert!(merge_verifying_keys(&absent, "{}").is_ok());
+    }
+
+    /// A refused bundle has to be named in terms an operator can act on, so
+    /// every `CycleResult` gets a hint rather than a bare label.
+    #[test]
+    fn every_pull_refusal_has_a_hint() {
+        use sbproxy_core::config_subscriber::CycleResult;
+
+        for result in [
+            CycleResult::Applied,
+            CycleResult::NotModified,
+            CycleResult::Unreachable,
+            CycleResult::VerifyFailed,
+            CycleResult::CompileFailed,
+            CycleResult::DeniedPath,
+            CycleResult::ReloadBusy,
+        ] {
+            assert!(
+                !pull_refusal_hint(result).is_empty(),
+                "{} has no hint",
+                result.as_str()
+            );
+        }
+    }
+
     // --- run-path resolution ---
 
     #[test]
@@ -7467,6 +9146,7 @@ mod tests {
             } else {
                 OutputFormat::Text
             },
+            no_fetch: false,
         }
     }
 
@@ -7615,6 +9295,7 @@ origins:
         let args = ValidateArgs {
             config_path: None,
             format: OutputFormat::Json,
+            no_fetch: false,
         };
         assert!(handle_validate_subcommand(&args).is_err());
     }
@@ -7658,6 +9339,7 @@ origins:
         let path = temp_config(MINIMAL_VALID);
         let args = PlanArgs {
             config: Some(path.clone()),
+            no_fetch: false,
             against: None,
             format: OutputFormat::Text,
             out: None,
@@ -7666,6 +9348,7 @@ origins:
         // Plan against itself: no changes -> exit 0.
         let args = PlanArgs {
             config: Some(path.clone()),
+            no_fetch: false,
             against: Some(path.clone()),
             format: OutputFormat::Text,
             out: None,
@@ -7678,6 +9361,7 @@ origins:
     fn handle_plan_missing_config_is_usage_error() {
         let args = PlanArgs {
             config: None,
+            no_fetch: false,
             against: None,
             format: OutputFormat::Text,
             out: None,

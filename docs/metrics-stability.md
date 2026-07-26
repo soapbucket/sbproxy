@@ -144,12 +144,16 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_clock_skew_seconds` | Gauge | `config_only` (nothing emits this yet) | `alpha` | none | Local clock offset from the SNTP reference, in seconds. |
 | `sbproxy_compression_decisions_total` | Counter | `stable` | `beta` | `codec`, `result` | Compression middleware decisions, by codec and outcome. |
 | `sbproxy_compression_ratio` | Histogram | `stable` | `beta` | `codec` | Achieved compression ratio (post_size / pre_size) when compression was applied. |
+| `sbproxy_config_authority_announce_total` | Counter | `stable` | `beta` | `result` | Config revision announcements published to the cluster, by result. |
 | `sbproxy_config_bundle_age_seconds` | Gauge | `stable` | `beta` | none | Seconds since this node received the config bundle it currently serves. |
 | `sbproxy_config_bundle_applied_degraded_total` | Counter | `stable` | `beta` | none | Config bundles applied while at least one subsystem stayed on prior state. |
 | `sbproxy_config_bundle_applied_total` | Counter | `stable` | `beta` | none | Config bundles applied with every subsystem reloaded cleanly. |
 | `sbproxy_config_bundle_fetch_total` | Counter | `stable` | `beta` | `result` | Config bundle fetch cycles, by result. |
+| `sbproxy_config_bundle_gossip_total` | Counter | `stable` | `beta` | `outcome` | Cluster config-revision announcement probes, by outcome. |
 | `sbproxy_config_bundle_revision` | Gauge | `stable` | `beta` | none | Authority revision of the config bundle this node currently serves. |
 | `sbproxy_config_reload_total` | Counter | `stable` | `beta` | `result` | Config reload attempts, by result. |
+| `sbproxy_config_source_fetch_total` | Counter | `stable` | `beta` | `kind`, `result` | Config source resolutions, by source kind and result. |
+| `sbproxy_config_source_revision_info` | Gauge | `stable` | `beta` | `sha` | Commit the config source resolved to; always 1, the commit is the label. |
 | `sbproxy_errors_total` | Counter | `stable` | `beta` | `hostname`, `error_type` | Total errors. |
 | `sbproxy_governance_fail_open_total` | Counter | `stable` | `beta` | `key_id` | Governed admissions that bypassed reservation because the governance backend was unavailable and failure_mode is allow_unreserved. |
 | `sbproxy_grpc_status_total` | Counter | `stable` | `beta` | `code` | Observed gRPC status codes, by canonical name. |

@@ -1961,6 +1961,143 @@ pub fn record_config_bundle_applied_degraded() {
     counter.inc();
 }
 
+// --- config source (git) metrics --------------------------------------
+//
+// A `source:` block resolves the config document from somewhere other
+// than the local file, today a git repository. These two families make a
+// stuck source as visible as a stale bundle: the counter says whether
+// the last resolution worked and why not, and the info gauge says which
+// commit the node is actually running.
+
+/// Count one config-source resolution on
+/// `sbproxy_config_source_fetch_total{kind,result}`.
+///
+/// `kind` is the `source.kind` that was resolved (`git` or
+/// `git_overlay`). `result` is a closed string:
+///
+/// | Result | Meaning |
+/// |---|---|
+/// | `ok` | Resolved, and the resolved commit differs from the one already serving, so it was compiled and applied. |
+/// | `not_modified` | Resolved to the commit already serving. No compile and no reload. |
+/// | `unreachable` | The remote could not be reached, or `git` is not installed. The cached document keeps serving. |
+/// | `timeout` | The fetch did not finish inside `timeout_secs` and the child process was killed. |
+/// | `revision_mismatch` | `revision` pins a commit sha and the resolved `HEAD` is a different commit. |
+/// | `verify_failed` | `verify_signature` is set and the tag or commit carries no signature this host can verify. |
+/// | `invalid` | The source block, the resolved path, or the resolved document itself is unusable. |
+/// | `compile_failed` | The resolved document did not compile, could not be constructed, or left a node-local `${VAR}` unresolved. |
+/// | `reload_busy` | Another reload held the reload lock; the cycle was skipped and the next interval retries. |
+pub fn record_config_source_fetch(kind: &'static str, result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_source_fetch_total",
+            "Config source resolutions, by source kind and result",
+            &["kind", "result"],
+        )
+        .expect("config source fetch counter registers")
+    });
+    counter.with_label_values(&[kind, result]).inc();
+}
+
+/// Publish the commit the config source resolved to on
+/// `sbproxy_config_source_revision_info{sha}`.
+///
+/// An info-style gauge: the value is always `1` and the commit travels
+/// as a label, which is how an operator joins "which config" onto every
+/// other series from this node. The previous label set is removed before
+/// the new one is set, so a node that has followed a branch for a year
+/// exports one series rather than a year of them.
+pub fn set_config_source_revision_info(sha: &str) {
+    use prometheus::{register_int_gauge_vec, IntGaugeVec};
+    use std::sync::{Mutex, OnceLock};
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    static CURRENT: Mutex<Option<String>> = Mutex::new(None);
+    let gauge = G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "sbproxy_config_source_revision_info",
+            "Commit the config source resolved to; always 1, the commit is the label",
+            &["sha"],
+        )
+        .expect("config source revision gauge registers")
+    });
+    let mut current = CURRENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if current.as_deref() == Some(sha) {
+        return;
+    }
+    if let Some(previous) = current.as_deref() {
+        let _ = gauge.remove_label_values(&[previous]);
+    }
+    gauge.with_label_values(&[sha]).set(1);
+    *current = Some(sha.to_string());
+}
+
+/// Count one config-revision announcement on
+/// `sbproxy_config_authority_announce_total{result}`.
+///
+/// An authority publishes its current revision into typed cluster state
+/// after every successful publication, so a mesh-member subscriber can pull
+/// on the hint rather than waiting out its poll interval. The announcement
+/// is an accelerator: `failed` costs propagation speed and nothing else,
+/// because polling converges on its own.
+///
+/// `result` is a closed string:
+///
+/// | Result | Meaning |
+/// |---|---|
+/// | `published` | Written into typed cluster state. |
+/// | `not_clustered` | This node has no mesh node, so there is nobody to tell. The ordinary case for a single-node authority serving subscribers over the internet. |
+/// | `failed` | The cluster write was refused or its owner was unreachable. Subscribers still converge on their poll interval. |
+pub fn record_config_authority_announce(result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_authority_announce_total",
+            "Config revision announcements published to the cluster, by result",
+            &["result"],
+        )
+        .expect("config authority announce counter registers")
+    });
+    counter.with_label_values(&[result]).inc();
+}
+
+/// Count one read of the cluster's config-revision announcement on
+/// `sbproxy_config_bundle_gossip_total{outcome}`.
+///
+/// Recorded once per probe by a mesh-member subscriber while it waits out
+/// its poll interval. `hint` is the interesting series: it counts the pulls
+/// gossip brought forward, so `rate(hint)` is what the accelerator is
+/// actually buying. Every other outcome leaves the subscriber on its
+/// interval.
+///
+/// `outcome` is a closed string:
+///
+/// | Outcome | Meaning |
+/// |---|---|
+/// | `hint` | An announced revision above this node's cursor. The poll interval was cut short and a full verify-and-apply pull ran. |
+/// | `stale` | An announced revision at or below this node's cursor. No fetch. |
+/// | `absent` | Nothing announced, or the announcement passed its TTL. |
+/// | `unreadable` | The announcement could not be read or did not validate. |
+pub fn record_config_bundle_gossip(outcome: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_bundle_gossip_total",
+            "Cluster config-revision announcement probes, by outcome",
+            &["outcome"],
+        )
+        .expect("config bundle gossip counter registers")
+    });
+    counter.with_label_values(&[outcome]).inc();
+}
+
 /// Count a well-known projection render failure on
 /// `sbproxy_projection_render_failures_total{projection}`. A non-zero
 /// value means a robots.txt / llms.txt / similar projection could not

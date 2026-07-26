@@ -1,6 +1,6 @@
 # Config authority: fleet configuration distribution
 
-*Last modified: 2026-07-25*
+*Last modified: 2026-07-26*
 
 One node signs a configuration and the rest of the fleet verifies it and applies it, so a change ships once instead of being copied to every box. Every payload carries an Ed25519 signature and a monotonic revision, and the authority validates it exactly the way boot does before it signs anything.
 
@@ -23,16 +23,39 @@ Configuration in a file is configuration you have to copy to every box. The usua
 
 The subscriber also owns a list of paths no authority can touch: `proxy.listeners`, `proxy.tls`, `proxy.admin`, `proxy.secrets`, `proxy.cluster`, `proxy.model_host`, `proxy.config_authority`, and `source`. A payload that names one is refused at publish time and, if it somehow arrives anyway, refused again at merge time. That is what keeps a fleet-wide push from taking away the admin port you would use to undo it.
 
+## Two ways to drive it
+
+Every step below is shown as a `curl` against the admin API, because that is the contract and a non-SBproxy control plane can implement it. The CLI wraps the same routes and is what you would actually use day to day:
+
+| Instead of | Run |
+|---|---|
+| generating a key by hand | `sbproxy config authority init --dir /etc/sbproxy` |
+| `POST .../subscribers` | `sbproxy config authority subscriber add edge-01` |
+| `POST .../publish` | `sbproxy config authority publish -f bundle.yml` |
+| `GET .../status` | `sbproxy config authority status` |
+| `POST .../subscribers/revoke` | `sbproxy config authority subscriber revoke --credential-id <id>` |
+| reading a diff out of the logs | `sbproxy config pull sb.yml --dry-run` on a subscriber |
+
+The CLI also runs the authority's own validation locally before it sends anything, so a payload that would be refused never spends a revision number, and it has an exit-code contract (`4` the authority refused, `7` the authority was unreachable) that a deploy script can branch on. See [manual.md](../../docs/manual.md#config-authority---operate-a-config-authority).
+
 ## Set up the authority
 
 Generate a signing key. It is a 32-byte Ed25519 seed in standard base64, and it must be owner-only:
 
 ```bash
+export ADMIN_PASSWORD=pick-a-real-one
 mkdir -p /var/lib/sbproxy/config-authority
+sbproxy config authority init --dir /etc/sbproxy
+export SB_CONFIG_AUTHORITY_SIGNING_KEY=/etc/sbproxy/authority-signing.key
+```
+
+`init` writes the seed to `authority-signing.key` at mode 0600 and the verifying-key file subscribers install to `authority-keys.json`, then prints what to copy where. It refuses to overwrite an existing signing key; `--force` rotates and keeps the old verifying key in the map so subscribers keep verifying while they are updated.
+
+By hand, if you would rather:
+
+```bash
 head -c 32 /dev/urandom | base64 > /etc/sbproxy/authority-signing.key
 chmod 600 /etc/sbproxy/authority-signing.key
-export SB_CONFIG_AUTHORITY_SIGNING_KEY=/etc/sbproxy/authority-signing.key
-export ADMIN_PASSWORD=pick-a-real-one
 ```
 
 A publishing node refuses to start with the shipped default admin password, whatever `proxy.admin.bind` says, and refuses to start if the signing key is missing, oversized, group-readable, or not a 32-byte seed. Both are startup failures rather than surprises during a change window.
@@ -167,6 +190,26 @@ curl -sS -u admin:"$ADMIN_PASSWORD" \
 ```
 
 `up_to_date` is the question an operator actually has during a rollout, so it is answered rather than left as arithmetic. `high_water_revision` above `current_revision` means a revision was reserved and never published, which happens when the process died mid-publish; the number is burned rather than reused, because a subscriber may already hold it.
+
+## Undo a bad revision
+
+```bash
+sbproxy config authority rollback
+```
+
+```json
+{
+  "schema_version": 1,
+  "revision": 3,
+  "restored_from_revision": 1,
+  "replaced_revision": 2,
+  "mode": "overlay"
+}
+```
+
+The store keeps the current bundle and the one before it for exactly this. Note that the number moves *forward*: the previous revision's payload is republished as a new revision rather than re-served under its old number, because a subscriber's replay cursor refuses any revision that is not greater than the one it applied. Re-serving revision 1 would reach only the nodes that had not yet taken 2, which is the opposite of what you want at that moment.
+
+The payload is revalidated on the way through, so a configuration that published cleanly before a binary upgrade and no longer constructs after one is refused here rather than pushed to the fleet. With nothing to go back to, the answer is `400` with code `no_previous_revision` and `"revision_consumed": false`.
 
 ## Retire a credential
 

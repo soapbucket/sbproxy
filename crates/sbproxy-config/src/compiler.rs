@@ -1552,24 +1552,93 @@ pub async fn compile_config_from_source(
     inline_text: &str,
     fetch_ctx: &crate::source::FetchContext,
 ) -> Result<CompiledConfig> {
-    // Pre-parse just the `source:` discriminator. We do this with a
-    // permissive lightweight type so a YAML that is mostly garbage
-    // still surfaces its source error here, rather than masking it
-    // behind a downstream schema error.
-    #[derive(serde::Deserialize)]
-    struct SourceHead {
-        #[serde(default)]
-        source: Option<crate::types::ConfigSource>,
+    compile_config_from_source_blocking(inline_text, fetch_ctx)
+}
+
+/// [`compile_config_from_source`] without the async wrapper.
+///
+/// The boot path and the reload transaction are both synchronous and run
+/// outside any tokio runtime, and the resolution itself never awaits
+/// anything: it shells out to `git` with a hard timeout and reads a
+/// file. So the production call sites use this and the async function
+/// above stays as a convenience for callers already in an async context.
+///
+/// # Errors
+///
+/// Returns an error if the top-level `source:` block cannot be parsed,
+/// if resolving a non-local config source fails, or if the resolved
+/// config fails to compile (see [`compile_config`]).
+pub fn compile_config_from_source_blocking(
+    inline_text: &str,
+    fetch_ctx: &crate::source::FetchContext,
+) -> Result<CompiledConfig> {
+    let resolved = crate::source::resolve_document(inline_text, fetch_ctx)
+        .map_err(|e| anyhow::anyhow!("config source: {e}"))?;
+    if resolved.is_remote() {
+        ensure_node_local_refs_resolved(&resolved.text)?;
     }
-    let head: SourceHead =
-        serde_yaml::from_str(inline_text).context("failed to parse top-level source: block")?;
-    let resolved = match head.source {
-        None | Some(crate::types::ConfigSource::Local) => inline_text.to_string(),
-        Some(src) => crate::source::load_from_source(&src, inline_text, fetch_ctx)
-            .await
-            .map_err(|e| anyhow::anyhow!("config source: {e}"))?,
-    };
-    compile_config(&resolved)
+    compile_config(&resolved.text)
+}
+
+/// Config paths whose value identifies *this* node and therefore must
+/// never be left as literal `${VAR}` text.
+///
+/// A shared repository carries `node_id: ${SB_NODE_ID}` and each host
+/// supplies its own value, which is the documented way one document
+/// serves a whole fleet. The failure mode without this check is quiet
+/// and bad: an unresolved reference is otherwise only a warning, so a
+/// host that forgot to export the variable would take the literal string
+/// `${SB_NODE_ID}` as its node id, join the cluster under it, and
+/// collide with every other host that forgot.
+///
+/// Scoped to `proxy.cluster` because that is the block
+/// `ClusterRestartFingerprint` covers: any change to it rejects a reload
+/// outright, so a wrong value there is not something a later reload can
+/// repair.
+pub const NODE_LOCAL_PATH_PREFIXES: &[&str] = &["proxy.cluster"];
+
+/// Refuse a resolved remote document that leaves a node-local value as
+/// literal `${VAR}` text.
+///
+/// Apply this to a document that came from a `source:` block, never to a
+/// hand-edited local file: the local file's operator is watching the log,
+/// the existing warning is enough for them, and tightening it would break
+/// configs that work today.
+///
+/// Called from both entry points that turn a resolved source into a
+/// running configuration, because they are separate paths:
+/// [`compile_config_from_source_blocking`] is what the CLI and the tests
+/// use, and the server's boot and reload paths resolve and compile in two
+/// steps so they can publish the resolved document for the
+/// config-authority merge base.
+///
+/// # Errors
+///
+/// Returns an error naming every offending path.
+pub fn ensure_node_local_refs_resolved(resolved_text: &str) -> Result<()> {
+    let unresolved = unresolved_env_references(resolved_text);
+    let offending: Vec<&String> = unresolved
+        .iter()
+        .filter(|entry| {
+            let path = entry.split(':').next().unwrap_or_default().trim();
+            NODE_LOCAL_PATH_PREFIXES
+                .iter()
+                .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}.")))
+        })
+        .collect();
+    if offending.is_empty() {
+        return Ok(());
+    }
+    let listed = offending
+        .iter()
+        .map(|entry| entry.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "the resolved config source leaves node-local reference(s) unresolved: {listed}. These \
+         identify this node, so the literal placeholder text cannot be used as a value: export \
+         the environment variable(s) on this host, or move the value into a node-local overlay"
+    )
 }
 
 /// Compile a single origin from its raw config.

@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-25*
+*Last modified: 2026-07-26*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -47,8 +47,9 @@ For AI-specific features in depth, see [ai-gateway.md](ai-gateway.md). For CEL, 
 37. [Environment variables](#environment-variables)
 38. [ACME / auto TLS](#acme--auto-tls)
 39. [Redis integration](#redis-integration)
-40. [Config authority](#config-authority-fleet-configuration-distribution)
-41. [Validation](#validation)
+40. [Config source (GitOps)](#config-source-gitops)
+41. [Config authority](#config-authority-fleet-configuration-distribution)
+42. [Validation](#validation)
 
 ---
 
@@ -4318,6 +4319,186 @@ the L2 connection.
 
 ---
 
+## Config source (GitOps)
+
+The top-level `source:` block says where the configuration document comes from. Without it, the file you hand the binary *is* the configuration, which is the historical behaviour and still the default. With it, that file is a pointer and the document it names is what compiles, boots, and serves traffic.
+
+Earlier releases parsed this block, published it in the JSON Schema, and then ignored it: a proxy configured with `source: {kind: git}` started clean and quietly served whatever was in the local file. That is fixed. The block is honoured at boot, on every reload, on a refresh timer, and by `sbproxy validate` and `sbproxy plan`. A `source:` block that cannot be resolved now stops the proxy starting instead of being skipped.
+
+```yaml
+source:
+  kind: git
+  repo: https://github.com/acme/sbproxy-config.git
+  revision: main                  # branch, tag, or a full commit sha
+  path: production/sb.yml
+  credential: env:SB_GIT_TOKEN    # private repositories only
+  verify_signature: false
+  timeout_secs: 60
+  refresh_interval_secs: 60
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `kind` | enum | required | `local` (the file is the config, same as omitting the block), `git`, or `git_overlay`. |
+| `repo` | string | required for `git` | Any URL `git clone` accepts. `https` and `ssh` both work. |
+| `revision` | string | default branch | A branch, a tag, or a full 40- or 64-character commit sha. A full sha is a pin, see below. |
+| `path` | string | required for `git` | Path to the config file inside the repository. Relative, and `..` components are refused: this names a file in the repository, not a file on the proxy host. |
+| `credential` | secret ref | | `env:NAME`, `${NAME}`, `file:/path`, or `secret://backend/name`. An inline literal is refused. |
+| `verify_signature` | bool | `false` | Require a verifiable signature on the resolved tag or commit. |
+| `timeout_secs` | int | `60` | Hard timeout for one fetch, 1 to 3600. The `git` child process is killed when it expires. |
+| `refresh_interval_secs` | int | `60` | How often to re-resolve while running. `0` resolves at boot and on ordinary reloads only. |
+
+### What a git source proves, and what it does not
+
+Transport trust: HTTPS plus whatever the git host authenticated the fetch as. There is no signature over the document and no provenance beyond "the remote served this". That is the same guarantee every GitOps tool offers and it is a reasonable place to stand, but it is **not** the guarantee a [signed config bundle](#config-authority-fleet-configuration-distribution) carries. If someone can write to the repository, or to the branch, they can change what your proxies run.
+
+Two settings close most of that gap, and both are yours to choose:
+
+- **Pin `revision` to a full commit sha.** After fetching, SBproxy resolves `HEAD` and refuses the document when it is not the commit you named. A branch moving underneath a pinned node cannot be followed silently, and a pinned node never reloads on someone else's push.
+- **Set `verify_signature: true`.** The resolved tag is checked first, then the commit, and a missing or unverifiable signature refuses the document. The signing key has to be in the git trust store on the proxy host.
+
+### `git` is a runtime dependency
+
+Resolution shells out to the `git` binary, so every host that resolves a git source needs `git` installed, container images included. A missing binary is a named failure that says so rather than a confusing clone error, and `sbproxy doctor` reports it in the `tooling` block:
+
+```text
+tooling
+  git         /usr/bin/git (git version 2.43.0)
+```
+
+One implementation note, because it changes what your git server has to allow: `git clone --depth 1` cannot fetch an arbitrary commit sha unless the server sets `uploadpack.allowReachableSHA1InWant`. Pinning to a sha therefore fetches the single commit when the server allows it and falls back to a full fetch when it does not. Pinning works either way; on a server without that setting it costs a full clone.
+
+### Refresh
+
+The resolved commit is the change detector. Each cycle re-resolves the source and compares: an unchanged commit means no recompile and no reload, exactly the way an unchanged `ETag` ends an authority poll. A moved commit compiles and applies through the same three-phase reload transaction a SIGHUP takes, so a document that does not compile leaves the previous configuration serving.
+
+The interval carries jitter, so a fleet that restarts together does not hit your git host in lockstep. The apply step never waits for the reload lock: another reload in flight skips the cycle and the next interval retries, rather than queueing up cycles for a commit that has since been superseded.
+
+| Situation | Behaviour |
+|---|---|
+| Remote unreachable, or `git` missing | Keep serving the document already applied. Error log, `unreachable` counter. |
+| Fetch exceeded `timeout_secs` | Child process killed. Keep serving. `timeout`. |
+| `revision` pins a sha and `HEAD` is a different commit | Refuse the document. `revision_mismatch`. |
+| `verify_signature` set and no verifiable signature | Refuse the document. `verify_failed`. |
+| Resolved document does not compile or cannot be constructed | Refuse the document. `compile_failed`. |
+| Another reload in flight | Skip the cycle. `reload_busy`. |
+| Resolved commit unchanged | Nothing at all. `not_modified`. |
+
+**Observability.** `sbproxy_config_source_fetch_total{kind,result}` counts one label per cycle, and `sbproxy_config_source_revision_info{sha}` carries the commit currently serving as a label with a constant value of `1`, so you can join "which config" onto every other series from that node.
+
+**Drift.** `GET /admin/drift` answers "has the local file changed since we read it?", so on a git-sourced node both sides of that comparison are the pointer file and drift stays `false` while the repository moves. Whether the *source* moved is what `sbproxy_config_source_revision_info` answers.
+
+### Node identity in a shared repository
+
+One repository pointed at by a whole fleet cannot carry `proxy.cluster` as written. Nearly every field in that block is a per-node fact, and changing any of them rejects the entire reload, so either every node claims the same `node_id` or the repository omits the block and every clustered node hard-fails.
+
+**The supported pattern is `${VAR}` interpolation.** The shared document names the per-node values and each host exports them:
+
+```yaml
+# in the repository, shared by the whole fleet
+proxy:
+  cluster:
+    cluster_id: prod-eu
+    node_id: ${SB_NODE_ID}
+    advertise_addr: ${SB_ADVERTISE_ADDR}:7946
+    roles: [gateway, worker]
+```
+
+Environment is the natural carrier in containers and Kubernetes, which is where a shared repository is most likely, and it needs no second document to keep in sync.
+
+Anywhere else in the config, an unresolved `${VAR}` is a warning and stays as literal text. **Under `proxy.cluster` in a resolved source document it is a hard failure**, because a host that forgot to export its node id would otherwise join the cluster under the literal string `${SB_NODE_ID}` and collide with every other host that forgot the same thing:
+
+```text
+the resolved config source leaves node-local reference(s) unresolved:
+proxy.cluster.node_id: ${SB_NODE_ID}. These identify this node, so the literal
+placeholder text cannot be used as a value: export the environment variable(s)
+on this host, or move the value into a node-local overlay
+```
+
+If a repository document changes the cluster fingerprint on a running node, the reload refusal now names the fields rather than saying only that something changed:
+
+```text
+process-owned cluster configuration changed and cannot be applied to a running
+process (changed field(s): proxy.cluster.node_id, proxy.cluster.seeds); restart
+sbproxy to adopt it.
+```
+
+`kind: git_overlay` is the alternative when the difference between nodes is structural rather than a handful of scalars. It resolves a base source and then merges ordered overlays on top of it, each of which is itself a source:
+
+```yaml
+source:
+  kind: git_overlay
+  base:
+    kind: git
+    repo: https://github.com/acme/sbproxy-config.git
+    revision: main
+    path: fleet/sb.yml
+  overlays:
+    - kind: git
+      repo: https://github.com/acme/sbproxy-config.git
+      revision: main
+      path: sites/eu-west/sb.yml
+```
+
+Overlays merge map by map with the overlay winning, sequences replace wholesale, and the chain is capped at eight levels deep. Every resolved commit contributes to the change detector, so a move in any input triggers one reload of the merged document.
+
+### Three deployment shapes
+
+**1. Standalone GitOps.** A `source:` block and no `proxy.config_authority`. The repository is the whole configuration and the proxy follows it on a timer. No signing infrastructure, no control plane, nothing to run.
+
+```yaml
+source:
+  kind: git
+  repo: https://github.com/acme/sbproxy-config.git
+  revision: main
+  path: production/sb.yml
+```
+
+**2. A git base with a signed authority overlay.** The local file declares a git source and also subscribes to an authority. Resolution order is fixed: the source resolves first and produces the base document, then the authority's signed overlay merges on top, then it compiles. **The authority wins over git**, key by key, because the [deny list](#what-the-subscriber-owns-outright) is what protects the box and the authority is the layer it is enforced against. Git content is operator-owned and therefore unrestricted, which is right: it is equivalent to editing the file by hand.
+
+```yaml
+source:
+  kind: git
+  repo: https://github.com/acme/sbproxy-config.git
+  revision: main
+  path: production/sb.yml
+proxy:
+  config_authority:
+    upstream:
+      url: https://control.example.com:9443
+      mode: overlay
+      subscriber_id: edge-01
+      credential: env:SB_CONFIG_AUTHORITY_TOKEN
+      verifying_keys_file: /etc/sbproxy/authority-keys.json
+      cache_path: /var/lib/sbproxy/config-bundle.json
+```
+
+You keep your own baseline in your repository and central policy still lands on it. Neither layer is locally owned, so a local edit is doomed either way. The merge records where every leaf in the result came from, and that provenance now has three values rather than two: `local`, `git`, and `authority`. A leaf from the git base carries the repository, the reference, and the resolved commit, which is what makes "why is this value here" answerable. An admin surface that serves the provenance map is not part of this version.
+
+When the repository moves, the refresh cycle re-applies the authority overlay it already holds on top of the new base, rather than reloading the repository's document alone. Otherwise there would be a window, one poll interval wide, where the node serves neither layer's answer.
+
+**3. A git-backed authority.** The authority's own published document declares a git source. It resolves that document, then validates, signs, stores, and distributes the *resolved* content. Customers keep configuration in their own repository, and the authority signs and fans it out.
+
+Signing the pointer instead would hand every subscriber a URL to fetch for itself, which is transport trust rather than the signed guarantee that endpoint promises. And because the resolved document is screened like any other payload, a repository whose configuration declares its own `source:` block is refused: `source` is on the deny list, since the authority overlays a base document and does not get to choose where that base comes from.
+
+### Validating a git-sourced config
+
+`sbproxy validate` and `sbproxy plan` resolve the source, so they check the document that would actually boot. Both accept `--no-fetch` to skip resolution, for a machine with no network or no credential for the repository, and both say so on stderr rather than passing silently:
+
+```bash
+sbproxy validate /etc/sbproxy/sb.yml
+sbproxy validate /etc/sbproxy/sb.yml --no-fetch
+# note: '/etc/sbproxy/sb.yml' declares a `source:` block and --no-fetch was
+# passed, so only the pointer file was checked. The document this proxy would
+# actually serve was not looked at.
+```
+
+### Not in this version
+
+No write-back: nothing here commits to a repository. Be aware that on a git-sourced node the admin config editor still writes the local pointer file, which the next refresh then resolves past, so the repository is the only place a configuration change sticks. Making that editor read-only is not part of this version. No `db` source kind, no submodule or LFS support, and no in-process git implementation; the `git` binary stays the transport.
+
+---
+
 ## Config authority (fleet configuration distribution)
 
 Configuration in a file is configuration you have to copy to every box. `proxy.config_authority` replaces the copying: one node signs a configuration and the rest verify it and apply it, through the same reload transaction a SIGHUP takes.
@@ -4419,14 +4600,32 @@ A publish payload is bounded by the admin server's request-body limit (512 KiB) 
 
 ### Admin routes
 
-All four sit on the admin listener behind operator auth and RBAC.
+All five sit on the admin listener behind operator auth and RBAC.
 
 | Route | Method | Purpose |
 |---|---|---|
 | `/admin/config-authority/publish` | `POST` | Body is the YAML payload; `?mode=overlay\|replace` selects how subscribers apply it (default `overlay`). |
+| `/admin/config-authority/rollback` | `POST` | Republish the previous stored revision's payload. No body, no query. |
 | `/admin/config-authority/status` | `GET` | Current revision, digest, ETag, key ID, the verifying-key file to distribute, and per-subscriber last-seen revision. |
 | `/admin/config-authority/subscribers` | `GET` / `POST` | List subscribers, or register one with `{"subscriber_id":"edge-01"}`. |
 | `/admin/config-authority/subscribers/revoke` | `POST` | `{"credential_id":"..."}` for one credential, `{"subscriber_id":"..."}` for every credential that node holds. |
+
+Operating these from `curl` is possible but nobody should have to.
+`sbproxy config authority {init|publish|status|rollback|subscriber}` is the
+same surface with local validation, an exit-code contract, and
+`--format json`; `sbproxy config pull --dry-run` previews what a
+subscriber would apply next without applying it. See
+[manual.md](manual.md#config-authority---operate-a-config-authority).
+
+`rollback` republishes the previous payload under a *new* revision number
+rather than re-serving the old one. A subscriber's anti-replay cursor
+refuses any revision that is not greater than the one it applied, so
+re-serving the old number would reach only the nodes that had not yet
+taken the revision being undone. The payload is revalidated on the way
+through, since a payload that published cleanly before a binary upgrade
+need not still construct after one. With nothing to go back to, the route
+answers `400` with code `no_previous_revision` and
+`"revision_consumed": false`.
 
 Registration returns the clear credential exactly once. The authority stores only a SHA-256 fingerprint of it, so the registry file is not a credential store: someone who reads it cannot authenticate with it. Credentials look like `sbca1.<credential-id>.<secret>` and are long-lived and reusable, unlike the single-use `sbce1` cluster enrollment tokens.
 

@@ -15,8 +15,13 @@
 //!    algorithm, and expiry are all checked by
 //!    [`sbproxy_config::SignedConfigBundle::verify_at`]; this module adds only the
 //!    declared-mode check and the anti-replay cursor probe.
-//! 3. Merge the payload over the local document with
-//!    [`sbproxy_config::merge_config`], as [`sbproxy_config::BaseOrigin::Local`], in the configured mode.
+//! 3. Merge the payload over the base document with
+//!    [`sbproxy_config::merge_config`], in the configured mode. The base
+//!    is the local file, or, on a node whose local file declares a
+//!    `source:` block, the document that source resolved to. The
+//!    [`sbproxy_config::BaseOrigin`] tag follows: `local` for a local
+//!    file, `git` for a resolved repository, so the provenance map has
+//!    three values rather than two.
 //! 4. Refuse a merged document that still carries an unresolved
 //!    `${VAR}` reference.
 //! 5. Apply through `try_reload_from_config_yaml`, the same three-phase
@@ -32,6 +37,23 @@
 //! a revision that has already been superseded. So the apply step uses
 //! the try-lock entry point and reports `reload_busy` instead, and the
 //! next interval retries with whatever the authority is serving by then.
+//!
+//! # Polling is the required path; gossip only shortens the wait
+//!
+//! Every subscriber converges by polling, on `poll_interval`, and that is
+//! what the contract promises. A subscriber that also happens to be a mesh
+//! member gets an accelerator on top: the authority announces its current
+//! revision into typed cluster state, and
+//! [`crate::config_subscriber::ConfigSubscriber::await_next_cycle`] cuts the
+//! interval short when it sees a revision this node does not hold. The pull
+//! it triggers is the same cycle as any other, with every verification step
+//! intact; nothing gossiped is ever adopted as configuration. See
+//! [`crate::config_gossip`].
+//!
+//! A subscriber with no mesh node holds no watcher and takes none of that
+//! code: `await_next_cycle` is one `sleep`. That case is not an afterthought,
+//! it is the common one. Managed-service subscribers reach the authority over
+//! the internet and are in nobody's gossip cluster.
 //!
 //! # Failure behaviour
 //!
@@ -117,6 +139,101 @@ const JITTER_FRACTION: f64 = 0.15;
 /// hostile authority cannot make a subscriber buffer the whole stream
 /// first.
 const MAX_RESPONSE_BYTES: usize = 2 * MAX_CONFIG_YAML_BYTES + 64 * 1024;
+
+/// The authority payload this node last applied, kept so a document
+/// resolved from a `source:` block can have the same overlay re-applied
+/// on top of it.
+///
+/// Resolution order is fixed: the source document is the base and the
+/// authority overlay goes on top. Without this, a git source that moved
+/// would reload the repository's document alone and silently drop
+/// central policy until the next authority poll, which is a fleet-wide
+/// window where the configuration is not what either layer says it is.
+///
+/// The payload was verified before it was applied, so re-merging it
+/// needs no signature check. Only the payload is kept, never a key.
+#[derive(Debug, Clone)]
+struct AppliedBundle {
+    config_yaml: String,
+    merge_mode: MergeMode,
+    revision: u64,
+    authority_id: String,
+}
+
+/// The authority payload currently applied on this node, if any.
+static APPLIED_BUNDLE: std::sync::Mutex<Option<AppliedBundle>> = std::sync::Mutex::new(None);
+
+/// Record the authority payload this node has applied.
+fn record_applied_bundle(bundle: &ConfigBundle) {
+    let mut slot = APPLIED_BUNDLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = Some(AppliedBundle {
+        config_yaml: bundle.config_yaml.clone(),
+        merge_mode: match bundle.mode {
+            BundleMode::Overlay => MergeMode::Overlay,
+            BundleMode::Replace => MergeMode::Replace,
+        },
+        revision: bundle.revision,
+        authority_id: bundle.authority_id.clone(),
+    });
+}
+
+/// Merge the authority payload this node already applied over a freshly
+/// resolved base document.
+///
+/// `Ok(None)` means this node has no authority overlay, so the base
+/// document is the effective document and the caller applies it
+/// unchanged. That is the standalone-GitOps shape and the common case.
+///
+/// Called by the config-source refresh poller so a moved commit lands
+/// underneath the authority's document rather than replacing it. The
+/// deny list still applies: an authority payload naming `source:` was
+/// already refused when it was first merged, and it is refused again
+/// here.
+///
+/// # Errors
+///
+/// Returns an error when the merge fails, including when the recorded
+/// payload names a subscriber-owned path.
+pub fn overlay_applied_bundle(
+    base_yaml: &str,
+    base_origin: BaseOrigin,
+) -> anyhow::Result<Option<String>> {
+    let applied = {
+        let slot = APPLIED_BUNDLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.clone()
+    };
+    let Some(applied) = applied else {
+        return Ok(None);
+    };
+    let merged = merge_config(
+        base_yaml,
+        base_origin,
+        &applied.config_yaml,
+        applied.merge_mode,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "re-merging authority {} revision {} over the resolved source document failed: \
+             {error}",
+            applied.authority_id,
+            applied.revision
+        )
+    })?;
+    Ok(Some(merged.merged_yaml))
+}
+
+/// Forget the applied authority payload. Test-only.
+#[doc(hidden)]
+pub fn clear_applied_bundle() {
+    let mut slot = APPLIED_BUNDLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = None;
+}
 
 /// Cursor rendered as an HTTP entity tag, or `None` when nothing has been
 /// applied yet and every revision is new.
@@ -361,6 +478,25 @@ pub struct ConfigSubscriber {
     /// Local receipt time of the bundle currently serving, if any.
     received_at_unix_ms: Option<u64>,
     client: reqwest::Client,
+    /// The gossip accelerator, present only on a mesh member.
+    ///
+    /// `None` is the whole of the non-mesh code path: a subscriber without a
+    /// watcher sleeps out its jittered interval exactly as it did before the
+    /// accelerator existed. Managed-service subscribers are in nobody's
+    /// gossip cluster, so that path is the one that has to stay boring.
+    gossip: Option<crate::config_gossip::ConfigGossipWatcher>,
+    /// Cursor revision at which a gossip hint last shortened the wait.
+    ///
+    /// Bounds the accelerator to one early pull per applied revision. Without
+    /// it, an announcement the pull cannot satisfy (a revision this node
+    /// refuses, a peer announcing a number no authority ever served, a reload
+    /// that stays busy) would still be a hint on the next probe, and the next,
+    /// so the subscriber would fetch on the probe cadence instead of the poll
+    /// interval: fast enough to trip the authority's own per-subscriber rate
+    /// limit and turn a speed-up into a stream of `429`s. One pull per
+    /// revision means a hint that does not move the cursor costs exactly one
+    /// extra fetch, after which this node is back on its interval.
+    gossip_pulled_at_cursor: Option<u64>,
 }
 
 impl std::fmt::Debug for ConfigSubscriber {
@@ -377,6 +513,7 @@ impl std::fmt::Debug for ConfigSubscriber {
             .field("mode", &self.mode)
             .field("keys", &self.keys.as_ref().map(VerifyingKeySet::len))
             .field("cursor", &self.cursor)
+            .field("gossip_accelerated", &self.gossip.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -439,9 +576,36 @@ impl ConfigSubscriber {
             cursor,
             received_at_unix_ms: None,
             client,
+            // Deliberately not resolved here. Construction runs from
+            // `fold_boot_bundle`, which the boot path calls before the
+            // process cluster is installed, so asking for a handle now would
+            // always answer `None` and quietly disable the accelerator on
+            // every clustered node. `run` resolves it instead, by which
+            // point the cluster is up.
+            gossip: None,
+            gossip_pulled_at_cursor: None,
         };
         subscriber.load_keys();
         Ok(subscriber)
+    }
+
+    /// Install a gossip accelerator, replacing any already attached.
+    ///
+    /// [`Self::run`] resolves the process cluster's watcher on its own, so
+    /// production never needs this. It exists so a test can point a
+    /// subscriber at a specific cluster handle without installing a
+    /// process-wide one.
+    pub fn attach_gossip(&mut self, watcher: crate::config_gossip::ConfigGossipWatcher) {
+        self.gossip = Some(watcher);
+    }
+
+    /// Whether a gossip accelerator is attached.
+    ///
+    /// `false` is the non-mesh subscriber: it converges by polling and takes
+    /// no cluster code path at all.
+    #[must_use]
+    pub const fn is_gossip_accelerated(&self) -> bool {
+        self.gossip.is_some()
     }
 
     /// Revision this node currently serves. Zero means none applied.
@@ -568,7 +732,7 @@ impl ConfigSubscriber {
 
         let merged = match merge_config(
             base_yaml,
-            BaseOrigin::Local,
+            base_origin_for(base_yaml),
             &bundle.config_yaml,
             self.merge_mode,
         ) {
@@ -663,6 +827,11 @@ impl ConfigSubscriber {
         }
 
         let received_at_unix_ms = now_unix_ms();
+        // Recorded so the config-source refresh poller can put this same
+        // overlay back on top of a newly resolved base document, which is
+        // what keeps the documented resolution order true on every apply
+        // rather than only on the authority's own cycles.
+        record_applied_bundle(&candidate.signed.bundle);
         self.cursor = candidate.cursor;
         self.received_at_unix_ms = Some(received_at_unix_ms);
         self.persist(&candidate.signed, received_at_unix_ms);
@@ -775,12 +944,21 @@ impl ConfigSubscriber {
         }
     }
 
-    /// Read the local document that every merge uses as its base.
+    /// Read the document that every merge uses as its base.
+    ///
+    /// On a node whose local file declares a `source:` block, the base is
+    /// the document that source resolved to, not the pointer file. The
+    /// pointer file is a few lines naming a repository; merging a bundle
+    /// over it would discard the whole configuration the repository
+    /// carries.
     ///
     /// `None` is a refusal, not an empty base: merging over a document
     /// this node cannot read would silently discard whatever the operator
     /// put in it.
     fn read_base_document(&self) -> Option<String> {
+        if let Some(base) = crate::config_source::current_resolved_base() {
+            return Some(base.yaml.clone());
+        }
         match std::fs::read_to_string(&self.config_path) {
             Ok(yaml) => Some(yaml),
             Err(error) => {
@@ -923,25 +1101,73 @@ impl ConfigSubscriber {
         result
     }
 
+    /// Sleep until the next cycle is due.
+    ///
+    /// The jittered poll interval, cut short when a cluster peer announces a
+    /// revision this node does not hold. Returns what woke it.
+    ///
+    /// Without a gossip accelerator this is one `sleep` and nothing else,
+    /// which is exactly what a non-mesh subscriber does and the only thing it
+    /// does.
+    ///
+    /// At most one wait per applied revision is shortened; see
+    /// `gossip_pulled_at_cursor` for why.
+    pub async fn await_next_cycle(&mut self) -> crate::config_gossip::CycleTrigger {
+        use crate::config_gossip::CycleTrigger;
+
+        let interval = jitter(self.poll_interval);
+        let Some(watcher) = self.gossip.as_ref() else {
+            tokio::time::sleep(interval).await;
+            return CycleTrigger::Interval;
+        };
+        if self.gossip_pulled_at_cursor == Some(self.cursor.revision) {
+            // A hint already bought this revision an early pull and the pull
+            // did not move the cursor. Whatever the announcement is saying,
+            // this node cannot act on it, so stop asking faster than the
+            // interval and let the ordinary cycle keep retrying.
+            tokio::time::sleep(interval).await;
+            return CycleTrigger::Interval;
+        }
+        let trigger = watcher.wait(self.cursor.revision, interval).await;
+        if trigger == CycleTrigger::Gossip {
+            self.gossip_pulled_at_cursor = Some(self.cursor.revision);
+            tracing::info!(
+                trigger = trigger.as_str(),
+                applied_revision = self.cursor.revision,
+                "a cluster peer announced a config revision this node does not hold; polling the \
+                 authority now rather than waiting out the interval",
+            );
+        }
+        trigger
+    }
+
     /// Poll forever, with jitter.
     ///
     /// The first sleep is a random fraction of a whole interval so a
     /// fleet that restarted together does not arrive at the authority in
     /// lockstep; every later sleep is the interval plus or minus the
-    /// documented jitter fraction of it.
+    /// documented jitter fraction of it, or less when a cluster peer
+    /// announces a newer revision first.
     pub async fn run(mut self) {
+        // Resolved here rather than at construction: this runs from the
+        // boot path's task spawn, after the process cluster is installed.
+        // A watcher already attached by a caller wins, so a test can pin one.
+        if self.gossip.is_none() {
+            self.gossip = crate::config_gossip::ConfigGossipWatcher::process();
+        }
         tracing::info!(
             authority_url = %self.base_url,
             subscriber_id = %self.subscriber_id,
             mode = %format_mode(self.mode),
             poll_interval_secs = self.poll_interval.as_secs(),
             revision = self.cursor.revision,
+            gossip_accelerated = self.is_gossip_accelerated(),
             "config authority subscriber started",
         );
         tokio::time::sleep(self.poll_interval.mul_f64(random_unit())).await;
         loop {
             self.poll_once().await;
-            tokio::time::sleep(jitter(self.poll_interval)).await;
+            self.await_next_cycle().await;
         }
     }
 
@@ -998,6 +1224,7 @@ impl ConfigSubscriber {
             ));
         }
 
+        record_applied_bundle(&cached.bundle.bundle);
         self.cursor = candidate.cursor;
         self.received_at_unix_ms = Some(cached.received_at_unix_ms);
         // A cache seeded by hand may arrive without a cursor beside it, so
@@ -1117,6 +1344,20 @@ pub fn spawn(subscriber: Option<ConfigSubscriber>) {
         .ok();
 }
 
+/// The provenance tag for a merge base document.
+///
+/// `Git` only when the base actually is the document a `source:` block
+/// resolved to, compared by content rather than assumed: the tag ends up
+/// in the provenance map an operator reads to answer "who set this
+/// value", and a tag that names a repository the value did not come from
+/// is worse than no tag at all.
+fn base_origin_for(base_yaml: &str) -> BaseOrigin {
+    match crate::config_source::current_resolved_base() {
+        Some(base) if base.yaml == base_yaml => base.origin.clone(),
+        _ => BaseOrigin::Local,
+    }
+}
+
 /// Cursor file that accompanies one cache file.
 fn cursor_path_for(cache_path: &Path) -> PathBuf {
     let mut name = cache_path
@@ -1141,39 +1382,9 @@ fn cursor_path_for(cache_path: &Path) -> PathBuf {
 /// arriving at the authority as a bearer credential is the failure this
 /// avoids.
 fn resolve_credential(reference: &str) -> anyhow::Result<String> {
-    let reference = reference.trim();
-    let normalized = match reference.strip_prefix("env:") {
-        Some(name) => format!("${{{name}}}"),
-        None => reference.to_string(),
-    };
-    if let Some(resolver) = sbproxy_vault::process_resolver() {
-        return resolver.resolve(&normalized).map_err(|error| {
-            anyhow::anyhow!("resolve proxy.config_authority.upstream.credential: {error:#}")
-        });
-    }
-    if let Some(name) = normalized
-        .strip_prefix("${")
-        .and_then(|rest| rest.strip_suffix('}'))
-    {
-        return std::env::var(name).map_err(|_| {
-            anyhow::anyhow!(
-                "proxy.config_authority.upstream.credential names the environment variable \
-                 {name}, which is not set"
-            )
-        });
-    }
-    if let Some(path) = normalized.strip_prefix("file:") {
-        return std::fs::read_to_string(path)
-            .map(|token| token.trim().to_string())
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "read proxy.config_authority.upstream.credential file '{path}': {error}"
-                )
-            });
-    }
-    anyhow::bail!(
-        "proxy.config_authority.upstream.credential references the secret '{reference}' but no \
-         secret backend is configured to resolve it; declare one under proxy.secrets.backends"
+    crate::config_source::resolve_secret_reference(
+        reference,
+        "proxy.config_authority.upstream.credential",
     )
 }
 

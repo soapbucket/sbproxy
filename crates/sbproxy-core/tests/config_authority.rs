@@ -509,6 +509,61 @@ origins:
 }
 
 #[test]
+fn rollback_republishes_the_previous_payload_as_a_new_revision() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let authority = authority(temp.path());
+
+    // Nothing published: there is nothing to go back to, and saying so is
+    // better than inventing an empty document.
+    let error = authority
+        .rollback()
+        .expect_err("a rollback with no history must be refused");
+    assert_eq!(error.code(), "no_previous_revision", "{error}");
+    assert!(error.is_request_fault());
+
+    authority
+        .publish(&payload("api.test", "good"), BundleMode::Overlay)
+        .expect("publish the good revision");
+    // One revision is still not enough: rolling back from 1 would leave
+    // nothing serving.
+    assert_eq!(
+        authority
+            .rollback()
+            .expect_err("one revision is not a history")
+            .code(),
+        "no_previous_revision",
+    );
+
+    authority
+        .publish(&payload("api.test", "regrettable"), BundleMode::Overlay)
+        .expect("publish the regrettable revision");
+    assert_eq!(authority.current_revision(), 2);
+
+    let rolled_back = authority.rollback().expect("rollback");
+    assert_eq!(rolled_back.restored_from_revision, 1);
+    assert_eq!(rolled_back.replaced_revision, 2);
+    assert_eq!(
+        rolled_back.outcome.revision, 3,
+        "a rollback must move forward: a subscriber's cursor refuses any revision that is not \
+         greater than the one it applied, so re-serving revision 1 would reach nobody who had \
+         already taken 2",
+    );
+    assert_eq!(authority.current_revision(), 3);
+
+    // The content really is revision 1's, byte for byte, which is what makes
+    // the digest comparison below meaningful rather than incidental.
+    let digest_of_good = sbproxy_config::config_bundle::ConfigBundle::content_digest_of(&payload(
+        "api.test", "good",
+    ));
+    assert_eq!(rolled_back.outcome.content_digest, digest_of_good);
+    assert_eq!(
+        authority.status()["current_content_digest"],
+        serde_json::json!(digest_of_good),
+    );
+    assert_eq!(authority.status()["previous_revision"], 2);
+}
+
+#[test]
 fn a_deny_listed_path_is_rejected_at_publish() {
     let temp = tempfile::tempdir().expect("temp dir");
     let authority = authority(temp.path());
@@ -535,6 +590,19 @@ fn a_deny_listed_path_is_rejected_at_publish() {
             ),
             Err(error) => error,
         };
+        if *path == "source" {
+            // `source` is the one deny-listed path that is legitimate in a
+            // *submitted* payload: that is how a git-backed authority points
+            // at the repository it publishes from. The deny-list applies to
+            // the *resolved* document, so this submission is read as a
+            // pointer and refused for being a malformed one rather than for
+            // naming a denied path. Refusal either way, but for the accurate
+            // reason. The resolved-document case is covered by
+            // `an_authority_bundle_carrying_source_is_rejected` in
+            // sbproxy-config's config_source_git tests.
+            assert_eq!(error.code(), "invalid_payload", "{path}: {error}");
+            continue;
+        }
         assert_eq!(error.code(), "denied_path", "{path}: {error}");
         assert!(error.to_string().contains(path), "{path}: {error}");
     }
@@ -1224,8 +1292,18 @@ async fn the_admin_routes_publish_register_revoke_and_report() {
     assert_eq!(revoked["revoked"], true);
     assert_eq!(authority.serve_bundle(&fetch(&token, None)).status, 403);
 
+    // Rollback republishes revision 1's payload as revision 3, and says
+    // where it came from.
+    let (status, rolled_back) = call("POST", "/admin/config-authority/rollback", None);
+    assert_eq!(status, 200, "{rolled_back}");
+    assert_eq!(rolled_back["revision"], 3);
+    assert_eq!(rolled_back["restored_from_revision"], 1);
+    assert_eq!(rolled_back["replaced_revision"], 2);
+    assert_eq!(rolled_back["key_id"], KEY_ID);
+
     // Method and shape errors are named rather than silently accepted.
     assert_eq!(call("GET", "/admin/config-authority/publish", None).0, 405);
+    assert_eq!(call("GET", "/admin/config-authority/rollback", None).0, 405);
     assert_eq!(
         call("POST", "/admin/config-authority/publish", None).1["code"],
         "invalid_payload",
@@ -1261,6 +1339,7 @@ async fn the_admin_routes_publish_register_revoke_and_report() {
         ("GET", "/admin/config-authority/status"),
         ("GET", "/admin/config-authority/subscribers"),
         ("POST", "/admin/config-authority/publish"),
+        ("POST", "/admin/config-authority/rollback"),
     ] {
         let (status, body) = call(method, path, Some("proxy: {}\n"));
         assert_eq!(status, 404, "{path}: {body}");
