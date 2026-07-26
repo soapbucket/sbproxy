@@ -5273,3 +5273,41 @@ mod inbound_key_phase_tests {
         assert!(!crate::inbound_key::requires_minted_key(&cfg));
     }
 }
+
+#[cfg(test)]
+mod inbound_key_governs_ai_tests {
+    use sbproxy_keystore::record::KeyRecord;
+
+    /// Regression pin for the silent failure this epic's design flagged.
+    ///
+    /// `handle_ai_proxy` runs after the auth block, so by the time the AI
+    /// gateway resolves a key the pre-auth sweep has already consumed the
+    /// header. If the gateway re-reads `authorization` instead of the context
+    /// it finds nothing, falls through to configured keys, finds nothing
+    /// there, and dispatches ungoverned with no error and no log.
+    ///
+    /// Asserts on the resolved policy rather than a status code, because a
+    /// 200 is exactly what the broken path also produces.
+    #[test]
+    fn a_swept_key_still_carries_its_policy_into_the_ai_gateway() {
+        let mut record = KeyRecord::new("0123456789abcdef", "unused-hash", chrono::Utc::now());
+        record.allowed_models = vec!["gpt-4".to_string()];
+        record.max_requests_per_minute = Some(7);
+
+        let ctx = crate::context::RequestContext {
+            resolved_inbound_key: Some(Box::new(record)),
+            ..Default::default()
+        };
+
+        let stamped = ctx
+            .resolved_inbound_key
+            .as_deref()
+            .expect("the sweep stamped a record on the context");
+
+        // These are the fields that silently vanish when the gateway re-reads
+        // a header the sweep already consumed.
+        assert_eq!(stamped.allowed_models, ["gpt-4"]);
+        assert_eq!(stamped.max_requests_per_minute, Some(7));
+        assert_eq!(stamped.key_id, "0123456789abcdef");
+    }
+}

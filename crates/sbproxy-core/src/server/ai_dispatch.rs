@@ -730,12 +730,23 @@ async fn resolve_dynamic_virtual_key(
 }
 
 async fn resolve_request_virtual_key(
+    ctx: &RequestContext,
     session: &Session,
     config: &AiHandlerConfig,
     principal: &sbproxy_plugin::Principal,
     plane: Option<&crate::key_plane::KeyPlane>,
     origin_tenant_id: &str,
 ) -> std::result::Result<Option<ResolvedRequestKey>, (u16, String)> {
+    // The pre-auth sweep may have already resolved the key, possibly from a
+    // header other than `authorization`, and consumed it. Prefer that record.
+    //
+    // Without this, a key swept out of `x-api-key` would find nothing here,
+    // fall through to the configured keys, find nothing there either, and
+    // dispatch UNGOVERNED: no model allowlist, no budget, no rate limit, no
+    // tool injection, no PII requirement, and no error or log to say so.
+    if let Some(record) = ctx.resolved_inbound_key.as_deref() {
+        return lower_stored_request_key(record, origin_tenant_id).map(Some);
+    }
     let auth_value = req_header_value(session, "authorization");
     let raw_key = auth_value.as_deref().map(|header| {
         header
@@ -1261,6 +1272,7 @@ pub(super) async fn handle_ai_proxy(
     // policy snapshots stay pinned for the rest of this request.
     let key_plane = crate::key_plane::current_key_plane();
     let resolved_request_vk = match resolve_request_virtual_key(
+        ctx,
         session,
         config,
         &ctx.principal,

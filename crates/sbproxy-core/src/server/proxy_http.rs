@@ -1207,6 +1207,14 @@ impl ProxyHttp for SbProxy {
         // request. Always strip any inbound X-Client-Cert-* headers
         // from the client first so a non-TLS client cannot forge
         // them.
+        // The header a minted virtual key arrived in is consumed here. The
+        // proxy's own key is not an upstream credential, and forwarding it
+        // would hand a governed secret to every origin the proxy talks to.
+        // Same reasoning as the X-Client-Cert-* strip below.
+        if let Some(header) = ctx.inbound_key_header.as_deref() {
+            upstream_request.remove_header(header);
+        }
+
         upstream_request.remove_header("x-client-cert-verified");
         upstream_request.remove_header("x-client-cert-cn");
         upstream_request.remove_header("x-client-cert-san");

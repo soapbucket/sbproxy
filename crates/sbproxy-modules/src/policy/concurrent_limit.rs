@@ -152,6 +152,7 @@ impl ConcurrentLimitPolicy {
     /// request headers, plus origin and route identifiers.
     pub fn resolve_key(
         &self,
+        resolved_key_id: Option<&str>,
         origin_id: &str,
         route_id: &str,
         client_ip: Option<&str>,
@@ -162,6 +163,14 @@ impl ConcurrentLimitPolicy {
             ConcurrentLimitKey::Origin => origin_id.to_string(),
             ConcurrentLimitKey::Ip => client_ip.unwrap_or("0.0.0.0").to_string(),
             ConcurrentLimitKey::ApiKey => {
+                // A verified minted key wins. Bucketing on the immutable public
+                // id rather than the presented secret keeps the plaintext token
+                // out of this process-global map, and keeps a caller's bucket
+                // intact across a secret rotation, which changes the header
+                // value but not the identity being limited.
+                if let Some(id) = resolved_key_id {
+                    return id.to_string();
+                }
                 if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
                     return v.to_string();
                 }
@@ -276,7 +285,16 @@ mod tests {
         client_ip: Option<&str>,
         headers: &http::HeaderMap,
     ) -> String {
-        policy.resolve_key(origin, route, client_ip, headers)
+        policy.resolve_key(None, origin, route, client_ip, headers)
+    }
+
+    /// Same, for a request whose minted key the pre-auth phase already verified.
+    fn resolved_with_key_id(
+        policy: &ConcurrentLimitPolicy,
+        key_id: &str,
+        headers: &http::HeaderMap,
+    ) -> String {
+        policy.resolve_key(Some(key_id), "origin-a", "/one", Some("192.0.2.1"), headers)
     }
 
     #[test]
@@ -307,6 +325,60 @@ mod tests {
         let _alpha_guard = policy.try_acquire(&alpha).expect("alpha permit");
         assert!(policy.try_acquire(&alpha).is_none());
         let _beta_guard = policy.try_acquire(&beta).expect("beta permit");
+    }
+
+    #[test]
+    fn a_resolved_minted_key_buckets_on_the_key_id_not_the_secret() {
+        let token = format!("sbp_{}_{}", "0".repeat(16), "a".repeat(64));
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-api-key", token.parse().unwrap());
+        let api_key = policy(serde_json::json!({"max": 1, "key_by": "api_key"}));
+
+        let bucket = resolved_with_key_id(&api_key, "0123456789abcdef", &headers);
+
+        assert_eq!(bucket, "0123456789abcdef");
+        assert!(
+            !bucket.contains(&token),
+            "the plaintext secret must never become a map key"
+        );
+    }
+
+    #[test]
+    fn rotating_the_secret_keeps_the_same_bucket() {
+        // The header value changes on rotation but the identity being limited
+        // does not, so the caller must not get a fresh budget for free.
+        let api_key = policy(serde_json::json!({"max": 1, "key_by": "api_key"}));
+        let mut before = http::HeaderMap::new();
+        before.insert(
+            "x-api-key",
+            format!("sbp_{}_{}", "0".repeat(16), "a".repeat(64))
+                .parse()
+                .unwrap(),
+        );
+        let mut after = http::HeaderMap::new();
+        after.insert(
+            "x-api-key",
+            format!("sbp_{}_{}", "0".repeat(16), "b".repeat(64))
+                .parse()
+                .unwrap(),
+        );
+
+        assert_eq!(
+            resolved_with_key_id(&api_key, "0123456789abcdef", &before),
+            resolved_with_key_id(&api_key, "0123456789abcdef", &after)
+        );
+    }
+
+    #[test]
+    fn without_a_resolved_key_the_header_value_is_still_the_bucket() {
+        // Static configured keys and unauthenticated traffic are unaffected.
+        let api_key = policy(serde_json::json!({"max": 1, "key_by": "api_key"}));
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-api-key", "legacy-static-key".parse().unwrap());
+        assert_eq!(
+            resolved(&api_key, "origin", "/v1/items", Some("192.0.2.9"), &headers),
+            "legacy-static-key"
+        );
     }
 
     #[test]
