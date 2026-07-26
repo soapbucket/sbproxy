@@ -67,6 +67,10 @@ pub mod compression_runtime;
 pub mod compression_store;
 /// Success-path bridge for prompt-free, per-lever AI compression value.
 pub mod compression_value;
+/// Config-authority publisher: validate a configuration the way boot
+/// does, sign it, store it under a monotonic revision, and serve it to
+/// subscribers on a listener of its own.
+pub mod config_authority;
 /// Config-authority subscriber: pull signed configuration from an
 /// upstream authority, verify it, merge it over the local document, and
 /// apply it through the shared reload transaction.

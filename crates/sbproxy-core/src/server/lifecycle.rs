@@ -1379,6 +1379,21 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // authority is configured.
     crate::config_subscriber::spawn(config_subscriber);
 
+    // Start the config-authority publisher: load the signing key, open
+    // the durable revision store, and bind the bundle listener. Fatal on
+    // failure, and deliberately so. A node configured to publish that
+    // silently does not is a node whose whole fleet stops receiving
+    // configuration with nothing in the logs saying why. `compile_config`
+    // has already refused a non-loopback bind with no TLS and an
+    // unreadable signing key, so reaching an error here means the address
+    // is taken or the store directory is not writable.
+    crate::config_authority::spawn(
+        server_config
+            .config_authority
+            .as_ref()
+            .and_then(|authority| authority.publish.as_ref()),
+    )?;
+
     // --- Wave 5 day-6 Item 4: SIGHUP re-bootstrap handler ---
     //
     // Pingora's `Server::run_forever` owns its own tokio runtime, but

@@ -1814,6 +1814,13 @@ pub fn handle_admin_request(
     if let Some(response) = crate::admin_cluster::dispatch(method, path, body) {
         return response;
     }
+    // Config-authority publication, status, and subscriber management.
+    // Deliberately here, behind the operator-auth gate: publishing a
+    // config is an operator action. The bundle endpoint subscribers fetch
+    // is not on this listener at all.
+    if let Some(response) = crate::config_authority::dispatch(method, path, body) {
+        return response;
+    }
     // WOR-1754 / WOR-1755: response-cache + key-policy-cache management.
     if let Some(response) = crate::admin_cache::dispatch(method, path, body) {
         return response;

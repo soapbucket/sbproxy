@@ -344,6 +344,24 @@ pub fn merge_config(
     })
 }
 
+/// Every [`AUTHORITY_DENIED_PATHS`] entry an authority document claims,
+/// in deny-list order.
+///
+/// Exists so a publishing authority screens a payload with exactly the
+/// detection its subscribers will run, instead of a second copy that can
+/// drift. Without it a deny-listed path publishes clean and is then
+/// refused by every subscriber at once, which is the least useful place to
+/// discover it.
+///
+/// # Errors
+///
+/// Returns [`MergeError::RemoteNotMapping`] when the document's root is
+/// not a YAML mapping, and [`MergeError::Yaml`] when it does not parse.
+pub fn denied_paths_in(remote_yaml: &str) -> Result<Vec<String>, MergeError> {
+    let remote = parse_root(remote_yaml)?.ok_or(MergeError::RemoteNotMapping)?;
+    Ok(scan_denied(&remote))
+}
+
 /// Parse a document root. `Ok(None)` means the document parsed but its
 /// root was not a mapping, which the caller turns into the error variant
 /// naming the offending document.
@@ -627,6 +645,40 @@ mod tests {
     }
 
     // --- deny list ----------------------------------------------------
+
+    #[test]
+    fn the_publish_side_scan_agrees_with_the_merge_side_rejection() {
+        // The authority screens a payload before publishing it and the
+        // subscriber screens it before merging. One implementation, so a
+        // payload cannot pass one and fail the other.
+        for path in AUTHORITY_DENIED_PATHS {
+            let remote = nested_yaml(path);
+            assert_eq!(
+                denied_paths_in(&remote).expect("scan"),
+                vec![(*path).to_string()],
+                "{path}"
+            );
+            for mode in MODES {
+                let error = merge_config(SIMPLE_BASE, local(), &remote, mode)
+                    .expect_err("a denied path must be rejected");
+                assert_eq!(denied_paths(error), denied_paths_in(&remote).expect("scan"));
+            }
+        }
+
+        // A payload that names nothing denied scans clean and merges.
+        let clean = "origins:\n  \"api.test\":\n    action:\n      type: static\n";
+        assert!(denied_paths_in(clean).expect("scan").is_empty());
+        assert!(merge_config(SIMPLE_BASE, local(), clean, MergeMode::Overlay).is_ok());
+
+        // A blank document is a mapping with no keys, not a refusal.
+        assert!(denied_paths_in("").expect("scan").is_empty());
+        // A root that is not a mapping is named as such rather than
+        // reported as "no denied paths".
+        assert!(matches!(
+            denied_paths_in("- one\n- two\n"),
+            Err(MergeError::RemoteNotMapping)
+        ));
+    }
 
     #[test]
     fn every_denied_path_is_rejected_at_its_own_level_in_both_modes() {

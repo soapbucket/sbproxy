@@ -1,0 +1,186 @@
+# Config authority: fleet configuration distribution
+
+*Last modified: 2026-07-25*
+
+One node signs a configuration and the rest of the fleet verifies it and applies it, so a change ships once instead of being copied to every box. Every payload carries an Ed25519 signature and a monotonic revision, and the authority validates it exactly the way boot does before it signs anything.
+
+This directory holds both halves and the payload that travels between them:
+
+| File | Role |
+|---|---|
+| `sb.yml` | the authority: validates, signs, stores, and serves |
+| `subscriber.yml` | a fleet node: polls, verifies, merges, applies |
+| `bundle.yml` | the payload an operator publishes |
+
+A node is either an authority or a subscriber, never both. Setting `publish` and `upstream` on one node is a config error.
+
+## Why this exists
+
+Configuration in a file is configuration you have to copy to every box. The usual answers are a config-management tool that rewrites files and restarts processes, or a control plane that holds the truth and hands it out. This is the second, with two properties that matter when the fleet is bigger than the change window:
+
+- **Every payload is signed.** A subscriber verifies an Ed25519 signature over the canonical bundle before it compiles anything, so an authority that gets compromised at the network layer still cannot push configuration. A revision counter refuses a replay of an older bundle, and it survives a restart.
+- **The authority validates exactly what boot validates.** `compile_config` alone leaves `action`, `policies`, `transforms`, and `authentication` as opaque JSON, so a typo inside a policy entry would sign cleanly and then fail on every subscriber at once. The publish path runs the module constructors and the model-host checks too, so a payload that cannot boot never gets a revision number.
+
+The subscriber also owns a list of paths no authority can touch: `proxy.listeners`, `proxy.tls`, `proxy.admin`, `proxy.secrets`, `proxy.cluster`, `proxy.model_host`, `proxy.config_authority`, and `source`. A payload that names one is refused at publish time and, if it somehow arrives anyway, refused again at merge time. That is what keeps a fleet-wide push from taking away the admin port you would use to undo it.
+
+## Set up the authority
+
+Generate a signing key. It is a 32-byte Ed25519 seed in standard base64, and it must be owner-only:
+
+```bash
+mkdir -p /var/lib/sbproxy/config-authority
+head -c 32 /dev/urandom | base64 > /etc/sbproxy/authority-signing.key
+chmod 600 /etc/sbproxy/authority-signing.key
+export SB_CONFIG_AUTHORITY_SIGNING_KEY=/etc/sbproxy/authority-signing.key
+export ADMIN_PASSWORD=pick-a-real-one
+```
+
+A publishing node refuses to start with the shipped default admin password, whatever `proxy.admin.bind` says, and refuses to start if the signing key is missing, oversized, group-readable, or not a 32-byte seed. Both are startup failures rather than surprises during a change window.
+
+```bash
+make run CONFIG=examples/config-authority/sb.yml
+```
+
+Two listeners come up. The admin server on `127.0.0.1:9090` is where an operator publishes; the bundle listener on `127.0.0.1:9443` is where subscribers fetch. They are separate on purpose: subscribers present a long-lived fleet credential, and that credential should not reach an admin surface.
+
+## Register a subscriber
+
+```bash
+curl -sS -u admin:"$ADMIN_PASSWORD" \
+  -H 'Content-Type: application/json' \
+  -d '{"subscriber_id":"edge-01"}' \
+  http://127.0.0.1:9090/admin/config-authority/subscribers
+```
+
+```json
+{
+  "schema_version": 1,
+  "subscriber_id": "edge-01",
+  "credential_id": "0lJ8kQ2vTn5mAqRt",
+  "credential": "sbca1.0lJ8kQ2vTn5mAqRt.9pQx7Yb2ZmKd3Lw8Rn6Tf1Vc4Hs0Jg5Ee2Aa8Bb1Cc",
+  "note": "shown once and never again; the authority keeps only a SHA-256 fingerprint..."
+}
+```
+
+The clear credential appears exactly once. The authority stores only a SHA-256 fingerprint of it, so the registry file is not a credential store: someone who reads it cannot authenticate with it. Give the token to the subscriber by secret reference:
+
+```bash
+export SB_CONFIG_AUTHORITY_TOKEN='sbca1.0lJ8kQ2vTn5mAqRt.9pQx7Yb2ZmKd3Lw8Rn6Tf1Vc4Hs0Jg5Ee2Aa8Bb1Cc'
+```
+
+## Publish the authority's public key
+
+Subscribers need the verifying key, and `status` hands it over in the exact file shape they install:
+
+```bash
+curl -sS -u admin:"$ADMIN_PASSWORD" \
+  http://127.0.0.1:9090/admin/config-authority/status \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["verifying_keys_file"])' \
+  > /etc/sbproxy/authority-keys.json
+```
+
+```json
+{
+  "authority-2026-07": {
+    "algorithm": "ed25519",
+    "key": "3p8Q0mB1yV4kX7wR2tL6nS9cF5jH0dA8gZ2eK4uY1oM="
+  }
+}
+```
+
+Rotation is additive: publish under a new `key_id` while subscribers still trust the old one, then drop the old entry a window later. No synchronized fleet restart.
+
+## Publish a configuration
+
+```bash
+curl -sS -u admin:"$ADMIN_PASSWORD" \
+  --data-binary @examples/config-authority/bundle.yml \
+  'http://127.0.0.1:9090/admin/config-authority/publish?mode=overlay'
+```
+
+```json
+{
+  "schema_version": 1,
+  "authority_id": "control-plane-lab",
+  "key_id": "authority-2026-07",
+  "revision": 1,
+  "content_digest": "sha256:fcde2b2edba56bf408601fb721fe9b5c338d10ee429ea04fae5511b68fbf8fb9",
+  "etag": "\"1-sha256:fcde2b2edba56bf408601fb721fe9b5c338d10ee429ea04fae5511b68fbf8fb9\"",
+  "mode": "overlay",
+  "issued_at_unix_ms": 1753401600000
+}
+```
+
+Break the payload on purpose and the refusal names the step that caught it, and confirms nothing was spent:
+
+```json
+{
+  "error": "config authority publish rejected: the payload compiles, but a module failed to construct, so every subscriber would refuse it at boot: unknown policy type ...",
+  "code": "construct_failed",
+  "revision_consumed": false
+}
+```
+
+`mode` has to match what the subscriber is configured for. A `replace` payload applied as an overlay would keep keys its author meant to drop, so the subscriber refuses the disagreement rather than guessing.
+
+## Start a subscriber
+
+```bash
+make run CONFIG=examples/config-authority/subscriber.yml
+```
+
+The first poll fetches the bundle, verifies it, merges it over `subscriber.yml`, and applies the result through the same three-phase transaction a SIGHUP takes. Boot does no network I/O: a node with an empty cache boots on its local document under `overlay` (with a loud warning) or refuses to start under `replace`, and the first poll a few seconds later brings the authority's document in.
+
+## Watch the rollout
+
+```bash
+curl -sS -u admin:"$ADMIN_PASSWORD" \
+  http://127.0.0.1:9090/admin/config-authority/status
+```
+
+```json
+{
+  "current_revision": 2,
+  "previous_revision": 1,
+  "high_water_revision": 2,
+  "subscriber_count": 2,
+  "live_subscriber_count": 2,
+  "subscribers": [
+    {
+      "subscriber_id": "edge-01",
+      "credential_id": "0lJ8kQ2vTn5mAqRt",
+      "revoked": false,
+      "last_seen_revision": 2,
+      "last_seen_at_unix_ms": 1753401660000,
+      "up_to_date": true
+    },
+    {
+      "subscriber_id": "edge-02",
+      "credential_id": "7bN2xW9pQr4sTu6v",
+      "revoked": false,
+      "last_seen_revision": 1,
+      "last_seen_at_unix_ms": 1753401612000,
+      "up_to_date": false
+    }
+  ]
+}
+```
+
+`up_to_date` is the question an operator actually has during a rollout, so it is answered rather than left as arithmetic. `high_water_revision` above `current_revision` means a revision was reserved and never published, which happens when the process died mid-publish; the number is burned rather than reused, because a subscriber may already hold it.
+
+## Retire a credential
+
+```bash
+curl -sS -u admin:"$ADMIN_PASSWORD" \
+  -H 'Content-Type: application/json' \
+  -d '{"credential_id":"0lJ8kQ2vTn5mAqRt"}' \
+  http://127.0.0.1:9090/admin/config-authority/subscribers/revoke
+```
+
+Pass `{"subscriber_id":"edge-01"}` instead to retire every credential that node holds. Revocation takes effect on the next fetch and survives a restart. A revoked subscriber keeps serving the configuration it already applied rather than losing it: an expired credential should not take a node down.
+
+To rotate without a gap, register a second credential for the same `subscriber_id`, deploy it, then revoke the first.
+
+## Reference
+
+Full field tables and the wire contract are in [docs/configuration.md](../../docs/configuration.md#config-authority-fleet-configuration-distribution).

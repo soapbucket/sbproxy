@@ -7,6 +7,9 @@
 //! - The repo-native [`listing::Listing`] primitive
 //! - Signed configuration bundles published by a config authority
 //!   ([`config_bundle`])
+//! - Durable publication state for a config authority: the revision
+//!   counter, the last two bundles, and the subscriber registry
+//!   ([`config_authority`])
 //! - Merging an authority-supplied document into a locally owned one
 //!   ([`config_merge`])
 
@@ -15,6 +18,7 @@
 
 pub mod cluster;
 pub mod compiler;
+pub mod config_authority;
 pub mod config_bundle;
 pub mod config_merge;
 pub mod duration;
@@ -31,15 +35,20 @@ pub mod validate;
 
 pub use cluster::*;
 pub use compiler::*;
+pub use config_authority::{
+    AuthorityStore, AuthorityStoreError, CredentialSeed, IssuedSubscriberCredential,
+    SubscriberAuthError, SubscriberRecord, AUTHORITY_STATE_SCHEMA_VERSION, CREDENTIAL_ID_BYTES,
+    CREDENTIAL_SECRET_BYTES, MAX_SUBSCRIBERS, SUBSCRIBER_TOKEN_PREFIX,
+};
 pub use config_bundle::{
-    BundleAlgorithm, BundleError, BundleMode, ConfigBundle, ConfigBundleCursor, ConfigBundleSigner,
-    CursorError, SignedConfigBundle, VerifyingKeyMaterial, VerifyingKeySet,
-    CONFIG_BUNDLE_CLOCK_SKEW_MS, CONFIG_BUNDLE_CONTEXT, CONFIG_BUNDLE_SCHEMA_VERSION,
-    MAX_CONFIG_YAML_BYTES,
+    is_valid_bundle_identifier, BundleAlgorithm, BundleError, BundleMode, ConfigBundle,
+    ConfigBundleCursor, ConfigBundleSigner, CursorError, SignedConfigBundle, VerifyingKeyMaterial,
+    VerifyingKeySet, CONFIG_BUNDLE_CLOCK_SKEW_MS, CONFIG_BUNDLE_CONTEXT,
+    CONFIG_BUNDLE_SCHEMA_VERSION, MAX_CONFIG_YAML_BYTES,
 };
 pub use config_merge::{
-    merge_config, BaseOrigin, MergeError, MergeMode, MergeOutcome, Provenance, ProvenanceMap,
-    AUTHORITY_DENIED_PATHS,
+    denied_paths_in, merge_config, BaseOrigin, MergeError, MergeMode, MergeOutcome, Provenance,
+    ProvenanceMap, AUTHORITY_DENIED_PATHS,
 };
 pub use listing::{
     is_well_placed_skill_url, load_listing_file, load_listings_from_repo, validate_listings,

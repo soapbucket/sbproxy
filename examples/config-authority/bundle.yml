@@ -1,0 +1,31 @@
+# The payload an operator publishes to the fleet.
+#
+#   curl -sS -u admin:"$ADMIN_PASSWORD" \
+#     --data-binary @examples/config-authority/bundle.yml \
+#     'http://127.0.0.1:9090/admin/config-authority/publish?mode=overlay'
+#
+# The authority validates this the way boot does before it signs anything:
+# `compile_config`, then the per-origin module constructors, then the
+# model-host desired-state checks. That is why a typo inside a `policies:`
+# entry is refused here instead of publishing clean and failing on every
+# subscriber at once.
+#
+# It is validated as a configuration in its own right, because that is all
+# the authority can see: under `mode: overlay` the document that actually
+# boots is this payload merged over each subscriber's own file, and the
+# authority does not have those files.
+#
+# A payload may not name any path a subscriber owns outright
+# (`proxy.listeners`, `proxy.tls`, `proxy.admin`, `proxy.secrets`,
+# `proxy.cluster`, `proxy.model_host`, `proxy.config_authority`, `source`).
+# Naming one is refused at publish time.
+origins:
+  "edge.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: rate_limiting
+        requests_per_second: 50
+        burst: 100
+        key: ip

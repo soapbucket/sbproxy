@@ -1113,6 +1113,72 @@ fn validate_admin_reachable_credentials(admin: &crate::types::AdminConfig) -> Re
     );
 }
 
+/// Refuse the shipped default admin credentials on a node that publishes
+/// configuration bundles, whatever its admin server is bound to.
+///
+/// The reachability test in [`validate_admin_reachable_credentials`] is the
+/// right one for an ordinary node: loopback with the defaults is the
+/// first-run path and guards nothing the local user does not already have.
+/// A publishing node is different. Its admin API is where a fleet's
+/// configuration is authored and signed, so `admin` / `changeme` there is
+/// not "a local convenience", it is a published constant standing between
+/// anyone who reaches the port and every subscriber's running config. The
+/// blast radius is the fleet, not the box, so the bind does not enter into
+/// it.
+fn validate_publishing_node_admin_credentials(
+    admin: Option<&crate::types::AdminConfig>,
+) -> Result<()> {
+    let Some(admin) = admin.filter(|admin| admin.enabled) else {
+        // No admin server means no publish route and no status route, so
+        // there is no credential to be weak. The node can still serve the
+        // bundle listener from a config an operator publishes some other
+        // way, which is an odd but coherent deployment.
+        return Ok(());
+    };
+    if admin.password != crate::types::DEFAULT_ADMIN_PASSWORD {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "proxy.config_authority.publish is set and proxy.admin.password is still the shipped \
+         default `{}`. A publishing node's admin API validates, signs, and publishes the \
+         configuration every subscriber then applies, so the default password there is not a \
+         local-development convenience: it is a published constant guarding a fleet-wide \
+         write. Set a real password (`password: ${{ADMIN_PASSWORD}}` with the variable \
+         exported, or a secret reference) before this node publishes anything. Unlike \
+         proxy.admin on an ordinary node, binding to loopback does not make this acceptable.",
+        crate::types::DEFAULT_ADMIN_PASSWORD
+    )
+}
+
+/// Refuse a publishing node whose signing key cannot be loaded.
+///
+/// An authority that cannot sign cannot serve. Checked here rather than at
+/// the first publication so the failure lands at boot, or in `sbproxy
+/// validate`, instead of in the middle of a change window when an operator
+/// is trying to push a fix. Loads through the same constructor the running
+/// authority uses, so "readable" means readable in the way that matters:
+/// present, bounded, owner-only, and a valid Ed25519 seed.
+fn validate_publish_signing_key(
+    publish: &crate::types::ConfigAuthorityPublishConfig,
+) -> Result<()> {
+    crate::config_bundle::ConfigBundleSigner::ed25519_from_seed_file(
+        publish.key_id.as_str(),
+        &publish.signing_key_file,
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "proxy.config_authority.publish.signing_key_file '{}' is not a usable signing key: \
+             {error}. Generate one with `head -c 32 /dev/urandom | base64 > {}` and \
+             `chmod 600` it, then publish the matching verifying key to subscribers with \
+             `GET /admin/config-authority/status`. An authority that cannot sign cannot serve, \
+             so this is refused at startup rather than at the first publish attempt.",
+            publish.signing_key_file,
+            publish.signing_key_file,
+        )
+    })
+}
+
 /// Compile a raw YAML config string into a `CompiledConfig`.
 ///
 /// # Errors
@@ -1267,6 +1333,10 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         authority
             .validate()
             .context("config compile: proxy.config_authority")?;
+        if let Some(publish) = authority.publish.as_ref() {
+            validate_publishing_node_admin_credentials(config_file.proxy.admin.as_ref())?;
+            validate_publish_signing_key(publish)?;
+        }
     }
 
     if let Some(cluster) = crate::cluster::resolve_effective_cluster(&config_file.proxy)

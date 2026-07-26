@@ -136,6 +136,9 @@ fn upstream(url: &str, mode: BundleMode, dir: &Path, keys: &Path) -> ConfigAutho
     upstream.validate().expect("fixture upstream validates");
     ConfigAuthorityConfig {
         upstream: Some(upstream.clone()),
+        // A subscriber, so no publish block. A node that sets both is
+        // rejected by validate, which is what the conflict rule asserts.
+        publish: None,
     }
     .validate()
     .expect("fixture block validates");

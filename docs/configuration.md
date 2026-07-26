@@ -47,7 +47,8 @@ For AI-specific features in depth, see [ai-gateway.md](ai-gateway.md). For CEL, 
 37. [Environment variables](#environment-variables)
 38. [ACME / auto TLS](#acme--auto-tls)
 39. [Redis integration](#redis-integration)
-40. [Validation](#validation)
+40. [Config authority](#config-authority-fleet-configuration-distribution)
+41. [Validation](#validation)
 
 ---
 
@@ -126,6 +127,7 @@ proxy:
   secrets: { ... }
   cluster: { ... }
   model_host: { ... }
+  config_authority: { ... }
 
   # L2 cache (Redis) for distributed rate limiting and caching
   l2_cache_settings:
@@ -4316,6 +4318,251 @@ origins:
 The messenger DSN above is intentionally shown separately. Do not add the L2
 TLS file fields under `messenger_settings` or assume that the messenger inherits
 the L2 connection.
+
+---
+
+## Config authority (fleet configuration distribution)
+
+Configuration in a file is configuration you have to copy to every box. `proxy.config_authority` replaces the copying: one node signs a configuration and the rest verify it and apply it, through the same reload transaction a SIGHUP takes.
+
+A node takes one of the two roles, never both:
+
+| Block | Role |
+|---|---|
+| `proxy.config_authority.publish` | **authority**: validates, signs, stores, and serves configuration |
+| `proxy.config_authority.upstream` | **subscriber**: polls, verifies, merges, applies |
+
+Setting both is a config error. A node in both roles would republish a document it does not fully own, and the provenance an auditor reads downstream would name that node rather than the authority the values actually came from.
+
+Runnable configs for both halves are in [`examples/config-authority/`](../examples/config-authority/).
+
+### What the subscriber owns outright
+
+No authority can set these paths, in either merge mode:
+
+`proxy.listeners`, `proxy.tls`, `proxy.admin`, `proxy.secrets`, `proxy.cluster`, `proxy.model_host`, `proxy.config_authority`, `source`
+
+Presence of one of them anywhere in a payload rejects the whole payload, at publish time on the authority and again at merge time on the subscriber. Not the changed keys, the whole thing: a partial apply of a configuration is a configuration nobody wrote.
+
+The reason is recovery. If a fleet-wide push could rewrite `proxy.admin`, the first bad push would take away the port you would use to undo it. If it could rewrite `proxy.config_authority`, it could point every node at a different authority, permanently. And `proxy.tls` and `proxy.secrets` are per-node material that a central document has no business knowing.
+
+### Authority: `proxy.config_authority.publish`
+
+```yaml
+proxy:
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: 9090
+    password: ${ADMIN_PASSWORD}
+
+  config_authority:
+    publish:
+      authority_id: control-plane-eu
+      key_id: authority-2026-07
+      signing_key_file: /etc/sbproxy/authority-signing.key
+      store_dir: /var/lib/sbproxy/config-authority
+      bind: 0.0.0.0:9443
+      tls:
+        cert_file: /etc/sbproxy/authority.pem
+        key_file: /etc/sbproxy/authority-key.pem
+      rate_limit_per_subscriber_per_minute: 30
+      rate_limit_total_per_minute: 1200
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `authority_id` | string | required | Stamped into every bundle. Subscribers read it as `authority_id`. Letters, digits, and `. - _ :`. |
+| `key_id` | string | required | Selects which entry of a subscriber's `verifying_keys_file` verifies the signature. Same character set. |
+| `signing_key_file` | path | required | One standard-base64 32-byte Ed25519 seed. Owner-only on unix. |
+| `store_dir` | path | required | Holds the durable revision counter, the current and previous signed bundles, and the subscriber registry. |
+| `bind` | `host:port` | required | The bundle listener's own address. An IP and a fixed port; a hostname and port `0` are both refused. |
+| `tls.cert_file` | path | | PEM certificate chain, leaf first. Required when `bind` is not loopback. |
+| `tls.key_file` | path | | PEM private key (PKCS#8 or RSA). Required when `bind` is not loopback. |
+| `rate_limit_per_subscriber_per_minute` | int | `30` | Requests one subscriber may make per minute before a `429`. 1 to 1000000; cannot be turned off. |
+| `rate_limit_total_per_minute` | int | `1200` | Requests served per minute across the whole fleet before a `429`. Must be at least the per-subscriber cap. |
+
+Two rules refuse a publishing node at startup, both checked by `sbproxy validate`:
+
+- **The shipped default admin password is refused, whatever `bind` says.** On an ordinary node, loopback plus the defaults is the first-run path and guards nothing the local user does not already have. On a publishing node the admin API validates, signs, and publishes the configuration every subscriber then applies, so the blast radius is the fleet rather than the box.
+- **A signing key that cannot be loaded is refused.** Missing, oversized, group-readable, or not a 32-byte seed. An authority that cannot sign cannot serve, and finding that out at the first publish attempt means finding it out during a change window.
+
+The bundle listener is separate from the admin listener, and its TLS posture is stricter. `proxy.admin` leaves TLS optional on a remote bind; this listener refuses to start on a non-loopback bind with no `tls` block, and refuses to start when configured TLS material cannot be read. It never falls back to plaintext. Subscribers present a long-lived fleet credential on it and the response body is the whole configuration.
+
+The listener serves exactly one path. `/admin/*`, `/metrics`, and the admin UI are all `404` there, so a subscriber's credential can never reach an operator surface.
+
+### The revision store on disk
+
+```text
+<store_dir>/
+  authority-state.json      revision counters + subscriber registry
+  revisions/current.json    the signed bundle subscribers fetch
+  revisions/previous.json   the one before it
+```
+
+Every file is written to a temporary name in the same directory, flushed, then renamed over the target, so a crash mid-write leaves the old file or the new one and never a truncated one.
+
+`authority-state.json` carries two counters. `current_revision` is what `revisions/current.json` holds; `high_water_revision` is the highest number ever handed out. The reservation is persisted *before* the bundle is signed, so a crash between the two burns a number rather than reissuing it: a subscriber that has applied revision 8 refuses a later bundle that also calls itself 8 with different content, and it refuses one that calls itself 7 at all. Gaps in the sequence are free; a reused number is not. `high_water_revision` above `current_revision` in the status document is exactly that: a reservation that never published.
+
+The bundle file is written before the state file names it, so the other crash window leaves a bundle nothing points at. That one is repaired at startup rather than refused: the reservation already covered the number, so nothing else can claim it, and the file on disk is the one that was signed. A bundle claiming a number above `high_water_revision`, or a state file naming a bundle that is not there, is refused, because both mean the two files came from different places.
+
+An invalid payload consumes nothing at all, because every validation step runs before the reservation.
+
+The store directory is pinned to its `authority_id`. Pointing a second authority at a directory the first wrote is refused rather than adopted, since the revision counter and the subscriber registry belong to whoever created them.
+
+### Publish validation matches boot
+
+`POST /admin/config-authority/publish` runs the same three steps `sbproxy validate` runs, in the same order: `compile_config`, then the per-origin module constructors, then the model-host desired-state checks.
+
+`compile_config` alone leaves `action`, `policies`, `transforms`, and `authentication` as opaque JSON. A typo inside a policy entry therefore compiles clean, signs clean, and then fails on every subscriber at once, which is a fleet-wide outage caused by a validation gap. Running the constructors is what catches it.
+
+The payload is validated as a configuration in its own right, because that is all the authority can see: under `mode: overlay` the document that actually boots is the payload merged over each subscriber's local file, and the authority does not have those files. So an `${VAR}` the authority cannot resolve is warned about rather than refused, since it may well resolve on the subscriber; if it does not, the subscriber refuses the bundle rather than applying the literal text.
+
+A publish payload is bounded by the admin server's request-body limit (512 KiB) as well as the signed-bundle limit (4 MiB), so the practical ceiling is the smaller of the two.
+
+### Admin routes
+
+All four sit on the admin listener behind operator auth and RBAC.
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/admin/config-authority/publish` | `POST` | Body is the YAML payload; `?mode=overlay\|replace` selects how subscribers apply it (default `overlay`). |
+| `/admin/config-authority/status` | `GET` | Current revision, digest, ETag, key ID, the verifying-key file to distribute, and per-subscriber last-seen revision. |
+| `/admin/config-authority/subscribers` | `GET` / `POST` | List subscribers, or register one with `{"subscriber_id":"edge-01"}`. |
+| `/admin/config-authority/subscribers/revoke` | `POST` | `{"credential_id":"..."}` for one credential, `{"subscriber_id":"..."}` for every credential that node holds. |
+
+Registration returns the clear credential exactly once. The authority stores only a SHA-256 fingerprint of it, so the registry file is not a credential store: someone who reads it cannot authenticate with it. Credentials look like `sbca1.<credential-id>.<secret>` and are long-lived and reusable, unlike the single-use `sbce1` cluster enrollment tokens.
+
+A subscriber may hold several credentials at once, which is how one is rotated without a window where the node cannot fetch: register the new one, deploy it, then revoke the old.
+
+A rejected publish says which step caught it and confirms nothing was spent:
+
+```json
+{
+  "error": "config authority publish rejected: the payload compiles, but a module failed to construct, so every subscriber would refuse it at boot: ...",
+  "code": "construct_failed",
+  "revision_consumed": false
+}
+```
+
+Codes are `invalid_payload`, `denied_path`, `compile_failed`, `construct_failed`, `model_runtime_invalid` (the payload is at fault, `400`), and `signing_failed`, `store_failed`, `internal` (the authority is at fault, `500`, safe to retry).
+
+### The wire contract
+
+Documented so a non-SBproxy server can serve subscribers. One endpoint, one method.
+
+**Request.**
+
+```http
+GET /config-authority/v1/bundle HTTP/1.1
+Host: control.example.com:9443
+Authorization: Bearer sbca1.0lJ8kQ2vTn5mAqRt.9pQx7Yb2ZmKd3Lw8Rn6Tf1Vc4Hs0Jg5Ee2Aa8Bb1Cc
+X-Sbproxy-Subscriber-Id: edge-01
+If-None-Match: "7-sha256:2c26b46b68ffc68ff99b453c1d3041341340d0d0d0d0d0d0d0d0d0d0d0d0d0d0"
+```
+
+`Authorization` is the credential and the identity. `X-Sbproxy-Subscriber-Id` is a claim about it: SBproxy refuses a fetch whose header disagrees with the credential's registered subscriber (`403`), because the last-seen revision the endpoint records is the fleet's rollout evidence and attributing it to the wrong node makes that evidence worse than none. Sending no header at all is fine.
+
+**Response.**
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+ETag: "8-sha256:fcde2b2edba56bf408601fb721fe9b5c338d10ee429ea04fae5511b68fbf8fb9"
+Cache-Control: no-store
+Content-Length: 612
+
+{"schema_version":1,"bundle":{"authority_id":"control-plane-eu","revision":8,"mode":"overlay","content_digest":"sha256:fcde2b2edba56bf408601fb721fe9b5c338d10ee429ea04fae5511b68fbf8fb9","config_yaml":"origins:\n  \"edge.example.com\":\n    action:\n      type: proxy\n      url: https://test.sbproxy.dev\n","issued_at_unix_ms":1753401600000,"expires_at_unix_ms":null},"key_id":"authority-2026-07","algorithm":"ed25519","signature":"3p8Q0m...=="}
+```
+
+**The ETag format is exact:** `"<revision>-<content_digest>"`, with the double quotes, where `content_digest` is the `sha256:<64 lowercase hex>` of the exact `config_yaml` bytes. Both halves matter. The revision is what the authority compares; the digest is what makes a same-revision content change visible instead of a silent `304`. A subscriber sends back verbatim what it last received.
+
+`If-None-Match` accepts a comma-separated list, `*`, and the weak `W/` prefix, so an ordinary HTTP client library works against this endpoint.
+
+**Statuses.**
+
+| Status | Meaning |
+|---|---|
+| `200` | A bundle, with its `ETag`. |
+| `304` | `If-None-Match` matched the current bundle. No body, no `Content-Length`. |
+| `401` | No bearer credential, or one that does not authenticate. |
+| `403` | A valid credential that has been revoked, or a subscriber-ID header that disagrees with it. |
+| `404` | Nothing published yet, or any path other than the bundle path. |
+| `405` | Any method other than `GET`. |
+| `429` | Past the per-subscriber or the fleet-wide rate limit. |
+
+A subscriber treats every non-`200`, non-`304` answer as "authority unreachable": it keeps serving the configuration it already applied and retries at the next interval. A revoked credential therefore does not take a node down, it stops it receiving updates.
+
+**The envelope.** `signature` is base64 Ed25519 over `sbproxy.config-bundle.v1`, a single `0x00` byte, then the RFC 8785 (JCS) canonical JSON of the `bundle` object. Canonical JSON means the signature survives any re-serialization that preserves the parsed values, and the domain-separation prefix means a bundle signature can never be replayed as a cluster-state or model-dispatch signature even when one key signs all three. `content_digest` is checked independently of the signature, so a corrupt payload is caught even when the signing key is compromised.
+
+**Key distribution.** Subscribers read trusted keys from a JSON file mapping key ID to material. `GET /admin/config-authority/status` returns exactly this document under `verifying_keys_file`:
+
+```json
+{
+  "authority-2026-07": {
+    "algorithm": "ed25519",
+    "key": "3p8Q0mB1yV4kX7wR2tL6nS9cF5jH0dA8gZ2eK4uY1oM="
+  },
+  "authority-2026-08": {
+    "algorithm": "ed25519",
+    "key": "9kL2xP7bT4mV1nQ8wR5tY6sF3jH0dA8gZ2eK4uY1oM="
+  }
+}
+```
+
+Rotation is additive: publish under the new `key_id` while subscribers still trust the old one, then drop the old entry a window later. No synchronized fleet restart. `hmac_sha256` is also accepted, for a single-operator lab, and refuses to verify unless the subscriber sets `allow_shared_secret_keys: true`; a shared secret is symmetric, so every subscriber holding it can forge a bundle for every other one.
+
+### Subscriber: `proxy.config_authority.upstream`
+
+```yaml
+proxy:
+  config_authority:
+    upstream:
+      url: https://control.example.com:9443
+      mode: overlay
+      subscriber_id: edge-01
+      credential: env:SB_CONFIG_AUTHORITY_TOKEN
+      verifying_keys_file: /etc/sbproxy/authority-keys.json
+      poll_interval: 30s
+      cache_path: /var/lib/sbproxy/config-bundle.json
+      max_staleness: 24h
+      require_bundle_on_boot: false
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `url` | string | required | Absolute base URL of the authority. Must be `https` unless `allow_insecure_http`. No query or fragment; the subscriber appends its own path. |
+| `mode` | enum | required | `overlay` merges the bundle over the local document; `replace` makes the bundle the whole document. Required rather than defaulted: the answer decides whether the local file still describes what the node serves. |
+| `subscriber_id` | string | required | Sent on every fetch as `x-sbproxy-subscriber-id`. Must match the id the credential was registered under. |
+| `credential` | secret ref | | Bearer credential, as `env:NAME`, `${NAME}`, `file:/path`, or `secret://backend/name`. An inline literal is refused: a token in a config file is a token in every copy of that file. |
+| `verifying_keys_file` | path | required | JSON file naming every key this subscriber trusts. |
+| `poll_interval` | duration | `30s` | 5s to 24h. The real interval carries jitter, so a fleet restarting together does not synchronize onto the authority. |
+| `cache_path` | path | required | Where the verified bundle is cached so the node can boot on the last known configuration. The anti-replay cursor is stored beside it as `<cache_path>.cursor`. |
+| `max_staleness` | duration | `24h` | How old a cached bundle may be and still be used at boot. At least `poll_interval`, at most 30 days. |
+| `require_bundle_on_boot` | bool | `false` under `overlay`, `true` under `replace` | Refuse to start without a usable bundle. An explicit `false` under `replace` is a config error rather than a silently overridden value, because under replace the local document is not a servable configuration. |
+| `allow_insecure_http` | bool | `false` | Permit a plaintext `http://` authority URL. Development only: signatures still hold, but the credential and the whole configuration are exposed on the path. |
+| `allow_shared_secret_keys` | bool | `false` | Acknowledge that `hmac_sha256` entries may verify bundles. Development only. |
+
+One cycle: conditional `GET`, verify the envelope, merge over the local document, refuse an unresolved `${VAR}`, then apply through the non-blocking reload entry point. A `304` ends the cycle before any compile.
+
+**Boot does no network I/O.** Startup that depends on a remote fetch is startup that hangs when the remote is slow. A node reads its cache and its key file and nothing else, so an empty cache means booting on the local document under `overlay` (with a loud warning) or refusing to start under `replace`. The first poll a few seconds later brings the authority's document in. Seeding `cache_path` with a signed bundle is how a `replace` subscriber comes up the first time.
+
+**Failure behaviour.** Every arm leaves the previously applied configuration serving:
+
+| Situation | Behaviour |
+|---|---|
+| Authority unreachable, or any answer other than `200` / `304` | Keep serving the cached bundle. Error log, age gauge climbs. |
+| Signature, schema, digest, expiry, declared-mode, or replay refusal | Reject the candidate. |
+| Merged document does not compile or cannot be constructed | Reject the candidate. |
+| Merged document carries an unresolved `${VAR}` | Reject the candidate, rather than applying the literal text fleet-wide. |
+| Bundle names a subscriber-owned path | Reject the whole bundle. |
+| Another reload in flight | Skip the cycle and retry at the next interval, rather than queueing behind it. |
+
+A running node past `max_staleness` keeps serving and logs at error level every cycle. The window is a boot-time gate, not a kill switch: a control-plane outage should not take down a data plane that does not depend on it.
+
+**Observability.** `sbproxy_config_bundle_fetch_total{result}` counts one label per cycle (`ok`, `not_modified`, `unreachable`, `verify_failed`, `compile_failed`, `denied_path`, `reload_busy`), `sbproxy_config_bundle_revision` gauges the applied revision, and `sbproxy_config_bundle_age_seconds` gauges the age of the bundle currently serving, measured from local receipt rather than from the authority's `issued_at` so two disagreeing clocks cannot produce an absurd age at exactly the moment someone is trying to work out whether distribution is stuck.
+
+Changing `proxy.config_authority` requires a restart. The block sits on the deny list, so it is also the one thing an authority can never rewrite.
 
 ---
 
