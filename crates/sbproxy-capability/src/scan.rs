@@ -80,38 +80,85 @@ pub struct SourceFile {
 
 /// Whether an item's attributes make it unreachable in every production build.
 pub(crate) fn attributes_exclude_production(attributes: &[syn::Attribute]) -> bool {
-    if attributes.iter().any(|attribute| {
-        let path = attribute.path();
-        if path.is_ident("test") {
-            return true;
-        }
-        let mut segments = path
-            .segments
-            .iter()
-            .map(|segment| segment.ident.to_string());
-        matches!(
-            (
-                segments.next().as_deref(),
-                segments.next().as_deref(),
-                segments.next()
-            ),
-            (Some("tokio" | "async_std"), Some("test"), None)
-        )
-    }) {
+    if attributes
+        .iter()
+        .any(|attribute| path_is_test_attribute(attribute.path()))
+    {
         return true;
     }
 
-    let predicates: Option<Vec<_>> = attributes
-        .iter()
-        .filter(|attribute| attribute.path().is_ident("cfg"))
-        .map(|attribute| match &attribute.meta {
-            syn::Meta::List(list) => list.parse_args::<syn::Meta>().ok(),
-            _ => None,
-        })
-        .collect();
+    let predicates = production_cfg_predicates(attributes);
     predicates.is_some_and(|predicates| {
         !predicates.is_empty() && !cfg_predicates_can_be_production(&predicates)
     })
+}
+
+fn path_is_test_attribute(path: &syn::Path) -> bool {
+    if path.is_ident("test") {
+        return true;
+    }
+    let mut segments = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string());
+    matches!(
+        (
+            segments.next().as_deref(),
+            segments.next().as_deref(),
+            segments.next()
+        ),
+        (Some("tokio" | "async_std"), Some("test"), None)
+    )
+}
+
+fn production_cfg_predicates(attributes: &[syn::Attribute]) -> Option<Vec<syn::Meta>> {
+    let mut predicates = Vec::new();
+    for attribute in attributes {
+        let syn::Meta::List(list) = &attribute.meta else {
+            if attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr") {
+                return None;
+            }
+            continue;
+        };
+        if list.path.is_ident("cfg") {
+            predicates.push(list.parse_args::<syn::Meta>().ok()?);
+        } else if list.path.is_ident("cfg_attr") {
+            let items = parse_meta_items(list)?;
+            let (condition, attributes) = items.split_first()?;
+            collect_cfg_attr_predicates(condition, attributes, &mut predicates)?;
+        }
+    }
+    Some(predicates)
+}
+
+fn collect_cfg_attr_predicates(
+    condition: &syn::Meta,
+    attributes: &[syn::Meta],
+    predicates: &mut Vec<syn::Meta>,
+) -> Option<()> {
+    for attribute in attributes {
+        if path_is_test_attribute(attribute.path()) {
+            let condition = condition.clone();
+            predicates.push(syn::parse_quote!(not(#condition)));
+            continue;
+        }
+        let syn::Meta::List(list) = attribute else {
+            continue;
+        };
+        if list.path.is_ident("cfg") {
+            let predicate = list.parse_args::<syn::Meta>().ok()?;
+            let condition = condition.clone();
+            predicates.push(syn::parse_quote!(any(not(#condition), #predicate)));
+        } else if list.path.is_ident("cfg_attr") {
+            let items = parse_meta_items(list)?;
+            let (nested_condition, attributes) = items.split_first()?;
+            let condition = condition.clone();
+            let nested_condition = nested_condition.clone();
+            let combined: syn::Meta = syn::parse_quote!(all(#condition, #nested_condition));
+            collect_cfg_attr_predicates(&combined, attributes, predicates)?;
+        }
+    }
+    Some(())
 }
 
 #[derive(Clone, Copy)]
@@ -356,6 +403,7 @@ fn cfg_key_has_single_value(key: &str) -> bool {
         key,
         "panic"
             | "target_arch"
+            | "target_abi"
             | "target_endian"
             | "target_env"
             | "target_os"

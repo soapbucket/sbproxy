@@ -383,7 +383,7 @@ fn primitive_type_reference(reference: &TypeReference) -> Option<&str> {
     (!reference.leading_colon
         && matches!(
             name.as_str(),
-            "bool"
+            "()" | "bool"
                 | "char"
                 | "str"
                 | "u8"
@@ -467,6 +467,30 @@ enum ConstArgumentReference {
 }
 
 #[derive(Debug, Clone)]
+enum TypeAliasParameter {
+    Type(String),
+    Const(String),
+}
+
+#[derive(Debug, Clone)]
+struct TypeAliasDefinition {
+    parameters: Vec<TypeAliasParameter>,
+    target: TypeReference,
+}
+
+#[derive(Debug, Default)]
+struct GenericOwnerBindings {
+    type_arguments: BTreeMap<String, String>,
+    const_arguments: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GenericRequirements {
+    trait_bounds: Vec<(String, TypeReference)>,
+    has_unresolved_requirements: bool,
+}
+
+#[derive(Debug, Clone)]
 struct FunctionReturn {
     symbol: String,
     result: TypeReference,
@@ -483,6 +507,7 @@ struct MethodSignature {
     owner: TypeReference,
     type_parameters: BTreeSet<String>,
     const_parameters: BTreeSet<String>,
+    requirements: GenericRequirements,
     receiver: MethodReceiver,
 }
 
@@ -507,6 +532,7 @@ struct TraitImplementation {
     owner: TraitImplementationOwner,
     type_parameters: BTreeSet<String>,
     const_parameters: BTreeSet<String>,
+    requirements: GenericRequirements,
     method_signatures: BTreeMap<String, Vec<MethodReceiver>>,
 }
 
@@ -595,7 +621,11 @@ impl NamespaceResolution {
 struct RustTypeIndex {
     fields: BTreeMap<String, BTreeMap<String, Option<TypeReference>>>,
     type_components: BTreeMap<String, Vec<Option<TypeReference>>>,
+    generic_type_parameters: BTreeMap<String, Vec<TypeAliasParameter>>,
+    tuple_struct_fields: BTreeMap<String, Vec<Option<TypeReference>>>,
+    enum_tuple_variant_fields: BTreeMap<(String, String), Vec<Option<TypeReference>>>,
     derived_traits: BTreeMap<String, BTreeSet<String>>,
+    type_aliases: BTreeMap<String, Vec<TypeAliasDefinition>>,
     types_by_name: BTreeMap<String, BTreeSet<String>>,
     symbol_bindings: BTreeMap<String, Vec<TypeReference>>,
     glob_imports: BTreeMap<ModuleContext, Vec<TypeReference>>,
@@ -652,6 +682,65 @@ impl RustTypeIndex {
 
     fn record_symbol_binding(&mut self, alias: String, target: TypeReference) {
         self.symbol_bindings.entry(alias).or_default().push(target);
+    }
+
+    fn record_type_alias(
+        &mut self,
+        alias: String,
+        generics: &syn::Generics,
+        target: TypeReference,
+    ) {
+        let parameters = generics
+            .params
+            .iter()
+            .filter_map(|parameter| match parameter {
+                syn::GenericParam::Type(parameter) => {
+                    Some(TypeAliasParameter::Type(parameter.ident.to_string()))
+                }
+                syn::GenericParam::Const(parameter) => {
+                    Some(TypeAliasParameter::Const(parameter.ident.to_string()))
+                }
+                syn::GenericParam::Lifetime(_) => None,
+            })
+            .collect();
+        self.type_aliases
+            .entry(alias)
+            .or_default()
+            .push(TypeAliasDefinition { parameters, target });
+    }
+
+    fn record_generic_type_parameters(&mut self, owner: &str, generics: &syn::Generics) {
+        let parameters = generics
+            .params
+            .iter()
+            .filter_map(|parameter| match parameter {
+                syn::GenericParam::Type(parameter) => {
+                    Some(TypeAliasParameter::Type(parameter.ident.to_string()))
+                }
+                syn::GenericParam::Const(parameter) => {
+                    Some(TypeAliasParameter::Const(parameter.ident.to_string()))
+                }
+                syn::GenericParam::Lifetime(_) => None,
+            })
+            .collect();
+        self.generic_type_parameters
+            .insert(owner.to_string(), parameters);
+    }
+
+    fn tuple_field_references(
+        fields: &syn::Fields,
+        context: &ModuleContext,
+    ) -> Option<Vec<Option<TypeReference>>> {
+        let syn::Fields::Unnamed(fields) = fields else {
+            return None;
+        };
+        Some(
+            fields
+                .unnamed
+                .iter()
+                .map(|field| type_reference(&field.ty, context))
+                .collect(),
+        )
     }
 
     fn record_glob_import(&mut self, context: &ModuleContext, target: TypeReference) {
@@ -736,6 +825,7 @@ impl RustTypeIndex {
 
     fn record_enum(&mut self, owner: &str, item: &syn::ItemEnum, context: &ModuleContext) {
         self.record_type(owner, &item.ident.to_string());
+        self.record_generic_type_parameters(owner, &item.generics);
         self.record_derived_traits(owner, &item.attrs);
         self.enum_variants.insert(
             owner.to_string(),
@@ -749,6 +839,10 @@ impl RustTypeIndex {
                 .insert(owner.to_string(), rust_field_name(&tag));
         }
         for variant in &item.variants {
+            if let Some(fields) = Self::tuple_field_references(&variant.fields, context) {
+                self.enum_tuple_variant_fields
+                    .insert((owner.to_string(), variant.ident.to_string()), fields);
+            }
             self.record_fields(owner, &variant.fields, context);
         }
     }
@@ -767,6 +861,32 @@ impl RustTypeIndex {
     }
 
     fn resolve_exact_type_reference(&self, reference: &TypeReference) -> Option<String> {
+        self.resolve_exact_type_reference_inner(reference, &mut BTreeSet::new())
+    }
+
+    fn resolve_exact_type_reference_inner(
+        &self,
+        reference: &TypeReference,
+        resolving_aliases: &mut BTreeSet<String>,
+    ) -> Option<String> {
+        let aliases = self.type_alias_definitions_for_reference(reference, &mut BTreeSet::new());
+        if !aliases.is_empty() {
+            let [alias] = aliases.as_slice() else {
+                return None;
+            };
+            let key = format!(
+                "{}:{}",
+                reference.context.path(),
+                reference.segments.join("::")
+            );
+            if !resolving_aliases.insert(key.clone()) {
+                return None;
+            }
+            let expanded = Self::instantiate_type_alias(alias, reference)?;
+            let resolved = self.resolve_exact_type_reference_inner(&expanded, resolving_aliases);
+            resolving_aliases.remove(&key);
+            return resolved;
+        }
         let owner = self
             .resolve_type_reference(reference)
             .or_else(|| primitive_type_reference(reference).map(str::to_string))?;
@@ -778,7 +898,7 @@ impl RustTypeIndex {
             .iter()
             .map(|argument| match argument {
                 GenericArgumentReference::Type(argument) => {
-                    self.resolve_exact_type_reference(argument)
+                    self.resolve_exact_type_reference_inner(argument, resolving_aliases)
                 }
                 GenericArgumentReference::Const(ConstArgumentReference::Literal(value)) => {
                     Some(format!("#{value}"))
@@ -787,6 +907,161 @@ impl RustTypeIndex {
             })
             .collect();
         Some(resolved_type_identity(owner, &arguments?))
+    }
+
+    fn type_alias_definitions_for_reference(
+        &self,
+        reference: &TypeReference,
+        resolving: &mut BTreeSet<String>,
+    ) -> Vec<TypeAliasDefinition> {
+        let Some(name) = reference.segments.last() else {
+            return Vec::new();
+        };
+        if reference.segments.len() == 1 && !reference.leading_colon {
+            return self.type_alias_definitions_in_namespace(&reference.context, name, resolving);
+        }
+        let namespace_reference = TypeReference {
+            segments: reference.segments[..reference.segments.len() - 1].to_vec(),
+            generic_arguments: Vec::new(),
+            has_unresolved_generic_arguments: false,
+            context: reference.context.clone(),
+            leading_colon: reference.leading_colon,
+        };
+        let namespaces = self.resolve_namespace_reference(&namespace_reference, resolving);
+        if namespaces.tainted {
+            return Vec::new();
+        }
+        namespaces
+            .namespaces
+            .iter()
+            .flat_map(|namespace| {
+                self.type_alias_definitions_in_namespace(namespace, name, resolving)
+            })
+            .collect()
+    }
+
+    fn type_alias_definitions_in_namespace(
+        &self,
+        namespace: &ModuleContext,
+        name: &str,
+        resolving: &mut BTreeSet<String>,
+    ) -> Vec<TypeAliasDefinition> {
+        let key = format!("type-alias:{}::{name}", namespace.path());
+        if !resolving.insert(key.clone()) {
+            return Vec::new();
+        }
+        let exact = namespace.symbol(name);
+        if let Some(aliases) = self.type_aliases.get(&exact) {
+            resolving.remove(&key);
+            return aliases.clone();
+        }
+        let mut aliases = Vec::new();
+        if let Some(bindings) = self.symbol_bindings.get(&exact) {
+            for binding in bindings {
+                aliases.extend(self.type_alias_definitions_for_reference(binding, resolving));
+            }
+        }
+        if let Some(globs) = self.glob_imports.get(namespace) {
+            for glob in globs {
+                let targets = self.resolve_namespace_reference(glob, resolving);
+                if targets.tainted {
+                    continue;
+                }
+                for target in targets.namespaces {
+                    aliases
+                        .extend(self.type_alias_definitions_in_namespace(&target, name, resolving));
+                }
+            }
+        }
+        resolving.remove(&key);
+        aliases
+    }
+
+    fn instantiate_type_alias(
+        alias: &TypeAliasDefinition,
+        reference: &TypeReference,
+    ) -> Option<TypeReference> {
+        if reference.has_unresolved_generic_arguments
+            || alias.parameters.len() != reference.generic_arguments.len()
+        {
+            return None;
+        }
+        let mut type_arguments = BTreeMap::new();
+        let mut const_arguments = BTreeMap::new();
+        for (parameter, argument) in alias.parameters.iter().zip(&reference.generic_arguments) {
+            match (parameter, argument) {
+                (TypeAliasParameter::Type(parameter), GenericArgumentReference::Type(argument)) => {
+                    type_arguments.insert(parameter.clone(), argument.clone());
+                }
+                (
+                    TypeAliasParameter::Const(parameter),
+                    GenericArgumentReference::Const(argument),
+                ) => {
+                    const_arguments.insert(parameter.clone(), argument.clone());
+                }
+                (
+                    TypeAliasParameter::Const(parameter),
+                    GenericArgumentReference::Type(argument),
+                ) if argument.segments.len() == 1
+                    && argument.generic_arguments.is_empty()
+                    && !argument.has_unresolved_generic_arguments
+                    && !argument.leading_colon =>
+                {
+                    const_arguments.insert(
+                        parameter.clone(),
+                        ConstArgumentReference::Path(argument.segments.clone()),
+                    );
+                }
+                _ => return None,
+            }
+        }
+        Self::substitute_type_alias_target(&alias.target, &type_arguments, &const_arguments)
+    }
+
+    fn substitute_type_alias_target(
+        reference: &TypeReference,
+        type_arguments: &BTreeMap<String, TypeReference>,
+        const_arguments: &BTreeMap<String, ConstArgumentReference>,
+    ) -> Option<TypeReference> {
+        if reference.segments.len() == 1
+            && reference.generic_arguments.is_empty()
+            && !reference.has_unresolved_generic_arguments
+            && !reference.leading_colon
+        {
+            if let Some(argument) = type_arguments.get(&reference.segments[0]) {
+                return Some(argument.clone());
+            }
+        }
+        let mut substituted = reference.clone();
+        substituted.generic_arguments = reference
+            .generic_arguments
+            .iter()
+            .map(|argument| match argument {
+                GenericArgumentReference::Type(argument)
+                    if argument.segments.len() == 1
+                        && argument.generic_arguments.is_empty()
+                        && !argument.has_unresolved_generic_arguments
+                        && !argument.leading_colon
+                        && const_arguments.contains_key(&argument.segments[0]) =>
+                {
+                    Some(GenericArgumentReference::Const(
+                        const_arguments.get(&argument.segments[0])?.clone(),
+                    ))
+                }
+                GenericArgumentReference::Type(argument) => Some(GenericArgumentReference::Type(
+                    Self::substitute_type_alias_target(argument, type_arguments, const_arguments)?,
+                )),
+                GenericArgumentReference::Const(ConstArgumentReference::Path(path))
+                    if path.len() == 1 && const_arguments.contains_key(&path[0]) =>
+                {
+                    Some(GenericArgumentReference::Const(
+                        const_arguments.get(&path[0])?.clone(),
+                    ))
+                }
+                argument => Some(argument.clone()),
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(substituted)
     }
 
     fn direct_generic_parameter<'a>(
@@ -803,15 +1078,49 @@ impl RustTypeIndex {
         .then_some(name.as_str())
     }
 
-    fn type_reference_matches_owner(
+    fn bind_generic_argument(
+        bindings: &mut BTreeMap<String, String>,
+        parameter: &str,
+        owner: &str,
+    ) -> bool {
+        if let Some(bound) = bindings.get(parameter) {
+            return bound == owner;
+        }
+        bindings.insert(parameter.to_string(), owner.to_string());
+        true
+    }
+
+    fn type_reference_owner_bindings(
         &self,
         reference: &TypeReference,
         type_parameters: &BTreeSet<String>,
         const_parameters: &BTreeSet<String>,
         owner: &str,
+    ) -> Option<GenericOwnerBindings> {
+        let mut bindings = GenericOwnerBindings::default();
+        self.unify_type_reference_with_owner(
+            reference,
+            type_parameters,
+            const_parameters,
+            owner,
+            &mut bindings,
+        )
+        .then_some(bindings)
+    }
+
+    fn unify_type_reference_with_owner(
+        &self,
+        reference: &TypeReference,
+        type_parameters: &BTreeSet<String>,
+        const_parameters: &BTreeSet<String>,
+        owner: &str,
+        bindings: &mut GenericOwnerBindings,
     ) -> bool {
-        if Self::direct_generic_parameter(reference, type_parameters).is_some() {
-            return !owner.starts_with('#');
+        if let Some(parameter) = Self::direct_generic_parameter(reference, type_parameters) {
+            if owner.starts_with('#') {
+                return false;
+            }
+            return Self::bind_generic_argument(&mut bindings.type_arguments, parameter, owner);
         }
         let Some(pattern_owner) = self
             .resolve_type_reference(reference)
@@ -833,17 +1142,26 @@ impl RustTypeIndex {
             .iter()
             .zip(owner_arguments)
             .all(|(argument, owner)| match argument {
-                GenericArgumentReference::Type(argument)
-                    if Self::direct_generic_parameter(argument, const_parameters).is_some() =>
-                {
-                    owner.starts_with('#')
+                GenericArgumentReference::Type(argument) => {
+                    if let Some(parameter) =
+                        Self::direct_generic_parameter(argument, const_parameters)
+                    {
+                        owner.starts_with('#')
+                            && Self::bind_generic_argument(
+                                &mut bindings.const_arguments,
+                                parameter,
+                                owner,
+                            )
+                    } else {
+                        self.unify_type_reference_with_owner(
+                            argument,
+                            type_parameters,
+                            const_parameters,
+                            owner,
+                            bindings,
+                        )
+                    }
                 }
-                GenericArgumentReference::Type(argument) => self.type_reference_matches_owner(
-                    argument,
-                    type_parameters,
-                    const_parameters,
-                    owner,
-                ),
                 GenericArgumentReference::Const(ConstArgumentReference::Literal(value)) => {
                     owner == format!("#{value}")
                 }
@@ -851,9 +1169,80 @@ impl RustTypeIndex {
                     let [name] = path.as_slice() else {
                         return false;
                     };
-                    const_parameters.contains(name) && owner.starts_with('#')
+                    const_parameters.contains(name)
+                        && owner.starts_with('#')
+                        && Self::bind_generic_argument(&mut bindings.const_arguments, name, owner)
                 }
             })
+    }
+
+    fn generic_bindings_for_resolved_owner<'a>(
+        &self,
+        owner: &'a str,
+    ) -> Option<(&'a str, GenericOwnerBindings)> {
+        let (nominal_owner, owner_arguments) = split_resolved_type_identity(owner)?;
+        let parameters = self.generic_type_parameters.get(nominal_owner)?;
+        if parameters.len() != owner_arguments.len() {
+            return None;
+        }
+        let mut bindings = GenericOwnerBindings::default();
+        for (parameter, argument) in parameters.iter().zip(owner_arguments) {
+            match parameter {
+                TypeAliasParameter::Type(parameter) if !argument.starts_with('#') => {
+                    bindings
+                        .type_arguments
+                        .insert(parameter.clone(), argument.to_string());
+                }
+                TypeAliasParameter::Const(parameter) if argument.starts_with('#') => {
+                    bindings
+                        .const_arguments
+                        .insert(parameter.clone(), argument.to_string());
+                }
+                _ => return None,
+            }
+        }
+        Some((nominal_owner, bindings))
+    }
+
+    fn resolve_type_reference_with_bindings(
+        &self,
+        reference: &TypeReference,
+        bindings: &GenericOwnerBindings,
+    ) -> Option<String> {
+        if reference.segments.len() == 1
+            && reference.generic_arguments.is_empty()
+            && !reference.has_unresolved_generic_arguments
+            && !reference.leading_colon
+        {
+            if let Some(owner) = bindings.type_arguments.get(&reference.segments[0]) {
+                return Some(owner.clone());
+            }
+        }
+        if reference.has_unresolved_generic_arguments {
+            return None;
+        }
+        let owner = self
+            .resolve_type_reference(reference)
+            .or_else(|| primitive_type_reference(reference).map(str::to_string))?;
+        let arguments: Option<Vec<_>> = reference
+            .generic_arguments
+            .iter()
+            .map(|argument| match argument {
+                GenericArgumentReference::Type(argument) => {
+                    self.resolve_type_reference_with_bindings(argument, bindings)
+                }
+                GenericArgumentReference::Const(ConstArgumentReference::Literal(value)) => {
+                    Some(format!("#{value}"))
+                }
+                GenericArgumentReference::Const(ConstArgumentReference::Path(path)) => {
+                    let [parameter] = path.as_slice() else {
+                        return None;
+                    };
+                    bindings.const_arguments.get(parameter).cloned()
+                }
+            })
+            .collect();
+        Some(resolved_type_identity(owner, &arguments?))
     }
 
     fn resolve_symbol_reference(
@@ -1179,6 +1568,7 @@ impl RustTypeIndex {
         owner: &TypeReference,
         type_parameters: &BTreeSet<String>,
         const_parameters: &BTreeSet<String>,
+        requirements: &GenericRequirements,
         signature: &syn::Signature,
     ) {
         let Some(receiver) = Self::signature_receiver(signature) else {
@@ -1191,6 +1581,7 @@ impl RustTypeIndex {
                 owner: owner.clone(),
                 type_parameters: type_parameters.clone(),
                 const_parameters: const_parameters.clone(),
+                requirements: requirements.clone(),
                 receiver,
             });
     }
@@ -1288,6 +1679,58 @@ impl RustTypeIndex {
         (bounds, has_unresolved_requirements)
     }
 
+    fn generic_requirements(
+        generics: &syn::Generics,
+        type_parameters: &BTreeSet<String>,
+        context: &ModuleContext,
+    ) -> GenericRequirements {
+        let mut requirements = GenericRequirements::default();
+        for parameter in &generics.params {
+            let syn::GenericParam::Type(parameter) = parameter else {
+                continue;
+            };
+            let mut bounds = Vec::new();
+            Self::collect_required_trait_bounds(
+                &parameter.bounds,
+                context,
+                &mut bounds,
+                &mut requirements.has_unresolved_requirements,
+            );
+            requirements.trait_bounds.extend(
+                bounds
+                    .into_iter()
+                    .map(|bound| (parameter.ident.to_string(), bound)),
+            );
+        }
+        if let Some(where_clause) = &generics.where_clause {
+            for predicate in &where_clause.predicates {
+                match predicate {
+                    syn::WherePredicate::Type(predicate) => {
+                        let Some(parameter) =
+                            direct_type_parameter_name(&predicate.bounded_ty, type_parameters)
+                        else {
+                            requirements.has_unresolved_requirements = true;
+                            continue;
+                        };
+                        let mut bounds = Vec::new();
+                        Self::collect_required_trait_bounds(
+                            &predicate.bounds,
+                            context,
+                            &mut bounds,
+                            &mut requirements.has_unresolved_requirements,
+                        );
+                        requirements
+                            .trait_bounds
+                            .extend(bounds.into_iter().map(|bound| (parameter.clone(), bound)));
+                    }
+                    syn::WherePredicate::Lifetime(_) => {}
+                    _ => requirements.has_unresolved_requirements = true,
+                }
+            }
+        }
+        requirements
+    }
+
     fn record_trait_implementation(&mut self, item: &syn::ItemImpl, context: &ModuleContext) {
         let Some((negative, trait_path, _)) = &item.trait_ else {
             return;
@@ -1299,6 +1742,7 @@ impl RustTypeIndex {
             return;
         };
         let (type_parameters, const_parameters) = generic_parameter_names(&item.generics);
+        let requirements = Self::generic_requirements(&item.generics, &type_parameters, context);
         let owner =
             if let Some(parameter) = direct_type_parameter_name(&item.self_ty, &type_parameters) {
                 let (bounds, has_unresolved_requirements) =
@@ -1333,6 +1777,7 @@ impl RustTypeIndex {
             owner,
             type_parameters,
             const_parameters,
+            requirements,
             method_signatures,
         });
     }
@@ -1346,6 +1791,38 @@ impl RustTypeIndex {
             1 => MethodReceiverResolution::Mutable,
             _ => MethodReceiverResolution::Ambiguous,
         }
+    }
+
+    fn generic_requirements_applicability(
+        &self,
+        requirements: &GenericRequirements,
+        bindings: &GenericOwnerBindings,
+        resolving: &mut BTreeSet<String>,
+    ) -> TraitImplementationApplicability {
+        if requirements.has_unresolved_requirements {
+            return TraitImplementationApplicability::Rejected;
+        }
+        let mut applicability = TraitImplementationApplicability::Proven;
+        for (parameter, bound) in &requirements.trait_bounds {
+            let Some(owner) = bindings.type_arguments.get(parameter) else {
+                return TraitImplementationApplicability::Rejected;
+            };
+            let bound_applicability = if let Some(bound) = self.resolve_type_reference(bound) {
+                self.owner_implements_trait(owner, &bound, resolving)
+            } else {
+                self.external_trait_bound_applicability(owner, bound)
+            };
+            match bound_applicability {
+                TraitImplementationApplicability::Rejected => {
+                    return TraitImplementationApplicability::Rejected;
+                }
+                TraitImplementationApplicability::ExternallyConstrained => {
+                    applicability = TraitImplementationApplicability::ExternallyConstrained;
+                }
+                TraitImplementationApplicability::Proven => {}
+            }
+        }
+        applicability
     }
 
     fn trait_implementation_applies(
@@ -1383,16 +1860,19 @@ impl RustTypeIndex {
                 applicability
             }
             TraitImplementationOwner::Exact(reference) => {
-                if self.type_reference_matches_owner(
+                let Some(bindings) = self.type_reference_owner_bindings(
                     reference,
                     &implementation.type_parameters,
                     &implementation.const_parameters,
                     owner,
-                ) {
-                    TraitImplementationApplicability::Proven
-                } else {
-                    TraitImplementationApplicability::Rejected
-                }
+                ) else {
+                    return TraitImplementationApplicability::Rejected;
+                };
+                self.generic_requirements_applicability(
+                    &implementation.requirements,
+                    &bindings,
+                    resolving,
+                )
             }
         }
     }
@@ -1420,6 +1900,10 @@ impl RustTypeIndex {
         let Some(bound) = reference.segments.last().map(String::as_str) else {
             return TraitImplementationApplicability::Rejected;
         };
+        let explicit = self.explicit_external_trait_applicability(owner, bound);
+        if explicit != TraitImplementationApplicability::Rejected {
+            return explicit;
+        }
         let Some((nominal_owner, _)) = split_resolved_type_identity(owner) else {
             return TraitImplementationApplicability::Rejected;
         };
@@ -1430,21 +1914,68 @@ impl RustTypeIndex {
         {
             return TraitImplementationApplicability::Proven;
         }
-        if bound == "Send" {
-            return self.structural_send_applicability(owner, &mut BTreeSet::new());
+        if matches!(bound, "Send" | "Sync") {
+            return self.structural_auto_trait_applicability(owner, bound, &mut BTreeSet::new());
         }
         TraitImplementationApplicability::ExternallyConstrained
     }
 
-    fn structural_send_applicability(
+    fn explicit_external_trait_applicability(
         &self,
         owner: &str,
+        bound: &str,
+    ) -> TraitImplementationApplicability {
+        let mut applicability = TraitImplementationApplicability::Rejected;
+        for implementation in &self.trait_implementations {
+            if implementation
+                .trait_reference
+                .segments
+                .last()
+                .map(String::as_str)
+                != Some(bound)
+                || !self.unresolved_trait_bound_is_external(&implementation.trait_reference)
+            {
+                continue;
+            }
+            let TraitImplementationOwner::Exact(reference) = &implementation.owner else {
+                continue;
+            };
+            let Some(bindings) = self.type_reference_owner_bindings(
+                reference,
+                &implementation.type_parameters,
+                &implementation.const_parameters,
+                owner,
+            ) else {
+                continue;
+            };
+            match self.generic_requirements_applicability(
+                &implementation.requirements,
+                &bindings,
+                &mut BTreeSet::new(),
+            ) {
+                TraitImplementationApplicability::Proven => {
+                    return TraitImplementationApplicability::Proven;
+                }
+                TraitImplementationApplicability::ExternallyConstrained => {
+                    applicability = TraitImplementationApplicability::ExternallyConstrained;
+                }
+                TraitImplementationApplicability::Rejected => {}
+            }
+        }
+        applicability
+    }
+
+    fn structural_auto_trait_applicability(
+        &self,
+        owner: &str,
+        auto_trait: &str,
         resolving: &mut BTreeSet<String>,
     ) -> TraitImplementationApplicability {
         let Some((nominal_owner, _)) = split_resolved_type_identity(owner) else {
             return TraitImplementationApplicability::Rejected;
         };
-        if !resolving.insert(nominal_owner.to_string()) {
+        let resolution_key = format!("{auto_trait}:{nominal_owner}");
+        if !resolving.insert(resolution_key.clone()) {
             return TraitImplementationApplicability::ExternallyConstrained;
         }
         let applicability = self.type_components.get(nominal_owner).map_or(
@@ -1454,7 +1985,11 @@ impl RustTypeIndex {
                 for component in components {
                     let component_applicability = component.as_ref().map_or(
                         TraitImplementationApplicability::ExternallyConstrained,
-                        |component| self.send_component_applicability(component, resolving),
+                        |component| {
+                            self.auto_trait_component_applicability(
+                                component, auto_trait, resolving,
+                            )
+                        },
                     );
                     match component_applicability {
                         TraitImplementationApplicability::Rejected => {
@@ -1469,27 +2004,51 @@ impl RustTypeIndex {
                 applicability
             },
         );
-        resolving.remove(nominal_owner);
+        resolving.remove(&resolution_key);
         applicability
     }
 
-    fn send_component_applicability(
+    fn auto_trait_component_applicability(
         &self,
         component: &TypeReference,
+        auto_trait: &str,
         resolving: &mut BTreeSet<String>,
     ) -> TraitImplementationApplicability {
-        if let Some(owner) = self.resolve_exact_type_reference(component) {
-            return self.structural_send_applicability(&owner, resolving);
-        }
         if primitive_type_reference(component).is_some() {
             return TraitImplementationApplicability::Proven;
         }
-        if component
-            .segments
-            .last()
-            .is_some_and(|segment| segment == "Rc")
-        {
+        let component_name = component.segments.last().map(String::as_str);
+        if component_name == Some("Rc") {
             return TraitImplementationApplicability::Rejected;
+        }
+        if component_name == Some("MutexGuard") {
+            if auto_trait == "Send" {
+                return TraitImplementationApplicability::Rejected;
+            }
+            if auto_trait == "Sync" {
+                if component.has_unresolved_generic_arguments {
+                    return TraitImplementationApplicability::ExternallyConstrained;
+                }
+                let mut applicability = TraitImplementationApplicability::Proven;
+                for argument in &component.generic_arguments {
+                    let GenericArgumentReference::Type(argument) = argument else {
+                        continue;
+                    };
+                    match self.auto_trait_component_applicability(argument, auto_trait, resolving) {
+                        TraitImplementationApplicability::Rejected => {
+                            return TraitImplementationApplicability::Rejected;
+                        }
+                        TraitImplementationApplicability::ExternallyConstrained => {
+                            applicability = TraitImplementationApplicability::ExternallyConstrained;
+                        }
+                        TraitImplementationApplicability::Proven => {}
+                    }
+                }
+                return applicability;
+            }
+        }
+        if let Some(owner) = self.resolve_exact_type_reference(component) {
+            return self.structural_auto_trait_applicability(&owner, auto_trait, resolving);
         }
         TraitImplementationApplicability::ExternallyConstrained
     }
@@ -1537,16 +2096,29 @@ impl RustTypeIndex {
         in_scope_traits: &BTreeSet<String>,
     ) -> MethodReceiverResolution {
         let mut receivers = BTreeSet::new();
+        let mut externally_constrained_receivers = BTreeSet::new();
         if let Some(signatures) = self.method_signatures.get(method) {
             for signature in signatures {
-                if self.type_reference_matches_owner(
+                let Some(bindings) = self.type_reference_owner_bindings(
                     &signature.owner,
                     &signature.type_parameters,
                     &signature.const_parameters,
                     owner,
+                ) else {
+                    continue;
+                };
+                let target = match self.generic_requirements_applicability(
+                    &signature.requirements,
+                    &bindings,
+                    &mut BTreeSet::new(),
                 ) {
-                    receivers.insert(signature.receiver);
-                }
+                    TraitImplementationApplicability::Rejected => continue,
+                    TraitImplementationApplicability::ExternallyConstrained => {
+                        &mut externally_constrained_receivers
+                    }
+                    TraitImplementationApplicability::Proven => &mut receivers,
+                };
+                target.insert(signature.receiver);
             }
         }
         let inherent = Self::receiver_resolution(&receivers);
@@ -1554,10 +2126,9 @@ impl RustTypeIndex {
             return inherent;
         }
         if in_scope_traits.is_empty() {
-            return MethodReceiverResolution::Missing;
+            return Self::receiver_resolution(&externally_constrained_receivers);
         }
 
-        let mut externally_constrained_receivers = BTreeSet::new();
         for trait_owner in in_scope_traits {
             let Some(implementations) = self.trait_implementations_by_trait.get(trait_owner) else {
                 continue;
@@ -1642,7 +2213,12 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
         }
         let owner = self.context.symbol(&node.ident.to_string());
         self.index.record_type(&owner, &node.ident.to_string());
+        self.index
+            .record_generic_type_parameters(&owner, &node.generics);
         self.index.record_derived_traits(&owner, &node.attrs);
+        if let Some(fields) = RustTypeIndex::tuple_field_references(&node.fields, &self.context) {
+            self.index.tuple_struct_fields.insert(owner.clone(), fields);
+        }
         self.index
             .record_fields(&owner, &node.fields, &self.context);
     }
@@ -1679,6 +2255,8 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
             return;
         };
         let (type_parameters, const_parameters) = generic_parameter_names(&node.generics);
+        let requirements =
+            RustTypeIndex::generic_requirements(&node.generics, &type_parameters, &self.context);
         for item in &node.items {
             let syn::ImplItem::Fn(method) = item else {
                 continue;
@@ -1688,6 +2266,7 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
                     &owner,
                     &type_parameters,
                     &const_parameters,
+                    &requirements,
                     &method.sig,
                 );
             }
@@ -1696,8 +2275,10 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
 
     fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
         if let Some(target) = type_reference(&node.ty, &self.context) {
+            let alias = self.context.symbol(&node.ident.to_string());
             self.index
-                .record_symbol_binding(self.context.symbol(&node.ident.to_string()), target);
+                .record_type_alias(alias.clone(), &node.generics, target.clone());
+            self.index.record_symbol_binding(alias, target);
         }
     }
 
@@ -1871,7 +2452,15 @@ fn nominal_type_reference(ty: &syn::Type, context: &ModuleContext) -> Option<Typ
     match ty {
         syn::Type::Group(group) => nominal_type_reference(&group.elem, context),
         syn::Type::Paren(paren) => nominal_type_reference(&paren.elem, context),
+        syn::Type::Reference(reference) => nominal_type_reference(&reference.elem, context),
         syn::Type::Path(path) if path.qself.is_none() => path_reference(&path.path, context),
+        syn::Type::Tuple(tuple) if tuple.elems.is_empty() => Some(TypeReference {
+            segments: vec!["()".to_string()],
+            generic_arguments: Vec::new(),
+            has_unresolved_generic_arguments: false,
+            context: context.clone(),
+            leading_colon: false,
+        }),
         _ => None,
     }
 }
@@ -2034,10 +2623,52 @@ fn type_is_mutable_reference(ty: &syn::Type) -> bool {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
+enum InferredValueKind {
+    Nominal(String),
+    Tuple(Vec<Option<InferredValue>>),
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct InferredValue {
-    owner: String,
+    kind: InferredValueKind,
     mutable_place: bool,
+}
+
+impl InferredValue {
+    fn nominal(owner: String, mutable_place: bool) -> Self {
+        Self {
+            kind: InferredValueKind::Nominal(owner),
+            mutable_place,
+        }
+    }
+
+    fn tuple(elements: Vec<Option<Self>>) -> Self {
+        Self {
+            kind: InferredValueKind::Tuple(elements),
+            mutable_place: false,
+        }
+    }
+
+    fn owner(&self) -> Option<&str> {
+        match &self.kind {
+            InferredValueKind::Nominal(owner) => Some(owner),
+            InferredValueKind::Tuple(_) => None,
+        }
+    }
+
+    fn tuple_elements(&self) -> Option<&[Option<Self>]> {
+        match &self.kind {
+            InferredValueKind::Nominal(_) => None,
+            InferredValueKind::Tuple(elements) => Some(elements),
+        }
+    }
+
+    fn with_enclosing_mutability(&self, mutable_place: bool) -> Self {
+        let mut value = self.clone();
+        value.mutable_place |= mutable_place;
+        value
+    }
 }
 
 #[derive(Clone, Default)]
@@ -2503,20 +3134,17 @@ impl<'a> FieldReadVisitor<'a> {
                     if let Some(owner) = &self.impl_owner {
                         self.environment.insert(
                             "self".to_string(),
-                            InferredValue {
-                                owner: owner.to_string(),
-                                mutable_place: receiver.mutability.is_some(),
-                            },
+                            InferredValue::nominal(
+                                owner.to_string(),
+                                receiver.mutability.is_some(),
+                            ),
                         );
                     }
                 }
                 syn::FnArg::Typed(typed) => {
-                    let value = self
-                        .resolve_type_scoped(&typed.ty)
-                        .map(|owner| InferredValue {
-                            owner,
-                            mutable_place: type_is_mutable_reference(&typed.ty),
-                        });
+                    let value = self.resolve_type_scoped(&typed.ty).map(|owner| {
+                        InferredValue::nominal(owner, type_is_mutable_reference(&typed.ty))
+                    });
                     self.bind_pattern(&typed.pat, value.as_ref());
                 }
             }
@@ -2527,6 +3155,69 @@ impl<'a> FieldReadVisitor<'a> {
             self.local_scopes = saved_local_scopes;
         }
         self.in_function = saved_in_function;
+    }
+
+    fn bind_inferred_sequence<'b>(
+        &mut self,
+        patterns: impl IntoIterator<Item = &'b syn::Pat>,
+        values: &[Option<InferredValue>],
+        mutable_place: bool,
+    ) -> bool {
+        let patterns: Vec<_> = patterns.into_iter().collect();
+        if patterns.len() != values.len()
+            || patterns
+                .iter()
+                .any(|pattern| Self::pattern_is_rest(pattern))
+        {
+            return false;
+        }
+        for (pattern, value) in patterns.into_iter().zip(values) {
+            let value = value
+                .as_ref()
+                .map(|value| value.with_enclosing_mutability(mutable_place));
+            self.bind_pattern(pattern, value.as_ref());
+        }
+        true
+    }
+
+    fn tuple_pattern_field_values(
+        &self,
+        path: &syn::Path,
+        value: &InferredValue,
+    ) -> Option<Vec<Option<InferredValue>>> {
+        let value_owner = value.owner()?;
+        let (nominal_owner, bindings) = self
+            .types
+            .generic_bindings_for_resolved_owner(value_owner)?;
+
+        let fields = if self.resolve_path_scoped(path).as_deref() == Some(nominal_owner) {
+            self.types.tuple_struct_fields.get(nominal_owner)?
+        } else {
+            let mut reference = path_reference(path, &self.context)?;
+            let variant = reference.segments.pop()?;
+            let pattern_owner = self.resolve_symbol_scoped(SymbolKind::Type, &reference)?;
+            if pattern_owner != nominal_owner {
+                return None;
+            }
+            self.types
+                .enum_tuple_variant_fields
+                .get(&(pattern_owner, variant))?
+        };
+
+        Some(
+            fields
+                .iter()
+                .map(|reference| {
+                    reference
+                        .as_ref()
+                        .and_then(|reference| {
+                            self.types
+                                .resolve_type_reference_with_bindings(reference, &bindings)
+                        })
+                        .map(|owner| InferredValue::nominal(owner, value.mutable_place))
+                })
+                .collect(),
+        )
     }
 
     fn bind_pattern(&mut self, pattern: &syn::Pat, value: Option<&InferredValue>) {
@@ -2550,16 +3241,27 @@ impl<'a> FieldReadVisitor<'a> {
                 self.bind_pattern(&reference.pat, referenced.as_ref());
             }
             syn::Pat::Type(typed) => {
-                let explicit = self
-                    .resolve_type_scoped(&typed.ty)
-                    .map(|owner| InferredValue {
+                let explicit = self.resolve_type_scoped(&typed.ty).map(|owner| {
+                    InferredValue::nominal(
                         owner,
-                        mutable_place: type_is_mutable_reference(&typed.ty)
+                        type_is_mutable_reference(&typed.ty)
                             || value.is_some_and(|value| value.mutable_place),
-                    });
+                    )
+                });
                 self.bind_pattern(&typed.pat, explicit.as_ref().or(value));
             }
             syn::Pat::Tuple(tuple) => {
+                if let Some(value) = value {
+                    if let Some(elements) = value.tuple_elements() {
+                        if self.bind_inferred_sequence(
+                            tuple.elems.iter(),
+                            elements,
+                            value.mutable_place,
+                        ) {
+                            return;
+                        }
+                    }
+                }
                 for element in &tuple.elems {
                     self.bind_pattern(element, value);
                 }
@@ -2571,6 +3273,17 @@ impl<'a> FieldReadVisitor<'a> {
             }
             syn::Pat::TupleStruct(tuple) => {
                 self.record_tagged_enum_match(&tuple.path);
+                if let Some(value) = value {
+                    if let Some(fields) = self.tuple_pattern_field_values(&tuple.path, value) {
+                        if self.bind_inferred_sequence(
+                            tuple.elems.iter(),
+                            &fields,
+                            value.mutable_place,
+                        ) {
+                            return;
+                        }
+                    }
+                }
                 for element in &tuple.elems {
                     self.bind_pattern(element, value);
                 }
@@ -2579,7 +3292,7 @@ impl<'a> FieldReadVisitor<'a> {
                 self.record_tagged_enum_match(&record.path);
                 let pattern_owner = self
                     .resolve_path_scoped(&record.path)
-                    .or_else(|| value.map(|value| value.owner.clone()));
+                    .or_else(|| value.and_then(InferredValue::owner).map(str::to_string));
                 if let Some(pattern_owner) = pattern_owner {
                     for field in &record.fields {
                         if attributes_exclude_production(&field.attrs)
@@ -2593,11 +3306,10 @@ impl<'a> FieldReadVisitor<'a> {
                             }
                             let target =
                                 self.types.field_type(&pattern_owner, &member).map(|owner| {
-                                    InferredValue {
+                                    InferredValue::nominal(
                                         owner,
-                                        mutable_place: value
-                                            .is_some_and(|value| value.mutable_place),
-                                    }
+                                        value.is_some_and(|value| value.mutable_place),
+                                    )
                                 });
                             self.bind_pattern(&field.pat, target.as_ref());
                         }
@@ -3345,7 +4057,7 @@ impl<'a> FieldReadVisitor<'a> {
             .all(|candidate| {
                 candidate
                     .as_ref()
-                    .is_some_and(|candidate| candidate.owner == first.owner)
+                    .is_some_and(|candidate| candidate.kind == first.kind)
             })
             .then_some(first)
     }
@@ -3366,22 +4078,17 @@ impl<'a> FieldReadVisitor<'a> {
                     return None;
                 };
                 self.function_return_scoped(&path.path)
-                    .map(|owner| InferredValue {
-                        owner,
-                        mutable_place: false,
-                    })
+                    .map(|owner| InferredValue::nominal(owner, false))
             }
             syn::Expr::Field(field) => {
                 let member = Self::named_member(&field.member)?;
                 let owner = self.infer_expr(&field.base)?;
-                let target = self.types.field_type(&owner.owner, &member);
-                if self.types.fields.contains_key(&owner.owner) {
-                    self.reads.insert((owner.owner, member));
+                let owner = owner.owner()?.to_string();
+                let target = self.types.field_type(&owner, &member);
+                if self.types.fields.contains_key(&owner) {
+                    self.reads.insert((owner, member));
                 }
-                target.map(|owner| InferredValue {
-                    owner,
-                    mutable_place: false,
-                })
+                target.map(|owner| InferredValue::nominal(owner, false))
             }
             syn::Expr::Group(group) => self.infer_expr(&group.expr),
             syn::Expr::Index(index) => {
@@ -3398,10 +4105,10 @@ impl<'a> FieldReadVisitor<'a> {
                 let place_owner = self.infer_place_expr(&call.receiver);
                 let receiver = place_owner
                     .as_ref()
-                    .map(|owner| {
+                    .and_then(|owner| {
+                        let owner = owner.owner()?;
                         let in_scope_traits = self.traits_in_scope_for_method(&method);
-                        self.types
-                            .method_receiver(&owner.owner, &method, &in_scope_traits)
+                        Some(self.types.method_receiver(owner, &method, &in_scope_traits))
                     })
                     .unwrap_or(MethodReceiverResolution::Missing);
                 let (reads_receiver, uses_mutable_receiver) = match receiver {
@@ -3472,12 +4179,16 @@ impl<'a> FieldReadVisitor<'a> {
                     self.visit_expr(rest);
                 }
                 self.resolve_path_scoped(&record.path)
-                    .map(|owner| InferredValue {
-                        owner,
-                        mutable_place: false,
-                    })
+                    .map(|owner| InferredValue::nominal(owner, false))
             }
             syn::Expr::Try(tried) => self.infer_expr(&tried.expr),
+            syn::Expr::Tuple(tuple) => Some(InferredValue::tuple(
+                tuple
+                    .elems
+                    .iter()
+                    .map(|element| self.infer_expr(element))
+                    .collect(),
+            )),
             syn::Expr::Unary(unary) => self.infer_expr(&unary.expr),
             _ => {
                 syn::visit::visit_expr(self, expression);
@@ -3499,13 +4210,11 @@ impl<'a> FieldReadVisitor<'a> {
             }
             syn::Expr::Field(field) => {
                 let owner = self.infer_place_expr(&field.base)?;
+                let owner = owner.owner()?;
                 let member = Self::named_member(&field.member)?;
                 self.types
-                    .field_type(&owner.owner, &member)
-                    .map(|target| InferredValue {
-                        owner: target,
-                        mutable_place: true,
-                    })
+                    .field_type(owner, &member)
+                    .map(|target| InferredValue::nominal(target, true))
             }
             syn::Expr::Group(group) => self.infer_place_expr(&group.expr),
             syn::Expr::Index(index) => {
@@ -5691,6 +6400,45 @@ fn production(config: Option<&Config>) {
         assert!(
             errors.is_empty(),
             "a binding shared by or-pattern alternatives must retain config provenance: \
+            {errors:?}"
+        );
+    }
+
+    #[test]
+    fn generic_enum_variable_patterns_preserve_payload_provenance() {
+        let errors = guard_errors(&[source(
+            "enum Either<T> { A(T), B(T) }\n\
+             struct GuardConfig { enabled: bool }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(value: Either<&GuardConfig>) {\n\
+                 match value {\n\
+                     Either::A(cfg) | Either::B(cfg) => consume(cfg.enabled),\n\
+                 }\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "a generic enum variable must project its payload owner into variant bindings: \
+             {errors:?}"
+        );
+    }
+
+    #[test]
+    fn generic_tuple_struct_variable_patterns_preserve_payload_provenance() {
+        let errors = guard_errors(&[source(
+            "struct Wrap<T>(T);\n\
+             struct GuardConfig { enabled: bool }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(value: Wrap<&GuardConfig>) {\n\
+                 let Wrap(cfg) = value;\n\
+                 consume(cfg.enabled);\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "a generic tuple-struct variable must project its field owner into bindings: \
              {errors:?}"
         );
     }
@@ -5900,6 +6648,59 @@ fn production(configs: &[Config]) {
         assert!(
             errors.is_empty(),
             "an array literal's item owner must reach an iterator closure: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn tuple_wrapped_array_iteration_preserves_config_provenance() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &GuardConfig) {\n\
+                 for (cfg,) in [(v,)] {\n\
+                     consume(cfg.enabled);\n\
+                 }\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "tuple structure inside an array must reach its for-loop pattern: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn tuple_wrapped_repeat_iteration_preserves_config_provenance() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &GuardConfig) {\n\
+                 for (cfg,) in [(v,); 2] {\n\
+                     consume(cfg.enabled);\n\
+                 }\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "tuple structure inside a repeated array must reach its for-loop pattern: \
+             {errors:?}"
+        );
+    }
+
+    #[test]
+    fn tuple_wrapped_array_closures_preserve_config_provenance() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &GuardConfig) {\n\
+                 [(v,)].into_iter().for_each(|(cfg,)| consume(cfg.enabled));\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "tuple structure inside an array must reach iterator closure patterns: {errors:?}"
         );
     }
 
@@ -6162,6 +6963,77 @@ fn cfg_test(config: &Config) {
             1,
             "a contradictory feature predicate must be excluded from production: {errors:?}"
         );
+    }
+
+    #[test]
+    fn cfg_attr_that_adds_cfg_test_in_production_is_not_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn consume<T>(_: T) {}\n\
+             #[cfg_attr(not(test), cfg(test))]\n\
+             fn runtime(v: &GuardConfig) { consume(v.enabled); }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "cfg_attr applies cfg(test) precisely in production and must exclude the item: \
+             {errors:?}"
+        );
+    }
+
+    #[test]
+    fn cfg_attr_that_adds_an_impossible_cfg_is_not_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn consume<T>(_: T) {}\n\
+             #[cfg_attr(not(test), cfg(all(unix, windows)))]\n\
+             fn runtime(v: &GuardConfig) { consume(v.enabled); }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "cfg_attr adds an impossible production predicate and must exclude the item: \
+             {errors:?}"
+        );
+    }
+
+    #[test]
+    fn competing_target_abi_values_are_not_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn consume<T>(_: T) {}\n\
+             #[cfg(all(target_abi = \"eabi\", target_abi = \"eabihf\"))]\n\
+             fn runtime(v: &GuardConfig) { consume(v.enabled); }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "target_abi is single-valued and cannot satisfy competing values: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn possible_cfg_attr_and_target_abi_predicates_remain_reader_evidence() {
+        for attribute in [
+            "#[cfg_attr(test, cfg(test))]",
+            "#[cfg(any(target_abi = \"eabi\", target_abi = \"eabihf\"))]",
+        ] {
+            let errors = guard_errors(&[source(&format!(
+                "struct GuardConfig {{ enabled: bool }}\n\
+                 fn consume<T>(_: T) {{}}\n\
+                 {attribute}\n\
+                 fn runtime(v: &GuardConfig) {{ consume(v.enabled); }}"
+            ))]);
+
+            assert!(
+                errors.is_empty(),
+                "a production-reachable attribute remains reader evidence: {attribute}\n\
+                 {errors:?}"
+            );
+        }
     }
 
     #[test]
@@ -7075,6 +7947,46 @@ fn cfg_test(config: &Config) {
     }
 
     #[test]
+    fn sync_but_not_send_components_select_the_shared_blanket_method() {
+        let errors = guard_errors(&[source(
+            "struct Flag(std::sync::MutexGuard<'static, ()>);\n\
+             trait Observe { fn is_set(&self) -> bool { true } }\n\
+             trait Mutate { fn is_set(&mut self) -> bool { false } }\n\
+             impl<T: Sync> Observe for T {}\n\
+             impl<T: Send> Mutate for T {}\n\
+             struct GuardConfig { enabled: Flag }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &mut GuardConfig) { consume(v.enabled.is_set()); }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "MutexGuard makes Flag Sync but not Send, so only the shared method applies: \
+             {errors:?}"
+        );
+    }
+
+    #[test]
+    fn manual_clone_impls_select_the_clone_bounded_shared_method() {
+        let errors = guard_errors(&[source(
+            "struct Flag(std::sync::MutexGuard<'static, ()>);\n\
+             impl Clone for Flag { fn clone(&self) -> Self { todo!() } }\n\
+             trait Observe { fn is_set(&self) -> bool { true } }\n\
+             trait Mutate { fn is_set(&mut self) -> bool { false } }\n\
+             impl<T: Clone> Observe for T {}\n\
+             impl<T: Send> Mutate for T {}\n\
+             struct GuardConfig { enabled: Flag }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &mut GuardConfig) { consume(v.enabled.is_set()); }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "a manual Clone impl applies while MutexGuard keeps Flag non-Send: {errors:?}"
+        );
+    }
+
+    #[test]
     fn structurally_non_send_bound_cannot_override_a_mutable_receiver() {
         let errors = guard_errors(&[source(
             "struct Flag(std::rc::Rc<()>);\n\
@@ -7210,6 +8122,131 @@ fn cfg_test(config: &Config) {
         assert!(
             errors.is_empty(),
             "an impl<T, const N> owner must unify with Wrap<Flag, 1>: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_impl_type_parameters_require_equal_receiver_arguments() {
+        let errors = guard_errors(&[source(
+            "struct A;\n\
+             struct B;\n\
+             struct Pair<X, Y>(X, Y);\n\
+             trait Observe { fn is_set(&self) -> bool { true } }\n\
+             trait Mutate { fn is_set(&mut self) -> bool { false } }\n\
+             impl Observe for Pair<A, B> {}\n\
+             impl<T> Mutate for Pair<T, T> {}\n\
+             struct GuardConfig { enabled: Pair<A, B> }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &mut GuardConfig) { consume(v.enabled.is_set()); }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "Pair<T, T> cannot match Pair<A, B> and hide its shared receiver: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn structured_impl_bounds_must_apply_to_the_concrete_argument() {
+        let errors = guard_errors(&[source(
+            "struct Flag;\n\
+             struct Wrap<T>(T);\n\
+             trait Marker {}\n\
+             trait Observe { fn is_set(&self) -> bool { true } }\n\
+             trait Mutate { fn is_set(&mut self) -> bool { false } }\n\
+             impl Observe for Wrap<Flag> {}\n\
+             impl<T: Marker> Mutate for Wrap<T> {}\n\
+             struct GuardConfig { enabled: Wrap<Flag> }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &mut GuardConfig) { consume(v.enabled.is_set()); }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "an unsatisfied bound on impl<T: Marker> Wrap<T> cannot hide a shared receiver: \
+             {errors:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_impl_const_parameters_require_equal_receiver_arguments() {
+        let errors = guard_errors(&[source(
+            "struct Pair<const A: usize, const B: usize>;\n\
+             trait Observe { fn is_set(&self) -> bool { true } }\n\
+             trait Mutate { fn is_set(&mut self) -> bool { false } }\n\
+             impl Observe for Pair<1, 2> {}\n\
+             impl<const N: usize> Mutate for Pair<N, N> {}\n\
+             struct GuardConfig { enabled: Pair<1, 2> }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &mut GuardConfig) { consume(v.enabled.is_set()); }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "Pair<N, N> cannot match Pair<1, 2> and hide its shared receiver: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn swapped_alias_arguments_resolve_to_the_underlying_owner_order() {
+        let errors = guard_errors(&[source(
+            "struct A;\n\
+             struct B;\n\
+             struct Pair<X, Y>(X, Y);\n\
+             type Swap<X, Y> = Pair<Y, X>;\n\
+             trait Observe { fn is_set(&self) -> bool { true } }\n\
+             trait Mutate { fn is_set(&mut self) -> bool { false } }\n\
+             impl Observe for Pair<B, A> {}\n\
+             impl Mutate for Pair<A, B> {}\n\
+             struct GuardConfig { enabled: Swap<A, B> }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &mut GuardConfig) { consume(v.enabled.is_set()); }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "Swap<A, B> must resolve as Pair<B, A> before method lookup: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn swapped_alias_arguments_do_not_preserve_the_alias_order() {
+        let errors = guard_errors(&[source(
+            "struct A;\n\
+             struct B;\n\
+             struct Pair<X, Y>(X, Y);\n\
+             type Swap<X, Y> = Pair<Y, X>;\n\
+             trait Observe { fn is_set(&self) -> bool { true } }\n\
+             trait Mutate { fn is_set(&mut self) -> bool { false } }\n\
+             impl Observe for Pair<A, B> {}\n\
+             impl Mutate for Pair<B, A> {}\n\
+             struct GuardConfig { enabled: Swap<A, B> }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &mut GuardConfig) { consume(v.enabled.is_set()); }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "Swap<A, B> must not be mistaken for Pair<A, B>: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn simple_generic_aliases_preserve_argument_provenance() {
+        let errors = guard_errors(&[source(
+            "struct Flag;\n\
+             struct Wrap<T>(T);\n\
+             type Alias<T> = Wrap<T>;\n\
+             impl<T> Wrap<T> { fn is_set(&self) -> bool { true } }\n\
+             struct GuardConfig { enabled: Alias<Flag> }\n\
+             fn consume<T>(_: T) {}\n\
+             fn inspect(v: &GuardConfig) { consume(v.enabled.is_set()); }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "a non-reordering generic alias remains a live-reader control: {errors:?}"
         );
     }
 
