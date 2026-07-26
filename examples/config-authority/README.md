@@ -224,6 +224,95 @@ Pass `{"subscriber_id":"edge-01"}` instead to retire every credential that node 
 
 To rotate without a gap, register a second credential for the same `subscriber_id`, deploy it, then revoke the first.
 
+## See who owns what on the subscriber
+
+Once a subscriber applies a bundle, "show me the config" has two different answers on that node. `GET /admin/config` is still its own file. `GET /admin/config/effective` is the document actually running, with the layer that set each setting:
+
+```bash
+curl -sS -u admin:"$ADMIN_PASSWORD" \
+  http://127.0.0.1:9091/admin/config/effective | jq '{locally_owned, layers, provenance}'
+```
+
+```json
+{
+  "locally_owned": false,
+  "layers": {
+    "base": {"kind": "local"},
+    "authority": {"authority_id": "control-plane", "revision": 2, "mode": "overlay"}
+  },
+  "provenance": {
+    "proxy.http_bind_port": "local",
+    "proxy.admin.bind_port": "local",
+    "origins.api.action.url": "authority"
+  }
+}
+```
+
+`locally_owned` is the flag the admin console reads to decide whether to offer its config editor at all.
+
+## Watch a write get refused
+
+The subscriber's own file is still on disk, and editing the parts the authority owns would look like it worked and then vanish at the next poll. So the write is refused instead:
+
+```bash
+# The authority sets origins.api.action.url, so this edit cannot survive.
+curl -sS -u admin:"$ADMIN_PASSWORD" -X PUT \
+  --data-binary @- http://127.0.0.1:9091/admin/config <<'YAML'
+proxy:
+  http_bind_port: 8080
+origins:
+  api:
+    action:
+      type: proxy
+      url: https://not-the-authoritys-value.test
+YAML
+```
+
+```json
+{
+  "error": "this node does not own the edited path: origins.api.action.url",
+  "code": "config_not_locally_owned",
+  "conflicts": [{"path": "origins.api.action.url", "owner": "authority"}],
+  "remedy": "authority control-plane owns these paths at revision 2; publish the change through the authority with `sbproxy authority publish`"
+}
+```
+
+Now change something the authority does not set. Under `mode: overlay` that still works, because the guard is per-setting rather than per-node:
+
+```bash
+# proxy.http_bind_port is not in the bundle, so this is still this node's to change.
+curl -sS -u admin:"$ADMIN_PASSWORD" -X PUT \
+  --data-binary @- http://127.0.0.1:9091/admin/config <<'YAML'
+proxy:
+  http_bind_port: 8081
+origins:
+  api:
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+YAML
+```
+
+Under `mode: replace` the same node keeps only the subscriber-owned paths, so `proxy.admin`, `proxy.tls`, and `proxy.secrets` remain editable and almost nothing else is. That is deliberate: a central authority that could take the admin listener could take away the port you would use to undo a bad push.
+
+Refusals land in the audit log, not only successful writes:
+
+```bash
+grep 'rejected_not_locally_owned' /var/log/sbproxy.log
+```
+
+## Build an editor against the running binary's schema
+
+`GET /admin/config/schema` serves the JSON Schema generated from the types the running binary parses with, so a form cannot offer fields the proxy would reject:
+
+```bash
+curl -sS -u admin:"$ADMIN_PASSWORD" -D /tmp/schema-headers \
+  http://127.0.0.1:9091/admin/config/schema > /tmp/sb-config.schema.json
+grep -i etag /tmp/schema-headers
+```
+
+The document is around 300KB and immutable for a given build, so send the `ETag` back as `If-None-Match` and get a `304` on every load after the first.
+
 ## Reference
 
-Full field tables and the wire contract are in [docs/configuration.md](../../docs/configuration.md#config-authority-fleet-configuration-distribution).
+Full field tables and the wire contract are in [docs/configuration.md](../../docs/configuration.md#config-authority-fleet-configuration-distribution). The endpoint reference is in [docs/admin-api-reference.md](../../docs/admin-api-reference.md#get-adminconfigeffective).

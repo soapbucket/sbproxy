@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sbproxy_config::config_merge::{BaseOrigin, MergeMode, Provenance};
 use sbproxy_config::types::AdminRole;
 use serde::Serialize;
 
@@ -1182,6 +1183,12 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
 /// `GET /admin/config`: return the current on-disk config YAML plus the
 /// loaded content-hash, which a client passes back as `if_match` on a
 /// write for optimistic concurrency.
+///
+/// This is the node's own file and nothing else. On a node that pulls from
+/// a git repository or an authority it is not what is running, and on a
+/// git-sourced node it may be nothing but the `source:` pointer that
+/// selected the repository. `GET /admin/config/effective` is the endpoint
+/// that answers "what is actually running".
 fn handle_config_read(state: &AdminState) -> (u16, &'static str, String) {
     let path = match state.config_path.as_ref() {
         Some(p) => p,
@@ -1214,6 +1221,267 @@ fn handle_config_read(state: &AdminState) -> (u16, &'static str, String) {
         200,
         "application/json",
         serde_json::json!({"revision": revision, "yaml": yaml}).to_string(),
+    )
+}
+
+/// Entity tag for the config JSON Schema, derived from the schema itself.
+///
+/// Content-derived rather than tied to the release version, because the
+/// schema changes whenever a config type or its documentation changes,
+/// which happens many times between releases. A tag that moved only on
+/// release would hand an editor a stale schema for the whole development
+/// cycle, and one that moved on every process start would defeat the point.
+fn config_schema_etag() -> &'static str {
+    static ETAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ETAG.get_or_init(|| {
+        let digest =
+            crate::identity::config_revision(sbproxy_config::config_json_schema().as_bytes());
+        format!("\"{digest}\"")
+    })
+}
+
+/// Refuse a write whose edits the node's remote layers would swallow,
+/// returning the `409` response, or `None` when every edit takes effect.
+///
+/// The rule this enforces is not "an authority exists, so writes are
+/// forbidden". It is "this specific edit would not reach the running
+/// configuration", which is both narrower and more useful: a node under a
+/// replace-mode authority can still change its own admin listener and TLS
+/// material, because the deny list guarantees the authority cannot take
+/// them, while an overlay-mode node is stopped only at the paths its
+/// authority actually sets. See [`crate::config_effective`] for how that is
+/// decided without a second copy of the merge rules.
+///
+/// The guard is not a substitute for RBAC. A read-only operator was already
+/// refused by the connection handler's role gate; this refuses writes that
+/// would be pointless rather than writes that are unauthorized.
+fn guard_config_write(
+    path: &std::path::Path,
+    proposed: &str,
+) -> Option<(u16, &'static str, String)> {
+    let on_disk = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => {
+            let msg = sanitise_path_in_error(&error.to_string(), path);
+            return Some((
+                500,
+                "application/json",
+                format!(
+                    r#"{{"error":"read current config to check ownership: {}"}}"#,
+                    msg.replace('"', "'")
+                ),
+            ));
+        }
+    };
+    let layers = crate::config_effective::current_layers(&on_disk);
+    if layers.is_local_only() {
+        return None;
+    }
+
+    let conflicts = match crate::config_effective::write_conflicts(&layers, &on_disk, proposed) {
+        Ok(conflicts) => conflicts,
+        Err(error) => {
+            // The guard could not be evaluated, so whether the write would
+            // survive is unknown. Refuse: persisting an edit that might be
+            // silently discarded is the failure this endpoint exists to
+            // prevent.
+            tracing::warn!(%error, "admin config write: ownership check failed");
+            return Some((
+                409,
+                "application/json",
+                serde_json::json!({
+                    "error": format!("could not determine which paths this node owns: {error}"),
+                    "code": "config_ownership_unknown",
+                    "layers": config_layers_json(&layers),
+                })
+                .to_string(),
+            ));
+        }
+    };
+    if conflicts.is_empty() {
+        return None;
+    }
+
+    let paths: Vec<&str> = conflicts.iter().map(|c| c.path.as_str()).collect();
+    // Audit the refusal, not only the writes that land. An operator
+    // repeatedly trying to edit configuration they do not own is a signal
+    // that a fleet is misconfigured or that someone is working against the
+    // wrong node, and neither shows up in a log of successes. The operator
+    // identity is on the connection handler's "admin action" line for the
+    // same request; this line carries the outcome.
+    tracing::warn!(
+        target: "sbproxy::admin::audit",
+        action = "config_write",
+        outcome = "rejected_not_locally_owned",
+        reason_code = "config_not_locally_owned",
+        conflicting_paths = %paths.join(","),
+        conflict_count = conflicts.len(),
+        "admin config write refused: this node does not own the edited paths"
+    );
+
+    Some((
+        409,
+        "application/json",
+        serde_json::json!({
+            "error": format!(
+                "this node does not own {}: {}",
+                if conflicts.len() == 1 { "the edited path" } else { "every edited path" },
+                paths.join(", ")
+            ),
+            "code": "config_not_locally_owned",
+            "conflicts": conflicts
+                .iter()
+                .map(|conflict| serde_json::json!({
+                    "path": conflict.path,
+                    "owner": match &conflict.owner {
+                        Some(Provenance::Local) => serde_json::json!("local"),
+                        Some(Provenance::Git { repo, reference, commit }) => serde_json::json!({
+                            "kind": "git", "repo": repo, "reference": reference, "commit": commit,
+                        }),
+                        Some(Provenance::Authority) => serde_json::json!("authority"),
+                        // No owner means the path is suppressed rather than
+                        // overwritten: a replace-mode authority discards it,
+                        // or a git base never had it. Same outcome for the
+                        // operator, so it is reported the same way.
+                        None => serde_json::json!("suppressed"),
+                    },
+                }))
+                .collect::<Vec<_>>(),
+            "layers": config_layers_json(&layers),
+            "remedy": config_write_redirect(&layers),
+        })
+        .to_string(),
+    ))
+}
+
+/// Describe the layers a node's configuration is assembled from, for both
+/// the effective-config response and the body of a rejected write.
+///
+/// Deliberately names the resolved commit and the applied revision rather
+/// than the configured repository and the configured authority. An operator
+/// reading this wants to know what is running, and "configured" and
+/// "running" differ during exactly the incidents where the answer matters.
+fn config_layers_json(layers: &crate::config_effective::ConfigLayers) -> serde_json::Value {
+    let base = match &layers.base_origin {
+        BaseOrigin::Local => serde_json::json!({"kind": "local"}),
+        BaseOrigin::Git {
+            repo,
+            reference,
+            commit,
+        } => serde_json::json!({
+            "kind": "git",
+            "repo": repo,
+            "reference": reference,
+            "commit": commit,
+        }),
+    };
+    let authority = layers.authority.as_ref().map(|applied| {
+        serde_json::json!({
+            "authority_id": applied.authority_id,
+            "revision": applied.revision,
+            "mode": match applied.merge_mode {
+                MergeMode::Overlay => "overlay",
+                MergeMode::Replace => "replace",
+            },
+        })
+    });
+    serde_json::json!({"base": base, "authority": authority})
+}
+
+/// Where an operator should go to change configuration this node does not
+/// own.
+///
+/// A 409 that says only "conflict" leaves the operator guessing, and the
+/// guess is usually "retry", which cannot work. Naming the repository or
+/// the authority turns the rejection into an instruction.
+fn config_write_redirect(layers: &crate::config_effective::ConfigLayers) -> String {
+    match (&layers.base_origin, &layers.authority) {
+        (
+            BaseOrigin::Git {
+                repo, reference, ..
+            },
+            _,
+        ) => format!(
+            "this node reads its configuration from {repo} at {reference}; commit the change \
+             there and the node will pick it up on its next refresh"
+        ),
+        (BaseOrigin::Local, Some(applied)) => format!(
+            "authority {} owns these paths at revision {}; publish the change through the \
+             authority with `sbproxy authority publish`",
+            applied.authority_id, applied.revision
+        ),
+        (BaseOrigin::Local, None) => {
+            "this node owns its own configuration; no redirect applies".to_string()
+        }
+    }
+}
+
+/// `GET /admin/config/effective`: the configuration this node is actually
+/// running, plus which layer owns each leaf of it.
+///
+/// On a node that owns its own configuration this is the local file merged
+/// with nothing, and every leaf reports `local`. The endpoint is still
+/// worth calling there, because the answer "every key is yours" is what
+/// tells an editor it may offer a write at all.
+fn handle_config_effective(state: &AdminState) -> (u16, &'static str, String) {
+    let path = match state.config_path.as_ref() {
+        Some(p) => p,
+        None => {
+            return (
+                503,
+                "application/json",
+                r#"{"error":"config path not wired"}"#.to_string(),
+            )
+        }
+    };
+    let local = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = sanitise_path_in_error(&e.to_string(), path);
+            return (
+                500,
+                "application/json",
+                format!(r#"{{"error":"read config: {}"}}"#, msg.replace('"', "'")),
+            );
+        }
+    };
+    let layers = crate::config_effective::current_layers(&local);
+    let effective = match crate::config_effective::effective_config(&layers) {
+        Ok(effective) => effective,
+        Err(error) => {
+            // A merge that fails here failed for the running node too, so
+            // the node is serving whatever it last applied. Say so rather
+            // than reporting a document that was never assembled.
+            tracing::warn!(%error, "admin effective config: merge failed");
+            return (
+                500,
+                "application/json",
+                serde_json::json!({
+                    "error": format!("could not assemble the effective config: {error}"),
+                    "code": "effective_config_unavailable",
+                    "layers": config_layers_json(&layers),
+                })
+                .to_string(),
+            );
+        }
+    };
+    let locally_owned = effective
+        .provenance
+        .iter()
+        .filter(|(_, provenance)| matches!(provenance, Provenance::Local))
+        .count();
+    (
+        200,
+        "application/json",
+        serde_json::json!({
+            "yaml": effective.yaml,
+            "provenance": effective.provenance,
+            "layers": config_layers_json(&layers),
+            "locally_owned": layers.is_local_only(),
+            "locally_owned_leaves": locally_owned,
+            "total_leaves": effective.provenance.len(),
+        })
+        .to_string(),
     )
 }
 
@@ -1294,6 +1562,14 @@ fn handle_config_write(
             ),
         );
     }
+    // WOR-2012: refuse a write this node's remote layers would swallow.
+    // Runs after validation on purpose: an operator who sends both a syntax
+    // error and an ownership violation is better served by hearing about the
+    // syntax error, and this is the last gate before anything is persisted.
+    if let Some(rejection) = guard_config_write(&path, yaml) {
+        return rejection;
+    }
+
     // Persist atomically (temp file + rename in the same directory).
     let tmp = path.with_extension("sbproxy-tmp");
     if let Err(e) = std::fs::write(&tmp, yaml.as_bytes()).and_then(|_| std::fs::rename(&tmp, &path))
@@ -2160,6 +2436,20 @@ pub fn handle_admin_request(
     // WOR-1720: config read + write (validate, persist, hot-swap). The
     // write path is a mutation, so the connection handler's RBAC gate has
     // already blocked read-only operators before we get here.
+    // WOR-2012: what is actually running here, and who owns each part of
+    // it. Distinct from `/admin/config`, which is this node's own file and
+    // on a git-sourced node is only the pointer that selected the
+    // repository.
+    if path_only == "/admin/config/effective" {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_config_effective(state);
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
     if path_only == "/admin/config" {
         if method.eq_ignore_ascii_case("GET") {
             return handle_config_read(state);
@@ -2850,6 +3140,10 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     let mut origin: Option<String> = None;
     let mut cookie: Option<String> = None;
     let mut csrf_header: Option<String> = None;
+    // WOR-2012: the config schema is large and immutable for a given
+    // build, so it is the one admin response worth revalidating rather
+    // than resending.
+    let mut if_none_match: Option<String> = None;
     for line in lines {
         if line.is_empty() {
             break;
@@ -2874,6 +3168,11 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             .or_else(|| line.strip_prefix("x-csrf-token:"))
         {
             csrf_header = Some(rest.trim().to_string());
+        } else if let Some(rest) = line
+            .strip_prefix("If-None-Match:")
+            .or_else(|| line.strip_prefix("if-none-match:"))
+        {
+            if_none_match = Some(rest.trim().to_string());
         }
     }
     // WOR-1717: CORS headers for an allowed cross-origin caller (echoed on
@@ -3011,6 +3310,62 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             "application/json",
             body.to_string().as_bytes(),
             &cors,
+        )
+        .await;
+        return;
+    }
+
+    // WOR-2012: the config JSON Schema. Dispatched here rather than in the
+    // generic handler because that handler returns a status, a content type,
+    // and a body, with no way to attach a validator, and this is the one
+    // admin document big enough (roughly 300KB) for the difference to
+    // matter. An editor fetches it on every load; with an entity tag it
+    // fetches it once per build.
+    let schema_route = path.split('?').next().unwrap_or(path);
+    if schema_route == "/admin/config/schema" {
+        if principal.is_none() {
+            let _ = write_admin_response_headed(
+                sock,
+                401,
+                "application/json",
+                br#"{"error":"authentication required"}"#,
+                &cors,
+            )
+            .await;
+            return;
+        }
+        if !method.eq_ignore_ascii_case("GET") {
+            let _ = write_admin_response_headed(
+                sock,
+                405,
+                "application/json",
+                br#"{"error":"method not allowed"}"#,
+                &cors,
+            )
+            .await;
+            return;
+        }
+        let schema = sbproxy_config::config_json_schema();
+        let etag = config_schema_etag();
+        // `no-cache` rather than a long `max-age`: the URL has no revision
+        // in it, so a cached copy that outlives an upgrade would describe
+        // the previous binary. Store it, revalidate every time, and let the
+        // entity tag turn the revalidation into a 304.
+        let mut headers = cors.clone();
+        headers.push(("ETag".to_string(), etag.to_string()));
+        headers.push(("Cache-Control".to_string(), "private, no-cache".to_string()));
+        if if_none_match.as_deref() == Some(etag) {
+            let _ =
+                write_admin_response_headed(sock, 304, "application/schema+json", b"", &headers)
+                    .await;
+            return;
+        }
+        let _ = write_admin_response_headed(
+            sock,
+            200,
+            "application/schema+json",
+            schema.as_bytes(),
+            &headers,
         )
         .await;
         return;
@@ -3208,6 +3563,7 @@ fn reason_phrase(status: u16) -> &'static str {
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        304 => "Not Modified",
         405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
@@ -4419,6 +4775,429 @@ mod tests {
         );
         // The on-disk config was never clobbered by the rejected writes.
         assert_eq!(std::fs::read_to_string(&cfgpath).unwrap(), original);
+    }
+
+    /// Serializes the tests that install process-wide config layers. The
+    /// applied authority payload and the resolved base are process globals,
+    /// so two of these running at once would see each other's fixtures.
+    static CONFIG_LAYERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the layer lock and clear both globals, so a test starts from a
+    /// node that owns its own configuration however the previous one ended.
+    fn config_layer_guard() -> std::sync::MutexGuard<'static, ()> {
+        let guard = CONFIG_LAYERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::config_subscriber::clear_applied_bundle();
+        crate::config_source::clear_resolved_base();
+        guard
+    }
+
+    /// Collects event target and fields as text so a test can assert that a
+    /// particular audit line was emitted. Asserting on the log is the only
+    /// way to pin an audit requirement: the audit trail is the product here,
+    /// not a side effect of one.
+    struct CaptureLayer {
+        sink: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut line = format!("{} ", event.metadata().target());
+            event.record(&mut FieldText(&mut line));
+            self.sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(line);
+        }
+    }
+
+    struct FieldText<'a>(&'a mut String);
+
+    impl tracing::field::Visit for FieldText<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={value} ", field.name());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={value:?} ", field.name());
+        }
+    }
+
+    fn owned_config_state(yaml: &str) -> (tempfile::TempDir, AdminState) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sb.yml");
+        std::fs::write(&path, yaml).unwrap();
+        let state = AdminState::new(AdminConfig::default())
+            .with_config_path(path)
+            .with_loaded_config_content_hash("known-revision");
+        (dir, state)
+    }
+
+    /// A real, compilable config. The write guard runs after validation, so
+    /// a fixture that does not compile would be rejected as invalid before
+    /// the guard was ever consulted. The origin key deliberately has no dot
+    /// in it, so its dotted provenance path is unambiguous.
+    const OWNED: &str = "proxy:\n  http_bind_port: 8080\norigins:\n  api:\n    action:\n      type: proxy\n      url: https://test.sbproxy.dev\n";
+
+    /// An authority document that claims the origin's upstream URL and
+    /// nothing else.
+    const AUTHORITY_CLAIMS_URL: &str =
+        "origins:\n  api:\n    action:\n      url: https://central.test\n";
+
+    fn overlay_authority(config_yaml: &str) -> crate::config_subscriber::AppliedAuthority {
+        crate::config_subscriber::AppliedAuthority {
+            config_yaml: config_yaml.to_string(),
+            merge_mode: MergeMode::Overlay,
+            revision: 9,
+            authority_id: "control-plane".to_string(),
+        }
+    }
+
+    #[test]
+    fn config_effective_reports_a_local_node_as_owning_everything() {
+        let _guard = config_layer_guard();
+        let (_dir, state) = owned_config_state(OWNED);
+        let (status, content_type, body) = handle_config_effective(&state);
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/json");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["locally_owned"], true);
+        assert_eq!(value["layers"]["base"]["kind"], "local");
+        assert!(value["layers"]["authority"].is_null());
+        assert_eq!(value["provenance"]["origins.api.action.url"], "local");
+        assert_eq!(value["locally_owned_leaves"], value["total_leaves"]);
+        assert!(value["yaml"].as_str().unwrap().contains("http_bind_port"));
+    }
+
+    #[test]
+    fn config_effective_attributes_each_leaf_to_the_layer_that_set_it() {
+        let _guard = config_layer_guard();
+        let (_dir, state) = owned_config_state(OWNED);
+        crate::config_subscriber::set_applied_authority(overlay_authority(AUTHORITY_CLAIMS_URL));
+
+        let (status, _, body) = handle_config_effective(&state);
+        assert_eq!(status, 200);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["locally_owned"], false);
+        assert_eq!(value["provenance"]["origins.api.action.url"], "authority");
+        assert_eq!(value["provenance"]["origins.api.action.type"], "local");
+        assert_eq!(value["provenance"]["proxy.http_bind_port"], "local");
+        assert_eq!(
+            value["layers"]["authority"]["authority_id"],
+            "control-plane"
+        );
+        assert_eq!(value["layers"]["authority"]["revision"], 9);
+        assert_eq!(value["layers"]["authority"]["mode"], "overlay");
+        assert!(
+            value["yaml"]
+                .as_str()
+                .unwrap()
+                .contains("https://central.test"),
+            "the effective document should carry the authority's value"
+        );
+
+        crate::config_subscriber::clear_applied_bundle();
+    }
+
+    #[test]
+    fn config_write_guard_lets_a_local_node_write_anything() {
+        let _guard = config_layer_guard();
+        let (_dir, state) = owned_config_state(OWNED);
+        let path = state.config_path.clone().unwrap();
+        assert!(
+            guard_config_write(&path, &OWNED.replace("8080", "8081")).is_none(),
+            "a node that owns its config has nothing that could swallow an edit"
+        );
+    }
+
+    #[test]
+    fn config_write_guard_allows_an_edit_the_authority_does_not_claim() {
+        let _guard = config_layer_guard();
+        let (_dir, state) = owned_config_state(OWNED);
+        let path = state.config_path.clone().unwrap();
+        crate::config_subscriber::set_applied_authority(overlay_authority(AUTHORITY_CLAIMS_URL));
+
+        assert!(
+            guard_config_write(&path, &OWNED.replace("8080", "8081")).is_none(),
+            "the authority claims the origin url, so the bind port is still the node's to change"
+        );
+
+        crate::config_subscriber::clear_applied_bundle();
+    }
+
+    #[test]
+    fn config_write_is_refused_when_the_authority_would_swallow_the_edit() {
+        let _guard = config_layer_guard();
+        let (_dir, state) = owned_config_state(OWNED);
+        let path = state.config_path.clone().unwrap();
+        crate::config_subscriber::set_applied_authority(overlay_authority(AUTHORITY_CLAIMS_URL));
+
+        let proposed = OWNED.replace("https://test.sbproxy.dev", "https://mine.test");
+        let (status, _, body) =
+            handle_config_write(&state, Some(&proposed), Some("known-revision"));
+        assert_eq!(status, 409, "{body}");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["code"], "config_not_locally_owned");
+        assert_eq!(value["conflicts"][0]["path"], "origins.api.action.url");
+        assert_eq!(value["conflicts"][0]["owner"], "authority");
+        // The rejection has to be actionable on its own. An operator who
+        // only sees "conflict" retries, and retrying cannot work.
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap()
+                .contains("origins.api.action.url"),
+            "the error should name the path: {}",
+            value["error"]
+        );
+        let remedy = value["remedy"].as_str().unwrap();
+        assert!(remedy.contains("control-plane"), "{remedy}");
+        assert!(remedy.contains("authority publish"), "{remedy}");
+        // Nothing was written.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OWNED);
+
+        crate::config_subscriber::clear_applied_bundle();
+    }
+
+    #[test]
+    fn config_write_is_refused_on_a_git_sourced_node_and_names_the_repository() {
+        let _guard = config_layer_guard();
+        // Internally tagged: `kind` selects the variant, and a git source
+        // requires both the repository and the path inside it.
+        let pointer = "source:\n  kind: git\n  repo: https://git.test/fleet.git\n  path: sb.yml\n";
+        let (_dir, state) = owned_config_state(pointer);
+        let path = state.config_path.clone().unwrap();
+        crate::config_source::publish_resolved_base(crate::config_source::ResolvedBase {
+            yaml: OWNED.to_string(),
+            origin: BaseOrigin::Git {
+                repo: "https://git.test/fleet.git".to_string(),
+                reference: "main".to_string(),
+                commit: "c".repeat(40),
+            },
+            fingerprint: "c".repeat(40),
+        });
+
+        let proposed = format!("{pointer}proxy:\n  http_bind_port: 8081\n");
+        let (status, _, body) =
+            handle_config_write(&state, Some(&proposed), Some("known-revision"));
+        assert_eq!(status, 409, "{body}");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["code"], "config_not_locally_owned");
+        assert_eq!(value["conflicts"][0]["path"], "proxy.http_bind_port");
+        assert_eq!(value["layers"]["base"]["kind"], "git");
+        assert_eq!(value["layers"]["base"]["reference"], "main");
+        let remedy = value["remedy"].as_str().unwrap();
+        assert!(remedy.contains("https://git.test/fleet.git"), "{remedy}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), pointer);
+
+        crate::config_source::clear_resolved_base();
+    }
+
+    /// A rejected write must still be auditable. An operator repeatedly
+    /// trying to edit configuration they do not own is a signal, and a log
+    /// of successes alone would never show it.
+    #[test]
+    fn a_refused_config_write_is_recorded_in_the_audit_log() {
+        let _guard = config_layer_guard();
+        let (_dir, state) = owned_config_state(OWNED);
+        crate::config_subscriber::set_applied_authority(overlay_authority(AUTHORITY_CLAIMS_URL));
+
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let logged = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = logged.clone();
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer { sink });
+        tracing::subscriber::with_default(subscriber, || {
+            let proposed = OWNED.replace("https://test.sbproxy.dev", "https://mine.test");
+            assert_eq!(
+                handle_config_write(&state, Some(&proposed), Some("known-revision")).0,
+                409
+            );
+        });
+
+        let lines = logged.lock().unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("sbproxy::admin::audit")
+                    && line.contains("rejected_not_locally_owned")
+                    && line.contains("origins.api.action.url")),
+            "no audit line named the refused write: {lines:?}"
+        );
+
+        crate::config_subscriber::clear_applied_bundle();
+    }
+
+    #[tokio::test]
+    async fn config_schema_endpoint_serves_the_committed_schema() {
+        let response = send_admin_request(
+            make_state(),
+            format!(
+                "GET /admin/config/schema HTTP/1.1\r\nAuthorization: {}\r\n\r\n",
+                basic_auth("admin", "secret")
+            ),
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("Content-Type: application/schema+json"));
+        assert!(response.contains("Cache-Control: private, no-cache"));
+        assert!(response.contains(&format!("ETag: {}", config_schema_etag())));
+
+        let body = response
+            .split_once("\r\n\r\n")
+            .expect("headers then body")
+            .1;
+        // Byte-identical to what the generator writes, which is what the CI
+        // freshness gate diffs. An editor validating against this document
+        // is validating against the running binary's own view of its config.
+        assert_eq!(body, sbproxy_config::config_json_schema());
+    }
+
+    #[tokio::test]
+    async fn config_schema_endpoint_answers_a_matching_entity_tag_with_304() {
+        let response = send_admin_request(
+            make_state(),
+            format!(
+                "GET /admin/config/schema HTTP/1.1\r\nAuthorization: {}\r\nIf-None-Match: {}\r\n\r\n",
+                basic_auth("admin", "secret"),
+                config_schema_etag()
+            ),
+        )
+        .await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 304 Not Modified"),
+            "{response}"
+        );
+        assert!(response.contains("Content-Length: 0"));
+        assert_eq!(
+            response.split_once("\r\n\r\n").expect("headers").1,
+            "",
+            "a 304 carries no body"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_schema_endpoint_ignores_a_stale_entity_tag() {
+        let response = send_admin_request(
+            make_state(),
+            format!(
+                "GET /admin/config/schema HTTP/1.1\r\nAuthorization: {}\r\nIf-None-Match: \"not-this-build\"\r\n\r\n",
+                basic_auth("admin", "secret")
+            ),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn config_schema_endpoint_requires_auth_and_only_answers_get() {
+        let unauthenticated = send_admin_request(
+            make_state(),
+            "GET /admin/config/schema HTTP/1.1\r\n\r\n".to_string(),
+        )
+        .await;
+        assert!(
+            unauthenticated.starts_with("HTTP/1.1 401 Unauthorized"),
+            "{unauthenticated}"
+        );
+
+        let wrong_method = send_admin_request(
+            make_state(),
+            format!(
+                "PUT /admin/config/schema HTTP/1.1\r\nAuthorization: {}\r\nContent-Length: 0\r\n\r\n",
+                basic_auth("admin", "secret")
+            ),
+        )
+        .await;
+        assert!(
+            wrong_method.starts_with("HTTP/1.1 405 Method Not Allowed"),
+            "{wrong_method}"
+        );
+    }
+
+    /// A read-only operator has to be able to read the schema. It is one of
+    /// the two documents that let someone understand a node they are not
+    /// allowed to change.
+    ///
+    /// Reached over a browser session, not Basic. `resolve_principal` grants
+    /// Basic only to the top-level admin credential, so an operator role
+    /// exists only on the session path. That is pre-existing behaviour and
+    /// worth pinning here, because a reader who tried Basic would get a 401
+    /// and reasonably conclude their account did not work.
+    #[tokio::test]
+    async fn a_read_only_operator_can_read_the_schema() {
+        let state = AdminState::new(AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "reader".to_string(),
+                password: "reader-secret".to_string(),
+                role: AdminRole::ReadOnly,
+            }],
+            ..AdminConfig::default()
+        });
+        let (token, _csrf) =
+            state
+                .session_signer
+                .mint("reader", AdminRole::ReadOnly, 3600, unix_now());
+        let response = send_admin_request(
+            state,
+            format!(
+                "GET /admin/config/schema HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    }
+
+    /// The same reader is still refused a write, so the read access above
+    /// did not widen anything.
+    #[tokio::test]
+    async fn a_read_only_operator_is_still_refused_a_config_write() {
+        let state = AdminState::new(AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "reader".to_string(),
+                password: "reader-secret".to_string(),
+                role: AdminRole::ReadOnly,
+            }],
+            ..AdminConfig::default()
+        });
+        let (token, csrf) =
+            state
+                .session_signer
+                .mint("reader", AdminRole::ReadOnly, 3600, unix_now());
+        let body = "proxy:\n  http_bind_port: 8080\n";
+        let response = send_admin_request(
+            state,
+            format!(
+                "PUT /admin/config HTTP/1.1\r\nCookie: sb_admin_session={token}\r\nX-CSRF-Token: {csrf}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+        assert!(response.contains("read-only operator"));
+    }
+
+    #[test]
+    fn config_effective_only_answers_get() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        for method in ["PUT", "POST", "DELETE"] {
+            let (status, _, _) =
+                handle_admin_request(method, "/admin/config/effective", &state, Some(&auth), None);
+            assert_eq!(status, 405, "{method} should not be accepted");
+        }
     }
 
     #[test]

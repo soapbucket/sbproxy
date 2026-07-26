@@ -20,12 +20,12 @@
 //! `examples/*/sb.yml`. The generator is deterministic: the
 //! `preserve_order` feature on `schemars` keeps object property
 //! order stable across runs so the diff is byte-for-byte.
-
-use sbproxy_config::ConfigFile;
+//!
+//! The generation itself lives in [`sbproxy_config::config_json_schema`],
+//! which the admin API also serves. Keeping it in one place is what makes
+//! the served document and the committed file the same document rather
+//! than two that agree until one of them is edited.
 
 fn main() {
-    let schema = schemars::schema_for!(ConfigFile);
-    let json =
-        serde_json::to_string_pretty(&schema).expect("schema serialises to JSON without panic");
-    println!("{json}");
+    println!("{}", sbproxy_config::config_json_schema());
 }

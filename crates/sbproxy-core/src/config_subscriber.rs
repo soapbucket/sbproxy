@@ -153,22 +153,41 @@ const MAX_RESPONSE_BYTES: usize = 2 * MAX_CONFIG_YAML_BYTES + 64 * 1024;
 /// The payload was verified before it was applied, so re-merging it
 /// needs no signature check. Only the payload is kept, never a key.
 #[derive(Debug, Clone)]
-struct AppliedBundle {
-    config_yaml: String,
-    merge_mode: MergeMode,
-    revision: u64,
-    authority_id: String,
+pub struct AppliedAuthority {
+    /// The authority document, as published and verified.
+    pub config_yaml: String,
+    /// How the document combines with the base document.
+    pub merge_mode: MergeMode,
+    /// Revision of the payload, as the authority numbered it.
+    pub revision: u64,
+    /// Identifier the authority published under.
+    pub authority_id: String,
 }
 
 /// The authority payload currently applied on this node, if any.
-static APPLIED_BUNDLE: std::sync::Mutex<Option<AppliedBundle>> = std::sync::Mutex::new(None);
+static APPLIED_BUNDLE: std::sync::Mutex<Option<AppliedAuthority>> = std::sync::Mutex::new(None);
+
+/// The authority payload this node has applied, if any.
+///
+/// `None` on a node with no upstream authority, which includes a node that
+/// has one configured but has not yet completed a poll. A caller reporting
+/// on configuration ownership wants exactly this distinction: an authority
+/// that is configured but has never been reached owns nothing yet, and the
+/// node's own file is still the whole story.
+#[must_use]
+pub fn applied_authority() -> Option<AppliedAuthority> {
+    APPLIED_BUNDLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
 
 /// Record the authority payload this node has applied.
 fn record_applied_bundle(bundle: &ConfigBundle) {
     let mut slot = APPLIED_BUNDLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *slot = Some(AppliedBundle {
+    *slot = Some(AppliedAuthority {
         config_yaml: bundle.config_yaml.clone(),
         merge_mode: match bundle.mode {
             BundleMode::Overlay => MergeMode::Overlay,
@@ -177,6 +196,16 @@ fn record_applied_bundle(bundle: &ConfigBundle) {
         revision: bundle.revision,
         authority_id: bundle.authority_id.clone(),
     });
+}
+
+/// Install an applied authority payload directly. Test-only; a running
+/// node only ever reaches this state by verifying and applying a bundle.
+#[doc(hidden)]
+pub fn set_applied_authority(applied: AppliedAuthority) {
+    let mut slot = APPLIED_BUNDLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = Some(applied);
 }
 
 /// Merge the authority payload this node already applied over a freshly

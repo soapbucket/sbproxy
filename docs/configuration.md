@@ -4760,6 +4760,69 @@ A running node past `max_staleness` keeps serving and logs at error level every 
 
 Changing `proxy.config_authority` requires a restart. The block sits on the deny list, so it is also the one thing an authority can never rewrite.
 
+### What is running here, and who owns it
+
+Once configuration can arrive from a repository or an authority, "show me the config" stops having one answer. Three routes give the three different answers, and the difference matters most on the node you are trying to debug.
+
+| Route | Answers |
+|---|---|
+| `GET /admin/config` | This node's own file, verbatim. On a git-sourced node this may be nothing but the `source:` block that selected the repository. |
+| `GET /admin/config/effective` | The document actually running, after the base and any authority overlay are merged, plus which layer set each setting. |
+| `GET /admin/config/schema` | The JSON Schema for the config file, generated from the running binary's own types. |
+
+`GET /admin/drift` keeps its existing meaning, which is narrower than it sounds: it compares the **local file** against the content hash captured at the last load. On a git-sourced or authority-managed node it therefore reports drift in the local file only, and a node whose repository moved is not "drifted" by this measure. Use the effective route to see the merged result and `sbproxy_config_bundle_revision` or `sbproxy_config_source_revision_info` to see whether the remote layer is current.
+
+The effective response carries a provenance map from dotted setting path to the layer that set it:
+
+```json
+{
+  "yaml": "proxy:\n  http_bind_port: 8080\n...",
+  "provenance": {
+    "proxy.http_bind_port": "local",
+    "origins.api.action.url": "authority"
+  },
+  "layers": {
+    "base": {"kind": "git", "repo": "https://git.example.com/fleet.git", "reference": "main", "commit": "3f2a..."},
+    "authority": {"authority_id": "control-plane", "revision": 12, "mode": "overlay"}
+  },
+  "locally_owned": false,
+  "locally_owned_leaves": 4,
+  "total_leaves": 61
+}
+```
+
+A git leaf carries the resolved commit rather than the configured reference, because during an incident those are the two things most likely to differ.
+
+### The editor is only live where the node owns its config
+
+`PUT /admin/config` writes the local file. On a node that pulls configuration from anywhere else, some or all of that file is dead text: the next poll re-merges and the edit vanishes with no error. So the write is refused up front, with `409` and the paths at fault:
+
+```json
+{
+  "error": "this node does not own the edited path: origins.api.action.url",
+  "code": "config_not_locally_owned",
+  "conflicts": [{"path": "origins.api.action.url", "owner": "authority"}],
+  "layers": {"base": {"kind": "local"}, "authority": {"authority_id": "control-plane", "revision": 12, "mode": "overlay"}},
+  "remedy": "authority control-plane owns these paths at revision 12; publish the change through the authority with `sbproxy authority publish`"
+}
+```
+
+The rule is per-setting rather than per-node, and it is derived from the merge rather than from a list:
+
+| Node shape | Writes |
+|---|---|
+| Local file only | Unchanged. Everything is editable. |
+| Authority in `overlay` mode | Settings the authority does not set are editable. Settings it does set are refused. Adding a setting the authority has never mentioned is allowed. |
+| Authority in `replace` mode | Refused, except the subscriber-owned paths above. Those are grafted back from the local file on every merge, so an operator can still change their own admin listener, TLS material, and secrets on a centrally managed node. |
+| `source:` resolving to git | Refused. The repository is the configuration; the error names the repo, the reference, and the resolved commit. |
+| Git base with an authority overlay | Refused, for both reasons. |
+
+An authority that is configured but has not yet been reached counts as not locally owned. The next poll can claim any path, so treating the file as authoritative in that window would be a promise the node cannot keep.
+
+The refusal is enforced on the server, not in the browser. The admin console greys the editor out and says why, but the same write from `curl` gets the same `409`, and refusals are recorded in the audit log alongside the writes that land.
+
+Two notes on `mode: replace`. The response is a re-serialization, so comments and key order in the local file are not preserved in the effective document (they were already lost in any config with a `features:` block, which is migrated through a full YAML round-trip). And a setting the authority's document simply omits is reported with owner `suppressed` rather than a layer name: under replace it is discarded rather than overwritten, which is the same outcome for whoever was trying to set it.
+
 ---
 
 ## Validation

@@ -1,6 +1,20 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { api, asList, ApiError, type TargetHealth } from "../api";
+import {
+  api,
+  asList,
+  ApiError,
+  type ConfigWriteConflict,
+  type EffectiveConfigResponse,
+  type TargetHealth,
+} from "../api";
+import {
+  isEditorLocked,
+  ownedElsewhere,
+  ownershipSummary,
+  provenanceLabel,
+  readOwnership,
+} from "../lib/config-ownership";
 import { useAsync } from "../composables/useAsync";
 import { toast } from "../composables/useToasts";
 import { formatMs } from "../lib/format";
@@ -13,13 +27,37 @@ const openapi = useAsync(() => api.openapi());
 const drift = useAsync(() => api.drift());
 const targetsReq = useAsync(() => api.targets());
 
+const effective = useAsync(() => api.effectiveConfig());
+
 function refresh() {
   openapi.run();
   drift.run();
   targetsReq.run();
+  effective.run();
   loadConfig();
 }
 onMounted(refresh);
+
+// ---- configuration ownership (WOR-2012) ----
+//
+// The editor is offered only on a node whose own file is the whole
+// configuration. This is a courtesy, not the enforcement: the server
+// refuses the same writes with a 409 whether they arrive from this page or
+// from curl. Showing the lock here just means an operator finds out before
+// they have typed an edit rather than after.
+//
+// The reading of the response lives in lib/config-ownership so the cases
+// that matter (an authority configured but never reached, a git base under
+// an overlay, a response that has not arrived) are testable without a
+// browser.
+const ownership = computed(() =>
+  readOwnership(effective.data.value as EffectiveConfigResponse | null),
+);
+const editorLocked = computed(() => isEditorLocked(ownership.value));
+const ownerSummary = computed(() => ownershipSummary(ownership.value));
+const notOwnedHere = computed(() =>
+  ownedElsewhere(effective.data.value as EffectiveConfigResponse | null),
+);
 
 // ---- live config editor (WOR-1763) ----
 const editorText = ref("");
@@ -44,7 +82,7 @@ async function loadConfig() {
 }
 
 async function saveConfig() {
-  if (saveBusy.value || !editorText.value.trim()) return;
+  if (saveBusy.value || editorLocked.value || !editorText.value.trim()) return;
   saveBusy.value = true;
   saveBanner.value = null;
   try {
@@ -53,15 +91,49 @@ async function saveConfig() {
     saveBanner.value = null;
     await loadConfig(); // pick up the new revision
     drift.run();
+    effective.run(); // ownership can move with the config
     targetsReq.run();
   } catch (e) {
     // Validation detail and revision conflicts render next to the
     // editor, where the fix happens; anything else raises a toast.
     if (e instanceof ApiError && e.status === 409) {
-      saveBanner.value = {
-        tone: "err",
-        text: "Revision mismatch: the on-disk config changed since you loaded it. Reload the editor and reapply your edits.",
-      };
+      // Two different 409s share this status and need opposite advice.
+      // A revision mismatch says reload and reapply. An ownership refusal
+      // says reapplying will fail exactly the same way, so name the paths
+      // and where they are actually set.
+      let conflict: ConfigWriteConflict | null = null;
+      try {
+        conflict = JSON.parse(e.body) as ConfigWriteConflict;
+      } catch {
+        // non-JSON body; fall through to the revision-mismatch wording
+      }
+      if (conflict?.code === "config_not_locally_owned") {
+        const paths = (conflict.conflicts ?? []).map((c) => c.path);
+        saveBanner.value = {
+          tone: "err",
+          text: [
+            paths.length === 1
+              ? `This node does not own ${paths[0]}.`
+              : `This node does not own these paths: ${paths.join(", ")}.`,
+            conflict.remedy ?? "",
+          ]
+            .filter(Boolean)
+            .join(" "),
+        };
+        effective.run(); // the layers may have moved since the page loaded
+      } else if (conflict?.code === "config_ownership_unknown") {
+        saveBanner.value = {
+          tone: "err",
+          text:
+            conflict.error ??
+            "Could not determine which paths this node owns, so the write was refused.",
+        };
+      } else {
+        saveBanner.value = {
+          tone: "err",
+          text: "Revision mismatch: the on-disk config changed since you loaded it. Reload the editor and reapply your edits.",
+        };
+      }
     } else if (e instanceof ApiError && e.status === 400) {
       let detail = e.body;
       try {
@@ -200,6 +272,57 @@ async function reload() {
   </PageHeader>
 
 
+  <!-- Where this node's configuration comes from -->
+  <section class="section" v-if="ownership">
+    <div class="section__head">
+      <h2>Configuration source</h2>
+      <StatusBadge
+        :tone="ownership.locallyOwned ? 'ok' : 'warn'"
+        :label="ownership.locallyOwned ? 'Local' : 'Managed elsewhere'"
+      />
+      <button class="sb-btn sb-btn--sm" :disabled="effective.loading.value" @click="effective.run">
+        {{ effective.loading.value ? "Checking..." : "Recheck" }}
+      </button>
+    </div>
+    <div class="sb-card">
+      <p>{{ ownerSummary }}</p>
+      <dl class="owner-grid">
+        <template v-if="ownership.base?.kind === 'git'">
+          <dt>Repository</dt>
+          <dd class="sb-mono">{{ ownership.base.repo }}</dd>
+          <dt>Reference</dt>
+          <dd class="sb-mono">{{ ownership.base.reference }}</dd>
+          <dt>Commit</dt>
+          <dd class="sb-mono">{{ ownership.base.commit }}</dd>
+        </template>
+        <template v-if="ownership.authority">
+          <dt>Authority</dt>
+          <dd class="sb-mono">{{ ownership.authority.authority_id }}</dd>
+          <dt>Revision applied</dt>
+          <dd class="sb-mono">{{ ownership.authority.revision }}</dd>
+          <dt>Merge mode</dt>
+          <dd class="sb-mono">{{ ownership.authority.mode }}</dd>
+        </template>
+        <dt>Settings this node owns</dt>
+        <dd class="sb-mono">{{ ownership.localLeaves }} of {{ ownership.totalLeaves }}</dd>
+      </dl>
+      <details class="owned-elsewhere" v-if="notOwnedHere.length">
+        <summary>
+          {{ notOwnedHere.length }} setting{{ notOwnedHere.length === 1 ? "" : "s" }}
+          set outside this node
+        </summary>
+        <table>
+          <tbody>
+            <tr v-for="row in notOwnedHere" :key="row.path">
+              <td class="sb-mono">{{ row.path }}</td>
+              <td class="sb-faint">{{ provenanceLabel(row.owner) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </div>
+  </section>
+
   <!-- Live config editor -->
   <section class="section">
     <div class="section__head">
@@ -211,6 +334,13 @@ async function reload() {
     </div>
     <ErrorState v-if="configErr" :error="configErr" @retry="loadConfig" />
     <div v-else class="sb-card">
+      <p class="banner banner--warn" v-if="editorLocked">
+        This node does not own its configuration, so editing it here would have
+        no effect. {{ ownerSummary }} Change it at the source and this node
+        will pick it up on its next refresh. The file below is shown read-only;
+        on a git-sourced node it may be nothing but the pointer that selected
+        the repository.
+      </p>
       <p class="banner" v-if="saveBanner" :class="`banner--${saveBanner.tone}`">
         {{ saveBanner.text }}
       </p>
@@ -218,17 +348,22 @@ async function reload() {
         v-model="editorText"
         class="sb-input editor"
         spellcheck="false"
+        :readonly="editorLocked"
         aria-label="Configuration YAML"
       ></textarea>
       <div class="editor-actions">
         <button
           class="sb-btn sb-btn--primary"
-          :disabled="saveBusy || !editorText.trim()"
+          :disabled="saveBusy || editorLocked || !editorText.trim()"
           @click="saveConfig"
         >
           {{ saveBusy ? "Saving..." : "Validate + save" }}
         </button>
-        <span class="sb-faint">
+        <span class="sb-faint" v-if="editorLocked">
+          Writes are refused by the server, not just hidden here. The same
+          request from curl gets the same answer.
+        </span>
+        <span class="sb-faint" v-else>
           Validated server-side, then hot-swapped. Optimistic concurrency by revision;
           a mismatch means the on-disk config changed under you.
         </span>
@@ -429,5 +564,40 @@ async function reload() {
 .banner--err {
   background: #fdecea;
   color: #c0392b;
+}
+.banner--warn {
+  background: #fdf3e0;
+  color: #8a5a12;
+}
+.owner-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--sb-space-2) var(--sb-space-4);
+  margin: var(--sb-space-3) 0 0;
+}
+.owner-grid dt {
+  color: var(--sb-text-faint);
+}
+.owner-grid dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.owned-elsewhere {
+  margin-top: var(--sb-space-3);
+}
+.owned-elsewhere summary {
+  cursor: pointer;
+  color: var(--sb-text-faint);
+  font-size: 0.9rem;
+}
+.owned-elsewhere table {
+  width: 100%;
+  margin-top: var(--sb-space-2);
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+.owned-elsewhere td {
+  padding: 0.2rem 0.5rem 0.2rem 0;
+  vertical-align: top;
 }
 </style>

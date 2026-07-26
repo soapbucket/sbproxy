@@ -71,6 +71,10 @@ pub mod compression_value;
 /// does, sign it, store it under a monotonic revision, and serve it to
 /// subscribers on a listener of its own.
 pub mod config_authority;
+/// What configuration is actually running on this node, which layer owns
+/// each part of it, and whether a proposed write to the local file would
+/// survive the next poll or be silently swallowed.
+pub mod config_effective;
 /// Gossip accelerator for config distribution: an authority announces its
 /// current revision into typed cluster state, and a mesh-member subscriber
 /// pulls on the hint instead of waiting out its poll interval. Never a

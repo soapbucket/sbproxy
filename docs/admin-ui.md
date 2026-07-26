@@ -134,12 +134,16 @@ Upstream provider secrets: metadata only, never the secret itself.
 
 ## Config (`/config`)
 
-The running configuration: the emitted OpenAPI surface, on-disk drift,
-per-target health, and a raw config editor.
+The running configuration: where it comes from, the emitted OpenAPI
+surface, on-disk drift, per-target health, and a raw config editor.
 
 ![The Config page: OpenAPI summary, a drift badge, and a reload control](assets/admin-config.png)
 
-- **Shows:** `GET /api/openapi.json` (a readable summary plus the raw
+- **Shows:** `GET /admin/config/effective` (a Configuration source
+  panel: a Local or Managed elsewhere badge, the resolved git commit
+  and the applied authority revision where they apply, how many
+  settings this node owns, and an expandable list of the ones set
+  elsewhere), `GET /api/openapi.json` (a readable summary plus the raw
   JSON), `GET /admin/drift` (in-sync or drifted badge with the
   content-hash diff), `GET /api/health/targets` (per-target health),
   `GET /admin/config` (the raw on-disk YAML, loaded into an editor on
@@ -149,10 +153,28 @@ per-target health, and a raw config editor.
   `PUT /admin/config` (writes the editor's text back, with `if_match`
   set to the revision it was loaded at, so a concurrent edit surfaces
   as a conflict instead of clobbering).
+- **The editor locks itself where the node does not own its config.**
+  When `locally_owned` is `false`, the textarea goes read-only, the save
+  button is disabled, and a banner names the repository or the authority
+  and says to change it there. This is a courtesy, not the enforcement:
+  the server refuses the same write with a `409` whether it arrives from
+  this page or from `curl`, and showing the lock only means an operator
+  finds out before typing an edit rather than after. The lock requires a
+  definite answer, so a request still in flight or one that failed
+  leaves the editor usable rather than making an admin-API hiccup look
+  like a permanent loss of control over the node.
+- **Two different conflicts share `409`.** A revision mismatch renders
+  as "reload the editor and reapply." An ownership refusal
+  (`code: config_not_locally_owned`) names the settings at fault and the
+  place they are actually set, because reapplying would fail the same
+  way.
 - **Empty/error notes:** `GET /admin/drift` returning `503` (no
   `config_path` wired, an in-memory/test boot) renders as "drift
   unavailable," not an error banner; a reload while another reload is
-  in flight (`409`) surfaces as "reload already in progress."
+  in flight (`409`) surfaces as "reload already in progress." On a node
+  with no remote layers the Configuration source panel still renders,
+  reading "This node owns its configuration," because the affirmative
+  answer is what tells an operator the editor is trustworthy.
 
 ## Logs (`/logs`)
 
