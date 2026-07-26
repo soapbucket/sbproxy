@@ -1104,12 +1104,29 @@ struct InferredValue {
     mutable_place: bool,
 }
 
+#[derive(Clone, Default)]
+struct LocalSymbolScope {
+    bindings: BTreeMap<String, Vec<TypeReference>>,
+    glob_imports: Vec<TypeReference>,
+    type_declarations: BTreeSet<String>,
+    function_declarations: BTreeSet<String>,
+    namespace_declarations: BTreeSet<String>,
+}
+
+impl LocalSymbolScope {
+    fn declares(&self, kind: SymbolKind, name: &str) -> bool {
+        match kind {
+            SymbolKind::Type => self.type_declarations.contains(name),
+            SymbolKind::Function => self.function_declarations.contains(name),
+        }
+    }
+}
+
 struct FieldReadVisitor<'a> {
     types: &'a RustTypeIndex,
     reads: BTreeSet<(String, String)>,
     environment: BTreeMap<String, InferredValue>,
-    local_symbol_bindings: BTreeMap<String, Vec<TypeReference>>,
-    local_glob_imports: Vec<TypeReference>,
+    local_scopes: Vec<LocalSymbolScope>,
     in_function: bool,
     impl_owner: Option<String>,
     context: ModuleContext,
@@ -1121,8 +1138,7 @@ impl<'a> FieldReadVisitor<'a> {
             types,
             reads: BTreeSet::new(),
             environment: BTreeMap::new(),
-            local_symbol_bindings: BTreeMap::new(),
-            local_glob_imports: Vec::new(),
+            local_scopes: Vec::new(),
             in_function: false,
             impl_owner: None,
             context,
@@ -1142,8 +1158,16 @@ impl<'a> FieldReadVisitor<'a> {
     fn resolve_symbol_scoped(&self, kind: SymbolKind, reference: &TypeReference) -> Option<String> {
         let mut resolving = BTreeSet::new();
         if !reference.leading_colon {
-            if let Some(first) = reference.segments.first() {
-                if let Some(bindings) = self.local_symbol_bindings.get(first) {
+            let first = reference.segments.first()?;
+            for scope in self.local_scopes.iter().rev() {
+                if scope.declares(kind, first)
+                    || (reference.segments.len() > 1
+                        && scope.namespace_declarations.contains(first))
+                {
+                    return None;
+                }
+
+                if let Some(bindings) = scope.bindings.get(first) {
                     let mut result = SymbolResolution::default();
                     for binding in bindings {
                         let mut expanded = binding.clone();
@@ -1158,31 +1182,28 @@ impl<'a> FieldReadVisitor<'a> {
                     }
                     return result.exact();
                 }
+
+                if reference.segments.len() == 1 && !scope.glob_imports.is_empty() {
+                    let mut result = SymbolResolution::default();
+                    for glob in &scope.glob_imports {
+                        let mut expanded = glob.clone();
+                        expanded.segments.push(first.clone());
+                        result.merge(self.types.resolve_symbol_reference(
+                            kind,
+                            &expanded,
+                            &mut resolving,
+                        ));
+                    }
+                    if result.tainted || !result.symbols.is_empty() {
+                        return result.exact();
+                    }
+                }
             }
         }
 
-        let global = self
-            .types
-            .resolve_symbol_reference(kind, reference, &mut resolving);
-        if reference.leading_colon
-            || reference.segments.len() != 1
-            || self.local_glob_imports.is_empty()
-            || (!global.tainted && global.symbols.len() == 1)
-        {
-            return global.exact();
-        }
-
-        let name = reference.segments.first()?;
-        let mut result = global;
-        for glob in &self.local_glob_imports {
-            let mut expanded = glob.clone();
-            expanded.segments.push(name.clone());
-            result.merge(
-                self.types
-                    .resolve_symbol_reference(kind, &expanded, &mut resolving),
-            );
-        }
-        result.exact()
+        self.types
+            .resolve_symbol_reference(kind, reference, &mut resolving)
+            .exact()
     }
 
     fn function_return_scoped(&self, path: &syn::Path) -> Option<String> {
@@ -1199,14 +1220,114 @@ impl<'a> FieldReadVisitor<'a> {
         self.types.resolve_type_reference(result)
     }
 
+    fn block_symbol_scope(&self, block: &syn::Block) -> LocalSymbolScope {
+        let mut scope = LocalSymbolScope::default();
+        for statement in &block.stmts {
+            let syn::Stmt::Item(item) = statement else {
+                continue;
+            };
+            if item_attributes(item).is_some_and(attributes_are_test_only) {
+                continue;
+            }
+            match item {
+                syn::Item::Use(item_use) => {
+                    let mut bindings = Vec::new();
+                    let mut globs = Vec::new();
+                    collect_use_bindings(
+                        &item_use.tree,
+                        &mut Vec::new(),
+                        &mut bindings,
+                        &mut globs,
+                    );
+                    for (alias, segments) in bindings {
+                        scope
+                            .bindings
+                            .entry(alias)
+                            .or_default()
+                            .push(TypeReference {
+                                segments,
+                                context: self.context.clone(),
+                                leading_colon: item_use.leading_colon.is_some(),
+                            });
+                    }
+                    for segments in globs {
+                        scope.glob_imports.push(TypeReference {
+                            segments,
+                            context: self.context.clone(),
+                            leading_colon: item_use.leading_colon.is_some(),
+                        });
+                    }
+                }
+                syn::Item::Type(item_type) => {
+                    let name = item_type.ident.to_string();
+                    if let Some(target) = type_reference(&item_type.ty, &self.context) {
+                        scope.bindings.entry(name).or_default().push(target);
+                    } else {
+                        scope.type_declarations.insert(name);
+                    }
+                }
+                syn::Item::ExternCrate(item_extern) => {
+                    let alias = item_extern
+                        .rename
+                        .as_ref()
+                        .map(|(_, alias)| alias.to_string())
+                        .unwrap_or_else(|| item_extern.ident.to_string());
+                    let ident = item_extern.ident.to_string();
+                    let (segments, leading_colon) = if ident == "self" {
+                        (vec!["crate".to_string()], false)
+                    } else {
+                        (vec![ident], true)
+                    };
+                    scope
+                        .bindings
+                        .entry(alias)
+                        .or_default()
+                        .push(TypeReference {
+                            segments,
+                            context: self.context.clone(),
+                            leading_colon,
+                        });
+                }
+                syn::Item::Struct(item_struct) => {
+                    scope
+                        .type_declarations
+                        .insert(item_struct.ident.to_string());
+                }
+                syn::Item::Enum(item_enum) => {
+                    scope.type_declarations.insert(item_enum.ident.to_string());
+                }
+                syn::Item::Union(item_union) => {
+                    scope.type_declarations.insert(item_union.ident.to_string());
+                }
+                syn::Item::Trait(item_trait) => {
+                    scope.type_declarations.insert(item_trait.ident.to_string());
+                }
+                syn::Item::TraitAlias(item_alias) => {
+                    scope.type_declarations.insert(item_alias.ident.to_string());
+                }
+                syn::Item::Mod(item_mod) => {
+                    let name = item_mod.ident.to_string();
+                    scope.type_declarations.insert(name.clone());
+                    scope.namespace_declarations.insert(name);
+                }
+                syn::Item::Fn(item_fn) => {
+                    scope
+                        .function_declarations
+                        .insert(item_fn.sig.ident.to_string());
+                }
+                _ => {}
+            }
+        }
+        scope
+    }
+
     fn visit_function(
         &mut self,
         inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>,
         block: &syn::Block,
     ) {
         let saved_environment = std::mem::take(&mut self.environment);
-        let saved_symbol_bindings = std::mem::take(&mut self.local_symbol_bindings);
-        let saved_glob_imports = std::mem::take(&mut self.local_glob_imports);
+        let saved_local_scopes = std::mem::take(&mut self.local_scopes);
         let saved_in_function = self.in_function;
         self.in_function = true;
         for input in inputs {
@@ -1235,8 +1356,7 @@ impl<'a> FieldReadVisitor<'a> {
         }
         self.visit_block(block);
         self.environment = saved_environment;
-        self.local_symbol_bindings = saved_symbol_bindings;
-        self.local_glob_imports = saved_glob_imports;
+        self.local_scopes = saved_local_scopes;
         self.in_function = saved_in_function;
     }
 
@@ -1342,12 +1462,31 @@ impl<'a> FieldReadVisitor<'a> {
         }
     }
 
-    fn pattern_discards_value(pattern: &syn::Pat) -> bool {
-        match pattern {
-            syn::Pat::Paren(paren) => Self::pattern_discards_value(&paren.pat),
-            syn::Pat::Reference(reference) => Self::pattern_discards_value(&reference.pat),
-            syn::Pat::Type(typed) => Self::pattern_discards_value(&typed.pat),
-            syn::Pat::Wild(_) => true,
+    fn visit_patterned_initializer(&mut self, pattern: &syn::Pat, expression: &syn::Expr) -> bool {
+        match (pattern, expression) {
+            (syn::Pat::Paren(pattern), _) => {
+                self.visit_patterned_initializer(&pattern.pat, expression)
+            }
+            (syn::Pat::Reference(pattern), _) => {
+                self.visit_patterned_initializer(&pattern.pat, expression)
+            }
+            (syn::Pat::Type(pattern), _) => {
+                self.visit_patterned_initializer(&pattern.pat, expression)
+            }
+            (syn::Pat::Wild(_), _) => {
+                self.visit_discarded_expr(expression);
+                true
+            }
+            (syn::Pat::Tuple(pattern), syn::Expr::Tuple(expression))
+                if pattern.elems.len() == expression.elems.len() =>
+            {
+                for (pattern, expression) in pattern.elems.iter().zip(&expression.elems) {
+                    if !self.visit_patterned_initializer(pattern, expression) {
+                        self.visit_expr(expression);
+                    }
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -1367,6 +1506,9 @@ impl<'a> FieldReadVisitor<'a> {
     }
 
     fn infer_expr(&mut self, expression: &syn::Expr) -> Option<InferredValue> {
+        if expr_attributes(expression).is_some_and(attributes_are_test_only) {
+            return None;
+        }
         match expression {
             syn::Expr::Await(awaited) => self.infer_expr(&awaited.base),
             syn::Expr::Call(call) => {
@@ -1525,6 +1667,9 @@ impl<'a> FieldReadVisitor<'a> {
     }
 
     fn infer_place_expr(&mut self, expression: &syn::Expr) -> Option<InferredValue> {
+        if expr_attributes(expression).is_some_and(attributes_are_test_only) {
+            return None;
+        }
         match expression {
             syn::Expr::Field(field) => {
                 let owner = self.infer_place_expr(&field.base)?;
@@ -1571,6 +1716,26 @@ impl<'a> FieldReadVisitor<'a> {
 }
 
 impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
+    fn visit_stmt(&mut self, node: &'ast syn::Stmt) {
+        let test_only = match node {
+            syn::Stmt::Local(local) => attributes_are_test_only(&local.attrs),
+            syn::Stmt::Item(item) => item_attributes(item).is_some_and(attributes_are_test_only),
+            syn::Stmt::Expr(expression, _) => {
+                expr_attributes(expression).is_some_and(attributes_are_test_only)
+            }
+            syn::Stmt::Macro(statement) => attributes_are_test_only(&statement.attrs),
+        };
+        if !test_only {
+            syn::visit::visit_stmt(self, node);
+        }
+    }
+
+    fn visit_expr(&mut self, node: &'ast syn::Expr) {
+        if !expr_attributes(node).is_some_and(attributes_are_test_only) {
+            syn::visit::visit_expr(self, node);
+        }
+    }
+
     fn visit_item(&mut self, node: &'ast syn::Item) {
         if !item_attributes(node).is_some_and(attributes_are_test_only) {
             syn::visit::visit_item(self, node);
@@ -1610,32 +1775,6 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
         self.context = saved_context;
     }
 
-    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
-        if !self.in_function {
-            return;
-        }
-        let mut bindings = Vec::new();
-        let mut globs = Vec::new();
-        collect_use_bindings(&node.tree, &mut Vec::new(), &mut bindings, &mut globs);
-        for (alias, segments) in bindings {
-            self.local_symbol_bindings
-                .entry(alias)
-                .or_default()
-                .push(TypeReference {
-                    segments,
-                    context: self.context.clone(),
-                    leading_colon: node.leading_colon.is_some(),
-                });
-        }
-        for segments in globs {
-            self.local_glob_imports.push(TypeReference {
-                segments,
-                context: self.context.clone(),
-                leading_colon: node.leading_colon.is_some(),
-            });
-        }
-    }
-
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
         if attributes_are_test_only(&node.attrs) {
             return;
@@ -1664,7 +1803,9 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
 
     fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
         // The destination is a place, not a value read. The right-hand side
-        // can still contain genuine config reads.
+        // can still contain genuine config reads. Computing a nested place
+        // (for example, an index expression) can contain reads of its own.
+        let _ = self.infer_place_expr(&node.left);
         self.visit_expr(&node.right);
     }
 
@@ -1681,17 +1822,17 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
     }
 
     fn visit_local(&mut self, node: &'ast syn::Local) {
+        if attributes_are_test_only(&node.attrs) {
+            return;
+        }
         let saved_environment = self.environment.clone();
-        let inferred = if Self::pattern_discards_value(&node.pat) {
-            if let Some(init) = &node.init {
-                self.visit_discarded_expr(&init.expr);
+        let inferred = node.init.as_ref().and_then(|init| {
+            if self.visit_patterned_initializer(&node.pat, &init.expr) {
+                None
+            } else {
+                self.infer_expr(&init.expr)
             }
-            None
-        } else {
-            node.init
-                .as_ref()
-                .and_then(|init| self.infer_expr(&init.expr))
-        };
+        });
         self.environment = saved_environment.clone();
         if let Some(init) = &node.init {
             if let Some((_, diverge)) = &init.diverge {
@@ -1704,12 +1845,14 @@ impl<'ast> Visit<'ast> for FieldReadVisitor<'_> {
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
         let saved_environment = self.environment.clone();
-        let saved_symbol_bindings = self.local_symbol_bindings.clone();
-        let saved_glob_imports = self.local_glob_imports.clone();
+        if self.in_function {
+            self.local_scopes.push(self.block_symbol_scope(node));
+        }
         syn::visit::visit_block(self, node);
         self.environment = saved_environment;
-        self.local_symbol_bindings = saved_symbol_bindings;
-        self.local_glob_imports = saved_glob_imports;
+        if self.in_function {
+            self.local_scopes.pop();
+        }
     }
 
     fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
@@ -1886,6 +2029,25 @@ fn foreign_item_attributes(item: &syn::ForeignItem) -> Option<&[syn::Attribute]>
         syn::ForeignItem::Macro(item) => Some(&item.attrs),
         syn::ForeignItem::Verbatim(_) | _ => None,
     }
+}
+
+fn expr_attributes(expression: &syn::Expr) -> Option<&[syn::Attribute]> {
+    macro_rules! attributes {
+        ($($variant:ident),+ $(,)?) => {
+            match expression {
+                $(syn::Expr::$variant(expression) => Some(&expression.attrs),)+
+                syn::Expr::Verbatim(_) => None,
+                _ => None,
+            }
+        };
+    }
+
+    attributes!(
+        Array, Assign, Async, Await, Binary, Block, Break, Call, Cast, Closure, Const, Continue,
+        Field, ForLoop, Group, If, Index, Infer, Let, Lit, Loop, Macro, Match, MethodCall, Paren,
+        Path, Range, RawAddr, Reference, Repeat, Return, Struct, Try, TryBlock, Tuple, Unary,
+        Unsafe, While, Yield,
+    )
 }
 
 #[cfg(test)]
@@ -2979,6 +3141,92 @@ fn production(existing: &ExistingFeature) {
     }
 
     #[test]
+    fn inner_named_import_shadows_outer_external_binding_for_the_whole_block() {
+        let errors = guard_errors(&[
+            source_at(
+                "crates/sbproxy-config/src/types.rs",
+                "pub struct GuardConfig { pub enabled: bool }",
+            ),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                "fn runtime() {\n\
+                     use external_crate::GuardConfig;\n\
+                     {\n\
+                         let value: &GuardConfig = todo!();\n\
+                         consume(value.enabled);\n\
+                         use sbproxy_config::types::GuardConfig;\n\
+                     }\n\
+                 }",
+            ),
+        ]);
+
+        assert!(
+            errors.is_empty(),
+            "the inner named import is hoisted and shadows the outer binding: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn inner_external_glob_shadows_an_outer_config_binding() {
+        let errors = guard_errors(&[
+            source_at(
+                "crates/sbproxy-config/src/types.rs",
+                "pub struct GuardConfig { pub enabled: bool }",
+            ),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                "fn runtime() {\n\
+                     use sbproxy_config::types::GuardConfig;\n\
+                     {\n\
+                         use external_crate::*;\n\
+                         let value: &GuardConfig = todo!();\n\
+                         consume(value.enabled);\n\
+                     }\n\
+                 }",
+            ),
+        ]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "an inner unresolved glob must shadow outer provenance: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn later_block_items_shadow_outer_config_bindings_for_the_whole_block() {
+        for shadow in [
+            "use external_crate::GuardConfig;",
+            "type GuardConfig = external_crate::GuardConfig;",
+            "struct GuardConfig { enabled: bool }",
+        ] {
+            let errors = guard_errors(&[
+                source_at(
+                    "crates/sbproxy-config/src/types.rs",
+                    "pub struct GuardConfig { pub enabled: bool }",
+                ),
+                source_at(
+                    "crates/runtime/src/lib.rs",
+                    &format!(
+                        "use sbproxy_config::types::GuardConfig;\n\
+                         fn runtime() {{\n\
+                             let value: &GuardConfig = todo!();\n\
+                             consume(value.enabled);\n\
+                             {shadow}\n\
+                         }}"
+                    ),
+                ),
+            ]);
+
+            assert_eq!(
+                errors.len(),
+                1,
+                "a hoisted block item must shadow the outer binding: {shadow}\n{errors:?}"
+            );
+        }
+    }
+
+    #[test]
     fn recursive_local_glob_cycles_preserve_exact_results_and_external_taint() {
         let local = guard_errors(&[source_at(
             "crates/config/src/lib.rs",
@@ -3479,6 +3727,41 @@ fn cfg_test(config: &Config) {
     }
 
     #[test]
+    fn test_attributed_statements_and_locals_are_not_reader_evidence() {
+        for statement in [
+            "#[cfg(test)] consume(v.enabled);",
+            "#[cfg(all(test, unix))] let observed = v.enabled;",
+        ] {
+            let errors = guard_errors(&[source(&format!(
+                "struct GuardConfig {{ enabled: bool }}\n\
+                 fn runtime(v: &GuardConfig) {{ {statement} }}"
+            ))]);
+
+            assert_eq!(
+                errors.len(),
+                1,
+                "a test-only statement must not prove a reader: {statement}\n{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn conditionally_production_statement_remains_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn runtime(v: &GuardConfig) {\n\
+                 #[cfg(any(test, feature = \"fixtures\"))]\n\
+                 consume(v.enabled);\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "a statement reachable in a production feature remains evidence: {errors:?}"
+        );
+    }
+
+    #[test]
     fn composite_cfg_and_non_function_test_items_are_not_reader_evidence() {
         let keys = [ConfigSchemaKey {
             path: "proxy.guard.enabled".to_string(),
@@ -3656,6 +3939,38 @@ fn cfg_test(config: &Config) {
                 "non-read syntax must not prove a reader: {errors:?}"
             );
         }
+    }
+
+    #[test]
+    fn assignment_places_preserve_nested_index_reads() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn route(v: &GuardConfig, out: &mut [bool]) {\n\
+                 out[v.enabled as usize] = true;\n\
+             }",
+        )]);
+
+        assert!(
+            errors.is_empty(),
+            "the index used to select an assignment place is a value read: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn ignored_tuple_initializer_elements_are_not_reader_evidence() {
+        let errors = guard_errors(&[source(
+            "struct GuardConfig { enabled: bool }\n\
+             fn ignore(v: &GuardConfig) {\n\
+                 let (_, kept) = (v.enabled, 1);\n\
+                 consume(kept);\n\
+             }",
+        )]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "an initializer paired with `_` is discarded, not consumed: {errors:?}"
+        );
     }
 
     #[test]
