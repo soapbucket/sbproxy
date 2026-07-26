@@ -14,7 +14,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 use syn::visit::Visit;
 
-use crate::scan::{attributes_exclude_production, SourceFile};
+use crate::scan::{
+    attributes_exclude_production, production_cfg_condition_possibility, SourceFile,
+};
 use crate::{validate_config_keys, ConfigKeyCapability, RegistryError, SupportLevel};
 
 /// One leaf key reached from the root of the generated configuration schema.
@@ -493,6 +495,10 @@ struct GenericRequirements {
 #[derive(Debug, Clone)]
 enum ValueTypeReference {
     Nominal(TypeReference),
+    Transparent {
+        wrapper: TypeReference,
+        inner: Box<ValueTypeReference>,
+    },
     Tuple(Vec<Option<ValueTypeReference>>),
 }
 
@@ -659,6 +665,7 @@ impl RustTypeIndex {
 
     fn record_type(&mut self, owner: &str, simple_name: &str) {
         self.fields.entry(owner.to_string()).or_default();
+        self.schema_fields.entry(owner.to_string()).or_default();
         self.type_components.entry(owner.to_string()).or_default();
         self.types_by_name
             .entry(simple_name.to_string())
@@ -745,6 +752,7 @@ impl RustTypeIndex {
             fields
                 .unnamed
                 .iter()
+                .filter(|field| !attributes_exclude_production(&field.attrs))
                 .map(|field| type_reference(&field.ty, context))
                 .collect(),
         )
@@ -814,22 +822,33 @@ impl RustTypeIndex {
         }
     }
 
-    fn record_fields(&mut self, owner: &str, fields: &syn::Fields, context: &ModuleContext) {
-        for field in fields {
+    fn record_fields(
+        &mut self,
+        owner: &str,
+        fields: &syn::Fields,
+        container_attributes: &[syn::Attribute],
+        context: &ModuleContext,
+    ) {
+        for field in fields
+            .iter()
+            .filter(|field| !attributes_exclude_production(&field.attrs))
+        {
             self.type_components
                 .entry(owner.to_string())
                 .or_default()
                 .push(nominal_type_reference(&field.ty, context));
             if let Some(ident) = &field.ident {
                 let field_name = ident.to_string().trim_start_matches("r#").to_string();
-                let serialized_name = explicit_schema_field_rename(&field.attrs)
-                    .unwrap_or_else(|| field_name.clone());
-                self.schema_fields
-                    .entry(owner.to_string())
-                    .or_default()
-                    .entry(rust_field_name(&serialized_name))
-                    .or_default()
-                    .insert(field_name.clone());
+                for serialized_name in
+                    possible_schema_field_names(&field_name, &field.attrs, container_attributes)
+                {
+                    self.schema_fields
+                        .entry(owner.to_string())
+                        .or_default()
+                        .entry(rust_field_name(&serialized_name))
+                        .or_default()
+                        .insert(field_name.clone());
+                }
                 self.fields
                     .entry(owner.to_string())
                     .or_default()
@@ -850,15 +869,24 @@ impl RustTypeIndex {
                 .collect(),
         );
         if let Some(tag) = serde_enum_tag(&item.attrs) {
-            self.enum_tags
-                .insert(owner.to_string(), rust_field_name(&tag));
+            let tag = rust_field_name(&tag);
+            self.enum_tags.insert(owner.to_string(), tag.clone());
+            self.schema_fields
+                .entry(owner.to_string())
+                .or_default()
+                .entry(tag.clone())
+                .or_default()
+                .insert(tag);
         }
         for variant in &item.variants {
+            if attributes_exclude_production(&variant.attrs) {
+                continue;
+            }
             if let Some(fields) = Self::tuple_field_references(&variant.fields, context) {
                 self.enum_tuple_variant_fields
                     .insert((owner.to_string(), variant.ident.to_string()), fields);
             }
-            self.record_fields(owner, &variant.fields, context);
+            self.record_fields(owner, &variant.fields, &variant.attrs, context);
         }
     }
 
@@ -875,13 +903,7 @@ impl RustTypeIndex {
         owner: &str,
         schema_field: &'a str,
     ) -> Option<&'a str> {
-        let Some(candidates) = self
-            .schema_fields
-            .get(owner)
-            .and_then(|fields| fields.get(schema_field))
-        else {
-            return Some(schema_field);
-        };
+        let candidates = self.schema_fields.get(owner)?.get(schema_field)?;
         (candidates.len() == 1)
             .then(|| candidates.first().map(String::as_str))
             .flatten()
@@ -2252,7 +2274,7 @@ impl<'ast> Visit<'ast> for TypeIndexVisitor<'_> {
             self.index.tuple_struct_fields.insert(owner.clone(), fields);
         }
         self.index
-            .record_fields(&owner, &node.fields, &self.context);
+            .record_fields(&owner, &node.fields, &node.attrs, &self.context);
     }
 
     fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
@@ -2475,30 +2497,203 @@ fn serde_enum_tag(attributes: &[syn::Attribute]) -> Option<String> {
     tag
 }
 
-fn explicit_attribute_rename(
-    attributes: &[syn::Attribute],
-    attribute_name: &str,
-) -> Option<String> {
-    let mut rename = None;
-    for attribute in attributes
-        .iter()
-        .filter(|attribute| attribute.path().is_ident(attribute_name))
-    {
-        let _ = attribute.parse_nested_meta(|meta| {
-            if meta.path.is_ident("rename") && meta.input.peek(syn::Token![=]) {
-                rename = Some(meta.value()?.parse::<syn::LitStr>()?.value());
-            } else if meta.input.peek(syn::Token![=]) {
-                let _ = meta.value()?.parse::<syn::Expr>()?;
-            }
-            Ok(())
-        });
-    }
-    rename
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RenameRule {
+    Lower,
+    Upper,
+    Pascal,
+    Camel,
+    Snake,
+    ScreamingSnake,
+    Kebab,
+    ScreamingKebab,
 }
 
-fn explicit_schema_field_rename(attributes: &[syn::Attribute]) -> Option<String> {
-    explicit_attribute_rename(attributes, "schemars")
-        .or_else(|| explicit_attribute_rename(attributes, "serde"))
+impl RenameRule {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "lowercase" => Some(Self::Lower),
+            "UPPERCASE" => Some(Self::Upper),
+            "PascalCase" => Some(Self::Pascal),
+            "camelCase" => Some(Self::Camel),
+            "snake_case" => Some(Self::Snake),
+            "SCREAMING_SNAKE_CASE" => Some(Self::ScreamingSnake),
+            "kebab-case" => Some(Self::Kebab),
+            "SCREAMING-KEBAB-CASE" => Some(Self::ScreamingKebab),
+            _ => None,
+        }
+    }
+
+    fn apply_to_field(self, field: &str) -> String {
+        match self {
+            Self::Lower | Self::Snake => field.to_string(),
+            Self::Upper => field.to_ascii_uppercase(),
+            Self::Pascal => pascal_case_field(field),
+            Self::Camel => {
+                let mut pascal = pascal_case_field(field);
+                if let Some(first) = pascal.get_mut(0..1) {
+                    first.make_ascii_lowercase();
+                }
+                pascal
+            }
+            Self::ScreamingSnake => field.to_ascii_uppercase(),
+            Self::Kebab => field.replace('_', "-"),
+            Self::ScreamingKebab => field.to_ascii_uppercase().replace('_', "-"),
+        }
+    }
+}
+
+fn pascal_case_field(field: &str) -> String {
+    let mut output = String::with_capacity(field.len());
+    let mut capitalize = true;
+    for character in field.chars() {
+        if character == '_' {
+            capitalize = true;
+        } else if capitalize {
+            output.extend(character.to_uppercase());
+            capitalize = false;
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn meta_items(list: &syn::MetaList) -> Option<Vec<syn::Meta>> {
+    list.parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+        .ok()
+        .map(|items| items.into_iter().collect())
+}
+
+fn meta_string_value(meta: &syn::Meta) -> Option<String> {
+    let syn::Meta::NameValue(name_value) = meta else {
+        return None;
+    };
+    let syn::Expr::Lit(expression) = &name_value.value else {
+        return None;
+    };
+    let syn::Lit::Str(value) = &expression.lit else {
+        return None;
+    };
+    Some(value.value())
+}
+
+fn attribute_string_setting(meta: &syn::Meta, setting: &str) -> Option<String> {
+    let syn::Meta::List(list) = meta else {
+        return None;
+    };
+    for item in meta_items(list)? {
+        if !item.path().is_ident(setting) {
+            continue;
+        }
+        if let Some(value) = meta_string_value(&item) {
+            return Some(value);
+        }
+        let syn::Meta::List(directions) = item else {
+            continue;
+        };
+        for direction in meta_items(&directions)? {
+            if direction.path().is_ident("deserialize") {
+                return meta_string_value(&direction);
+            }
+        }
+    }
+    None
+}
+
+fn apply_attribute_setting(
+    states: &BTreeSet<Option<String>>,
+    meta: &syn::Meta,
+    attribute_name: &str,
+    setting: &str,
+) -> BTreeSet<Option<String>> {
+    if meta.path().is_ident(attribute_name) {
+        let Some(value) = attribute_string_setting(meta, setting) else {
+            return states.clone();
+        };
+        return BTreeSet::from([Some(value)]);
+    }
+
+    let syn::Meta::List(list) = meta else {
+        return states.clone();
+    };
+    if !list.path.is_ident("cfg_attr") {
+        return states.clone();
+    }
+    let Some(items) = meta_items(list) else {
+        return states.clone();
+    };
+    let Some((condition, nested_attributes)) = items.split_first() else {
+        return states.clone();
+    };
+    let (can_be_true, can_be_false) = production_cfg_condition_possibility(condition);
+    let mut possibilities = BTreeSet::new();
+    if can_be_false {
+        possibilities.extend(states.iter().cloned());
+    }
+    if can_be_true {
+        let mut applied = states.clone();
+        for nested in nested_attributes {
+            applied = apply_attribute_setting(&applied, nested, attribute_name, setting);
+        }
+        possibilities.extend(applied);
+    }
+    if possibilities.is_empty() {
+        states.clone()
+    } else {
+        possibilities
+    }
+}
+
+fn possible_attribute_settings(
+    attributes: &[syn::Attribute],
+    attribute_name: &str,
+    setting: &str,
+) -> BTreeSet<Option<String>> {
+    attributes
+        .iter()
+        .fold(BTreeSet::from([None]), |states, attribute| {
+            apply_attribute_setting(&states, &attribute.meta, attribute_name, setting)
+        })
+}
+
+fn possible_schema_attribute_settings(
+    attributes: &[syn::Attribute],
+    setting: &str,
+) -> BTreeSet<Option<String>> {
+    let schemars = possible_attribute_settings(attributes, "schemars", setting);
+    let serde = possible_attribute_settings(attributes, "serde", setting);
+    let mut settings = BTreeSet::new();
+    for schema_setting in &schemars {
+        for serde_setting in &serde {
+            settings.insert(schema_setting.as_ref().or(serde_setting.as_ref()).cloned());
+        }
+    }
+    settings
+}
+
+fn possible_schema_field_names(
+    field: &str,
+    field_attributes: &[syn::Attribute],
+    container_attributes: &[syn::Attribute],
+) -> BTreeSet<String> {
+    let explicit_names = possible_schema_attribute_settings(field_attributes, "rename");
+    let rename_rules = possible_schema_attribute_settings(container_attributes, "rename_all");
+    let mut names = BTreeSet::new();
+    for explicit_name in explicit_names {
+        if let Some(explicit_name) = explicit_name {
+            names.insert(explicit_name);
+            continue;
+        }
+        for rule in &rename_rules {
+            let name = rule
+                .as_deref()
+                .and_then(RenameRule::parse)
+                .map_or_else(|| field.to_string(), |rule| rule.apply_to_field(field));
+            names.insert(name);
+        }
+    }
+    names
 }
 
 fn type_reference(ty: &syn::Type, context: &ModuleContext) -> Option<TypeReference> {
@@ -2506,10 +2701,13 @@ fn type_reference(ty: &syn::Type, context: &ModuleContext) -> Option<TypeReferen
     path_reference(path, context)
 }
 
-fn transparent_type_argument(ty: &syn::Type) -> Option<&syn::Type> {
+fn transparent_type_argument(ty: &syn::Type) -> Option<(&syn::Path, &syn::Type)> {
     let syn::Type::Path(path) = ty else {
         return None;
     };
+    if path.qself.is_some() {
+        return None;
+    }
     let segment = path.path.segments.last()?;
     let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
         return None;
@@ -2522,14 +2720,15 @@ fn transparent_type_argument(ty: &syn::Type) -> Option<&syn::Type> {
             _ => None,
         })
         .collect();
-    match segment.ident.to_string().as_str() {
+    let inner = match segment.ident.to_string().as_str() {
         "HashMap" | "BTreeMap" | "IndexMap" => generic_types.get(1).copied(),
         "Result" => generic_types.first().copied(),
         "Option" | "Vec" | "VecDeque" | "Box" | "Arc" | "Rc" | "Cow" | "SmallVec" | "HashSet"
         | "BTreeSet" | "Guard" | "MappedGuard" | "MutexGuard" | "RwLockReadGuard"
         | "RwLockWriteGuard" => generic_types.first().copied(),
         _ => None,
-    }
+    }?;
+    Some((&path.path, inner))
 }
 
 fn value_type_reference(ty: &syn::Type, context: &ModuleContext) -> Option<ValueTypeReference> {
@@ -2548,14 +2747,113 @@ fn value_type_reference(ty: &syn::Type, context: &ModuleContext) -> Option<Value
                 .collect(),
         )),
         syn::Type::Path(_) => {
-            if let Some(inner) = transparent_type_argument(ty) {
-                if let Some(reference) = value_type_reference(inner, context) {
-                    return Some(reference);
+            if let Some((wrapper, inner)) = transparent_type_argument(ty) {
+                if let (Some(wrapper), Some(inner)) = (
+                    path_reference(wrapper, context),
+                    value_type_reference(inner, context),
+                ) {
+                    return Some(ValueTypeReference::Transparent {
+                        wrapper,
+                        inner: Box::new(inner),
+                    });
                 }
             }
             type_reference(ty, context).map(ValueTypeReference::Nominal)
         }
         _ => type_reference(ty, context).map(ValueTypeReference::Nominal),
+    }
+}
+
+fn recognized_transparent_wrapper(reference: &TypeReference, resolved_owner: Option<&str>) -> bool {
+    if resolved_owner.is_some() {
+        return false;
+    }
+    let path = reference.segments.join("::");
+    let Some(name) = reference.segments.last().map(String::as_str) else {
+        return false;
+    };
+    if reference.segments.len() == 1 && !reference.leading_colon {
+        return matches!(
+            name,
+            "HashMap"
+                | "BTreeMap"
+                | "IndexMap"
+                | "Result"
+                | "Option"
+                | "Vec"
+                | "VecDeque"
+                | "Box"
+                | "Arc"
+                | "Rc"
+                | "Cow"
+                | "SmallVec"
+                | "HashSet"
+                | "BTreeSet"
+                | "Guard"
+                | "MappedGuard"
+                | "MutexGuard"
+                | "RwLockReadGuard"
+                | "RwLockWriteGuard"
+        );
+    }
+    match name {
+        "Result" => matches!(
+            path.as_str(),
+            "std::result::Result" | "core::result::Result" | "anyhow::Result"
+        ),
+        "Option" => matches!(
+            path.as_str(),
+            "std::option::Option" | "core::option::Option"
+        ),
+        "Vec" => matches!(path.as_str(), "std::vec::Vec" | "alloc::vec::Vec"),
+        "VecDeque" => matches!(
+            path.as_str(),
+            "std::collections::VecDeque" | "alloc::collections::VecDeque"
+        ),
+        "Box" => matches!(path.as_str(), "std::boxed::Box" | "alloc::boxed::Box"),
+        "Arc" => matches!(path.as_str(), "std::sync::Arc" | "alloc::sync::Arc"),
+        "Rc" => matches!(path.as_str(), "std::rc::Rc" | "alloc::rc::Rc"),
+        "Cow" => matches!(path.as_str(), "std::borrow::Cow" | "alloc::borrow::Cow"),
+        "HashMap" => matches!(
+            path.as_str(),
+            "std::collections::HashMap" | "hashbrown::HashMap"
+        ),
+        "BTreeMap" => matches!(
+            path.as_str(),
+            "std::collections::BTreeMap" | "alloc::collections::BTreeMap"
+        ),
+        "IndexMap" => path == "indexmap::IndexMap",
+        "SmallVec" => path == "smallvec::SmallVec",
+        "HashSet" => matches!(
+            path.as_str(),
+            "std::collections::HashSet" | "hashbrown::HashSet"
+        ),
+        "BTreeSet" => matches!(
+            path.as_str(),
+            "std::collections::BTreeSet" | "alloc::collections::BTreeSet"
+        ),
+        "Guard" => path == "arc_swap::Guard",
+        "MappedGuard" => matches!(
+            path.as_str(),
+            "parking_lot::MappedMutexGuard" | "parking_lot::MappedRwLockReadGuard"
+        ),
+        "MutexGuard" => matches!(
+            path.as_str(),
+            "std::sync::MutexGuard" | "tokio::sync::MutexGuard" | "parking_lot::MutexGuard"
+        ),
+        "RwLockReadGuard" => matches!(
+            path.as_str(),
+            "std::sync::RwLockReadGuard"
+                | "tokio::sync::RwLockReadGuard"
+                | "parking_lot::RwLockReadGuard"
+        ),
+        "RwLockWriteGuard" => matches!(
+            path.as_str(),
+            "std::sync::RwLockWriteGuard"
+                | "tokio::sync::RwLockWriteGuard"
+                | "parking_lot::RwLockWriteGuard"
+        ),
+        _ => false,
     }
 }
 
@@ -3075,6 +3373,23 @@ impl<'a> FieldReadVisitor<'a> {
             ValueTypeReference::Nominal(reference) => self
                 .resolve_exact_type_scoped_with_limit(reference, scope_limit)
                 .map(|owner| InferredValue::nominal(owner, false)),
+            ValueTypeReference::Transparent { wrapper, inner } => {
+                let resolved = self
+                    .resolve_symbol_scoped_with_limit(
+                        SymbolKind::Type,
+                        wrapper,
+                        scope_limit,
+                        &mut BTreeSet::new(),
+                        &mut BTreeSet::new(),
+                    )
+                    .exact();
+                if recognized_transparent_wrapper(wrapper, resolved.as_deref()) {
+                    self.resolve_value_type_scoped_with_limit(inner, scope_limit)
+                } else {
+                    self.resolve_exact_type_scoped_with_limit(wrapper, scope_limit)
+                        .map(|owner| InferredValue::nominal(owner, false))
+                }
+            }
             ValueTypeReference::Tuple(elements) => Some(InferredValue::tuple(
                 elements
                     .iter()
@@ -3094,6 +3409,16 @@ impl<'a> FieldReadVisitor<'a> {
                 .types
                 .resolve_exact_type_reference(reference)
                 .map(|owner| InferredValue::nominal(owner, false)),
+            ValueTypeReference::Transparent { wrapper, inner } => {
+                let resolved = self.types.resolve_type_reference(wrapper);
+                if recognized_transparent_wrapper(wrapper, resolved.as_deref()) {
+                    self.resolve_value_type(inner)
+                } else {
+                    self.types
+                        .resolve_exact_type_reference(wrapper)
+                        .map(|owner| InferredValue::nominal(owner, false))
+                }
+            }
             ValueTypeReference::Tuple(elements) => Some(InferredValue::tuple(
                 elements
                     .iter()
@@ -3316,14 +3641,39 @@ impl<'a> FieldReadVisitor<'a> {
         mutable_place: bool,
     ) -> bool {
         let patterns: Vec<_> = patterns.into_iter().collect();
-        if patterns.len() != values.len()
-            || patterns
-                .iter()
-                .any(|pattern| Self::pattern_is_rest(pattern))
-        {
+        let rest_positions: Vec<_> = patterns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pattern)| Self::pattern_is_rest(pattern).then_some(index))
+            .collect();
+        if rest_positions.is_empty() {
+            if patterns.len() != values.len() {
+                return false;
+            }
+            for (pattern, value) in patterns.into_iter().zip(values) {
+                let value = value
+                    .as_ref()
+                    .map(|value| value.with_enclosing_mutability(mutable_place));
+                self.bind_pattern(pattern, value.as_ref());
+            }
+            return true;
+        }
+        if rest_positions.len() != 1 || values.len() + 1 < patterns.len() {
             return false;
         }
-        for (pattern, value) in patterns.into_iter().zip(values) {
+
+        let rest_index = rest_positions[0];
+        for (pattern, value) in patterns[..rest_index].iter().zip(&values[..rest_index]) {
+            let value = value
+                .as_ref()
+                .map(|value| value.with_enclosing_mutability(mutable_place));
+            self.bind_pattern(pattern, value.as_ref());
+        }
+        let suffix_len = patterns.len() - rest_index - 1;
+        for (pattern, value) in patterns[rest_index + 1..]
+            .iter()
+            .zip(&values[values.len() - suffix_len..])
+        {
             let value = value
                 .as_ref()
                 .map(|value| value.with_enclosing_mutability(mutable_place));
@@ -6978,6 +7328,95 @@ fn production(config: Config) {
     }
 
     #[test]
+    fn custom_result_types_do_not_inherit_standard_result_provenance() {
+        let errors = guard_errors(&[
+            source_at(
+                "crates/sbproxy-config/src/lib.rs",
+                "pub struct GuardConfig { pub enabled: bool }\n\
+                 pub struct Other { pub enabled: bool }\n\
+                 pub struct Result<A, B>(pub A, pub B);\n\
+                 pub fn fold(c: GuardConfig, o: Other) -> Result<GuardConfig, Other> {\n\
+                     Result(c, o)\n\
+                 }",
+            ),
+            source_at(
+                "crates/runtime/src/lib.rs",
+                "fn consume<T>(_: T) {}\n\
+                 fn run(c: sbproxy_config::GuardConfig, o: sbproxy_config::Other) {\n\
+                     let sbproxy_config::Result(_, other) = sbproxy_config::fold(c, o);\n\
+                     consume(other.enabled);\n\
+                 }",
+            ),
+        ]);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a custom type named Result must retain its own tuple slots: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn tuple_function_return_rest_patterns_preserve_aligned_slots() {
+        for body in [
+            "let (_, selected, ..) = fold(c);",
+            "let (.., selected) = fold(c);",
+            "let (_, .., selected) = fold(c);",
+        ] {
+            let signature = if body.starts_with("let (..") {
+                "(bool, Other, Config)"
+            } else if body.contains(".., selected") {
+                "(Other, bool, Config)"
+            } else {
+                "(Other, Config, bool)"
+            };
+            let errors = verify_config_readers(
+                &[key("proxy.live", "live")],
+                &[],
+                &[source(&format!(
+                    "struct Config {{ live: bool }}\n\
+                     struct Other {{ live: bool }}\n\
+                     fn consume<T>(_: T) {{}}\n\
+                     fn fold(c: Config) -> {signature} {{ todo!() }}\n\
+                     fn run(c: Config) {{\n\
+                         {body}\n\
+                         consume(selected.live);\n\
+                     }}"
+                ))],
+            );
+
+            assert!(
+                errors.is_empty(),
+                "a tuple rest must preserve the selected slot for `{body}`: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tuple_function_return_rest_patterns_do_not_cross_contaminate_slots() {
+        let errors = verify_config_readers(
+            &[key("proxy.live", "live")],
+            &[],
+            &[source(
+                "struct Config { live: bool }\n\
+                 struct Other { live: bool }\n\
+                 fn consume<T>(_: T) {}\n\
+                 fn fold(c: Config) -> (Config, bool, Other) { todo!() }\n\
+                 fn run(c: Config) {\n\
+                     let (.., selected) = fold(c);\n\
+                     consume(selected.live);\n\
+                 }",
+            )],
+        );
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a tuple rest must not assign a config owner to the wrong suffix slot: {errors:?}"
+        );
+    }
+
+    #[test]
     fn serde_renamed_schema_field_maps_back_to_the_rust_field() {
         let keys = [key("proxy.poll_interval", "poll_interval")];
         let sources = [source(
@@ -7013,6 +7452,130 @@ fn production(config: &mut Config) {
         )];
 
         assert_eq!(verify_config_readers(&keys, &[], &sources).len(), 1);
+    }
+
+    #[test]
+    fn serde_rename_all_does_not_let_a_decoy_rust_field_cover_the_schema_field() {
+        let errors = verify_config_readers(
+            &[key("proxy.pollInterval", "pollInterval")],
+            &[],
+            &[source(
+                "#[allow(non_snake_case)]\n\
+                 #[serde(rename_all = \"camelCase\")]\n\
+                 struct Config {\n\
+                     poll_interval: bool,\n\
+                     #[serde(rename = \"other\")]\n\
+                     pollInterval: bool,\n\
+                 }\n\
+                 fn consume<T>(_: T) {}\n\
+                 fn run(c: &Config) { consume(c.pollInterval); }",
+            )],
+        );
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "rename_all must map the schema property to poll_interval, not its decoy: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn production_cfg_attr_rename_does_not_let_a_decoy_cover_the_schema_field() {
+        let errors = verify_config_readers(
+            &[key("proxy.productionName", "productionName")],
+            &[],
+            &[source(
+                "#[allow(non_snake_case)]\n\
+                 struct Config {\n\
+                     #[cfg_attr(not(test), serde(rename = \"productionName\"))]\n\
+                     actual: bool,\n\
+                     #[serde(rename = \"other\")]\n\
+                     productionName: bool,\n\
+                 }\n\
+                 fn consume<T>(_: T) {}\n\
+                 fn run(c: &Config) { consume(c.productionName); }",
+            )],
+        );
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a production cfg_attr rename must map to the actual Rust field: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn production_serde_and_schemars_cfg_attr_renames_map_to_rust_fields() {
+        let keys = [
+            key("proxy.serde_name", "serde_name"),
+            key("proxy.schema_name", "schema_name"),
+        ];
+        let errors = verify_config_readers(
+            &keys,
+            &[],
+            &[source(
+                "struct Config {\n\
+                     #[cfg_attr(not(test), serde(rename = \"serde_name\"))]\n\
+                     serde_field: bool,\n\
+                     #[cfg_attr(not(test), schemars(rename = \"schema_name\"))]\n\
+                     schema_field: bool,\n\
+                 }\n\
+                 fn consume<T>(_: T) {}\n\
+                 fn run(c: &Config) {\n\
+                     consume(c.serde_field);\n\
+                     consume(c.schema_field);\n\
+                 }",
+            )],
+        );
+
+        assert!(
+            errors.is_empty(),
+            "production cfg_attr renames must map back to their Rust fields: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn asymmetric_serde_rename_uses_the_deserialize_name() {
+        let errors = verify_config_readers(
+            &[key("proxy.wire_in", "wire_in")],
+            &[],
+            &[source(
+                "struct Config {\n\
+                     #[serde(rename(serialize = \"wire_out\", deserialize = \"wire_in\"))]\n\
+                     rust_name: bool,\n\
+                 }\n\
+                 fn consume<T>(_: T) {}\n\
+                 fn run(c: &Config) { consume(c.rust_name); }",
+            )],
+        );
+
+        assert!(
+            errors.is_empty(),
+            "the input schema uses the deserialize-side name: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn cfg_test_fields_are_not_schema_field_candidates() {
+        let errors = verify_config_readers(
+            &[key("proxy.live", "live")],
+            &[],
+            &[source(
+                "struct Config {\n\
+                     live: bool,\n\
+                     #[cfg(test)]\n\
+                     #[serde(rename = \"live\")]\n\
+                     decoy: bool,\n\
+                 }\n\
+                 fn consume<T>(_: T) {}\n\
+                 fn run(c: &Config) { consume(c.live); }",
+            )],
+        );
+
+        assert!(
+            errors.is_empty(),
+            "test-only fields must not make a production schema mapping ambiguous: {errors:?}"
+        );
     }
 
     #[test]

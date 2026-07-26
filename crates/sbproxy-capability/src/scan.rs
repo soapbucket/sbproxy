@@ -196,6 +196,14 @@ fn cfg_predicates_can_be_production(predicates: &[syn::Meta]) -> bool {
     cfg_assignment_can_satisfy(predicates, &atoms, 0, &mut BTreeMap::<&str, bool>::new())
 }
 
+pub(crate) fn production_cfg_condition_possibility(predicate: &syn::Meta) -> (bool, bool) {
+    let can_be_true = cfg_predicates_can_be_production(std::slice::from_ref(predicate));
+    let predicate = predicate.clone();
+    let negated: syn::Meta = syn::parse_quote!(not(#predicate));
+    let can_be_false = cfg_predicates_can_be_production(std::slice::from_ref(&negated));
+    (can_be_true, can_be_false)
+}
+
 fn cfg_atom_search_priority(atom: &str, polarities: &BTreeMap<String, CfgAtomPolarity>) -> u8 {
     if atom == "unix"
         || atom == "windows"
