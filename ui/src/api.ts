@@ -2078,6 +2078,10 @@ export const api = {
   effectiveConfig: () =>
     getJson<EffectiveConfigResponse>("/admin/config/effective"),
 
+  // The config JSON Schema, generated from the running binary's own types.
+  // Around 300KB, so it is fetched once per page load and not per edit.
+  configSchema: () => getJson<Record<string, unknown>>("/admin/config/schema"),
+
   // Rate-limit budget audit trail (WOR-1761) + fleet metrics (WOR-1762).
   auditRecent: (limit = 100) => getJson<AuditRow[]>(`/api/audit/recent?limit=${limit}`),
   clusterStatus: () => getJson<ClusterStatusResponse>("/admin/cluster/status"),

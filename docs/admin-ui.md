@@ -41,6 +41,17 @@ the binary via `include_dir!` at compile time and mounts
 returns a `404` whose body names the two commands above; the default
 build never requires a prior `npm run build` to succeed.
 
+`crates/sbproxy-core/build.rs` declares `ui/dist` as an input, so
+changing the UI invalidates the crate and the next `cargo build` picks
+it up. That script exists because cargo cannot see through
+`include_dir!` to the files it reads: without it, `npm run build`
+followed by `cargo build` produced a binary carrying the *previous* UI,
+with nothing failing and nothing warning. The browser simply served a
+stale page, and rebuilding again did not help, because cargo still
+considered the crate fresh. If you are debugging a UI change that will
+not appear, check that you rebuilt with the feature on before
+suspecting the cache.
+
 Then, with the admin server enabled (see [admin.md](admin.md#enabling-it)),
 open:
 
@@ -167,7 +178,51 @@ surface, on-disk drift, per-target health, and a raw config editor.
   as "reload the editor and reapply." An ownership refusal
   (`code: config_not_locally_owned`) names the settings at fault and the
   place they are actually set, because reapplying would fail the same
-  way.
+  way. In the form view the refusal also renders on the offending
+  fields: a `409` naming six paths as one banner is a puzzle, and the
+  same information attached to six fields is a to-do list.
+
+### Form and raw YAML
+
+The editor has two views of the same document, switched with the
+Form / Raw YAML buttons.
+
+**The form is generated from `GET /admin/config/schema`**, never from a
+hand-maintained field list, so a field added to the config types
+appears without a UI change. Fields carry the doc comment from the
+Rust type as help text, enums render as pickers, and a value that
+cannot be the declared type (a port typed as a word) is a red field
+rather than a round trip and a `400`.
+
+**It does not render everything, and says so where it stops.** Four
+fields are `serde_json::Value` in the config types (`origins[].action`,
+`policies`, `transforms`, `authentication`), so the schema describes no
+shape for them and no form can. Those drop to a YAML box scoped to that
+one node, labelled with why. The detection is by shape rather than by a
+list of known paths, so a fifth opaque field added later falls back the
+same way instead of rendering as a section with no settings in it.
+
+**Switching views never loses an edit**, because there is only one
+document: a form edit applies its change to the same text the raw view
+shows. That change goes through the YAML document tree rather than a
+parse and re-serialize, so **comments and key order survive an edit**.
+A form that rewrote the file on every change would be a worse editor
+than the textarea it replaced, and operators would be right to call it
+data loss.
+
+Fields the node does not own render locked with an `authority <id> rev
+<n>` or `git <commit>` badge. One case is deliberately locked without a
+definite answer: a path whose key contains a dot, which is every origin
+hostname. The server's provenance map joins path segments with dots, so
+`origins["api.test"].action` and `origins.api.test.action` are the same
+string and a lookup cannot tell them apart. The form reports "ownership
+unclear" and sends the operator to the raw editor, where the server
+judges the write properly. Guessing would either lock a field they own
+or unlock one they do not.
+
+The raw textarea remains, and on a node with no remote config layer
+nothing above changes anything: every field is editable, exactly as
+before.
 - **Empty/error notes:** `GET /admin/drift` returning `503` (no
   `config_path` wired, an in-memory/test boot) renders as "drift
   unavailable," not an error banner; a reload while another reload is

@@ -15,6 +15,11 @@ import {
   provenanceLabel,
   readOwnership,
 } from "../lib/config-ownership";
+import { applyEdits, PatchError } from "../lib/config-patch";
+import { authorityLabel, conflictsByPath } from "../lib/config-form";
+import { buildForm } from "../lib/config-schema";
+import ConfigForm from "../components/ConfigForm.vue";
+import { parse as parseYaml } from "yaml";
 import { useAsync } from "../composables/useAsync";
 import { toast } from "../composables/useToasts";
 import { formatMs } from "../lib/format";
@@ -28,12 +33,14 @@ const drift = useAsync(() => api.drift());
 const targetsReq = useAsync(() => api.targets());
 
 const effective = useAsync(() => api.effectiveConfig());
+const configSchema = useAsync(() => api.configSchema());
 
 function refresh() {
   openapi.run();
   drift.run();
   targetsReq.run();
   effective.run();
+  configSchema.run();
   loadConfig();
 }
 onMounted(refresh);
@@ -67,6 +74,79 @@ const configErr = ref<ApiError | null>(null);
 const saveBusy = ref(false);
 const saveBanner = ref<{ tone: "ok" | "err"; text: string } | null>(null);
 
+// ---- schema-generated form (WOR-2013) ----
+//
+// `editorText` stays the single source of truth for both views. A form edit
+// applies its patch to that text immediately rather than accumulating a
+// separate edit list, which is what makes switching between form and raw
+// unable to lose anything: there is only ever one document.
+//
+// The patch goes through the YAML document tree rather than a parse and
+// re-serialize, so comments and key order survive. A form that rewrote the
+// whole file on every change would be a worse editor than the textarea it
+// replaced.
+const mode = ref<"form" | "raw">("raw");
+// Paths the write guard rejected, indexed so each field renders its own
+// error. A 409 naming six paths as one toast is a puzzle; the same
+// information on the six fields is a to-do list.
+const fieldConflicts = ref<Record<string, true>>({});
+const patchError = ref<string | null>(null);
+
+/** The current document, parsed. `null` while the raw text does not parse. */
+const parsedDoc = computed<unknown>(() => {
+  if (!editorText.value.trim()) return {};
+  try {
+    return parseYaml(editorText.value) ?? {};
+  } catch {
+    return null;
+  }
+});
+
+const formNodes = computed(() => {
+  const schema = configSchema.data.value;
+  if (!schema || parsedDoc.value === null) return [];
+  return buildForm(schema, parsedDoc.value);
+});
+
+/**
+ * Under `mode: replace`, or on a git-sourced node, nothing on this node is
+ * editable and the form says so once at the top rather than on every field.
+ */
+const formOwnership = computed(() => ({
+  wholeDocumentLocked: editorLocked.value,
+  provenance:
+    (effective.data.value as EffectiveConfigResponse | null)?.provenance ?? {},
+  authorityLabel: authorityLabel(ownership.value?.authority),
+}));
+
+function onFormSet(path: string[], value: unknown) {
+  applyToDocument([{ path, value }]);
+}
+
+function onFormRemove(path: string[]) {
+  applyToDocument([{ path, remove: true as const }]);
+}
+
+function applyToDocument(edits: Parameters<typeof applyEdits>[1]) {
+  try {
+    editorText.value = applyEdits(editorText.value, edits);
+    patchError.value = null;
+    // An edited field is no longer the field the server complained about.
+    for (const edit of edits) delete fieldConflicts.value[edit.path.join(".")];
+  } catch (e) {
+    patchError.value =
+      e instanceof PatchError ? e.message : "could not apply that change to the document";
+  }
+}
+
+const formUnavailable = computed(() => {
+  if (configSchema.error.value) return "The config schema could not be loaded, so the form is unavailable.";
+  if (!configSchema.data.value) return "Loading the config schema...";
+  if (parsedDoc.value === null)
+    return "The raw text does not parse as YAML, so the form cannot render it. Fix it in the raw editor.";
+  return null;
+});
+
 async function loadConfig() {
   configLoading.value = true;
   configErr.value = null;
@@ -90,6 +170,7 @@ async function saveConfig() {
     toast.success("Config saved", "Validated and hot-swapped into the live pipeline.");
     saveBanner.value = null;
     await loadConfig(); // pick up the new revision
+    fieldConflicts.value = {};
     drift.run();
     effective.run(); // ownership can move with the config
     targetsReq.run();
@@ -109,6 +190,9 @@ async function saveConfig() {
       }
       if (conflict?.code === "config_not_locally_owned") {
         const paths = (conflict.conflicts ?? []).map((c) => c.path);
+        // Attach the rejection to the fields it names, so the form shows it
+        // where the fix is rather than only in a banner.
+        fieldConflicts.value = conflictsByPath(conflict.conflicts);
         saveBanner.value = {
           tone: "err",
           text: [
@@ -344,7 +428,47 @@ async function reload() {
       <p class="banner" v-if="saveBanner" :class="`banner--${saveBanner.tone}`">
         {{ saveBanner.text }}
       </p>
+      <p class="banner banner--err" v-if="patchError">{{ patchError }}</p>
+
+      <div class="mode-switch" role="tablist" aria-label="Editor mode">
+        <button
+          class="sb-btn sb-btn--sm"
+          role="tab"
+          :aria-selected="mode === 'form'"
+          :class="{ 'sb-btn--primary': mode === 'form' }"
+          @click="mode = 'form'"
+        >
+          Form
+        </button>
+        <button
+          class="sb-btn sb-btn--sm"
+          role="tab"
+          :aria-selected="mode === 'raw'"
+          :class="{ 'sb-btn--primary': mode === 'raw' }"
+          @click="mode = 'raw'"
+        >
+          Raw YAML
+        </button>
+        <span class="sb-faint">
+          Both views edit the same document, so switching never loses an edit.
+        </span>
+      </div>
+
+      <div v-if="mode === 'form'">
+        <p class="sb-faint" v-if="formUnavailable">{{ formUnavailable }}</p>
+        <ConfigForm
+          v-else
+          :nodes="formNodes"
+          :doc="parsedDoc"
+          :ownership="formOwnership"
+          :conflicts="fieldConflicts"
+          @set="onFormSet"
+          @remove="onFormRemove"
+        />
+      </div>
+
       <textarea
+        v-show="mode === 'raw'"
         v-model="editorText"
         class="sb-input editor"
         spellcheck="false"
@@ -568,6 +692,13 @@ async function reload() {
 .banner--warn {
   background: #fdf3e0;
   color: #8a5a12;
+}
+.mode-switch {
+  display: flex;
+  align-items: center;
+  gap: var(--sb-space-2);
+  margin-bottom: var(--sb-space-3);
+  flex-wrap: wrap;
 }
 .owner-grid {
   display: grid;
