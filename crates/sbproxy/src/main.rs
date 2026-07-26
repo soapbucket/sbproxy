@@ -5800,10 +5800,23 @@ fn handle_apply_from_yaml(yaml_path: &std::path::Path) -> anyhow::Result<i32> {
     }
 
     let yaml_path_str = yaml_path.to_string_lossy().into_owned();
-    sbproxy_core::server::reload_from_config_path(&yaml_path_str)
+    let outcome = sbproxy_core::server::reload_from_config_path(&yaml_path_str)
         .map_err(|e| anyhow::anyhow!("reload failed: {e:#}"))?;
     println!("apply: reloaded config from {yaml_path_str}");
+    report_reload_degradation(&outcome);
     Ok(0)
+}
+
+/// Print the subsystems a reload could not apply, if any. The reload
+/// itself succeeded and the new pipeline is live, so this is a notice
+/// on stderr rather than a non-zero exit: an operator scripting `apply`
+/// should still see it without the script treating it as a failure.
+fn report_reload_degradation(outcome: &sbproxy_core::server::ReloadOutcome) {
+    if outcome.is_fully_applied() {
+        return;
+    }
+    eprintln!("apply: warning, some subsystems did not apply: {outcome}");
+    eprintln!("apply: the new pipeline is live; those subsystems are serving prior state.");
 }
 
 /// `apply -p <plan-file>` flow. Reads the plan-file, locates the
@@ -5867,9 +5880,10 @@ fn handle_apply_from_plan_file(plan_path: &std::path::Path) -> anyhow::Result<i3
         return Ok(3);
     }
 
-    sbproxy_core::server::reload_from_config_path(&yaml_path)
+    let outcome = sbproxy_core::server::reload_from_config_path(&yaml_path)
         .map_err(|e| anyhow::anyhow!("reload failed: {e:#}"))?;
     println!("apply: reloaded config from {yaml_path} (via plan-file {plan_path_str})");
+    report_reload_degradation(&outcome);
     Ok(0)
 }
 

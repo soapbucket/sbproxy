@@ -20,6 +20,12 @@
 //!    catalog (`reload_provider_registry`) without restarting the
 //!    process. In-flight `get_provider_info` lookups continue against
 //!    their snapshot until they complete.
+//! 4. A reload that has to be all-or-nothing splits step 3 into
+//!    `prepare_provider_registry` (build, no visible effect),
+//!    `install_prepared_provider_registry` (publish), and
+//!    `restore_provider_registry` (put back the catalog captured by
+//!    `provider_registry_snapshot` when a later step of the same
+//!    transaction fails).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -196,6 +202,98 @@ pub fn reload_provider_registry(override_path: Option<&Path>) -> anyhow::Result<
     install_registry(registry);
     tracing::info!("AI provider registry reloaded");
     Ok(())
+}
+
+/// A provider catalog that has been built and validated but is not yet
+/// live.
+///
+/// Reload paths that must stay atomic build the catalog first, decide
+/// whether the rest of the reload can succeed, and only then hand the
+/// prepared value to [`install_prepared_provider_registry`]. The inner
+/// registry is deliberately opaque: callers can move it, but they
+/// cannot read or mutate the compiled catalog.
+pub struct PreparedProviderRegistry {
+    /// The compiled but not-yet-installed catalog.
+    registry: Registry,
+}
+
+impl std::fmt::Debug for PreparedProviderRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedProviderRegistry")
+            .field("provider_count", &self.registry.providers.len())
+            .finish()
+    }
+}
+
+/// A snapshot of the live provider catalog, taken so a caller can put
+/// the previous catalog back if a later step fails.
+///
+/// Cheap to take and cheap to hold: it is a reference-counted handle on
+/// the catalog that was live at the moment [`provider_registry_snapshot`]
+/// ran, not a copy of it.
+pub struct ProviderRegistrySnapshot {
+    /// The catalog that was live when the snapshot was taken.
+    registry: Arc<Registry>,
+}
+
+impl std::fmt::Debug for ProviderRegistrySnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderRegistrySnapshot")
+            .field("provider_count", &self.registry.providers.len())
+            .finish()
+    }
+}
+
+/// Build a provider catalog from the override file at `override_path`
+/// (or the embedded catalog when `override_path` is `None`) without
+/// touching the live one.
+///
+/// This is the first half of [`reload_provider_registry`], split out so
+/// a caller that needs the reload to be all-or-nothing can find out
+/// whether the catalog builds before anything observable changes.
+///
+/// Returns `Err` only when the embedded catalog itself fails to parse
+/// (a build-time bug). A missing or malformed override falls back to the
+/// embedded set with a warn-level log, exactly as in
+/// [`init_provider_registry`].
+pub fn prepare_provider_registry(
+    override_path: Option<&Path>,
+) -> anyhow::Result<PreparedProviderRegistry> {
+    Ok(PreparedProviderRegistry {
+        registry: build_registry(override_path)?,
+    })
+}
+
+/// Take a reference-counted snapshot of the live provider catalog.
+///
+/// Pair with [`restore_provider_registry`] to undo an
+/// [`install_prepared_provider_registry`] when a later step of the same
+/// transaction fails.
+pub fn provider_registry_snapshot() -> ProviderRegistrySnapshot {
+    ProviderRegistrySnapshot {
+        registry: registry_slot().load_full(),
+    }
+}
+
+/// Atomically make a [`PreparedProviderRegistry`] the live catalog.
+///
+/// In-flight [`get_provider_info`] lookups continue to see their
+/// previous snapshot until they finish.
+pub fn install_prepared_provider_registry(prepared: PreparedProviderRegistry) {
+    install_registry(prepared.registry);
+    tracing::info!("AI provider registry installed");
+}
+
+/// Atomically put a previously snapshotted catalog back.
+///
+/// Used by a reload that installed a new catalog and then failed at a
+/// later step: the process must be left serving exactly the catalog it
+/// was serving before the reload started.
+pub fn restore_provider_registry(snapshot: ProviderRegistrySnapshot) {
+    registry_slot().store(snapshot.registry);
+    tracing::info!("AI provider registry restored to the previous catalog");
 }
 
 fn install_registry(registry: Registry) {

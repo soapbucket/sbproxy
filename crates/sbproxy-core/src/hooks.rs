@@ -65,8 +65,21 @@ pub trait EnterpriseStartupHook: Send + Sync {
 
     /// Re-populate enterprise slots on a reloaded pipeline. Called after
     /// the new `CompiledPipeline` is built from reloaded config, before
-    /// it goes live. Returning an error causes the reload to be aborted
-    /// and the previous pipeline stays in place.
+    /// it goes live.
+    ///
+    /// Returning an error does **not** abort the reload. The call site
+    /// logs the error, records the hook in the returned
+    /// `server::ReloadOutcome` as a degraded subsystem, and swaps the
+    /// new pipeline in anyway. That is deliberate: a failing enterprise
+    /// extension must not be able to permanently pin an operator on an
+    /// old config, which is exactly what aborting would do for every
+    /// subsequent reload until the extension was fixed. Operators see
+    /// the degradation in the log line and in the `/admin/reload`
+    /// response body instead.
+    ///
+    /// An implementation that must not go live half-populated should
+    /// therefore leave the pipeline untouched on its own error paths
+    /// rather than relying on the reload to roll back.
     async fn on_reload(
         &self,
         pipeline: &mut crate::pipeline::CompiledPipeline,

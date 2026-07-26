@@ -10,6 +10,16 @@ SBproxy resolves secret material through provider-specific reference schemes. Th
 
 Backend instances are declared once, at proxy scope, under `proxy.secrets.backends:`. There is no per-tenant or per-origin backend list. A reference resolves against the backend whose `name` matches the authority segment and whose provider type matches the scheme; to keep tenants on separate stores, declare one named backend per store and reference the right name from each origin.
 
+## Backends are process-owned: changing them needs a restart
+
+The resolver is built once, at startup, and it owns live connections to whatever you configured: a Vault client, an AWS or GCP SDK client, a Kubernetes API client. Swapping that out underneath a running proxy is not something a config reload can do safely, so it does not try.
+
+A reload whose `proxy.secrets` block differs from the one the process started with is **refused**, with an error saying a restart is required. The previous config keeps serving and nothing from the candidate is applied. This includes adding a backend, removing one, renaming one, repointing a Vault address, and changing the rotation or fallback settings.
+
+Earlier versions accepted the reload and silently ignored the change. That was worse than refusing: the new backend never existed, so the first reference to it failed at handler construction with an error that named the reference rather than the real cause, and the reload that introduced it had already reported success. If you are used to that behaviour, the refusal is the fix, not a regression.
+
+Everything else in a config still hot-reloads normally. Only the `proxy.secrets` block carries this restriction, and only when it actually changes; reloading an unchanged block is a no-op. The values behind a reference are re-resolved on every reload, so rotating a secret **in** Vault or Secrets Manager needs no restart. It is only changing where SBproxy looks that does.
+
 ## Scheme Table
 
 | Scheme | Provider type | Example |

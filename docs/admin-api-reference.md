@@ -199,8 +199,8 @@ for the full login/CSRF walkthrough.
 
 ### `POST /admin/login`
 
-Verifies credentials — an `Authorization: Basic` header, or a JSON
-`{"username": "...", "password": "..."}` body — against the top-level
+Verifies credentials (an `Authorization: Basic` header, or a JSON
+`{"username": "...", "password": "..."}` body) against the top-level
 admin or a configured `operators[]` entry.
 
 Success (`200`) sets `Set-Cookie: sb_admin_session=<token>; HttpOnly;
@@ -223,7 +223,7 @@ exceptions, alongside login and session discovery).
 ### `GET /admin/session`
 
 Reports whether the request carries a valid session, without ever
-returning `401` — it distinguishes "please log in" from an error so
+returning `401`. It distinguishes "please log in" from an error so
 the UI can render a login form on a fresh visit:
 
 ```json
@@ -234,8 +234,8 @@ or `{"authenticated": false}`. `via_session` is `false` for a request
 authenticated by HTTP Basic (a Basic caller is "authenticated" here
 too, so a Basic-authenticated browser session can still recover a
 usable CSRF token: the server mints and `Set-Cookie`s a session token
-automatically on a Basic-authenticated request that lacks one — the
-Basic-to-session upgrade — but the RBAC/CSRF gate still treats
+automatically on a Basic-authenticated request that lacks one (the
+Basic-to-session upgrade), but the RBAC/CSRF gate still treats
 `via_session: false` requests as CSRF-exempt).
 
 ---
@@ -260,7 +260,7 @@ the policy model these records drive.
 | DELETE | `/admin/keys/{id}` | Delete a key. |
 | GET | `/admin/keys/{id}/usage` | Governed usage snapshot (requests/tokens/budget counters) and backend health. |
 | POST | `/admin/keys/{id}/effective-policy/preview` | Evaluate the key's effective policy against a hypothetical request, without dispatching one. |
-| POST | `/admin/keys/{id}/revoke` | Mark revoked (terminal — no further mutation). |
+| POST | `/admin/keys/{id}/revoke` | Mark revoked (terminal, no further mutation). |
 | POST | `/admin/keys/{id}/block` | Mark blocked (reversible). |
 | POST | `/admin/keys/{id}/unblock` | Mark active. |
 | POST | `/admin/keys/{id}/rotate` | Mint a new secret with a grace-window dual-key transition. |
@@ -316,7 +316,7 @@ missing key/credential id is `404`.
 `status` is `active`, `blocked`, or `revoked`. `policy_digest` is only
 populated for records that own a tenant (`tenant_id` set); a tenantless
 record inherits the request's origin tenant, so it has no single
-runtime digest — get one per-origin from the effective-policy preview
+runtime digest. Get one per-origin from the effective-policy preview
 instead. `rotation_pending` is true while a prior secret is still
 valid inside its rotation grace window.
 
@@ -355,7 +355,7 @@ Mints a fresh secret, keeps the prior hash valid for `grace_secs`
 
 ### `GET /admin/keys/{id}/usage`
 
-Returns `{"usage": <GovernanceSnapshot>}` — the same request/token/
+Returns `{"usage": <GovernanceSnapshot>}`, the same request/token/
 budget counters the AI gateway's governance seam reserves against,
 read live rather than derived from the log. Returns
 `503 {"error":"governance backend unavailable"}` if the governance
@@ -366,7 +366,7 @@ key record itself is not at fault in that case.
 
 Body is an optional sample request shape (`model`, `provider`, `tools`,
 `principal`, `origin_tenant_id`, `active_pii_rules`,
-`prompt_injection_detected`, `usage`, `at`) — every field optional; an
+`prompt_injection_detected`, `usage`, `at`). Every field is optional; an
 empty body still returns the resolved policy. Response:
 
 ```json
@@ -707,7 +707,7 @@ tests delivery only and cannot create, edit, or delete rules or channels.
 Recent rate-limit budget audit rows (suspend, throttle, resume
 transitions), newest first. `?limit=` bounds the count (default 50).
 Returns `[]` (not an error) when no `rate_limits:` block is
-configured — there is nothing to have audited.
+configured, so there is nothing to have audited.
 
 ### `GET /api/rate_limits/budget`
 
@@ -738,7 +738,7 @@ now: `?workspace=<id>` (defaults to `default`).
 
 **Test/dev-only.** Advances the rate limiter's clock by `?secs=N`
 seconds. This only does anything when `proxy.rate_limits.clock:
-manual` is set — a mode that exists so integration tests can assert
+manual` is set, a mode that exists so integration tests can assert
 token-bucket refill and suspend-cooldown behavior deterministically,
 without sleeping in wall time. Production configs use the default
 `system` clock, for which this route returns
@@ -1062,14 +1062,14 @@ Reads and writes the raw on-disk config text.
 ```
 
 `PUT`/`POST` validates the submitted YAML, persists it, and hot-swaps
-the running pipeline — the same swap `POST /admin/reload` performs,
+the running pipeline, the same swap `POST /admin/reload` performs,
 just sourced from the request body instead of re-reading the file.
 Add `?if_match=<revision>` for optimistic concurrency (the write is
 rejected with `409` if the loaded revision has moved since the caller
 last read it). `400` for a YAML parse failure or a failed pipeline
 compile; the config path itself is scrubbed from any error message.
 Env-var interpolation (`${VAR}`) and secret-backend references are
-stored and echoed back exactly as written — a secret is never
+stored and echoed back exactly as written. A secret is never
 resolved into the saved config or exposed in this editor. See
 [secrets.md](secrets.md).
 
@@ -1107,18 +1107,55 @@ Success response (`200`):
 ```json
 {
   "config_revision": "abc123...",
-  "loaded_at": "2026-05-12T10:15:32.456Z"
+  "loaded_at": "2026-05-12T10:15:32.456Z",
+  "fully_applied": true,
+  "degraded": []
 }
 ```
 
+A reload swaps the pipeline as one step, and every check that can
+refuse the config runs before that swap. If any of them refuses, the
+previous config keeps serving and nothing from the candidate is left
+installed.
+
+A few subsystems are allowed to fail without refusing the reload,
+because a stale AI catalog is better than a proxy pinned on an old
+config: the AI provider registry, the dynamic key plane, the listings
+registry, the sink dispatcher, and the enterprise reload hook. When one
+of them fails, the swap still happens, `fully_applied` is `false`, and
+`degraded` names what did not take effect:
+
+```json
+{
+  "config_revision": "abc123...",
+  "loaded_at": "2026-05-12T10:15:32.456Z",
+  "fully_applied": false,
+  "degraded": ["ai_provider_registry"]
+}
+```
+
+Treat that as a partial success. The status code is still `200`,
+because the config did load, so automation that only checks the status
+code will miss it. Check `fully_applied` if you need to know that
+everything took effect.
+
 | Status | When |
 |---|---|
-| `200` | Reload succeeded; pipeline swapped. |
+| `200` | Reload succeeded; pipeline swapped. Check `fully_applied` for whether every subsystem took effect. |
 | `400` | YAML parse failed. Error body carries the parse error with the config path scrubbed. |
 | `405` | Method other than POST. |
 | `409` | Another reload is already in flight. |
 | `500` | Could not read the config file (permissions, ENOENT), or pipeline compile failed. |
 | `503` | The admin server has no `config_path` wired (in-memory / test mode). |
+
+Two changes need a restart rather than a reload, and both are refused
+with a message saying so rather than being applied by halves. Cluster
+identity, discovery, listeners, and peer security are process-owned
+(see `proxy.cluster`), and so are the secret backends under
+`proxy.secrets`: the resolver holding live connections to Vault, AWS,
+GCP, or Kubernetes is built once at startup, so a reload that changed
+that block would otherwise be ignored while references to a new backend
+failed with an unrelated-looking error.
 
 See [manual.md section 9](manual.md#9-hot-reload) for the full
 operator workflow including curl examples and the Kubernetes
@@ -1195,7 +1232,7 @@ mutations are accepted.
 
 `load`, `stop`/`drain`/`evict`, and `reset` all accept `{"deployment":
 "<id>"}` (the legacy key `model` is still accepted as an alias) and
-operate only on a deployment ID that already exists in desired state —
+operate only on a deployment ID that already exists in desired state,
 none of them create or delete a deployment; that is what the
 `deployments` PUT and `sb.yml` are for.
 
@@ -1226,7 +1263,7 @@ Empty (all-zero) until a locally served or compressed request
 completes successfully. `compression` is sorted by model and lever;
 `compression_totals` aggregates by lever name. A known target-model
 tokenizer produces `model_tokenizer` precision; the UTF-8
-byte-length fallback produces `heuristic` — both are sbproxy estimates,
+byte-length fallback produces `heuristic`. Both are sbproxy estimates,
 not provider billing totals. The ledger is a bounded in-memory
 structure (at most 1,000 model lanes, with overflow folded into
 `__other__`) unless a qualifying `providers[].serve` block with
@@ -1249,7 +1286,7 @@ data-plane policy that produces these savings.
 ```
 
 `cache_root: null` and an empty `artifacts` array when no model host
-is configured — an honest empty inventory, not an error.
+is configured, an honest empty inventory rather than an error.
 
 ### `POST /admin/model-host/gc`
 
@@ -1258,7 +1295,7 @@ automatically, on demand. Protects configured, resident, pinned,
 leased, and file-locked artifacts identically to the automatic sweep
 and to `DELETE .../artifacts/{digest}`. Returns the collection report
 (bytes reclaimed, artifacts removed). `409` when no cache budget is
-configured — there is no target to collect toward.
+configured, so there is no target to collect toward.
 
 ### `DELETE /admin/model-host/artifacts/{digest}`
 
@@ -1296,7 +1333,7 @@ prefix; `memcached` has no scan primitive).
 
 ### `POST /admin/cache/purge`
 
-Body selects the scope — `{"key": "..."}` deletes one entry,
+Body selects the scope. `{"key": "..."}` deletes one entry,
 `{"prefix": "..."}` deletes a prefix, an empty body `{}` clears the
 whole cache:
 
@@ -1459,7 +1496,7 @@ node's latest accepted snapshot from the model directory; a node with
 no accepted snapshot yet is omitted from `nodes` and flips the
 top-level `partial: true` flag rather than silently under-reporting.
 Outside a configured cluster (or when the directory has no other
-members), reports the local node's own artifact cache — the same
+members), reports the local node's own artifact cache, the same
 inventory as `GET /admin/model-host/files`, reshaped for the fleet
 view. `405` for a method other than GET.
 
@@ -1554,7 +1591,7 @@ keys and credentials, config editing and drift, the request log (with
 live tail), metrics, spend, AI performance, guardrails, prompts, a
 chat playground, the response/semantic cache, model host (catalog,
 desired-state editing, lifecycle actions), artifact storage, the audit
-and rate-limit view, and — despite older notes to the contrary — the
+and rate-limit view, and (despite older notes to the contrary) the
 full cluster roster, health rail, and unhealthy-node alerts, reading
 `GET /admin/cluster/status` and `GET /admin/cluster/metrics`. See
 [admin-ui.md](admin-ui.md) for the page-by-page reference. `GET /`

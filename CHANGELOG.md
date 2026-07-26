@@ -57,8 +57,44 @@ the next version cut.
   quorum. See [`docs/ai-classifier-routing.md`](docs/ai-classifier-routing.md)
   and the runnable [`examples/ai-classifier-routing/`](examples/ai-classifier-routing/).
 
+### Changed
+
+- **A reload that fails now really does change nothing.** Reloading a
+  config installed a dozen pieces of process state (log redaction,
+  cardinality caps, log sinks, the AI provider catalog, the key plane,
+  detection singletons, Lua sandbox limits) *before* it got to the two
+  steps most likely to reject the config. So a config that parsed but
+  failed to build left the box running the new redaction rules and the
+  new AI catalog against the old pipeline, while the log line said the
+  previous config was still serving. Everything that can refuse a config
+  now runs first, and nothing installs until every one of those checks
+  has passed. `POST /admin/reload` also reports what happened rather
+  than only whether it worked: the response carries `fully_applied` and,
+  when a subsystem loaded with stale state, a `degraded` list naming it.
+  A handful of subsystems are still allowed to fail without refusing the
+  reload, because a stale AI catalog beats a proxy pinned on an old
+  config, but they can no longer fail silently.
+- **Changing `proxy.secrets` is refused instead of ignored.** The secret
+  resolver owns live connections to Vault, AWS, GCP, or Kubernetes and
+  is built once at startup, so a reload never actually rebuilt it. The
+  change was dropped on the floor and the first reference to a
+  newly-declared backend then failed at handler construction with an
+  error naming the reference rather than the cause, long after the
+  reload had reported success. Such a reload is now rejected outright
+  with a message saying a restart is required, the way a cluster
+  identity change already was. Rotating a secret inside your vault still
+  needs no restart; only changing where SBproxy looks does. See
+  [`docs/secrets.md`](docs/secrets.md).
+
 ### Fixed
 
+- **`GET /admin/drift` no longer invents drift after a hot reload.** The
+  baseline it compares against was recorded at startup and by
+  `POST /admin/reload`, but not by the file watcher or by `SIGHUP`. So
+  editing the config file and letting the watcher pick it up left the
+  running config correct and the baseline stale, and drift reported a
+  difference that did not exist until the next admin reload or restart.
+  Every path that loads a config now records the baseline.
 - **Saving config from the admin console no longer leaks health probes.**
   Validating a config meant building the whole pipeline to see whether
   every module would construct, and that construction spawned the active

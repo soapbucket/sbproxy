@@ -12,6 +12,215 @@ use super::*;
 
 static CONFIG_RELOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Fingerprint of the effective `proxy.secrets:` block this process
+/// owns, captured the first time a config is loaded.
+///
+/// The secret resolver behind `proxy.secrets:` is installed into a
+/// set-once slot in `sbproxy-vault` at binary boot, so a later reload
+/// that changes the block cannot take effect. Recording the fingerprint
+/// lets the reload path reject the change loudly instead of accepting a
+/// config whose secret backends will never be honoured.
+static PROCESS_SECRETS_FINGERPRINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// One subsystem that did not apply during a reload that nonetheless
+/// succeeded.
+///
+/// Every variant corresponds to a failure the reload path deliberately
+/// tolerates: aborting on any of them would let one broken subsystem
+/// pin an operator on an old config. Surfacing them here means an
+/// automated config authority can tell "applied" from "applied, but
+/// this part of the node is stale".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DegradedSubsystem {
+    /// The AI provider catalog could not be rebuilt; the node keeps
+    /// serving the catalog it had before the reload.
+    AiProviderRegistry,
+    /// The dynamic key plane could not be reconciled from
+    /// `key_management:`; the previously installed plane stays live.
+    KeyPlane,
+    /// One or more `listings/*.yaml` entries failed to load; the
+    /// pipeline went live without them.
+    Listings,
+    /// The enterprise reload hook returned an error, or its runtime
+    /// could not be built. Enterprise slots on the new pipeline may
+    /// carry prior state.
+    EnterpriseHook,
+    /// The telemetry sink dispatcher could not be installed; log and
+    /// event export falls back to the legacy tracing subscriber.
+    SinkDispatcher,
+}
+
+impl DegradedSubsystem {
+    /// Stable machine-readable identifier, suitable for a JSON body or
+    /// a structured log field. Never changes for a given variant.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AiProviderRegistry => "ai_provider_registry",
+            Self::KeyPlane => "key_plane",
+            Self::Listings => "listings",
+            Self::EnterpriseHook => "enterprise_hook",
+            Self::SinkDispatcher => "sink_dispatcher",
+        }
+    }
+}
+
+impl std::fmt::Display for DegradedSubsystem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::AiProviderRegistry => "AI provider registry",
+            Self::KeyPlane => "key plane",
+            Self::Listings => "listings",
+            Self::EnterpriseHook => "enterprise reload hook",
+            Self::SinkDispatcher => "sink dispatcher",
+        };
+        formatter.write_str(text)
+    }
+}
+
+/// What a reload actually accomplished.
+///
+/// A reload that returns `Ok` has published the new pipeline. It has
+/// not necessarily applied every subsystem: the ones listed by
+/// [`Self::degraded()`] failed in a way the reload path tolerates on
+/// purpose. Check [`Self::is_fully_applied`] before reporting a reload
+/// as clean.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReloadOutcome {
+    /// Subsystems that failed to apply while the reload still succeeded.
+    degraded: Vec<DegradedSubsystem>,
+}
+
+impl ReloadOutcome {
+    /// Record one subsystem that failed to apply. Repeated records of
+    /// the same subsystem collapse into one entry.
+    fn degrade(&mut self, subsystem: DegradedSubsystem) {
+        if !self.degraded.contains(&subsystem) {
+            self.degraded.push(subsystem);
+        }
+    }
+
+    /// Whether every subsystem this reload touched applied cleanly.
+    pub fn is_fully_applied(&self) -> bool {
+        self.degraded.is_empty()
+    }
+
+    /// The subsystems that failed to apply, in the order the reload
+    /// reached them. Empty when [`Self::is_fully_applied`] is true.
+    pub fn degraded(&self) -> &[DegradedSubsystem] {
+        &self.degraded
+    }
+}
+
+impl std::fmt::Display for ReloadOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.degraded.is_empty() {
+            return formatter.write_str("fully applied");
+        }
+        for (index, subsystem) in self.degraded.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            write!(formatter, "{subsystem}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Fingerprint the effective `proxy.secrets:` block.
+///
+/// An absent block fingerprints differently from any present one, so
+/// adding or removing the block is itself a change. The serialization
+/// goes through `serde_json::Value`, whose object representation is
+/// key-ordered, so a `HashMap` field cannot make the fingerprint vary
+/// between two runs over identical config.
+fn secrets_fingerprint(secrets: Option<&sbproxy_config::types::SecretsConfig>) -> String {
+    let value = match secrets {
+        Some(cfg) => serde_json::to_value(cfg).unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    };
+    let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
+    crate::identity::config_revision(serialized.as_bytes())
+}
+
+/// Record the `proxy.secrets:` block this process is going to own.
+///
+/// Called from `run` with the boot config. A second call is ignored, so
+/// a process that boots normally pins the boot-time block and a process
+/// that only ever reloads (tests, embedders) pins whatever it saw
+/// first.
+fn record_process_secrets_fingerprint(secrets: Option<&sbproxy_config::types::SecretsConfig>) {
+    let _ = PROCESS_SECRETS_FINGERPRINT.set(secrets_fingerprint(secrets));
+}
+
+/// Reject a reload that changes the process-owned `proxy.secrets:`
+/// block.
+///
+/// The secret resolver assembled from that block is installed into a
+/// set-once slot (`sbproxy_vault::install_process_resolver`) at binary
+/// boot and nothing re-installs it. Accepting a changed block would
+/// leave the node resolving `secret://` references against the old
+/// backends and would only surface later, as a confusing
+/// handler-construction failure the first time a config referenced a
+/// backend that "exists" in the YAML. Rejecting here keeps the
+/// failure at the reload, where the operator can act on it.
+///
+/// Mirrors `cluster::reconcile_process_cluster`, which rejects
+/// restart-only cluster changes the same way.
+fn reconcile_process_secrets(
+    secrets: Option<&sbproxy_config::types::SecretsConfig>,
+) -> anyhow::Result<()> {
+    let candidate = secrets_fingerprint(secrets);
+    let installed = PROCESS_SECRETS_FINGERPRINT.get_or_init(|| candidate.clone());
+    if *installed == candidate {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "proxy.secrets backend, vault connection, named backends, rotation, or fallback changed; \
+         restart sbproxy to apply the new process-owned secret configuration"
+    )
+}
+
+/// Restores the previously live AI provider catalog when a reload that
+/// already installed a new one fails before it publishes.
+///
+/// The catalog has to be installed before
+/// [`CompiledPipeline::from_config`] runs, because AI handler
+/// construction resolves provider names against the live registry. That
+/// makes it the one process global the reload cannot defer to commit
+/// time, so it gets an explicit undo instead. Dropping an armed guard
+/// puts the old catalog back; [`Self::disarm`] at the commit point
+/// keeps the new one.
+struct ProviderRegistryRollback {
+    /// The catalog to restore, or `None` once the reload has committed.
+    snapshot: Option<sbproxy_ai::ProviderRegistrySnapshot>,
+}
+
+impl ProviderRegistryRollback {
+    fn new(snapshot: sbproxy_ai::ProviderRegistrySnapshot) -> Self {
+        Self {
+            snapshot: Some(snapshot),
+        }
+    }
+
+    /// Keep the newly installed catalog: the reload reached its commit
+    /// point and every fallible step behind it succeeded.
+    fn disarm(&mut self) {
+        self.snapshot = None;
+    }
+}
+
+impl Drop for ProviderRegistryRollback {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.snapshot.take() {
+            sbproxy_ai::restore_provider_registry(snapshot);
+            tracing::warn!(
+                "reload failed after the AI provider catalog was installed; \
+                 restored the catalog that was live before the reload",
+            );
+        }
+    }
+}
+
 /// Start a file watcher that reloads the config on changes.
 ///
 /// Spawns a background thread that watches the config file for modifications.
@@ -29,20 +238,25 @@ static CONFIG_RELOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Reads the file, runs `compile_config` (which also drives the
 /// features.* migration), constructs a fresh
 /// [`CompiledPipeline`], invokes the enterprise reload hook
-/// (best-effort), and atomically swaps the live pipeline. Returns
-/// `Ok(())` on success; logs and returns `Err` on any step's failure
-/// so the caller can decide whether to retry.
+/// (best-effort), and atomically swaps the live pipeline. Returns a
+/// [`ReloadOutcome`] on success; logs and returns `Err` on any step's
+/// failure so the caller can decide whether to retry.
+///
+/// An `Err` means nothing was applied: the node keeps serving the
+/// pipeline and the process globals it had before the call. An `Ok`
+/// whose [`ReloadOutcome::is_fully_applied`] is false means the
+/// pipeline went live but the subsystems it names did not.
 ///
 /// Idempotent: invoking back-to-back yields the same effect as one
 /// invocation. Safe to call from any thread; the global pipeline
 /// `ArcSwap` handles the publish.
-pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<()> {
+pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<ReloadOutcome> {
     // WOR-1101: stamp every reload outcome so operators can alert on
     // failures and watch the reload cadence from metrics, not just
     // logs. The inner function carries the original early-return body.
     let result = reload_from_config_path_inner(config_path);
     match &result {
-        Ok(()) => sbproxy_observe::metrics::record_config_reload("success"),
+        Ok(_) => sbproxy_observe::metrics::record_config_reload("success"),
         Err(_) => sbproxy_observe::metrics::record_config_reload("failure"),
     }
     result
@@ -221,7 +435,7 @@ fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
     }
 }
 
-fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<()> {
+fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<ReloadOutcome> {
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{config_path}': {e}"))?;
     reload_from_config_yaml(config_path, &yaml)
@@ -229,7 +443,31 @@ fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<()> {
 
 /// Reload one exact config payload through the same prepare and publish
 /// transaction used by file-watch and SIGHUP reloads.
-pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::Result<()> {
+///
+/// The transaction has three phases and the order matters:
+///
+/// 1. **Reject.** Compile the YAML and run every check that can refuse
+///    the candidate outright, before anything observable changes.
+/// 2. **Construct.** Install the AI provider catalog (the one process
+///    global `CompiledPipeline::from_config` reads while it builds), then
+///    build the pipeline, load listings, run the enterprise hook, and
+///    reconcile the model runtime. A failure anywhere in this phase
+///    returns `Err` and rolls the catalog back, so the node is left
+///    exactly as it was.
+/// 3. **Commit.** Install the request-path and admin-path process
+///    globals, then publish the pipeline. Nothing here can fail the
+///    reload; the subsystems that can fail softly record themselves in
+///    the returned [`ReloadOutcome`].
+///
+/// Keeping phase 3 after phase 2 is the whole point: a config that
+/// compiles but cannot construct a pipeline used to leave the node
+/// running new Lua sandbox limits, new redaction rules, a new key plane
+/// and a new sink dispatcher against the old pipeline, while the error
+/// claimed nothing had been applied.
+pub(crate) fn reload_from_config_yaml(
+    config_path: &str,
+    yaml: &str,
+) -> anyhow::Result<ReloadOutcome> {
     let _reload_guard = CONFIG_RELOAD_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -238,84 +476,59 @@ pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::
         log_capture_header_warnings(al);
     }
 
+    // --- Phase 1: reject-only checks, before anything installs ---
+
     // Reconcile process-owned cluster identity and listeners before any
     // dependent subsystem observes this candidate configuration. Restart-only
     // changes reject the reload and leave the installed handle untouched.
     crate::cluster::reconcile_process_cluster(&compiled.server)?;
 
-    // WOR-594: refresh the operator-configured Lua sandbox limits on
-    // reload so SIGHUP / hot-reload pick up changes to
-    // `proxy.scripting.lua.sandbox:` without restarting the process.
-    sbproxy_extension::lua::install_sandbox_config(sbproxy_extension::lua::SandboxConfig::from(
-        &compiled.server.scripting.lua.sandbox,
-    ));
+    // The secret resolver assembled from `proxy.secrets:` is set-once
+    // for the life of the process, so a changed block can never take
+    // effect. Refuse it here rather than accept a config whose secret
+    // backends are silently ignored.
+    reconcile_process_secrets(compiled.server.secrets.as_ref())?;
 
-    // Refresh the operator-extensible log redactor on reload so
-    // SIGHUP picks up changes to `proxy.observability.log.redact:`
-    // (proxy scope) as well as the tenant-scope and origin-scope
-    // `observability.log.redact.pii:` overrides (WOR-1043 PR2 / PR3).
-    install_op_redact_state(&compiled);
+    let mut outcome = ReloadOutcome::default();
 
-    // WOR-1067 PR2: refresh per-tenant cardinality caps on reload so
-    // SIGHUP picks up changes to `tenants[].observability.cardinality.max_series`
-    // without restarting the process. Tenants without an entry stay
-    // on the proxy-wide cap.
-    install_tenant_cardinality_state(&compiled.server);
+    // --- Phase 2: construct, with the catalog installed and undoable ---
 
-    // WOR-1045 PR1 + PR2: validate the declared sinks block and (PR2)
-    // build a SinkDispatcher from proxy + tenant + origin scopes so
-    // every declared sink receives the matching records. When no
-    // sinks block is declared, the dispatcher slot stays empty and
-    // the legacy `tracing::*!` fallback continues to drive stdout.
-    validate_sinks_config(&compiled.server);
-    install_sink_dispatcher_from_config(&compiled);
-    install_usage_rollups_from_config(&compiled);
-
-    // WOR-173: refresh the AI provider catalog and rebuild the AI
-    // client alongside the pipeline. Both globals live behind an
-    // `ArcSwap`, so this is a lock-free atomic swap from the reload
-    // thread's perspective. Failures fall back to the embedded
-    // catalog with a warn-level log inside `reload_provider_registry`,
-    // matching the startup behaviour. Note: `BUDGET_TRACKER` is
-    // deliberately *not* refreshed - in-memory accumulators must
-    // survive reload, see the doc comment on the static.
-    {
+    // WOR-173: refresh the AI provider catalog. This is the only
+    // process global that has to move before the pipeline is built:
+    // AI handler construction resolves provider names against the live
+    // registry and hard-errors on an unknown one. Everything else waits
+    // for the commit phase. The rollback guard puts the previous
+    // catalog back if any later step of this function fails.
+    //
+    // Failures to build fall back to the embedded catalog with a
+    // warn-level log inside `prepare_provider_registry`, matching the
+    // startup behaviour, and leave the live catalog untouched. Note:
+    // `BUDGET_TRACKER` is deliberately *not* refreshed - in-memory
+    // accumulators must survive reload, see the doc comment on the
+    // static.
+    let mut registry_rollback = {
         let override_path = compiled
             .server
             .ai_providers_file
             .as_deref()
             .map(std::path::Path::new);
-        if let Err(e) = sbproxy_ai::reload_provider_registry(override_path) {
-            tracing::error!(
-                error = %e,
-                "AI provider registry reload failed; serving with the previous catalog",
-            );
-        } else {
-            reload_ai_client();
+        match sbproxy_ai::prepare_provider_registry(override_path) {
+            Ok(prepared) => {
+                let rollback =
+                    ProviderRegistryRollback::new(sbproxy_ai::provider_registry_snapshot());
+                sbproxy_ai::install_prepared_provider_registry(prepared);
+                Some(rollback)
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "AI provider registry reload failed; serving with the previous catalog",
+                );
+                outcome.degrade(DegradedSubsystem::AiProviderRegistry);
+                None
+            }
         }
-    }
-
-    // WOR-1164: refresh the detection singletons (agent-class resolver,
-    // TLS-fingerprint catalogue + CEL matcher, agent-detect scorer) so
-    // a reload that changed `agent_classes:`, the resolver flags, or
-    // `agent_detect.*` takes effect.
-    // Runs before `compiled` is moved into the pipeline below.
-    install_detection_singletons(&compiled);
-
-    // WOR-1546: reconcile the dynamic key plane so a reload that changed
-    // `key_management:` re-seeds config records and swaps the live plane.
-    // Config-seeded records are re-asserted unless `allow_api_override`.
-    if let Some(km) = compiled.server.key_management.as_ref() {
-        if let Err(e) = crate::key_plane::init_key_plane(km) {
-            tracing::error!(error = %e, "failed to reconcile dynamic key plane on reload");
-        }
-    }
-
-    // WOR-1835: same reasoning as the boot path above - retry starting
-    // governance dissemination now that this reload's key plane is
-    // installed. A no-op once the loop is already running, and a no-op
-    // until both clustering and approximate governance are configured.
-    crate::cluster::start_governance_dissemination();
+    };
 
     let mut new_pipeline = CompiledPipeline::from_config(compiled)?;
 
@@ -336,6 +549,9 @@ pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::
         for err in &load_errors {
             tracing::warn!(error = %err, "listings load error; skipping entry");
         }
+        if !load_errors.is_empty() {
+            outcome.degrade(DegradedSubsystem::Listings);
+        }
         if !loaded.is_empty() {
             let mut findings: Vec<sbproxy_config::PlanFinding> = Vec::new();
             new_pipeline.listings =
@@ -354,11 +570,12 @@ pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::
     // Invoke the enterprise reload hook (best-effort): the OSS reload
     // path must continue to swap the pipeline even if a downstream
     // hook errors, otherwise a failing enterprise extension would
-    // permanently pin the operator on the old config. We spin up a
+    // permanently pin the operator on the old config. The failure is
+    // reported through `ReloadOutcome` instead. We spin up a
     // current-thread runtime when no ambient tokio runtime exists so
     // the file-watcher thread (plain std thread) can also call this.
     if let Some(startup) = new_pipeline.hooks.startup.clone() {
-        if tokio::runtime::Handle::try_current().is_ok() {
+        let hook_failed = if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     if let Err(e) = startup.on_reload(&mut new_pipeline).await {
@@ -366,9 +583,11 @@ pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::
                             error = %e,
                             "enterprise reload hook failed; serving with prior hook state",
                         );
+                        return true;
                     }
-                });
-            });
+                    false
+                })
+            })
         } else {
             match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -380,6 +599,9 @@ pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::
                             error = %e,
                             "enterprise reload hook failed; serving with prior hook state",
                         );
+                        true
+                    } else {
+                        false
                     }
                 }
                 Err(e) => {
@@ -387,8 +609,12 @@ pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::
                         error = %e,
                         "failed to build reload-hook runtime; skipping reload hook",
                     );
+                    true
                 }
             }
+        };
+        if hook_failed {
+            outcome.degrade(DegradedSubsystem::EnterpriseHook);
         }
     }
     let config_dir = std::path::Path::new(config_path)
@@ -396,9 +622,102 @@ pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::
         .unwrap_or_else(|| std::path::Path::new("."));
     super::model_host::reconcile_model_runtime_blocking(&new_pipeline, config_dir)
         .map_err(|error| anyhow::anyhow!("model runtime reconciliation failed: {error}"))?;
+
+    // --- Phase 3: commit ---
+    //
+    // Every fallible step is behind us. From here the reload returns
+    // `Ok`, so the process globals below are safe to move: nothing can
+    // leave them applied against the previous pipeline. They are read on
+    // the request path and the admin path, never during pipeline
+    // construction, which is what lets them wait this long. The compiled
+    // config was moved into the pipeline, so they read it back through
+    // `new_pipeline.config` rather than cloning it.
+    if let Some(rollback) = registry_rollback.as_mut() {
+        rollback.disarm();
+    }
+    {
+        let compiled = &new_pipeline.config;
+
+        // WOR-594: refresh the operator-configured Lua sandbox limits on
+        // reload so SIGHUP / hot-reload pick up changes to
+        // `proxy.scripting.lua.sandbox:` without restarting the process.
+        sbproxy_extension::lua::install_sandbox_config(
+            sbproxy_extension::lua::SandboxConfig::from(&compiled.server.scripting.lua.sandbox),
+        );
+
+        // Refresh the operator-extensible log redactor on reload so
+        // SIGHUP picks up changes to `proxy.observability.log.redact:`
+        // (proxy scope) as well as the tenant-scope and origin-scope
+        // `observability.log.redact.pii:` overrides (WOR-1043 PR2 / PR3).
+        install_op_redact_state(compiled);
+
+        // WOR-1067 PR2: refresh per-tenant cardinality caps on reload so
+        // SIGHUP picks up changes to `tenants[].observability.cardinality.max_series`
+        // without restarting the process. Tenants without an entry stay
+        // on the proxy-wide cap.
+        install_tenant_cardinality_state(&compiled.server);
+
+        // WOR-1045 PR1 + PR2: validate the declared sinks block and (PR2)
+        // build a SinkDispatcher from proxy + tenant + origin scopes so
+        // every declared sink receives the matching records. When no
+        // sinks block is declared, the dispatcher slot stays empty and
+        // the legacy `tracing::*!` fallback continues to drive stdout.
+        validate_sinks_config(&compiled.server);
+        if !install_sink_dispatcher_from_config(compiled) {
+            outcome.degrade(DegradedSubsystem::SinkDispatcher);
+        }
+        install_usage_rollups_from_config(compiled);
+
+        // Rebuild the AI client alongside the catalog. It lives behind an
+        // `ArcSwap`, so this is a lock-free atomic swap from the reload
+        // thread's perspective. The rebuild does not depend on the
+        // catalog reload succeeding, so it runs unconditionally.
+        reload_ai_client();
+
+        // WOR-1164: refresh the detection singletons (agent-class resolver,
+        // TLS-fingerprint catalogue + CEL matcher, agent-detect scorer) so
+        // a reload that changed `agent_classes:`, the resolver flags, or
+        // `agent_detect.*` takes effect.
+        install_detection_singletons(compiled);
+
+        // WOR-1546: reconcile the dynamic key plane so a reload that changed
+        // `key_management:` re-seeds config records and swaps the live plane.
+        // Config-seeded records are re-asserted unless `allow_api_override`.
+        if let Some(km) = compiled.server.key_management.as_ref() {
+            if let Err(e) = crate::key_plane::init_key_plane(km) {
+                tracing::error!(error = %e, "failed to reconcile dynamic key plane on reload");
+                outcome.degrade(DegradedSubsystem::KeyPlane);
+            }
+        }
+    }
+
+    // WOR-1835: same reasoning as the boot path above - retry starting
+    // governance dissemination now that this reload's key plane is
+    // installed. A no-op once the loop is already running, and a no-op
+    // until both clustering and approximate governance are configured.
+    crate::cluster::start_governance_dissemination();
+
     reload::load_pipeline(new_pipeline);
-    tracing::info!("config reloaded successfully");
-    Ok(())
+
+    // Move the drift baseline here, in the one place every reload path
+    // converges, rather than in the individual callers. Only startup and
+    // `POST /admin/reload` used to record it, so after a file-watcher or
+    // SIGHUP reload `GET /admin/drift` compared the running config against
+    // a pre-reload hash and reported drift that did not exist.
+    crate::admin::record_loaded_config_content_hash(&crate::identity::config_revision(
+        yaml.as_bytes(),
+    ));
+
+    if outcome.is_fully_applied() {
+        tracing::info!("config reloaded successfully");
+    } else {
+        tracing::warn!(
+            degraded = %outcome,
+            "config reloaded, but some subsystems did not apply; the node is serving the new \
+             pipeline with stale state for those subsystems",
+        );
+    }
+    Ok(outcome)
 }
 
 pub(super) fn start_config_watcher(config_path: String) {
@@ -446,6 +765,9 @@ pub(super) fn start_config_watcher(config_path: String) {
                         || event.kind.is_remove() =>
                 {
                     tracing::info!("config directory changed, reloading...");
+                    // The outcome's degraded list is already logged by
+                    // the reload itself; the watcher only needs to know
+                    // whether the reload was refused outright.
                     if let Err(e) = reload_from_config_path(&config_path) {
                         tracing::error!(error = %e, "reload failed; serving prior pipeline");
                     }
@@ -498,7 +820,9 @@ pub fn install_sighup_handler(config_path: String) {
             let path = config_path.clone();
             let result = tokio::task::spawn_blocking(move || reload_from_config_path(&path)).await;
             match result {
-                Ok(Ok(())) => {}
+                // A degraded-but-applied reload already logged its own
+                // warning naming the subsystems; nothing to add here.
+                Ok(Ok(_outcome)) => {}
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "SIGHUP reload failed; serving prior pipeline");
                 }
@@ -718,6 +1042,12 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     let server_config = compiled.server.clone();
     let hostnames: Vec<String> = compiled.host_map.keys().map(|k| k.to_string()).collect();
 
+    // Pin the `proxy.secrets:` block this process owns. The binary
+    // installs the matching resolver into a set-once slot before it
+    // calls `run`, so every later reload must present the same block;
+    // `reconcile_process_secrets` rejects the ones that do not.
+    record_process_secrets_fingerprint(server_config.secrets.as_ref());
+
     if let Some(metrics_cfg) = server_config.metrics.as_ref() {
         let _ = sbproxy_observe::metrics::init_cardinality_limiter(
             sbproxy_observe::CardinalityConfig {
@@ -738,7 +1068,9 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     install_op_redact_state(&compiled);
     install_tenant_cardinality_state(&server_config);
     validate_sinks_config(&server_config);
-    install_sink_dispatcher_from_config(&compiled);
+    // Boot has nothing to degrade into: the install result is already
+    // logged and metered inside the helper.
+    let _sinks_installed = install_sink_dispatcher_from_config(&compiled);
     // WOR-1875: this is the startup path (the earlier call site runs
     // on reload); the installer is set-once so both calling is safe.
     install_usage_rollups_from_config(&compiled);
@@ -2346,6 +2678,11 @@ fn validate_sinks_config(server: &sbproxy_config::ProxyServerConfig) {
 /// snapshot so `current_sink_dispatcher()` returns `None`; the
 /// `emit()` path then falls back to the legacy single `tracing::*!`
 /// subscriber and stdout behaviour is preserved.
+///
+/// Returns whether the dispatcher was installed. `false` means the
+/// dispatcher lock was poisoned and telemetry export is unavailable;
+/// the reload path records that as a degraded subsystem rather than
+/// failing the reload.
 /// WOR-1875: open the durable usage-rollup store and install the
 /// process-global writer. Default-on: an absent config block means
 /// the defaults apply. Idempotent (the writer slot is set-once), so
@@ -2395,7 +2732,7 @@ fn install_usage_rollups_from_config(compiled: &sbproxy_config::CompiledConfig) 
     }
 }
 
-fn install_sink_dispatcher_from_config(compiled: &sbproxy_config::CompiledConfig) {
+fn install_sink_dispatcher_from_config(compiled: &sbproxy_config::CompiledConfig) -> bool {
     use sbproxy_observe::sink_dispatcher::{
         install_sink_dispatcher, CompiledSink, SinkDispatcher, SinkScope,
     };
@@ -2463,7 +2800,8 @@ fn install_sink_dispatcher_from_config(compiled: &sbproxy_config::CompiledConfig
     // WOR-1099: a failed install (poisoned dispatcher lock) leaves the
     // proxy serving traffic with no log/event export. Surface it
     // instead of discarding the result bool.
-    if !install_sink_dispatcher(SinkDispatcher::new(compiled_sinks)) {
+    let installed = install_sink_dispatcher(SinkDispatcher::new(compiled_sinks));
+    if !installed {
         sbproxy_observe::metrics::record_sink_install_failure();
         tracing::error!(
             count,
@@ -2480,6 +2818,7 @@ fn install_sink_dispatcher_from_config(compiled: &sbproxy_config::CompiledConfig
             "WOR-1045 PR2: no sinks declared; emit() falls back to the legacy tracing subscriber"
         );
     }
+    installed
 }
 
 /// Compile a single declared sink. Returns `None` when the YAML

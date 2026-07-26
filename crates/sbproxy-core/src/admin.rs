@@ -1069,16 +1069,19 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
     }
 
     let path_text = path.to_string_lossy();
-    if let Err(error) = crate::server::reload_from_config_yaml(&path_text, &yaml) {
-        sbproxy_observe::metrics::record_config_reload("failure");
-        tracing::error!(error = %error, "admin reload: shared reload transaction failed");
-        let msg = sanitise_path_in_error(&error.to_string(), &path);
-        return (
-            500,
-            "application/json",
-            format!(r#"{{"error":"reload failed: {}"}}"#, msg.replace('"', "'")),
-        );
-    }
+    let outcome = match crate::server::reload_from_config_yaml(&path_text, &yaml) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            sbproxy_observe::metrics::record_config_reload("failure");
+            tracing::error!(error = %error, "admin reload: shared reload transaction failed");
+            let msg = sanitise_path_in_error(&error.to_string(), &path);
+            return (
+                500,
+                "application/json",
+                format!(r#"{{"error":"reload failed: {}"}}"#, msg.replace('"', "'")),
+            );
+        }
+    };
     sbproxy_observe::metrics::record_config_reload("success");
 
     let revision = crate::reload::current_pipeline().config_revision.clone();
@@ -1094,13 +1097,25 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
         "admin reload: pipeline swapped"
     );
 
+    // A reload can succeed while one subsystem stayed on prior state.
+    // The caller (often an unattended config authority) needs to see
+    // that in the response body, not only in this node's logs.
+    let degraded = outcome
+        .degraded()
+        .iter()
+        .map(|subsystem| format!("\"{}\"", subsystem.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
+
     (
         200,
         "application/json",
         format!(
-            r#"{{"config_revision":"{}","loaded_at":"{}"}}"#,
+            r#"{{"config_revision":"{}","loaded_at":"{}","fully_applied":{},"degraded":[{}]}}"#,
             revision.replace('"', "'"),
             loaded_at,
+            outcome.is_fully_applied(),
+            degraded,
         ),
     )
 }
@@ -2468,6 +2483,22 @@ pub fn install_admin_log_sink(state: Arc<AdminState>) {
 /// pipeline's logging hook to record each completed request.
 pub fn admin_log_sink() -> Option<&'static Arc<AdminState>> {
     ADMIN_LOG_SINK.get()
+}
+
+/// Record the raw-bytes hash of a config the process just loaded, so
+/// `GET /admin/drift` compares against what is actually running.
+///
+/// Every path that loads a config must call this. Previously only
+/// startup and `POST /admin/reload` did, so after a file-watcher or
+/// SIGHUP reload the baseline still held the pre-reload hash and drift
+/// reported a difference that did not exist. A no-op when the admin
+/// server is disabled.
+pub fn record_loaded_config_content_hash(hex: &str) {
+    if let Some(state) = ADMIN_LOG_SINK.get() {
+        if let Ok(mut guard) = state.loaded_config_content_hash.lock() {
+            *guard = Some(hex.to_string());
+        }
+    }
 }
 
 /// Spawn the admin server bound to `127.0.0.1:<config.port>`.

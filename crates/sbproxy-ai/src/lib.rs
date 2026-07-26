@@ -97,8 +97,10 @@ pub use provider_ratelimit::{
     QuotaSignalSource,
 };
 pub use providers::{
-    get_provider_info, init_provider_registry, list_providers, reload_provider_registry,
-    ProviderFormat, ProviderInfo,
+    get_provider_info, init_provider_registry, install_prepared_provider_registry, list_providers,
+    prepare_provider_registry, provider_registry_snapshot, reload_provider_registry,
+    restore_provider_registry, PreparedProviderRegistry, ProviderFormat, ProviderInfo,
+    ProviderRegistrySnapshot,
 };
 pub use quota_pool::{
     rank_by_fair_share, reserve_next_candidate, validate_quota_pool_config, LocalQuotaPool,
