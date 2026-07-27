@@ -1824,6 +1824,29 @@ pub struct InboundHeaderConfig {
     pub scheme: String,
 }
 
+/// One rule mapping an inbound credential's shape to a provider label, for
+/// attribution of native (non-minted) keys.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ProviderHintConfig {
+    /// Provider label stamped on the request when this rule matches
+    /// (canonical AI-provider spelling: `anthropic`, `openai`, ...).
+    pub provider: String,
+    /// Header the credential arrives in, matched case-insensitively.
+    pub header: String,
+    /// Scheme prefix stripped before the value test, matched
+    /// case-insensitively. Empty for raw-value headers.
+    #[serde(default)]
+    pub scheme: String,
+    /// Prefix the credential value must start with (`sk-ant-`). Empty
+    /// matches any non-empty value.
+    #[serde(default)]
+    pub value_prefix: String,
+    /// A second header that must also be present for this rule to match
+    /// (`anthropic-version`). `None` requires nothing extra.
+    #[serde(default)]
+    pub also_header: Option<String>,
+}
+
 /// `key_management.inbound:` block. Controls which request headers are swept
 /// for a minted key, and whether a route refuses requests that carry none.
 ///
@@ -1842,6 +1865,12 @@ pub struct KeyInboundConfig {
     /// on a route that has no other auth provider.
     #[serde(default)]
     pub require: bool,
+    /// Ordered rules attributing a native (non-minted) inbound credential to
+    /// a provider. First match wins, so more specific value prefixes belong
+    /// before general ones. Attribution never refuses a request: a credential
+    /// matching no rule is admitted unattributed.
+    #[serde(default = "default_provider_hints")]
+    pub provider_hints: Vec<ProviderHintConfig>,
 }
 
 impl Default for KeyInboundConfig {
@@ -1849,8 +1878,44 @@ impl Default for KeyInboundConfig {
         Self {
             headers: default_inbound_headers(),
             require: false,
+            provider_hints: default_provider_hints(),
         }
     }
+}
+
+/// Built-in attribution rules for the common provider key shapes.
+///
+/// Ordered most-specific first: `sk-ant-` and `sk-or-` must precede the bare
+/// `sk-` rule or every Anthropic and OpenRouter key would attribute to OpenAI.
+fn default_provider_hints() -> Vec<ProviderHintConfig> {
+    fn hint(
+        provider: &str,
+        header: &str,
+        scheme: &str,
+        value_prefix: &str,
+        also_header: Option<&str>,
+    ) -> ProviderHintConfig {
+        ProviderHintConfig {
+            provider: provider.to_string(),
+            header: header.to_string(),
+            scheme: scheme.to_string(),
+            value_prefix: value_prefix.to_string(),
+            also_header: also_header.map(str::to_string),
+        }
+    }
+    vec![
+        hint("anthropic", "x-api-key", "", "sk-ant-", None),
+        hint("anthropic", "authorization", "Bearer ", "sk-ant-", None),
+        // A non-Anthropic-shaped x-api-key still attributes to Anthropic when
+        // the SDK's version header rides along.
+        hint("anthropic", "x-api-key", "", "", Some("anthropic-version")),
+        hint("openrouter", "authorization", "Bearer ", "sk-or-", None),
+        hint("gemini", "x-goog-api-key", "", "", None),
+        hint("azure", "api-key", "", "", None),
+        // Last: the loose OpenAI shape, which would otherwise swallow the
+        // more specific prefixes above.
+        hint("openai", "authorization", "Bearer ", "sk-", None),
+    ]
 }
 
 /// Header names that may never be swept: hop-by-hop and framing headers, plus
@@ -1908,6 +1973,23 @@ impl KeyInboundConfig {
                     "key_management.inbound.headers: {:?} is listed more than once",
                     entry.name
                 ));
+            }
+        }
+        for hint in &self.provider_hints {
+            if hint.provider.trim().is_empty() {
+                return Err(
+                    "key_management.inbound.provider_hints: provider must not be empty".to_string(),
+                );
+            }
+            for name in std::iter::once(hint.header.as_str()).chain(hint.also_header.as_deref()) {
+                let lower = name.trim().to_ascii_lowercase();
+                if lower.is_empty()
+                    || http::header::HeaderName::from_bytes(lower.as_bytes()).is_err()
+                {
+                    return Err(format!(
+                        "key_management.inbound.provider_hints: {name:?} is not a valid HTTP header name"
+                    ));
+                }
             }
         }
         Ok(())
@@ -8602,6 +8684,7 @@ mod inbound_key_header_tests {
                 scheme: String::new(),
             }],
             require: false,
+            provider_hints: Vec::new(),
         };
         assert!(bad.validate().is_err());
     }
@@ -8615,6 +8698,7 @@ mod inbound_key_header_tests {
                     scheme: String::new(),
                 }],
                 require: false,
+                provider_hints: Vec::new(),
             };
             assert!(cfg.validate().is_err(), "{forbidden} must be rejected");
         }
@@ -8634,6 +8718,7 @@ mod inbound_key_header_tests {
                 },
             ],
             require: false,
+            provider_hints: Vec::new(),
         };
         assert!(dupe.validate().is_err());
     }
@@ -8643,6 +8728,7 @@ mod inbound_key_header_tests {
         let cfg = KeyInboundConfig {
             headers: vec![],
             require: false,
+            provider_hints: Vec::new(),
         };
         assert!(cfg.validate().is_ok());
         assert!(cfg.header_names().is_empty());
@@ -8656,6 +8742,7 @@ mod inbound_key_header_tests {
                 scheme: String::new(),
             }],
             require: false,
+            provider_hints: Vec::new(),
         };
         assert_eq!(cfg.header_names(), ["x-tool-auth"]);
     }

@@ -104,6 +104,19 @@ upstream <- authorization: Bearer <the tool's own key>   (untouched)
 Both fall out of one rule: the key's header is consumed, and a bound
 credential, if any, is written to its own header.
 
+### Attributing native provider keys
+
+A request that carries no minted key but does carry a recognizable provider
+credential is attributed to that provider. The rules live under
+`inbound.provider_hints`, ship with defaults for the common shapes (`sk-ant-`
+is Anthropic, `sk-or-` is OpenRouter, a bare `sk-` bearer is OpenAI,
+`x-goog-api-key` is Gemini, `api-key` is Azure), and are ordered: the first
+match wins, so specific prefixes belong before loose ones.
+
+Attribution is observational. It never refuses a request, and a credential
+matching no rule is admitted unattributed. It exists so native-key traffic
+shows up in metrics, audit, and policy instead of being invisible.
+
 ### Requiring a key
 
 `require: true` refuses a request that carried no minted key, with a 401. It is

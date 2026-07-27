@@ -954,6 +954,13 @@ pub struct RequestContext {
     /// Stripped from the upstream request so the proxy's own key never reaches
     /// an origin.
     pub inbound_key_header: Option<String>,
+    /// Provider a native (non-minted) inbound credential was attributed to,
+    /// from the `key_management.inbound.provider_hints` rules.
+    ///
+    /// Attribution only: set when no minted key resolved, and never a reason
+    /// to refuse. Read by metrics, audit, and policy so native-key traffic
+    /// stops being invisible.
+    pub native_key_provider: Option<String>,
     /// Accepted ingress governance reservation owned by this request.
     ///
     /// Successful response accounting settles it with actual usage. Paths
@@ -1362,6 +1369,7 @@ impl RequestContext {
             effective_key_policy: None,
             resolved_inbound_key: None,
             inbound_key_header: None,
+            native_key_provider: None,
             governance_lease: None,
             ai_admission: None,
             ai_realtime_session: None,
