@@ -362,6 +362,74 @@ pub fn denied_paths_in(remote_yaml: &str) -> Result<Vec<String>, MergeError> {
     Ok(scan_denied(&remote))
 }
 
+/// Leaf paths at which two documents disagree, in path order.
+///
+/// A path is reported when it is a leaf in one document and not the
+/// other, or a leaf in both with a different value. Both documents are
+/// walked with the same leaf definition and the same dotted-path
+/// rendering [`ProvenanceMap`] uses, which is the whole reason this lives
+/// here: a caller that wants to know "does this edit touch a path the
+/// authority owns?" looks the answer up in a [`ProvenanceMap`], and a
+/// second path renderer written next to that lookup could disagree with
+/// this one on exactly the keys that matter least often and cost most to
+/// debug.
+///
+/// This answers "what did the operator change", not "what will actually
+/// take effect". A caller enforcing ownership wants both: see
+/// `sbproxy-core`'s config-effective module, which compares the merged
+/// result before and after a proposed write and treats the difference
+/// between the two as the set of edits the remote layer swallows.
+///
+/// # Errors
+///
+/// Returns [`MergeError::BaseNotMapping`] when either document's root is
+/// not a YAML mapping, and [`MergeError::Yaml`] when either does not
+/// parse. A blank document counts as an empty mapping, so comparing
+/// against nothing reports every leaf in the other side.
+pub fn changed_leaf_paths(before: &str, after: &str) -> Result<Vec<String>, MergeError> {
+    let before = leaf_values(before)?;
+    let after = leaf_values(after)?;
+    let mut changed: Vec<String> = before
+        .iter()
+        .filter(|(path, value)| after.get(*path) != Some(value))
+        .map(|(path, _)| path.clone())
+        .collect();
+    changed.extend(
+        after
+            .keys()
+            .filter(|path| !before.contains_key(*path))
+            .cloned(),
+    );
+    changed.sort();
+    changed.dedup();
+    Ok(changed)
+}
+
+/// Every leaf in a document, keyed by dotted path.
+fn leaf_values(yaml: &str) -> Result<BTreeMap<String, Value>, MergeError> {
+    let root = parse_root(yaml)?.ok_or(MergeError::BaseNotMapping)?;
+    let mut out = BTreeMap::new();
+    let mut trail = Vec::new();
+    record_leaves(&root, &mut trail, &mut out);
+    Ok(out)
+}
+
+/// Walk a document and record one entry per leaf. Mirrors
+/// [`record_provenance`]'s traversal so the two produce the same key set
+/// for the same document.
+fn record_leaves(map: &Mapping, trail: &mut Vec<Value>, out: &mut BTreeMap<String, Value>) {
+    for (key, value) in map {
+        trail.push(key.clone());
+        match value.as_mapping() {
+            Some(inner) if !inner.is_empty() => record_leaves(inner, trail, out),
+            _ => {
+                out.insert(dotted_path(trail), value.clone());
+            }
+        }
+        trail.pop();
+    }
+}
+
 /// Parse a document root. `Ok(None)` means the document parsed but its
 /// root was not a mapping, which the caller turns into the error variant
 /// naming the offending document.
@@ -1404,6 +1472,81 @@ origins:
                 path.split('.').all(|segment| !segment.is_empty()),
                 "{path} has an empty segment"
             );
+        }
+    }
+
+    #[test]
+    fn changed_leaf_paths_reports_edits_additions_and_removals() {
+        let before = "proxy:\n  http_bind_port: 8080\n  admin:\n    bind: 127.0.0.1\n";
+        let after = "proxy:\n  http_bind_port: 9090\n  workers: 4\n";
+        assert_eq!(
+            changed_leaf_paths(before, after).expect("compare"),
+            vec![
+                "proxy.admin.bind".to_string(),
+                "proxy.http_bind_port".to_string(),
+                "proxy.workers".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn changed_leaf_paths_is_empty_for_a_document_compared_with_itself() {
+        let doc = "proxy:\n  http_bind_port: 8080\norigins:\n  api:\n    url: https://a.test\n";
+        assert!(changed_leaf_paths(doc, doc).expect("compare").is_empty());
+    }
+
+    #[test]
+    fn changed_leaf_paths_ignores_key_order_and_formatting() {
+        let before = "origins:\n  api:\n    url: https://a.test\n    timeout: 5s\n";
+        let after = "origins:\n  api:\n    timeout: \"5s\"\n    url: https://a.test\n";
+        assert!(
+            changed_leaf_paths(before, after)
+                .expect("compare")
+                .is_empty(),
+            "reordering keys and quoting a string are not edits"
+        );
+    }
+
+    /// A leaf that becomes a subtree is reported at both paths. The old
+    /// leaf is gone and the new ones did not exist, and a caller checking
+    /// ownership needs to see both, since the two paths can be owned by
+    /// different layers.
+    #[test]
+    fn changed_leaf_paths_reports_a_leaf_that_became_a_subtree() {
+        let paths = changed_leaf_paths("a: 1\n", "a:\n  b: 2\n").expect("compare");
+        assert_eq!(paths, vec!["a".to_string(), "a.b".to_string()]);
+    }
+
+    #[test]
+    fn changed_leaf_paths_treats_a_blank_document_as_empty() {
+        let paths = changed_leaf_paths("# just a comment\n", "proxy:\n  workers: 2\n")
+            .expect("a blank document is an empty mapping, not an error");
+        assert_eq!(paths, vec!["proxy.workers".to_string()]);
+    }
+
+    #[test]
+    fn changed_leaf_paths_rejects_a_document_that_is_not_a_mapping() {
+        assert!(matches!(
+            changed_leaf_paths("- one\n- two\n", "proxy: {}\n"),
+            Err(MergeError::BaseNotMapping)
+        ));
+    }
+
+    /// The leaf walk and the provenance walk must agree on the key set for
+    /// the same document, because a caller looks an edited path up in a
+    /// provenance map. Two traversals that disagree would silently return
+    /// "no provenance recorded" for a path that is in fact owned.
+    #[test]
+    fn the_leaf_walk_and_the_provenance_walk_produce_the_same_paths() {
+        let base = "proxy:\n  http_bind_port: 8080\n  empty: {}\norigins:\n  api:\n    tags:\n      - a\n      - b\n";
+        let remote = "origins:\n  api:\n    timeout: 5s\n";
+        for mode in MODES {
+            let outcome = merge_config(base, BaseOrigin::Local, remote, mode).expect("merge");
+            let leaves = leaf_values(&outcome.merged_yaml).expect("walk leaves");
+            let provenance: std::collections::BTreeSet<&str> = outcome.provenance.paths().collect();
+            let walked: std::collections::BTreeSet<&str> =
+                leaves.keys().map(String::as_str).collect();
+            assert_eq!(walked, provenance, "{mode:?} disagreed on the leaf set");
         }
     }
 }

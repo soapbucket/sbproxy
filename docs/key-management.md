@@ -116,6 +116,25 @@ configured provider, so an origin with a JWT provider accepts either a valid
 JWT or a valid minted key. That is what makes minted keys work in parallel with
 credentials you already issue.
 
+### Rate limiting a minted key
+
+Bucket on `request.key_id`, not on the header:
+
+```yaml
+policies:
+  - type: rate_limit
+    key: request.key_id
+    requests_per_minute: 600
+```
+
+The header carries the presented secret, so bucketing on it means the bucket
+changes when you rotate the key and the caller gets a fresh budget. The key id
+does not change. `request.key_id` is an empty string when no minted key
+resolved, so the expression still evaluates on unauthenticated traffic.
+
+`concurrent_limit` with `key_by: api_key` already does this for you: it uses the
+resolved key id when there is one and falls back to the header otherwise.
+
 ## Binding a key to an upstream credential
 
 A key can name a stored credential with `credential_id`. That credential is
@@ -147,11 +166,20 @@ record's tenant can change afterwards.
 
 **Credential bindings need a fully upgraded fleet.** A node on an older build
 drops `credential_id` when the record replicates to it, resolves the key
-without a binding, and dispatches on the origin's shared credential. Minting a
-bound key is therefore refused unless every node is known to understand the
-field, and on a clustered deployment it is refused outright until node
-capabilities are visible in the membership snapshot. A single-node deployment
-is unaffected. Pin your image tag when you roll out.
+without a binding, and dispatches on the origin's shared credential. You cannot
+make an already-running binary refuse a field it ignores, so minting a bound
+key is refused unless every node is known to understand it.
+
+Each node republishes what it understands into cluster state, and the gate
+reads one record per member before allowing a binding. A member with no record
+refuses the mint and is named in the error, whether it is on an older build or
+just unreachable: neither can be told apart from the case the gate exists to
+prevent. A single-node deployment has no peers and is unaffected.
+
+The records carry a two-minute expiry and are republished at half that, so a
+node that is replaced by an older build drops out of the set on its own and the
+fleet starts refusing again without anyone intervening. Pin your image tag when
+you roll out.
 
 
 ## Store backends

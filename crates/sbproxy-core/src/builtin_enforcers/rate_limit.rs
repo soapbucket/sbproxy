@@ -152,6 +152,15 @@ pub(crate) fn rate_limit_key_from_cel(
         properties: Some(&ctx.properties),
     };
     populate_envelope_namespace(&mut cel_ctx, &envelope);
+    // `request.key_id` is the rotation-safe bucket expression. Keying on
+    // `request.headers["x-api-key"]` buckets on the presented secret, so a
+    // rotation silently hands the caller a fresh budget.
+    sbproxy_extension::cel::context::populate_resolved_key_id(
+        &mut cel_ctx,
+        ctx.resolved_inbound_key
+            .as_deref()
+            .map(|record| record.key_id.as_str()),
+    );
     let features = FeatureFlagsView {
         debug: ctx.flags.debug,
         trace: ctx.flags.trace,

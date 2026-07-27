@@ -1058,12 +1058,17 @@ curl -fsS -X POST -u "admin:${SB_ADMIN_PASSWORD}" \
 
 ### `GET`, `PUT` `/admin/config`
 
-Reads and writes the raw on-disk config text.
+Reads and writes the raw on-disk config text. **This node's own file,
+not necessarily what is running.** On a node with a `source:` block or
+an upstream config authority, see
+[`GET /admin/config/effective`](#get-adminconfigeffective) for the
+document actually in force; the local file there may be nothing but the
+`source:` pointer that selected a repository.
 
 `GET` returns the current YAML plus the loaded revision:
 
 ```json
-{"config": "proxy:\n  http_bind_port: 8080\n...", "revision": "abc123..."}
+{"yaml": "proxy:\n  http_bind_port: 8080\n...", "revision": "abc123..."}
 ```
 
 `PUT`/`POST` validates the submitted YAML, persists it, and hot-swaps
@@ -1077,6 +1082,139 @@ Env-var interpolation (`${VAR}`) and secret-backend references are
 stored and echoed back exactly as written. A secret is never
 resolved into the saved config or exposed in this editor. See
 [secrets.md](secrets.md).
+
+**Ownership guard.** A write whose edits the node's remote layers would
+silently discard is refused with `409` and a body naming the paths and
+where they are actually set:
+
+```json
+{
+  "error": "this node does not own the edited path: origins.api.action.url",
+  "code": "config_not_locally_owned",
+  "conflicts": [{"path": "origins.api.action.url", "owner": "authority"}],
+  "layers": {
+    "base": {"kind": "local"},
+    "authority": {"authority_id": "control-plane", "revision": 12, "mode": "overlay"}
+  },
+  "remedy": "authority control-plane owns these paths at revision 12; publish the change through the authority with `sbproxy authority publish`"
+}
+```
+
+Two `409` bodies are possible and they need opposite responses, so
+branch on `code` rather than on the status. A revision mismatch has no
+`code` and means reload and reapply. `config_not_locally_owned` means
+reapplying will fail identically; change it at the source instead.
+`config_ownership_unknown` means the merge could not be evaluated, so
+the write was refused rather than persisted on a guess.
+
+The guard is per-setting, not per-node. Under `mode: overlay` a write
+confined to settings the authority does not set succeeds as it always
+did, and adding a setting the authority has never mentioned is allowed.
+Under `mode: replace` the subscriber-owned paths (`proxy.admin`,
+`proxy.tls`, `proxy.secrets`, and the rest of the deny list) stay
+editable, because the authority provably cannot take them. A whole
+request is rejected or applied; there is no partial write. See
+[configuration.md](configuration.md#the-editor-is-only-live-where-the-node-owns-its-config)
+for the full table.
+
+Refusals are recorded in the audit log
+(`target=sbproxy::admin::audit`, `outcome=rejected_not_locally_owned`)
+alongside the writes that land, so an operator repeatedly editing
+configuration they do not own is visible.
+
+| Status | When |
+|---|---|
+| `200` | Read succeeded, or the write was validated, persisted, and hot-swapped. |
+| `400` | Empty body, YAML parse failure, or the config does not compile or construct. |
+| `409` | Revision mismatch, or the write touches paths this node does not own. |
+| `500` | Could not read or write the config file. The path is scrubbed from the message. |
+| `503` | The admin server has no `config_path` wired. |
+
+---
+
+### `GET /admin/config/effective`
+
+The configuration this node is actually running, after the base
+document and any authority overlay are merged, plus which layer set
+each setting. On a node that owns its own configuration this is the
+local file merged with nothing and every setting reports `local`, which
+is the answer that tells an editor it may offer a write at all.
+
+```json
+{
+  "yaml": "proxy:\n  http_bind_port: 8080\n...",
+  "provenance": {
+    "proxy.http_bind_port": "local",
+    "origins.api.action.url": "authority"
+  },
+  "layers": {
+    "base": {"kind": "git", "repo": "https://git.example.com/fleet.git", "reference": "main", "commit": "3f2a9c1..."},
+    "authority": {"authority_id": "control-plane", "revision": 12, "mode": "overlay"}
+  },
+  "locally_owned": false,
+  "locally_owned_leaves": 4,
+  "total_leaves": 61
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `yaml` | string | The merged document. Re-serialized, so comments and original key order are not preserved even when the merge changed nothing. |
+| `provenance` | object | Dotted setting path to the layer that set it. `"local"`, `"authority"`, or `{"git": {"repo", "reference", "commit"}}`. |
+| `layers.base` | object | `{"kind": "local"}`, or `{"kind": "git", ...}` with the **resolved** commit rather than the configured reference. |
+| `layers.authority` | object | The applied authority payload, or `null`. Reports what is applied, not what is configured; the two differ during exactly the incidents where it matters. |
+| `locally_owned` | bool | True only when this node's own file is the whole configuration. An authority configured but never reached reports `false`, because the next poll can claim any path. |
+| `locally_owned_leaves` | number | Settings whose provenance is `local`. |
+| `total_leaves` | number | Settings in the merged document. |
+
+Read-only operators may call this. A setting reported with owner
+`suppressed` in a write conflict has no provenance entry here: under
+`mode: replace` a local-only setting is discarded rather than
+overwritten.
+
+| Status | When |
+|---|---|
+| `200` | The effective document was assembled. |
+| `500` | The merge failed, so the node is serving whatever it last applied. Body carries `code: effective_config_unavailable` and the layers. |
+| `503` | The admin server has no `config_path` wired. |
+
+---
+
+### `GET /admin/config/schema`
+
+The JSON Schema for the config file, generated from the running
+binary's own types rather than read off disk. A form built from a stale
+schema is wrong in the most expensive way, offering fields the proxy
+will reject and hiding fields it would accept, so the served document
+cannot be older or newer than the binary serving it. The committed copy
+at `schemas/sb-config.schema.json` is byte-identical and CI proves it.
+
+Around 300KB, and immutable for a given build. It is served with a
+content-derived `ETag` and `Cache-Control: private, no-cache`, so a
+client that sends `If-None-Match` gets `304` on every load after the
+first:
+
+```bash
+curl -u "admin:${SB_ADMIN_PASSWORD}" -D- -o /dev/null \
+  "${SB_ADMIN_URL}/admin/config/schema"
+# ETag: "a1b2c3d4e5f6"
+
+curl -u "admin:${SB_ADMIN_PASSWORD}" -o /dev/null -w '%{http_code}\n' \
+  -H 'If-None-Match: "a1b2c3d4e5f6"' "${SB_ADMIN_URL}/admin/config/schema"
+# 304
+```
+
+`no-cache` rather than a long `max-age` is deliberate: the URL carries
+no revision, so a cached copy that outlived a binary upgrade would
+describe the previous build. Content type is
+`application/schema+json`. Read-only operators may call this.
+
+| Status | When |
+|---|---|
+| `200` | Schema body, with `ETag` and `Cache-Control`. |
+| `304` | `If-None-Match` matched the current build's schema. No body. |
+| `401` | Not authenticated. |
+| `405` | Anything other than `GET`. |
 
 ### `GET`, `PUT` `/admin/log-level`
 
@@ -1207,6 +1345,21 @@ or alert pipeline. When `drift: true` is sustained for more than the
 expected reload window, page the operator: either the watcher is
 stuck, the deploy pipeline forgot to call `POST /admin/reload`, or
 someone hand-edited the file out of band.
+
+**What it means per config source.** This route compares the **local
+file** against the last-loaded content hash, which is narrower than
+"is this node's configuration current":
+
+| Node shape | `drift: true` means | What it does not tell you |
+|---|---|---|
+| Local file only | The file changed and has not been reloaded. The full answer. | Nothing missing. |
+| `source:` resolving to git | The local `source:` pointer itself changed. | Whether the repository moved. Watch `sbproxy_config_source_revision_info{sha}` and compare against the resolved commit in `GET /admin/config/effective`. |
+| Upstream authority | The local base file changed. | Whether the authority published a newer revision. Watch `sbproxy_config_bundle_revision` and `sbproxy_config_bundle_age_seconds`. |
+| Git base with an authority overlay | The pointer changed, which is rare and usually a deploy mistake. | Either remote layer. Use both metrics above. |
+
+A node whose repository moved is not "drifted" by this measure, and a
+node serving a stale bundle because the authority is unreachable is not
+either. Alert on the age gauge for those.
 
 ---
 

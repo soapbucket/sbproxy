@@ -1000,6 +1000,34 @@ pub fn extend_context(ctx: &mut CelContext, name: &str, values: HashMap<String, 
 
 // --- Tests ---
 
+/// Splice `request.key_id` into the context: the immutable public id of a
+/// minted virtual key the pre-auth phase already verified.
+///
+/// Exists so a CEL rate-limit or policy can bucket on the key's identity
+/// rather than on `request.headers["x-api-key"]`. Bucketing on the header
+/// means bucketing on the presented secret, which puts an 85-character token
+/// in a process-global map and hands the caller a fresh budget every time they
+/// rotate. `request.key_id` survives rotation because the id does not change.
+///
+/// Empty string when no minted key resolved, so an expression referencing it
+/// on unauthenticated traffic evaluates rather than erroring.
+pub fn populate_resolved_key_id(ctx: &mut CelContext, key_id: Option<&str>) {
+    let request_var = ctx
+        .variables
+        .remove("request")
+        .unwrap_or_else(|| CelValue::Map(HashMap::new()));
+    let mut request_map = match request_var {
+        CelValue::Map(m) => m,
+        _ => HashMap::new(),
+    };
+    request_map.insert(
+        "key_id".to_string(),
+        CelValue::String(key_id.unwrap_or_default().to_string()),
+    );
+    ctx.variables
+        .insert("request".to_string(), CelValue::Map(request_map));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1997,6 +2025,58 @@ mod tests {
             .unwrap());
         assert!(engine
             .eval_bool_source(r#"features.any_set == true"#, &ctx)
+            .unwrap());
+    }
+}
+
+#[cfg(test)]
+mod resolved_key_id_tests {
+    use super::*;
+    use crate::cel::CelEngine;
+
+    fn ctx() -> CelContext {
+        build_request_context(
+            "POST",
+            "/v1/chat/completions",
+            &HeaderMap::new(),
+            None,
+            Some("192.0.2.1"),
+            "api.example",
+        )
+    }
+
+    #[test]
+    fn key_id_is_readable_from_a_cel_expression() {
+        let mut c = ctx();
+        populate_resolved_key_id(&mut c, Some("0123456789abcdef"));
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source(r#"request.key_id == "0123456789abcdef""#, &c)
+            .unwrap());
+    }
+
+    #[test]
+    fn key_id_is_empty_rather_than_absent_without_a_resolved_key() {
+        // Absent would make an expression referencing it error on
+        // unauthenticated traffic; empty lets the same expression evaluate.
+        let mut c = ctx();
+        populate_resolved_key_id(&mut c, None);
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source(r#"request.key_id == """#, &c)
+            .unwrap());
+    }
+
+    #[test]
+    fn splicing_key_id_preserves_the_existing_request_fields() {
+        let mut c = ctx();
+        populate_resolved_key_id(&mut c, Some("abc"));
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source(r#"request.method == "POST""#, &c)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(r#"request.path == "/v1/chat/completions""#, &c)
             .unwrap());
     }
 }

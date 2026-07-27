@@ -67,7 +67,13 @@ pub struct RateLimitPolicy {
     ///
     /// - `connection.remote_ip`: per-IP buckets (default behaviour when
     ///   the field is unset).
-    /// - `request.headers["x-api-key"]`: per-API-key buckets.
+    /// - `request.key_id`: per-key buckets for a minted virtual key. Prefer
+    ///   this over the header below when `key_management` is on: the header
+    ///   holds the presented secret, so a rotation changes it and hands the
+    ///   caller a fresh budget, whereas the id is immutable. Empty string when
+    ///   no minted key resolved.
+    /// - `request.headers["x-api-key"]`: per-API-key buckets. Correct for
+    ///   static configured keys; see `request.key_id` for minted ones.
     /// - `jwt.claims.tenant_id`: per-JWT-claim buckets (the
     ///   "Volumetric Abuse Detection" pattern).
     /// - `jwt.claims.sub + ":" + jwt.claims.tenant_id`: composite keys.

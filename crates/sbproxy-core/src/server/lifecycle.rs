@@ -2614,6 +2614,21 @@ fn install_op_redact_state(compiled: &sbproxy_config::CompiledConfig) {
         tenant_pii,
         origin_pii,
     });
+
+    // Teach both redaction paths which headers the inbound key sweep reads.
+    // A configured sweep header carries a live minted key, and a custom name
+    // matches none of the built-in `-key` / `-secret` / `-token` rules, so
+    // without this it would reach the access log and a `capture_headers: ["*"]`
+    // glob in plaintext. Driven from config so adding a header cannot silently
+    // open that hole.
+    let swept = compiled
+        .server
+        .key_management
+        .as_ref()
+        .map(|km| km.inbound.header_names())
+        .unwrap_or_default();
+    sbproxy_observe::logging::set_swept_header_names(swept.clone());
+    sbproxy_config::types::set_extra_sensitive_headers(swept);
 }
 
 /// Compose a child scope's `(enabled, rules)` from the parent's

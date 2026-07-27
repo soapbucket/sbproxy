@@ -77,28 +77,126 @@ pub fn evaluate_members(
     }
 }
 
+/// Typed cluster-state namespace each node publishes its capabilities under.
+///
+/// One key per node id, so a member that publishes nothing is visibly absent.
+/// Uses typed cluster state rather than the SWIM peer table on purpose: adding
+/// a field to the gossip wire format to solve a mixed-version problem would
+/// itself be a mixed-version problem.
+pub const CAPABILITY_NAMESPACE: &str = "keycap";
+
+/// Schema version of the published capability record.
+pub const CAPABILITY_SCHEMA_VERSION: u32 = 1;
+
+/// How long a published capability record stays valid.
+///
+/// Republished at half this interval, so a node that stops publishing (it
+/// died, or was replaced by an older build) falls out of the set within one
+/// TTL and the gate starts refusing again.
+pub const CAPABILITY_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What one node publishes about itself.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CapabilityAnnouncement {
+    /// Capability names this node understands.
+    pub caps: Vec<String>,
+}
+
+/// Publish this node's capability set into typed cluster state.
+///
+/// A no-op when the process is not clustered, where the gate is satisfied
+/// without any announcement.
+pub async fn announce_local_capabilities(generation: u64) {
+    if !has_peers() {
+        return;
+    }
+    let Some(handle) = crate::cluster::current_cluster_handle() else {
+        return;
+    };
+    let node_id = handle.identity().node_id.clone();
+    let announcement = CapabilityAnnouncement {
+        caps: vec![CAP_CREDENTIAL_BINDING.to_string()],
+    };
+    if let Err(error) = handle
+        .publish_state(
+            CAPABILITY_NAMESPACE,
+            &node_id,
+            CAPABILITY_SCHEMA_VERSION,
+            generation,
+            CAPABILITY_TTL,
+            &announcement,
+        )
+        .await
+    {
+        tracing::warn!(
+            %error,
+            "could not announce node capabilities; credential bindings will be refused \
+             fleet-wide until this node is reachable"
+        );
+    }
+}
+
+/// Whether this process has peers that could be running an older build.
+///
+/// A standalone node still installs a cluster handle, so the presence of a
+/// handle proves nothing. What matters is whether a mesh node is running,
+/// which is the same condition that decides whether the announcer runs at all:
+/// if nothing is publishing, nothing can be read, and treating that as a
+/// clustered fleet would refuse every binding on an ordinary single-node
+/// install.
+fn has_peers() -> bool {
+    crate::cluster::current_cluster_handle()
+        .and_then(|handle| handle.mesh_node())
+        .is_some()
+}
+
 /// Evaluate `cap` across the running fleet.
 ///
-/// Single node, meaning no cluster handle is installed: there is no peer that
-/// could be on an older binary, so [`FleetCapability::Satisfied`]. This is the
-/// common self-hosted shape and must not be blocked.
+/// No mesh: there is no peer that could be on an older binary, so
+/// [`FleetCapability::Satisfied`]. This is the common self-hosted shape and
+/// must not be blocked.
 ///
-/// Clustered: currently [`FleetCapability::Unknown`], which refuses. The
-/// membership snapshot (`ClusterMember`) does not yet carry the per-node
-/// metadata that [`local_capabilities`] stamps, so the check cannot be made.
-/// Refusing is the honest answer: a mixed-version fleet is exactly the case
-/// where an older node would silently drop `credential_id` and dispatch on the
-/// origin's shared credential. Exposing node metadata through the membership
-/// snapshot is what lets a clustered fleet use bindings.
-pub fn check_fleet_capability(_cap: &str) -> FleetCapability {
-    if crate::cluster::current_cluster_handle().is_none() {
+/// Meshed: read one capability record per member. A member that published
+/// nothing is either running a build that does not know to publish, or is not
+/// currently reachable. Both refuse, because neither can be distinguished from
+/// the case this gate exists to prevent.
+pub async fn check_fleet_capability(cap: &str) -> FleetCapability {
+    if !has_peers() {
         return FleetCapability::Satisfied;
     }
-    FleetCapability::Unknown(
-        "cluster membership does not expose per-node capabilities, so a mixed-version \
-         fleet cannot be ruled out"
-            .to_string(),
-    )
+    let Some(handle) = crate::cluster::current_cluster_handle() else {
+        return FleetCapability::Satisfied;
+    };
+    let members = handle.membership();
+    if members.is_empty() {
+        return FleetCapability::Unknown("no cluster members reported".to_string());
+    }
+
+    let mut declared: Vec<(String, HashMap<String, String>)> = Vec::with_capacity(members.len());
+    for member in &members {
+        let caps = match handle
+            .read_state::<CapabilityAnnouncement>(
+                CAPABILITY_NAMESPACE,
+                &member.node_id,
+                CAPABILITY_SCHEMA_VERSION,
+            )
+            .await
+        {
+            sbproxy_mesh::cluster_handle::ClusterStateRead::Present(record) => {
+                record.payload.caps.join(",")
+            }
+            // Missing, expired, or a schema this build does not understand all
+            // mean the same thing here: no usable declaration from that node.
+            _ => String::new(),
+        };
+        let mut metadata = HashMap::new();
+        if !caps.is_empty() {
+            metadata.insert(CAPS_METADATA_KEY.to_string(), caps);
+        }
+        declared.push((member.node_id.clone(), metadata));
+    }
+
+    evaluate_members(&declared, cap)
 }
 
 #[cfg(test)]
@@ -161,6 +259,64 @@ mod tests {
             evaluate_members(&[], CAP_CREDENTIAL_BINDING),
             FleetCapability::Unknown(_)
         ));
+    }
+
+    #[test]
+    fn a_standalone_node_is_satisfied_without_any_announcement() {
+        // The common self-hosted shape, and the one an e2e drill caught: a
+        // standalone node still installs a cluster handle, so testing for the
+        // handle rather than for a mesh refused every binding on a normal
+        // single-node install.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(
+            rt.block_on(check_fleet_capability(CAP_CREDENTIAL_BINDING)),
+            FleetCapability::Satisfied
+        );
+    }
+
+    #[test]
+    fn announcing_on_an_unclustered_process_is_a_no_op() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(announce_local_capabilities(1));
+    }
+
+    #[test]
+    fn a_published_record_round_trips_through_its_wire_shape() {
+        // What a node puts into cluster state has to come back as something
+        // `evaluate_members` accepts, or every member would read as missing.
+        let announcement = CapabilityAnnouncement {
+            caps: vec![CAP_CREDENTIAL_BINDING.to_string()],
+        };
+        let wire = serde_json::to_value(&announcement).unwrap();
+        let back: CapabilityAnnouncement = serde_json::from_value(wire).unwrap();
+
+        let mut metadata = HashMap::new();
+        metadata.insert(CAPS_METADATA_KEY.to_string(), back.caps.join(","));
+        assert_eq!(
+            evaluate_members(&[("node-a".to_string(), metadata)], CAP_CREDENTIAL_BINDING),
+            FleetCapability::Satisfied
+        );
+    }
+
+    #[test]
+    fn a_member_that_published_nothing_reads_as_missing() {
+        // This is the old-node case as the cluster read produces it: an empty
+        // metadata map, because Missing / Expired / IncompatibleSchema all
+        // collapse to "no usable declaration".
+        let members = vec![
+            node("new-node", Some(CAP_CREDENTIAL_BINDING)),
+            ("old-node".to_string(), HashMap::new()),
+        ];
+        assert_eq!(
+            evaluate_members(&members, CAP_CREDENTIAL_BINDING),
+            FleetCapability::Missing(vec!["old-node".to_string()])
+        );
     }
 
     #[test]
