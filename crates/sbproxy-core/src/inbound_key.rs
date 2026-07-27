@@ -98,6 +98,61 @@ pub fn requires_minted_key(cfg: &KeyInboundConfig) -> bool {
     cfg.require
 }
 
+/// Attribute a native (non-minted) inbound credential to a provider.
+///
+/// Runs only when [`sweep_headers`] found no minted key, so it can never
+/// shadow the governed path. First matching rule wins, mirroring the sweep's
+/// ordering semantics. Returns `None` for a request whose credentials match
+/// no rule, and the caller admits it unattributed: refusing here would break
+/// the pass-through this attribution exists to observe.
+pub fn resolve_provider_hint(
+    headers: &http::HeaderMap,
+    hints: &[sbproxy_config::types::ProviderHintConfig],
+) -> Option<String> {
+    for hint in hints {
+        let lower = hint.header.trim().to_ascii_lowercase();
+        let Ok(name) = http::header::HeaderName::from_bytes(lower.as_bytes()) else {
+            // Rejected at config load; skip a hand-built bad rule.
+            continue;
+        };
+        if let Some(also) = hint.also_header.as_deref() {
+            let also_lower = also.trim().to_ascii_lowercase();
+            let Ok(also_name) = http::header::HeaderName::from_bytes(also_lower.as_bytes()) else {
+                continue;
+            };
+            if !headers.contains_key(&also_name) {
+                continue;
+            }
+        }
+        for raw in headers.get_all(&name).iter().take(MAX_VALUES_PER_HEADER) {
+            let Ok(value) = raw.to_str() else {
+                continue;
+            };
+            let value = value.trim();
+            let candidate = if hint.scheme.is_empty() {
+                value
+            } else {
+                match strip_scheme(value, &hint.scheme) {
+                    Some(rest) => rest,
+                    None => continue,
+                }
+            };
+            if candidate.is_empty() {
+                continue;
+            }
+            // A minted key is never a native credential, whatever rule it
+            // would otherwise satisfy.
+            if sbproxy_keystore::crypto::parse_minted_token(candidate).is_some() {
+                continue;
+            }
+            if candidate.starts_with(&hint.value_prefix) {
+                return Some(hint.provider.clone());
+            }
+        }
+    }
+    None
+}
+
 /// Strip `scheme` from the front of `value`, case-insensitively, returning the
 /// remainder trimmed.
 ///
@@ -233,6 +288,7 @@ mod tests {
         let off = KeyInboundConfig {
             headers: vec![],
             require: false,
+            provider_hints: Vec::new(),
         };
         assert_eq!(sweep_headers(&h, &off), SweepOutcome::None);
     }
@@ -253,6 +309,7 @@ mod tests {
                 },
             ],
             require: false,
+            provider_hints: Vec::new(),
         };
         match sweep_headers(&h, &ordered) {
             SweepOutcome::Found { header, .. } => assert_eq!(header, "x-sb-api"),
@@ -266,5 +323,68 @@ mod tests {
         // than that, or one whose boundary is mid-codepoint, must return None.
         let h = headers(&[("authorization", "Be"), ("x-api-key", "é")]);
         assert_eq!(sweep_headers(&h, &cfg()), SweepOutcome::None);
+    }
+    #[test]
+    fn anthropic_native_headers_attribute_to_anthropic() {
+        let defaults = KeyInboundConfig::default();
+        let h = headers(&[("x-api-key", "sk-ant-api03-abcdefghijklmnop")]);
+        assert_eq!(
+            resolve_provider_hint(&h, &defaults.provider_hints).as_deref(),
+            Some("anthropic")
+        );
+        // Same key on the bearer path.
+        let h = headers(&[("authorization", "Bearer sk-ant-api03-abcdefghijklmnop")]);
+        assert_eq!(
+            resolve_provider_hint(&h, &defaults.provider_hints).as_deref(),
+            Some("anthropic")
+        );
+        // A non-prefixed x-api-key still attributes when the SDK version
+        // header rides along.
+        let h = headers(&[
+            ("x-api-key", "some-opaque-key"),
+            ("anthropic-version", "2023-06-01"),
+        ]);
+        assert_eq!(
+            resolve_provider_hint(&h, &defaults.provider_hints).as_deref(),
+            Some("anthropic")
+        );
+    }
+
+    #[test]
+    fn specific_prefixes_win_over_the_loose_openai_rule() {
+        // sk-ant- and sk-or- both start with sk-, so ordering is what keeps
+        // them from attributing to OpenAI.
+        let defaults = KeyInboundConfig::default();
+        for (value, expect) in [
+            ("Bearer sk-ant-api03-x", "anthropic"),
+            ("Bearer sk-or-v1-x", "openrouter"),
+            ("Bearer sk-proj-x", "openai"),
+            ("Bearer sk-plainkey", "openai"),
+        ] {
+            let h = headers(&[("authorization", value)]);
+            assert_eq!(
+                resolve_provider_hint(&h, &defaults.provider_hints).as_deref(),
+                Some(expect),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_credential_is_unattributed_not_refused() {
+        let defaults = KeyInboundConfig::default();
+        let h = headers(&[("authorization", "Bearer some-opaque-jwt")]);
+        assert_eq!(resolve_provider_hint(&h, &defaults.provider_hints), None);
+        let h = headers(&[]);
+        assert_eq!(resolve_provider_hint(&h, &defaults.provider_hints), None);
+    }
+
+    #[test]
+    fn a_minted_key_never_attributes_as_a_native_credential() {
+        // sbp_ tokens are ours; even a rule that would match them by prefix
+        // must not turn a governed key into native attribution.
+        let defaults = KeyInboundConfig::default();
+        let h = headers(&[("x-api-key", &token()), ("anthropic-version", "2023-06-01")]);
+        assert_eq!(resolve_provider_hint(&h, &defaults.provider_hints), None);
     }
 }

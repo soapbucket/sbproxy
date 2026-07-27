@@ -3577,6 +3577,57 @@
                 "scheme": ""
               }
             ],
+            "provider_hints": [
+              {
+                "also_header": null,
+                "header": "x-api-key",
+                "provider": "anthropic",
+                "scheme": "",
+                "value_prefix": "sk-ant-"
+              },
+              {
+                "also_header": null,
+                "header": "authorization",
+                "provider": "anthropic",
+                "scheme": "Bearer ",
+                "value_prefix": "sk-ant-"
+              },
+              {
+                "also_header": "anthropic-version",
+                "header": "x-api-key",
+                "provider": "anthropic",
+                "scheme": "",
+                "value_prefix": ""
+              },
+              {
+                "also_header": null,
+                "header": "authorization",
+                "provider": "openrouter",
+                "scheme": "Bearer ",
+                "value_prefix": "sk-or-"
+              },
+              {
+                "also_header": null,
+                "header": "x-goog-api-key",
+                "provider": "gemini",
+                "scheme": "",
+                "value_prefix": ""
+              },
+              {
+                "also_header": null,
+                "header": "api-key",
+                "provider": "azure",
+                "scheme": "",
+                "value_prefix": ""
+              },
+              {
+                "also_header": null,
+                "header": "authorization",
+                "provider": "openai",
+                "scheme": "Bearer ",
+                "value_prefix": "sk-"
+              }
+            ],
             "require": false
           },
           "allOf": [
@@ -4171,6 +4222,64 @@
           "description": "Deny with 401 when no minted key resolved. Off by default, so an upgrade changes nothing. Set per origin to make the proxy the only door on a route that has no other auth provider.",
           "default": false,
           "type": "boolean"
+        },
+        "provider_hints": {
+          "description": "Ordered rules attributing a native (non-minted) inbound credential to a provider. First match wins, so more specific value prefixes belong before general ones. Attribution never refuses a request: a credential matching no rule is admitted unattributed.",
+          "default": [
+            {
+              "also_header": null,
+              "header": "x-api-key",
+              "provider": "anthropic",
+              "scheme": "",
+              "value_prefix": "sk-ant-"
+            },
+            {
+              "also_header": null,
+              "header": "authorization",
+              "provider": "anthropic",
+              "scheme": "Bearer ",
+              "value_prefix": "sk-ant-"
+            },
+            {
+              "also_header": "anthropic-version",
+              "header": "x-api-key",
+              "provider": "anthropic",
+              "scheme": "",
+              "value_prefix": ""
+            },
+            {
+              "also_header": null,
+              "header": "authorization",
+              "provider": "openrouter",
+              "scheme": "Bearer ",
+              "value_prefix": "sk-or-"
+            },
+            {
+              "also_header": null,
+              "header": "x-goog-api-key",
+              "provider": "gemini",
+              "scheme": "",
+              "value_prefix": ""
+            },
+            {
+              "also_header": null,
+              "header": "api-key",
+              "provider": "azure",
+              "scheme": "",
+              "value_prefix": ""
+            },
+            {
+              "also_header": null,
+              "header": "authorization",
+              "provider": "openai",
+              "scheme": "Bearer ",
+              "value_prefix": "sk-"
+            }
+          ],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ProviderHintConfig"
+          }
         }
       }
     },
@@ -4189,6 +4298,42 @@
           "description": "Prefix stripped from the value before the token shape is tested, matched case-insensitively. Empty for raw-value headers such as `x-api-key`.",
           "default": "",
           "type": "string"
+        }
+      }
+    },
+    "ProviderHintConfig": {
+      "description": "One rule mapping an inbound credential's shape to a provider label, for attribution of native (non-minted) keys.",
+      "type": "object",
+      "required": [
+        "header",
+        "provider"
+      ],
+      "properties": {
+        "provider": {
+          "description": "Provider label stamped on the request when this rule matches (canonical AI-provider spelling: `anthropic`, `openai`, ...).",
+          "type": "string"
+        },
+        "header": {
+          "description": "Header the credential arrives in, matched case-insensitively.",
+          "type": "string"
+        },
+        "scheme": {
+          "description": "Scheme prefix stripped before the value test, matched case-insensitively. Empty for raw-value headers.",
+          "default": "",
+          "type": "string"
+        },
+        "value_prefix": {
+          "description": "Prefix the credential value must start with (`sk-ant-`). Empty matches any non-empty value.",
+          "default": "",
+          "type": "string"
+        },
+        "also_header": {
+          "description": "A second header that must also be present for this rule to match (`anthropic-version`). `None` requires nothing extra.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },

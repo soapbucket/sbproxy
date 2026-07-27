@@ -2274,6 +2274,13 @@ pub(super) async fn request_filter(
                 sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", true);
             }
             InboundKeyPhase::NotPresent => {
+                // No minted key: attribute a native provider credential, if
+                // one is recognizable, so this traffic stops being invisible
+                // to metrics, audit, and policy. Attribution never refuses.
+                ctx.native_key_provider = crate::inbound_key::resolve_provider_hint(
+                    &session.req_header().headers,
+                    &plane.inbound().provider_hints,
+                );
                 if crate::inbound_key::requires_minted_key(plane.inbound()) {
                     finalize_inbound_key_trust(ctx, AuthTrustOutcome::Missing);
                     sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", false);

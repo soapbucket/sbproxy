@@ -168,6 +168,13 @@ const createForm = reactive({
 const createBusy = ref(false);
 const createError = ref<ApiError | null>(null);
 const createdToken = ref<string | null>(null);
+// Shown beside the one-time token so an operator learns how to present it.
+// x-api-key is the default shown because it is the header the tools that
+// motivated the sweep (Anthropic SDKs, Claude Code) already send.
+const curlExample = computed(
+  () =>
+    `curl https://your-proxy/v1/messages \\\n  -H 'x-api-key: ${createdToken.value ?? ""}' \\\n  -H 'content-type: application/json' \\\n  -d '{"model":"...","messages":[]}'`,
+);
 const createdMeta = ref<AdminKey | null>(null);
 
 function resetCreate() {
@@ -1178,6 +1185,21 @@ function statusOf(k: AdminKey): string {
     <p class="sb-faint" style="margin-top: 12px" v-if="createdMeta">
       Key id: <span class="sb-mono">{{ keyId(createdMeta) }}</span>
     </p>
+
+    <h4 class="use-head">How to present it</h4>
+    <p class="sb-faint">
+      This key is accepted in any swept header, so a tool that already sends
+      one of these needs no change beyond its base URL. Defaults are
+      <code>authorization</code> (as <code>Bearer</code>),
+      <code>x-api-key</code>, and <code>x-sb-api</code>; the list is
+      configurable under <code>key_management.inbound.headers</code>.
+    </p>
+    <CopyText :value="curlExample" mono />
+    <p class="sb-faint" style="margin-top: 8px">
+      To keep sending your own upstream credential and have SBproxy govern the
+      request without holding that secret, put this key in
+      <code>x-sb-api</code> and leave <code>authorization</code> as it is.
+    </p>
     <template #footer>
       <button class="sb-btn sb-btn--primary" @click="createdToken = null">Done</button>
     </template>
@@ -1739,5 +1761,10 @@ function statusOf(k: AdminKey): string {
   gap: 8px;
   color: var(--sb-text-muted);
   font-size: 0.85rem;
+}
+.use-head {
+  margin: 18px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
 }
 </style>
