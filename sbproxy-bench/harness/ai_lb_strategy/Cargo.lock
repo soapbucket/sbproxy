@@ -3097,7 +3097,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "log",
  "multimap",
  "once_cell",
@@ -3117,7 +3117,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -3818,6 +3818,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "hex",
+ "httpdate",
  "parking_lot",
  "rand 0.8.6",
  "redis",
@@ -3838,6 +3839,8 @@ version = "0.1.0"
 dependencies = [
  "schemars",
  "serde",
+ "serde_json",
+ "syn",
 ]
 
 [[package]]
@@ -3967,7 +3970,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy-observe"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
