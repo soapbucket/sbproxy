@@ -56,12 +56,15 @@ function apiErrorHasCode(error: ApiError | null, code: string): boolean {
 }
 
 export function useModelManagement() {
-  const statusReq = useAsync(() => api.modelHostStatus());
+  // Engine and deployment state moves on its own: a model finishes loading,
+  // a replica dies, a node drops. Poll the things that change and leave the
+  // catalog alone, since it only moves when an operator edits it.
+  const statusReq = useAsync(() => api.modelHostStatus(), { pollMs: 15_000 });
   const catalogReq = useAsync(() => api.modelHostCatalog());
-  const deploymentsReq = useAsync(() => api.modelHostDeployments());
-  const clusterStatusReq = useAsync(() => api.clusterStatus());
-  const clusterBundleReq = useAsync(() => api.clusterDeployments());
-  const metricsReq = useAsync(() => api.metrics());
+  const deploymentsReq = useAsync(() => api.modelHostDeployments(), { pollMs: 15_000 });
+  const clusterStatusReq = useAsync(() => api.clusterStatus(), { pollMs: 30_000 });
+  const clusterBundleReq = useAsync(() => api.clusterDeployments(), { pollMs: 30_000 });
+  const metricsReq = useAsync(() => api.metrics(), { pollMs: 30_000 });
 
   const banner = ref<{ tone: "ok" | "warn" | "err"; text: string } | null>(null);
   const lifecycleBusy = ref("");

@@ -14,7 +14,9 @@ import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
 
-const req = useAsync(() => api.alerts());
+// A firing alert nobody sees is the failure mode this page exists to
+// prevent, so it refreshes on its own.
+const req = useAsync(() => api.alerts(), { pollMs: 15_000 });
 const snapshot = computed(() => req.data.value);
 onMounted(req.run);
 

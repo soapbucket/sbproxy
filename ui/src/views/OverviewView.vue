@@ -9,9 +9,12 @@ import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
 
-const health = useAsync(() => api.health());
-const stats = useAsync(() => api.stats());
-const modelHost = useAsync(() => api.modelHostStatus());
+// This page's subtitle promises live health, so it polls. 10s on health
+// (the thing an operator is actually watching) and 30s on the heavier
+// aggregate panels.
+const health = useAsync(() => api.health(), { pollMs: 10_000 });
+const stats = useAsync(() => api.stats(), { pollMs: 30_000 });
+const modelHost = useAsync(() => api.modelHostStatus(), { pollMs: 30_000 });
 
 function refresh() {
   health.run();
