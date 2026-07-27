@@ -231,6 +231,24 @@ fn default_usage_parser() -> String {
 }
 
 impl AiHandlerConfig {
+    /// Eagerly construct enforcing safety classifiers before publication.
+    ///
+    /// The shipped centroids are meaningful only for their pinned embedding
+    /// model and tokenizer bytes. Startup and reload call this after the
+    /// concrete classifier factory is installed, so an unavailable or
+    /// mismatched artifact rejects the candidate pipeline. Routing-only
+    /// `type: classifier` entries keep their established inert-on-error
+    /// behavior.
+    pub fn preflight_default_safety_centroids(&self) -> anyhow::Result<()> {
+        let Some(config) = self.guardrails.as_ref() else {
+            return Ok(());
+        };
+        if crate::guardrails::uses_default_safety_centroids(config) {
+            self.guardrail_pipeline()?;
+        }
+        Ok(())
+    }
+
     /// Return this handler's compiled guardrail pipeline, building it once.
     ///
     /// The returned `Arc` lets in-flight requests finish against the old

@@ -1,5 +1,5 @@
 # Local inference (embeddings and prompt-injection classify)
-*Last modified: 2026-07-22*
+*Last modified: 2026-07-26*
 
 SBproxy can run three AI-gateway features on local ONNX models instead of paid
 APIs:
@@ -46,9 +46,9 @@ mkdir -p /var/lib/sbproxy/models/minilm /var/lib/sbproxy/models/injection
 
 # Embedding model (all-MiniLM-L6-v2)
 curl -fSL -o /var/lib/sbproxy/models/minilm/model.onnx \
-  https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx
+  https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/5641a7880f40ebf4035d05e60c5f9b7a9c272c84/onnx/model.onnx
 curl -fSL -o /var/lib/sbproxy/models/minilm/tokenizer.json \
-  https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json
+  https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/5641a7880f40ebf4035d05e60c5f9b7a9c272c84/tokenizer.json
 
 # Prompt-injection classifier
 curl -fSL -o /var/lib/sbproxy/models/injection/model.onnx \
@@ -243,18 +243,24 @@ block when their configured unsafe class wins.
 
 Classifier mode is never an automatic upgrade. Keyword mode remains the
 zero-dependency default, and it is a literal substring matcher. When
-classifier mode is explicit, publication validates the configuration structure
-without opening the model or tokenizer. The published handler loads those
-artifacts lazily when its guardrail pipeline is first used. An unavailable
-artifact fails that request and every later request on the same handler
-generation closed with a configuration error instead of quietly weakening the
-guardrail.
+classifier mode is explicit, startup and reload construct the enforcing
+classifier before publishing the pipeline. An unavailable artifact or digest
+mismatch rejects boot or reload with a configuration error instead of quietly
+weakening the guardrail.
 
 The three guardrails use separate closed class taxonomies but share the
 process-level model cache. Multiple entries that point at the same resolved
 model and tokenizer therefore load one embedder while maintaining independent
 centroids, thresholds, and verdicts. `content_safety` also requires a
 nonempty `blocked_categories` subset.
+
+The safety taxonomies ship precomputed default centroids. Operator examples
+are optional and extend the defaults. Those vectors are valid only for the
+pinned model and tokenizer revision, so a digest mismatch fails classifier
+construction. See
+[the evaluation report](ai-default-centroids-evaluation.md) for the exact
+pins, measured class precision and recall, and deterministic regeneration
+method.
 
 For a configuration covering input scope, output streaming behavior,
 taxonomies, and metrics, see

@@ -23,7 +23,7 @@ pub use agent_alignment::{AgentAlignmentConfig, AgentAlignmentGuardrail, AgentAl
 pub use classifier::{
     build_classifier, register_classifier_factory, ClassifierBackendConfig, ClassifierConfig,
     ClassifierFactory, ClassifierGuardrail, ClassifierScope, ClassifierVerdict,
-    EmbeddingBackendConfig, TextClassifier,
+    DefaultCentroidTaxonomy, EmbeddingBackendConfig, TextClassifier,
 };
 pub use content_safety::ContentSafetyGuardrail;
 pub use context_poisoning::{
@@ -802,6 +802,18 @@ pub fn validate_pipeline_config(config: &GuardrailsConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn uses_default_safety_centroids(config: &GuardrailsConfig) -> bool {
+    config.input.iter().chain(&config.output).any(|entry| {
+        entry
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .and_then(SafetyGuardrailKind::from_type_name)
+            .is_some()
+            && safety_classifier::mode(entry)
+                .is_ok_and(|mode| mode == safety_classifier::SafetyGuardrailMode::Classifier)
+    })
 }
 
 fn validate_guardrail_config(config: &serde_json::Value) -> Result<()> {

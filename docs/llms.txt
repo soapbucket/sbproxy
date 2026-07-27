@@ -37,6 +37,7 @@ For human-facing documentation, see `docs/architecture.md`, `docs/configuration.
 - ai_context_compression.state: stateful `summary_buffer` keeps canonical running-summary state in Redis only; the mesh is rejected and workers retain no canonical conversation state.
 - ai_context_compression.value: successful provider requests record per-lever target-model tokens and gross input cost saved in bounded metrics and `GET /admin/model-host/value`, with tokenizer-versus-heuristic precision.
 - ai_context_compression.eval: a deterministic off/on smoke gate covers synthetic retrieval and coding-agent shapes; external benchmark adapters are import-and-report-only.
+- ai_guardrails.default_centroids: toxicity, jailbreak, and content-safety classifier modes ship versioned MiniLM centroids with exact model, tokenizer, and artifact SHA-256 pins; operator examples extend the defaults.
 
 ## Audit
 

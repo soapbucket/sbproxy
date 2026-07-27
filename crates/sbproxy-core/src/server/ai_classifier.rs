@@ -60,6 +60,46 @@ pub(super) fn build_centroid(vectors: &[Vec<f32>]) -> Option<Vec<f32>> {
     Some(sum)
 }
 
+/// Extend a precomputed centroid with operator-supplied example vectors.
+///
+/// `sample_count` gives the normalized default centroid intentional weight
+/// proportional to its training-set size before new unit embeddings are
+/// added. Operator examples therefore augment the shipped centroid instead of
+/// replacing it or receiving accidental one-centroid weight.
+#[cfg(any(feature = "inprocess-classify", test))]
+fn extend_default_centroid(
+    default: &[f32],
+    sample_count: usize,
+    operator_vectors: &[Vec<f32>],
+) -> Option<Vec<f32>> {
+    if sample_count == 0
+        || default.is_empty()
+        || default.iter().any(|value| !value.is_finite())
+        || operator_vectors
+            .iter()
+            .any(|vector| vector.len() != default.len() || vector.iter().any(|v| !v.is_finite()))
+    {
+        return None;
+    }
+    let mut sum: Vec<f32> = default
+        .iter()
+        .map(|value| value * sample_count as f32)
+        .collect();
+    for vector in operator_vectors {
+        for (total, value) in sum.iter_mut().zip(vector) {
+            *total += value;
+        }
+    }
+    let norm = dot(&sum, &sum).sqrt();
+    if !norm.is_finite() || norm <= f32::EPSILON {
+        return None;
+    }
+    for value in &mut sum {
+        *value /= norm;
+    }
+    Some(sum)
+}
+
 /// Pick the centroid closest to `embedding`.
 ///
 /// Returns `None` unless the best class clears `min_score` and beats the
@@ -239,6 +279,26 @@ struct EmbedderArtifactSnapshots {
 }
 
 #[cfg(feature = "inprocess-classify")]
+fn verify_default_centroid_model_hashes(
+    model_sha256: &[u8; 32],
+    tokenizer_sha256: &[u8; 32],
+    artifact: &sbproxy_classifiers::DefaultCentroidArtifact,
+) -> anyhow::Result<()> {
+    let model_sha256 = hex::encode(model_sha256);
+    let tokenizer_sha256 = hex::encode(tokenizer_sha256);
+    if model_sha256 != artifact.model_sha256 || tokenizer_sha256 != artifact.tokenizer_sha256 {
+        anyhow::bail!(
+            "classifier artifacts do not match default centroid model pin: \
+             expected model sha256 {} and tokenizer sha256 {}, got model sha256 \
+             {model_sha256} and tokenizer sha256 {tokenizer_sha256}",
+            artifact.model_sha256,
+            artifact.tokenizer_sha256
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "inprocess-classify")]
 fn cache_entry_is_stale(cached: &EmbedderCacheKey, current: &EmbedderCacheKey) -> bool {
     let same_model_source = cached.model.source_path == current.model.source_path
         || cached.model.canonical_path == current.model.canonical_path;
@@ -383,6 +443,7 @@ fn load_embedder_from_snapshots_with<T>(
 #[cfg(feature = "inprocess-classify")]
 fn shared_embedder(
     cfg: &sbproxy_ai::guardrails::EmbeddingBackendConfig,
+    default_artifact: Option<&sbproxy_classifiers::DefaultCentroidArtifact>,
 ) -> anyhow::Result<std::sync::Arc<sbproxy_classifiers::OnnxEmbedder>> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -400,6 +461,13 @@ fn shared_embedder(
     // lookup. The eventual parser consumes these buffers rather than
     // reopening the configured pathname.
     let snapshots = embedder_artifact_snapshots(cfg)?;
+    if let Some(artifact) = default_artifact {
+        verify_default_centroid_model_hashes(
+            &snapshots.model.identity.sha256,
+            &snapshots.tokenizer.identity.sha256,
+            artifact,
+        )?;
+    }
     let key = snapshots.key.clone();
     if let Ok(mut map) = cache.lock() {
         // Drop an older generation at these paths before looking up the
@@ -486,8 +554,23 @@ fn embed_class_examples(
 #[cfg(feature = "inprocess-classify")]
 fn build_class_centroids(
     cfg: &sbproxy_ai::guardrails::ClassifierConfig,
+    defaults: Option<&sbproxy_classifiers::DefaultCentroidTaxonomyArtifact>,
     mut embed: impl FnMut(&str) -> anyhow::Result<Vec<f32>>,
 ) -> anyhow::Result<Vec<(String, Vec<f32>)>> {
+    if let Some(defaults) = defaults {
+        let mut centroids = Vec::with_capacity(defaults.classes.len());
+        for (label, default) in &defaults.classes {
+            let operator_examples = cfg.classes.get(label).map(Vec::as_slice).unwrap_or(&[]);
+            let vectors = embed_class_examples(cfg, label, operator_examples, &mut embed)?;
+            let centroid = extend_default_centroid(&default.vector, default.sample_count, &vectors)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("classifier class `{label}` has no usable centroid")
+                })?;
+            centroids.push((label.clone(), centroid));
+        }
+        return Ok(centroids);
+    }
+
     let mut centroids = Vec::with_capacity(cfg.classes.len());
     let mut expected_dimension = None;
     for (label, examples) in &cfg.classes {
@@ -516,10 +599,26 @@ fn build_backend(
     // Only one backend variant exists today, so this destructure is
     // irrefutable.
     let sbproxy_ai::guardrails::ClassifierBackendConfig::Embedding(backend) = &cfg.backend;
-    let embedder = shared_embedder(backend)?;
-    let centroids = build_class_centroids(cfg, |example| {
+    let default_artifact = cfg
+        .default_centroids
+        .map(|_| sbproxy_classifiers::default_centroid_artifact())
+        .transpose()?;
+    let defaults = cfg
+        .default_centroids
+        .map(sbproxy_classifiers::default_safety_centroids)
+        .transpose()?;
+    let embedder = shared_embedder(backend, default_artifact)?;
+    let centroids = build_class_centroids(cfg, defaults, |example| {
         embedder.embed(example).map(|output| output.values)
     })?;
+    let (min_score, min_margin) = if cfg.use_default_thresholds {
+        let defaults = defaults.ok_or_else(|| {
+            anyhow::anyhow!("classifier requested default thresholds without default centroids")
+        })?;
+        (defaults.min_score, defaults.min_margin)
+    } else {
+        (backend.min_score, backend.min_margin)
+    };
     let model_label = std::path::Path::new(&backend.model_path)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -532,8 +631,8 @@ fn build_backend(
     Ok(std::sync::Arc::new(CentroidClassifier {
         embedder,
         centroids,
-        min_score: backend.min_score,
-        min_margin: backend.min_margin,
+        min_score,
+        min_margin,
         model_label,
     }))
 }
@@ -577,6 +676,106 @@ mod tests {
         let inv = 1.0f32 / 2.0f32.sqrt();
         assert!((c[0] - inv).abs() < 1e-6, "got {c:?}");
         assert!((c[1] - inv).abs() < 1e-6, "got {c:?}");
+    }
+
+    #[test]
+    fn operator_examples_extend_a_weighted_default_centroid() {
+        let extended = extend_default_centroid(&[1.0, 0.0], 2, &[vec![0.0, 1.0]])
+            .expect("default plus operator example should produce a centroid");
+        let norm = 5.0_f32.sqrt();
+        assert!((extended[0] - 2.0 / norm).abs() < 1e-6);
+        assert!((extended[1] - 1.0 / norm).abs() < 1e-6);
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn default_centroids_reject_a_different_embedding_model_generation() {
+        let artifact =
+            sbproxy_classifiers::default_centroid_artifact().expect("shipped artifact validates");
+        let error = verify_default_centroid_model_hashes(&[0_u8; 32], &[1_u8; 32], artifact)
+            .expect_err("different model bytes must be a hard configuration error")
+            .to_string();
+        assert!(error.contains("model pin"), "unexpected error: {error}");
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    #[ignore = "requires the pinned 90 MB MiniLM model and tokenizer"]
+    fn no_example_configs_meet_the_held_out_safety_fixture_floor() {
+        let model_path =
+            std::env::var("SBPROXY_CENTROID_MODEL_PATH").expect("set centroid model path");
+        let tokenizer_path =
+            std::env::var("SBPROXY_CENTROID_TOKENIZER_PATH").expect("set centroid tokenizer path");
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../sbproxy-classifiers/fixtures/default-safety-centroids-evaluation.json"
+        ))
+        .expect("evaluation fixtures");
+        let taxonomies = [
+            (
+                "toxicity",
+                sbproxy_ai::guardrails::DefaultCentroidTaxonomy::Toxicity,
+            ),
+            (
+                "jailbreak",
+                sbproxy_ai::guardrails::DefaultCentroidTaxonomy::Jailbreak,
+            ),
+            (
+                "content_safety",
+                sbproxy_ai::guardrails::DefaultCentroidTaxonomy::ContentSafety,
+            ),
+        ];
+
+        for (taxonomy_name, taxonomy) in taxonomies {
+            let cfg = sbproxy_ai::guardrails::ClassifierConfig {
+                backend: sbproxy_ai::guardrails::ClassifierBackendConfig::Embedding(
+                    sbproxy_ai::guardrails::EmbeddingBackendConfig {
+                        model_path: model_path.clone(),
+                        tokenizer_path: tokenizer_path.clone(),
+                        min_score: 0.30,
+                        min_margin: 0.05,
+                        max_model_bytes: None,
+                    },
+                ),
+                classes: std::collections::BTreeMap::new(),
+                default_centroids: Some(taxonomy),
+                use_default_thresholds: true,
+                scope: sbproxy_ai::guardrails::ClassifierScope::LastUserMessage,
+                max_chars: 2_000,
+            };
+            let backend = build_backend(&cfg).expect("no-example default classifier");
+            let classes = fixtures[taxonomy_name]
+                .as_object()
+                .expect("taxonomy fixture classes");
+            let mut unsafe_total = 0;
+            let mut unsafe_blocked = 0;
+            for (expected, prompts) in classes {
+                for prompt in prompts.as_array().expect("prompt array") {
+                    let verdict = backend
+                        .classify(prompt.as_str().expect("prompt text"))
+                        .expect("inference");
+                    if expected == "safe" {
+                        assert!(
+                            verdict
+                                .as_ref()
+                                .is_none_or(|verdict| verdict.label == "safe"),
+                            "{taxonomy_name} produced an unsafe false positive: {verdict:?}"
+                        );
+                    } else {
+                        unsafe_total += 1;
+                        if verdict
+                            .as_ref()
+                            .is_some_and(|verdict| verdict.label != "safe")
+                        {
+                            unsafe_blocked += 1;
+                        }
+                    }
+                }
+            }
+            assert!(
+                unsafe_blocked * 100 >= unsafe_total * 80,
+                "{taxonomy_name} unsafe enforcement recall was {unsafe_blocked}/{unsafe_total}"
+            );
+        }
     }
 
     #[test]
@@ -731,6 +930,8 @@ mod tests {
                 "documentation".to_string(),
                 vec!["write docs".to_string()],
             )]),
+            default_centroids: None,
+            use_default_thresholds: false,
             scope: sbproxy_ai::guardrails::ClassifierScope::LastUserMessage,
             max_chars,
         }
@@ -779,7 +980,7 @@ mod tests {
             vec!["ordinary conversation".to_string()],
         );
 
-        let error = build_class_centroids(&cfg, |text| {
+        let error = build_class_centroids(&cfg, None, |text| {
             if text == "ordinary conversation" {
                 anyhow::bail!("fixture embedding failure");
             }
@@ -802,7 +1003,7 @@ mod tests {
             vec!["ordinary conversation".to_string()],
         );
 
-        let error = build_class_centroids(&cfg, |text| {
+        let error = build_class_centroids(&cfg, None, |text| {
             if text == "ordinary conversation" {
                 Ok(vec![1.0, 0.0, 0.0])
             } else {
@@ -829,7 +1030,7 @@ mod tests {
             ],
         );
 
-        let error = build_class_centroids(&cfg, |text| {
+        let error = build_class_centroids(&cfg, None, |text| {
             if text == "empty vector" {
                 Ok(Vec::new())
             } else {
@@ -856,7 +1057,7 @@ mod tests {
             ],
         );
 
-        let error = build_class_centroids(&cfg, |text| {
+        let error = build_class_centroids(&cfg, None, |text| {
             if text == "infinite vector" {
                 Ok(vec![f32::INFINITY, 0.0])
             } else {
@@ -883,7 +1084,7 @@ mod tests {
             ],
         );
 
-        let error = build_class_centroids(&cfg, |text| {
+        let error = build_class_centroids(&cfg, None, |text| {
             if text == "wrong dimension" {
                 Ok(vec![1.0, 0.0, 0.0])
             } else {
@@ -916,6 +1117,8 @@ mod tests {
                 "documentation".to_string(),
                 vec!["write the readme".to_string()],
             )]),
+            default_centroids: None,
+            use_default_thresholds: false,
             scope: sbproxy_ai::guardrails::ClassifierScope::LastUserMessage,
             max_chars: 2000,
         };

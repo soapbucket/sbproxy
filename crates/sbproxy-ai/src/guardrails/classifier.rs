@@ -62,6 +62,21 @@ pub enum ClassifierScope {
     FullText,
 }
 
+/// Shipped centroid taxonomy selected by an enforcing safety guardrail.
+///
+/// This is runtime metadata, not a user-configurable field. Safety config
+/// parsing sets it from the guardrail `type`, while the routing classifier
+/// continues to require a complete operator-supplied class map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultCentroidTaxonomy {
+    /// Binary `toxic | safe` taxonomy.
+    Toxicity,
+    /// Binary `jailbreak | safe` taxonomy.
+    Jailbreak,
+    /// Multi-class content-safety taxonomy.
+    ContentSafety,
+}
+
 fn default_min_score() -> f32 {
     0.30
 }
@@ -119,6 +134,12 @@ pub struct ClassifierConfig {
     /// representative examples per class is the useful range.
     #[serde(default)]
     pub classes: BTreeMap<String, Vec<String>>,
+    /// Built-in centroids to seed before any operator examples are embedded.
+    #[serde(skip)]
+    pub default_centroids: Option<DefaultCentroidTaxonomy>,
+    /// Use thresholds calibrated with the shipped centroid artifact.
+    #[serde(skip)]
+    pub use_default_thresholds: bool,
     /// Which slice of the prompt to classify.
     #[serde(default)]
     pub scope: ClassifierScope,
@@ -163,7 +184,7 @@ impl ClassifierConfig {
                 "classifier guardrail backend `min_margin` must be finite and in [0, 2]"
             ));
         }
-        if self.classes.is_empty() {
+        if self.classes.is_empty() && self.default_centroids.is_none() {
             return Err(anyhow!(
                 "classifier guardrail needs at least one entry under `classes`"
             ));
@@ -235,41 +256,53 @@ pub fn build_classifier(cfg: &ClassifierConfig) -> Result<Arc<dyn TextClassifier
 #[derive(Debug)]
 pub struct ClassifierGuardrail {
     cfg: ClassifierConfig,
-    /// `None` when the backend failed to load. The guardrail then
-    /// returns no label rather than erroring, so a bad model path
-    /// cannot disable the guardrails configured next to it.
-    backend: Option<Arc<dyn TextClassifier>>,
+    /// Built on the first routing-classification attempt. `None` after a
+    /// load failure leaves the routing signal inert for this config
+    /// generation without retrying artifact I/O on every request.
+    backend: OnceLock<Option<Arc<dyn TextClassifier>>>,
 }
 
 impl ClassifierGuardrail {
     /// Build from an already-resolved backend. Used by tests and by
-    /// [`ClassifierGuardrail::from_config`].
+    /// callers that inject a custom classifier.
     pub fn with_backend(cfg: ClassifierConfig, backend: Option<Arc<dyn TextClassifier>>) -> Self {
-        Self { cfg, backend }
+        Self {
+            cfg,
+            backend: OnceLock::from(backend),
+        }
     }
 
-    /// Build from a raw config value using the registered factory.
+    /// Build from a raw config value without opening its runtime artifacts.
     ///
-    /// A malformed config is an error. A backend that will not load is
-    /// warned about and degrades to an inert guardrail.
+    /// A malformed config is an error. The registered factory runs on the
+    /// first classification attempt; a backend that will not load is warned
+    /// about and remains inert for this config generation.
     pub fn from_config(config: &serde_json::Value) -> Result<Self> {
         let cfg = parse_config(config)?;
-        let backend = match build_classifier(&cfg) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                // Only one backend variant exists today, so this
-                // destructure is irrefutable.
-                let ClassifierBackendConfig::Embedding(embedding) = &cfg.backend;
-                warn!(
-                    error = %e,
-                    model_path = %embedding.model_path,
-                    "classifier guardrail backend unavailable; guardrail is inert \
-                     and prompts keep their original routing"
-                );
-                None
-            }
-        };
-        Ok(Self { cfg, backend })
+        Ok(Self {
+            cfg,
+            backend: OnceLock::new(),
+        })
+    }
+
+    fn backend(&self) -> Option<&Arc<dyn TextClassifier>> {
+        self.backend
+            .get_or_init(|| match build_classifier(&self.cfg) {
+                Ok(backend) => Some(backend),
+                Err(error) => {
+                    // Only one backend variant exists today, so this
+                    // destructure is irrefutable.
+                    let ClassifierBackendConfig::Embedding(embedding) = &self.cfg.backend;
+                    warn!(
+                        %error,
+                        model_path = %embedding.model_path,
+                        "classifier guardrail backend unavailable; guardrail is inert \
+                         and prompts keep their original routing"
+                    );
+                    None
+                }
+            })
+            .as_ref()
     }
 
     /// The text this guardrail classifies, honoring `scope` and
@@ -305,13 +338,13 @@ impl ClassifierGuardrail {
         content: &str,
         messages: &[Message],
     ) -> Result<Option<GuardrailLabel>> {
-        let Some(backend) = self.backend.as_ref() else {
-            return Ok(None);
-        };
         let subject = self.subject(content, messages);
         if subject.trim().is_empty() {
             return Ok(None);
         }
+        let Some(backend) = self.backend() else {
+            return Ok(None);
+        };
         let Some(verdict) = backend.classify(&subject)? else {
             return Ok(None);
         };
@@ -391,6 +424,8 @@ mod tests {
                 max_model_bytes: None,
             }),
             classes: std::collections::BTreeMap::new(),
+            default_centroids: None,
+            use_default_thresholds: false,
             scope,
             max_chars: 2000,
         }

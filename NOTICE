@@ -72,6 +72,16 @@ https://github.com/huggingface/tokenizers
 
 ===========================================================================
 
+sentence-transformers/all-MiniLM-L6-v2
+Copyright Sentence Transformers contributors
+Licensed under the Apache License, Version 2.0
+https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+
+SBproxy includes centroid vectors derived from this model. Model weights and
+training corpora are not redistributed.
+
+===========================================================================
+
 tract (tract-onnx, tract-onnx-opl, tract-core, tract-data, tract-hir,
        tract-linalg, tract-nnef)
 Copyright 2017-2026 the tract authors

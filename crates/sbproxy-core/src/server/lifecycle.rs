@@ -433,6 +433,35 @@ fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
     }
 }
 
+/// Construct enforcing safety classifiers before a candidate pipeline can
+/// become requestable.
+///
+/// Routing classifiers keep their inert-on-load-failure contract. The
+/// enforcing toxicity, jailbreak, and content-safety paths use shipped
+/// centroids bound to exact model bytes, so their construction is a required
+/// startup and reload preflight.
+fn preflight_default_safety_centroids(pipeline: &CompiledPipeline) -> anyhow::Result<()> {
+    fn preflight_action(action: &Action) -> anyhow::Result<()> {
+        if let Action::AiProxy(action) = action {
+            action
+                .config
+                .preflight_default_safety_centroids()
+                .map_err(|error| {
+                    anyhow::anyhow!("AI safety classifier startup preflight failed: {error}")
+                })?;
+        }
+        Ok(())
+    }
+
+    for action in &pipeline.actions {
+        preflight_action(action)?;
+    }
+    for rule in pipeline.forward_rules.iter().flatten() {
+        preflight_action(&rule.action)?;
+    }
+    Ok(())
+}
+
 fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<ReloadOutcome> {
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{config_path}': {e}"))?;
@@ -603,6 +632,7 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
     };
 
     let mut new_pipeline = CompiledPipeline::from_config(compiled)?;
+    preflight_default_safety_centroids(&new_pipeline)?;
 
     // WOR-196: pick up `listings/*.yaml` from the same Repo (the
     // directory the served `sb.yml` lives in) and stash the loaded
@@ -1315,6 +1345,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
 
     // Compile config into a pipeline with action/auth/policy module instances.
     let mut pipeline = CompiledPipeline::from_config(compiled)?;
+    preflight_default_safety_centroids(&pipeline)?;
 
     // WOR-196: pick up `listings/*.yaml` from the same Repo (the
     // directory the served `sb.yml` lives in) and stash the loaded
@@ -3096,6 +3127,117 @@ fn compile_one_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safety_centroid_preflight_rejects_mismatched_model_before_publication() {
+        super::ai_classifier::install_classifier_factory();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model = dir.path().join("model.onnx");
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&model, b"different model generation").expect("model fixture");
+        std::fs::write(&tokenizer, b"different tokenizer generation").expect("tokenizer fixture");
+        let yaml = format!(
+            r#"
+origins:
+  "ai.test":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: sk-test
+      guardrails:
+        input:
+          - type: jailbreak
+            mode: classifier
+            classifier:
+              backend:
+                kind: embedding
+                model_path: "{}"
+                tokenizer_path: "{}"
+"#,
+            model.display(),
+            tokenizer.display()
+        );
+        let compiled = sbproxy_config::compile_config(&yaml).expect("structurally valid config");
+        let pipeline =
+            CompiledPipeline::from_config(compiled).expect("action construction stays structural");
+
+        let error = preflight_default_safety_centroids(&pipeline)
+            .expect_err("mismatched default-centroid model must reject startup")
+            .to_string();
+
+        assert!(
+            error.contains("startup preflight"),
+            "unexpected error: {error}"
+        );
+        #[cfg(feature = "inprocess-classify")]
+        assert!(error.contains("model pin"), "unexpected error: {error}");
+        #[cfg(not(feature = "inprocess-classify"))]
+        assert!(
+            error.contains("without the `inprocess-classify` feature"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn safety_centroid_preflight_covers_live_forward_rule_ai_actions() {
+        super::ai_classifier::install_classifier_factory();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model = dir.path().join("model.onnx");
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&model, b"different model generation").expect("model fixture");
+        std::fs::write(&tokenizer, b"different tokenizer generation").expect("tokenizer fixture");
+        let yaml = format!(
+            r#"
+origins:
+  "front.test":
+    action:
+      type: static
+      status: 200
+      text_body: ok
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /ai/
+        origin:
+          id: inline-ai
+          action:
+            type: ai_proxy
+            providers:
+              - name: openai
+                api_key: sk-test
+            guardrails:
+              input:
+                - type: jailbreak
+                  mode: classifier
+                  classifier:
+                    backend:
+                      kind: embedding
+                      model_path: "{}"
+                      tokenizer_path: "{}"
+"#,
+            model.display(),
+            tokenizer.display()
+        );
+        let compiled = sbproxy_config::compile_config(&yaml).expect("structurally valid config");
+        let pipeline =
+            CompiledPipeline::from_config(compiled).expect("forward action construction");
+
+        let error = preflight_default_safety_centroids(&pipeline)
+            .expect_err("forward-rule AI safety artifacts must be verified before publication")
+            .to_string();
+        assert!(
+            error.contains("startup preflight"),
+            "unexpected error: {error}"
+        );
+        #[cfg(feature = "inprocess-classify")]
+        assert!(error.contains("model pin"), "unexpected error: {error}");
+        #[cfg(not(feature = "inprocess-classify"))]
+        assert!(
+            error.contains("without the `inprocess-classify` feature"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn real_reload_seeds_replaces_clears_and_preserves_flags_on_rejection() {

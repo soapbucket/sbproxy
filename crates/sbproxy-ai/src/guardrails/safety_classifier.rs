@@ -7,7 +7,8 @@ use anyhow::{anyhow, bail, Result};
 use serde::Deserialize;
 
 use super::classifier::{
-    build_classifier, ClassifierConfig, ClassifierScope, ClassifierVerdict, TextClassifier,
+    build_classifier, ClassifierConfig, ClassifierScope, ClassifierVerdict,
+    DefaultCentroidTaxonomy, TextClassifier,
 };
 use super::GuardrailBlock;
 use crate::types::Message;
@@ -88,6 +89,14 @@ impl SafetyGuardrailKind {
             Self::ContentSafety => &[],
         }
     }
+
+    fn default_centroids(self) -> DefaultCentroidTaxonomy {
+        match self {
+            Self::Toxicity => DefaultCentroidTaxonomy::Toxicity,
+            Self::Jailbreak => DefaultCentroidTaxonomy::Jailbreak,
+            Self::ContentSafety => DefaultCentroidTaxonomy::ContentSafety,
+        }
+    }
 }
 
 /// Runtime classifier for one built-in safety guardrail.
@@ -123,9 +132,12 @@ impl SafetyClassifierGuardrail {
     ) -> Result<Self> {
         validate_config(kind, config)?;
         let envelope = parse_envelope(config)?;
-        let cfg = envelope
+        let mut cfg = envelope
             .classifier
             .ok_or_else(|| anyhow!("{} classifier configuration is missing", kind.name()))?;
+        cfg.default_centroids = Some(kind.default_centroids());
+        cfg.use_default_thresholds = config.pointer("/classifier/backend/min_score").is_none()
+            && config.pointer("/classifier/backend/min_margin").is_none();
         let backend = build_classifier(&cfg).map_err(|error| {
             anyhow!("{} classifier backend is unavailable: {error}", kind.name())
         })?;
@@ -316,19 +328,20 @@ fn validate_envelope(kind: SafetyGuardrailKind, envelope: &SafetyConfigEnvelope)
         SafetyGuardrailMode::Classifier => {}
     }
 
-    let cfg = envelope.classifier.as_ref().ok_or_else(|| {
+    let mut cfg = envelope.classifier.clone().ok_or_else(|| {
         anyhow!(
             "{} with `mode: classifier` requires a `classifier` block",
             kind.name()
         )
     })?;
+    cfg.default_centroids = Some(kind.default_centroids());
     cfg.validate()?;
 
     let configured: BTreeSet<&str> = cfg.classes.keys().map(String::as_str).collect();
     let expected: BTreeSet<&str> = kind.taxonomy().iter().copied().collect();
-    if configured != expected {
+    if !configured.is_subset(&expected) {
         bail!(
-            "{} classifier classes must be exactly: {}",
+            "{} classifier classes must be drawn from: {}",
             kind.name(),
             kind.taxonomy().join(", ")
         );
@@ -492,6 +505,8 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            default_centroids: None,
+            use_default_thresholds: false,
             scope,
             max_chars: 2_000,
         }
@@ -622,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn every_builtin_classifier_taxonomy_is_accepted_exactly() {
+    fn every_builtin_classifier_taxonomy_rejects_unknown_classes() {
         for kind in [
             SafetyGuardrailKind::Toxicity,
             SafetyGuardrailKind::Jailbreak,
@@ -631,15 +646,49 @@ mod tests {
             validate_config(kind, &raw(kind)).expect("canonical taxonomy should validate");
         }
 
-        let mut incomplete = raw(SafetyGuardrailKind::Jailbreak);
-        incomplete["classifier"]["classes"]
-            .as_object_mut()
-            .expect("classes object")
-            .remove("safe");
-        let error = validate_config(SafetyGuardrailKind::Jailbreak, &incomplete)
-            .expect_err("missing safe class must fail")
+        let mut unknown = raw(SafetyGuardrailKind::Jailbreak);
+        unknown["classifier"]["classes"]["unrecognized"] = serde_json::json!(["unknown class"]);
+        let error = validate_config(SafetyGuardrailKind::Jailbreak, &unknown)
+            .expect_err("unknown classes must fail")
             .to_string();
-        assert!(error.contains("exactly") && error.contains("safe"));
+        assert!(error.contains("drawn from") && error.contains("safe"));
+    }
+
+    #[test]
+    fn classifier_safety_defaults_do_not_require_operator_examples() {
+        for kind in [
+            SafetyGuardrailKind::Toxicity,
+            SafetyGuardrailKind::Jailbreak,
+            SafetyGuardrailKind::ContentSafety,
+        ] {
+            let mut config = raw(kind);
+            config["classifier"]
+                .as_object_mut()
+                .expect("classifier object")
+                .remove("classes");
+
+            validate_config(kind, &config)
+                .expect("built-in safety centroids should supply the complete taxonomy");
+        }
+    }
+
+    #[test]
+    fn operator_examples_may_extend_a_subset_of_default_classes() {
+        let mut config = raw(SafetyGuardrailKind::Jailbreak);
+        config["classifier"]["classes"] = serde_json::json!({
+            "jailbreak": ["a deployment-specific bypass phrase"]
+        });
+
+        validate_config(SafetyGuardrailKind::Jailbreak, &config)
+            .expect("operator examples should extend, not replace, the shipped classes");
+
+        config["classifier"]["classes"] = serde_json::json!({
+            "unknown": ["an unrecognized class must not extend the closed taxonomy"]
+        });
+        let error = validate_config(SafetyGuardrailKind::Jailbreak, &config)
+            .expect_err("operator examples must stay inside the shipped taxonomy")
+            .to_string();
+        assert!(error.contains("drawn from"), "unexpected error: {error}");
     }
 
     #[test]

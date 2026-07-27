@@ -1,11 +1,11 @@
 # Classifier-backed safety guardrails
 
-*Last modified: 2026-07-23*
+*Last modified: 2026-07-26*
 
 Enforce `jailbreak`, `content_safety`, and `toxicity` with one local
-operator-supplied sentence-embedding model. The example keeps each
-guardrail's class taxonomy and verdict separate while sharing the loaded
-embedder.
+sentence-embedding model and the shipped precomputed centroids. The example
+keeps each guardrail's class taxonomy and verdict separate while sharing the
+loaded embedder.
 
 ## Run
 
@@ -53,9 +53,12 @@ sum by (guardrail, class, backend, verdict) (
 - Keyword matching remains the default when `mode` is omitted. It is a
   case-insensitive substring matcher, not an ML classifier.
 - `mode: classifier` is explicit and enforcing. An invalid class map rejects
-  the candidate configuration. Artifacts load lazily on the first request;
-  missing artifacts fail that request and later requests on the same handler
-  generation closed. There is no silent keyword fallback.
+  the candidate configuration. Startup and reload construct the classifier
+  before publishing the pipeline; missing or mismatched artifacts reject that
+  boot or reload. There is no silent keyword fallback.
+- The shipped centroid artifact pins the exact model and tokenizer digests.
+  Downloading another revision fails classifier construction. Optional
+  `classes` entries extend a shipped class; they do not replace it.
 - Input classifiers default to the last user message. The output toxicity
   entry uses the complete response.
 - The output entry uses `stream_policy: close`. Non-streaming responses are
@@ -63,9 +66,12 @@ sum by (guardrail, class, backend, verdict) (
   until the complete assistant text receives a clean close verdict. A block,
   classifier error, decode failure, or buffer overflow releases no body bytes
   and prevents cache admission.
-- The sample centroids are starting points, not a certification set. Measure
-  false positives and false negatives on representative prompts, then tune
-  examples, `min_score`, and `min_margin`.
+- The default thresholds enforce a zero false-positive budget on the
+  repo-authored held-out safe fixtures. Review the measured per-class results
+  in
+  [the evaluation report](../../docs/ai-default-centroids-evaluation.md), then
+  add deployment-specific examples or explicit thresholds if your traffic
+  requires different tradeoffs.
 
 ## See also
 

@@ -10,6 +10,17 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+### Added
+
+- **Classifier safety guardrails now ship calibrated default centroids.**
+  `toxicity`, `jailbreak`, and `content_safety` classifier mode no longer
+  requires operator examples. Optional examples extend the versioned
+  defaults. The artifact pins the exact `all-MiniLM-L6-v2` revision, model,
+  tokenizer, and artifact digests, and incompatible bytes fail closed.
+  Repo-authored held-out fixtures, measured class precision and recall, and
+  deterministic regeneration live in
+  [`docs/ai-default-centroids-evaluation.md`](docs/ai-default-centroids-evaluation.md).
+
 ## [1.8.0] - 2026-07-27
 
 Trust tier becomes live policy input, config authority grows a command

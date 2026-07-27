@@ -148,24 +148,25 @@ pub const PROMPT_INJECTION_V2_MODEL: KnownModel = KnownModel {
 /// cache and ship to air-gapped sites, and its quality is well-suited to
 /// near-duplicate prompt detection (the semantic-cache use case).
 ///
-/// SHA pins are empty for the same reason as `prompt-injection-v2`: the
-/// build sandbox cannot reach the upstream URL, so operators compute the
-/// hash on first download. The `no_known_model_has_unpinned_sha256` test
-/// stays `#[ignore]`'d until the pinning follow-up lands.
+/// The immutable revision and hashes are shared with the default safety
+/// centroid artifact. A different generation can produce incompatible
+/// vectors and is rejected rather than scored against the shipped centroids.
 pub const ALL_MINILM_L6_V2_MODEL: KnownModel = KnownModel {
     name: "all-MiniLM-L6-v2",
     model_url: concat!(
         "https://huggingface.co/sentence-transformers/",
-        "all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
+        "all-MiniLM-L6-v2/resolve/",
+        "5641a7880f40ebf4035d05e60c5f9b7a9c272c84/onnx/model.onnx"
     ),
-    model_sha256: "",
+    model_sha256: "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452",
     tokenizer_url: concat!(
         "https://huggingface.co/sentence-transformers/",
-        "all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+        "all-MiniLM-L6-v2/resolve/",
+        "5641a7880f40ebf4035d05e60c5f9b7a9c272c84/tokenizer.json"
     ),
-    tokenizer_sha256: "",
+    tokenizer_sha256: "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037",
     license: "Apache-2.0",
-    revision_pinned_at: "2026-06-08",
+    revision_pinned_at: "2026-07-26",
 };
 
 /// Every entry the registry knows about. Add new pins here; tests

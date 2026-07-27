@@ -1514,23 +1514,35 @@ does not provide semantic or ML detection.
 
 Set `mode: classifier` to make one of those guardrails enforce the local
 embedding classifier. This is an explicit, fail-closed configuration choice:
-the proxy rejects an unavailable backend, an incomplete class taxonomy, or
-keyword-only fields that would otherwise be ignored. It never substitutes the
-keyword backend after classifier mode was requested.
+the proxy rejects an unavailable backend, an incompatible model generation,
+an unknown class label, or keyword-only fields that would otherwise be
+ignored. It never substitutes the keyword backend after classifier mode was
+requested.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `mode` | `keyword` or `classifier` | `keyword` | Selects the literal matcher or local classifier. |
-| `classifier` | object | required in classifier mode | Uses the same `backend`, threshold, class-example, `scope`, and `max_chars` fields as the classifier input guardrail below. Rejected in keyword mode. |
+| `classifier` | object | required in classifier mode | Uses the same `backend`, threshold, optional class-example, `scope`, and `max_chars` fields as the classifier input guardrail below. Rejected in keyword mode. |
 | `blocked_categories` | list | type-specific | In classifier mode, valid only for `content_safety`, must be nonempty, and may contain `violence`, `self_harm`, `sexual`, `hate_speech`, or `illegal`. |
 | `stream_policy` | `chunk`, `close`, or `off` | mode-specific | Output classifier mode defaults to `close`, accepts `close` or `off`, and rejects `chunk`. Keyword mode retains the normal streaming default. |
 
-Classifier class maps must be exact:
+Classifier mode ships these closed class maps:
 
 - `toxicity`: `toxic`, `safe`
 - `jailbreak`: `jailbreak`, `safe`
 - `content_safety`: `violence`, `self_harm`, `sexual`, `hate_speech`,
   `illegal`, `safe`
+
+The `classes` map may be omitted. SBproxy then uses the versioned,
+precomputed centroids bundled with the binary. Entries supplied under
+`classes` add deployment-specific examples to the matching shipped class;
+they do not replace the default centroid. Unknown class names are rejected.
+The defaults require the pinned
+`sentence-transformers/all-MiniLM-L6-v2` model revision and tokenizer.
+A digest mismatch is a hard configuration error because vectors from another
+model generation are not comparable. When both threshold fields are omitted,
+the calibrated artifact thresholds apply. Explicit `min_score` or
+`min_margin` values opt into operator tuning.
 
 Input classifier mode defaults to `scope: last_user_message`; `full_text` is
 also available. Output classifier mode always evaluates the complete response:

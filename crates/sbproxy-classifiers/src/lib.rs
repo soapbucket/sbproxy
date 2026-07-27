@@ -66,7 +66,14 @@ pub mod agent_classifier_types;
 pub mod judge_rpc;
 pub mod known_models;
 
+mod default_centroids;
 mod embedder;
+pub use default_centroids::{
+    default_centroid_artifact, default_safety_centroids, DefaultCentroid, DefaultCentroidArtifact,
+    DefaultCentroidTaxonomyArtifact, DEFAULT_CENTROID_DIMENSION, DEFAULT_CENTROID_MODEL_ID,
+    DEFAULT_CENTROID_MODEL_REVISION, DEFAULT_CENTROID_MODEL_SHA256,
+    DEFAULT_CENTROID_TOKENIZER_SHA256,
+};
 pub use embedder::{EmbeddingOutput, OnnxEmbedder};
 
 pub use agent_class::{
