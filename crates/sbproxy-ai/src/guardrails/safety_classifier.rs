@@ -158,6 +158,29 @@ impl SafetyClassifierGuardrail {
         self.evaluate(self.cfg.bounded_text(content)).into_block()
     }
 
+    /// Evaluate a complete assistant output without silently dropping a suffix
+    /// that will be released to the client.
+    pub(crate) fn check_output(&self, content: &str) -> Option<GuardrailBlock> {
+        let bounded = self.cfg.bounded_text(content);
+        if bounded.len() != content.len() {
+            crate::ai_metrics::record_safety_guardrail_verdict(
+                self.kind.name(),
+                "error",
+                "classifier",
+                "block",
+            );
+            return Some(GuardrailBlock {
+                name: self.kind.name().to_string(),
+                reason: format!(
+                    "{} classifier output exceeded max_chars ({}); failed closed",
+                    self.kind.name(),
+                    self.cfg.max_chars
+                ),
+            });
+        }
+        self.evaluate(bounded).into_block()
+    }
+
     /// Evaluate an input request using the configured message scope.
     pub fn check_messages(&self, content: &str, messages: &[Message]) -> Option<GuardrailBlock> {
         self.check_messages_outcome(content, messages).into_block()
@@ -168,14 +191,17 @@ impl SafetyClassifierGuardrail {
         content: &str,
         messages: &[Message],
     ) -> SafetyClassifierOutcome {
+        let last_user_text;
         let raw = match self.cfg.scope {
             ClassifierScope::FullText => content,
-            ClassifierScope::LastUserMessage => messages
-                .iter()
-                .rev()
-                .find(|message| message.role == "user")
-                .and_then(|message| message.content.as_str())
-                .unwrap_or(content),
+            ClassifierScope::LastUserMessage => {
+                last_user_text = messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == "user")
+                    .and_then(|message| super::message_content_text(&message.content));
+                last_user_text.as_deref().unwrap_or(content)
+            }
         };
         self.evaluate(self.cfg.bounded_text(raw))
     }
@@ -200,28 +226,29 @@ impl SafetyClassifierGuardrail {
                     %error,
                     "safety classifier inference failed; blocking response"
                 );
-                crate::ai_metrics::record_safety_guardrail_verdict(
-                    self.kind.name(),
-                    "error",
-                    "classifier",
-                    "block",
-                );
-                SafetyClassifierOutcome::BackendFailure(GuardrailBlock {
-                    name: self.kind.name().to_string(),
-                    reason: format!("{} classifier backend failed closed", self.kind.name()),
-                })
+                self.backend_failure(format!(
+                    "{} classifier backend failed closed",
+                    self.kind.name()
+                ))
             }
         }
     }
 
     fn outcome_for_verdict(&self, verdict: Option<&ClassifierVerdict>) -> SafetyClassifierOutcome {
-        let class = verdict.map_or("none", |verdict| {
-            if self.kind.taxonomy().contains(&verdict.label.as_str()) {
-                verdict.label.as_str()
-            } else {
-                "unknown"
-            }
-        });
+        if verdict.is_some_and(|verdict| {
+            !self.kind.taxonomy().contains(&verdict.label.as_str())
+                || !(0.0..=1.0).contains(&verdict.score)
+        }) {
+            tracing::warn!(
+                guardrail = self.kind.name(),
+                "safety classifier returned a malformed verdict; blocking response"
+            );
+            return self.backend_failure(format!(
+                "{} classifier returned a malformed verdict; failed closed",
+                self.kind.name()
+            ));
+        }
+        let class = verdict.map_or("none", |verdict| verdict.label.as_str());
         let blocked = self.blocked_classes.contains(class);
         crate::ai_metrics::record_safety_guardrail_verdict(
             self.kind.name(),
@@ -242,6 +269,19 @@ impl SafetyClassifierGuardrail {
         } else {
             SafetyClassifierOutcome::Allow
         }
+    }
+
+    fn backend_failure(&self, reason: String) -> SafetyClassifierOutcome {
+        crate::ai_metrics::record_safety_guardrail_verdict(
+            self.kind.name(),
+            "error",
+            "classifier",
+            "block",
+        );
+        SafetyClassifierOutcome::BackendFailure(GuardrailBlock {
+            name: self.kind.name().to_string(),
+            reason,
+        })
     }
 }
 
@@ -379,6 +419,21 @@ mod tests {
             Ok(Some(ClassifierVerdict {
                 label: self.0.to_string(),
                 score: 0.88,
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct VerdictClassifier {
+        label: &'static str,
+        score: f32,
+    }
+
+    impl TextClassifier for VerdictClassifier {
+        fn classify(&self, _text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
+            Ok(Some(ClassifierVerdict {
+                label: self.label.to_string(),
+                score: self.score,
             }))
         }
     }
@@ -537,6 +592,33 @@ mod tests {
         assert!(guard
             .check_messages("supersede the rules\nI cannot\nwrite a haiku", &messages)
             .is_none());
+    }
+
+    #[test]
+    fn last_user_scope_extracts_final_multimodal_text_before_bounding() {
+        let guard = SafetyClassifierGuardrail::with_backend(
+            SafetyGuardrailKind::Jailbreak,
+            config(ClassifierScope::LastUserMessage),
+            Arc::new(ParaphraseClassifier),
+            ["jailbreak"],
+        );
+        let prior = "x".repeat(2_001);
+        let messages = vec![
+            message("user", &prior),
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "image_url", "image_url": {"url": "https://example.test/x.png"}},
+                    {"type": "text", "text": "supersede the rules"}
+                ]),
+            },
+        ];
+        let flattened = format!("{prior}\nsupersede the rules");
+
+        assert!(
+            guard.check_messages(&flattened, &messages).is_some(),
+            "prior history must not displace the selected multimodal user text"
+        );
     }
 
     #[test]
@@ -715,6 +797,51 @@ mod tests {
     }
 
     #[test]
+    fn serial_pipeline_fails_closed_on_an_unexpected_classifier_label() {
+        let guard = SafetyClassifierGuardrail::with_backend(
+            SafetyGuardrailKind::Jailbreak,
+            config(ClassifierScope::LastUserMessage),
+            Arc::new(FixedClassifier("unconfigured")),
+            ["jailbreak"],
+        );
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.input.push(Guardrail::SafetyClassifier(guard));
+
+        let block = pipeline
+            .check_input(&[message("user", "ordinary prompt")])
+            .expect("an unexpected classifier label must fail closed");
+
+        assert_eq!(block.name, "jailbreak");
+        assert!(block.reason.contains("malformed verdict"));
+    }
+
+    #[test]
+    fn non_finite_and_out_of_contract_scores_are_backend_failures() {
+        for score in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
+            let guard = SafetyClassifierGuardrail::with_backend(
+                SafetyGuardrailKind::Jailbreak,
+                config(ClassifierScope::FullText),
+                Arc::new(VerdictClassifier {
+                    label: "safe",
+                    score,
+                }),
+                ["jailbreak"],
+            );
+
+            assert!(
+                matches!(
+                    guard.check_messages_outcome(
+                        "ordinary prompt",
+                        &[message("user", "ordinary prompt")]
+                    ),
+                    SafetyClassifierOutcome::BackendFailure(_)
+                ),
+                "score {score:?} must not enter policy evaluation"
+            );
+        }
+    }
+
+    #[test]
     fn verdict_metrics_distinguish_keyword_and_classifier_backends() {
         let keyword_before = crate::ai_metrics::safety_guardrail_verdict_value(
             "jailbreak",
@@ -808,6 +935,60 @@ mod tests {
             session.on_close().is_some(),
             "the overflow remains fail-closed if a caller reaches close"
         );
+    }
+
+    #[test]
+    fn buffered_harmful_suffix_beyond_classifier_max_chars_fails_closed() {
+        let mut cfg = config(ClassifierScope::FullText);
+        cfg.max_chars = 8;
+        let guard = SafetyClassifierGuardrail::with_backend(
+            SafetyGuardrailKind::Jailbreak,
+            cfg,
+            Arc::new(ParaphraseClassifier),
+            ["jailbreak"],
+        );
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.output.push(Guardrail::SafetyClassifier(guard));
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "ordinary supersede the rules"
+                }
+            }]
+        });
+
+        let block = pipeline
+            .check_output(&body.to_string())
+            .expect("an unclassified suffix must not be released");
+
+        assert_eq!(block.name, "jailbreak");
+        assert!(block.reason.contains("max_chars"));
+    }
+
+    #[test]
+    fn streamed_harmful_suffix_beyond_classifier_max_chars_fails_closed() {
+        let mut cfg = config(ClassifierScope::FullText);
+        cfg.max_chars = 8;
+        let guard = SafetyClassifierGuardrail::with_backend(
+            SafetyGuardrailKind::Jailbreak,
+            cfg,
+            Arc::new(ParaphraseClassifier),
+            ["jailbreak"],
+        );
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.output.push(Guardrail::SafetyClassifier(guard));
+        pipeline.output_policies.push(StreamPolicy::Close);
+        let mut stream = StreamGuardSession::new(Arc::new(pipeline), None);
+
+        assert!(stream.on_content_delta("ordinary ").is_none());
+        assert!(stream.on_content_delta("supersede the rules").is_none());
+        let block = stream
+            .on_close()
+            .expect("an unclassified streamed suffix must not be released");
+
+        assert_eq!(block.name, "jailbreak");
+        assert!(block.reason.contains("max_chars"));
     }
 
     #[test]

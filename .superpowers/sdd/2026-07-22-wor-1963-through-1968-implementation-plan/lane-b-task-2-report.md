@@ -257,3 +257,172 @@ No scoped correctness concern remains. The canonical terminal validator covers
 the three gateway response protocols that can reach an enforcing held body:
 OpenAI Chat, Anthropic Messages, and OpenAI Responses. Live model artifacts and
 remote classifiers remain intentionally out of scope.
+
+## Final Review Fix Wave
+
+### Outcome
+
+All seven final-review findings are closed. Enforcing classifier output now
+fails closed rather than classifying a truncated prefix, mesh latency budgets
+cannot suppress an enforcing safety classifier, zero query embeddings are
+backend errors, final multimodal user text is scoped before bounding, canonical
+stream validation covers every staged tail byte, and malformed classifier
+verdicts fail closed without entering the cache. Keyword mode remains the
+zero-dependency default. No dependency, schema, GPU, remote-classifier, or
+unrelated change was added.
+
+### Finding-to-code and regression mapping
+
+1. **Full-output enforcement (`CRITICAL`)**
+   - `SafetyClassifierGuardrail::check_output` compares the character-bounded
+     subject with the complete canonical assistant text and fails closed with
+     the bounded `class="error"` metric when any suffix would be omitted.
+     Buffered and close-policy streaming entry points use this output-specific
+     method; request-side bounded-prefix behavior is unchanged.
+   - Code: `crates/sbproxy-ai/src/guardrails/safety_classifier.rs`,
+     `crates/sbproxy-ai/src/guardrails/mod.rs`, and
+     `crates/sbproxy-ai/src/guardrails/stream.rs`.
+   - Tests:
+     `buffered_harmful_suffix_beyond_classifier_max_chars_fails_closed` and
+     `streamed_harmful_suffix_beyond_classifier_max_chars_fails_closed`.
+2. **Latency-budget/cache bypass (`IMPORTANT`)**
+   - The mesh still skips optional work after the configured budget, but always
+     evaluates `SafetyClassifierGuardrail`. Backend failures retain the
+     existing fail-closed, quorum-bypassing, non-cacheable treatment.
+   - Code and test: `crates/sbproxy-ai/src/guardrails/mesh.rs`,
+     `exhausted_budget_still_runs_enforcing_classifier_without_caching_partial_allow`.
+3. **Zero query embedding (`IMPORTANT`)**
+   - Query embeddings must have a finite L2 norm greater than
+     `f32::EPSILON`, in addition to the existing nonempty, finite-value, and
+     expected-dimension invariants. Invalid vectors return `Err`; legitimate
+     finite threshold and margin abstentions remain `Ok(None)`.
+   - Code and test: `crates/sbproxy-core/src/server/ai_classifier.rs`,
+     extended `malformed_request_embeddings_are_classifier_errors`.
+4. **Final multimodal user scope (`IMPORTANT`)**
+   - String and array message content now share one text extractor. The final
+     user message is selected and its text parts extracted before `max_chars`
+     is applied, so oversized prior history cannot displace the operative
+     multimodal prompt.
+   - Code: `crates/sbproxy-ai/src/guardrails/mod.rs` and
+     `crates/sbproxy-ai/src/guardrails/safety_classifier.rs`.
+   - Test:
+     `last_user_scope_extracts_final_multimodal_text_before_bounding`.
+5. **Canonical tail ordering (`IMPORTANT`)**
+   - Every ordinary outbound frame, translated decoder tail, and reversible
+     restorer tail is staged before the single final canonical validation.
+     Staging invalidates prior validation, and `release` refuses protected
+     bytes without a validation of the latest held state.
+   - Code and test: `crates/sbproxy-core/src/server/ai_dispatch.rs`,
+     `canonical_validation_is_invalidated_by_a_late_tail_before_release`.
+6. **Malformed classifier verdict (`IMPORTANT`)**
+   - Safety classifiers accept only their closed configured taxonomy and a
+     finite score in `[0, 1]`. Unexpected labels and invalid scores become
+     `SafetyClassifierOutcome::BackendFailure`, record only
+     `class="error"`, bypass mesh quorum, and are not cached.
+   - Code: `crates/sbproxy-ai/src/guardrails/safety_classifier.rs`.
+   - Tests:
+     `serial_pipeline_fails_closed_on_an_unexpected_classifier_label`,
+     `non_finite_and_out_of_contract_scores_are_backend_failures`, and
+     `mesh_fails_closed_and_does_not_cache_an_unexpected_classifier_label`.
+7. **Stale construction comment (`MINOR`)**
+   - `crates/sbproxy-core/src/server/ai_classifier.rs` now states that any
+     malformed configured example rejects construction; it no longer claims
+     malformed examples are skipped.
+
+### Strict TDD evidence
+
+Each production change followed an observed regression failure for the
+intended reason:
+
+1. Full-output enforcement:
+   - RED:
+     `cargo nextest run -p sbproxy-ai --locked -E 'test(buffered_harmful_suffix_beyond_classifier_max_chars_fails_closed) or test(streamed_harmful_suffix_beyond_classifier_max_chars_fails_closed)'`
+     failed 0/2 because both paths classified the safe bounded prefix and
+     returned no block.
+   - GREEN:
+     `cargo nextest run -p sbproxy-ai --locked -E 'test(buffered_harmful_suffix_beyond_classifier_max_chars_fails_closed) or test(streamed_harmful_suffix_beyond_classifier_max_chars_fails_closed) or test(buffered_envelopes_and_streamed_deltas_classify_the_same_assistant_text)'`
+     passed 3/3.
+2. Exhausted mesh budget:
+   - RED:
+     `cargo nextest run -p sbproxy-ai --locked -E 'test(exhausted_budget_still_runs_enforcing_classifier_without_caching_partial_allow)'`
+     failed 0/1 at `the first backend failure must fail closed`; the backend
+     was skipped and the empty allow was cached.
+   - GREEN:
+     `cargo nextest run -p sbproxy-ai --locked -E 'test(exhausted_budget_still_runs_enforcing_classifier_without_caching_partial_allow) or test(mesh_does_not_cache_an_enforcing_classifier_backend_error_as_allow) or test(enforcing_classifier_backend_error_blocks_regardless_of_mesh_quorum)'`
+     passed 3/3.
+3. Zero query embedding:
+   - RED:
+     `cargo nextest run -p sbproxy-core --features inprocess-classify --locked -E 'test(malformed_request_embeddings_are_classifier_errors)'`
+     failed 0/1 because `[0.0, 0.0]` became an abstention.
+   - GREEN:
+     `cargo nextest run -p sbproxy-core --features inprocess-classify --locked -E 'test(malformed_request_embeddings_are_classifier_errors) or test(legitimate_threshold_and_margin_abstentions_remain_ok_none)'`
+     passed 2/2.
+4. Multimodal last-user scope:
+   - RED:
+     `cargo nextest run -p sbproxy-ai --locked -E 'test(last_user_scope_extracts_final_multimodal_text_before_bounding)'`
+     failed 0/1 because the selected array fell back to the oversized flattened
+     history.
+   - GREEN:
+     `cargo nextest run -p sbproxy-ai --locked -E 'test(last_user_scope_extracts_final_multimodal_text_before_bounding) or test(input_scope_uses_only_the_last_user_message) or test(extract_text_multimodal_content)'`
+     passed 3/3.
+5. Tail validation ordering:
+   - RED:
+     `cargo nextest run -p sbproxy-core --locked -E 'test(canonical_validation_is_invalidated_by_a_late_tail_before_release)'`
+     failed 0/1 because bytes staged after a previously valid terminal remained
+     releasable.
+   - GREEN:
+     `cargo nextest run -p sbproxy-core --locked -E 'test(canonical_validation_is_invalidated_by_a_late_tail_before_release) or test(relay_emits_no_body_bytes_before_classifier_close_verdict) or test(canonical_terminal_allows_fragmented_sse_grammar_without_changing_bytes)'`
+     passed 3/3.
+6. Malformed verdicts:
+   - RED:
+     `cargo nextest run -p sbproxy-ai --locked -E 'test(serial_pipeline_fails_closed_on_an_unexpected_classifier_label) or test(non_finite_and_out_of_contract_scores_are_backend_failures) or test(mesh_fails_closed_and_does_not_cache_an_unexpected_classifier_label)'`
+     failed 0/3: serial and mesh paths allowed the unexpected label, and the
+     score cases did not become backend failures.
+   - GREEN:
+     `cargo nextest run -p sbproxy-ai --locked -E 'test(serial_pipeline_fails_closed_on_an_unexpected_classifier_label) or test(non_finite_and_out_of_contract_scores_are_backend_failures) or test(mesh_fails_closed_and_does_not_cache_an_unexpected_classifier_label) or test(backend_error_fails_closed_and_is_not_recorded_as_allow) or test(ordinary_threshold_abstention_remains_an_allow)'`
+     passed 5/5.
+
+### Verification
+
+- Acceptance set:
+  `cargo nextest run -p sbproxy-ai -p sbproxy-core --features sbproxy-core/inprocess-classify --locked -E 'test(buffered_harmful_suffix_beyond_classifier_max_chars_fails_closed) or test(streamed_harmful_suffix_beyond_classifier_max_chars_fails_closed) or test(exhausted_budget_still_runs_enforcing_classifier_without_caching_partial_allow) or test(malformed_request_embeddings_are_classifier_errors) or test(last_user_scope_extracts_final_multimodal_text_before_bounding) or test(canonical_validation_is_invalidated_by_a_late_tail_before_release) or test(serial_pipeline_fails_closed_on_an_unexpected_classifier_label) or test(non_finite_and_out_of_contract_scores_are_backend_failures) or test(mesh_fails_closed_and_does_not_cache_an_unexpected_classifier_label)'`:
+  passed 9/9.
+- Affected suites:
+  `cargo nextest run -p sbproxy-ai -p sbproxy-core --features sbproxy-core/inprocess-classify --locked`:
+  passed 2273/2273 with 11 skipped.
+- Lint:
+  `cargo clippy -p sbproxy-ai -p sbproxy-core --features sbproxy-core/inprocess-classify --all-targets -- -D warnings`:
+  passed.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+
+The controller will run final exact-tree verification, so the full workspace
+lane was not duplicated in this fix wave.
+
+### Self-review
+
+- Hot-path bounds: output-size detection scans at most `max_chars + 1`
+  Unicode scalar values and refuses a larger output before inference. The
+  stream close buffer and relay body remain bounded by their existing byte
+  caps. Mesh budget exhaustion walks the bounded configured guard list only to
+  find enforcing safety classifiers.
+- Byte fidelity: `RelayBodyHoldback` continues storing the original `Bytes`
+  chunks and releases them in original order. Canonical framing observes but
+  never reserializes held bytes. Fragmented SSE byte-fidelity coverage remains
+  green.
+- Fail-closed/cache behavior: backend errors and malformed verdicts both use
+  `SecurityBackendFailure`; they bypass quorum and cannot enter the verdict
+  cache. Optional mesh budget work remains optional, but enforcing safety
+  classifiers cannot be skipped.
+- Scope and compatibility: keyword code/config defaults were untouched.
+  Request subjects still use the configured bounded prefix. Only complete
+  enforcing output subjects fail closed above the backend maximum.
+- Scope audit: no dependency, schema, GPU, remote classifier, external ledger,
+  integration, or unrelated files changed.
+
+### Remaining concerns
+
+No scoped correctness concern remains. Failing closed on enforcing assistant
+output longer than `max_chars` is intentionally conservative; operators that
+need longer classifier-backed output must raise the existing bound within the
+relay/stream caps.

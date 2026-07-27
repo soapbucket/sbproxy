@@ -476,7 +476,7 @@ impl GuardrailPipeline {
         for guard in &self.output {
             let block = match guard {
                 Guardrail::SafetyClassifier(classifier) => match classifier_subject.as_deref() {
-                    Some(subject) => classifier.check(subject),
+                    Some(subject) => classifier.check_output(subject),
                     None => Some(GuardrailBlock {
                         name: classifier.name().to_string(),
                         reason: format!(
@@ -605,25 +605,28 @@ pub fn message_text(messages: &[Message]) -> String {
     extract_text_from_messages(messages)
 }
 
+pub(crate) fn message_content_text(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>();
+            (!text.is_empty()).then(|| text.join("\n"))
+        }
+        _ => None,
+    }
+}
+
 /// Extract text content from a slice of messages.
 /// Handles both string content and multimodal arrays.
 fn extract_text_from_messages(messages: &[Message]) -> String {
-    let mut parts = Vec::new();
-    for msg in messages {
-        match &msg.content {
-            serde_json::Value::String(s) => parts.push(s.as_str().to_owned()),
-            serde_json::Value::Array(arr) => {
-                for item in arr {
-                    // Multimodal format: [{"type": "text", "text": "..."}]
-                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                        parts.push(text.to_owned());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    parts.join("\n")
+    messages
+        .iter()
+        .filter_map(|message| message_content_text(&message.content))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Compile a guardrail from a JSON config value.

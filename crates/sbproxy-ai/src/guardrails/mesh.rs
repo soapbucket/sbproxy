@@ -12,9 +12,10 @@
 //! - **Redact-and-continue**: a flagged-but-not-blocked request can have its
 //!   prompt masked and proceed, rather than only pass or block.
 //! - **Latency-SLO cascade + verdict cache**: cheap detectors (regex, PII,
-//!   schema) run first, and once a wall-clock budget is spent the remaining
-//!   expensive classifiers are skipped; a content-addressed cache lets a
-//!   repeated prompt skip re-running the detectors entirely.
+//!   schema) run first, and once a wall-clock budget is spent optional
+//!   expensive classifiers are skipped; enforcing safety classifiers always
+//!   run. A content-addressed cache lets a repeated prompt skip re-running the
+//!   detectors entirely.
 //!
 //! Default off: with no `mesh` block the dispatch path keeps using the
 //! serial, block-on-any check.
@@ -47,9 +48,9 @@ pub struct GuardrailMeshConfig {
     /// through untouched. Routing labels do not trigger redaction.
     #[serde(default)]
     pub redact_on_flag: bool,
-    /// Wall-clock budget for running the detectors. Once exceeded, the
-    /// cascade stops launching further (expensive) detectors. `None` runs
-    /// them all.
+    /// Wall-clock budget for running optional detectors. Once exceeded, the
+    /// cascade skips remaining optional work but still runs enforcing safety
+    /// classifiers. `None` runs every detector.
     #[serde(default)]
     pub latency_budget_ms: Option<u64>,
     /// Cache verdicts by prompt text, role/content structure, and role-aware
@@ -260,8 +261,9 @@ impl GuardrailMesh {
         }
     }
 
-    /// Run every input guardrail, cheap-first, collecting all verdicts.
-    /// Stops launching further detectors once the latency budget is spent.
+    /// Run input guardrails cheap-first, collecting all verdicts. Optional
+    /// detectors are skipped once the latency budget is spent; enforcing
+    /// safety classifiers are never skipped.
     fn collect_cascade(
         &self,
         pipeline: &GuardrailPipeline,
@@ -278,8 +280,10 @@ impl GuardrailMesh {
         let mut out = Vec::new();
         for idx in order {
             if let Some(ms) = budget {
-                if start.elapsed().as_millis() as u64 >= ms {
-                    break;
+                if start.elapsed().as_millis() as u64 >= ms
+                    && !matches!(pipeline.input[idx], Guardrail::SafetyClassifier(_))
+                {
+                    continue;
                 }
             }
             // WOR-1692: reuse the text already extracted for the cache
@@ -348,6 +352,25 @@ mod tests {
             }
             Ok(Some(ClassifierVerdict {
                 label: "safe".to_string(),
+                score: 0.91,
+            }))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecoveringUnexpectedSafetyClassifier {
+        calls: AtomicUsize,
+    }
+
+    impl TextClassifier for RecoveringUnexpectedSafetyClassifier {
+        fn classify(&self, _text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
+            let label = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                "unconfigured"
+            } else {
+                "safe"
+            };
+            Ok(Some(ClassifierVerdict {
+                label: label.to_string(),
                 score: 0.91,
             }))
         }
@@ -516,6 +539,31 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_budget_still_runs_enforcing_classifier_without_caching_partial_allow() {
+        let mut config = cfg(1);
+        config.latency_budget_ms = Some(0);
+        config.cache = true;
+        let mesh = GuardrailMesh::new(config);
+        let backend = Arc::new(RecoveringSafetyClassifier::default());
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.input.push(safety_classifier(backend.clone()));
+
+        let first = eval(&mesh, &pipeline, "same prompt");
+        let second = eval(&mesh, &pipeline, "same prompt");
+
+        assert!(first.block, "the first backend failure must fail closed");
+        assert!(
+            !second.block,
+            "the enforcing classifier must run again after its transient failure"
+        );
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            2,
+            "an exhausted optional budget must not skip an enforcing classifier"
+        );
+    }
+
+    #[test]
     fn enforcing_classifier_backend_error_blocks_regardless_of_mesh_quorum() {
         let mesh = GuardrailMesh::new(cfg(2));
         let backend = Arc::new(RecoveringSafetyClassifier::default());
@@ -529,6 +577,33 @@ mod tests {
             "an enforcing backend failure must fail closed even below the configured quorum"
         );
         assert_eq!(decision.security_labels, ["jailbreak"]);
+    }
+
+    #[test]
+    fn mesh_fails_closed_and_does_not_cache_an_unexpected_classifier_label() {
+        let mut config = cfg(2);
+        config.cache = true;
+        let mesh = GuardrailMesh::new(config);
+        let backend = Arc::new(RecoveringUnexpectedSafetyClassifier::default());
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.input.push(safety_classifier(backend.clone()));
+
+        let first = eval(&mesh, &pipeline, "same prompt");
+        let second = eval(&mesh, &pipeline, "same prompt");
+
+        assert!(
+            first.block,
+            "a malformed enforcing verdict must fail closed below quorum"
+        );
+        assert!(
+            !second.block,
+            "the malformed verdict must not become a cached decision"
+        );
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            2,
+            "the backend must be retried after a malformed verdict"
+        );
     }
 
     #[test]

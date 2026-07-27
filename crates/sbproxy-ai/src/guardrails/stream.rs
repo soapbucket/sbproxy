@@ -399,7 +399,11 @@ impl StreamGuardSession {
                 subject
             });
         for &i in &self.at_close {
-            if let Some(block) = self.pipeline.output[i].check(&close_subject) {
+            let block = match &self.pipeline.output[i] {
+                Guardrail::SafetyClassifier(classifier) => classifier.check_output(&close_subject),
+                guard => guard.check(&close_subject),
+            };
+            if let Some(block) = block {
                 return Some(block);
             }
         }

@@ -124,6 +124,10 @@ fn classify_embedding(
     if embedding.iter().any(|value| !value.is_finite()) {
         anyhow::bail!("classifier query embedding contains a non-finite value");
     }
+    let norm = dot(embedding, embedding).sqrt();
+    if !norm.is_finite() || norm <= f32::EPSILON {
+        anyhow::bail!("classifier query embedding has no usable direction");
+    }
     if embedding.len() != expected_dimension {
         anyhow::bail!(
             "classifier query embedding dimension {} does not match {expected_dimension}",
@@ -438,10 +442,9 @@ fn shared_embedder(
 
 /// Build a classifier backend for `cfg`.
 ///
-/// Embed every configured class and require each one to produce a unit
-/// centroid. Individual bad examples are skipped, but dropping an entire
-/// class would silently change the configured taxonomy and is therefore
-/// a construction error.
+/// Embed every configured example and require each class to produce a unit
+/// centroid. A malformed example rejects construction because skipping it
+/// would silently change the configured classifier.
 #[cfg(feature = "inprocess-classify")]
 fn embed_class_examples(
     cfg: &sbproxy_ai::guardrails::ClassifierConfig,
@@ -679,6 +682,7 @@ mod tests {
         ];
         for malformed in [
             Vec::new(),
+            vec![0.0, 0.0],
             vec![f32::NAN, 0.0],
             vec![f32::INFINITY, 0.0],
             vec![1.0, 0.0, 0.0],

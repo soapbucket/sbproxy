@@ -6665,6 +6665,7 @@ struct RelayBodyHoldback {
     canonical_protocol: Option<CanonicalSseProtocol>,
     canonical_terminal: bool,
     canonical_invalid: bool,
+    canonical_validated: bool,
 }
 
 /// The canonical stream syntax used for a classifier-held response body.
@@ -6687,6 +6688,7 @@ impl RelayBodyHoldback {
             canonical_protocol: None,
             canonical_terminal: false,
             canonical_invalid: false,
+            canonical_validated: false,
         }
     }
 
@@ -6697,6 +6699,7 @@ impl RelayBodyHoldback {
         let Some(guardrail) = self.guardrail.as_deref() else {
             return Ok(Some(bytes));
         };
+        self.canonical_validated = false;
         if self.failed || self.buffered_bytes.saturating_add(bytes.len()) > self.max_bytes {
             self.failed = true;
             self.buffered_bytes = 0;
@@ -6720,10 +6723,11 @@ impl RelayBodyHoldback {
     }
 
     fn release(&mut self) -> Vec<Bytes> {
-        if self.failed {
+        if self.failed || (self.guardrail.is_some() && !self.canonical_validated) {
             return Vec::new();
         }
         self.buffered_bytes = 0;
+        self.canonical_validated = false;
         std::mem::take(&mut self.chunks)
     }
 
@@ -6742,7 +6746,9 @@ impl RelayBodyHoldback {
         &mut self,
         _decoder_yielded: bool,
     ) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
+        self.canonical_validated = false;
         if self.buffered_bytes == 0 {
+            self.canonical_validated = true;
             return None;
         }
         if self.sse_framer.flush().is_some() {
@@ -6766,6 +6772,7 @@ impl RelayBodyHoldback {
                 ),
             });
         }
+        self.canonical_validated = true;
         None
     }
 
@@ -6921,18 +6928,24 @@ mod stream_classifier_holdback_tests {
         let mut holdback = RelayBodyHoldback::new(Some("jailbreak"), 1024);
         let mut downstream = Vec::new();
 
-        relay_one(&mut holdback, &mut downstream, b"data: first\n\n").expect("first frame");
-        relay_one(&mut holdback, &mut downstream, b"data: second\n\n").expect("second frame");
+        relay_one(
+            &mut holdback,
+            &mut downstream,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"safe\"}}]}\n\n",
+        )
+        .expect("content frame");
+        relay_one(&mut holdback, &mut downstream, b"data: [DONE]\n\n").expect("terminal frame");
 
         assert!(
             downstream.is_empty(),
             "no response-body frame may reach the client before the close verdict"
         );
+        assert!(holdback.close_decode_block(true).is_none());
 
         downstream.extend(holdback.release());
         assert_eq!(
             downstream.concat(),
-            b"data: first\n\ndata: second\n\n",
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"safe\"}}]}\n\ndata: [DONE]\n\n",
             "a clean close releases the original frames in order"
         );
     }
@@ -7044,6 +7057,38 @@ mod stream_classifier_holdback_tests {
 
         assert_eq!(block.name, "jailbreak");
         assert!(block.reason.contains("terminal"));
+    }
+
+    #[test]
+    fn canonical_validation_is_invalidated_by_a_late_tail_before_release() {
+        let mut protected = RelayBodyHoldback::new(Some("jailbreak"), 2048);
+        let mut downstream = Vec::new();
+        relay_one(
+            &mut protected,
+            &mut downstream,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"safe\"}}]}\n\n",
+        )
+        .expect("stage content");
+        relay_one(&mut protected, &mut downstream, b"data: [DONE]\n\n").expect("stage terminal");
+        assert!(
+            protected.close_decode_block(true).is_none(),
+            "the complete prefix is initially valid"
+        );
+
+        relay_one(
+            &mut protected,
+            &mut downstream,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"}}]}\n\n",
+        )
+        .expect("stage late tail");
+        assert!(
+            protected.close_decode_block(true).is_some(),
+            "an event after the terminal invalidates the canonical stream"
+        );
+        assert!(
+            protected.release().is_empty(),
+            "bytes staged after validation must not remain releasable"
+        );
     }
 
     #[test]
@@ -7708,26 +7753,6 @@ pub(super) async fn relay_ai_stream(
                 if guard_decoder.is_some() && !tail_events.is_empty() {
                     guard_decoder_yielded = true;
                 }
-                if let Some(block) =
-                    response_body_holdback.close_decode_block(guard_decoder_yielded)
-                {
-                    warn!(
-                        guardrail = %block.name,
-                        reason = %block.reason,
-                        "AI proxy: enforcing output classifier stream decode failed closed"
-                    );
-                    sbproxy_ai::ai_metrics::record_stream_guardrail_violation(&block.name);
-                    sbproxy_ai::tracing_spans::record_error(
-                        &ai_span,
-                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                        &block.reason,
-                    );
-                    if let Some(c) = ctx.as_deref_mut() {
-                        mark_guardrail_block(c, block.name.clone());
-                    }
-                    output_guard_blocked = true;
-                    break;
-                }
 
                 // --- WOR-1810: final guardrail pass BEFORE tail
                 // emission: tail events, pending tool calls, the
@@ -7871,6 +7896,26 @@ pub(super) async fn relay_ai_stream(
                             break 'relay;
                         }
                     }
+                }
+                if let Some(block) =
+                    response_body_holdback.close_decode_block(guard_decoder_yielded)
+                {
+                    warn!(
+                        guardrail = %block.name,
+                        reason = %block.reason,
+                        "AI proxy: enforcing output classifier stream decode failed closed"
+                    );
+                    sbproxy_ai::ai_metrics::record_stream_guardrail_violation(&block.name);
+                    sbproxy_ai::tracing_spans::record_error(
+                        &ai_span,
+                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                        &block.reason,
+                    );
+                    if let Some(c) = ctx.as_deref_mut() {
+                        mark_guardrail_block(c, block.name.clone());
+                    }
+                    output_guard_blocked = true;
+                    break;
                 }
                 for ready in response_body_holdback.release() {
                     if let Some(trace) = trace_stream_content.as_mut() {
