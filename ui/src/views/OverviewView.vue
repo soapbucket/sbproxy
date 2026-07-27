@@ -12,9 +12,12 @@ import EmptyState from "../components/EmptyState.vue";
 // This page's subtitle promises live health, so it polls. 10s on health
 // (the thing an operator is actually watching) and 30s on the heavier
 // aggregate panels.
-const health = useAsync(() => api.health(), { pollMs: 10_000 });
-const stats = useAsync(() => api.stats(), { pollMs: 30_000 });
-const modelHost = useAsync(() => api.modelHostStatus(), { pollMs: 30_000 });
+const health = useAsync(() => api.health(), { pollMs: 10_000, refreshLabel: "Health" });
+const stats = useAsync(() => api.stats(), { pollMs: 30_000, refreshLabel: "Stats" });
+const modelHost = useAsync(() => api.modelHostStatus(), {
+  pollMs: 30_000,
+  refreshLabel: "Model host status",
+});
 
 function refresh() {
   health.run();

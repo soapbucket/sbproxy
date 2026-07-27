@@ -1,5 +1,6 @@
 import { onScopeDispose, ref, shallowRef, type Ref, type ShallowRef } from "vue";
 import { ApiError } from "../api";
+import { toast } from "./useToasts";
 
 export interface AsyncState<T> {
   data: ShallowRef<T | null>;
@@ -23,6 +24,16 @@ export interface UseAsyncOptions {
    * requests nor shows a stale panel when the operator returns.
    */
   pollMs?: number;
+  /**
+   * Human name for what is being loaded ("Compression sessions"). When set,
+   * a background refresh that fails over data already on screen raises an
+   * error toast, because the view keeps showing the last good data and
+   * would otherwise go stale silently.
+   *
+   * The first load needs no label: it fails into `error`, and views render
+   * that as a full error panel.
+   */
+  refreshLabel?: string;
 }
 
 /**
@@ -46,6 +57,9 @@ export function useAsync<T>(
   const lastLoadedAt = ref<Date | null>(null);
   let latestInvocation = 0;
   let inFlight = false;
+  // True once a background refresh has failed and not yet recovered, so a
+  // loop of failing polls toasts once rather than on every tick.
+  let refreshFailing = false;
 
   async function run() {
     inFlight = true;
@@ -65,13 +79,18 @@ export function useAsync<T>(
       if (invocation !== latestInvocation) return;
       data.value = loaded;
       succeeded.value = true;
+      refreshFailing = false;
       lastLoadedAt.value = new Date();
     } catch (e) {
       if (invocation !== latestInvocation) return;
-      if (e instanceof ApiError) {
-        error.value = e;
-      } else {
-        error.value = new ApiError(0, String(e));
+      const err = e instanceof ApiError ? e : new ApiError(0, String(e));
+      error.value = err;
+      // A failed refresh leaves stale data on screen with no error panel,
+      // so say so once per failure streak. 401 is excluded: the session
+      // handler redirects to login, and a toast would race that.
+      if (options.refreshLabel && !isFirst && !refreshFailing && err.status !== 401) {
+        refreshFailing = true;
+        toast.error(err, `Refreshing ${options.refreshLabel.toLowerCase()}`);
       }
     } finally {
       if (invocation === latestInvocation) {

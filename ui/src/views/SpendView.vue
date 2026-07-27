@@ -347,7 +347,14 @@ const hasHistory = computed(() => historyRows.value.length > 0);
 
     <section class="panel" v-if="hasOrigins">
       <h2>Spend by origin</h2>
-      <MiniBars :items="spendByOrigin" :format="formatUsd" />
+      <!-- Origin is the one spend dimension the request log can filter on,
+           so it is the one that gets a link. Linking the others would land
+           the operator on an unfiltered log, which is worse than no link. -->
+      <MiniBars
+        :items="spendByOrigin"
+        :format="formatUsd"
+        :link-for="(origin: string) => `/logs?origin=${encodeURIComponent(origin)}`"
+      />
     </section>
 
     <section class="panel" v-if="hasKeys">

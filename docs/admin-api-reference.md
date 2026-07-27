@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-07-25*
+*Last modified: 2026-07-26*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -706,6 +706,27 @@ Success is `202 {"queued":true,"channel_index":0}`. A malformed body is
 bounded command queue is `503`. Poll `GET /api/alerts` until that channel's
 `health.last_attempt_at` changes to observe the delivery result. This endpoint
 tests delivery only and cannot create, edit, or delete rules or channels.
+
+### `GET /api/admin/users`
+
+The accounts that can sign in to the admin server, with their roles.
+
+```json
+{"users": [
+  {"username": "admin", "role": "admin", "primary": true},
+  {"username": "viewer", "role": "read_only", "primary": false}
+]}
+```
+
+`primary` marks the top-level `admin.username` credential, which always
+carries the full-access `admin` role; the remaining rows are
+`admin.operators` entries. Passwords are never included in the response.
+
+This route is read-only by design. Accounts are config, not API state:
+add, remove, or re-role one by editing `admin.username` /
+`admin.operators` and reloading. The list is built from the same config
+`POST /admin/login` authenticates against, so it cannot report an
+account that does not work.
 
 ### `GET /api/audit/recent`
 

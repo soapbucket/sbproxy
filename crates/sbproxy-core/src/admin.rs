@@ -2279,6 +2279,36 @@ pub fn handle_admin_request(
             ),
         };
     }
+    // Who can sign in to this console, and with what role. Sourced from
+    // the same config `check_operator_login` authenticates against, so the
+    // list cannot drift from the accounts that actually work. Passwords are
+    // never included: this answers "who has access", not "what is the
+    // secret". Accounts are managed in config, not through this route.
+    if path_only == "/api/admin/users" {
+        let mut users = vec![serde_json::json!({
+            "username": state.config.username,
+            "role": "admin",
+            "primary": true,
+        })];
+        users.extend(state.config.operators.iter().map(|op| {
+            serde_json::json!({
+                "username": op.username,
+                "role": match op.role {
+                    AdminRole::ReadOnly => "read_only",
+                    AdminRole::Admin => "admin",
+                },
+                "primary": false,
+            })
+        }));
+        return match serde_json::to_string(&serde_json::json!({ "users": users })) {
+            Ok(body) => (200, "application/json", body),
+            Err(e) => (
+                500,
+                "application/json",
+                format!(r#"{{"error":"serialization failed: {e}"}}"#),
+            ),
+        };
+    }
     if path_only == "/api/audit/recent" {
         let limit: usize = rl_query_param(path, "limit")
             .and_then(|s| s.parse().ok())
@@ -6698,6 +6728,44 @@ origins:
         let store = overlay.by_host.get("example.com").unwrap();
         let prompt = store.templates.get("greet").unwrap();
         assert_eq!(prompt.default_version.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn admin_users_lists_roles_and_never_passwords() {
+        let mut cfg = make_state().config.clone();
+        cfg.operators = vec![
+            AdminOperator {
+                username: "viewer".to_string(),
+                password: "viewer-secret".to_string(),
+                role: AdminRole::ReadOnly,
+            },
+            AdminOperator {
+                username: "oncall".to_string(),
+                password: "oncall-secret".to_string(),
+                role: AdminRole::Admin,
+            },
+        ];
+        let state = AdminState::new(cfg);
+        let auth = basic_auth("admin", "secret");
+        let (status, _, body) =
+            handle_admin_request("GET", "/api/admin/users", &state, Some(&auth), None);
+        assert_eq!(status, 200);
+
+        // No password, in any form, reaches the console.
+        assert!(!body.contains("viewer-secret"), "leaked operator password");
+        assert!(!body.contains("oncall-secret"), "leaked operator password");
+        assert!(!body.contains("secret"), "leaked a password: {body}");
+
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let users = v["users"].as_array().unwrap();
+        assert_eq!(users.len(), 3, "primary admin plus both operators");
+        assert_eq!(users[0]["username"], "admin");
+        assert_eq!(users[0]["role"], "admin");
+        assert_eq!(users[0]["primary"], true);
+        assert_eq!(users[1]["username"], "viewer");
+        assert_eq!(users[1]["role"], "read_only");
+        assert_eq!(users[1]["primary"], false);
+        assert_eq!(users[2]["role"], "admin");
     }
 
     #[test]

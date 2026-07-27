@@ -16,7 +16,7 @@ import EmptyState from "../components/EmptyState.vue";
 
 // A firing alert nobody sees is the failure mode this page exists to
 // prevent, so it refreshes on its own.
-const req = useAsync(() => api.alerts(), { pollMs: 15_000 });
+const req = useAsync(() => api.alerts(), { pollMs: 15_000, refreshLabel: "Alerts" });
 const snapshot = computed(() => req.data.value);
 onMounted(req.run);
 

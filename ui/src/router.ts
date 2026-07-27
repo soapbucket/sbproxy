@@ -117,6 +117,18 @@ const routes = [
     meta: { title: "Cluster" },
   },
   {
+    path: "/compression",
+    name: "compression",
+    component: () => import("./views/CompressionView.vue"),
+    meta: { title: "Compression" },
+  },
+  {
+    path: "/users",
+    name: "users",
+    component: () => import("./views/UsersView.vue"),
+    meta: { title: "Users" },
+  },
+  {
     path: "/login",
     name: "login",
     component: () => import("./views/LoginView.vue"),

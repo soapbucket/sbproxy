@@ -60,6 +60,9 @@ onMounted(() => {
   if (typeof guardrail === "string") fGuardrail.value = guardrail;
   const session = route.query.session_id;
   if (typeof session === "string") fSession.value = session;
+  // Arrived from a spend row: pre-filter to the origin that produced it.
+  const origin = route.query.origin;
+  if (typeof origin === "string") fOrigin.value = origin;
   req.run();
   loadLogLevel();
   loadUiSettings();

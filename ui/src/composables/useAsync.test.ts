@@ -1,8 +1,9 @@
 import { effectScope } from "vue";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError } from "../api";
 import { useAsync } from "./useAsync";
+import { toast, useToasts } from "./useToasts";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -136,5 +137,102 @@ describe("useAsync polling", () => {
     expect(calls).toBe(0);
     scope.stop();
     vi.useRealTimers();
+  });
+
+});
+
+describe("useAsync refreshLabel", () => {
+  // Sibling tests opt into fake timers without restoring them.
+  beforeEach(() => vi.useRealTimers());
+
+  it("toasts once per failure streak when a refresh fails over existing data", async () => {
+    toast.clear();
+    const { toasts } = useToasts();
+    let attempt = 0;
+    const loader = vi.fn(async () => {
+      attempt += 1;
+      if (attempt === 1) return "first-good";
+      throw new ApiError(500, "upstream exploded");
+    });
+
+    const scope = effectScope();
+    const state = scope.run(() => useAsync(loader, { refreshLabel: "Alerts" }))!;
+
+    await state.run();
+    expect(state.data.value).toBe("first-good");
+    expect(toasts).toHaveLength(0);
+
+    // First failing refresh: stale data stays, so say so.
+    await state.run();
+    expect(state.data.value).toBe("first-good");
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0].kind).toBe("error");
+    expect(toasts[0].message).toBe("Refreshing alerts failed");
+
+    // Still failing: no second toast for the same streak.
+    await state.run();
+    expect(toasts).toHaveLength(1);
+
+    scope.stop();
+    toast.clear();
+  });
+
+  it("stays silent on a first-load failure and on 401", async () => {
+    toast.clear();
+    const { toasts } = useToasts();
+
+    // First load has no data to go stale; the view renders an error panel.
+    const failFirst = vi.fn(async () => {
+      throw new ApiError(500, "nope");
+    });
+    const scopeA = effectScope();
+    const a = scopeA.run(() => useAsync(failFirst, { refreshLabel: "Alerts" }))!;
+    await a.run();
+    expect(a.error.value?.status).toBe(500);
+    expect(toasts).toHaveLength(0);
+    scopeA.stop();
+
+    // 401 belongs to the session handler's redirect, not to a toast.
+    let n = 0;
+    const expire = vi.fn(async () => {
+      n += 1;
+      if (n === 1) return "good";
+      throw new ApiError(401, "session expired");
+    });
+    const scopeB = effectScope();
+    const b = scopeB.run(() => useAsync(expire, { refreshLabel: "Alerts" }))!;
+    await b.run();
+    await b.run();
+    expect(b.error.value?.status).toBe(401);
+    expect(toasts).toHaveLength(0);
+    scopeB.stop();
+    toast.clear();
+  });
+
+  it("re-arms the toast after a recovery", async () => {
+    toast.clear();
+    const { toasts } = useToasts();
+    const script = ["ok", "fail", "ok", "fail"];
+    let i = 0;
+    const loader = vi.fn(async () => {
+      const step = script[i++];
+      if (step === "fail") throw new ApiError(503, "flap");
+      return step;
+    });
+
+    const scope = effectScope();
+    const state = scope.run(() => useAsync(loader, { refreshLabel: "Stats" }))!;
+    await state.run();
+    await state.run();
+    expect(toasts).toHaveLength(1);
+
+    // Recovered, then failed again: that is a new streak worth reporting.
+    await state.run();
+    toast.clear();
+    await state.run();
+    expect(toasts).toHaveLength(1);
+
+    scope.stop();
+    toast.clear();
   });
 });

@@ -8,6 +8,12 @@ const props = defineProps<{
   format?: (v: number) => string;
   /** Fill for bars without their own color. Defaults to series 1. */
   color?: string;
+  /**
+   * Turn each label into a link to the requests behind it. Given the bar's
+   * key, return a router path. Omit for a plain, unlinked chart: a label
+   * that looks clickable and is not is worse than no link at all.
+   */
+  linkFor?: (key: string) => string;
 }>();
 
 const max = computed(() =>
@@ -23,7 +29,15 @@ function fmt(v: number): string {
   <div class="bars">
     <div class="bar" v-for="item in items" :key="item.key">
       <div class="bar__head">
-        <span class="bar__key sb-mono">{{ item.key }}</span>
+        <RouterLink
+          v-if="linkFor"
+          class="bar__key bar__key--link sb-mono"
+          :to="linkFor(item.key)"
+          :title="`Show requests for ${item.key}`"
+        >
+          {{ item.key }}
+        </RouterLink>
+        <span v-else class="bar__key sb-mono">{{ item.key }}</span>
         <span class="bar__val">{{
           format ? format(item.value) : fmt(item.value) + (unit || "")
         }}</span>
@@ -71,5 +85,14 @@ function fmt(v: number): string {
 }
 .bar__fill {
   height: 100%;
+}
+.bar__key--link {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+}
+.bar__key--link:hover {
+  text-decoration-style: solid;
 }
 </style>
