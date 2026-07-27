@@ -475,9 +475,17 @@ impl GuardrailPipeline {
         let classifier_subject = assistant_response_text(content);
         for guard in &self.output {
             let block = match guard {
-                Guardrail::SafetyClassifier(classifier) => {
-                    classifier.check(classifier_subject.as_deref().unwrap_or(content))
-                }
+                Guardrail::SafetyClassifier(classifier) => match classifier_subject.as_deref() {
+                    Some(subject) => classifier.check(subject),
+                    None => Some(GuardrailBlock {
+                        name: classifier.name().to_string(),
+                        reason: format!(
+                            "{} classifier could not extract a canonical assistant response; \
+                                 failed closed",
+                            classifier.name()
+                        ),
+                    }),
+                },
                 _ => guard.check(content),
             };
             if let Some(block) = block {
@@ -485,6 +493,24 @@ impl GuardrailPipeline {
             }
         }
         None
+    }
+
+    /// Check a buffered output body without treating invalid UTF-8 as a
+    /// harmless non-classifier response.
+    pub fn check_output_bytes(&self, content: &[u8]) -> Option<GuardrailBlock> {
+        match std::str::from_utf8(content) {
+            Ok(content) => self.check_output(content),
+            Err(_) => self.output.iter().find_map(|guard| match guard {
+                Guardrail::SafetyClassifier(classifier) => Some(GuardrailBlock {
+                    name: classifier.name().to_string(),
+                    reason: format!(
+                        "{} classifier could not decode a canonical assistant response; failed closed",
+                        classifier.name()
+                    ),
+                }),
+                _ => None,
+            }),
+        }
     }
 }
 
@@ -520,7 +546,22 @@ fn assistant_response_text(content: &str) -> Option<String> {
 
     if let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) {
         let mut recognized = false;
-        for choice in choices {
+        let mut indexed_choices: Vec<(u64, usize, &serde_json::Value)> = choices
+            .iter()
+            .enumerate()
+            .map(|(position, choice)| {
+                (
+                    choice
+                        .get("index")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(position as u64),
+                    position,
+                    choice,
+                )
+            })
+            .collect();
+        indexed_choices.sort_by_key(|(index, position, _)| (*index, *position));
+        for (_, _, choice) in indexed_choices {
             if let Some(message) = choice.get("message") {
                 if let Some(message_content) = message.get("content") {
                     recognized |= append_content(message_content, &mut out);

@@ -5578,7 +5578,7 @@ pub(super) async fn relay_ai_response_with_cache(
             Ok(text) => {
                 let sync_block = output_guardrails
                     .as_ref()
-                    .and_then(|g| g.check_output(text));
+                    .and_then(|g| g.check_output_bytes(&resp_body));
                 if sync_block.is_some() {
                     sync_block
                 } else if output_external.is_empty() {
@@ -5592,7 +5592,9 @@ pub(super) async fn relay_ai_response_with_cache(
                     .map(|(name, reason)| sbproxy_ai::guardrails::GuardrailBlock { name, reason })
                 }
             }
-            Err(_) => None,
+            Err(_) => output_guardrails
+                .as_ref()
+                .and_then(|g| g.check_output_bytes(&resp_body)),
         }
     } else {
         None
@@ -6615,10 +6617,11 @@ fn process_guard_events(
     for ev in events {
         match ev {
             HubChunk::ContentDelta {
+                index,
                 delta: ContentPartDelta::Text(t),
                 ..
             } => {
-                if let Some(block) = sessn.on_content_delta(t) {
+                if let Some(block) = sessn.on_content_delta_at(*index, t) {
                     return (Some(block), released);
                 }
             }
@@ -6658,6 +6661,18 @@ struct RelayBodyHoldback {
     buffered_bytes: usize,
     chunks: Vec<Bytes>,
     failed: bool,
+    sse_framer: sbproxy_ai::format::SseFramer,
+    canonical_protocol: Option<CanonicalSseProtocol>,
+    canonical_terminal: bool,
+    canonical_invalid: bool,
+}
+
+/// The canonical stream syntax used for a classifier-held response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanonicalSseProtocol {
+    OpenAiChat,
+    AnthropicMessages,
+    OpenAiResponses,
 }
 
 impl RelayBodyHoldback {
@@ -6668,6 +6683,10 @@ impl RelayBodyHoldback {
             buffered_bytes: 0,
             chunks: Vec::new(),
             failed: false,
+            sse_framer: sbproxy_ai::format::SseFramer::new(),
+            canonical_protocol: None,
+            canonical_terminal: false,
+            canonical_invalid: false,
         }
     }
 
@@ -6692,7 +6711,11 @@ impl RelayBodyHoldback {
             });
         }
         self.buffered_bytes += bytes.len();
+        let frames = self.sse_framer.feed(&bytes);
         self.chunks.push(bytes);
+        for frame in frames {
+            self.observe_canonical_sse_frame(&frame);
+        }
         Ok(None)
     }
 
@@ -6715,34 +6738,165 @@ impl RelayBodyHoldback {
         })
     }
 
-    fn contains_malformed_sse_data(&self) -> bool {
-        let mut framer = sbproxy_ai::format::SseFramer::new();
-        let mut frames = Vec::new();
-        for chunk in &self.chunks {
-            frames.extend(framer.feed(chunk));
-        }
-        if let Some(frame) = framer.flush() {
-            frames.push(frame);
-        }
-        frames.into_iter().any(|frame| {
-            let (_, data) = sbproxy_ai::format::split_sse_frame(&frame);
-            let data = data.trim();
-            !data.is_empty()
-                && data != "[DONE]"
-                && serde_json::from_str::<serde_json::Value>(data).is_err()
-        })
-    }
-
     fn close_decode_block(
-        &self,
-        decoder_yielded: bool,
+        &mut self,
+        _decoder_yielded: bool,
     ) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
         if self.buffered_bytes == 0 {
             return None;
         }
-        (!decoder_yielded || self.contains_malformed_sse_data())
-            .then(|| self.decode_fallback_block())
-            .flatten()
+        if self.sse_framer.flush().is_some() {
+            // A complete canonical event always ends in a blank line. A
+            // syntactically valid partial event at EOF is still incomplete.
+            self.canonical_invalid = true;
+        }
+        if self.sse_framer.error().is_some()
+            || self.canonical_invalid
+            || self.canonical_protocol.is_none()
+        {
+            return self.decode_fallback_block();
+        }
+        if !self.canonical_terminal {
+            let guardrail = self.guardrail.as_deref()?;
+            return Some(sbproxy_ai::guardrails::GuardrailBlock {
+                name: guardrail.to_string(),
+                reason: format!(
+                    "{guardrail} enforcing stream ended without its canonical terminal event; \
+                     failed closed"
+                ),
+            });
+        }
+        None
+    }
+
+    fn observe_canonical_sse_frame(&mut self, frame: &str) {
+        let (event, data) = sbproxy_ai::format::split_sse_frame(frame);
+        let data = data.trim();
+        if data.is_empty() {
+            // Comments, id, and retry fields are valid SSE metadata but do
+            // not contribute a canonical assistant response event.
+            return;
+        }
+        if self.canonical_terminal {
+            self.canonical_invalid = true;
+            return;
+        }
+        if data == "[DONE]" {
+            self.observe_openai_terminal(event.as_deref());
+            return;
+        }
+
+        let payload: serde_json::Value = match serde_json::from_str(data) {
+            Ok(payload) => payload,
+            Err(_) => {
+                self.canonical_invalid = true;
+                return;
+            }
+        };
+        if payload.get("error").is_some() {
+            self.canonical_invalid = true;
+            return;
+        }
+
+        let event = event.as_deref();
+        let ty = payload.get("type").and_then(serde_json::Value::as_str);
+        if let Some(event) = event.filter(|event| event.starts_with("response.")) {
+            self.observe_responses_event(event, ty, &payload);
+        } else if let Some(event) = event.filter(|event| {
+            matches!(
+                *event,
+                "message_start"
+                    | "content_block_start"
+                    | "content_block_delta"
+                    | "content_block_stop"
+                    | "message_delta"
+                    | "message_stop"
+                    | "ping"
+            )
+        }) {
+            self.observe_anthropic_event(event, ty);
+        } else if event.is_none() && payload.get("choices").is_some() {
+            self.observe_openai_event(&payload);
+        } else {
+            self.canonical_invalid = true;
+        }
+    }
+
+    fn select_protocol(&mut self, protocol: CanonicalSseProtocol) -> bool {
+        match self.canonical_protocol {
+            Some(existing) if existing != protocol => {
+                self.canonical_invalid = true;
+                false
+            }
+            Some(_) => true,
+            None => {
+                self.canonical_protocol = Some(protocol);
+                true
+            }
+        }
+    }
+
+    fn observe_openai_event(&mut self, payload: &serde_json::Value) {
+        if !self.select_protocol(CanonicalSseProtocol::OpenAiChat)
+            || !payload
+                .get("choices")
+                .is_some_and(serde_json::Value::is_array)
+        {
+            self.canonical_invalid = true;
+        }
+    }
+
+    fn observe_openai_terminal(&mut self, event: Option<&str>) {
+        if event.is_some() || !self.select_protocol(CanonicalSseProtocol::OpenAiChat) {
+            self.canonical_invalid = true;
+            return;
+        }
+        self.canonical_terminal = true;
+    }
+
+    fn observe_anthropic_event(&mut self, event: &str, ty: Option<&str>) {
+        if !self.select_protocol(CanonicalSseProtocol::AnthropicMessages) || ty != Some(event) {
+            self.canonical_invalid = true;
+            return;
+        }
+        if event == "message_stop" {
+            self.canonical_terminal = true;
+        }
+    }
+
+    fn observe_responses_event(
+        &mut self,
+        event: &str,
+        ty: Option<&str>,
+        payload: &serde_json::Value,
+    ) {
+        const RESPONSES_EVENTS: &[&str] = &[
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.content_part.added",
+            "response.content_part.done",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.completed",
+        ];
+        if !self.select_protocol(CanonicalSseProtocol::OpenAiResponses)
+            || !RESPONSES_EVENTS.contains(&event)
+            || ty != Some(event)
+        {
+            self.canonical_invalid = true;
+            return;
+        }
+        if event == "response.completed" {
+            if payload.get("response").is_none() {
+                self.canonical_invalid = true;
+            } else {
+                self.canonical_terminal = true;
+            }
+        }
     }
 }
 
@@ -6839,9 +6993,12 @@ mod stream_classifier_holdback_tests {
             .close_decode_block(false)
             .expect("a nonempty body with no decoded event must fail closed");
         assert_eq!(block.name, "jailbreak");
-        assert!(protected.close_decode_block(true).is_none());
+        assert!(
+            protected.close_decode_block(true).is_some(),
+            "an invalid stream remains unreleasable after a repeated close check"
+        );
 
-        let empty = RelayBodyHoldback::new(Some("jailbreak"), 1024);
+        let mut empty = RelayBodyHoldback::new(Some("jailbreak"), 1024);
         assert!(
             empty.close_decode_block(false).is_none(),
             "an actually empty response has no unclassified body bytes"
@@ -6868,6 +7025,113 @@ mod stream_classifier_holdback_tests {
 
         assert_eq!(block.name, "jailbreak");
         assert!(block.reason.contains("decode"));
+    }
+
+    #[test]
+    fn canonical_openai_stream_requires_done_before_release() {
+        let mut protected = RelayBodyHoldback::new(Some("jailbreak"), 1024);
+        let mut downstream = Vec::new();
+        relay_one(
+            &mut protected,
+            &mut downstream,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"prefix\"}}]}\n\n",
+        )
+        .expect("stage");
+
+        let block = protected
+            .close_decode_block(true)
+            .expect("early EOF without [DONE] must fail closed");
+
+        assert_eq!(block.name, "jailbreak");
+        assert!(block.reason.contains("terminal"));
+    }
+
+    #[test]
+    fn canonical_stream_rejects_valid_error_and_unsupported_events() {
+        for event in [
+            b"data: {\"error\":{\"message\":\"provider failed\"}}\n\n".as_slice(),
+            b"data: {\"unsupported\":\"valid json\"}\n\n".as_slice(),
+        ] {
+            let mut protected = RelayBodyHoldback::new(Some("content_safety"), 1024);
+            let mut downstream = Vec::new();
+            relay_one(
+                &mut protected,
+                &mut downstream,
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"safe\"}}]}\n\n",
+            )
+            .expect("stage content");
+            relay_one(&mut protected, &mut downstream, event).expect("stage event");
+            relay_one(&mut protected, &mut downstream, b"data: [DONE]\n\n")
+                .expect("stage terminal");
+
+            let block = protected
+                .close_decode_block(true)
+                .expect("unclassified valid JSON must fail closed");
+            assert_eq!(block.name, "content_safety");
+        }
+    }
+
+    #[test]
+    fn canonical_stream_rejects_invalid_utf8_even_when_fragmented() {
+        let mut protected = RelayBodyHoldback::new(Some("toxicity"), 1024);
+        let mut downstream = Vec::new();
+        relay_one(
+            &mut protected,
+            &mut downstream,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"",
+        )
+        .expect("stage prefix");
+        relay_one(&mut protected, &mut downstream, b"\xf0\x28\x8c\x28")
+            .expect("stage invalid UTF-8");
+        relay_one(
+            &mut protected,
+            &mut downstream,
+            b"\"}}]}\n\ndata: [DONE]\n\n",
+        )
+        .expect("stage suffix");
+
+        assert!(
+            protected.close_decode_block(true).is_some(),
+            "invalid UTF-8 must never be released"
+        );
+    }
+
+    #[test]
+    fn canonical_anthropic_and_responses_streams_require_their_terminal_event() {
+        for prefix in [
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"prefix\"}}\n\n".as_slice(),
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"prefix\"}\n\n".as_slice(),
+        ] {
+            let mut protected = RelayBodyHoldback::new(Some("jailbreak"), 2048);
+            let mut downstream = Vec::new();
+            relay_one(&mut protected, &mut downstream, prefix).expect("stage provider event");
+            assert!(
+                protected.close_decode_block(true).is_some(),
+                "provider-specific early EOF must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_terminal_allows_fragmented_sse_grammar_without_changing_bytes() {
+        let wire = b": keepalive\r\nid: 7\r\nretry: 1000\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"caf\xc3\xa9\"}}]}\r\n\r\ndata: [DONE]\r\n\r\n";
+        for split in 1..wire.len() {
+            let mut protected = RelayBodyHoldback::new(Some("jailbreak"), 4096);
+            let mut downstream = Vec::new();
+            let first = Bytes::copy_from_slice(&wire[..split]);
+            let second = Bytes::copy_from_slice(&wire[split..]);
+            if let Some(ready) = protected.stage(first).expect("stage first") {
+                downstream.push(ready);
+            }
+            if let Some(ready) = protected.stage(second).expect("stage second") {
+                downstream.push(ready);
+            }
+            assert!(
+                protected.close_decode_block(true).is_none(),
+                "valid terminal stream rejected at byte split {split}"
+            );
+            assert_eq!(protected.release().concat(), wire);
+        }
     }
 }
 
@@ -7444,27 +7708,25 @@ pub(super) async fn relay_ai_stream(
                 if guard_decoder.is_some() && !tail_events.is_empty() {
                     guard_decoder_yielded = true;
                 }
-                if guard_decoder.is_some() {
-                    if let Some(block) =
-                        response_body_holdback.close_decode_block(guard_decoder_yielded)
-                    {
-                        warn!(
-                            guardrail = %block.name,
-                            reason = %block.reason,
-                            "AI proxy: enforcing output classifier stream decode failed closed"
-                        );
-                        sbproxy_ai::ai_metrics::record_stream_guardrail_violation(&block.name);
-                        sbproxy_ai::tracing_spans::record_error(
-                            &ai_span,
-                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                            &block.reason,
-                        );
-                        if let Some(c) = ctx.as_deref_mut() {
-                            mark_guardrail_block(c, block.name.clone());
-                        }
-                        output_guard_blocked = true;
-                        break;
+                if let Some(block) =
+                    response_body_holdback.close_decode_block(guard_decoder_yielded)
+                {
+                    warn!(
+                        guardrail = %block.name,
+                        reason = %block.reason,
+                        "AI proxy: enforcing output classifier stream decode failed closed"
+                    );
+                    sbproxy_ai::ai_metrics::record_stream_guardrail_violation(&block.name);
+                    sbproxy_ai::tracing_spans::record_error(
+                        &ai_span,
+                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                        &block.reason,
+                    );
+                    if let Some(c) = ctx.as_deref_mut() {
+                        mark_guardrail_block(c, block.name.clone());
                     }
+                    output_guard_blocked = true;
+                    break;
                 }
 
                 // --- WOR-1810: final guardrail pass BEFORE tail

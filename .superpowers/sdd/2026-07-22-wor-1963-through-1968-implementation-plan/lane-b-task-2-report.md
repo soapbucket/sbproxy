@@ -146,3 +146,114 @@ Recovered regressions were re-run in focused groups:
 No scoped correctness concern remains. The full workspace suite observed the
 unrelated flaky model-host reload test noted above; it passed on retry. Live GPU
 or remote-classifier validation was intentionally out of scope.
+
+## Round 2
+
+### Outcome
+
+All three re-review findings are closed. The repair preserves the keyword
+default, fixed metric labels, and the existing classifier seam. It adds no
+dependencies, schemas, GPU work, or remote classifiers.
+
+### Finding 1: malformed embeddings failed open
+
+- Configured examples now reject empty, non-finite, and within-class
+  dimension-mismatched embeddings before a centroid is published.
+- Query embeddings must be non-empty, finite, and match every centroid's
+  dimension. Structural defects return classifier errors; finite threshold and
+  margin abstentions remain `Ok(None)`.
+- Code: `crates/sbproxy-core/src/server/ai_classifier.rs`.
+- Tests: `classifier_construction_rejects_an_empty_example_embedding`,
+  `classifier_construction_rejects_a_non_finite_example_embedding`,
+  `classifier_construction_rejects_a_wrong_dimension_example_within_its_class`,
+  `malformed_request_embeddings_are_classifier_errors`, and
+  `legitimate_threshold_and_margin_abstentions_remain_ok_none`.
+
+### Finding 2: holdback released incomplete, error, or fragmented SSE
+
+- `SseFramer` now buffers bytes until a complete UTF-8 SSE event, preserving
+  multi-byte characters across arbitrary network splits and recording framing
+  failures instead of lossy replacement.
+- The enforcing holdback incrementally validates canonical OpenAI Chat,
+  Anthropic Messages, and OpenAI Responses event streams. It requires `[DONE]`,
+  `message_stop`, or `response.completed` respectively, rejects provider error
+  and unsupported events, and never releases a partial or invalid sequence.
+- The close validator now runs for translated/native relay paths as well as the
+  OpenAI decode-only path.
+- Code: `crates/sbproxy-ai/src/format/native_streams.rs` and
+  `crates/sbproxy-core/src/server/ai_dispatch.rs`.
+- Tests: `sse_framer_preserves_utf8_across_every_network_split`,
+  `sse_framer_rejects_invalid_utf8_instead_of_replacing_it`,
+  `canonical_openai_stream_requires_done_before_release`,
+  `canonical_anthropic_and_responses_streams_require_their_terminal_event`,
+  `canonical_stream_rejects_valid_error_and_unsupported_events`,
+  `canonical_stream_rejects_invalid_utf8_even_when_fragmented`, and
+  `canonical_terminal_allows_fragmented_sse_grammar_without_changing_bytes`.
+
+### Finding 3: buffered and streaming output subjects diverged
+
+- Buffered Chat choices and close-policy streamed deltas now both concatenate
+  assistant text in ascending choice index, independent of arrival order.
+- Classifier output enforcement rejects malformed, unsupported, or non-UTF-8
+  buffered envelopes instead of classifying raw body bytes or silently skipping
+  enforcement. Non-classifier output guards retain their existing behavior.
+- Code: `crates/sbproxy-ai/src/guardrails/mod.rs`,
+  `crates/sbproxy-ai/src/guardrails/stream.rs`, and
+  `crates/sbproxy-core/src/server/ai_dispatch.rs`.
+- Tests: `buffered_multi_choice_classifier_subject_uses_choice_index_order`,
+  `streamed_multi_choice_classifier_subject_uses_choice_index_order`, and
+  `classifier_output_rejects_malformed_and_unsupported_buffered_envelopes`.
+
+### Strict TDD evidence
+
+The four-file in-progress diff was preserved and audited before editing.
+Recovered source regressions cover malformed configured/query embeddings,
+byte-safe SSE framing, terminal-event holdback, and canonical-output parity.
+The following new RED/GREEN cycles were observed during round 2:
+
+1. Buffered multi-choice order:
+   - RED: `cargo nextest run -p sbproxy-ai --locked -E 'test(buffered_multi_choice_classifier_subject_uses_choice_index_order)'` failed because array/arrival order produced `onezero`, not `zeroone`.
+   - GREEN: the same command passed 1/1 after sorting buffered choices by index.
+2. Streamed multi-choice order:
+   - RED: `cargo nextest run -p sbproxy-ai --locked -E 'test(streamed_multi_choice_classifier_subject_uses_choice_index_order)'` failed to compile because `StreamGuardSession::on_content_delta_at` did not exist.
+   - GREEN: `cargo nextest run -p sbproxy-ai --locked -E 'test(buffered_multi_choice_classifier_subject_uses_choice_index_order) or test(streamed_multi_choice_classifier_subject_uses_choice_index_order) or test(buffered_envelopes_and_streamed_deltas_classify_the_same_assistant_text)'` passed 3/3 after indexed close-buffer assembly and dispatch wiring.
+3. Malformed buffered envelopes:
+   - RED: `cargo nextest run -p sbproxy-ai --locked -E 'test(classifier_output_rejects_malformed_and_unsupported_buffered_envelopes)'` failed because raw malformed/provider envelopes became an allow.
+   - GREEN: the same command passed 1/1 after canonical-envelope failure blocks. A deliberate temporary mutation of the non-UTF-8 branch made the same test fail with `non-UTF-8 must not skip classifier output enforcement`; restoring the fail-closed branch returned it to green.
+4. Missing terminal event:
+   - RED: `cargo nextest run -p sbproxy-core --locked -E 'test(canonical_openai_stream_requires_done_before_release)'` failed because EOF after a valid delta had no `[DONE]` requirement.
+   - GREEN: `cargo nextest run -p sbproxy-core --locked -E 'test(canonical_openai_stream_requires_done_before_release) or test(canonical_stream_rejects_valid_error_and_unsupported_events) or test(canonical_stream_rejects_invalid_utf8_even_when_fragmented) or test(canonical_anthropic_and_responses_streams_require_their_terminal_event) or test(canonical_terminal_allows_fragmented_sse_grammar_without_changing_bytes) or test(short_undecodable_enforcing_body_fails_closed_at_stream_end) or test(malformed_frame_after_a_decoded_event_still_fails_closed)'` passed 7/7.
+
+### Verification
+
+- `cargo nextest run -p sbproxy-core --features inprocess-classify --locked -E 'test(malformed_request_embeddings_are_classifier_errors) or test(legitimate_threshold_and_margin_abstentions_remain_ok_none) or test(classifier_construction_rejects_an_empty_example_embedding) or test(classifier_construction_rejects_a_non_finite_example_embedding) or test(classifier_construction_rejects_a_wrong_dimension_example_within_its_class)'`: passed 5/5.
+- `cargo nextest run -p sbproxy-core --locked -E 'test(stream_classifier_holdback_tests)'`: passed 11/11.
+- `cargo nextest run -p sbproxy-ai --locked -E 'test(sse_framer_)'`: passed 7/7.
+- `cargo nextest run -p sbproxy-ai -p sbproxy-core --features sbproxy-core/inprocess-classify --locked`: passed 2265 with 11 skipped after the final clippy-only loop refactor.
+- `cargo build --workspace`: passed.
+- `cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci`: passed 7543/7543, zero failures and zero disabled tests (from `target/nextest/ci/junit.xml`).
+- `cargo test --workspace --exclude sbproxy-e2e --locked --doc`: passed.
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed after converting the SSE frame-drain loop to `while let`.
+- `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+
+### Self-review
+
+- Audited every held response-byte path: ordinary outbound chunks, translated
+  tail frames, and reversible-restorer tails all enter the same validator and
+  are released only after the final classifier verdict and canonical terminal.
+- Confirmed no non-finite or wrong-dimension embedding can turn into an
+  abstention/cacheable allow; legitimate finite abstentions retain their
+  original behavior.
+- Confirmed buffered and streamed classifier subjects use choice-index order;
+  non-classifier guards, keyword defaults, and bounded metric taxonomy remain
+  unchanged.
+- Confirmed the final diff contains no dependency, schema, GPU, or remote
+  classifier changes.
+
+### Remaining concerns
+
+No scoped correctness concern remains. The canonical terminal validator covers
+the three gateway response protocols that can reach an enforcing held body:
+OpenAI Chat, Anthropic Messages, and OpenAI Responses. Live model artifacts and
+remote classifiers remain intentionally out of scope.

@@ -863,4 +863,88 @@ mod tests {
         let seen = backend.seen.lock().expect("seen lock");
         assert_eq!(seen.as_slice(), [subject, subject, subject, subject]);
     }
+
+    #[test]
+    fn buffered_multi_choice_classifier_subject_uses_choice_index_order() {
+        let backend = Arc::new(ExactSubjectClassifier {
+            expected: "zeroone".to_string(),
+            seen: Mutex::new(Vec::new()),
+        });
+        let guard = SafetyClassifierGuardrail::with_backend(
+            SafetyGuardrailKind::Jailbreak,
+            config(ClassifierScope::FullText),
+            backend.clone(),
+            ["jailbreak"],
+        );
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.output.push(Guardrail::SafetyClassifier(guard));
+
+        let body = serde_json::json!({
+            "choices": [
+                {"index": 1, "message": {"role": "assistant", "content": "one"}},
+                {"index": 0, "message": {"role": "assistant", "content": "zero"}}
+            ]
+        });
+
+        assert!(
+            pipeline.check_output(&body.to_string()).is_some(),
+            "classifier must receive canonical choice-index order"
+        );
+        assert_eq!(
+            backend.seen.lock().expect("seen lock").as_slice(),
+            ["zeroone"]
+        );
+    }
+
+    #[test]
+    fn streamed_multi_choice_classifier_subject_uses_choice_index_order() {
+        let backend = Arc::new(ExactSubjectClassifier {
+            expected: "zeroone".to_string(),
+            seen: Mutex::new(Vec::new()),
+        });
+        let guard = SafetyClassifierGuardrail::with_backend(
+            SafetyGuardrailKind::Jailbreak,
+            config(ClassifierScope::FullText),
+            backend.clone(),
+            ["jailbreak"],
+        );
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.output.push(Guardrail::SafetyClassifier(guard));
+        pipeline.output_policies.push(StreamPolicy::Close);
+        let mut stream = StreamGuardSession::new(Arc::new(pipeline), None);
+
+        assert!(stream.on_content_delta_at(1, "one").is_none());
+        assert!(stream.on_content_delta_at(0, "zero").is_none());
+        assert!(stream.on_close().is_some());
+        assert_eq!(
+            backend.seen.lock().expect("seen lock").as_slice(),
+            ["zeroone"]
+        );
+    }
+
+    #[test]
+    fn classifier_output_rejects_malformed_and_unsupported_buffered_envelopes() {
+        let guard = SafetyClassifierGuardrail::with_backend(
+            SafetyGuardrailKind::Toxicity,
+            config(ClassifierScope::FullText),
+            Arc::new(FixedClassifier("safe")),
+            ["toxic"],
+        );
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.output.push(Guardrail::SafetyClassifier(guard));
+
+        for body in ["not json", r#"{"error":{"message":"provider failed"}}"#] {
+            let block = pipeline
+                .check_output(body)
+                .expect("a classifier must not classify raw malformed/provider envelopes");
+            assert_eq!(block.name, "toxicity");
+            assert!(block.reason.contains("canonical assistant response"));
+        }
+
+        let block = pipeline
+            .check_output_bytes(b"\xff")
+            .expect("non-UTF-8 must not skip classifier output enforcement");
+        assert_eq!(block.name, "toxicity");
+        assert!(block.reason.contains("decode"));
+    }
 }

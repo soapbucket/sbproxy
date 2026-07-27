@@ -88,8 +88,10 @@ pub struct StreamGuardSession {
     tail_keep: usize,
     /// Deferred DAN standalone-word verdict (see module docs).
     deferred: Option<GuardrailBlock>,
-    /// Accumulated decoded text for `stream_policy: close` guards.
-    close_buf: String,
+    /// Decoded text for `stream_policy: close` guards, partitioned by
+    /// response choice index so interleaved choices have one deterministic
+    /// full-response subject.
+    close_buf: std::collections::BTreeMap<usize, String>,
     close_buf_full: bool,
     /// Tool calls mid-assembly, keyed by stream index.
     pending: std::collections::BTreeMap<usize, PendingCall>,
@@ -168,7 +170,7 @@ impl StreamGuardSession {
             tail: String::new(),
             tail_keep,
             deferred: None,
-            close_buf: String::new(),
+            close_buf: std::collections::BTreeMap::new(),
             close_buf_full: false,
             pending: std::collections::BTreeMap::new(),
             completed_calls: 0,
@@ -222,6 +224,15 @@ impl StreamGuardSession {
 
     /// Feed one decoded content delta. Returns the first block verdict.
     pub fn on_content_delta(&mut self, text: &str) -> Option<GuardrailBlock> {
+        self.on_content_delta_at(0, text)
+    }
+
+    /// Feed one decoded content delta for its response choice index.
+    ///
+    /// Window and per-delta guards still evaluate in arrival order, but
+    /// close-policy guards use the complete choice-index ordered subject to
+    /// match buffered Chat response classification.
+    pub fn on_content_delta_at(&mut self, index: usize, text: &str) -> Option<GuardrailBlock> {
         // More text arrived: any deferred boundary verdict re-derives
         // from the fresh scan below (the candidate bytes live in the
         // tail), so drop it rather than double-report.
@@ -256,11 +267,12 @@ impl StreamGuardSession {
         }
 
         if !self.at_close.is_empty() && !self.close_buf_full {
-            if self.close_buf.len() + text.len() > MAX_STREAM_GUARD_BUFFER_BYTES {
+            let buffered = self.close_buf.values().map(String::len).sum::<usize>();
+            if buffered + text.len() > MAX_STREAM_GUARD_BUFFER_BYTES {
                 self.close_buf_full = true;
                 return Some(self.close_buffer_overflow_block());
             } else {
-                self.close_buf.push_str(text);
+                self.close_buf.entry(index).or_default().push_str(text);
             }
         }
 
@@ -379,8 +391,15 @@ impl StreamGuardSession {
         if self.close_buf_full {
             return Some(self.close_buffer_overflow_block());
         }
+        let close_subject = self
+            .close_buf
+            .values()
+            .fold(String::new(), |mut subject, text| {
+                subject.push_str(text);
+                subject
+            });
         for &i in &self.at_close {
-            if let Some(block) = self.pipeline.output[i].check(&self.close_buf) {
+            if let Some(block) = self.pipeline.output[i].check(&close_subject) {
                 return Some(block);
             }
         }

@@ -29,9 +29,9 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 /// Average `vectors` into a single unit vector.
 ///
-/// Vectors whose dimension does not match the first entry are skipped.
-/// Returns `None` when there is nothing usable to average or when the
-/// sum has no direction, which is the case for an all-zero input.
+/// Every vector must be non-empty, finite, and have the same dimension.
+/// Returns `None` when the input is malformed or when the sum has no
+/// direction, which is the case for an all-zero input.
 ///
 /// Summing and then normalizing is equivalent to averaging and then
 /// normalizing, so the element count never enters the arithmetic.
@@ -42,19 +42,16 @@ pub(super) fn build_centroid(vectors: &[Vec<f32>]) -> Option<Vec<f32>> {
         return None;
     }
     let mut sum = vec![0f32; dim];
-    let mut used = 0usize;
-    for v in vectors.iter().filter(|v| v.len() == dim) {
+    for v in vectors {
+        if v.len() != dim || v.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
         for (s, x) in sum.iter_mut().zip(v.iter()) {
             *s += x;
         }
-        used += 1;
-    }
-    if used == 0 {
-        return None;
     }
     let norm = dot(&sum, &sum).sqrt();
-    // NaN compares false against everything, so it needs an explicit check.
-    if norm.is_nan() || norm <= f32::EPSILON {
+    if !norm.is_finite() || norm <= f32::EPSILON {
         return None;
     }
     for s in sum.iter_mut() {
@@ -105,6 +102,44 @@ pub(super) fn nearest_centroid(
     })
 }
 
+/// Validate one query embedding before applying score and margin thresholds.
+///
+/// Structural embedding defects are classifier errors. A valid vector that
+/// does not clear the configured thresholds remains an ordinary abstention.
+#[cfg(any(feature = "inprocess-classify", test))]
+fn classify_embedding(
+    embedding: &[f32],
+    centroids: &[(String, Vec<f32>)],
+    min_score: f32,
+    min_margin: f32,
+) -> anyhow::Result<Option<ClassifierVerdict>> {
+    let expected_dimension = centroids
+        .first()
+        .map(|(_, centroid)| centroid.len())
+        .filter(|dimension| *dimension > 0)
+        .ok_or_else(|| anyhow::anyhow!("classifier has no usable centroid dimension"))?;
+    if embedding.is_empty() {
+        anyhow::bail!("classifier query embedding is empty");
+    }
+    if embedding.iter().any(|value| !value.is_finite()) {
+        anyhow::bail!("classifier query embedding contains a non-finite value");
+    }
+    if embedding.len() != expected_dimension {
+        anyhow::bail!(
+            "classifier query embedding dimension {} does not match {expected_dimension}",
+            embedding.len()
+        );
+    }
+    if centroids.iter().any(|(_, centroid)| {
+        centroid.len() != expected_dimension || centroid.iter().any(|value| !value.is_finite())
+    }) {
+        anyhow::bail!("classifier contains a malformed centroid");
+    }
+    Ok(nearest_centroid(
+        embedding, centroids, min_score, min_margin,
+    ))
+}
+
 /// Nearest-centroid classifier over the in-process MiniLM embedder.
 #[cfg(feature = "inprocess-classify")]
 struct CentroidClassifier {
@@ -138,8 +173,15 @@ impl std::fmt::Debug for CentroidClassifier {
 impl sbproxy_ai::guardrails::TextClassifier for CentroidClassifier {
     fn classify(&self, text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
         let started = std::time::Instant::now();
-        let embedded = self.embedder.embed(text);
-        let result = if embedded.is_ok() { "ok" } else { "error" };
+        let classified = self.embedder.embed(text).and_then(|output| {
+            classify_embedding(
+                &output.values,
+                &self.centroids,
+                self.min_score,
+                self.min_margin,
+            )
+        });
+        let result = if classified.is_ok() { "ok" } else { "error" };
         sbproxy_observe::metrics::record_inference(
             "classify",
             "inprocess",
@@ -147,19 +189,13 @@ impl sbproxy_ai::guardrails::TextClassifier for CentroidClassifier {
             result,
             started.elapsed().as_secs_f64(),
         );
-        let out = match embedded {
-            Ok(o) => o,
+        match classified {
+            Ok(verdict) => Ok(verdict),
             Err(e) => {
                 tracing::warn!(error = %e, "classifier embedding failed; no label emitted");
-                return Err(e);
+                Err(e)
             }
-        };
-        Ok(nearest_centroid(
-            &out.values,
-            &self.centroids,
-            self.min_score,
-            self.min_margin,
-        ))
+        }
     }
 }
 
@@ -412,20 +448,36 @@ fn embed_class_examples(
     label: &str,
     examples: &[String],
     mut embed: impl FnMut(&str) -> anyhow::Result<Vec<f32>>,
-) -> Vec<Vec<f32>> {
-    examples
-        .iter()
-        .filter_map(|example| {
-            let bounded = cfg.bounded_text(example);
-            match embed(bounded) {
-                Ok(values) => Some(values),
-                Err(err) => {
-                    tracing::warn!(error = %err, class = %label, "skipping unembeddable example");
-                    None
-                }
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    let mut vectors = Vec::with_capacity(examples.len());
+    let mut expected_dimension = None;
+    for (index, example) in examples.iter().enumerate() {
+        let bounded = cfg.bounded_text(example);
+        let values = embed(bounded).map_err(|error| {
+            anyhow::anyhow!("classifier class `{label}` example {index} embedding failed: {error}")
+        })?;
+        if values.is_empty() {
+            anyhow::bail!("classifier class `{label}` example {index} embedding is empty");
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            anyhow::bail!(
+                "classifier class `{label}` example {index} embedding contains a non-finite value"
+            );
+        }
+        match expected_dimension {
+            Some(dimension) if values.len() != dimension => {
+                anyhow::bail!(
+                    "classifier class `{label}` example {index} embedding dimension {} \
+                     does not match {dimension}",
+                    values.len()
+                );
             }
-        })
-        .collect()
+            None => expected_dimension = Some(values.len()),
+            Some(_) => {}
+        }
+        vectors.push(values);
+    }
+    Ok(vectors)
 }
 
 #[cfg(feature = "inprocess-classify")]
@@ -436,7 +488,7 @@ fn build_class_centroids(
     let mut centroids = Vec::with_capacity(cfg.classes.len());
     let mut expected_dimension = None;
     for (label, examples) in &cfg.classes {
-        let vectors = embed_class_examples(cfg, label, examples, &mut embed);
+        let vectors = embed_class_examples(cfg, label, examples, &mut embed)?;
         let centroid = build_centroid(&vectors)
             .ok_or_else(|| anyhow::anyhow!("classifier class `{label}` has no usable centroid"))?;
         match expected_dimension {
@@ -533,9 +585,8 @@ mod tests {
     }
 
     #[test]
-    fn centroid_skips_vectors_of_the_wrong_dimension() {
-        let c = build_centroid(&[vec![1.0, 0.0], vec![1.0, 0.0, 0.0]]).expect("centroid");
-        assert_eq!(c.len(), 2);
+    fn centroid_rejects_vectors_of_the_wrong_dimension() {
+        assert!(build_centroid(&[vec![1.0, 0.0], vec![1.0, 0.0, 0.0]]).is_none());
     }
 
     #[test]
@@ -620,6 +671,44 @@ mod tests {
         assert_eq!(v.label, "good");
     }
 
+    #[test]
+    fn malformed_request_embeddings_are_classifier_errors() {
+        let centroids = vec![
+            (label("documentation"), vec![1.0, 0.0]),
+            (label("coding"), vec![0.0, 1.0]),
+        ];
+        for malformed in [
+            Vec::new(),
+            vec![f32::NAN, 0.0],
+            vec![f32::INFINITY, 0.0],
+            vec![1.0, 0.0, 0.0],
+        ] {
+            assert!(
+                classify_embedding(&malformed, &centroids, 0.30, 0.05).is_err(),
+                "malformed request embedding must not become a threshold abstention: {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legitimate_threshold_and_margin_abstentions_remain_ok_none() {
+        let centroids = vec![
+            (label("documentation"), vec![1.0, 0.0]),
+            (label("coding"), vec![0.0, 1.0]),
+        ];
+        assert_eq!(
+            classify_embedding(&[0.2, 0.1], &centroids, 0.30, 0.05)
+                .expect("a weak finite embedding is not a backend error"),
+            None
+        );
+        let inv = 1.0f32 / 2.0f32.sqrt();
+        assert_eq!(
+            classify_embedding(&[inv, inv], &centroids, 0.30, 0.05)
+                .expect("an ambiguous finite embedding is not a backend error"),
+            None
+        );
+    }
+
     #[cfg(feature = "inprocess-classify")]
     fn classifier_config_with_max_chars(
         max_chars: usize,
@@ -653,7 +742,8 @@ mod tests {
         let vectors = embed_class_examples(&cfg, "documentation", &examples, |text| {
             seen.push(text.to_string());
             Ok(vec![1.0])
-        });
+        })
+        .expect("valid example embeddings");
 
         assert_eq!(seen, ["éabc"]);
         assert_eq!(vectors, [vec![1.0]]);
@@ -669,7 +759,8 @@ mod tests {
         let vectors = embed_class_examples(&cfg, "documentation", &examples, |text| {
             seen.push(text.to_string());
             Ok(vec![1.0])
-        });
+        })
+        .expect("valid example embeddings");
 
         assert_eq!(seen, ["éabc"]);
         assert_eq!(vectors, [vec![1.0]]);
@@ -719,6 +810,87 @@ mod tests {
         assert!(
             error.to_string().contains("dimension"),
             "error must explain the malformed centroid dimensions: {error}"
+        );
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn classifier_construction_rejects_an_empty_example_embedding() {
+        let mut cfg = classifier_config_with_max_chars(2000);
+        cfg.classes.insert(
+            "safe".to_string(),
+            vec![
+                "ordinary conversation".to_string(),
+                "empty vector".to_string(),
+            ],
+        );
+
+        let error = build_class_centroids(&cfg, |text| {
+            if text == "empty vector" {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![1.0, 0.0])
+            }
+        })
+        .expect_err("one empty example embedding must reject the configured class");
+
+        assert!(
+            error.to_string().contains("safe") && error.to_string().contains("example 1"),
+            "error must identify the malformed configured example: {error}"
+        );
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn classifier_construction_rejects_a_non_finite_example_embedding() {
+        let mut cfg = classifier_config_with_max_chars(2000);
+        cfg.classes.insert(
+            "safe".to_string(),
+            vec![
+                "ordinary conversation".to_string(),
+                "infinite vector".to_string(),
+            ],
+        );
+
+        let error = build_class_centroids(&cfg, |text| {
+            if text == "infinite vector" {
+                Ok(vec![f32::INFINITY, 0.0])
+            } else {
+                Ok(vec![1.0, 0.0])
+            }
+        })
+        .expect_err("one non-finite example embedding must reject the configured class");
+
+        assert!(
+            error.to_string().contains("safe") && error.to_string().contains("example 1"),
+            "error must identify the malformed configured example: {error}"
+        );
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn classifier_construction_rejects_a_wrong_dimension_example_within_its_class() {
+        let mut cfg = classifier_config_with_max_chars(2000);
+        cfg.classes.insert(
+            "safe".to_string(),
+            vec![
+                "ordinary conversation".to_string(),
+                "wrong dimension".to_string(),
+            ],
+        );
+
+        let error = build_class_centroids(&cfg, |text| {
+            if text == "wrong dimension" {
+                Ok(vec![1.0, 0.0, 0.0])
+            } else {
+                Ok(vec![1.0, 0.0])
+            }
+        })
+        .expect_err("one wrong-dimension example must reject the configured class");
+
+        assert!(
+            error.to_string().contains("safe") && error.to_string().contains("example 1"),
+            "error must identify the malformed configured example: {error}"
         );
     }
 
