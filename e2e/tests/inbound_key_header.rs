@@ -44,11 +44,23 @@ struct StubUpstream {
 
 impl StubUpstream {
     fn start() -> anyhow::Result<Self> {
+        Self::start_failing_first(0)
+    }
+
+    /// Answer a retryable 503 to the first `failures` requests, then 200.
+    ///
+    /// Used to prove the bound credential is re-injected on a retry. Pingora
+    /// re-runs `upstream_request_filter` for each attempt, which is why the
+    /// injection lives there; a first-attempt-only assertion would still pass
+    /// if someone moved it into `request_filter`, where the retry would reach
+    /// the origin with no credential at all.
+    fn start_failing_first(failures: usize) -> anyhow::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         let (tx, seen) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let mut served = 0_usize;
         let join = std::thread::spawn(move || {
             // Serve until dropped so a retry lands on the same stub. The stop
             // flag is checked after every accept: `Drop` sets it and then makes
@@ -63,9 +75,20 @@ impl StubUpstream {
                     continue;
                 };
                 let _ = tx.send(seen);
-                let body = b"{\"ok\":true}";
+                let retryable = served < failures;
+                served += 1;
+                let body: &[u8] = if retryable {
+                    b"{\"retry\":true}"
+                } else {
+                    b"{\"ok\":true}"
+                };
+                let status = if retryable {
+                    "503 Service Unavailable"
+                } else {
+                    "200 OK"
+                };
                 let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 let _ = stream.write_all(head.as_bytes());
@@ -380,4 +403,69 @@ fn requiring_a_key_refuses_a_request_that_carries_none() {
         .send()
         .expect("proxied request");
     assert_eq!(response.status().as_u16(), 401);
+}
+
+#[test]
+fn a_bound_credential_is_re_injected_on_an_upstream_retry() {
+    // Pingora re-runs `upstream_request_filter` for each attempt, which is
+    // why the credential injection lives there rather than in
+    // `request_filter`. Asserting only on the first attempt would still pass
+    // if someone moved it earlier, and the retry would then reach the origin
+    // carrying no credential at all.
+    let admin_port = free_port();
+    let upstream = StubUpstream::start_failing_first(1).expect("stub upstream");
+    let yaml = config(admin_port, upstream.port, "").replace(
+        "      url: http://127.0.0.1:",
+        "      retry:\n        max_attempts: 2\n        retry_on: [503]\n        backoff_ms: 0\n      url: http://127.0.0.1:",
+    );
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("proxy starts");
+
+    assert_eq!(
+        create_credential(
+            admin_port,
+            serde_json::json!({
+                "id": "retry-cred",
+                "secret": "the-real-upstream-secret",
+                "header": "x-api-key",
+                "scheme": ""
+            })
+        ),
+        201
+    );
+    let token = mint(
+        admin_port,
+        serde_json::json!({"name": "retried", "credential_id": "retry-cred"}),
+    );
+
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{}/anything", harness.base_url()))
+        .header("Host", "tools.local")
+        .header("x-api-key", &token)
+        .send()
+        .expect("proxied request");
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "the retry should have succeeded"
+    );
+
+    let first = upstream.next_request();
+    assert_eq!(
+        first.get("x-api-key"),
+        Some("the-real-upstream-secret"),
+        "first attempt carries the bound credential: {first:?}"
+    );
+
+    let retried = upstream.next_request();
+    assert_eq!(
+        retried.get("x-api-key"),
+        Some("the-real-upstream-secret"),
+        "the RETRY must carry it too, not just the first attempt: {retried:?}"
+    );
+    assert!(
+        !retried
+            .get("x-api-key")
+            .is_some_and(|v| v.starts_with("sbp_")),
+        "and it must be the credential, never the caller's minted key"
+    );
 }
