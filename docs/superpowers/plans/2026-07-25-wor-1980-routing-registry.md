@@ -40,7 +40,7 @@ Add tests that prove an implementation defining only `select` and `name` remains
 
 Use deterministic `epsilon: 0.0` and explicit outcomes:
 
-```rust
+```rust,no_run
 strategy.record_outcome(
     "http://slow",
     RoutingOutcome {
@@ -72,7 +72,7 @@ Expected: compile failure because `RoutingOutcome`, the callback, and namespace 
 
 In `routing/mod.rs`, add:
 
-```rust
+```rust,no_run
 #[derive(Debug, Clone, Copy)]
 pub struct RoutingOutcome {
     pub success: bool,
@@ -97,7 +97,7 @@ and clamp every computed reward to the finite `0.0..=1.0` range defensively.
 
 Add a process registry shaped as:
 
-```rust
+```rust,no_run
 struct BanditStateRegistry {
     order: VecDeque<String>,
     states: HashMap<String, Arc<Mutex<HashMap<String, ArmStats>>>>,
@@ -182,7 +182,7 @@ Expected: plugin fields are ignored and the assertions fail.
 Add optional `strategy`, `strategy_config`, and `lb_method` fields to the
 private deserialization config. Add:
 
-```rust
+```rust,no_run
 #[serde(default)]
 pub metadata: HashMap<String, serde_json::Value>,
 ```
@@ -282,7 +282,7 @@ not exist.
 
 Add:
 
-```rust
+```rust,no_run
 pub lb_attempt_started_at: Option<Instant>,
 pub lb_outcome_recorded: bool,
 ```
