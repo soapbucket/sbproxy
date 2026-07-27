@@ -17,3 +17,7 @@ examples/*/certs/
 
 # curl cookie jars from running the examples/docs commands; never commit
 cookies.txt
+
+# scripts/capture-admin-screenshots.mjs resolves puppeteer from the
+# workspace root, so a capture run installs it here.
+node_modules/

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onMounted } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorState from "../components/ErrorState.vue";
 import PageHeader from "../components/PageHeader.vue";
@@ -8,6 +8,7 @@ import { api, type AdminUser } from "../api";
 import { useAsync } from "../composables/useAsync";
 
 const req = useAsync(() => api.adminUsers());
+onMounted(req.run);
 
 const users = computed<AdminUser[]>(() => req.data.value?.users ?? []);
 const admins = computed(() => users.value.filter((u) => u.role === "admin").length);
@@ -46,8 +47,7 @@ function roleHint(role: AdminUser["role"]): string {
 
     <EmptyState
       v-if="!users.length && !req.loading.value"
-      title="No accounts reported"
-      hint="The admin server always has at least the top-level credential, so an empty list means this build could not read its own config."
+      message="No accounts reported. The admin server always has at least the top-level credential, so an empty list means this build could not read its own config."
     />
 
     <div v-else class="sb-card table-wrap">

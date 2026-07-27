@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onMounted } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorState from "../components/ErrorState.vue";
 import PageHeader from "../components/PageHeader.vue";
@@ -13,6 +13,7 @@ const req = useAsync(() => api.compressionSessions(200), {
   pollMs: 20_000,
   refreshLabel: "Compression sessions",
 });
+onMounted(req.run);
 
 const records = computed<CompressionRecord[]>(() => req.data.value?.records ?? []);
 
@@ -68,8 +69,7 @@ function ratio(r: CompressionRecord): string {
 
     <EmptyState
       v-if="!records.length && !req.loading.value"
-      title="No compression records"
-      hint="Records appear once a route with a compression profile handles a conversation."
+      message="No compression records. Records appear once a route with a compression profile handles a conversation."
     />
 
     <div v-else class="sb-card table-wrap">

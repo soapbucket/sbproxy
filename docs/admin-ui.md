@@ -542,6 +542,8 @@ invalidation and semantic-cache debugging.
 
 ## Compression (`/compression`)
 
+![Compression: three live records with covered tokens, summary size, and compression ratio](assets/admin-compression.png)
+
 Externalized conversation context: which sessions have a stored
 summary standing in for their history, and how much that saves.
 
@@ -624,6 +626,8 @@ each fired.
   "not configured," not an error, since there is nothing to audit.
 
 ## Users (`/users`)
+
+![Users: the top-level admin credential plus two configured operators, with role and capability per row](assets/admin-users.png)
 
 Who can sign in to this console, and what each account may do.
 
