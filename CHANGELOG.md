@@ -10,6 +10,17 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+### Removed
+
+- **Dead model-host residency prototypes.** Removed the unwired vLLM sleep/wake
+  client and policy-only KV tiering abstraction. Neither was a supported
+  capability, and vLLM development endpoints are no longer enabled by default.
+  The engine-native `swap_space_gib` and `cpu_offload_gib` settings remain.
+  Safe future sleep/wake wiring needs bounded asynchronous transition polling,
+  retained process ownership and accounting after cleanup failures, a bounded
+  host-RAM policy, isolated container development endpoints, and end-to-end
+  fake-engine coverage (WOR-1987).
+
 ### Added
 
 - **Classifier safety guardrails now ship calibrated default centroids.**

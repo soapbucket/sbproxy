@@ -1977,7 +1977,7 @@
           ]
         },
         "swap_space_gib": {
-          "description": "CPU KV-cache tier size in GiB (vLLM `--swap-space`). Omit to use the engine default.",
+          "description": "CPU swap pool size in GiB (vLLM `--swap-space`). Omit to use the engine default.",
           "default": null,
           "type": [
             "integer",
