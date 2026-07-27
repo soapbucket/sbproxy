@@ -10,8 +10,37 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+## [1.8.0] - 2026-07-27
+
+Trust tier becomes live policy input, config authority grows a command
+line, and the admin console gains the pages it was missing. This release
+also moves the vendored Pingora fork onto upstream 0.8.1, which carries
+security fixes; see Security below.
+
+### Security
+
+- **Pingora updated to upstream 0.8.1.** The vendored fork was based on
+  0.8.0 and has been rebased onto 0.8.1, picking up an HTTP/2 server
+  limit bound that mitigates a memory-exhaustion vector, plus the fixes
+  for `RUSTSEC-2026-0098` and `RUSTSEC-2026-0099`. Every deployment
+  terminating HTTP/2 should take this release. SBproxy's three local
+  patches (dynamic rustls cert resolver, the
+  `upstream_response_decision` retry hook, and the refusal to retry once
+  response bytes have reached the client) are unchanged.
+
 ### Added
 
+- **The admin console reports context compression.** A Compression page
+  lists the sessions whose history has been externalized to a summary,
+  with tokens covered, summary size, and the resulting ratio. Summary
+  text is never listed, only its size and provenance.
+- **The admin console reports who can sign in.** A Users page lists each
+  account and its role over a new read-only `GET /api/admin/users`.
+  Accounts remain config (`admin.username`, `admin.operators`), so the
+  route reports and does not mutate, and passwords are never included in
+  the response.
+- **Spend links through to the requests behind it.** Origin rows in the
+  spend breakdown open the request log filtered to that origin.
 - **Trust tier is now live policy input.** The request path combines
   authentication and agent-detection evidence into `suspicious`, `strong`,
   `named`, or `anonymous`; CEL expression and assertion policies can read
