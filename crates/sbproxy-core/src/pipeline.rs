@@ -1298,10 +1298,28 @@ impl CompiledPipeline {
                     .map_err(|e| {
                         anyhow::anyhow!("origin {}: outbound_credential: {}", origin.origin_id, e)
                     })?;
-                    // WOR-1784: resolve provider-URI secret references in the
-                    // credential's client_secret / secret at load, failing
-                    // loud, so they never reach the token endpoint verbatim.
-                    parsed.resolve_secret_refs().map_err(|e| {
+                    if parsed.is_dpop_enabled()
+                        && (matches!(actions.last(), Some(Action::LoadBalancer(_)))
+                            || forward_rules.last().is_some_and(|rules| {
+                                rules
+                                    .iter()
+                                    .any(|rule| matches!(&rule.action, Action::LoadBalancer(_)))
+                            }))
+                    {
+                        anyhow::bail!(
+                            "origin {}: outbound_credential: DPoP is not supported with load-balanced actions",
+                            origin.origin_id
+                        );
+                    }
+                    // Live pipelines resolve and compile the DPoP private key
+                    // at boot. Validation pipelines check only the reference,
+                    // algorithm, and public JWK so CLI validation never
+                    // dereferences an external secret.
+                    let prepared = match mode {
+                        PipelineConstructionMode::Runtime => parsed.resolve_runtime_secret_refs(),
+                        PipelineConstructionMode::Validation => parsed.validate_dpop(),
+                    };
+                    prepared.map_err(|e| {
                         anyhow::anyhow!("origin {}: outbound_credential: {}", origin.origin_id, e)
                     })?;
                     Some(parsed)
@@ -2893,6 +2911,43 @@ origins:
         basic.insert("authorization", http::HeaderValue::from_static("Basic xyz"));
         assert!(rule.matchers[0].match_request("/", None, &bearer).is_some());
         assert!(rule.matchers[0].match_request("/", None, &basic).is_none());
+    }
+
+    #[test]
+    fn validation_rejects_dpop_on_load_balanced_action() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 18080
+origins:
+  "dpop-lb.test":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      targets:
+        - url: https://one.example.test
+        - url: https://two.example.test
+    outbound_credential:
+      type: client_credentials
+      token_endpoint: https://idp.example.test/token
+      client_id: sbproxy
+      client_secret: secret://prod/client-secret
+      dpop:
+        key: secret://prod/dpop-key
+        alg: ES256
+        jwk:
+          kty: EC
+          crv: P-256
+          x: DpZdjog3y9hgIyKgEPltBi5ptXKUeuRwVOAPSmoQAu4
+          y: bfVVYV9slbMcg4dvtvYbeekYtpFXsYCWcIa9RCrBmTc
+"#;
+        let config = sbproxy_config::compile_config(yaml).unwrap();
+        let error = match CompiledPipeline::from_config_for_validation(config) {
+            Ok(_) => panic!("load-balanced DPoP configuration must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("not supported with load-balanced actions"));
     }
 }
 

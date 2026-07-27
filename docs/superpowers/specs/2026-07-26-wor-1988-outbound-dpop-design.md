@@ -69,7 +69,9 @@ DPoP: <fresh-proof>
 
 The proof's `htu` is built from the actual upstream transport scheme, final
 Host authority, and final path, with query and fragment removed. Its `ath` is
-the base64url-no-pad SHA-256 hash of the access token. Each attempt, including
+the base64url-no-pad SHA-256 hash of the token in the final, uniquely validated
+`Authorization: DPoP <token>` header. A later modifier that replaces that
+header fails closed. Method case is preserved exactly. Each attempt, including
 an ordinary upstream retry, mints a new proof.
 
 ## Nonce challenges
@@ -102,6 +104,12 @@ behavior. When DPoP is enabled, key resolution, signer construction, token
 acquisition, proof minting, and header construction fail closed. The request
 is never sent without the configured sender constraint.
 
+A resolved inbound-key credential cannot override a DPoP-enabled origin
+credential because bound credentials may use arbitrary header shapes; that
+runtime combination fails closed. DPoP proof headers are never captured in
+access logs, even through an exact header allowlist, and the structured-log
+field-key denylist redacts them in other sinks.
+
 ## Verification
 
 Focused unit and local-server integration tests cover:
@@ -116,4 +124,3 @@ Focused unit and local-server integration tests cover:
 - schema-v1 configurations without DPoP;
 - generated schema, example validation, docs, formatting, targeted Clippy,
   and affected crate tests.
-

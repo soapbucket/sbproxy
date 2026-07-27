@@ -6172,7 +6172,15 @@
         },
         "outbound_credential": {
           "description": "Per-origin outbound credential resolver (WOR-802). When set, the proxy mints/resolves a credential and stamps it on the request it sends upstream (RFC 8693 token exchange, OAuth client-credentials, or a vault-resolved secret). Kept as JSON for deferred compilation in `sbproxy-core` (the typed enum lives in `sbproxy-modules`). Secret fields use the standard `${ENV}` interpolation, resolved at config load.",
-          "default": null
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OutboundCredentialSchema"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "outbound_web_bot_auth": {
           "description": "Opt this origin into outbound Web Bot Auth signing (WOR-805). When `true` and `proxy.web_bot_auth` is configured, the proxy signs the request it sends upstream with the proxy's Ed25519 key (RFC 9421, `tag=web-bot-auth`), so an upstream that demands Web Bot Auth accepts SBproxy as a verified agent. Default `false`.",
@@ -7889,6 +7897,210 @@
           "type": "string"
         }
       }
+    },
+    "OutboundCredentialSchema": {
+      "description": "Schema-only mirror of the deferred outbound credential enum. Runtime parsing remains in `sbproxy-modules`; this keeps generated editor tooling precise without introducing a crate dependency cycle.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "audience",
+            "token_endpoint",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "token_exchange"
+              ]
+            },
+            "token_endpoint": {
+              "type": "string"
+            },
+            "audience": {
+              "type": "string"
+            },
+            "scope": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "subject_token_issuers": {
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "allowed_audiences": {
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "act_depth_cap": {
+              "default": 4,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "client_id": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "client_secret": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "dpop": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/OutboundDpopSchema"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "client_id",
+            "client_secret",
+            "token_endpoint",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "client_credentials"
+              ]
+            },
+            "token_endpoint": {
+              "type": "string"
+            },
+            "client_id": {
+              "type": "string"
+            },
+            "client_secret": {
+              "type": "string"
+            },
+            "scope": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "audience": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "dpop": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/OutboundDpopSchema"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "secret",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "vault_secret"
+              ]
+            },
+            "secret": {
+              "type": "string"
+            },
+            "header": {
+              "default": "authorization",
+              "type": "string"
+            },
+            "scheme": {
+              "default": "Bearer",
+              "type": "string"
+            },
+            "dpop": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/OutboundDpopSchema"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "OutboundDpopSchema": {
+      "type": "object",
+      "required": [
+        "alg",
+        "jwk",
+        "key"
+      ],
+      "properties": {
+        "key": {
+          "description": "Existing provider URI or `file:` secret reference. Inline PEM is rejected and SBproxy never generates this key.",
+          "type": "string"
+        },
+        "jwk": {
+          "description": "Public-only JWK matching the referenced private key."
+        },
+        "alg": {
+          "description": "Asymmetric signing algorithm accepted for RFC 9449 proofs.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OutboundDpopAlgorithmSchema"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "OutboundDpopAlgorithmSchema": {
+      "type": "string",
+      "enum": [
+        "ES256",
+        "ES384",
+        "RS256",
+        "RS384",
+        "RS512",
+        "PS256",
+        "PS384",
+        "PS512",
+        "EdDSA"
+      ]
     },
     "OriginObservabilityConfig": {
       "description": "Origin-scope observability sub-tree. The `log.redact` block, `log.sinks` (origin-scoped fan-out, filtered by the stamped `route`), and `log.custom_fields` (the most-specific access-log fields, which override tenant- and proxy-scope fields of the same name) are all consumed at runtime.",

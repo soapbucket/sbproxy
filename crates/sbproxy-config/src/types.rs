@@ -3953,13 +3953,15 @@ fn default_capture_max_value_bytes() -> usize {
 }
 
 /// Header names excluded from `*` and glob matches. Listing one of
-/// these by exact name still works (intentional opt-in).
+/// these by exact name still works as an intentional opt-in, except
+/// `dpop`: sender-constraining proofs are never loggable.
 pub const SENSITIVE_HEADER_DENYLIST: &[&str] = &[
     "authorization",
     "cookie",
     "set-cookie",
     "proxy-authorization",
     "x-api-key",
+    "dpop",
     // Default sidecar header for a minted virtual key. It matches none of the
     // `-key` / `-secret` / `-token` suffix rules the log redactor uses, so
     // without this entry a `capture_headers: ["*"]` glob logs a live key.
@@ -4055,8 +4057,12 @@ impl CompiledHeaderAllowlist {
 
     /// Decide whether `header_name` (already lowercased) should be
     /// captured. The denylist always wins for `*` and glob matches;
-    /// exact matches override the denylist.
+    /// exact matches override the denylist except for DPoP proofs,
+    /// which are never loggable.
     pub fn matches(&self, header_name: &str) -> bool {
+        if header_name == "dpop" {
+            return false;
+        }
         if self.exact.contains(header_name) {
             return true;
         }
@@ -4907,6 +4913,91 @@ pub enum CredentialPolicy {
     },
 }
 
+/// Schema-only mirror of the deferred outbound credential enum. Runtime
+/// parsing remains in `sbproxy-modules`; this keeps generated editor tooling
+/// precise without introducing a crate dependency cycle.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[allow(dead_code)]
+enum OutboundCredentialSchema {
+    TokenExchange {
+        token_endpoint: String,
+        audience: String,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        subject_token_issuers: Vec<String>,
+        #[serde(default)]
+        allowed_audiences: Vec<String>,
+        #[serde(default = "default_outbound_act_depth")]
+        act_depth_cap: usize,
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        client_secret: Option<String>,
+        #[serde(default)]
+        dpop: Option<OutboundDpopSchema>,
+    },
+    ClientCredentials {
+        token_endpoint: String,
+        client_id: String,
+        client_secret: String,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        audience: Option<String>,
+        #[serde(default)]
+        dpop: Option<OutboundDpopSchema>,
+    },
+    VaultSecret {
+        secret: String,
+        #[serde(default = "default_outbound_credential_header")]
+        header: String,
+        #[serde(default = "default_outbound_credential_scheme")]
+        scheme: String,
+        #[serde(default)]
+        dpop: Option<OutboundDpopSchema>,
+    },
+}
+
+fn default_outbound_act_depth() -> usize {
+    4
+}
+
+fn default_outbound_credential_header() -> String {
+    "authorization".to_string()
+}
+
+fn default_outbound_credential_scheme() -> String {
+    "Bearer".to_string()
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct OutboundDpopSchema {
+    /// Existing provider URI or `file:` secret reference. Inline PEM is
+    /// rejected and SBproxy never generates this key.
+    key: String,
+    /// Public-only JWK matching the referenced private key.
+    jwk: serde_json::Value,
+    /// Asymmetric signing algorithm accepted for RFC 9449 proofs.
+    alg: OutboundDpopAlgorithmSchema,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+enum OutboundDpopAlgorithmSchema {
+    ES256,
+    ES384,
+    RS256,
+    RS384,
+    RS512,
+    PS256,
+    PS384,
+    PS512,
+    EdDSA,
+}
+
 /// A single origin config as it appears in YAML.
 /// Plugin-specific fields are kept as `serde_json::Value` for deferred parsing.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -5143,6 +5234,7 @@ pub struct RawOriginConfig {
     /// `sbproxy-modules`). Secret fields use the standard `${ENV}`
     /// interpolation, resolved at config load.
     #[serde(default)]
+    #[schemars(with = "Option<OutboundCredentialSchema>")]
     pub outbound_credential: Option<serde_json::Value>,
     /// Opt this origin into outbound Web Bot Auth signing (WOR-805).
     /// When `true` and `proxy.web_bot_auth` is configured, the proxy

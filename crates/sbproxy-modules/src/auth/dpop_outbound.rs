@@ -16,28 +16,22 @@
 //!    `DpopSigner::from_pem`.
 //! 2. Mint a fresh proof per call via `DpopSigner::mint_proof`:
 //!    the header carries `alg`, `typ=dpop+jwt`, and the public JWK;
-//!    the claims carry `jti` (UUIDv4), `htm` (method), `htu` (URI),
+//!    the claims carry a random 128-bit `jti`, `htm` (method), `htu` (URI),
 //!    `iat` (current epoch), and `nonce` when the upstream's last
 //!    response carried a `DPoP-Nonce` header (RFC 9449 §8).
-//! 3. Cache the signer per origin so the parsed key + the JWK
-//!    serialisation are reused across requests.
+//! 3. Reuse the parsed signer per origin while minting a new proof for
+//!    every token and protected-resource attempt.
 //!
-//! ## What this module does NOT do
-//!
-//! * Fetch the access token. The upstream credential resolver
-//!   (`outbound_credential.rs`) drives the token-acquisition flow;
-//!   this module signs the proof that travels alongside the token.
-//! * Decide WHEN to mint. The credential resolver inspects the
-//!   per-upstream config (`require_dpop: true`) and calls
-//!   `mint_proof` only when the proof is required.
-//! * Retry on a 401 `DPoP-Nonce` challenge. The HTTP layer that
-//!   handles 401 retries threads the new nonce back into
-//!   `mint_proof`'s `nonce` argument on the second attempt.
+//! Token acquisition and the bounded nonce retry loops are driven by
+//! `outbound_credential.rs` and the Pingora resource-request seam.
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAX_NONCE_BYTES: usize = 1024;
 
 /// Errors `DpopSigner::from_pem` can return when parsing the key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +46,19 @@ pub enum DpopSignerError {
         /// Algorithm name as configured.
         found: String,
     },
+    /// The configured JWK is malformed, incompatible with the selected
+    /// algorithm, or contains private key members.
+    InvalidPublicJwk,
+    /// The public JWK does not correspond to the configured private key.
+    KeyPairMismatch,
+    /// DPoP private keys must use the existing secret-reference surface.
+    KeyReferenceRequired,
+    /// A server nonce was empty, too large, or outside RFC 9449 syntax.
+    InvalidNonce,
+    /// A protected-resource target did not have an HTTP(S) origin.
+    InvalidTargetUri,
+    /// Internal nonce state could not be accessed.
+    NonceStateUnavailable,
 }
 
 impl std::fmt::Display for DpopSignerError {
@@ -61,6 +68,18 @@ impl std::fmt::Display for DpopSignerError {
             Self::AlgorithmNotAllowed { found } => {
                 write!(f, "algorithm `{found}` not in the DPoP allowlist")
             }
+            Self::InvalidPublicJwk => {
+                f.write_str("DPoP public JWK is malformed or contains private key material")
+            }
+            Self::KeyPairMismatch => {
+                f.write_str("DPoP public JWK does not match the configured private key")
+            }
+            Self::KeyReferenceRequired => {
+                f.write_str("DPoP signing key must be an existing secret reference")
+            }
+            Self::InvalidNonce => f.write_str("DPoP nonce is malformed"),
+            Self::InvalidTargetUri => f.write_str("DPoP target URI is malformed"),
+            Self::NonceStateUnavailable => f.write_str("DPoP nonce state is unavailable"),
         }
     }
 }
@@ -120,22 +139,26 @@ impl DpopSigner {
             }
             _ => return Err(DpopSignerError::InvalidKeyFormat),
         };
-        Ok(Self {
+        validate_public_jwk(&jwk, alg_parsed)?;
+        let signer = Self {
             alg: alg_parsed,
             key,
             jwk,
-        })
+        };
+        signer.validate_key_pair()?;
+        Ok(signer)
     }
 
     /// Mint a fresh DPoP proof for the given `(method, url)` pair.
     /// Pass `nonce` only when the upstream's last response carried a
     /// `DPoP-Nonce` header per RFC 9449 §8. The proof's `iat` is the
-    /// current Unix time; the `jti` is a fresh UUIDv4 so the inbound
+    /// current Unix time; the `jti` carries 128 fresh random bits so the inbound
     /// replay cache on the upstream cannot collide across calls.
     pub fn mint_proof(
         &self,
         method: &str,
         url: &str,
+        access_token: Option<&str>,
         nonce: Option<&str>,
     ) -> Result<String, DpopSignerError> {
         let mut header = Header::new(self.alg);
@@ -148,18 +171,29 @@ impl DpopSigner {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let jti = format!("dpop-{:016x}-{:016x}", now, rand::random::<u64>());
+        let jti = format!(
+            "{:016x}{:016x}",
+            rand::random::<u64>(),
+            rand::random::<u64>()
+        );
         let mut claims = serde_json::Map::new();
         claims.insert("jti".to_string(), serde_json::Value::String(jti));
         claims.insert(
             "htm".to_string(),
-            serde_json::Value::String(method.to_ascii_uppercase()),
+            serde_json::Value::String(method.to_string()),
         );
         claims.insert(
             "htu".to_string(),
             serde_json::Value::String(url.to_string()),
         );
         claims.insert("iat".to_string(), serde_json::Value::Number(now.into()));
+        if let Some(token) = access_token {
+            use base64::Engine;
+            use sha2::{Digest, Sha256};
+            let ath = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(Sha256::digest(token.as_bytes()));
+            claims.insert("ath".to_string(), serde_json::Value::String(ath));
+        }
         if let Some(n) = nonce {
             claims.insert(
                 "nonce".to_string(),
@@ -169,6 +203,203 @@ impl DpopSigner {
         jsonwebtoken::encode(&header, &claims, &self.key)
             .map_err(|_| DpopSignerError::InvalidKeyFormat)
     }
+
+    fn validate_key_pair(&self) -> Result<(), DpopSignerError> {
+        let jkt = crate::auth::dpop::jwk_thumbprint(&self.jwk)
+            .ok_or(DpopSignerError::InvalidPublicJwk)?;
+        let proof = self.mint_proof(
+            "POST",
+            "https://dpop-key-validation.invalid/token",
+            None,
+            None,
+        )?;
+        crate::auth::dpop::DpopVerifier::default()
+            .verify(
+                Some(&proof),
+                "POST",
+                "https://dpop-key-validation.invalid/token",
+                &jkt,
+                SystemTime::now(),
+            )
+            .map(|_| ())
+            .map_err(|rejection| match rejection {
+                crate::auth::dpop::DpopRejection::BadSignature => DpopSignerError::KeyPairMismatch,
+                _ => DpopSignerError::InvalidPublicJwk,
+            })
+    }
+}
+
+fn validate_public_jwk(jwk: &serde_json::Value, alg: Algorithm) -> Result<(), DpopSignerError> {
+    let object = jwk.as_object().ok_or(DpopSignerError::InvalidPublicJwk)?;
+    const PRIVATE_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
+    if PRIVATE_MEMBERS
+        .iter()
+        .any(|member| object.contains_key(*member))
+    {
+        return Err(DpopSignerError::InvalidPublicJwk);
+    }
+    let kty = object
+        .get("kty")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(DpopSignerError::InvalidPublicJwk)?;
+    let compatible = match alg {
+        Algorithm::ES256 => {
+            kty == "EC" && object.get("crv").and_then(serde_json::Value::as_str) == Some("P-256")
+        }
+        Algorithm::ES384 => {
+            kty == "EC" && object.get("crv").and_then(serde_json::Value::as_str) == Some("P-384")
+        }
+        Algorithm::RS256
+        | Algorithm::RS384
+        | Algorithm::RS512
+        | Algorithm::PS256
+        | Algorithm::PS384
+        | Algorithm::PS512 => kty == "RSA",
+        Algorithm::EdDSA => {
+            kty == "OKP" && object.get("crv").and_then(serde_json::Value::as_str) == Some("Ed25519")
+        }
+        _ => false,
+    };
+    if !compatible || crate::auth::dpop::jwk_thumbprint(jwk).is_none() {
+        return Err(DpopSignerError::InvalidPublicJwk);
+    }
+    Ok(())
+}
+
+/// Check that a private key is named through the repository's existing
+/// secret-reference surface. HTTP URLs and inline PEM are never accepted.
+pub fn validate_key_reference(reference: &str) -> Result<(), DpopSignerError> {
+    let reference = reference.trim();
+    let file_reference = reference
+        .strip_prefix("file:")
+        .is_some_and(|path| !path.is_empty());
+    if file_reference || sbproxy_vault::looks_like_secret_reference_uri(reference) {
+        return Ok(());
+    }
+    Err(DpopSignerError::KeyReferenceRequired)
+}
+
+/// Validate the bounded RFC 9449 nonce syntax accepted from token and
+/// protected-resource responses.
+pub fn validate_nonce(nonce: &str) -> Result<(), DpopSignerError> {
+    let valid = !nonce.is_empty()
+        && nonce.len() <= MAX_NONCE_BYTES
+        && nonce.bytes().all(|byte| {
+            byte == 0x21 || (0x23..=0x5b).contains(&byte) || (0x5d..=0x7e).contains(&byte)
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(DpopSignerError::InvalidNonce)
+    }
+}
+
+/// Parsed per-origin DPoP key and nonce state.
+///
+/// Authorization-server and resource-server nonces intentionally occupy
+/// different slots because RFC 9449 limits each nonce to its issuing server.
+pub struct DpopRuntime {
+    signer: DpopSigner,
+    jkt: String,
+    authorization_nonce: Mutex<Option<String>>,
+    resource_nonces: Mutex<std::collections::HashMap<String, String>>,
+}
+
+impl std::fmt::Debug for DpopRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DpopRuntime")
+            .field("jkt", &self.jkt)
+            .field(
+                "authorization_nonce",
+                &self.authorization_nonce.lock().map(|n| n.is_some()),
+            )
+            .field(
+                "resource_nonce_origins",
+                &self.resource_nonces.lock().map(|nonces| nonces.len()),
+            )
+            .finish()
+    }
+}
+
+impl DpopRuntime {
+    /// Parse and validate one origin's configured signing key.
+    pub fn new(pem: &[u8], jwk: serde_json::Value, alg: &str) -> Result<Self, DpopSignerError> {
+        let signer = DpopSigner::from_pem(pem, jwk.clone(), alg)?;
+        let jkt =
+            crate::auth::dpop::jwk_thumbprint(&jwk).ok_or(DpopSignerError::InvalidPublicJwk)?;
+        Ok(Self {
+            signer,
+            jkt,
+            authorization_nonce: Mutex::new(None),
+            resource_nonces: Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// Non-secret stable identity used to partition the minted-token cache.
+    pub fn key_thumbprint(&self) -> &str {
+        &self.jkt
+    }
+
+    /// Mint a proof for the token endpoint without an `ath` claim.
+    pub fn mint_token_proof(&self, method: &str, htu: &str) -> Result<String, DpopSignerError> {
+        let nonce = self
+            .authorization_nonce
+            .lock()
+            .map_err(|_| DpopSignerError::NonceStateUnavailable)?
+            .clone();
+        self.signer.mint_proof(method, htu, None, nonce.as_deref())
+    }
+
+    /// Mint a protected-resource proof bound to `access_token`.
+    pub fn mint_resource_proof(
+        &self,
+        method: &str,
+        htu: &str,
+        access_token: &str,
+    ) -> Result<String, DpopSignerError> {
+        let nonce_key = resource_nonce_key(htu)?;
+        let nonce = self
+            .resource_nonces
+            .lock()
+            .map_err(|_| DpopSignerError::NonceStateUnavailable)?
+            .get(&nonce_key)
+            .cloned();
+        self.signer
+            .mint_proof(method, htu, Some(access_token), nonce.as_deref())
+    }
+
+    /// Replace the authorization-server nonce after validating its syntax.
+    pub fn set_authorization_nonce(&self, nonce: &str) -> Result<(), DpopSignerError> {
+        validate_nonce(nonce)?;
+        *self
+            .authorization_nonce
+            .lock()
+            .map_err(|_| DpopSignerError::NonceStateUnavailable)? = Some(nonce.to_string());
+        Ok(())
+    }
+
+    /// Replace the resource-server nonce after validating its syntax.
+    pub fn set_resource_nonce(&self, htu: &str, nonce: &str) -> Result<(), DpopSignerError> {
+        validate_nonce(nonce)?;
+        let nonce_key = resource_nonce_key(htu)?;
+        let mut nonces = self
+            .resource_nonces
+            .lock()
+            .map_err(|_| DpopSignerError::NonceStateUnavailable)?;
+        if nonces.len() >= 128 && !nonces.contains_key(&nonce_key) {
+            nonces.clear();
+        }
+        nonces.insert(nonce_key, nonce.to_string());
+        Ok(())
+    }
+}
+
+fn resource_nonce_key(htu: &str) -> Result<String, DpopSignerError> {
+    let target = url::Url::parse(htu).map_err(|_| DpopSignerError::InvalidTargetUri)?;
+    if !matches!(target.scheme(), "http" | "https") || target.host_str().is_none() {
+        return Err(DpopSignerError::InvalidTargetUri);
+    }
+    Ok(target.origin().ascii_serialization())
 }
 
 /// Per-origin signer cache. The credential resolver registers one
@@ -202,17 +433,71 @@ impl DpopSignerCache {
 /// Configuration for an outbound DPoP-bound credential. Mirrors the
 /// proxy's existing outbound credential block shape so it slots in
 /// under the same `outbound_credential:` config key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DpopOutboundConfig {
-    /// PEM-encoded PKCS#8 private key the proxy signs proofs with.
-    /// Resolved via the existing `vault://` URI scheme.
-    pub key_pem: String,
+    /// Existing secret-provider or `file:` reference to a PKCS#8 PEM.
+    pub key: String,
     /// Public JWK matching `key_pem`. Ships in every minted proof's
     /// header so the upstream verifies without an out-of-band fetch.
     pub jwk: serde_json::Value,
     /// Algorithm slug: `ES256` / `ES384` / `RS256` / `RS384` /
     /// `RS512` / `PS256` / `PS384` / `PS512` / `EdDSA`.
     pub alg: String,
+    /// Parsed signer installed during runtime pipeline construction.
+    #[serde(skip)]
+    runtime: Option<Arc<DpopRuntime>>,
+}
+
+impl std::fmt::Debug for DpopOutboundConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DpopOutboundConfig")
+            .field("key", &"[SECRET REFERENCE]")
+            .field("alg", &self.alg)
+            .field(
+                "jkt",
+                &crate::auth::dpop::jwk_thumbprint(&self.jwk).as_deref(),
+            )
+            .field("runtime", &self.runtime.is_some())
+            .finish()
+    }
+}
+
+impl DpopOutboundConfig {
+    /// Validate reference and public-key fields without resolving the secret.
+    pub fn validate(&self) -> Result<(), DpopSignerError> {
+        validate_key_reference(&self.key)?;
+        let alg =
+            self.alg
+                .parse::<Algorithm>()
+                .map_err(|_| DpopSignerError::AlgorithmNotAllowed {
+                    found: self.alg.clone(),
+                })?;
+        if !is_allowed(alg) {
+            return Err(DpopSignerError::AlgorithmNotAllowed {
+                found: self.alg.clone(),
+            });
+        }
+        validate_public_jwk(&self.jwk, alg)
+    }
+
+    /// Install the resolved private key after boot-time secret resolution.
+    pub fn install_resolved_key(&mut self, pem: &str) -> Result<(), DpopSignerError> {
+        self.validate()?;
+        self.runtime = Some(Arc::new(DpopRuntime::new(
+            pem.as_bytes(),
+            self.jwk.clone(),
+            &self.alg,
+        )?));
+        Ok(())
+    }
+
+    /// Return the compiled runtime. Runtime requests fail closed if absent.
+    pub fn runtime(&self) -> Result<Arc<DpopRuntime>, DpopSignerError> {
+        self.runtime
+            .clone()
+            .ok_or(DpopSignerError::InvalidKeyFormat)
+    }
 }
 
 /// Mirror of the inbound verifier's allowlist. Kept in a private
@@ -275,7 +560,7 @@ mod tests {
         let signer = DpopSigner::from_pem(TEST_PRIVATE_KEY_PEM.as_bytes(), test_jwk(), "ES256")
             .expect("signer constructs");
         let proof = signer
-            .mint_proof("POST", "https://api.example/resource", None)
+            .mint_proof("POST", "https://api.example/resource", None, None)
             .expect("mint");
 
         let v = DpopVerifier::default();
@@ -297,7 +582,12 @@ mod tests {
         let signer = DpopSigner::from_pem(TEST_PRIVATE_KEY_PEM.as_bytes(), test_jwk(), "ES256")
             .expect("signer constructs");
         let proof = signer
-            .mint_proof("GET", "https://api.example/n", Some("server-nonce-123"))
+            .mint_proof(
+                "GET",
+                "https://api.example/n",
+                None,
+                Some("server-nonce-123"),
+            )
             .expect("mint");
 
         // Decode the proof's claims segment + assert the nonce is
@@ -359,10 +649,10 @@ mod tests {
         let signer = DpopSigner::from_pem(TEST_PRIVATE_KEY_PEM.as_bytes(), test_jwk(), "ES256")
             .expect("signer constructs");
         let first = signer
-            .mint_proof("GET", "https://api.example/r", Some("nonce-A"))
+            .mint_proof("GET", "https://api.example/r", None, Some("nonce-A"))
             .expect("first mint");
         let second = signer
-            .mint_proof("GET", "https://api.example/r", Some("nonce-B"))
+            .mint_proof("GET", "https://api.example/r", None, Some("nonce-B"))
             .expect("second mint");
 
         use base64::Engine;
@@ -374,5 +664,125 @@ mod tests {
             let claims: serde_json::Value = serde_json::from_slice(&claims_bytes).unwrap();
             assert_eq!(claims.get("nonce").and_then(|v| v.as_str()), Some(expected));
         }
+    }
+
+    fn proof_claims(proof: &str) -> serde_json::Value {
+        use base64::Engine;
+        let claims = proof.split('.').nth(1).expect("claims segment");
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(claims)
+            .expect("base64url claims");
+        serde_json::from_slice(&decoded).expect("JSON claims")
+    }
+
+    #[test]
+    fn resource_proof_binds_the_access_token_with_ath() {
+        let runtime =
+            DpopRuntime::new(TEST_PRIVATE_KEY_PEM.as_bytes(), test_jwk(), "ES256").unwrap();
+        let proof = runtime
+            .mint_resource_proof(
+                "PATCH",
+                "https://api.example/resource",
+                "access-token-value",
+            )
+            .unwrap();
+
+        assert_eq!(
+            proof_claims(&proof)["ath"],
+            "iJgTy-uvL4oMlW_aBkwnk0nI686296RGFKrgcDJXTpo"
+        );
+    }
+
+    #[test]
+    fn proof_preserves_extension_method_case() {
+        let signer = DpopSigner::from_pem(TEST_PRIVATE_KEY_PEM.as_bytes(), test_jwk(), "ES256")
+            .expect("signer constructs");
+        let proof = signer
+            .mint_proof("customMethod", "https://api.example/resource", None, None)
+            .expect("mint");
+
+        assert_eq!(proof_claims(&proof)["htm"], "customMethod");
+    }
+
+    #[test]
+    fn every_mint_has_a_fresh_jti_and_signature() {
+        let runtime =
+            DpopRuntime::new(TEST_PRIVATE_KEY_PEM.as_bytes(), test_jwk(), "ES256").unwrap();
+        let first = runtime
+            .mint_resource_proof("GET", "https://api.example/items", "token")
+            .unwrap();
+        let second = runtime
+            .mint_resource_proof("GET", "https://api.example/items", "token")
+            .unwrap();
+
+        assert_ne!(first, second);
+        assert_ne!(proof_claims(&first)["jti"], proof_claims(&second)["jti"]);
+    }
+
+    #[test]
+    fn public_jwk_with_private_member_is_rejected() {
+        let mut jwk = test_jwk();
+        jwk["d"] = serde_json::Value::String("private-material".to_string());
+        let result = DpopRuntime::new(TEST_PRIVATE_KEY_PEM.as_bytes(), jwk, "ES256");
+
+        assert!(matches!(result, Err(DpopSignerError::InvalidPublicJwk)));
+    }
+
+    #[test]
+    fn public_jwk_must_match_private_key() {
+        let mut jwk = test_jwk();
+        jwk["x"] =
+            serde_json::Value::String("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string());
+        let result = DpopRuntime::new(TEST_PRIVATE_KEY_PEM.as_bytes(), jwk, "ES256");
+
+        assert!(matches!(result, Err(DpopSignerError::KeyPairMismatch)));
+    }
+
+    #[test]
+    fn authorization_and_resource_nonces_are_separate() {
+        let runtime =
+            DpopRuntime::new(TEST_PRIVATE_KEY_PEM.as_bytes(), test_jwk(), "ES256").unwrap();
+        runtime.set_authorization_nonce("as-nonce").unwrap();
+        runtime
+            .set_resource_nonce("https://api.example/resource", "rs-nonce")
+            .unwrap();
+
+        let token = runtime
+            .mint_token_proof("POST", "https://idp.example/token")
+            .unwrap();
+        let resource = runtime
+            .mint_resource_proof("GET", "https://api.example/items", "token")
+            .unwrap();
+        assert_eq!(proof_claims(&token)["nonce"], "as-nonce");
+        assert_eq!(proof_claims(&resource)["nonce"], "rs-nonce");
+    }
+
+    #[test]
+    fn resource_nonce_is_scoped_to_its_issuing_origin() {
+        let runtime =
+            DpopRuntime::new(TEST_PRIVATE_KEY_PEM.as_bytes(), test_jwk(), "ES256").unwrap();
+        runtime
+            .set_resource_nonce("https://one.example/resource", "one-nonce")
+            .unwrap();
+
+        let other = runtime
+            .mint_resource_proof("GET", "https://two.example/resource", "token")
+            .unwrap();
+        assert!(proof_claims(&other).get("nonce").is_none());
+    }
+
+    #[test]
+    fn dpop_private_key_must_be_an_existing_secret_reference() {
+        for reference in [
+            "secret://prod/dpop-key",
+            "vault://primary/apps/api?key=dpop",
+            "file:/run/secrets/api-dpop.pem",
+        ] {
+            validate_key_reference(reference).expect(reference);
+        }
+
+        let inline = validate_key_reference(TEST_PRIVATE_KEY_PEM).unwrap_err();
+        assert!(matches!(inline, DpopSignerError::KeyReferenceRequired));
+        assert!(!inline.to_string().contains("PRIVATE KEY"));
     }
 }
