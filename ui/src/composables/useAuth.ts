@@ -8,6 +8,9 @@ const role = ref("");
 // True once the initial session check has completed, so the app can show
 // a brief loading state instead of flashing the login form.
 const ready = ref(false);
+// Set when a 401 ends a session that was working, so the sign-in screen can
+// say why the operator landed back on it instead of just appearing.
+const sessionExpired = ref(false);
 
 /**
  * Session-based auth for the SPA (WOR-1758). On load, `refresh()` asks
@@ -19,6 +22,11 @@ const ready = ref(false);
 // A 401 on any request means the session is gone. Flip the shared state
 // once, here, so every consumer (router guard included) sees it.
 setUnauthorizedHandler(() => {
+  // Only a session that was live can expire. A 401 while already signed out
+  // is just an unauthenticated request and needs no explanation.
+  if (authenticated.value) {
+    sessionExpired.value = true;
+  }
   authenticated.value = false;
 });
 
@@ -44,6 +52,7 @@ export function useAuth() {
   async function login(user: string, password: string): Promise<void> {
     const r = await api.login(user, password);
     authenticated.value = true;
+    sessionExpired.value = false;
     username.value = r.username;
     role.value = r.role;
   }
@@ -59,5 +68,5 @@ export function useAuth() {
     }
   }
 
-  return { authenticated, username, role, ready, refresh, login, logout };
+  return { authenticated, username, role, ready, sessionExpired, refresh, login, logout };
 }

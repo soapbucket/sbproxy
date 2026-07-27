@@ -98,6 +98,9 @@ describe("auth guard", () => {
     );
     await expect(api.keys()).rejects.toThrow();
     expect(auth.authenticated.value).toBe(false);
+    // And the sign-in screen can explain itself, rather than appearing
+    // mid-session with no reason given.
+    expect(auth.sessionExpired.value).toBe(true);
     vi.unstubAllGlobals();
   });
 });
