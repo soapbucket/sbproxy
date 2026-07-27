@@ -1,4 +1,5 @@
 import { createMemoryHistory, createRouter, createWebHistory } from "vue-router";
+import { useAuth } from "./composables/useAuth";
 
 const routes = [
   {
@@ -115,6 +116,12 @@ const routes = [
     component: () => import("./views/ClusterView.vue"),
     meta: { title: "Cluster" },
   },
+  {
+    path: "/login",
+    name: "login",
+    component: () => import("./views/LoginView.vue"),
+    meta: { title: "Sign in", public: true },
+  },
   { path: "/:pathMatch(.*)*", redirect: "/" },
 ];
 
@@ -126,4 +133,27 @@ export const router = createRouter({
       ? createMemoryHistory("/admin/ui/")
       : createWebHistory("/admin/ui/"),
   routes,
+});
+
+// Send an unauthenticated visitor to the login route rather than swapping
+// the form in beneath whatever URL they asked for. The destination rides
+// along as `next` so signing in returns them where they were headed, which
+// is what makes a bookmarked deep link survive a session expiry.
+//
+// The guard waits for the initial session check: routing before it settles
+// would bounce an authenticated operator to the login page on every cold
+// load.
+router.beforeEach(async (to) => {
+  const { authenticated, ready, refresh } = useAuth();
+  if (!ready.value) {
+    await refresh();
+  }
+  if (authenticated.value) {
+    // Nothing to sign in to; keep the login route out of the history.
+    return to.name === "login" ? { path: "/" } : true;
+  }
+  if (to.meta.public) {
+    return true;
+  }
+  return { name: "login", query: to.fullPath === "/" ? {} : { next: to.fullPath } };
 });

@@ -15,6 +15,27 @@
  */
 
 // In-memory CSRF token for the current session; null when unauthenticated
+// Called when the server rejects a request as unauthenticated, so the app
+// can drop to the sign-in screen instead of leaving the operator on a shell
+// where every panel quietly errors. Registered by `useAuth`; a callback
+// rather than a direct import because `useAuth` already imports this module.
+let onUnauthorized: (() => void) | null = null;
+
+/** Register the handler invoked when a request comes back 401. */
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  onUnauthorized = handler;
+}
+
+/**
+ * Paths that legitimately answer 401 without meaning "your session died":
+ * the login attempt itself, and the session probe used to discover that
+ * there is no session yet. Firing the handler for these would fight the
+ * sign-in flow.
+ */
+function isAuthProbePath(path: string): boolean {
+  return path.startsWith("/admin/login") || path.startsWith("/admin/session");
+}
+
 // or authenticated via Basic. Set from the login / session responses.
 let csrfToken: string | null = null;
 export function setCsrfToken(token: string | null): void {
@@ -198,6 +219,12 @@ async function request(
     } catch {
       // ignore
     }
+    if (res.status === 401 && !isAuthProbePath(path)) {
+      // The session lapsed mid-use. Tell the app so it can send the
+      // operator to sign in, rather than leaving them on a console where
+      // every panel reports "Not authorized" with no way forward.
+      onUnauthorized?.();
+    }
     throw new ApiError(res.status, `${method} ${path} failed (${res.status})`, text);
   }
   return res;
@@ -259,6 +286,12 @@ async function sendRaw(
       text = await res.text();
     } catch {
       // ignore
+    }
+    if (res.status === 401 && !isAuthProbePath(path)) {
+      // The session lapsed mid-use. Tell the app so it can send the
+      // operator to sign in, rather than leaving them on a console where
+      // every panel reports "Not authorized" with no way forward.
+      onUnauthorized?.();
     }
     throw new ApiError(res.status, `${method} ${path} failed (${res.status})`, text);
   }

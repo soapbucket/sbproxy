@@ -3183,6 +3183,22 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
         return;
     }
 
+    // An operator who opens the admin port in a browser lands on `/`, and
+    // used to get `{"error":"Not Found"}` with no hint the console exists.
+    // Send the browser to the SPA instead. Dispatched before the auth gate
+    // on purpose: the redirect target carries no data, and requiring
+    // credentials to be told where the login page lives is a dead end. The
+    // SPA then gates itself and shows its own login.
+    if crate::admin_ui::is_console_entry_path(&path) {
+        let mut headers = cors.clone();
+        headers.push((
+            "Location".to_string(),
+            format!("{}/", crate::admin_ui::UI_PREFIX),
+        ));
+        let _ = write_admin_response_headed(sock, 302, "text/plain", b"", &headers).await;
+        return;
+    }
+
     // Slice the request body off the buffer (needed by login + dispatch).
     let body_owned: Option<String> = match (header_end, content_length) {
         (Some(end), Some(cl)) => {

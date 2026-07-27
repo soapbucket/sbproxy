@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { ref } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import { useAuth } from "../composables/useAuth";
 import { ApiError } from "../api";
 import BrandMark from "../components/BrandMark.vue";
 
 const { login } = useAuth();
+const route = useRoute();
+const router = useRouter();
 const username = ref("");
 const password = ref("");
 const submitting = ref(false);
@@ -16,6 +19,15 @@ async function submit() {
   submitting.value = true;
   try {
     await login(username.value, password.value);
+    // Return the operator to whatever they were trying to reach. Only
+    // same-app paths are honoured: `next` comes from the query string, so
+    // treating it as a raw location would let a crafted link bounce a
+    // freshly authenticated operator to another origin.
+    const next = route.query.next;
+    const target = typeof next === "string" && next.startsWith("/") && !next.startsWith("//")
+      ? next
+      : "/";
+    await router.replace(target);
   } catch (e) {
     if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
       error.value = "Invalid username or password.";

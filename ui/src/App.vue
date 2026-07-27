@@ -3,7 +3,6 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import AppSidebar from "./components/AppSidebar.vue";
 import BrandMark from "./components/BrandMark.vue";
 import ToastHost from "./components/ToastHost.vue";
-import LoginView from "./views/LoginView.vue";
 import { useAuth } from "./composables/useAuth";
 import { api } from "./api";
 
@@ -65,7 +64,10 @@ onUnmounted(() => {
 
 <template>
   <div v-if="!ready" class="boot">Loading...</div>
-  <LoginView v-else-if="!authenticated" />
+  <!-- The router guard sends an unauthenticated visitor to /login, which
+       renders LoginView as a route. App only draws the chrome, so the
+       sidebar and topbar never flash behind the sign-in form. -->
+  <RouterView v-else-if="!authenticated" />
   <div v-else class="frame">
     <header class="topbar">
       <BrandMark />

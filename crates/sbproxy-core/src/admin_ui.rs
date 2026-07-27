@@ -67,6 +67,17 @@ pub fn dispatch(method: &str, path: &str) -> Option<(u16, &'static str, String)>
     }
 }
 
+/// True for the bare entry paths an operator reaches by typing the admin
+/// host into a browser: `/`, `/admin`, and `/admin/`.
+///
+/// These carry no data and exist only to point at the console, so the
+/// server answers them with a redirect to [`UI_PREFIX`] rather than the
+/// generic JSON 404 they used to get.
+pub fn is_console_entry_path(path: &str) -> bool {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    matches!(path, "/" | "/admin" | "/admin/")
+}
+
 /// Path-matching helper. `/admin/ui` (no trailing slash) and any
 /// subpath under `/admin/ui/` belong to this module. We accept the
 /// no-slash form so a single href like `<a href="/admin/ui">` does
@@ -238,6 +249,42 @@ fn content_type_for(path: &str) -> &'static str {
         "ico" => "image/x-icon",
         "wasm" => "application/wasm",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod console_entry_tests {
+    use super::*;
+
+    #[test]
+    fn bare_entry_paths_are_console_entries() {
+        // An operator typing the admin host into a browser lands on one of
+        // these, and used to get a JSON 404 with no hint the console exists.
+        for path in ["/", "/admin", "/admin/"] {
+            assert!(is_console_entry_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn query_and_fragment_do_not_defeat_the_match() {
+        assert!(is_console_entry_path("/?from=bookmark"));
+        assert!(is_console_entry_path("/admin?x=1"));
+    }
+
+    #[test]
+    fn real_api_and_ui_paths_are_not_console_entries() {
+        // Redirecting any of these would break the API or loop the SPA.
+        for path in [
+            "/admin/keys",
+            "/admin/ui",
+            "/admin/ui/",
+            "/admin/ui/keys",
+            "/health",
+            "/metrics",
+            "/adminsomething",
+        ] {
+            assert!(!is_console_entry_path(path), "{path}");
+        }
     }
 }
 

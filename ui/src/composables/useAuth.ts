@@ -1,5 +1,5 @@
 import { ref } from "vue";
-import { api, setCsrfToken } from "../api";
+import { api, setCsrfToken, setUnauthorizedHandler } from "../api";
 
 // Module-level (singleton) auth state shared across the app.
 const authenticated = ref(false);
@@ -16,6 +16,12 @@ const ready = ref(false);
  * Basic-auth users appear authenticated with no CSRF token, which the
  * API client handles (Basic is CSRF-exempt server-side).
  */
+// A 401 on any request means the session is gone. Flip the shared state
+// once, here, so every consumer (router guard included) sees it.
+setUnauthorizedHandler(() => {
+  authenticated.value = false;
+});
+
 export function useAuth() {
   async function refresh(): Promise<void> {
     try {
