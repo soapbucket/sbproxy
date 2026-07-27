@@ -1,6 +1,6 @@
 # AI crawlers are reading your site for free
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-26*
 
 ![An unsigned crawler gets 401, a signed crawler gets a 402 price challenge, a payment token redeems once for a 200, and the replay is charged again](assets/use-case-meter-crawlers.gif)
 
@@ -177,5 +177,4 @@ Note that the replayed request reused the same signature headers and still passe
 - [402-challenge.md](402-challenge.md) is the wire contract: single-rail and multi-rail challenge bodies, quote tokens, the 406 fallback, and Cloudflare Pay Per Crawl interop via `cloudflare_compat: true`.
 - [rsl.md](rsl.md) and [content-for-agents.md](content-for-agents.md) advertise your terms so cooperative crawlers can discover them without a 402 round-trip: `/licenses.xml`, `robots.txt`, `llms.txt`, TDMRep, and Markdown or JSON projections of your pages.
 - [l402.md](l402.md) documents the Lightning-flavored macaroon credential surface if your buyers already speak L402.
-- [outbound-peer-pricing.md](outbound-peer-pricing.md) is this story's mirror image: your own agents reading someone else's priced manifest and staying inside a budget.
 - [listings.md](listings.md) publishes a versioned, priced view of an origin once you have something worth selling.

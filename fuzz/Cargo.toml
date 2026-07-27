@@ -15,10 +15,10 @@
 # this change. CI runs longer; see `.github/workflows/wave4-fuzz.yml`
 # (B4.5 / B4.6 fan-out).
 #
-# G4.6 (llms.txt projection, WOR-130) and WOR-188 (llms_pricing)
-# have landed; the `llms_txt_parser` target drives the public
-# `sbproxy_modules::transform::{llms_txt, llms_pricing}::parse`
-# entry-points directly. G4.5 (robots.txt) and G4.7 (RSL XML
+# G4.6 (llms.txt projection, WOR-130) has landed; the
+# `llms_txt_parser` target drives the public
+# `sbproxy_modules::transform::llms_txt::parse` entry-point directly.
+# G4.5 (robots.txt) and G4.7 (RSL XML
 # emitter / parser counterpart) still call in-file stubs; replace
 # those once the production parsers are in tree.
 

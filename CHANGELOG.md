@@ -152,6 +152,18 @@ security fixes; see Security below.
   runnable
   [`examples/ai-classifier-routing/`](examples/ai-classifier-routing/).
 
+### Removed
+
+- **Unreachable policy prototypes no longer look supported.** The
+  `peer_pricing_preflight` policy and the inactive NL-to-Cedar compiler,
+  linter, and compiled-policy store had no production request-path caller
+  and have been removed. Delete `peer_pricing_preflight` entries from
+  configuration; there is no outbound peer-pricing replacement today.
+  Existing `semantic_constraint` policies remain supported, but must drop
+  the inert `policy_id` field and continue to configure their judge
+  directly. AI crawl payment negotiation keeps its live
+  `Accept-Payment` parser.
+
 ### Changed
 
 - **A reload that fails now really does change nothing.** Reloading a

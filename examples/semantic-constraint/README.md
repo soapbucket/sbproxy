@@ -1,8 +1,8 @@
 # Semantic constraint policy
 
-*Last modified: 2026-05-10*
+*Last modified: 2026-07-26*
 
-A natural-language policy enforced by an LLM-as-judge backend. The `semantic_constraint` policy renders a prompt template against the request envelope (`request.method`, `request.path`, `request.host`, `request.query`), sends the rendered prompt to a configured judge endpoint, and maps the returned verdict (`allow` or `deny`) onto the request. Useful for the long tail of policy intents that do not factor into a clean Cedar or CEL rule, or as a fast prototype while a deterministic policy is being designed.
+An LLM-as-judge policy. The `semantic_constraint` policy renders a prompt template against the request envelope (`request.method`, `request.path`, `request.host`, `request.query`), sends the rendered prompt to a configured judge endpoint, and maps the returned verdict (`allow` or `deny`) onto the request. Use it for policy intents that do not factor into a deterministic rule, or as a fast prototype while a deterministic policy is being designed.
 
 The example wires a single `test.sbproxy.dev` origin behind a judge that decides whether the path looks like routine API traffic (allow) or a sensitive admin route (deny). The judge endpoint is a placeholder pointed at `http://127.0.0.1:9999/judge`; in production the operator points it at any frontier-model API or an in-VPC judge service. The bearer token is read from the env var named in `api_key_env` (BYOK).
 
@@ -48,4 +48,4 @@ Swap the stub for one that returns `{"verdict":"deny"}` and the same request com
 - `judge.cache_capacity`: bounded LRU cache keyed on the rendered prompt; saves a round-trip on identical requests.
 - `judge.budget_tokens`: circuit-breaker that disables the policy after the configured token budget is consumed in a rolling window.
 
-See `docs/policy.md` in this repo for the full schema and the OSS vs enterprise capability boundary (multi-provider judges, NL-to-Cedar compilation, and rationale templating live in the enterprise crate).
+See `docs/policy.md` in this repo for the full schema and behaviour.

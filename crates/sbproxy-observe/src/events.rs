@@ -15,8 +15,8 @@ use std::sync::Arc;
 /// it carries the fields a regulator-defensible audit trail can be
 /// reconstructed from in the OSS context (request correlation, the
 /// stable verdict tag, and a coarse decision latency). Enterprise
-/// extends the payload with the rendered rationale, the Cedar policy
-/// content hash, judge call summaries, redacted input contexts, and
+/// extends the payload with the rendered rationale, judge call
+/// summaries, redacted input contexts, and
 /// W3C trace correlation; those fields are out of scope for OSS so
 /// they are not declared here. The struct is `#[non_exhaustive]` so
 /// adding them later does not break consumers.
@@ -39,9 +39,7 @@ pub struct PolicyVerdictEvent {
     /// Stable identifier for the policy that fired.
     ///
     /// In OSS scope this is the policy_type string from the policy
-    /// (`rate_limit`, `waf`, `ip_filter`, ...); the full Cedar policy
-    /// UUID is enterprise scope and lands on the same field once the
-    /// enterprise policy registry is wired.
+    /// (`rate_limit`, `waf`, `ip_filter`, ...).
     pub policy_id: String,
     /// Built-in dispatch path versus dynamic-dispatch plugin path.
     pub surface: PolicySurface,
@@ -102,8 +100,8 @@ impl PolicyVerdictEvent {
 /// dynamic-dispatch plugins registered via the
 /// [`sbproxy_plugin::PolicyEnforcer`] trait.
 ///
-/// Marked `#[non_exhaustive]` so future surfaces (Cedar, CEL, Lua,
-/// JS, WASM, webhook) the enterprise audit binding distinguishes can
+/// Marked `#[non_exhaustive]` so future surfaces (CEL, Lua, JS, WASM,
+/// webhook) the enterprise audit binding distinguishes can
 /// extend this enum without breaking external consumers.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
