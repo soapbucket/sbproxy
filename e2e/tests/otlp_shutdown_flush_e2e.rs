@@ -88,9 +88,14 @@ fn a_request_survives_a_graceful_shutdown_without_hanging_or_panicking() {
     }))
     .expect("start mock upstream");
 
-    let mut harness =
-        ProxyHarness::start_with_yaml(&config(&upstream.base_url(), &collector.endpoint))
-            .expect("start proxy");
+    // A 1s drain grace: the binary's default is 30s (sized for
+    // orchestrators), which would outlast this test's 15s exit window
+    // and read as a hang.
+    let mut harness = ProxyHarness::start_with_yaml_and_shutdown_grace(
+        &config(&upstream.base_url(), &collector.endpoint),
+        1_000,
+    )
+    .expect("start proxy");
 
     let body = json!({
         "model": "gpt-4o",
