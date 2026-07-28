@@ -330,6 +330,11 @@ pub fn serving_flags(engine: EngineKind, entry: &crate::config::ServeEntry) -> V
         args.push("--tool-call-parser".to_string());
         args.push(parser.clone());
     }
+    // Automatic prefix caching: reuse already-computed KV blocks across
+    // requests that share a prompt prefix.
+    if entry.enable_prefix_caching == Some(true) {
+        args.push("--enable-prefix-caching".to_string());
+    }
     // WOR-1687: KV-cache tiering to CPU. `--swap-space` sizes the CPU
     // pool vLLM spills GPU KV blocks into under pressure; `--cpu-offload-gb`
     // keeps that many GiB of weights in CPU RAM.
@@ -963,6 +968,7 @@ mod tests {
             max_context: None,
             extra_args: vec![],
             kv_quant: KvCacheQuant::Auto,
+            enable_prefix_caching: None,
             speculative: spec,
             chunked_prefill: cp,
             lora_adapters: loras,
@@ -1070,6 +1076,21 @@ mod tests {
             !df.iter().any(|a| a == "--lora-modules"),
             "dynamic paging loads on demand, not via --lora-modules"
         );
+    }
+
+    #[test]
+    fn enable_prefix_caching_adds_the_engine_flag() {
+        let mut e = entry_with(None, None, vec![]);
+        e.enable_prefix_caching = Some(true);
+        let f = serving_flags(EngineKind::Vllm, &e);
+        assert!(f.iter().any(|a| a == "--enable-prefix-caching"));
+    }
+
+    #[test]
+    fn prefix_caching_unset_omits_the_flag() {
+        let e = entry_with(None, None, vec![]);
+        let f = serving_flags(EngineKind::Vllm, &e);
+        assert!(!f.iter().any(|a| a.contains("prefix-caching")));
     }
 
     #[test]

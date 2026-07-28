@@ -195,10 +195,16 @@ fn desired_rejects_conflicting_legacy_host_policies() {
 
 #[test]
 fn desired_rejects_legacy_fields_the_managed_driver_cannot_honor() {
+    // Pinned to llama_cpp: `vllm_passthrough_supported` is false for
+    // both an unresolved (`None`, this compile-time validate pass) and
+    // a resolved (`Some(LlamaCpp)`, boot/prepare) engine, so speculative
+    // decoding of any method is rejected at both stages equally --
+    // llama.cpp has no consumer for the speculation flags at all.
     let config: ModelHostConfig = serde_yaml::from_str(
         r#"
 models:
   - model: qwen3-14b
+    engine: llama_cpp
     speculative: {}
 "#,
     )
@@ -221,6 +227,44 @@ models:
         error,
         DesiredStateError::Invalid(ref message) if message.contains("speculative")
     ));
+}
+
+#[test]
+fn desired_accepts_deferred_auto_engine_with_ngram_speculative_at_boot() {
+    // The engine is unpinned (`Auto`), so at this compile-time validate
+    // pass `resolved_engine` is `None` and `vllm_passthrough_supported`
+    // defers to `entry.engine` -- `Auto` is not excluded, so it reads as
+    // "supported for now" rather than guessing wrong on a pinned
+    // non-vLLM engine. `speculative: {}` (n-gram, the default method)
+    // needs no draft-model VRAM check, so it is accepted here rather
+    // than deferred-and-rejected. This is intentional, not a gap: were
+    // the engine to actually resolve to something other than vLLM at
+    // prepare time, `runtime_manager.rs`'s prepare path re-runs the same
+    // `validate_legacy_managed_compatibility` check with the resolved
+    // engine (runtime_manager.rs:3228) and rejects it there instead, the
+    // same two-stage pattern the other three vLLM-only passthroughs
+    // (chunked_prefill, tool_call_parser, swap_space_gib) already use.
+    let config: ModelHostConfig = serde_yaml::from_str(
+        r#"
+models:
+  - model: qwen3-14b
+    speculative: {}
+"#,
+    )
+    .unwrap();
+    compile_desired_state(
+        input(
+            None,
+            Vec::new(),
+            vec![LegacyServeInput {
+                origin: "origin-a".to_string(),
+                provider: "local".to_string(),
+                config,
+            }],
+        ),
+        &Catalog::builtin(),
+    )
+    .expect("an unpinned engine with n-gram speculative config defers to prepare, not a boot-time reject");
 }
 
 fn manager_desired(

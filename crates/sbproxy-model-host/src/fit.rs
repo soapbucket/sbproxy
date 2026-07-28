@@ -1489,6 +1489,47 @@ pub fn plan_replica_fits(
     Ok(plans)
 }
 
+/// A conservative VRAM floor for a draft model absent a real size lookup:
+/// enough for a dense ~1B-parameter model at 4-bit weights plus a small
+/// KV allowance. Draft models used for speculation are chosen small on
+/// purpose, so this floor is deliberately generous rather than tight.
+const DEFAULT_DRAFT_MODEL_BYTES_FLOOR: u64 = 1_500_000_000;
+
+/// Resolve whether a requested speculative-decoding config can run
+/// alongside a base model's chosen fit plan.
+///
+/// N-gram / prompt-lookup speculation ([`crate::config::SpecMethod::Ngram`])
+/// proposes tokens from the prompt itself, with no separate model weights
+/// to load, so it always resolves once requested. Draft-model speculation
+/// ([`crate::config::SpecMethod::DraftModel`]) loads a second, smaller
+/// model onto the same device(s) as the base model, so it only resolves
+/// when the base model's fit plan left enough headroom below the device's
+/// total capacity to also hold the draft model:
+/// `draft_weight_bytes_hint`, when known (a resolved catalog entry for
+/// the draft model), or [`DEFAULT_DRAFT_MODEL_BYTES_FLOOR`] otherwise. A
+/// `DraftModel` request naming no `draft_model` never resolves, since
+/// there is nothing to load.
+pub fn resolve_speculative_config(
+    requested: &crate::config::SpeculativeConfig,
+    plan: &FitPlan,
+    device_total_vram_bytes: u64,
+    draft_weight_bytes_hint: Option<u64>,
+) -> Option<crate::config::SpeculativeConfig> {
+    match requested.method {
+        crate::config::SpecMethod::Ngram => Some(requested.clone()),
+        crate::config::SpecMethod::DraftModel => {
+            requested.draft_model.as_ref()?;
+            let headroom = device_total_vram_bytes.saturating_sub(plan.memory.total_bytes);
+            let needed = draft_weight_bytes_hint.unwrap_or(DEFAULT_DRAFT_MODEL_BYTES_FLOOR);
+            if headroom >= needed {
+                Some(requested.clone())
+            } else {
+                None
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2480,5 +2521,85 @@ mod tests {
                 if message.contains("replica 3")),
             "the third replica cannot be placed: {error:?}"
         );
+    }
+
+    fn synthetic_plan(total_bytes: u64) -> FitPlan {
+        FitPlan {
+            quant_name: "FP8".to_string(),
+            quant: Quant::Fp8,
+            estimated_vram_bytes: total_bytes,
+            gpu_indexes: vec![0],
+            seq_len: 8192,
+            memory: MemoryEstimate {
+                device_indexes: vec![0],
+                weight_bytes: total_bytes,
+                kv_bytes: 0,
+                runtime_overhead_bytes: 0,
+                safety_margin_bytes: 0,
+                total_bytes,
+            },
+            moe: None,
+            throughput: None,
+            gpu_memory_fraction: None,
+        }
+    }
+
+    #[test]
+    fn ngram_speculation_always_resolves() {
+        use crate::config::{SpecMethod, SpeculativeConfig};
+        let requested = SpeculativeConfig {
+            method: SpecMethod::Ngram,
+            draft_model: None,
+            num_speculative_tokens: 5,
+        };
+        // Zero headroom: the base model plan consumes the whole device.
+        let plan = synthetic_plan(24_000_000_000);
+        let resolved = resolve_speculative_config(&requested, &plan, 24_000_000_000, None);
+        assert_eq!(resolved, Some(requested));
+    }
+
+    #[test]
+    fn draft_model_speculation_resolves_when_headroom_covers_the_hint() {
+        use crate::config::{SpecMethod, SpeculativeConfig};
+        let requested = SpeculativeConfig {
+            method: SpecMethod::DraftModel,
+            draft_model: Some("Qwen/Qwen3-0.6B".to_string()),
+            num_speculative_tokens: 4,
+        };
+        // 20 GiB base model on a 24 GiB device: 4 GiB headroom, comfortably
+        // above a 1 GiB draft-model hint.
+        let plan = synthetic_plan(20_000_000_000);
+        let resolved =
+            resolve_speculative_config(&requested, &plan, 24_000_000_000, Some(1_000_000_000));
+        assert_eq!(resolved, Some(requested));
+    }
+
+    #[test]
+    fn draft_model_speculation_is_declined_without_enough_headroom() {
+        use crate::config::{SpecMethod, SpeculativeConfig};
+        let requested = SpeculativeConfig {
+            method: SpecMethod::DraftModel,
+            draft_model: Some("Qwen/Qwen3-0.6B".to_string()),
+            num_speculative_tokens: 4,
+        };
+        // 23 GiB base model on a 24 GiB device: 1 GiB headroom, below the
+        // default 1.5 GiB floor with no hint given.
+        let plan = synthetic_plan(23_000_000_000);
+        let resolved = resolve_speculative_config(&requested, &plan, 24_000_000_000, None);
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn draft_model_speculation_with_no_named_draft_never_resolves() {
+        use crate::config::{SpecMethod, SpeculativeConfig};
+        let requested = SpeculativeConfig {
+            method: SpecMethod::DraftModel,
+            draft_model: None,
+            num_speculative_tokens: 4,
+        };
+        // Huge headroom, but there is nothing to load.
+        let plan = synthetic_plan(1_000_000_000);
+        let resolved = resolve_speculative_config(&requested, &plan, 24_000_000_000, None);
+        assert_eq!(resolved, None);
     }
 }

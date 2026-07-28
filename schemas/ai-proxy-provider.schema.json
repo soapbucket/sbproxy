@@ -307,8 +307,16 @@
             }
           ]
         },
+        "enable_prefix_caching": {
+          "description": "Support: preview. Enable vLLM's automatic prefix caching, reusing already-computed KV blocks across requests that share a prompt prefix. `None` leaves the engine default (off) in place.",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "speculative": {
-          "description": "Support: unsupported. Speculative decoding. Rejected today: no runtime consumer emits the engine's speculation flags yet, so a model that sets this fails to deploy rather than silently ignoring it. `None` disables it.",
+          "description": "Support: preview. Speculative decoding. The vLLM driver emits the engine's speculation flags; the managed reconcile path accepts n-gram speculation (needs no extra model) on a vLLM engine, but rejects draft-model speculation until its VRAM-headroom check (`fit::resolve_speculative_config`) is wired into a real prepare-time call site. `None` disables it.",
           "default": null,
           "anyOf": [
             {
