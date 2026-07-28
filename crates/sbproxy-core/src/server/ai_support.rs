@@ -1029,6 +1029,28 @@ pub(crate) fn budget_preflight(
     BudgetGate::Allow
 }
 
+pub(super) fn realtime_model_from_uri(uri: &http::Uri) -> Option<String> {
+    url::form_urlencoded::parse(uri.query()?.as_bytes())
+        .find_map(|(name, value)| (name == "model").then(|| value.into_owned()))
+}
+
+pub(super) fn replace_realtime_model_query(
+    uri: &http::Uri,
+    model: &str,
+) -> Result<http::Uri, http::uri::InvalidUri> {
+    let mut parameters: Vec<(String, String)> =
+        url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+            .filter(|(name, _)| name != "model")
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect();
+    parameters.push(("model".to_string(), model.to_string()));
+
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(parameters)
+        .finish();
+    format!("{}?{}", uri.path(), query).parse()
+}
+
 #[cfg(test)]
 mod budget_preflight_tests {
     use super::{budget_preflight, scoped_budget_preflight, BudgetGate};
@@ -1141,6 +1163,49 @@ mod budget_preflight_tests {
             vec![(0, "workspace:budget-preflight-scoped".to_string())]
         );
         assert!(matches!(gate, BudgetGate::Block { status: 402, .. }));
+    }
+}
+
+#[cfg(test)]
+mod realtime_model_query_tests {
+    use super::{realtime_model_from_uri, replace_realtime_model_query};
+
+    #[test]
+    fn realtime_model_query_decodes_the_first_value() {
+        let uri: http::Uri = "/v1/realtime?model=gpt-4o%2Frealtime&model=ignored"
+            .parse()
+            .expect("URI");
+
+        assert_eq!(
+            realtime_model_from_uri(&uri).as_deref(),
+            Some("gpt-4o/realtime")
+        );
+    }
+
+    #[test]
+    fn realtime_model_override_adds_a_missing_parameter() {
+        let uri: http::Uri = "/v1/realtime?voice=alloy".parse().expect("URI");
+
+        let replaced = replace_realtime_model_query(&uri, "gpt-4o-mini").expect("rewritten URI");
+
+        assert_eq!(
+            replaced.path_and_query().map(|value| value.as_str()),
+            Some("/v1/realtime?voice=alloy&model=gpt-4o-mini")
+        );
+    }
+
+    #[test]
+    fn realtime_model_override_replaces_duplicates_and_encodes_the_value() {
+        let uri: http::Uri = "/v1/realtime?model=first&voice=alloy&model=second"
+            .parse()
+            .expect("URI");
+
+        let replaced = replace_realtime_model_query(&uri, "gpt 4o/mini").expect("rewritten URI");
+
+        assert_eq!(
+            replaced.path_and_query().map(|value| value.as_str()),
+            Some("/v1/realtime?voice=alloy&model=gpt+4o%2Fmini")
+        );
     }
 }
 

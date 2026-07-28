@@ -594,8 +594,6 @@ fn immutable_budget_key_id(ctx: &RequestContext) -> Option<String> {
         })
 }
 
-// Task 2 wires this shared admission seam into realtime action dispatch.
-#[allow(dead_code)]
 pub(super) async fn realtime_budget_gate(
     session: &Session,
     config: &AiHandlerConfig,

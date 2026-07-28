@@ -42,6 +42,12 @@ pub struct RealtimeDispatchCtx {
     pub upstream_port: u16,
     /// Whether the upstream uses TLS.
     pub upstream_tls: bool,
+    /// Budget-authoritative model query value to apply after request modifiers.
+    ///
+    /// This carries only a public model identifier. Provider credentials stay
+    /// local to the final outbound request seam and must never enter this
+    /// `Debug` context.
+    pub model_override: Option<String>,
     /// Wall-clock instant when the session started. Diffed against
     /// the `logging` callback time to produce the session-duration
     /// histogram observation and the AudioSeconds billing approximation.

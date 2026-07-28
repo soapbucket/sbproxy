@@ -1868,6 +1868,22 @@ impl ProxyHttp for SbProxy {
             }
         }
 
+        if let Some(model_override) = ctx
+            .ai_realtime_dispatch
+            .as_ref()
+            .and_then(|dispatch| dispatch.model_override.as_deref())
+        {
+            let rewritten = replace_realtime_model_query(&upstream_request.uri, model_override)
+                .map_err(|error| {
+                    pingora_error::Error::because(
+                        pingora_error::ErrorType::InternalError,
+                        "failed to apply realtime model override",
+                        error,
+                    )
+                })?;
+            upstream_request.set_uri(rewritten);
+        }
+
         // --- Distributed tracing: inject child traceparent into upstream request ---
         if let Some(parent_ctx) = &ctx.trace_ctx {
             let child = parent_ctx.child();
