@@ -32,6 +32,9 @@ const fn config_only(path: &'static str, note: &'static str) -> ConfigKeyCapabil
     }
 }
 
+const OUTBOUND_CREDENTIAL_CONSUMER: &str =
+    "sbproxy_core::pipeline::parse_outbound_credential_config";
+
 /// Keys whose reader is indirect, plus deliberately inert compatibility keys.
 ///
 /// Every override names one exact schema leaf. Parent entries never suppress
@@ -222,6 +225,66 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     stable(
         "origins.*.observability.log.sinks[].output.type",
         "sbproxy_core::server::lifecycle::compile_one_sink",
+    ),
+    stable(
+        "origins.*.outbound_credential.act_depth_cap",
+        OUTBOUND_CREDENTIAL_CONSUMER,
+    ),
+    stable(
+        "origins.*.outbound_credential.allowed_audiences[]",
+        OUTBOUND_CREDENTIAL_CONSUMER,
+    ),
+    stable(
+        "origins.*.outbound_credential.audience",
+        OUTBOUND_CREDENTIAL_CONSUMER,
+    ),
+    stable(
+        "origins.*.outbound_credential.client_id",
+        OUTBOUND_CREDENTIAL_CONSUMER,
+    ),
+    stable(
+        "origins.*.outbound_credential.client_secret",
+        OUTBOUND_CREDENTIAL_CONSUMER,
+    ),
+    stable(
+        "origins.*.outbound_credential.dpop.alg",
+        OUTBOUND_CREDENTIAL_CONSUMER,
+    ),
+    stable(
+        "origins.*.outbound_credential.dpop.jwk",
+        OUTBOUND_CREDENTIAL_CONSUMER,
+    ),
+    stable(
+        "origins.*.outbound_credential.dpop.key",
+        OUTBOUND_CREDENTIAL_CONSUMER,
+    ),
+    stable(
+        "origins.*.outbound_credential.header",
+        OUTBOUND_CREDENTIAL_CONSUMER,
+    ),
+    stable(
+        "origins.*.outbound_credential.scheme",
+        OUTBOUND_CREDENTIAL_CONSUMER,
+    ),
+    stable(
+        "origins.*.outbound_credential.scope",
+        OUTBOUND_CREDENTIAL_CONSUMER,
+    ),
+    stable(
+        "origins.*.outbound_credential.secret",
+        OUTBOUND_CREDENTIAL_CONSUMER,
+    ),
+    stable(
+        "origins.*.outbound_credential.subject_token_issuers[]",
+        OUTBOUND_CREDENTIAL_CONSUMER,
+    ),
+    stable(
+        "origins.*.outbound_credential.token_endpoint",
+        OUTBOUND_CREDENTIAL_CONSUMER,
+    ),
+    stable(
+        "origins.*.outbound_credential.type",
+        OUTBOUND_CREDENTIAL_CONSUMER,
     ),
     stable(
         "origins.*.olp.introspect.auth.mode",

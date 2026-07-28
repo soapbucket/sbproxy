@@ -1146,6 +1146,14 @@ enum PipelineConstructionMode {
     Validation,
 }
 
+fn parse_outbound_credential_config(
+    origin_id: &str,
+    config: &serde_json::Value,
+) -> anyhow::Result<sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig> {
+    serde_json::from_value(config.clone())
+        .map_err(|error| anyhow::anyhow!("origin {origin_id}: outbound_credential: {error}"))
+}
+
 impl CompiledPipeline {
     /// Compile a config into a full pipeline with modules instantiated.
     ///
@@ -1292,12 +1300,7 @@ impl CompiledPipeline {
             // mode fails config load rather than silently at request time.
             let outbound_cred = match &origin.outbound_credential {
                 Some(cfg) => {
-                    let mut parsed = serde_json::from_value::<
-                        sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig,
-                    >(cfg.clone())
-                    .map_err(|e| {
-                        anyhow::anyhow!("origin {}: outbound_credential: {}", origin.origin_id, e)
-                    })?;
+                    let mut parsed = parse_outbound_credential_config(&origin.origin_id, cfg)?;
                     if parsed.is_dpop_enabled()
                         && (matches!(actions.last(), Some(Action::LoadBalancer(_)))
                             || forward_rules.last().is_some_and(|rules| {
