@@ -1506,7 +1506,7 @@ const DEFAULT_DRAFT_MODEL_BYTES_FLOOR: u64 = 1_500_000_000;
 /// when the base model's fit plan left enough headroom below the device's
 /// total capacity to also hold the draft model:
 /// `draft_weight_bytes_hint`, when known (a resolved catalog entry for
-/// the draft model), or [`DEFAULT_DRAFT_MODEL_BYTES_FLOOR`] otherwise. A
+/// the draft model), or `DEFAULT_DRAFT_MODEL_BYTES_FLOOR` otherwise. A
 /// `DraftModel` request naming no `draft_model` never resolves, since
 /// there is nothing to load.
 pub fn resolve_speculative_config(
