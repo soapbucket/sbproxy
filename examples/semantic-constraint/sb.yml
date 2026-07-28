@@ -5,8 +5,7 @@
 # and maps the verdict to allow / deny. The prompt template is
 # rendered against the request envelope (`request.method`,
 # `request.path`, `request.host`, `request.query`) before the call.
-# See docs/policy.md for the full config surface and the OSS vs
-# enterprise capability boundary.
+# See docs/policy.md for the full config surface and runtime behavior.
 #
 # This example uses a local placeholder endpoint; in production the
 # endpoint points at the operator's chosen frontier or in-VPC judge

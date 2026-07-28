@@ -1185,6 +1185,25 @@ fn validate_publish_signing_key(
     })
 }
 
+fn validate_compression_state_local_path(path: &str) -> Result<()> {
+    const MAX_PATH_BYTES: usize = 4_096;
+    let field = "proxy.compression_state.local_path";
+
+    if path.trim().is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+    if path.len() > MAX_PATH_BYTES {
+        anyhow::bail!("{field} must not exceed {MAX_PATH_BYTES} bytes");
+    }
+    if path.chars().any(char::is_control) {
+        anyhow::bail!("{field} must not contain control characters");
+    }
+    if !std::path::Path::new(path).is_absolute() {
+        anyhow::bail!("{field} must be an absolute path");
+    }
+    Ok(())
+}
+
 /// Compile a raw YAML config string into a `CompiledConfig`.
 ///
 /// # Errors
@@ -1316,6 +1335,15 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
              served by this build. Set `enabled: false` or remove the `http3` block. Native \
              HTTP/3 support is tracked in WOR-1969."
         );
+    }
+
+    if let Some(local_path) = config_file
+        .proxy
+        .compression_state
+        .as_ref()
+        .and_then(|state| state.local_path.as_deref())
+    {
+        validate_compression_state_local_path(local_path)?;
     }
 
     // WOR-1818: report interpolation leftovers. An unset `${VAR}` stays

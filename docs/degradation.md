@@ -226,17 +226,14 @@ summary call without contacting the provider.
 request. The failed lever keeps the last committed message list and later
 levers continue. Safe admission conditions such as `policy_denied`,
 `budget_denied`, `lock_contended`, and `state_expired` are skips rather than
-failures. An expired summary is never reused while Redis awaits physical TTL
-removal.
+failures. An expired summary is never reused even when the selected backend
+has not physically removed it yet.
 
-Selecting `backend: redis` without the Redis L2 wiring is a startup
-configuration error. `proxy.cluster.replication` supplies a durable replicated
-mesh substrate, but compression's legacy mesh adapter is not integrated with or
-validated against `ReplicatedStore` for session and Admin lifecycle semantics;
-public `backend: mesh` selection remains rejected. Runtime failure-open
-behavior begins only after a valid pipeline has been built. Redis remains the
-only canonical summary store; worker memory and the mesh never become an
-implicit state fork.
+Omitting `state` from a stateful pipeline selects the process-owned Local redb
+store with a 24-hour TTL. Selecting `backend: redis` without Redis L2 wiring or
+`backend: mesh` without live `proxy.cluster.replication` is a startup
+configuration error; explicit backends never fall back to Local. Runtime
+failure-open behavior begins only after a valid pipeline has been built.
 
 **Log level:** the content-free `ai_compression_summary` event is `DEBUG` when
 all levers skip, `INFO` when at least one applies and none fail, and `WARN` when

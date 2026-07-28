@@ -272,12 +272,25 @@ routing:
 
 ### peak_ewma
 
-Power-of-two-choices over observed latency: sample two eligible providers and route to the one with the lower recently observed latency. Cuts tail latency under skewed load versus always picking the single lowest-latency provider, which herds traffic. An untried provider is explored first.
+Power-of-two-choices over time-decayed latency and current in-flight load:
+sample two eligible providers and route to the lower effective cost. A latency
+spike takes effect immediately and decays toward the pool's neutral latency.
+After one configured half-life without a completed attempt, the provider
+re-enters at neutral cost so it can prove recovery. In-flight requests multiply
+the cost, so a provider that has just started queueing is deprioritized before
+a slow response completes. Providers without observations use the same nonzero
+pool-neutral score.
 
 ```yaml
 routing:
   strategy: peak_ewma
+  half_life: 10s
 ```
+
+The default half-life is `10s`. Set `half_life` as integer seconds or a
+human-readable duration such as `10s`. Shorter values react and recover faster;
+longer values retain spike penalties longer. Provider eligibility and
+power-of-two candidate sampling are unchanged.
 
 ### cascade
 
@@ -465,7 +478,11 @@ origins:
 
 Keys are the `AiSurface` labels emitted on metrics (`chat_completions`, `models`, `embeddings`, `assistants`, `threads`, `batches`, `fine_tuning`, `files`, `realtime`, `image_generation`, `image_edits`, `image_variations`, `audio_transcription`, `audio_speech`, `moderations`, `reranking`). Surfaces without an entry are uncapped. When the cap fires, the proxy returns 429 before any upstream call.
 
-The sliding window is one minute, shared across all configured origins (state is process-global). Audio-seconds-per-hour caps for realtime sessions are reserved for the realtime dispatch phase.
+The sliding window is one minute, shared across all configured origins
+(state is process-global). Realtime runs configured hard-budget admission
+before its WebSocket upgrade, but the byte-transparent relay does not inspect
+or charge individual frames. Frame-derived audio or token caps therefore
+remain unavailable on the OSS path.
 
 ## Guardrails
 
@@ -901,9 +918,19 @@ action:
 
 - A limit fires the first time `usage >= max_tokens` or `usage >= max_cost_usd`. Limits are checked in declaration order and the first match wins.
 - `on_exceed: log` records a warning and a `sbproxy_ai_budget_utilization_ratio` gauge update, then lets the request through.
-- `on_exceed: downgrade` swaps the request's model to the firing limit's `downgrade_to` and proceeds. If `downgrade_to` is unset, the request is blocked.
+- `on_exceed: downgrade` swaps the request's model to the firing limit's
+  `downgrade_to` and proceeds. When that field is unset, the gateway selects
+  the cheapest configured model it can price; it blocks only when no target is
+  available.
 - Setting only `max_tokens` and leaving `max_cost_usd` unset (or vice versa) is supported. A limit with neither field is a no-op.
 - Multiple limits on the same scope with different `period` values (for example daily and monthly) accrue in separate window buckets. Each limit is checked against its own key; the tightest binding that is exceeded fires first in declaration order. There is no separate org/team/project hierarchy tracker: `BudgetScope` is the single enum (`workspace`, `api_key`, `user`, `model`, `origin`, `tag`) used by `BudgetLimit`.
+- Realtime WebSocket requests run the same hard-limit preflight before the
+  upgrade. `block` returns 402 without an upstream WebSocket handshake, `log`
+  permits the upgrade, and `downgrade` replaces every inbound `model` query
+  value with one effective model while preserving unrelated query parameters.
+  Realtime frames are byte-transparent and do not debit token or cost
+  counters, so this is admission control over usage already recorded by other
+  requests, not per-frame accounting.
 
 ### Soft-landing (predictive budgets)
 
@@ -1020,9 +1047,11 @@ At compile time each `ai_provider` credential is lowered onto the runtime key re
 
 Two caches run on the serving path: the semantic cache and the idempotency middleware, both described below. Cache hit and miss counts land in `sbproxy_ai_cache_results_total`.
 
-### Exact prompt cache (design stage)
+### Exact replay
 
-An exact-match prompt cache is design-stage library code, not part of the serving path: `prompt_cache.rs` in `crates/sbproxy-ai` implements SHA-256 keying over the canonicalised JSON `messages` array and detection of Anthropic's native `cache_control` blocks, but nothing in the dispatch pipeline calls it, and there are no YAML knobs for it. For byte-identical replay of retried requests today, use the idempotency middleware below; for near-duplicate prompts, use the semantic cache.
+For byte-identical replay of retried requests, use the idempotency middleware
+below. The gateway does not have a separate exact-prompt-cache configuration
+surface. For near-duplicate prompts, use the semantic cache.
 
 ### Semantic cache
 
@@ -1292,23 +1321,20 @@ default. Explicit-budget fitting preserves leading system and developer
 instructions, the newest complete turn, contiguous recent history, and
 OpenAI/Anthropic tool-call groupings.
 
-A stateful summary requires a captured session ID and the configured Redis L2
-service. Request workers retain no canonical session summary in process.
-`proxy.cluster.replication` provides a durable replicated mesh substrate, but
-compression's legacy mesh adapter is not integrated with or validated against
-its `ReplicatedStore` session and Admin lifecycle semantics. Public
-`backend: mesh` selection therefore remains rejected as a separate, unshipped
-integration. There is no OmniRoute dependency, import, or migration path.
+A stateful summary requires a captured session ID. A stateful pipeline with no
+explicit `state` block uses a process-owned Local redb file with a 24-hour TTL.
+Choose `backend: redis` explicitly for serialized state shared across processes,
+or `backend: mesh` for an eventually consistent Redis-free fleet already
+running `proxy.cluster.replication`. Explicit backends fail startup when their
+dependency is unavailable and never fall back to Local. There is no OmniRoute
+dependency, import, or migration path.
+
 The legacy `resilience.llm_aware.context_compress` switch remains a shorthand
 for one `window_fit` lever only when the explicit block is absent.
 
 The complete configuration, session and structured-content safety rules,
-Redis state guarantees, failure table, metrics, logs, and PromQL are
+state-backend guarantees, failure table, metrics, logs, and PromQL are
 in [AI context compression](ai-context-compression.md).
-
-### Context relay (design stage)
-
-Context relay is design-stage: nothing on the serving path uses it. `crates/sbproxy-ai/src/context_relay.rs` implements a thread-safe map of session ID to message history, intended to replay prior messages to a new provider when the router rotates mid-session so the conversation does not reset. The router does not call it today, and there is no YAML config for it.
 
 ### Context overflow (design stage)
 
@@ -1316,57 +1342,39 @@ The overflow decision layer is design-stage: `crates/sbproxy-ai/src/context_over
 
 ## Streaming analytics
 
-Per-stream timing on the live path is limited to Time to First Token: the dispatch pipeline measures TTFT on streaming responses and records it to the `sbproxy_ai_ttft_seconds` histogram, labelled by provider and model.
+The dispatch pipeline measures streaming responses inline: time to first token,
+output throughput, and average inter-token latency are recorded in
+`sbproxy_ai_ttft_seconds`,
+`sbproxy_ai_output_throughput_tokens_per_second`, and
+`sbproxy_ai_inter_token_latency_seconds`, labelled by provider and model.
 
-The richer per-stream tracker is design-stage: `crates/sbproxy-ai/src/streaming_analytics.rs` ships a `StreamTracker` (start, first-token, and last-token instants, with derived tokens-per-second and average inter-token latency) and a `StreamRegistry` map of in-flight streams, but nothing on the serving path constructs either type today.
+## Structured output
 
-## Structured output (design stage)
+Provider-enforced JSON output works where the upstream supports it:
+`response_format` passes through to OpenAI-compatible upstreams (the Gemini
+translator drops it as an unsupported knob). The proxy does not re-validate
+the returned JSON, and there is no `structured_output:` config key.
 
-Gateway-side structured-output validation is design-stage: `crates/sbproxy-ai/src/structured_output.rs` implements the validator, but no dispatch code calls it and a `structured_output:` block in the config is ignored. Provider-enforced JSON output still works where the upstream supports it: `response_format` passes through to OpenAI-compatible upstreams (the Gemini translator drops it as an unsupported knob). What does not exist is the proxy re-checking the response.
+## OpenAI surface-area routing
 
-The library code covers the intended flow: `extract_json` strips ` ```json ` and ` ``` ` fences before parsing so models that wrap output in markdown still validate, `validate_response` does structural checks (required-field presence and per-property type checks for `string`, `number`, `integer`, `boolean`, `array`, `object`, `null`; no `$ref` or `oneOf`), and `build_schema_instruction` renders the schema into a system-prompt retry instruction for a validation-failure retry loop.
-
-## OpenAI surface-area modules
-
-The `sbproxy-ai` crate ships shape definitions and lightweight handlers for the OpenAI surface beyond chat completions: assistants, threads, batch jobs, image generation, audio, fine-tuning, realtime sessions, and structured output. The shapes are stable and round-trip through `serde_json`. Path classification on the live dispatch path is done by two functions: `classify_surface(method, path)` in `crates/sbproxy-ai/src/handler.rs` labels every request with an `AiSurface` (the full table above), and `parse_endpoint(path)` in `crates/sbproxy-ai/src/api_routes.rs` types a narrower endpoint subset (chat, embeddings, models, rerank, moderations, image generation, audio transcription, audio speech) for the per-provider capability check, falling back to `Unknown` for the rest. There is no `parse_ai_path` function. The remaining shapes are present so plugin authors can build on top of them.
-
-The subsections below describe what each module contributes today.
-
-### `assistants`
-
-Assistants requests are served by the generic surface dispatch described above: `classify_surface` labels them, and the gateway forwards them passthrough to a provider that supports the surface (OpenAI). There is no `assistants:` config key; writing one is silently ignored, since the action config drops unknown fields rather than rejecting them.
-
-The module itself is design-stage shape code with no serving-path callers: `AssistantHandler::route_request(path, method)` classifies a request into `CreateAssistant`, `ListAssistants`, `GetAssistant(id)`, `CreateThread`, `CreateMessage(thread_id)`, `CreateRun(thread_id)`, `GetRun(thread_id, run_id)`, or `Unknown` (optional `/v1` prefix stripped), and `AssistantConfig { enabled: bool }` is the intended on/off shape. Nothing constructs either today. Source: `crates/sbproxy-ai/src/assistants.rs:AssistantHandler`.
-
-### `threads`
-
-Threads requests, like assistants, are proxied passthrough by the generic surface dispatch. The `ThreadStore` module is design-stage with no serving-path callers: it implements an in-memory, mutex-backed store of `Thread { id, created_at, metadata }` and ordered `ThreadMessage { id, thread_id, role, content, created_at }`, intended for gateway-local session continuity, but nothing constructs it today and there is no YAML field for it. Source: `crates/sbproxy-ai/src/threads.rs:ThreadStore`.
-
-### `batch`
-
-Batch requests are proxied passthrough by the generic surface dispatch (`batches` in the surface table). The module's `BatchJob` shape (id, status, created_at, completed_at, total_requests, completed_requests, failed_requests, metadata), `BatchStore` trait, and `MemoryBatchStore` implementation (status lifecycle `pending`, `in_progress`, `completed`, `failed`, `cancelled`) are design-stage code that nothing constructs today; there is no `batch:` YAML block. Source: `crates/sbproxy-ai/src/batch.rs`.
-
-### `image`
-
-Request and response shapes for image generation, edit, and variation. `ImageGenerationRequest { prompt, model, size, n }` and `ImageGenerationResponse { images: Vec<ImageData> }`, where each `ImageData` carries either a `url` or a base-64 `b64_json` payload depending on the provider's `response_format`. `/v1/images/generations` is routed by `api_routes.rs`; the per-call dispatch is built by the runtime. No dedicated YAML knobs. Source: `crates/sbproxy-ai/src/image.rs`.
-
-### `audio`
-
-Request and response shapes for audio transcription and speech synthesis. `TranscriptionRequest { file_url, model, language }`, `TranscriptionResponse { text, duration }`, and `SpeechRequest { input, model, voice }`. `/v1/audio/transcriptions` and `/v1/audio/speech` are recognised by `api_routes.rs`. No dedicated YAML knobs; the audio dispatcher reuses the top-level provider list and routing strategy. Source: `crates/sbproxy-ai/src/audio.rs`.
-
-### `finetune`
-
-Fine-tuning requests are proxied passthrough by the generic surface dispatch (`fine_tuning` in the surface table). There is no `finetune:` config key; writing one is silently ignored. The module's `FinetuneHandler::route_request(path, method)` classifier (`CreateJob`, `ListJobs`, `GetJob(id)`, `CancelJob(id)`, `ListEvents(id)`, `Unknown`) and `FinetuneConfig { enabled: bool }` shape are design-stage code with no serving-path callers. Source: `crates/sbproxy-ai/src/finetune.rs:FinetuneHandler`.
+Assistants, threads, batches, image generation, audio, and fine-tuning remain
+live passthrough surfaces. `classify_surface(method, path)` in
+`crates/sbproxy-ai/src/handler.rs` labels every request with an `AiSurface`,
+and `parse_endpoint(path)` in `crates/sbproxy-ai/src/api_routes.rs` types the
+endpoint subset used by provider capability checks. The gateway forwards the
+request to an eligible provider; it does not emulate those provider APIs
+locally, and there are no per-surface emulation config blocks.
 
 ### `realtime`
 
-Realtime WebSocket proxying ships and is documented in the [Realtime](#realtime-1) section below: the gateway gates the upgrade on provider capability, applies `per_surface_rate_limits.realtime`, and forwards frames byte-transparently. There is no `realtime:` config key on the action; writing one is silently ignored. The knobs that exist are the provider list (a provider that supports Realtime must be configured) and the per-surface rate limit.
+Realtime WebSocket proxying ships and is documented in the [Realtime](#realtime-1) section below: the gateway gates the upgrade on provider capability, applies `per_surface_rate_limits.realtime`, and forwards frames byte-transparently. There is no `realtime:` config key on the action; writing one is silently ignored. Realtime instead uses the action's shared provider, rate-limit, budget, and governed-key settings.
+
+The action-level `budget` block and governed-key identity also participate in
+pre-upgrade admission. Provider and bound key-plane credentials are selected
+at the final outbound header seam; origin `outbound_credential` resolvers do
+not run for Realtime.
 
 The `realtime.rs` module itself is design-stage shape code with no serving-path callers: `RealtimeConfig { enabled, model }`, `RealtimeSession { session_id, model, created_at, status }`, and `RealtimeEvent { event_type, data }` round-trip through serde but nothing constructs them. Source: `crates/sbproxy-ai/src/realtime.rs`.
-
-### `structured_output`
-
-Design-stage; covered above under [Structured output](#structured-output-design-stage). The validator functions (`extract_json`, `validate_response`, `build_schema_instruction`) have no serving-path callers and there is no `structured_output:` config key. Source: `crates/sbproxy-ai/src/structured_output.rs`.
 
 ## Per-request attribution
 
@@ -1574,13 +1582,49 @@ What runs before the upgrade:
 - Surface classification stamps `ai.surface = "realtime"` on the request span and the access log.
 - The 501 capability gate fires if no configured provider supports Realtime.
 - The per-surface rate limit (`per_surface_rate_limits.realtime`) fires before the upgrade is attempted, returning 429 when the cap is hit.
-- The active-sessions gauge `sbproxy_ai_realtime_sessions_active` ticks up.
+- Governed-key identity is resolved before dispatch. Its immutable public key
+  id scopes any per-key budget; the plaintext key is never used as a budget
+  key or stored on the realtime request context.
+- Hard budget admission uses the action budget merged with the governed key's
+  budget. `block` returns the existing 402 `budget_exceeded` JSON response,
+  `log` warns and continues, and `downgrade` makes the target model
+  authoritative in the upstream query.
+- One trusted upstream credential is selected: a credential bound to the
+  governed key wins, otherwise the selected provider's nonblank `api_key` is
+  used. If neither exists, the request fails closed with 503 and no upstream
+  WebSocket handshake.
+
+Credential headers are finalized after ordinary header modifiers and Lua
+scripts. The proxy removes caller-controlled `Authorization`,
+`Proxy-Authorization`, `DPoP`, `x-api-key`, `api-key`, `x-goog-api-key`,
+`x-sb-api`, every resolved/configured inbound key header, the origin
+`outbound_credential` presentation header, and the selected credential's own
+header, then inserts exactly one trusted credential. This means a Lua script
+cannot replace the provider credential. Credential carriers cannot claim
+WebSocket handshake, tracing, or Web Bot Auth signature headers. WebSocket
+handshake metadata (`Upgrade`, `Connection`, and every `Sec-WebSocket-*`
+header) and `OpenAI-Beta` are preserved.
+
+Realtime deliberately skips the origin-level `outbound_credential` and DPoP
+minting paths. Those mechanisms retain their existing semantics for ordinary
+HTTP proxy requests, but they neither authorize nor add a second credential
+to a Realtime upgrade.
+
+After the provider accepts the upgrade with `101 Switching Protocols`, the
+active-sessions gauge `sbproxy_ai_realtime_sessions_active` ticks up. A
+non-`101` provider response does not change that gauge and does not emit
+session-duration or realtime billing events.
 
 What runs during the session:
 - Pingora forwards WebSocket frames byte-transparently. The proxy does not inspect individual frames (per-frame guardrails are not on the OSS path; they would require terminate-and-relay, which is reserved for an enterprise build).
+- Admission is evaluated once. A hot policy/config update applies to new
+  upgrades; a socket that already received 101 continues relaying frames and
+  can complete its close handshake.
+- There is no per-frame token, cost, or audio accounting. In particular, an
+  accepted session is not rechecked against a budget after each frame.
 
 What runs at session close (the `logging` hook):
-- The active-sessions gauge ticks down.
+- For an accepted session, the active-sessions gauge ticks down.
 - `sbproxy_ai_realtime_session_duration_seconds` records the wall-clock session lifetime.
 - An `AiBillingEvent` fires with `usage = AudioSeconds { seconds = wall_clock }` so operators see realtime usage on the standard billing event bus. Cost is reported as 0.0 in OSS until the realtime rate card lands in the pricing helper; downstream consumers can compute cost from the duration.
 

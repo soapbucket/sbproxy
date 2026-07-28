@@ -12,6 +12,14 @@ the next version cut.
 
 ### Added
 
+- **AI routing and state now carry production authority end to end.** Peak
+  EWMA routing tracks complete provider attempts with configurable decay;
+  Realtime WebSocket upgrades replace caller credentials with one trusted
+  provider credential and apply governed-key budget admission; stateful
+  context compression defaults to a private, restart-durable Local redb store
+  while retaining explicit Redis and mesh choices; and verified crawler CAPs
+  enforce bounded per-subject request rates before policy evaluation while
+  exempting approved traffic from ledger pricing.
 - **Classifier safety guardrails now ship calibrated default centroids.**
   `toxicity`, `jailbreak`, and `content_safety` classifier mode no longer
   requires operator examples. Optional examples extend the versioned
@@ -20,6 +28,55 @@ the next version cut.
   Repo-authored held-out fixtures, measured class precision and recall, and
   deterministic regeneration live in
   [`docs/ai-default-centroids-evaluation.md`](docs/ai-default-centroids-evaluation.md).
+- **Outbound credentials can use DPoP-bound tokens.** `client_credentials`,
+  token exchange, and vault-backed credentials can load an existing private
+  key from the secret-provider surface and mint fresh RFC 9449 proofs for
+  token and resource requests. Method and URI binding, access-token hashes,
+  nonce challenges, retry bounds, and proof-header redaction are enforced.
+  See [`docs/outbound-dpop.md`](docs/outbound-dpop.md).
+
+### Removed
+
+- **Superseded `sbproxy-ai` library modules.** Removed unreachable local
+  emulation, prompt-cache, response-deduplication, context-relay,
+  structured-output, and streaming-tracker code. Provider passthrough
+  surfaces, semantic caching, idempotency, live streaming metrics, and the
+  shipped context-compression pipeline are unchanged.
+- **Unreachable policy prototypes no longer look supported.** The
+  `peer_pricing_preflight` policy and the inactive NL-to-Cedar compiler,
+  linter, and compiled-policy store had no production request-path caller
+  and have been removed. Delete `peer_pricing_preflight` entries from
+  configuration; there is no outbound peer-pricing replacement today.
+  Existing `semantic_constraint` policies remain supported, but must drop
+  the inert `policy_id` field and continue to configure their judge
+  directly. AI crawl payment negotiation keeps its live
+  `Accept-Payment` parser.
+- **Dead model-host residency prototypes.** Removed the unwired vLLM sleep/wake
+  client and policy-only KV tiering abstraction. Neither was a supported
+  capability, and vLLM development endpoints are no longer enabled by default.
+  The engine-native `swap_space_gib` and `cpu_offload_gib` settings remain.
+  Safe future sleep/wake wiring needs bounded asynchronous transition polling,
+  retained process ownership and accounting after cleanup failures, a bounded
+  host-RAM policy, isolated container development endpoints, and end-to-end
+  fake-engine coverage (WOR-1987).
+
+### Changed
+
+- **Admin operator passwords are now hashed at rest [BREAKING].**
+  `proxy.admin.operators[].password` is replaced by `password_hash`, an
+  HMAC-SHA256 hash (hex-encoded) using the same pepper the inbound key
+  plane hashes virtual keys with. A plaintext `password` field under
+  `operators:` no longer parses. Compute the hash with the new `sbproxy
+  admin hash-password` CLI helper (`--password` or `--password-stdin`),
+  which resolves `key_management.crypto.pepper` from config when set and
+  falls back to a fixed default otherwise, so hashing works with no
+  `key_management:` block configured. That default is a fixed public
+  constant, the same in every install, so a leaked `password_hash` is
+  offline-crackable unless `key_management.crypto.pepper` is pinned; pin
+  it in production. The admin console gains a read-only Operators page
+  (`GET /api/operators`) listing configured operator usernames and roles;
+  operators stay config-only, with no admin API to add, remove, or
+  re-role one.
 
 ## [1.8.0] - 2026-07-27
 
@@ -1930,14 +1987,11 @@ AI providers behind one OpenAI-compatible API.
   fresh delivery ULID on every retry attempt.
   ([crates/sbproxy-observe/src/notify.rs])
 
-- **AI client retry resilience.** `MemoryBatchStore` now uses
-  `parking_lot::Mutex` so a panic in one worker cannot poison the
-  in-memory batch map for every later operation. Provider retries now
-  honor `provider.max_retries` as same-provider retry attempts with
+- **AI client retry resilience.** Provider retries now honor
+  `provider.max_retries` as same-provider retry attempts with
   bounded jittered exponential backoff before recording provider
   failure and moving to the next eligible provider.
-  ([crates/sbproxy-ai/src/batch.rs],
-  [crates/sbproxy-ai/src/client.rs])
+  ([crates/sbproxy-ai/src/client.rs])
 
 - **Dynamic Web Bot Auth directory dispatch.** The main request auth
   path now invokes `BotAuthProvider::verify_async` when a configured

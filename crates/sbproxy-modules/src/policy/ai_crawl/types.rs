@@ -1306,10 +1306,9 @@ pub struct AiCrawlControlConfig {
     /// fallback (the in-memory ledger is constructed regardless and
     /// only swapped out when this block parses cleanly).
     ///
-    /// Requires the `http-ledger` cargo feature to be on. With the
-    /// feature off, the field still deserialises (so YAML written
-    /// against the larger schema parses cleanly) but is ignored at
-    /// policy construction.
+    /// Requires the `http-ledger` cargo feature to be on. Policy
+    /// construction fails closed when this block is present in a build
+    /// without that feature.
     #[serde(default)]
     pub ledger: Option<LedgerYamlConfig>,
     /// Optional multi-rail challenge configuration. When
@@ -1379,6 +1378,11 @@ pub struct LedgerYamlConfig {
     /// Base URL of the ledger. Plain `http://` is rejected at
     /// construction time; operators must use `https://`.
     pub url: String,
+    /// Optional PEM-encoded CA certificates trusted in addition to the
+    /// system trust store. Each entry may contain one or more
+    /// `-----BEGIN CERTIFICATE-----` blocks.
+    #[serde(default)]
+    pub trust_roots: Vec<String>,
     /// HMAC key id (selects which key on the ledger side validates
     /// the signature).
     #[serde(alias = "hmac_key_id", alias = "key-id")]

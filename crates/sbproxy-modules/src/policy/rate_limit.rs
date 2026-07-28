@@ -185,11 +185,72 @@ impl Default for TokenBucket {
     }
 }
 
-// Methods live on the struct (rather than duplicating the arithmetic in
-// the test module) so the proptest exercises exactly the math used by
-// `RateLimitPolicy::allow_with_info_for`.
-#[cfg(test)]
 impl TokenBucket {
+    fn with_rate(refill_rate: f64, now: Instant) -> Self {
+        let max_tokens = refill_rate.ceil().max(1.0);
+        Self {
+            tokens: max_tokens,
+            max_tokens,
+            refill_rate,
+            last_refill: now,
+        }
+    }
+
+    fn refill_at(&mut self, now: Instant) {
+        // Callers capture time before contending on a shared bucket lock.
+        // Preserve the newest timestamp so a delayed older caller cannot make
+        // a later request earn the same refill interval twice.
+        let now = now.max(self.last_refill);
+        let elapsed = now.duration_since(self.last_refill);
+        self.refill_with_elapsed(elapsed.as_secs_f64());
+        self.last_refill = now;
+    }
+
+    fn refill_with_elapsed(&mut self, elapsed_secs: f64) {
+        self.tokens = (self.tokens + elapsed_secs * self.refill_rate).min(self.max_tokens);
+    }
+
+    fn reconfigure_at(&mut self, refill_rate: f64, now: Instant) {
+        // Earn elapsed tokens under the rate that governed that elapsed
+        // interval. Changing a grant must not mint tokens retroactively.
+        self.refill_at(now);
+        let max_tokens = refill_rate.ceil().max(1.0);
+        self.tokens = self.tokens.min(max_tokens);
+        self.max_tokens = max_tokens;
+        self.refill_rate = refill_rate;
+    }
+
+    fn try_acquire(&mut self, tokens: f64) -> bool {
+        if self.tokens >= tokens {
+            self.tokens -= tokens;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn projected_tokens_at(&self, now: Instant) -> f64 {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        (self.tokens + elapsed.as_secs_f64() * self.refill_rate).min(self.max_tokens)
+    }
+
+    fn full_refill_reset_secs_at(&self, now: Instant) -> u64 {
+        if self.refill_rate <= 0.0 {
+            return 0;
+        }
+        let deficit = self.max_tokens - self.projected_tokens_at(now);
+        (deficit / self.refill_rate).ceil() as u64
+    }
+
+    fn next_token_reset_secs_at(&self, now: Instant) -> u64 {
+        if self.refill_rate <= 0.0 {
+            return 0;
+        }
+        let deficit = (1.0 - self.projected_tokens_at(now)).max(0.0);
+        (deficit / self.refill_rate).ceil() as u64
+    }
+
+    #[cfg(test)]
     pub(crate) fn for_test(capacity: f64, refill_rate: f64) -> Self {
         Self {
             tokens: capacity,
@@ -199,30 +260,118 @@ impl TokenBucket {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn current_tokens(&self) -> f64 {
         self.tokens
     }
 
+    #[cfg(test)]
     pub(crate) fn capacity(&self) -> f64 {
         self.max_tokens
-    }
-
-    pub(crate) fn refill_with_elapsed(&mut self, dt_secs: f64) {
-        self.tokens = (self.tokens + dt_secs * self.refill_rate).min(self.max_tokens);
-    }
-
-    pub(crate) fn try_acquire(&mut self, n: f64) -> bool {
-        if self.tokens >= n {
-            self.tokens -= n;
-            true
-        } else {
-            false
-        }
     }
 }
 
 fn default_max_keys() -> usize {
     100_000
+}
+
+/// Admission result from a dynamic keyed token bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DynamicRateLimitInfo {
+    /// Whether the request consumed a token.
+    pub(crate) allowed: bool,
+    /// Current bucket capacity.
+    pub(crate) limit: u64,
+    /// Whole tokens available after this decision.
+    pub(crate) remaining: u64,
+    /// Seconds until the governing bucket is fully refilled.
+    pub(crate) reset_secs: u64,
+}
+
+/// Bounded token-bucket registry whose rate can change on every admission.
+#[derive(Debug)]
+pub(crate) struct DynamicKeyedTokenBuckets {
+    buckets: Mutex<lru::LruCache<String, TokenBucket>>,
+}
+
+impl Default for DynamicKeyedTokenBuckets {
+    fn default() -> Self {
+        Self::new(default_max_keys())
+    }
+}
+
+impl DynamicKeyedTokenBuckets {
+    pub(crate) fn new(max_keys: usize) -> Self {
+        let capacity = std::num::NonZeroUsize::new(max_keys.max(1))
+            .expect("dynamic bucket capacity is at least one");
+        Self {
+            buckets: Mutex::new(lru::LruCache::new(capacity)),
+        }
+    }
+
+    pub(crate) fn check(&self, key: &str, refill_rate: f64) -> DynamicRateLimitInfo {
+        self.check_at(key, refill_rate, Instant::now())
+    }
+
+    fn check_at(&self, key: &str, refill_rate: f64, now: Instant) -> DynamicRateLimitInfo {
+        if !refill_rate.is_finite() || refill_rate <= 0.0 {
+            return DynamicRateLimitInfo {
+                allowed: false,
+                limit: 0,
+                remaining: 0,
+                reset_secs: 1,
+            };
+        }
+
+        let requested_limit = refill_rate.ceil().max(1.0) as u64;
+        let mut buckets = self.buckets.lock();
+        if let Some(bucket) = buckets.get_mut(key) {
+            bucket.reconfigure_at(refill_rate, now);
+            return Self::consume(bucket, now);
+        }
+
+        if buckets.len() >= buckets.cap().get() {
+            let (evictable, reset_secs) = {
+                let (_, candidate) = buckets
+                    .peek_lru()
+                    .expect("a full dynamic bucket registry has an LRU entry");
+                (
+                    candidate.projected_tokens_at(now) >= candidate.max_tokens,
+                    candidate.full_refill_reset_secs_at(now).max(1),
+                )
+            };
+            if !evictable {
+                return DynamicRateLimitInfo {
+                    allowed: false,
+                    limit: requested_limit,
+                    remaining: 0,
+                    reset_secs,
+                };
+            }
+            buckets.pop_lru();
+        }
+
+        buckets.put(key.to_string(), TokenBucket::with_rate(refill_rate, now));
+        let bucket = buckets
+            .get_mut(key)
+            .expect("dynamic bucket was inserted immediately above");
+        Self::consume(bucket, now)
+    }
+
+    fn consume(bucket: &mut TokenBucket, now: Instant) -> DynamicRateLimitInfo {
+        let allowed = bucket.try_acquire(1.0);
+        let reset_secs = if allowed {
+            bucket.full_refill_reset_secs_at(now)
+        } else {
+            bucket.next_token_reset_secs_at(now)
+        };
+        DynamicRateLimitInfo {
+            allowed,
+            limit: bucket.max_tokens as u64,
+            remaining: bucket.tokens.floor() as u64,
+            reset_secs,
+        }
+    }
 }
 
 impl RateLimitPolicy {
@@ -408,14 +557,11 @@ impl RateLimitPolicy {
             &mut template_guard
         };
 
-        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * bucket.refill_rate).min(bucket.max_tokens);
-        bucket.last_refill = now;
+        bucket.refill_at(now);
 
         let limit = bucket.max_tokens as u64;
 
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
+        if bucket.try_acquire(1.0) {
             let remaining = bucket.tokens.floor() as u64;
             let deficit = bucket.max_tokens - bucket.tokens;
             let reset_secs = if bucket.refill_rate > 0.0 {
@@ -754,6 +900,135 @@ mod tests {
         assert!(
             !policy.allow_with_info_for("legit").allowed,
             "LRU eviction must not reset an exhausted legitimate bucket"
+        );
+    }
+
+    #[test]
+    fn dynamic_keyed_buckets_isolate_keys() {
+        let buckets = DynamicKeyedTokenBuckets::new(2);
+        let now = Instant::now();
+
+        assert!(buckets.check_at("agent-a", 0.1, now).allowed);
+        assert!(!buckets.check_at("agent-a", 0.1, now).allowed);
+        assert!(buckets.check_at("agent-b", 0.1, now).allowed);
+    }
+
+    #[test]
+    fn dynamic_keyed_buckets_refill_fractional_rates() {
+        let buckets = DynamicKeyedTokenBuckets::new(1);
+        let start = Instant::now();
+
+        assert!(buckets.check_at("agent", 0.5, start).allowed);
+        assert!(
+            !buckets
+                .check_at("agent", 0.5, start + std::time::Duration::from_secs(1))
+                .allowed
+        );
+        assert!(
+            buckets
+                .check_at("agent", 0.5, start + std::time::Duration::from_secs(2))
+                .allowed
+        );
+    }
+
+    #[test]
+    fn dynamic_keyed_buckets_rate_increase_does_not_grant_tokens() {
+        let buckets = DynamicKeyedTokenBuckets::new(1);
+        let start = Instant::now();
+
+        assert!(buckets.check_at("agent", 1.0, start).allowed);
+        assert!(!buckets.check_at("agent", 2.0, start).allowed);
+        assert!(
+            buckets
+                .check_at("agent", 2.0, start + std::time::Duration::from_millis(500),)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn dynamic_keyed_buckets_ignore_stale_observation_time() {
+        let buckets = DynamicKeyedTokenBuckets::new(1);
+        let start = Instant::now();
+
+        assert!(buckets.check_at("agent", 1.0, start).allowed);
+        assert!(
+            buckets
+                .check_at("agent", 1.0, start + std::time::Duration::from_secs(1))
+                .allowed
+        );
+        assert!(
+            !buckets
+                .check_at("agent", 1.0, start + std::time::Duration::from_millis(500),)
+                .allowed
+        );
+        assert!(
+            !buckets
+                .check_at(
+                    "agent",
+                    1.0,
+                    start + std::time::Duration::from_millis(1_500),
+                )
+                .allowed,
+            "a stale caller must not move the refill clock backward"
+        );
+        assert!(
+            buckets
+                .check_at("agent", 1.0, start + std::time::Duration::from_secs(2))
+                .allowed
+        );
+    }
+
+    #[test]
+    fn dynamic_keyed_buckets_lower_rate_clamps_available_tokens() {
+        let buckets = DynamicKeyedTokenBuckets::new(1);
+        let now = Instant::now();
+
+        assert!(buckets.check_at("agent", 4.0, now).allowed);
+        let lowered = buckets.check_at("agent", 1.0, now);
+        assert!(lowered.allowed);
+        assert_eq!(lowered.limit, 1);
+        assert_eq!(lowered.remaining, 0);
+        assert!(!buckets.check_at("agent", 1.0, now).allowed);
+    }
+
+    #[test]
+    fn dynamic_keyed_buckets_fail_closed_when_registry_is_saturated() {
+        let buckets = DynamicKeyedTokenBuckets::new(1);
+        let start = Instant::now();
+
+        assert!(buckets.check_at("agent-a", 0.1, start).allowed);
+        let saturated = buckets.check_at("agent-b", 0.1, start + std::time::Duration::from_secs(1));
+        assert!(!saturated.allowed);
+        assert_eq!(saturated.remaining, 0);
+        assert_eq!(saturated.reset_secs, 9);
+
+        assert!(
+            buckets
+                .check_at("agent-b", 0.1, start + std::time::Duration::from_secs(10),)
+                .allowed,
+            "a fully refilled LRU bucket may be safely reused"
+        );
+    }
+
+    #[test]
+    fn dynamic_keyed_buckets_distinguish_next_token_from_full_refill_reset() {
+        let buckets = DynamicKeyedTokenBuckets::new(1);
+        let now = Instant::now();
+
+        assert!(buckets.check_at("agent-a", 1.1, now).allowed);
+        assert!(buckets.check_at("agent-a", 1.1, now).allowed);
+        let exhausted = buckets.check_at("agent-a", 1.1, now);
+        assert!(!exhausted.allowed);
+        assert_eq!(
+            exhausted.reset_secs, 1,
+            "an exhausted known key waits only for its next token"
+        );
+
+        let saturated = buckets.check_at("agent-b", 1.1, now);
+        assert!(!saturated.allowed);
+        assert_eq!(
+            saturated.reset_secs, 2,
+            "an unseen key waits until the LRU candidate is fully reusable"
         );
     }
 

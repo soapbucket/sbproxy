@@ -100,6 +100,19 @@ origins:
     )
 }
 
+fn priced_cap_config(upstream_url: &str, pubkey_b64url: &str) -> String {
+    let mut config = cap_config(upstream_url, pubkey_b64url);
+    config.push_str(
+        r#"    policies:
+      - type: ai_crawl_control
+        price: 0.001
+        currency: USD
+        valid_tokens: []
+"#,
+    );
+    config
+}
+
 // --- Tests ---
 
 #[test]
@@ -184,6 +197,77 @@ fn valid_cap_token_returns_200() {
         !upstream.captured().is_empty(),
         "the upstream must see the proxied request"
     );
+}
+
+#[test]
+fn cap_subject_rate_limit_returns_authenticated_429() {
+    let (signing, pubkey) = fresh_keypair();
+    let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
+    let harness =
+        ProxyHarness::start_with_yaml(&cap_config(&upstream.base_url(), &pubkey)).expect("start");
+    let token = mint_cap(&signing, |claims| {
+        claims["rps"] = json!(0.001);
+    });
+
+    let first = harness
+        .get_with_headers("/blog/article", "cap.localhost", &[("cap-token", &token)])
+        .expect("first request");
+    let second = harness
+        .get_with_headers("/blog/article", "cap.localhost", &[("cap-token", &token)])
+        .expect("second request");
+
+    assert_eq!(first.status, 200);
+    assert_eq!(second.status, 429);
+    assert_eq!(
+        second.headers.get("x-ratelimit-remaining"),
+        Some(&"0".to_string())
+    );
+    assert!(
+        second
+            .headers
+            .get("retry-after")
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|seconds| seconds > 0),
+        "429 must include a positive Retry-After"
+    );
+    assert!(
+        !second.headers.contains_key("www-authenticate"),
+        "an authenticated rate limit is not an auth challenge"
+    );
+    assert_eq!(
+        upstream.captured().len(),
+        1,
+        "only the admitted request may reach upstream"
+    );
+}
+
+#[test]
+fn verified_cap_bypasses_priced_crawl_control() {
+    let (signing, pubkey) = fresh_keypair();
+    let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
+    let harness = ProxyHarness::start_with_yaml(&priced_cap_config(&upstream.base_url(), &pubkey))
+        .expect("start");
+    let token = mint_cap(&signing, |claims| {
+        claims["sub"] = json!("openai-gptbot");
+    });
+
+    let response = harness
+        .get_with_headers(
+            "/blog/article",
+            "cap.localhost",
+            &[("cap-token", &token), ("user-agent", "GPTBot/1.0")],
+        )
+        .expect("send");
+
+    assert_eq!(
+        response.status,
+        200,
+        "body: {}; proxy stderr: {}",
+        String::from_utf8_lossy(&response.body),
+        harness.stderr_contents()
+    );
+    assert_eq!(upstream.captured().len(), 1);
+    assert!(!response.headers.contains_key("crawler-payment"));
 }
 
 #[test]

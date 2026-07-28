@@ -347,6 +347,18 @@ pub const BLAST_RADIUS_MATRIX: &[BlastRadiusRule] = &[
         radius: BlastRadius::Restart,
         reason: "subscribing to, or stopping subscription to, a config authority requires restart",
     },
+    // --- Embedded compression state: the database handle is process-owned
+    //     and remains fixed for the lifetime of the process. ---
+    BlastRadiusRule {
+        pattern: "proxy.compression_state.**",
+        radius: BlastRadius::Restart,
+        reason: "the embedded compression database is opened once at startup",
+    },
+    BlastRadiusRule {
+        pattern: "proxy.compression_state",
+        radius: BlastRadius::Restart,
+        reason: "enabling or changing process-owned compression storage requires restart",
+    },
     // --- L2 cache: driver swap rebuilds the KV handle (restart);
     //     param tuning is hot-swappable. ---
     BlastRadiusRule {

@@ -42,6 +42,12 @@ pub struct RealtimeDispatchCtx {
     pub upstream_port: u16,
     /// Whether the upstream uses TLS.
     pub upstream_tls: bool,
+    /// Budget-authoritative model query value to apply after request modifiers.
+    ///
+    /// This carries only a public model identifier. Provider credentials stay
+    /// local to the final outbound request seam and must never enter this
+    /// `Debug` context.
+    pub model_override: Option<String>,
     /// Wall-clock instant when the session started. Diffed against
     /// the `logging` callback time to produce the session-duration
     /// histogram observation and the AudioSeconds billing approximation.
@@ -242,6 +248,12 @@ pub struct RequestContext {
     /// the final upstream response so operators can see why the proxy
     /// did not replay a matching failure status.
     pub status_retry_skip_reason: Option<&'static str>,
+    /// Whether the current upstream attempt carried an outbound DPoP proof.
+    pub outbound_dpop_active: bool,
+    /// One-shot guard for the RFC 9449 protected-resource nonce retry.
+    pub dpop_nonce_retry_used: bool,
+    /// Canonical final resource target used by the active DPoP attempt.
+    pub outbound_dpop_htu: Option<String>,
 
     // --- Bounded admin gateway status ---
     /// Strongest response-cache or semantic-cache outcome observed.
@@ -949,13 +961,13 @@ pub struct RequestContext {
     /// Every downstream key predicate reads this retained snapshot rather
     /// than resolving mutable key state again.
     pub effective_key_policy: Option<sbproxy_ai::effective_key_policy::EffectiveKeyPolicy>,
-    /// Key record resolved by the pre-auth inbound-key phase, before the
-    /// origin's configured auth provider runs.
+    /// Authenticated key record retained for later proxy phases.
     ///
-    /// Set only when a minted token was swept out of a configured header and
-    /// verified. The AI gateway reads this instead of re-reading
-    /// `authorization`, which the sweep may have already consumed: without it a
-    /// swept key would dispatch ungoverned with no error and no log.
+    /// Usually set by the pre-auth sweep for a minted token. The AI gateway
+    /// also sets it when its legacy bearer or OIDC mapping resolves a record
+    /// later, preserving credential bindings needed by the upstream phase.
+    /// Downstream code reads this instead of re-reading `authorization`, which
+    /// an earlier phase may already have consumed.
     pub resolved_inbound_key: Option<Box<sbproxy_keystore::record::KeyRecord>>,
     /// Lowercase name of the header the minted key arrived in.
     ///
@@ -1224,6 +1236,9 @@ impl RequestContext {
             retry_count: 0,
             retry_backoff_ms: None,
             status_retry_skip_reason: None,
+            outbound_dpop_active: false,
+            dpop_nonce_retry_used: false,
+            outbound_dpop_htu: None,
             admin_cache_status: AdminCacheStatus::Disabled,
             admin_ai_attempts: 0,
             admin_failover_from: None,

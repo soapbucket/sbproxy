@@ -216,13 +216,6 @@ pub fn compile_policy(config: &serde_json::Value) -> Result<Policy> {
         "semantic_constraint" => Ok(Policy::SemanticConstraint(
             SemanticConstraintPolicy::from_config(config.clone())?,
         )),
-        // WOR-188: outbound peer-pricing pre-flight. Stored as an
-        // `Arc<PeerPricingPreflightPolicy>` so the outbound
-        // dispatcher (a later wiring PR) can clone a cheap handle
-        // out of the compiled chain.
-        "peer_pricing_preflight" => Ok(Policy::PeerPricingPreflight(std::sync::Arc::new(
-            crate::policy::PeerPricingPreflightPolicy::from_config(config.clone())?,
-        ))),
         // WOR-506: per-`agent_id` semantic rate limit. The policy is
         // wrapped in `Arc` so the enforcer wrapper in `sbproxy-core`
         // can share the bucket state across the compiled chain
@@ -730,6 +723,42 @@ mod tests {
     fn compile_policy_unknown_type() {
         let json = serde_json::json!({"type": "nonexistent_policy"});
         assert!(compile_policy(&json).is_err());
+    }
+
+    #[test]
+    fn compile_policy_rejects_removed_peer_pricing_preflight() {
+        let json = serde_json::json!({"type": "peer_pricing_preflight"});
+        let err = compile_policy(&json).expect_err("removed policy must not compile");
+        assert!(err.to_string().contains("unknown policy type"));
+    }
+
+    #[test]
+    fn compile_policy_accepts_live_semantic_constraint_shape() {
+        let json = serde_json::json!({
+            "type": "semantic_constraint",
+            "prompt_template": "classify {{ request.path }}",
+            "judge": {
+                "endpoint": "http://127.0.0.1:1/",
+                "api_key_env": "SBPROXY_SC_TEST_KEY"
+            }
+        });
+        let policy = compile_policy(&json).expect("live semantic_constraint must compile");
+        assert_eq!(policy.policy_type(), "semantic_constraint");
+    }
+
+    #[test]
+    fn compile_policy_rejects_removed_semantic_constraint_policy_id() {
+        let json = serde_json::json!({
+            "type": "semantic_constraint",
+            "prompt_template": "classify {{ request.path }}",
+            "policy_id": "legacy-compiled-policy",
+            "judge": {
+                "endpoint": "http://127.0.0.1:1/",
+                "api_key_env": "SBPROXY_SC_TEST_KEY"
+            }
+        });
+        let err = compile_policy(&json).expect_err("removed policy_id must not compile");
+        assert!(err.to_string().contains("policy_id"));
     }
 
     #[test]

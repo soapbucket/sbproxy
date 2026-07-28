@@ -13,6 +13,9 @@ use std::fmt;
 /// Default completion capacity reserved by the legacy window-fit behavior.
 pub const DEFAULT_COMPLETION_RESERVE_TOKENS: u64 = 1_024;
 
+/// Default lifetime for omitted state on a stateful compression pipeline.
+pub const DEFAULT_COMPRESSION_STATE_TTL_SECS: u64 = 24 * 60 * 60;
+
 /// Maximum request-selectable compression profile name length.
 pub const MAX_COMPRESSION_PROFILE_NAME_LEN: usize = 64;
 
@@ -117,10 +120,21 @@ pub struct CompressionStateConfig {
     pub ttl_secs: u64,
 }
 
+impl Default for CompressionStateConfig {
+    fn default() -> Self {
+        Self {
+            backend: CompressionStateBackend::Local,
+            ttl_secs: DEFAULT_COMPRESSION_STATE_TTL_SECS,
+        }
+    }
+}
+
 /// State backends safe to select from public compression configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CompressionStateBackend {
+    /// Durable lease-serialized state in the process-owned embedded database.
+    Local,
     /// Strict Redis lease, fence, and compare-and-set storage.
     Redis,
     /// Replicated mesh storage over the cluster replication substrate.
@@ -133,6 +147,8 @@ pub enum CompressionStateBackend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CompressionBackend {
+    /// Durable lease-serialized state in the process-owned embedded database.
+    Local,
     /// Strict Redis lease, fence, and compare-and-set storage.
     Redis,
     /// Eventual last-writer-wins mesh storage.
@@ -356,6 +372,17 @@ impl CompressionPolicy {
         }
     }
 
+    /// Materialize defaults needed by stateful pipelines after deserialization.
+    ///
+    /// Route and profile pipelines are independent: a profile with an omitted
+    /// state block receives Local state rather than borrowing the route state.
+    pub fn apply_state_defaults(&mut self) {
+        apply_pipeline_state_default(&mut self.state, &self.levers);
+        for profile in self.profiles.values_mut() {
+            apply_pipeline_state_default(&mut profile.state, &profile.levers);
+        }
+    }
+
     /// Validate policy-local invariants and summarizer provider references.
     pub fn validate(&self, providers: &[ProviderConfig]) -> anyhow::Result<()> {
         validate_pipeline("compression", self.state.as_ref(), &self.levers, providers)?;
@@ -380,6 +407,19 @@ impl CompressionPolicy {
     }
 }
 
+fn apply_pipeline_state_default(
+    state: &mut Option<CompressionStateConfig>,
+    levers: &[CompressionLeverConfig],
+) {
+    if state.is_none()
+        && levers
+            .iter()
+            .any(|lever| matches!(lever, CompressionLeverConfig::SummaryBuffer(_)))
+    {
+        *state = Some(CompressionStateConfig::default());
+    }
+}
+
 fn validate_pipeline(
     path: &str,
     state: Option<&CompressionStateConfig>,
@@ -393,9 +433,6 @@ fn validate_pipeline(
     for (index, lever) in levers.iter().enumerate() {
         match lever {
             CompressionLeverConfig::SummaryBuffer(summary) => {
-                if state.is_none() {
-                    bail!("{path}.state is required for summary_buffer");
-                }
                 if summary.min_tokens == 0 {
                     bail!("{path}.levers[{index}].min_tokens must be greater than zero");
                 }
@@ -817,7 +854,20 @@ mod tests {
     }
 
     #[test]
-    fn parses_mesh_as_a_compression_state_backend_without_changing_redis() {
+    fn parses_local_and_mesh_as_closed_compression_state_backends_without_changing_redis() {
+        let mut local_value = valid_config();
+        local_value["compression"]["state"]["backend"] = serde_json::json!("local");
+        let local = AiHandlerConfig::from_config(local_value).expect("local backend parses");
+        assert_eq!(
+            local
+                .compression
+                .as_ref()
+                .and_then(|policy| policy.state.as_ref())
+                .expect("state config")
+                .backend,
+            CompressionStateBackend::Local
+        );
+
         let mut value = valid_config();
         value["compression"]["state"]["backend"] = serde_json::json!("mesh");
 
@@ -850,15 +900,36 @@ mod tests {
     }
 
     #[test]
-    fn rejects_summary_buffer_without_state() {
+    fn summary_buffer_without_state_defaults_to_local_for_default_pipeline() {
         let mut value = valid_config();
         value["compression"]
             .as_object_mut()
             .unwrap()
             .remove("state");
 
-        let error = AiHandlerConfig::from_config(value).unwrap_err().to_string();
-        assert!(error.contains("compression.state is required for summary_buffer"));
+        let config = AiHandlerConfig::from_config(value).expect("omitted state defaults");
+        let state = config
+            .compression
+            .as_ref()
+            .and_then(|policy| policy.state.as_ref())
+            .expect("summary buffer receives canonical state");
+        assert_eq!(state.backend, CompressionStateBackend::Local);
+        assert_eq!(state.ttl_secs, 24 * 60 * 60);
+    }
+
+    #[test]
+    fn stateless_pipeline_without_state_remains_none() {
+        let config = AiHandlerConfig::from_config(config_with_levers(serde_json::json!([{
+            "type": "window_fit"
+        }])))
+        .expect("stateless policy compiles");
+
+        assert!(config
+            .compression
+            .as_ref()
+            .expect("compression")
+            .state
+            .is_none());
     }
 
     #[test]
@@ -1145,13 +1216,20 @@ mod tests {
                 }
             }
         });
-        let error = AiHandlerConfig::from_config(missing_state)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("compression.profiles.stateful.state is required for summary_buffer"),
-            "a profile cannot borrow the default pipeline state: {error}"
+        let config =
+            AiHandlerConfig::from_config(missing_state).expect("profile state defaults locally");
+        let policy = config.compression.expect("compression");
+        assert_eq!(
+            policy.state.as_ref().expect("route state").backend,
+            CompressionStateBackend::Redis,
+            "explicit route state remains unchanged"
         );
+        let profile_state = policy.profiles["stateful"]
+            .state
+            .as_ref()
+            .expect("stateful profile receives independent state");
+        assert_eq!(profile_state.backend, CompressionStateBackend::Local);
+        assert_eq!(profile_state.ttl_secs, 24 * 60 * 60);
     }
 
     #[test]

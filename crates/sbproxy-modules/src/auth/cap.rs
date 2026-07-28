@@ -15,9 +15,10 @@
 //! * Verifies `sub` matches the resolved `agent_id` from the resolver
 //!   chain (when present on the request context).
 //! * Verifies the request path matches the token's `glob` allow-list.
-//! * Surfaces the per-token rate-limit budget (`rps`, daily bytes) on
-//!   the returned view so a downstream limiter can enforce it. The
-//!   verifier itself does not register buckets today.
+//! * Enforces the token's RPS grant in a bounded per-subject token-bucket
+//!   registry after every signature, claim, binding, and route check passes.
+//! * Surfaces the daily-byte budget on the returned view for downstream
+//!   enforcement.
 //! * Returns a [`CapVerdict`] capturing the result. The `Verified`
 //!   arm carries a [`CapTokenView`] suitable for stamping onto
 //!   `RequestContext.cap_token` (the field is added by a separate
@@ -47,6 +48,7 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::jwks::{self, JwksCache};
+use crate::policy::rate_limit::DynamicKeyedTokenBuckets;
 
 // --- Public verdict surface ---
 
@@ -59,9 +61,11 @@ use crate::auth::jwks::{self, JwksCache};
 /// the ADR's claim shape; comparators stick to `PartialEq`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CapTokenView {
-    /// Token id (`jti`). Used as the rate-limit bucket key and the
-    /// access-log attribution key.
+    /// Token id (`jti`). Used as the access-log attribution key.
     pub jti: String,
+    /// Fully verified token subject. This is the rate-limit bucket key
+    /// and the principal identity preserved by the core request path.
+    pub subject: String,
     /// Maximum requests per second the token authorises. Stored as a
     /// `f64` per the ADR; the rate-limit middleware rounds at use time.
     pub max_rps: f64,
@@ -73,6 +77,19 @@ pub struct CapTokenView {
     pub route_glob: String,
 }
 
+/// Rate-limit metadata returned with an authenticated CAP denial.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapRateLimitInfo {
+    /// Verified token view, retained so core can preserve the principal.
+    pub token: CapTokenView,
+    /// Current bucket capacity.
+    pub limit: u64,
+    /// Whole tokens remaining after the denied admission.
+    pub remaining: u64,
+    /// Seconds until another request can be admitted.
+    pub reset_secs: u64,
+}
+
 /// Verdict produced by [`CapVerifier::verify`].
 ///
 /// The closed set mirrors the OSS verifier failure modes.
@@ -81,6 +98,10 @@ pub enum CapVerdict {
     /// The token verified end-to-end. Carries the typed view for
     /// `RequestContext` stamping.
     Verified(CapTokenView),
+    /// The token verified end-to-end, but its subject exhausted the
+    /// granted request rate. This is an authenticated 429, not an auth
+    /// challenge.
+    RateLimited(CapRateLimitInfo),
     /// No `CAP-Token` (or `Authorization: CAP`) header was present.
     /// Origin policy decides whether to allow unauthenticated traffic
     /// or fail closed.
@@ -102,8 +123,8 @@ pub enum CapError {
     /// claims, or used an unsupported algorithm.
     InvalidToken {
         /// One of: `malformed`, `unsupported_alg`, `missing_kid`,
-        /// `missing_jti`, `missing_rps`, `missing_bytes`, `missing_glob`,
-        /// `bad_cap_v`, `parse_error`.
+        /// `missing_sub`, `missing_jti`, `missing_rps`, `missing_bytes`,
+        /// `missing_glob`, `bad_cap_v`, `parse_error`.
         reason: &'static str,
     },
     /// `exp <= now`. Distinct so the agent can retry by re-issuing.
@@ -269,6 +290,7 @@ pub struct CapVerifier {
     /// WOR-1149: fail closed when binding is required but no agent id
     /// was resolved.
     require_agent_binding: bool,
+    rate_limiter: DynamicKeyedTokenBuckets,
 }
 
 impl std::fmt::Debug for CapVerifier {
@@ -278,6 +300,7 @@ impl std::fmt::Debug for CapVerifier {
             .field("has_static_jwks", &self.static_set.is_some())
             .field("audience", &self.audience)
             .field("require_agent_binding", &self.require_agent_binding)
+            .field("rate_limiter", &self.rate_limiter)
             .finish()
     }
 }
@@ -303,6 +326,7 @@ impl CapVerifier {
             static_set: cfg.jwks_static,
             audience: cfg.audience,
             require_agent_binding: cfg.require_agent_binding,
+            rate_limiter: DynamicKeyedTokenBuckets::default(),
         })
     }
 
@@ -402,12 +426,17 @@ impl CapVerifier {
 
         // Required-claim presence guards (jsonwebtoken parses missing
         // numeric fields as zero; treat zero-ish budgets as a bad token).
+        if claims.sub.trim().is_empty() {
+            return CapVerdict::Invalid(CapError::InvalidToken {
+                reason: "missing_sub",
+            });
+        }
         if claims.jti.is_empty() {
             return CapVerdict::Invalid(CapError::InvalidToken {
                 reason: "missing_jti",
             });
         }
-        if claims.rps <= 0.0 {
+        if !cap_rps_is_valid(claims.rps) {
             return CapVerdict::Invalid(CapError::InvalidToken {
                 reason: "missing_rps",
             });
@@ -460,12 +489,24 @@ impl CapVerifier {
             return CapVerdict::Invalid(CapError::PathNotAuthorized);
         }
 
-        CapVerdict::Verified(CapTokenView {
+        let view = CapTokenView {
             jti: claims.jti,
+            subject: claims.sub,
             max_rps: claims.rps,
             max_bytes_per_day: claims.bytes,
             route_glob: claims.glob,
-        })
+        };
+        let admission = self.rate_limiter.check(&view.subject, view.max_rps);
+        if admission.allowed {
+            CapVerdict::Verified(view)
+        } else {
+            CapVerdict::RateLimited(CapRateLimitInfo {
+                token: view,
+                limit: admission.limit,
+                remaining: admission.remaining,
+                reset_secs: admission.reset_secs,
+            })
+        }
     }
 
     /// Look up a JWK by `kid`, preferring the cached JWKS over the
@@ -484,6 +525,10 @@ impl CapVerifier {
         }
         None
     }
+}
+
+fn cap_rps_is_valid(rps: f64) -> bool {
+    rps.is_finite() && rps > 0.0
 }
 
 // --- Header / token / glob helpers ---
@@ -710,12 +755,125 @@ mod tests {
         match verdict {
             CapVerdict::Verified(view) => {
                 assert_eq!(view.jti, "01J7HZ8X9R3CAPTEST");
+                assert_eq!(view.subject, "agent_acme_001");
                 assert_eq!(view.max_rps, 2.0);
                 assert_eq!(view.max_bytes_per_day, 10_737_418_240);
                 assert_eq!(view.route_glob, "/blog/**");
             }
             other => panic!("expected Verified, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn empty_subject_is_rejected() {
+        let (verifier, kid, signing) = build_verifier_with_keypair();
+        let token = mint_token(&signing, &kid, |claims| {
+            claims["sub"] = json!("");
+        });
+
+        assert_eq!(
+            verifier.verify_token(&token, "api.example.com", "/blog/x", None),
+            CapVerdict::Invalid(CapError::InvalidToken {
+                reason: "missing_sub"
+            })
+        );
+    }
+
+    #[test]
+    fn whitespace_only_subject_is_rejected() {
+        let (verifier, kid, signing) = build_verifier_with_keypair();
+        let token = mint_token(&signing, &kid, |claims| {
+            claims["sub"] = json!(" \t ");
+        });
+
+        assert_eq!(
+            verifier.verify_token(&token, "api.example.com", "/blog/x", None),
+            CapVerdict::Invalid(CapError::InvalidToken {
+                reason: "missing_sub"
+            })
+        );
+    }
+
+    #[test]
+    fn cap_rps_must_be_finite_and_positive() {
+        assert!(cap_rps_is_valid(0.1));
+        assert!(!cap_rps_is_valid(0.0));
+        assert!(!cap_rps_is_valid(-1.0));
+        assert!(!cap_rps_is_valid(f64::NAN));
+        assert!(!cap_rps_is_valid(f64::INFINITY));
+        assert!(!cap_rps_is_valid(f64::NEG_INFINITY));
+    }
+
+    #[test]
+    fn cap_rate_limit_is_shared_by_subject_across_jtis() {
+        let (verifier, kid, signing) = build_verifier_with_keypair();
+        let first = mint_token(&signing, &kid, |claims| {
+            claims["rps"] = json!(0.001);
+            claims["jti"] = json!("first-jti");
+        });
+        let second = mint_token(&signing, &kid, |claims| {
+            claims["rps"] = json!(0.001);
+            claims["jti"] = json!("second-jti");
+        });
+
+        assert!(matches!(
+            verifier.verify_token(&first, "api.example.com", "/blog/x", None),
+            CapVerdict::Verified(_)
+        ));
+        match verifier.verify_token(&second, "api.example.com", "/blog/x", None) {
+            CapVerdict::RateLimited(info) => {
+                assert_eq!(info.token.subject, "agent_acme_001");
+                assert_eq!(info.limit, 1);
+                assert_eq!(info.remaining, 0);
+                assert!(info.reset_secs > 0);
+            }
+            other => panic!("expected subject-shared rate limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cap_rate_limit_isolated_between_subjects() {
+        let (verifier, kid, signing) = build_verifier_with_keypair();
+        let first = mint_token(&signing, &kid, |claims| {
+            claims["sub"] = json!("agent-a");
+            claims["rps"] = json!(0.001);
+            claims["jti"] = json!("agent-a-jti");
+        });
+        let second = mint_token(&signing, &kid, |claims| {
+            claims["sub"] = json!("agent-b");
+            claims["rps"] = json!(0.001);
+            claims["jti"] = json!("agent-b-jti");
+        });
+
+        assert!(matches!(
+            verifier.verify_token(&first, "api.example.com", "/blog/x", None),
+            CapVerdict::Verified(_)
+        ));
+        assert!(matches!(
+            verifier.verify_token(&second, "api.example.com", "/blog/x", None),
+            CapVerdict::Verified(_)
+        ));
+    }
+
+    #[test]
+    fn invalid_cap_does_not_consume_subject_rate_limit() {
+        let (verifier, kid, signing) = build_verifier_with_keypair();
+        let token = mint_token(&signing, &kid, |claims| {
+            claims["rps"] = json!(0.001);
+        });
+
+        assert_eq!(
+            verifier.verify_token(&token, "api.example.com", "/private", None),
+            CapVerdict::Invalid(CapError::PathNotAuthorized)
+        );
+        assert!(matches!(
+            verifier.verify_token(&token, "api.example.com", "/blog/x", None),
+            CapVerdict::Verified(_)
+        ));
+        assert!(matches!(
+            verifier.verify_token(&token, "api.example.com", "/blog/x", None),
+            CapVerdict::RateLimited(_)
+        ));
     }
 
     #[test]

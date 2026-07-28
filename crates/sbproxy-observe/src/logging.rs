@@ -819,6 +819,12 @@ fn redact_value(value: &mut serde_json::Value, sink: Sink, extra_fields: &[Strin
 /// most-specific scope's additions fire.
 fn match_denylist(key: &str, sink: Sink, extra_fields: &[String]) -> Option<&'static str> {
     let k = key.to_ascii_lowercase();
+    // RFC 9449 proofs are bearer-adjacent sender-constraining material. A
+    // compact JWS does not match the value-shape redactor, so protect it by
+    // field name in every structured sink.
+    if k == "dpop" {
+        return Some("[REDACTED:DPOP_PROOF]");
+    }
     // Authorization headers + cookies: every sink redacts these.
     if k == "authorization" || k == "proxy-authorization" {
         return Some("[REDACTED:AUTHORIZATION]");
@@ -1102,6 +1108,36 @@ mod tests {
         assert!(
             !out.contains("<redacted:"),
             "legacy v1-shape marker leaked: {out}"
+        );
+    }
+
+    #[test]
+    fn structured_logs_redact_compact_dpop_proofs_by_field_key() {
+        const DPOP_PROOF: &str = concat!(
+            "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2",
+            "IjoiUC0yNTYiLCJ4IjoibDh0RnIzRjdrS3Rjb2J4NWVmMHlONUR1ejN0RDdmWUZQUmRaeFk1",
+            "VlFKMCIsInkiOiI0cE4tNUo3azZKbTZUdmVXZEVLd3FWRE1IWVE1bk5vVEhUY0xRa0cxZDVN",
+            "In19.",
+            "eyJqdGkiOiJmNmE4ZjMyZC00YzY1LTRjMjctYThiOS0zMDQ3ZjY4ZTI3MTUiLCJodG0iOiJH",
+            "RVQiLCJodHUiOiJodHRwczovL2FwaS5leGFtcGxlLmNvbS9yZXNvdXJjZSIsImlhdCI6MTc4",
+            "NTA5MTIwMH0.",
+            "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1",
+            "Njc4OWFiY2RlZg",
+        );
+        let json = serde_json::json!({
+            "request_headers": {
+                "dpop": DPOP_PROOF,
+            },
+        })
+        .to_string();
+
+        let out = apply_redaction(&json, Sink::AccessLog);
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(value["request_headers"]["dpop"], "[REDACTED:DPOP_PROOF]");
+        assert!(
+            !out.contains(DPOP_PROOF),
+            "compact DPoP proof leaked from structured log: {out}"
         );
     }
 
