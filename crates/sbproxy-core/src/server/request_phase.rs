@@ -1160,6 +1160,18 @@ pub(super) async fn request_filter(
         // current GraphQL action validates the final modified request.
         ctx.graphql_validation_pending = true;
     }
+    // RFC 9449 permits one retry when a protected resource challenges
+    // with a nonce. Enable Pingora's bounded replay buffer before any
+    // request body is consumed so that retry is safe for body-bearing
+    // methods as well as bodyless requests.
+    if pipeline
+        .outbound_creds
+        .get(origin_idx)
+        .and_then(Option::as_ref)
+        .is_some_and(|credential| credential.is_dpop_enabled())
+    {
+        session.as_mut().enable_retry_buffering();
+    }
 
     // WOR-1053: stamp the matched origin's tenant on the request
     // context so downstream auth / policy / vault resolution can

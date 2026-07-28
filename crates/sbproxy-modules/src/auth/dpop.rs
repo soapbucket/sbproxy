@@ -308,7 +308,7 @@ impl DpopVerifier {
         }
 
         // 2. Method + URI bind.
-        if !claims.htm.eq_ignore_ascii_case(method) {
+        if claims.htm != method {
             return Err(DpopRejection::MethodMismatch {
                 expected: method.to_string(),
                 found: claims.htm,
@@ -440,7 +440,7 @@ fn decoding_key_from_jwk(jwk: &serde_json::Value, alg: Algorithm) -> Option<Deco
 /// Compute the RFC 7638 JWK thumbprint (SHA-256) of a public key.
 /// Returns the base64url-no-pad encoding so it matches the shape of
 /// the access token's `cnf.jkt` claim.
-fn jwk_thumbprint(jwk: &serde_json::Value) -> Option<String> {
+pub(crate) fn jwk_thumbprint(jwk: &serde_json::Value) -> Option<String> {
     use base64::Engine;
     use sha2::{Digest, Sha256};
     // RFC 7638 §3.2: canonical members per key type, sorted
@@ -583,6 +583,25 @@ mod tests {
         let result = v.verify(
             Some(&proof),
             "GET",
+            "https://api.example/m",
+            &test_jkt(),
+            SystemTime::now(),
+        );
+        assert!(matches!(result, Err(DpopRejection::MethodMismatch { .. })));
+    }
+
+    #[test]
+    fn method_binding_is_case_sensitive() {
+        let v = DpopVerifier::default();
+        let proof = mint_proof(
+            "customMethod",
+            "https://api.example/m",
+            "method-case-1",
+            None,
+        );
+        let result = v.verify(
+            Some(&proof),
+            "CUSTOMMETHOD",
             "https://api.example/m",
             &test_jkt(),
             SystemTime::now(),

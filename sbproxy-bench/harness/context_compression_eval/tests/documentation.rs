@@ -130,7 +130,6 @@ fn readme_and_workflow_cover_reproducibility_and_external_data_boundaries() {
         "crates/sbproxy-core/src/compression_runtime.rs",
         "crates/sbproxy-core/src/server/ai_dispatch.rs",
         "crates/sbproxy-ai/src/compression/**",
-        "crates/sbproxy-ai/src/context_compress.rs",
         "crates/sbproxy-ai/src/context_overflow.rs",
         "crates/sbproxy-ai/src/token_estimate.rs",
         "schemas/ai-compression.schema.json",

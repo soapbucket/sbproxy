@@ -798,7 +798,7 @@ Each entry accepts these settings.
 | `gguf_file` | Exact GGUF filename to serve from a multi-file llama.cpp repo. |
 | `extra_args` | Extra engine flags appended after the runtime's own arguments, one argv element each, filtered against an allowlist. |
 | `tool_call_parser` | vLLM tool-call parser (`hermes`, `llama3_json`, `mistral`) that enables auto tool choice. |
-| `swap_space_gib` | CPU KV-cache tier in GiB (vLLM `--swap-space`). |
+| `swap_space_gib` | CPU swap pool in GiB (vLLM `--swap-space`). |
 | `cpu_offload_gib` | GiB of weights kept in CPU RAM (vLLM `--cpu-offload-gb`). |
 | `reference` | Hosted model this local model displaces, used to price the dollars-saved value report. |
 
@@ -1097,6 +1097,15 @@ Stable admission reason codes are:
 Keep-alive starts after the last request permit is released. Active or queued
 work pauses expiry. A draining deployment rejects new work and waits up to the
 configured shutdown deadline for active requests.
+
+Policy-driven eviction stops the engine process. WOR-1987 removed an unwired
+sleep/wake HTTP client and a policy-only KV tiering abstraction; neither was a
+supported model-host capability. The engine-native `swap_space_gib` and
+`cpu_offload_gib` settings remain available. A future sleep/wake implementation
+needs bounded polling for asynchronous engine transitions, retained process
+ownership and accounting when cleanup fails, a bounded host-RAM policy for
+sleeping weights, isolated container development endpoints, and end-to-end
+coverage through a fake engine.
 
 ## Status and operations
 

@@ -9255,7 +9255,6 @@ dependencies = [
  "tract-onnx",
  "ulid",
  "url",
- "uuid 1.23.1",
  "yaml_serde",
  "zip 0.6.6",
 ]

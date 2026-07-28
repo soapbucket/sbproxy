@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::context::{LoadBalancerActionKey, LoadBalancerAttemptToken};
+use anyhow::Context as _;
 
 fn active_action<'a>(pipeline: &'a CompiledPipeline, ctx: &RequestContext) -> Option<&'a Action> {
     let origin_idx = ctx.origin_idx?;
@@ -288,9 +289,10 @@ fn finish_terminal_load_balancer_attempt(
 
 /// Scheme-agnostic host + path of an upstream URL (WOR-1698).
 struct ParsedUpstreamUrl {
-    /// `Url::host_str()` of the upstream, or `None` when the URL has no
-    /// host or does not parse.
+    /// `Url::host_str()` of the upstream.
     host: Option<String>,
+    /// Configured transport scheme.
+    scheme: Option<String>,
     /// `Url::path()` of the upstream (empty string when the URL does not
     /// parse), used to derive the base-path prefix for the Proxy action.
     path: String,
@@ -322,7 +324,10 @@ fn parsed_upstream_url(url: &str) -> std::sync::Arc<ParsedUpstreamUrl> {
     }
     let parsed = url::Url::parse(url).ok();
     let info = std::sync::Arc::new(ParsedUpstreamUrl {
-        host: parsed.as_ref().and_then(|u| u.host_str().map(String::from)),
+        host: parsed
+            .as_ref()
+            .and_then(|url| url.host_str().map(str::to_string)),
+        scheme: parsed.as_ref().map(|u| u.scheme().to_string()),
         path: parsed
             .as_ref()
             .map(|u| u.path().to_string())
@@ -397,6 +402,246 @@ fn status_retry_skip_reason(session: &mut Session) -> Option<&'static str> {
     }
 
     None
+}
+
+fn dpop_retry_skip_reason(session: &mut Session) -> Option<&'static str> {
+    if session.as_mut().is_body_empty() {
+        return None;
+    }
+    if !session.as_mut().is_body_done() {
+        return Some("streaming_body");
+    }
+    if session.as_ref().retry_buffer_truncated() {
+        return Some("body_too_large");
+    }
+    if session.as_ref().get_retry_buffer().is_none() {
+        return Some("body_unavailable");
+    }
+    None
+}
+
+fn dpop_resource_htu(scheme: &str, request: &RequestHeader) -> anyhow::Result<String> {
+    let scheme = match scheme {
+        "http" | "ws" | "grpc" => "http",
+        "https" | "wss" | "grpcs" => "https",
+        _ => anyhow::bail!("outbound DPoP requires an HTTP or HTTPS upstream scheme"),
+    };
+    let authority = request
+        .headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| request.uri.authority().map(http::uri::Authority::as_str))
+        .filter(|value| !value.is_empty())
+        .context("outbound DPoP request has no final authority")?;
+    let path = if request.uri.path().is_empty() {
+        "/"
+    } else {
+        request.uri.path()
+    };
+    let mut target = url::Url::parse(&format!("{scheme}://{authority}{path}"))
+        .context("outbound DPoP request target is not a valid absolute URI")?;
+    target.set_query(None);
+    target.set_fragment(None);
+    Ok(target.to_string())
+}
+
+fn response_dpop_nonce(response: &ResponseHeader) -> Option<String> {
+    let values: Vec<_> = response.headers.get_all("dpop-nonce").iter().collect();
+    if values.len() != 1 {
+        return None;
+    }
+    let nonce = values[0].to_str().ok()?;
+    sbproxy_modules::auth::dpop_outbound::validate_nonce(nonce).ok()?;
+    Some(nonce.to_string())
+}
+
+/// Return whether one `WWW-Authenticate` field contains a DPoP challenge with
+/// the exact `error=use_dpop_nonce` auth parameter.
+///
+/// Commas are ambiguous in RFC 9110 authentication fields: they delimit both
+/// challenges and auth parameters. Track the current challenge while scanning
+/// comma-separated segments outside quoted strings so a combined
+/// `Bearer ..., DPoP ...` field is handled without letting near-name
+/// parameters such as `fooerror` match.
+fn dpop_authenticate_value_requests_nonce(header: &str) -> bool {
+    let bytes = header.as_bytes();
+    let mut segment_start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut current_challenge_is_dpop = false;
+
+    for segment_end in (0..=bytes.len()).filter(|&index| {
+        if index == bytes.len() {
+            return true;
+        }
+        let byte = bytes[index];
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            false
+        } else if byte == b'"' {
+            quoted = true;
+            false
+        } else {
+            byte == b','
+        }
+    }) {
+        let segment = header[segment_start..segment_end].trim();
+        segment_start = segment_end.saturating_add(1);
+        if segment.is_empty() {
+            continue;
+        }
+
+        let segment_bytes = segment.as_bytes();
+        let token_end = segment_bytes
+            .iter()
+            .position(|byte| !is_auth_token_byte(*byte))
+            .unwrap_or(segment_bytes.len());
+        if token_end == 0 {
+            current_challenge_is_dpop = false;
+            continue;
+        }
+        let mut after_token = token_end;
+        while segment_bytes
+            .get(after_token)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            after_token += 1;
+        }
+
+        if segment_bytes.get(after_token) == Some(&b'=') {
+            if current_challenge_is_dpop
+                && auth_challenge_has_parameter(segment, "error", "use_dpop_nonce")
+            {
+                return true;
+            }
+            continue;
+        }
+
+        current_challenge_is_dpop = segment[..token_end].eq_ignore_ascii_case("DPoP");
+        if current_challenge_is_dpop
+            && auth_challenge_has_parameter(&segment[token_end..], "error", "use_dpop_nonce")
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn dpop_resource_nonce_challenge_present(response: &ResponseHeader) -> bool {
+    if response.status != http::StatusCode::UNAUTHORIZED {
+        return false;
+    }
+    response
+        .headers
+        .get_all(http::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(dpop_authenticate_value_requests_nonce)
+}
+
+fn dpop_resource_nonce_challenge(response: &ResponseHeader) -> Option<String> {
+    dpop_resource_nonce_challenge_present(response)
+        .then(|| response_dpop_nonce(response))
+        .flatten()
+}
+
+fn maybe_retry_dpop_nonce(
+    session: &mut Session,
+    upstream_response: &ResponseHeader,
+    ctx: &mut RequestContext,
+) -> Option<Box<Error>> {
+    if !ctx.outbound_dpop_active {
+        return None;
+    }
+    let challenged = dpop_resource_nonce_challenge_present(upstream_response);
+    let nonce = if challenged {
+        dpop_resource_nonce_challenge(upstream_response)?
+    } else {
+        response_dpop_nonce(upstream_response)?
+    };
+    let pipeline = ctx.pipeline.clone();
+    let runtime = pipeline
+        .outbound_creds
+        .get(ctx.origin_idx?)
+        .and_then(Option::as_ref)
+        .and_then(|credential| credential.dpop_runtime().ok().flatten())?;
+    let htu = ctx.outbound_dpop_htu.as_deref()?;
+
+    if !challenged || ctx.dpop_nonce_retry_used || dpop_retry_skip_reason(session).is_some() {
+        let _ = runtime.set_resource_nonce(htu, &nonce);
+        return None;
+    }
+
+    if runtime.set_resource_nonce(htu, &nonce).is_err() {
+        return None;
+    }
+    ctx.dpop_nonce_retry_used = true;
+    finish_load_balancer_attempt(ctx, LoadBalancerAttemptOutcome::Failure);
+    let mut error = Error::explain(
+        ErrorType::HTTPStatus(http::StatusCode::UNAUTHORIZED.as_u16()),
+        "protected resource requested a DPoP nonce",
+    );
+    error.set_retry(true);
+    Some(error)
+}
+
+fn insert_outbound_credential_header(
+    request: &mut RequestHeader,
+    header_name: String,
+    header_value: &str,
+) -> Result<()> {
+    request
+        .insert_header(header_name, header_value)
+        .map_err(|_| {
+            pingora_error::Error::explain(
+                pingora_error::ErrorType::HTTPStatus(503),
+                "outbound credential header rejected",
+            )
+        })
+}
+
+fn ensure_dpop_credential_source(
+    bound_credential_id: Option<&str>,
+    origin_dpop_enabled: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !(origin_dpop_enabled && bound_credential_id.is_some()),
+        "bound credential cannot satisfy origin DPoP"
+    );
+    Ok(())
+}
+
+fn final_dpop_access_token<'a>(
+    request: &'a RequestHeader,
+    expected_token: &str,
+) -> anyhow::Result<&'a str> {
+    let mut values = request.headers.get_all(http::header::AUTHORIZATION).iter();
+    let value = values
+        .next()
+        .context("outbound DPoP authorization header is missing")?;
+    anyhow::ensure!(
+        values.next().is_none(),
+        "outbound DPoP authorization header is duplicated"
+    );
+    let value = value
+        .to_str()
+        .context("outbound DPoP authorization header is invalid")?;
+    let token = value
+        .strip_prefix("DPoP ")
+        .filter(|token| !token.is_empty())
+        .context("outbound DPoP authorization scheme is invalid")?;
+    anyhow::ensure!(
+        token == expected_token,
+        "outbound DPoP authorization token was modified"
+    );
+    Ok(token)
 }
 
 /// Decide whether the upstream response status triggers a retry.
@@ -903,6 +1148,7 @@ impl ProxyHttp for SbProxy {
         let mut advanced_modifiers: Vec<sbproxy_config::RequestModifierConfig> = Vec::new();
         let mut upstream_url_path: Option<String> = None;
         let mut upstream_host_header: Option<String> = None;
+        let mut upstream_scheme: Option<String> = None;
         let mut disable_forwarded_host: bool = false;
         let mut forwarding = ForwardingHeaderControls::default();
         // WOR-802: outbound credential resolver config for this origin,
@@ -911,6 +1157,10 @@ impl ProxyHttp for SbProxy {
         let mut outbound_cred: Option<
             sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig,
         > = None;
+        let mut dpop_resource: Option<(
+            std::sync::Arc<sbproxy_modules::auth::dpop_outbound::DpopRuntime>,
+            String,
+        )> = None;
         // WOR-805: outbound Web Bot Auth signer + Signature-Agent for
         // this origin, cloned (Arc) out of the pipeline so they outlive
         // the pipeline guard dropped below.
@@ -1043,6 +1293,19 @@ impl ProxyHttp for SbProxy {
                 // upstreams (Vercel, Cloudflare, AWS ALB, K8s ingresses) reject
                 // the request because the client's Host header was forwarded
                 // verbatim.
+                let selected_upstream_url = match effective_action {
+                    Action::Proxy(action) => Some(action.url.as_str()),
+                    Action::LoadBalancer(action) => active_load_balancer_target_index(ctx)
+                        .and_then(|index| action.targets.get(index))
+                        .map(|target| target.url.as_str()),
+                    Action::WebSocket(action) => Some(action.url.as_str()),
+                    Action::Grpc(action) => Some(action.url.as_str()),
+                    Action::A2a(action) => Some(action.url.as_str()),
+                    Action::GraphQL(action) => Some(action.url.as_str()),
+                    _ => None,
+                };
+                upstream_scheme =
+                    selected_upstream_url.and_then(|url| parsed_upstream_url(url).scheme.clone());
                 let mut fc = ForwardingHeaderControls::default();
                 upstream_host_header = match effective_action {
                     Action::Proxy(p) => {
@@ -1436,9 +1699,11 @@ impl ProxyHttp for SbProxy {
         // secrets are already `${ENV}`-interpolated at load, so the
         // request-path secret lookup is identity. Minted tokens are
         // cached (by origin + subject) until they near expiry. On
-        // failure we fail open: the request goes upstream without the
-        // minted credential (the upstream rejects it) rather than the
-        // proxy 500ing; a fail-closed flag can follow.
+        // resolver failure for a legacy non-DPoP credential fails open:
+        // the request goes upstream without the minted credential (the
+        // upstream rejects it). DPoP failures and rejected credential
+        // headers fail closed because continuing could forward the caller's
+        // identity without the configured sender constraint.
         // A credential bound to the resolved minted key wins, and SUPPRESSES
         // the origin-level resolver rather than running it and overwriting the
         // result. Two concrete reasons: the origin's `token_exchange` mode
@@ -1450,6 +1715,26 @@ impl ProxyHttp for SbProxy {
             .resolved_inbound_key
             .as_deref()
             .and_then(|record| record.credential_id.clone());
+        let origin_dpop_enabled = outbound_cred
+            .as_ref()
+            .is_some_and(|credential| credential.is_dpop_enabled());
+        if origin_dpop_enabled {
+            // Never forward a caller-supplied proof as the proxy's proof.
+            upstream_request.remove_header("dpop");
+        }
+        if let Err(error) =
+            ensure_dpop_credential_source(bound_credential_id.as_deref(), origin_dpop_enabled)
+        {
+            warn!(
+                origin = %ctx.hostname,
+                error = %error,
+                "bound credential conflicts with origin DPoP; refusing the request"
+            );
+            return Err(pingora_error::Error::explain(
+                pingora_error::ErrorType::HTTPStatus(503),
+                "bound credential cannot satisfy origin DPoP",
+            ));
+        }
 
         if let Some(credential_id) = bound_credential_id {
             let Some(plane) = crate::key_plane::current_key_plane() else {
@@ -1471,7 +1756,11 @@ impl ProxyHttp for SbProxy {
                 .await
             {
                 Ok(resolved) => {
-                    let _ = upstream_request.insert_header(resolved.header, &resolved.value);
+                    insert_outbound_credential_header(
+                        upstream_request,
+                        resolved.header,
+                        &resolved.value,
+                    )?;
                 }
                 Err(e) => {
                     // Fail CLOSED, unlike the origin-level resolver below.
@@ -1514,10 +1803,48 @@ impl ProxyHttp for SbProxy {
             .await
             {
                 Ok(minted) => {
-                    let _ =
-                        upstream_request.insert_header(minted.header_name, &minted.header_value);
+                    let dpop_access_token = minted.dpop_access_token().map(str::to_string);
+                    insert_outbound_credential_header(
+                        upstream_request,
+                        minted.header_name,
+                        &minted.header_value,
+                    )?;
+                    if cred_cfg.is_dpop_enabled() {
+                        let access_token = dpop_access_token.ok_or_else(|| {
+                            pingora_error::Error::explain(
+                                pingora_error::ErrorType::HTTPStatus(503),
+                                "DPoP credential did not contain a DPoP access token",
+                            )
+                        })?;
+                        let runtime = cred_cfg
+                            .dpop_runtime()
+                            .map_err(|_| {
+                                pingora_error::Error::explain(
+                                    pingora_error::ErrorType::HTTPStatus(503),
+                                    "DPoP signer unavailable",
+                                )
+                            })?
+                            .ok_or_else(|| {
+                                pingora_error::Error::explain(
+                                    pingora_error::ErrorType::HTTPStatus(503),
+                                    "DPoP signer unavailable",
+                                )
+                            })?;
+                        dpop_resource = Some((runtime, access_token));
+                    }
                 }
                 Err(e) => {
+                    if cred_cfg.is_dpop_enabled() {
+                        warn!(
+                            origin = %ctx.hostname,
+                            error = %e,
+                            "outbound DPoP credential resolution failed; refusing the request"
+                        );
+                        return Err(pingora_error::Error::explain(
+                            pingora_error::ErrorType::HTTPStatus(503),
+                            "outbound DPoP credential unavailable",
+                        ));
+                    }
                     warn!(
                         origin = %ctx.hostname,
                         error = %e,
@@ -1729,6 +2056,51 @@ impl ProxyHttp for SbProxy {
             }
         }
 
+        // Mint at the final outbound request seam. Every URI/method/header
+        // rewrite and GraphQL validation has completed, and retries re-enter
+        // this hook, so each attempt receives a fresh proof.
+        ctx.outbound_dpop_active = false;
+        ctx.outbound_dpop_htu = None;
+        if let Some((runtime, access_token)) = dpop_resource {
+            let final_access_token = final_dpop_access_token(upstream_request, &access_token)
+                .map_err(|_| {
+                    pingora_error::Error::explain(
+                        pingora_error::ErrorType::HTTPStatus(503),
+                        "outbound DPoP authorization header was modified",
+                    )
+                })?;
+            let scheme = upstream_scheme.as_deref().ok_or_else(|| {
+                pingora_error::Error::explain(
+                    pingora_error::ErrorType::HTTPStatus(503),
+                    "outbound DPoP upstream scheme unavailable",
+                )
+            })?;
+            let htu = dpop_resource_htu(scheme, upstream_request).map_err(|_| {
+                pingora_error::Error::explain(
+                    pingora_error::ErrorType::HTTPStatus(503),
+                    "outbound DPoP target unavailable",
+                )
+            })?;
+            let proof = runtime
+                .mint_resource_proof(upstream_request.method.as_str(), &htu, final_access_token)
+                .map_err(|_| {
+                    pingora_error::Error::explain(
+                        pingora_error::ErrorType::HTTPStatus(503),
+                        "outbound DPoP proof minting failed",
+                    )
+                })?;
+            upstream_request
+                .insert_header("dpop", &proof)
+                .map_err(|_| {
+                    pingora_error::Error::explain(
+                        pingora_error::ErrorType::HTTPStatus(503),
+                        "outbound DPoP proof header rejected",
+                    )
+                })?;
+            ctx.outbound_dpop_active = true;
+            ctx.outbound_dpop_htu = Some(htu);
+        }
+
         Ok(())
     }
 
@@ -1752,6 +2124,16 @@ impl ProxyHttp for SbProxy {
         Self::CTX: Send + Sync,
     {
         capture_load_balancer_upstream_response(ctx, upstream_response);
+        let dpop_nonce_challenge =
+            ctx.outbound_dpop_active && dpop_resource_nonce_challenge_present(upstream_response);
+        if let Some(error) = maybe_retry_dpop_nonce(session, upstream_response, ctx) {
+            return Some(error);
+        }
+        if dpop_nonce_challenge {
+            // The RFC 9449 retry has its own exact one-attempt budget.
+            // Never let a generic status retry multiply it.
+            return None;
+        }
         maybe_retry_upstream_status(session, upstream_response, ctx).await
     }
 
@@ -5006,6 +5388,148 @@ mod tests {
     use super::*;
     use pingora_error::ErrorSource;
 
+    #[test]
+    fn dpop_resource_htu_uses_final_authority_and_path_without_query() {
+        let mut request =
+            pingora_http::RequestHeader::build("PATCH", b"/v2/items/a%2Fb?debug=true", None)
+                .unwrap();
+        request
+            .insert_header("host", "api.example.test:8443")
+            .unwrap();
+
+        assert_eq!(
+            dpop_resource_htu("https", &request).unwrap(),
+            "https://api.example.test:8443/v2/items/a%2Fb"
+        );
+    }
+
+    #[test]
+    fn resource_nonce_challenge_requires_401_dpop_error_and_one_nonce() {
+        let mut response = pingora_http::ResponseHeader::build(401, Some(2)).unwrap();
+        response
+            .insert_header(
+                "www-authenticate",
+                r#"DPoP error="use_dpop_nonce", error_description="nonce required""#,
+            )
+            .unwrap();
+        response
+            .insert_header("dpop-nonce", "resource-nonce")
+            .unwrap();
+        assert_eq!(
+            dpop_resource_nonce_challenge(&response).as_deref(),
+            Some("resource-nonce")
+        );
+
+        response.status = http::StatusCode::BAD_REQUEST;
+        assert!(dpop_resource_nonce_challenge(&response).is_none());
+        response.status = http::StatusCode::UNAUTHORIZED;
+        response
+            .append_header("dpop-nonce", "second-resource-nonce")
+            .unwrap();
+        assert!(dpop_resource_nonce_challenge(&response).is_none());
+    }
+
+    #[test]
+    fn resource_nonce_challenge_finds_dpop_after_another_challenge() {
+        let mut response = pingora_http::ResponseHeader::build(401, Some(3)).unwrap();
+        response
+            .insert_header(
+                "www-authenticate",
+                r#"Bearer realm="api", DPoP error = "use_dpop_nonce""#,
+            )
+            .unwrap();
+        response.insert_header("dpop-nonce", "nonce-2").unwrap();
+
+        assert_eq!(
+            dpop_resource_nonce_challenge(&response).as_deref(),
+            Some("nonce-2")
+        );
+    }
+
+    #[test]
+    fn resource_nonce_challenge_requires_the_exact_error_parameter_name() {
+        let mut response = pingora_http::ResponseHeader::build(401, Some(3)).unwrap();
+        response
+            .insert_header(
+                "www-authenticate",
+                r#"DPoP fooerror="use_dpop_nonce", error_description="use_dpop_nonce""#,
+            )
+            .unwrap();
+        response.insert_header("dpop-nonce", "nonce-3").unwrap();
+
+        assert!(dpop_resource_nonce_challenge(&response).is_none());
+    }
+
+    #[test]
+    fn malformed_nonce_does_not_hide_the_dpop_challenge() {
+        let mut response = pingora_http::ResponseHeader::build(401, Some(3)).unwrap();
+        response
+            .insert_header("www-authenticate", r#"DPoP error="use_dpop_nonce""#)
+            .unwrap();
+        response
+            .insert_header("dpop-nonce", "contains a space")
+            .unwrap();
+
+        assert!(dpop_resource_nonce_challenge_present(&response));
+        assert!(dpop_resource_nonce_challenge(&response).is_none());
+    }
+
+    #[test]
+    fn final_dpop_authorization_must_match_the_minted_token() {
+        let mut request = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+        request
+            .insert_header("authorization", "DPoP minted-token")
+            .unwrap();
+        assert_eq!(
+            final_dpop_access_token(&request, "minted-token").unwrap(),
+            "minted-token"
+        );
+
+        // A post-credential Lua modifier can overwrite Authorization. The
+        // final proof seam must reject that request instead of hashing the
+        // stale minted token into `ath`.
+        request
+            .insert_header("authorization", "DPoP lua-token")
+            .unwrap();
+        assert!(final_dpop_access_token(&request, "minted-token").is_err());
+
+        request
+            .insert_header("authorization", "Bearer minted-token")
+            .unwrap();
+        assert!(final_dpop_access_token(&request, "minted-token").is_err());
+    }
+
+    #[test]
+    fn malformed_outbound_credential_header_fails_closed() {
+        let mut request = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+        request
+            .insert_header("authorization", "Bearer inbound-token")
+            .unwrap();
+
+        assert!(insert_outbound_credential_header(
+            &mut request,
+            "authorization".to_string(),
+            "DPoP invalid\r\nvalue",
+        )
+        .is_err());
+        assert_eq!(
+            request.headers.get("authorization").unwrap(),
+            "Bearer inbound-token"
+        );
+    }
+
+    #[test]
+    fn origin_dpop_rejects_a_bound_credential_override() {
+        let error = ensure_dpop_credential_source(Some("bound-credential"), true)
+            .expect_err("bound credentials cannot silently bypass origin DPoP");
+        assert!(error
+            .to_string()
+            .contains("bound credential cannot satisfy origin DPoP"));
+
+        ensure_dpop_credential_source(None, true).unwrap();
+        ensure_dpop_credential_source(Some("bound-credential"), false).unwrap();
+    }
+
     fn target_selection(
         target_index: usize,
         selection_method: &str,
@@ -5562,9 +6086,10 @@ mod tests {
     }
 
     #[test]
-    fn parsed_upstream_url_extracts_host_and_path() {
+    fn parsed_upstream_url_extracts_host_scheme_and_path() {
         let info = parsed_upstream_url("https://api.example.com:8443/v1/base");
         assert_eq!(info.host.as_deref(), Some("api.example.com"));
+        assert_eq!(info.scheme.as_deref(), Some("https"));
         assert_eq!(info.path, "/v1/base");
     }
 

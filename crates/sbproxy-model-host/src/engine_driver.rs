@@ -105,7 +105,7 @@ pub struct EngineTuning {
     /// vLLM auto tool-choice parser: `--enable-auto-tool-choice
     /// --tool-call-parser <name>`.
     pub tool_call_parser: Option<String>,
-    /// CPU KV-cache tier in GiB: `--swap-space`.
+    /// CPU swap pool in GiB: `--swap-space`.
     pub swap_space_gib: Option<u64>,
     /// Weights kept in CPU RAM in GiB: `--cpu-offload-gb`.
     pub cpu_offload_gib: Option<u64>,

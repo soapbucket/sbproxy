@@ -664,9 +664,8 @@ pub fn record_lb_decision(strategy: &str, provider: &str) {
 
 /// Record a streaming time-to-first-token observation, in seconds.
 ///
-/// Call sites: the streaming relay's first-token hook, after the
-/// per-request `StreamTracker::record_first_token` has captured the
-/// instant. Convert with `tracker.ttft_ms().map(|ms| ms / 1000.0)`.
+/// The streaming relay calls this from its first-token hook using the
+/// elapsed time captured directly for that request.
 pub fn record_ttft(provider: &str, model: &str, ttft_seconds: f64) {
     AI_TTFT
         .with_label_values(&[provider, model])
@@ -867,14 +866,13 @@ pub fn record_token_estimate_error(model: &str, estimated: u64, actual: u64) {
 // detectors that the gateway can flag deterministically without
 // any guess about what the caller intended:
 //
-// * `duplicate_request`: response_dedup.rs already detects an
-//   exact-context resend; tag the spend wasted.
+// * `duplicate_request`: an exact-context resend reported by the serving
+//   path; tag the spend wasted.
 // * `abandoned_stream`: the client cancelled or the upstream
 //   stream closed with zero output tokens after the prompt was
 //   already sent.
-// * `validation_failed`: a guardrail or structured-output
-//   validator rejected AFTER the upstream call completed; the
-//   spend already happened.
+// * `validation_failed`: a guardrail rejected AFTER the upstream call
+//   completed; the spend already happened.
 // * `context_bloat`: input tokens significantly above the
 //   route's rolling median (the gateway emits the counter; the
 //   classifier-cum-roller lives outside this module and reports
@@ -946,9 +944,8 @@ fn label_or_empty(value: Option<&str>) -> &str {
 /// auditable instead of letting a typo create a new time series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WasteKind {
-    /// The request's full context matched a recent prior request
-    /// per `response_dedup.rs`; the gateway served the cached
-    /// reply but the upstream call still happened (or would have).
+    /// The request's full context matched a recent prior request; the
+    /// upstream call still happened (or would have).
     DuplicateRequest,
     /// The client cancelled or the upstream stream closed with
     /// zero output tokens after the prompt was sent.

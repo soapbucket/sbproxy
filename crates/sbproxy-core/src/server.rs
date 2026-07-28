@@ -2884,6 +2884,9 @@ async fn check_auth_with_tls_outcome(
 /// request-scoped deadline below. The outer client-level timeout
 /// (default 30s) reads from
 /// `proxy.http_client_timeouts.forward_auth_client_secs` on first use.
+/// Redirects are disabled because this client also acquires bound outbound
+/// credentials: replaying an authorization subrequest or DPoP proof at a
+/// redirected method or URI would invalidate its security binding.
 static FORWARD_AUTH_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
 
 fn forward_auth_client() -> &'static reqwest::Client {
@@ -2895,6 +2898,7 @@ fn forward_auth_client() -> &'static reqwest::Client {
             .forward_auth_client_secs;
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(secs))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("forward-auth reqwest::Client build must succeed")
     })

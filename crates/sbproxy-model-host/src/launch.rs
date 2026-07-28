@@ -43,7 +43,7 @@ pub fn build_launch_spec(
     extra_args: &[String],
 ) -> LaunchSpec {
     let mut args: Vec<String> = Vec::new();
-    let mut env: Vec<(String, String)> = Vec::new();
+    let env: Vec<(String, String)> = Vec::new();
 
     match engine {
         EngineKind::Vllm => {
@@ -65,8 +65,6 @@ pub fn build_launch_spec(
             }
             args.push("--max-model-len".to_string());
             args.push(plan.seq_len.to_string());
-            // Enable the dev endpoints the sleep/wake phase drives.
-            env.push(("VLLM_SERVER_DEV_MODE".to_string(), "1".to_string()));
         }
         EngineKind::SGLang => {
             // SGLang mirrors vLLM here: an OpenAI-compatible server. The
@@ -335,9 +333,9 @@ pub fn serving_flags(engine: EngineKind, entry: &crate::config::ServeEntry) -> V
     if entry.enable_prefix_caching == Some(true) {
         args.push("--enable-prefix-caching".to_string());
     }
-    // WOR-1687: KV-cache tiering to CPU. `--swap-space` sizes the CPU
-    // pool vLLM spills GPU KV blocks into under pressure; `--cpu-offload-gb`
-    // keeps that many GiB of weights in CPU RAM.
+    // Engine-native CPU memory controls. `--swap-space` sizes the CPU pool
+    // vLLM uses for request KV blocks; `--cpu-offload-gb` keeps that many
+    // GiB of weights in CPU RAM.
     if let Some(gib) = entry.swap_space_gib {
         args.push("--swap-space".to_string());
         args.push(gib.to_string());
@@ -690,11 +688,7 @@ mod tests {
             .position(|a| a == "--quantization")
             .unwrap();
         assert_eq!(spec.args[qi + 1], "fp8");
-        // dev mode env for the sleep/wake phase
-        assert!(spec
-            .env
-            .iter()
-            .any(|(k, v)| k == "VLLM_SERVER_DEV_MODE" && v == "1"));
+        assert!(spec.env.is_empty());
         assert_eq!(spec.vram_bytes, 12 * crate::fit::GIB);
     }
 
@@ -717,10 +711,10 @@ mod tests {
         // The original vLLM argv follows verbatim.
         assert_eq!(wrapped.args[5], "serve");
         assert_eq!(wrapped.args[6], "Qwen/Qwen3-14B");
-        // engine, env, and VRAM estimate carry over.
+        // Engine, environment, and VRAM estimate carry over.
         assert_eq!(wrapped.engine, EngineKind::Vllm);
         assert_eq!(wrapped.vram_bytes, spec.vram_bytes);
-        assert!(wrapped.env.iter().any(|(k, _)| k == "VLLM_SERVER_DEV_MODE"));
+        assert_eq!(wrapped.env, spec.env);
     }
 
     #[test]
@@ -1094,8 +1088,8 @@ mod tests {
     }
 
     #[test]
-    fn serving_flags_kv_tiering() {
-        // WOR-1687: swap_space / cpu_offload emit the CPU-tier flags.
+    fn serving_flags_emit_engine_native_cpu_memory_controls() {
+        // The retained settings map directly to vLLM's CPU memory flags.
         let mut e = entry_with(None, None, vec![]);
         e.swap_space_gib = Some(16);
         e.cpu_offload_gib = Some(8);

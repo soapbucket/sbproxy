@@ -51,7 +51,6 @@ pub mod foreign_cache;
 pub mod generation_store;
 pub mod hybrid;
 pub mod jobs;
-pub mod kv_tiering;
 pub mod launch;
 pub mod llama_driver;
 pub mod llama_release;
@@ -74,7 +73,6 @@ pub mod runtime;
 pub mod runtime_manager;
 pub mod scheduling;
 pub mod sglang_driver;
-pub mod sleep_wake;
 pub mod supervisor;
 pub mod supply_chain;
 #[cfg(feature = "tokenizer")]
@@ -165,7 +163,6 @@ pub use hybrid::{savings_micros, CloudPrice, CompressionValue, LaneSplit, TokenC
 pub use jobs::{
     FileJobStore, JobError, OperationJob, OperationKind, OperationProgress, OperationState,
 };
-pub use kv_tiering::{KvTier, KvTieringPolicy, TierDecision};
 pub use launch::{build_launch_spec, serving_flags, should_speculate, ProcessEngineLauncher};
 pub use llama_driver::{
     LlamaBinarySource, LlamaCppDriver, LlamaDetection, LlamaProvisioned, SystemLlamaBinarySource,
@@ -222,7 +219,6 @@ pub use scheduling::{admit, next_to_admit, PriorityClass, SchedulingDecision};
 pub use sglang_driver::{
     build_sglang_container_plan, SGLangContainerPlan, SGLangDriver, DEFAULT_SGLANG_VERSION,
 };
-pub use sleep_wake::{is_sleeping, sleep, wake_up, SleepLevel};
 pub use supervisor::{
     BackoffPolicy, CrashLoopState, EngineLauncher, EngineState, EngineSupervisor, LaunchSpec,
     SupervisorClock, SupervisorError, TokioSupervisorClock,

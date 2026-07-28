@@ -121,7 +121,7 @@ pub struct ModelDeployment {
     /// calling off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_parser: Option<String>,
-    /// CPU KV-cache tier size in GiB (vLLM `--swap-space`). `None` uses the
+    /// CPU swap pool size in GiB (vLLM `--swap-space`). `None` uses the
     /// engine default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swap_space_gib: Option<u64>,

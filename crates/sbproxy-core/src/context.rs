@@ -242,6 +242,12 @@ pub struct RequestContext {
     /// the final upstream response so operators can see why the proxy
     /// did not replay a matching failure status.
     pub status_retry_skip_reason: Option<&'static str>,
+    /// Whether the current upstream attempt carried an outbound DPoP proof.
+    pub outbound_dpop_active: bool,
+    /// One-shot guard for the RFC 9449 protected-resource nonce retry.
+    pub dpop_nonce_retry_used: bool,
+    /// Canonical final resource target used by the active DPoP attempt.
+    pub outbound_dpop_htu: Option<String>,
 
     // --- Bounded admin gateway status ---
     /// Strongest response-cache or semantic-cache outcome observed.
@@ -1216,6 +1222,9 @@ impl RequestContext {
             retry_count: 0,
             retry_backoff_ms: None,
             status_retry_skip_reason: None,
+            outbound_dpop_active: false,
+            dpop_nonce_retry_used: false,
+            outbound_dpop_htu: None,
             admin_cache_status: AdminCacheStatus::Disabled,
             admin_ai_attempts: 0,
             admin_failover_from: None,

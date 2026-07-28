@@ -152,7 +152,7 @@ pub struct ManagedDeploymentConfig {
     /// `llama3_json`, `mistral`. Omit to leave tool calling off.
     #[serde(default)]
     pub tool_call_parser: Option<String>,
-    /// CPU KV-cache tier size in GiB (vLLM `--swap-space`). Omit to use the
+    /// CPU swap pool size in GiB (vLLM `--swap-space`). Omit to use the
     /// engine default.
     #[serde(default)]
     pub swap_space_gib: Option<u64>,
