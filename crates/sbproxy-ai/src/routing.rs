@@ -129,7 +129,7 @@ pub const DEFAULT_PEAK_EWMA_HALF_LIFE_SECS: u64 = 10;
 /// Configuration for [`RoutingStrategy::PeakEwma`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeakEwmaConfig {
-    /// Seconds for an excess latency penalty to decay halfway toward neutral.
+    /// Seconds of decay before an idle provider re-enters at neutral cost.
     pub half_life_secs: u64,
 }
 
@@ -314,6 +314,21 @@ pub struct Router {
     quota: ProviderRateLimitTracker,
     /// Last explicit round-robin fallback under policy-filtered selection.
     last_filtered_fallback: parking_lot::Mutex<Option<FilteredSelectionFallback>>,
+}
+
+/// Cancellation-safe accounting for one provider attempt.
+#[must_use = "dropping the guard releases the provider's in-flight slot"]
+pub struct ProviderInFlightGuard<'a> {
+    router: &'a Router,
+    provider_idx: Option<usize>,
+}
+
+impl Drop for ProviderInFlightGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(provider_idx) = self.provider_idx {
+            self.router.record_disconnect(provider_idx);
+        }
+    }
 }
 
 impl std::fmt::Debug for Router {
@@ -503,10 +518,27 @@ impl Router {
         }
     }
 
+    /// Track one provider attempt until the returned guard is dropped.
+    ///
+    /// The guard balances success, failure, early-return, and future
+    /// cancellation paths. An unknown provider index produces an inert guard.
+    pub fn track_in_flight(&self, provider_idx: usize) -> ProviderInFlightGuard<'_> {
+        let provider_idx = self.connections.get(provider_idx).map(|slot| {
+            slot.fetch_add(1, Ordering::Relaxed);
+            provider_idx
+        });
+        ProviderInFlightGuard {
+            router: self,
+            provider_idx,
+        }
+    }
+
     /// Decrement the in-flight connection count for a provider.
     pub fn record_disconnect(&self, provider_idx: usize) {
         if let Some(slot) = self.connections.get(provider_idx) {
-            slot.fetch_sub(1, Ordering::Relaxed);
+            let _ = slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
         }
     }
 
@@ -1848,6 +1880,24 @@ mod tests {
             .map(|_| router.select(&providers).expect("provider"))
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(selections, std::collections::HashSet::from([0, 1]));
+    }
+
+    #[test]
+    fn in_flight_guard_balances_on_drop_and_ignores_unknown_provider() {
+        let router = Router::new(RoutingStrategy::LeastConnections, 2);
+        assert_eq!(router.connections[0].load(Ordering::Relaxed), 0);
+
+        {
+            let _guard = router.track_in_flight(0);
+            assert_eq!(router.connections[0].load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(router.connections[0].load(Ordering::Relaxed), 0);
+
+        {
+            let _guard = router.track_in_flight(99);
+        }
+        assert_eq!(router.connections[0].load(Ordering::Relaxed), 0);
+        assert_eq!(router.connections[1].load(Ordering::Relaxed), 0);
     }
 
     #[test]

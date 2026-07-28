@@ -274,11 +274,12 @@ routing:
 
 Power-of-two-choices over time-decayed latency and current in-flight load:
 sample two eligible providers and route to the lower effective cost. A latency
-spike takes effect immediately, then its excess over the pool's neutral
-latency decays by half during each configured half-life. In-flight requests
-multiply the cost, so a provider that has just started queueing is
-deprioritized before a slow response completes. Providers without observations
-use the same nonzero pool-neutral score.
+spike takes effect immediately and decays toward the pool's neutral latency.
+After one configured half-life without a completed attempt, the provider
+re-enters at neutral cost so it can prove recovery. In-flight requests multiply
+the cost, so a provider that has just started queueing is deprioritized before
+a slow response completes. Providers without observations use the same nonzero
+pool-neutral score.
 
 ```yaml
 routing:
@@ -286,7 +287,8 @@ routing:
   half_life: 10s
 ```
 
-The default half-life is `10s`. Shorter values react and recover faster;
+The default half-life is `10s`. Set `half_life` as integer seconds or a
+human-readable duration such as `10s`. Shorter values react and recover faster;
 longer values retain spike penalties longer. Provider eligibility and
 power-of-two candidate sampling are unchanged.
 

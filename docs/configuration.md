@@ -1225,7 +1225,7 @@ Peak EWMA accepts the object form:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `routing.strategy` | string | `round_robin` | Set to `peak_ewma` for power-of-two choices over decayed latency and in-flight cost. |
-| `routing.half_life` | duration | `10s` | Time for a provider's excess latency penalty to decay halfway toward the pool-neutral latency. |
+| `routing.half_life` | duration | `10s` | Maximum idle decay interval before a provider re-enters at pool-neutral cost. Accepts integer seconds or a human-readable duration such as `10s`. |
 
 `default_model` is a per-provider field, not an action-level field. Set it on each `providers[]` entry.
 

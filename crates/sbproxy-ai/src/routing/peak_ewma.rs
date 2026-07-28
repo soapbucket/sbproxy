@@ -36,6 +36,7 @@ struct EwmaState {
 pub(super) struct PeakEwmaEstimator {
     clock: Arc<dyn MonotonicClock>,
     half_life_nanos: f64,
+    reentry_after_nanos: u64,
     neutral: Mutex<EwmaState>,
     providers: Vec<Mutex<EwmaState>>,
 }
@@ -50,10 +51,12 @@ impl PeakEwmaEstimator {
         half_life: Duration,
         clock: Arc<dyn MonotonicClock>,
     ) -> Self {
-        let half_life_nanos = half_life.as_nanos().max(1) as f64;
+        let reentry_after_nanos = u64::try_from(half_life.as_nanos().max(1)).unwrap_or(u64::MAX);
+        let half_life_nanos = reentry_after_nanos as f64;
         Self {
             clock,
             half_life_nanos,
+            reentry_after_nanos,
             neutral: Mutex::new(EwmaState::default()),
             providers: (0..provider_count)
                 .map(|_| Mutex::new(EwmaState::default()))
@@ -91,11 +94,16 @@ impl PeakEwmaEstimator {
 
         let state = provider.lock();
         let latency_us = if state.observed {
-            let decay = decay_factor(
-                now.saturating_sub(state.updated_at_nanos),
-                self.half_life_nanos,
-            );
-            neutral_us + (state.estimate_us - neutral_us) * decay
+            let elapsed_nanos = now.saturating_sub(state.updated_at_nanos);
+            if elapsed_nanos >= self.reentry_after_nanos {
+                // Exponential decay preserves ordering forever. Expire a
+                // stale observation after one configured half-life so an
+                // idle endpoint is sampled again and can prove recovery.
+                neutral_us
+            } else {
+                let decay = decay_factor(elapsed_nanos, self.half_life_nanos);
+                neutral_us + (state.estimate_us - neutral_us) * decay
+            }
         } else {
             neutral_us
         };
@@ -120,6 +128,9 @@ fn update_estimate(
         return;
     }
 
+    // Another observation can advance the state while this caller waits for
+    // the mutex. Linearize at the newest timestamp so time never regresses.
+    let now = now.max(state.updated_at_nanos);
     let decay = decay_factor(now.saturating_sub(state.updated_at_nanos), half_life_nanos);
     let average = state.estimate_us * decay + sample_us * (1.0 - decay);
     state.estimate_us = if peak_sensitive {
@@ -179,15 +190,46 @@ mod tests {
     }
 
     #[test]
-    fn spike_penalty_recovers_toward_pool_baseline_after_one_half_life() {
+    fn spike_penalty_reenters_at_pool_neutral_after_one_half_life() {
         let (estimator, clock) = estimator(2);
         estimator.observe(0, 100);
         estimator.observe(1, 100);
         estimator.observe(0, 300);
 
         assert_close(estimator.score(0, 0).expect("provider exists"), 300.0);
+        clock.advance(Duration::from_secs(5));
+        assert!(
+            estimator.score(0, 0).expect("provider exists") > 100.0,
+            "the peak penalty remains active before one half-life"
+        );
+        clock.advance(Duration::from_secs(5));
+        assert_close(estimator.score(1, 0).expect("provider exists"), 100.0);
+        assert_close(estimator.score(0, 0).expect("provider exists"), 100.0);
+    }
+
+    #[test]
+    fn reordered_observation_never_moves_timestamp_backwards() {
+        let mut state = EwmaState {
+            observed: true,
+            estimate_us: 100.0,
+            updated_at_nanos: 20,
+        };
+
+        update_estimate(&mut state, 300.0, 10, 100.0, true);
+
+        assert_eq!(state.updated_at_nanos, 20);
+        assert_close(state.estimate_us, 300.0);
+    }
+
+    #[test]
+    fn stale_fast_observation_also_reenters_at_pool_neutral() {
+        let (estimator, clock) = estimator(2);
+        estimator.observe(0, 50);
+        estimator.observe(1, 100);
+
         clock.advance(Duration::from_secs(10));
-        assert_close(estimator.score(0, 0).expect("provider exists"), 200.0);
+        assert_close(estimator.score(0, 0).expect("provider exists"), 50.0);
+        assert_close(estimator.score(1, 0).expect("provider exists"), 50.0);
     }
 
     #[test]

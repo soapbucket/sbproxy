@@ -42,6 +42,59 @@ fn update_router_quota_from_response(
     router.update_quota_from_headers(provider_name, &headers, status);
 }
 
+/// Run one selected provider attempt with shared load-balancer observation.
+///
+/// The in-flight guard is cancellation-safe. Successful response-header
+/// completion records latency for every forwarding surface; transport errors
+/// release the slot but remain owned by the router's failure signals.
+async fn run_routed_provider_attempt<T, E>(
+    router: &sbproxy_ai::Router,
+    provider_idx: usize,
+    attempt: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let _in_flight = router.track_in_flight(provider_idx);
+    let started = std::time::Instant::now();
+    let result = attempt.await;
+    if result.is_ok() {
+        let elapsed_us = u64::try_from(started.elapsed().as_micros())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        router.record_latency(provider_idx, elapsed_us);
+    }
+    result
+}
+
+#[cfg(test)]
+mod routed_provider_observation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn routed_attempt_is_visible_as_in_flight_before_completion() {
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai", "api_key": "test"},
+                {"name": "anthropic", "api_key": "test"}
+            ],
+            "routing": {"strategy": "peak_ewma", "half_life": "10s"}
+        }))
+        .expect("valid AI config");
+        let router = config.router();
+        router.record_latency(0, 1_000);
+        router.record_latency(1, 1_000);
+
+        run_routed_provider_attempt(&router, 0, async {
+            assert_eq!(
+                router.select(&config.providers),
+                Some(1),
+                "the active attempt must raise provider 0's effective cost"
+            );
+            Ok::<(), ()>(())
+        })
+        .await
+        .expect("attempt succeeds");
+    }
+}
+
 fn effective_policy_to_virtual_key(
     policy: &sbproxy_ai::effective_key_policy::EffectiveKeyPolicy,
 ) -> sbproxy_ai::identity::VirtualKeyConfig {
@@ -1615,20 +1668,20 @@ pub(super) async fn handle_ai_proxy(
         }
 
         ctx.record_admin_ai_attempt(&provider.name);
-        let resp = AI_CLIENT
-            .load()
-            .forward_get_request(provider, &path)
-            .await
-            .map_err(|e| {
-                record_ai_transport_failure(
-                    &ai_span,
-                    Some(provider.name.as_str()),
-                    &e,
-                    "AI upstream GET request failed",
-                );
-                warn!(error = %e, "AI proxy: upstream GET request failed");
-                Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
-            })?;
+        let resp = run_routed_provider_attempt(&router, provider_idx, async {
+            AI_CLIENT.load().forward_get_request(provider, &path).await
+        })
+        .await
+        .map_err(|e| {
+            record_ai_transport_failure(
+                &ai_span,
+                Some(provider.name.as_str()),
+                &e,
+                "AI upstream GET request failed",
+            );
+            warn!(error = %e, "AI proxy: upstream GET request failed");
+            Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
+        })?;
         record_ai_provider_response_failure(
             &ai_span,
             provider.name.as_str(),
@@ -1754,25 +1807,28 @@ pub(super) async fn handle_ai_proxy(
             };
 
         ctx.record_admin_ai_attempt(&provider.name);
-        let resp = AI_CLIENT
-            .load()
-            .forward_with_method(provider, &method_str, &path, body_opt.as_ref())
-            .await
-            .map_err(|e| {
-                record_ai_transport_failure(
-                    &ai_span,
-                    Some(provider.name.as_str()),
-                    &e,
-                    "AI upstream method-aware request failed",
-                );
-                warn!(
-                    error = %e,
-                    method = %method_str,
-                    ai.surface = surface.label(),
-                    "AI proxy: upstream method-aware request failed"
-                );
-                Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
-            })?;
+        let resp = run_routed_provider_attempt(&router, provider_idx, async {
+            AI_CLIENT
+                .load()
+                .forward_with_method(provider, &method_str, &path, body_opt.as_ref())
+                .await
+        })
+        .await
+        .map_err(|e| {
+            record_ai_transport_failure(
+                &ai_span,
+                Some(provider.name.as_str()),
+                &e,
+                "AI upstream method-aware request failed",
+            );
+            warn!(
+                error = %e,
+                method = %method_str,
+                ai.surface = surface.label(),
+                "AI proxy: upstream method-aware request failed"
+            );
+            Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
+        })?;
         record_ai_provider_response_failure(
             &ai_span,
             provider.name.as_str(),
@@ -2051,78 +2107,84 @@ pub(super) async fn handle_ai_proxy(
             ctx.record_admin_ai_attempt(&provider.name);
             let distributed_managed =
                 crate::server::model_host::distributed_managed_provider(provider);
-            let response_result: anyhow::Result<reqwest::Response> = if distributed_managed {
-                let origin = ctx
-                    .origin_idx
-                    .and_then(|index| ctx.pipeline.config.origins.get(index))
-                    .map(|origin| origin.origin_id.to_string())
-                    .unwrap_or_else(|| ctx.hostname.to_string());
-                let preferred_region = ctx
-                    .principal
-                    .attrs
-                    .metadata
-                    .get("region")
-                    .cloned()
-                    .or_else(|| ctx.request_geo.clone());
-                let prefix_key = format!(
-                    "{}:{}",
-                    ctx.tenant_id,
-                    requested_model.as_deref().unwrap_or_default()
-                );
-                match crate::server::model_host::distributed_managed_upstream(
-                    crate::server::model_host::ManagedDistributedRequest {
-                        origin: &origin,
-                        provider,
-                        requested_model: requested_model.as_deref(),
-                        request_id: ctx.request_id.as_str(),
-                        tenant_id: ctx.tenant_id.as_str(),
-                        governed_key_id: ctx.principal.api_key_id(),
-                        policy_revision: &peer_policy_revision,
-                        path: &path,
-                        body: forwarded_body.clone(),
-                        content_type: Some(&request_content_type),
-                        priority: crate::server::model_host::lane_class_for(ctx.ai_lane_priority),
-                        prefix_key: prefix_key.as_bytes(),
-                        preferred_region: preferred_region.as_deref(),
-                        requested_adapter: None,
-                        max_body_bytes: maximum,
-                    },
-                )
-                .await
-                {
-                    Ok(Some(upstream)) => {
-                        ctx.ai_logical_model = Some(upstream.public_model.clone());
-                        ctx.ai_serve_model = Some(upstream.public_model);
-                        ctx.managed_model_permit = upstream.local_permit;
-                        ctx.managed_route_class = upstream.route_class;
-                        ctx.managed_route_trace = Some(upstream.trace);
-                        Ok(upstream.response)
-                    }
-                    Ok(None) => Err(anyhow::anyhow!(
-                        "distributed managed provider did not produce an attempt"
-                    )),
-                    Err(error) => {
-                        if let Some(trace) = error.trace() {
-                            ctx.managed_route_trace = Some(trace.clone());
+            let response_result: anyhow::Result<reqwest::Response> =
+                run_routed_provider_attempt(&router, provider_idx, async {
+                    if distributed_managed {
+                        let origin = ctx
+                            .origin_idx
+                            .and_then(|index| ctx.pipeline.config.origins.get(index))
+                            .map(|origin| origin.origin_id.to_string())
+                            .unwrap_or_else(|| ctx.hostname.to_string());
+                        let preferred_region = ctx
+                            .principal
+                            .attrs
+                            .metadata
+                            .get("region")
+                            .cloned()
+                            .or_else(|| ctx.request_geo.clone());
+                        let prefix_key = format!(
+                            "{}:{}",
+                            ctx.tenant_id,
+                            requested_model.as_deref().unwrap_or_default()
+                        );
+                        match crate::server::model_host::distributed_managed_upstream(
+                            crate::server::model_host::ManagedDistributedRequest {
+                                origin: &origin,
+                                provider,
+                                requested_model: requested_model.as_deref(),
+                                request_id: ctx.request_id.as_str(),
+                                tenant_id: ctx.tenant_id.as_str(),
+                                governed_key_id: ctx.principal.api_key_id(),
+                                policy_revision: &peer_policy_revision,
+                                path: &path,
+                                body: forwarded_body.clone(),
+                                content_type: Some(&request_content_type),
+                                priority: crate::server::model_host::lane_class_for(
+                                    ctx.ai_lane_priority,
+                                ),
+                                prefix_key: prefix_key.as_bytes(),
+                                preferred_region: preferred_region.as_deref(),
+                                requested_adapter: None,
+                                max_body_bytes: maximum,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(Some(upstream)) => {
+                                ctx.ai_logical_model = Some(upstream.public_model.clone());
+                                ctx.ai_serve_model = Some(upstream.public_model);
+                                ctx.managed_model_permit = upstream.local_permit;
+                                ctx.managed_route_class = upstream.route_class;
+                                ctx.managed_route_trace = Some(upstream.trace);
+                                Ok(upstream.response)
+                            }
+                            Ok(None) => Err(anyhow::anyhow!(
+                                "distributed managed provider did not produce an attempt"
+                            )),
+                            Err(error) => {
+                                if let Some(trace) = error.trace() {
+                                    ctx.managed_route_trace = Some(trace.clone());
+                                }
+                                if let Some(reason) = error.public_reason() {
+                                    ctx.managed_fallback_reason = Some(reason);
+                                }
+                                Err(anyhow::Error::new(error))
+                            }
                         }
-                        if let Some(reason) = error.public_reason() {
-                            ctx.managed_fallback_reason = Some(reason);
-                        }
-                        Err(anyhow::Error::new(error))
+                    } else {
+                        AI_CLIENT
+                            .load()
+                            .forward_bytes(
+                                provider,
+                                &method_str,
+                                &path,
+                                forwarded_body.clone(),
+                                &request_content_type,
+                            )
+                            .await
                     }
-                }
-            } else {
-                AI_CLIENT
-                    .load()
-                    .forward_bytes(
-                        provider,
-                        &method_str,
-                        &path,
-                        forwarded_body.clone(),
-                        &request_content_type,
-                    )
-                    .await
-            };
+                })
+                .await;
             match response_result {
                 Ok(response) => {
                     // WOR-1881: refresh quota snapshots before failover reselect.
@@ -4286,8 +4348,14 @@ pub(super) async fn handle_ai_proxy(
             }
             let path_ref = path.as_str();
             let cl = &client;
+            let attempt_router = std::sync::Arc::clone(&router);
             futs.push(async move {
-                let r = cl.forward_request(provider, path_ref, &attempt_body).await;
+                let r = run_routed_provider_attempt(
+                    &attempt_router,
+                    idx,
+                    cl.forward_request(provider, path_ref, &attempt_body),
+                )
+                .await;
                 (idx, r)
             });
         }
@@ -4301,7 +4369,6 @@ pub(super) async fn handle_ai_proxy(
             match res {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
-                    router.record_latency(idx, race_start.elapsed().as_micros() as u64);
                     // WOR-1881: race losers still contribute quota signals.
                     update_router_quota_from_response(&router, &config.providers[idx].name, &resp);
                     let outcome = if (200..300).contains(&status) {
@@ -4641,107 +4708,112 @@ pub(super) async fn handle_ai_proxy(
             provider = %provider.name,
             attempt = attempt,
         );
-        let result: anyhow::Result<reqwest::Response> = if distributed_managed {
-            let managed_body = serde_json::to_vec(&attempt_body)
-                .map(bytes::Bytes::from)
-                .map_err(anyhow::Error::from);
-            match managed_body {
-                Ok(managed_body) => {
-                    let origin = ctx
-                        .origin_idx
-                        .and_then(|index| ctx.pipeline.config.origins.get(index))
-                        .map(|origin| origin.origin_id.to_string())
-                        .unwrap_or_else(|| ctx.hostname.to_string());
-                    let prefix_key = extract_prefix_key(&attempt_body, 1024);
-                    let requested_adapter = attempt_body
-                        .get("adapter")
-                        .or_else(|| attempt_body.get("lora_adapter"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string);
-                    let preferred_region = ctx
-                        .principal
-                        .attrs
-                        .metadata
-                        .get("region")
-                        .cloned()
-                        .or_else(|| ctx.request_geo.clone());
-                    let maximum = config
-                        .max_body_size
-                        .filter(|maximum| *maximum > 0)
-                        .unwrap_or(64 * 1024 * 1024)
-                        .min(1024 * 1024 * 1024);
-                    let managed = crate::server::model_host::distributed_managed_upstream(
-                        crate::server::model_host::ManagedDistributedRequest {
-                            origin: &origin,
-                            provider,
-                            requested_model: (!model.is_empty()).then_some(model.as_str()),
-                            request_id: ctx.request_id.as_str(),
-                            tenant_id: ctx.tenant_id.as_str(),
-                            governed_key_id: ctx.principal.api_key_id(),
-                            policy_revision: &peer_policy_revision,
-                            path: &path,
-                            body: managed_body,
-                            content_type: Some("application/json"),
-                            priority: crate::server::model_host::lane_class_for(
-                                ctx.ai_lane_priority,
-                            ),
-                            prefix_key: &prefix_key,
-                            preferred_region: preferred_region.as_deref(),
-                            requested_adapter: requested_adapter.as_deref(),
-                            max_body_bytes: maximum,
-                        },
-                    )
-                    .instrument(attempt_span)
-                    .await;
-                    match managed {
-                        Ok(Some(upstream)) => {
-                            local_public_model = Some(upstream.public_model);
-                            ctx.managed_model_permit = upstream.local_permit;
-                            ctx.managed_route_class = upstream.route_class;
-                            ctx.managed_route_trace = Some(upstream.trace);
-                            Ok(upstream.response)
+        let result: anyhow::Result<reqwest::Response> =
+            run_routed_provider_attempt(&router, provider_idx, async {
+                if distributed_managed {
+                    let managed_body = serde_json::to_vec(&attempt_body)
+                        .map(bytes::Bytes::from)
+                        .map_err(anyhow::Error::from);
+                    match managed_body {
+                        Ok(managed_body) => {
+                            let origin = ctx
+                                .origin_idx
+                                .and_then(|index| ctx.pipeline.config.origins.get(index))
+                                .map(|origin| origin.origin_id.to_string())
+                                .unwrap_or_else(|| ctx.hostname.to_string());
+                            let prefix_key = extract_prefix_key(&attempt_body, 1024);
+                            let requested_adapter = attempt_body
+                                .get("adapter")
+                                .or_else(|| attempt_body.get("lora_adapter"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string);
+                            let preferred_region = ctx
+                                .principal
+                                .attrs
+                                .metadata
+                                .get("region")
+                                .cloned()
+                                .or_else(|| ctx.request_geo.clone());
+                            let maximum = config
+                                .max_body_size
+                                .filter(|maximum| *maximum > 0)
+                                .unwrap_or(64 * 1024 * 1024)
+                                .min(1024 * 1024 * 1024);
+                            let managed = crate::server::model_host::distributed_managed_upstream(
+                                crate::server::model_host::ManagedDistributedRequest {
+                                    origin: &origin,
+                                    provider,
+                                    requested_model: (!model.is_empty()).then_some(model.as_str()),
+                                    request_id: ctx.request_id.as_str(),
+                                    tenant_id: ctx.tenant_id.as_str(),
+                                    governed_key_id: ctx.principal.api_key_id(),
+                                    policy_revision: &peer_policy_revision,
+                                    path: &path,
+                                    body: managed_body,
+                                    content_type: Some("application/json"),
+                                    priority: crate::server::model_host::lane_class_for(
+                                        ctx.ai_lane_priority,
+                                    ),
+                                    prefix_key: &prefix_key,
+                                    preferred_region: preferred_region.as_deref(),
+                                    requested_adapter: requested_adapter.as_deref(),
+                                    max_body_bytes: maximum,
+                                },
+                            )
+                            .instrument(attempt_span)
+                            .await;
+                            match managed {
+                                Ok(Some(upstream)) => {
+                                    local_public_model = Some(upstream.public_model);
+                                    ctx.managed_model_permit = upstream.local_permit;
+                                    ctx.managed_route_class = upstream.route_class;
+                                    ctx.managed_route_trace = Some(upstream.trace);
+                                    Ok(upstream.response)
+                                }
+                                Ok(None) => Err(anyhow::anyhow!(
+                                    "distributed managed provider did not produce an attempt"
+                                )),
+                                Err(error) => {
+                                    if let Some(trace) = error.trace() {
+                                        ctx.managed_route_trace = Some(trace.clone());
+                                    }
+                                    if let Some(reason) = error.public_reason() {
+                                        ctx.managed_fallback_reason = Some(reason);
+                                    }
+                                    Err(anyhow::Error::new(error))
+                                }
+                            }
                         }
-                        Ok(None) => Err(anyhow::anyhow!(
-                            "distributed managed provider did not produce an attempt"
-                        )),
-                        Err(error) => {
-                            if let Some(trace) = error.trace() {
-                                ctx.managed_route_trace = Some(trace.clone());
-                            }
-                            if let Some(reason) = error.public_reason() {
-                                ctx.managed_fallback_reason = Some(reason);
-                            }
-                            Err(anyhow::Error::new(error))
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    async {
+                        if let Some((bypass_body, native_path)) = upstream_call {
+                            AI_CLIENT
+                                .load()
+                                .forward_native_bypass(
+                                    provider,
+                                    &method_str,
+                                    native_path,
+                                    bypass_body,
+                                )
+                                .await
+                        } else {
+                            AI_CLIENT
+                                .load()
+                                .forward_request(provider, &path, &attempt_body)
+                                .await
                         }
                     }
+                    .instrument(attempt_span)
+                    .await
                 }
-                Err(error) => Err(error),
-            }
-        } else {
-            async {
-                if let Some((bypass_body, native_path)) = upstream_call {
-                    AI_CLIENT
-                        .load()
-                        .forward_native_bypass(provider, &method_str, native_path, bypass_body)
-                        .await
-                } else {
-                    AI_CLIENT
-                        .load()
-                        .forward_request(provider, &path, &attempt_body)
-                        .await
-                }
-            }
-            .instrument(attempt_span)
-            .await
-        };
+            })
+            .await;
         ctx.ai_serve_model = local_public_model.clone();
 
         match result {
             Ok(resp) => {
-                // WOR-798: feed the latency-aware LB. Record the upstream
-                // round-trip latency for this provider so `peak_ewma` /
-                // `lowest_latency` reflect live data on the next request.
-                router.record_latency(provider_idx, attempt_start.elapsed().as_micros() as u64);
                 let status = resp.status().as_u16();
                 // WOR-1881: update quota snapshots before retry/reselect so
                 // headroom and reset-aware strategies see this response's
