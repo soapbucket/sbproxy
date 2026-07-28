@@ -1,6 +1,6 @@
 # Self-hosting SBproxy
 
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-27*
 
 One binary to self-host your AI gateway, and the same binary runs the
 models. OpenRouter proved that teams want unified routing, fallbacks,
@@ -273,19 +273,19 @@ stores a fleet needs are in
 
 What OpenRouter offers, the SBproxy equivalent, and what the enterprise
 tier adds on top. Honest about the gap: OpenRouter brokers a
-400-plus-model hosted marketplace; we route to 66 hosted providers plus
+400-plus-model hosted marketplace; we route to 72 hosted providers plus
 your own GPUs.
 
 | OpenRouter | SBproxy | Enterprise adds |
 |---|---|---|
-| Unified API across providers | One OpenAI/Anthropic-shaped API across 66 providers plus local engines | Same |
+| Unified API across providers | One OpenAI/Anthropic-shaped API across 72 providers plus local engines | Same |
 | Model catalog | Model manifest (source, pinning, digests, pull policy) | Curated allowlist, signed |
 | Fallback + provider routing preferences | Fallback chain, cost/latency routing, prefix-affinity, least-token-usage | GPU-aware and prefix-cache-aware routing across a node fleet |
 | Virtual keys | Virtual keys with per-key scopes | Tenants, RBAC |
 | Spend limits and accounting | Budgets, hierarchical quotas, usage ledger, dollars-saved report at `/admin/model-host/value` | Audit trail, per-tenant accounting |
 | Zero-data-retention routing | `no_prompt_training` provider flag + `x-sbproxy-disallow-prompt-training` request header | Air-gapped: guardrails, redaction, and generation all local |
 | Bring your own key | Provider keys plus a credential resolver (env, secret stores, vault) | Managed key rotation, mesh-distributed key cache |
-| 400-plus hosted-model marketplace | 66 hosted providers plus models on your GPUs | Same providers, fleet placement |
+| 400-plus hosted-model marketplace | 72 hosted providers plus models on your GPUs | Same providers, fleet placement |
 
 ## Runnable examples
 

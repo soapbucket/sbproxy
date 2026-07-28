@@ -8,7 +8,7 @@
 
 <h3 align="center">The self-hosted AI gateway.</h3>
 
-<p align="center">SBproxy is a self-hosted AI gateway. It governs your AI traffic in both directions: which apps and agents can call which models, on whose keys, at what spend. Route the AI you call: 200+ models across 66 providers plus open-weight models on your own GPUs, picked by prompt difficulty and rerouted on live cost-per-success. Gate the AI that calls you: verified agents, metered crawlers, and your APIs served over MCP. <a href="https://sbproxy.dev">sbproxy.dev</a></p>
+<p align="center">SBproxy is a self-hosted AI gateway. It governs your AI traffic in both directions: which apps and agents can call which models, on whose keys, at what spend. Route the AI you call: 200+ models across 72 providers plus open-weight models on your own GPUs, picked by prompt difficulty and rerouted on live cost-per-success. Gate the AI that calls you: verified agents, metered crawlers, and your APIs served over MCP. <a href="https://sbproxy.dev">sbproxy.dev</a></p>
 
 <p align="center">
   <a href="https://sbproxy.dev"><img src="https://sbproxy.dev/sbproxy-flow.gif" alt="SBproxy routing live traffic in both directions: apps, pipelines, crawlers, and MCP clients through one gateway to your GPUs, hosted providers, and your own APIs" width="820"></a>
@@ -37,7 +37,7 @@
 
 Cloudflare's AI Gateway and Vercel's got a lot right: one endpoint in front of every model, caching, budgets, failover. SBproxy hands you the whole thing to run yourself, in your VPC or air-gapped, on your own keys at your providers' prices. It also does the two things a hosted edge can't: serve the weights on your own GPUs, and gate the AI traffic coming *into* your APIs. One Rust binary, Apache 2.0.
 
-**Call any model.** 200+ models across 66 providers behind one endpoint that speaks the OpenAI and Anthropic wire formats. Sixteen routing strategies, predictive budgets, per-error retries, and a semantic cache that can run its embeddings on-box. Coming from LiteLLM? `sbproxy config import-litellm` [converts your config](docs/migration-litellm.md).
+**Call any model.** 200+ models across 72 providers behind one endpoint that speaks the OpenAI and Anthropic wire formats. Sixteen routing strategies, predictive budgets, per-error retries, and a semantic cache that can run its embeddings on-box. Coming from LiteLLM? `sbproxy config import-litellm` [converts your config](docs/migration-litellm.md).
 
 **Serve your own.** The same binary runs the models: a `serve:` block resolves the weights, fits an engine and quantization to your card, and supervises vLLM or llama.cpp to a governed endpoint. Local models get the same keys, budgets, and failover as hosted ones, so open-weight vs hosted is a one-line swap.
 

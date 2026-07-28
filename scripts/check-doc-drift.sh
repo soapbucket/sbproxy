@@ -5,7 +5,7 @@
 # Guard against regression of provider-count, routing-strategy, and
 # unimplemented-feature claims in user-facing docs. Code reality:
 #
-#   - crates/sbproxy-ai/data/ai_providers.yml has 66 entries.
+#   - crates/sbproxy-ai/data/ai_providers.yml has 72 entries.
 #   - crates/sbproxy-ai/src/routing.rs defines 15 routing strategies
 #     (RoundRobin, Weighted, FallbackChain, Random, LowestLatency,
 #     LeastConnections, CostOptimized, TokenRate, LeastTokenUsage,

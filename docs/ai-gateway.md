@@ -1,12 +1,12 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-07-26*
+*Last modified: 2026-07-27*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
 Three providers behind one wire format ([config](../examples/ai-gateway-quickstart/)).
 
-SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 66 native providers behind one OpenAI-compatible API, including native Anthropic, Gemini, and Bedrock translators. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
+SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 72 native providers behind one OpenAI-compatible API, including native Anthropic, Gemini, and Bedrock translators. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
 
 This guide owns the end-to-end picture: provider setup, wire compatibility, routing, streaming, budgets, caching, and per-request attribution. Seven features get a summary here and a full page of their own: the [guardrail mesh](ai-guardrail-mesh.md), [outcome-aware routing](ai-outcome-aware-routing.md), the [AI policy plane](ai-policy-cel.md), [predictive budgets with soft-landing](ai-predictive-budget.md), the [verifiable usage ledger](ai-usage-ledger.md), [LLM-aware resilience](ai-llm-aware-resilience.md), and [AI context compression](ai-context-compression.md). For those seven, the linked page is canonical; it carries the semantics, tuning advice, and reference tables.
 
@@ -35,7 +35,7 @@ origins:
 API keys support environment variable interpolation with `${VAR_NAME}` syntax. Never put raw keys in config files. `default_model` is a per-provider field, not an `action`-level one; an action-level `default_model` key is ignored. Context compression also requires the request's effective `model` to be non-empty, so hosted requests that omit it do not run the compression pipeline.
 
 ### Native providers
-66 native providers ship in-tree alongside native translators for Anthropic, Gemini, and Bedrock. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`.
+72 native providers ship in-tree alongside native translators for Anthropic, Gemini, and Bedrock. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`.
 
 Any model a listed provider serves works without extra config. For a self-hosted or proprietary endpoint, point `vllm` or any provider at it with a custom `base_url`. `openrouter` is available as one of the providers when you want many vendors behind a single key. See `providers.md` for the full per-provider table.
 

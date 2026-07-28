@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-26*
+*Last modified: 2026-07-27*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -1179,7 +1179,7 @@ origins:
 
 ### ai_proxy
 
-Route requests across LLM providers with automatic failover, cost tracking, and content-based routing. Supports 66 native providers behind one OpenAI-compatible API; the model name passes straight through, so any model a provider serves is reachable. For full details, see [ai-gateway.md](ai-gateway.md) and [providers.md](providers.md).
+Route requests across LLM providers with automatic failover, cost tracking, and content-based routing. Supports 72 native providers behind one OpenAI-compatible API; the model name passes straight through, so any model a provider serves is reachable. For full details, see [ai-gateway.md](ai-gateway.md) and [providers.md](providers.md).
 
 ```yaml
 origins:
