@@ -5,6 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{body::Bytes, extract::State, http::StatusCode, routing::post, Router};
+use opentelemetry_proto::tonic::collector::metrics::v1::{
+    metrics_service_server::{MetricsService, MetricsServiceServer},
+    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+};
 use opentelemetry_proto::tonic::collector::trace::v1::{
     trace_service_server::{TraceService, TraceServiceServer},
     ExportTraceServiceRequest, ExportTraceServiceResponse,
@@ -14,10 +18,12 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 type Received = Arc<Mutex<Vec<ExportTraceServiceRequest>>>;
+type ReceivedMetrics = Arc<Mutex<Vec<ExportMetricsServiceRequest>>>;
 
 pub struct StartedCollector {
     pub endpoint: String,
     received: Received,
+    received_metrics: ReceivedMetrics,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -30,6 +36,7 @@ impl Drop for StartedCollector {
 #[derive(Clone, Default)]
 struct MockGrpcCollector {
     received: Received,
+    received_metrics: ReceivedMetrics,
 }
 
 #[tonic::async_trait]
@@ -46,10 +53,26 @@ impl TraceService for MockGrpcCollector {
     }
 }
 
+#[tonic::async_trait]
+impl MetricsService for MockGrpcCollector {
+    async fn export(
+        &self,
+        req: Request<ExportMetricsServiceRequest>,
+    ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
+        self.received_metrics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(req.into_inner());
+        Ok(Response::new(ExportMetricsServiceResponse::default()))
+    }
+}
+
 pub async fn start_grpc_collector() -> StartedCollector {
     let received = Arc::new(Mutex::new(Vec::new()));
+    let received_metrics = Arc::new(Mutex::new(Vec::new()));
     let collector = MockGrpcCollector {
         received: received.clone(),
+        received_metrics: received_metrics.clone(),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -58,7 +81,8 @@ pub async fn start_grpc_collector() -> StartedCollector {
     let stream = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(TraceServiceServer::new(collector))
+            .add_service(TraceServiceServer::new(collector.clone()))
+            .add_service(MetricsServiceServer::new(collector))
             .serve_with_incoming(stream)
             .await
             .expect("serve gRPC OTLP collector");
@@ -66,6 +90,7 @@ pub async fn start_grpc_collector() -> StartedCollector {
     StartedCollector {
         endpoint: format!("http://{addr}"),
         received,
+        received_metrics,
         handle,
     }
 }
@@ -87,6 +112,10 @@ pub async fn start_http_collector() -> StartedCollector {
     StartedCollector {
         endpoint: format!("http://{addr}/v1/traces"),
         received,
+        // The HTTP collector only serves /v1/traces; nothing in this
+        // test binary sends OTLP/HTTP metrics today, but the field
+        // still needs a value to satisfy the shared struct shape.
+        received_metrics: Arc::new(Mutex::new(Vec::new())),
         handle,
     }
 }
@@ -110,7 +139,10 @@ pub async fn assert_complete_ai_span_exports(
         sample_rate: Some(1.0),
         ..Default::default()
     };
-    sbproxy_observe::telemetry::init_otlp_pipeline(&cfg).expect("init OTLP pipeline");
+    // Boot through the same entry point the shipped binary calls
+    // (`init_tracing` in `crates/sbproxy/src/main.rs`).
+    sbproxy_observe::logging::LoggingConfig::default()
+        .init_with_resolved_filter_and_telemetry(Some(&cfg));
 
     emit_complete_ai_request_span();
 
@@ -197,6 +229,52 @@ fn emit_complete_ai_request_span() {
     }
 }
 
+/// Poll the collector until it has received at least one span of any
+/// name, or the timeout elapses. Used by tests that only need to prove
+/// *something* arrived (e.g. a shutdown-triggered flush) rather than
+/// inspect a named span's attributes.
+pub async fn wait_for_any_span(collector: &StartedCollector, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !observed_span_names(&collector.received).is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Poll the collector until it has received at least one metric data
+/// point (a non-empty `resource_metrics[].scope_metrics[].metrics`),
+/// or the timeout elapses.
+pub async fn wait_for_any_metric_data_point(
+    collector: &StartedCollector,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let found = collector
+            .received_metrics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|req| {
+                req.resource_metrics
+                    .iter()
+                    .any(|rm| rm.scope_metrics.iter().any(|sm| !sm.metrics.is_empty()))
+            });
+        if found {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn wait_for_span_attrs(
     received: &Received,
     span_name: &str,
@@ -257,6 +335,26 @@ fn find_span_ids(received: &Received, span_name: &str) -> Option<(Vec<u8>, Vec<u
         }
     }
     None
+}
+
+/// Poll for a span named `span_name` and return its trace ID as
+/// lowercase hex, or `None` on timeout. Used by tests that assert an
+/// exported span's trace ID against an inbound `traceparent`.
+pub async fn wait_for_span_trace_id_hex(
+    collector: &StartedCollector,
+    span_name: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some((trace_id, _, _)) = find_span_ids(&collector.received, span_name) {
+            return Some(trace_id.iter().map(|b| format!("{b:02x}")).collect());
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn observed_span_names(received: &Received) -> HashSet<String> {

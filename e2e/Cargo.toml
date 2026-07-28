@@ -98,7 +98,7 @@ prost = "0.13"
 # proto + opentelemetry crates are pinned to the same majors already in the
 # lock via opentelemetry-otlp, so no duplicate compile.
 sbproxy-ai.workspace = true
-opentelemetry-proto = { version = "0.27", features = ["gen-tonic", "trace"] }
+opentelemetry-proto = { version = "0.27", features = ["gen-tonic", "trace", "metrics"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 
 # Compression decoders for compression.rs e2e assertions. Pinned to the
