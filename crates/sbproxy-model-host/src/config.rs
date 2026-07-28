@@ -523,14 +523,12 @@ pub struct ServeEntry {
     #[serde(default)]
     pub tool_call_parser: Option<String>,
     /// Support: preview.
-    /// CPU KV-cache tier size in GiB (WOR-1687): vLLM's `--swap-space`,
-    /// the CPU pool it spills GPU KV blocks to under pressure so a
-    /// longer effective context / larger batch survives beyond GPU
-    /// VRAM. `None` uses the engine default.
+    /// CPU swap pool size in GiB: vLLM's `--swap-space`. `None` uses the
+    /// engine default.
     #[serde(default)]
     pub swap_space_gib: Option<u64>,
     /// Support: preview.
-    /// GiB of model weights to keep in CPU RAM (WOR-1687): vLLM's
+    /// GiB of model weights to keep in CPU RAM: vLLM's
     /// `--cpu-offload-gb`, trading PCIe bandwidth for VRAM so a model
     /// that does not fit can still load. `None` disables offload.
     #[serde(default)]

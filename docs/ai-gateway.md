@@ -1020,9 +1020,11 @@ At compile time each `ai_provider` credential is lowered onto the runtime key re
 
 Two caches run on the serving path: the semantic cache and the idempotency middleware, both described below. Cache hit and miss counts land in `sbproxy_ai_cache_results_total`.
 
-### Exact prompt cache (design stage)
+### Exact replay
 
-An exact-match prompt cache is design-stage library code, not part of the serving path: `prompt_cache.rs` in `crates/sbproxy-ai` implements SHA-256 keying over the canonicalised JSON `messages` array and detection of Anthropic's native `cache_control` blocks, but nothing in the dispatch pipeline calls it, and there are no YAML knobs for it. For byte-identical replay of retried requests today, use the idempotency middleware below; for near-duplicate prompts, use the semantic cache.
+For byte-identical replay of retried requests, use the idempotency middleware
+below. The gateway does not have a separate exact-prompt-cache configuration
+surface. For near-duplicate prompts, use the semantic cache.
 
 ### Semantic cache
 
@@ -1306,67 +1308,40 @@ The complete configuration, session and structured-content safety rules,
 Redis state guarantees, failure table, metrics, logs, and PromQL are
 in [AI context compression](ai-context-compression.md).
 
-### Context relay (design stage)
-
-Context relay is design-stage: nothing on the serving path uses it. `crates/sbproxy-ai/src/context_relay.rs` implements a thread-safe map of session ID to message history, intended to replay prior messages to a new provider when the router rotates mid-session so the conversation does not reset. The router does not call it today, and there is no YAML config for it.
-
 ### Context overflow (design stage)
 
 The overflow decision layer is design-stage: `crates/sbproxy-ai/src/context_overflow.rs` ships a registry of context windows for the OpenAI, Anthropic, Gemini, Mistral, and Llama families plus typed overflow actions (`Error`, `FallbackToLarger`, `Truncate`), but no dispatch code drives those actions and a `context_overflow:` block in the config is ignored. The one part of the module that does run is its window registry, which context compression consults to size a model's budget. The shipped way to handle overflow is `resilience.llm_aware.context_compress` above.
 
 ## Streaming analytics
 
-Per-stream timing on the live path is limited to Time to First Token: the dispatch pipeline measures TTFT on streaming responses and records it to the `sbproxy_ai_ttft_seconds` histogram, labelled by provider and model.
+The dispatch pipeline measures streaming responses inline: time to first token,
+output throughput, and average inter-token latency are recorded in
+`sbproxy_ai_ttft_seconds`,
+`sbproxy_ai_output_throughput_tokens_per_second`, and
+`sbproxy_ai_inter_token_latency_seconds`, labelled by provider and model.
 
-The richer per-stream tracker is design-stage: `crates/sbproxy-ai/src/streaming_analytics.rs` ships a `StreamTracker` (start, first-token, and last-token instants, with derived tokens-per-second and average inter-token latency) and a `StreamRegistry` map of in-flight streams, but nothing on the serving path constructs either type today.
+## Structured output
 
-## Structured output (design stage)
+Provider-enforced JSON output works where the upstream supports it:
+`response_format` passes through to OpenAI-compatible upstreams (the Gemini
+translator drops it as an unsupported knob). The proxy does not re-validate
+the returned JSON, and there is no `structured_output:` config key.
 
-Gateway-side structured-output validation is design-stage: `crates/sbproxy-ai/src/structured_output.rs` implements the validator, but no dispatch code calls it and a `structured_output:` block in the config is ignored. Provider-enforced JSON output still works where the upstream supports it: `response_format` passes through to OpenAI-compatible upstreams (the Gemini translator drops it as an unsupported knob). What does not exist is the proxy re-checking the response.
+## OpenAI surface-area routing
 
-The library code covers the intended flow: `extract_json` strips ` ```json ` and ` ``` ` fences before parsing so models that wrap output in markdown still validate, `validate_response` does structural checks (required-field presence and per-property type checks for `string`, `number`, `integer`, `boolean`, `array`, `object`, `null`; no `$ref` or `oneOf`), and `build_schema_instruction` renders the schema into a system-prompt retry instruction for a validation-failure retry loop.
-
-## OpenAI surface-area modules
-
-The `sbproxy-ai` crate ships shape definitions and lightweight handlers for the OpenAI surface beyond chat completions: assistants, threads, batch jobs, image generation, audio, fine-tuning, realtime sessions, and structured output. The shapes are stable and round-trip through `serde_json`. Path classification on the live dispatch path is done by two functions: `classify_surface(method, path)` in `crates/sbproxy-ai/src/handler.rs` labels every request with an `AiSurface` (the full table above), and `parse_endpoint(path)` in `crates/sbproxy-ai/src/api_routes.rs` types a narrower endpoint subset (chat, embeddings, models, rerank, moderations, image generation, audio transcription, audio speech) for the per-provider capability check, falling back to `Unknown` for the rest. There is no `parse_ai_path` function. The remaining shapes are present so plugin authors can build on top of them.
-
-The subsections below describe what each module contributes today.
-
-### `assistants`
-
-Assistants requests are served by the generic surface dispatch described above: `classify_surface` labels them, and the gateway forwards them passthrough to a provider that supports the surface (OpenAI). There is no `assistants:` config key; writing one is silently ignored, since the action config drops unknown fields rather than rejecting them.
-
-The module itself is design-stage shape code with no serving-path callers: `AssistantHandler::route_request(path, method)` classifies a request into `CreateAssistant`, `ListAssistants`, `GetAssistant(id)`, `CreateThread`, `CreateMessage(thread_id)`, `CreateRun(thread_id)`, `GetRun(thread_id, run_id)`, or `Unknown` (optional `/v1` prefix stripped), and `AssistantConfig { enabled: bool }` is the intended on/off shape. Nothing constructs either today. Source: `crates/sbproxy-ai/src/assistants.rs:AssistantHandler`.
-
-### `threads`
-
-Threads requests, like assistants, are proxied passthrough by the generic surface dispatch. The `ThreadStore` module is design-stage with no serving-path callers: it implements an in-memory, mutex-backed store of `Thread { id, created_at, metadata }` and ordered `ThreadMessage { id, thread_id, role, content, created_at }`, intended for gateway-local session continuity, but nothing constructs it today and there is no YAML field for it. Source: `crates/sbproxy-ai/src/threads.rs:ThreadStore`.
-
-### `batch`
-
-Batch requests are proxied passthrough by the generic surface dispatch (`batches` in the surface table). The module's `BatchJob` shape (id, status, created_at, completed_at, total_requests, completed_requests, failed_requests, metadata), `BatchStore` trait, and `MemoryBatchStore` implementation (status lifecycle `pending`, `in_progress`, `completed`, `failed`, `cancelled`) are design-stage code that nothing constructs today; there is no `batch:` YAML block. Source: `crates/sbproxy-ai/src/batch.rs`.
-
-### `image`
-
-Request and response shapes for image generation, edit, and variation. `ImageGenerationRequest { prompt, model, size, n }` and `ImageGenerationResponse { images: Vec<ImageData> }`, where each `ImageData` carries either a `url` or a base-64 `b64_json` payload depending on the provider's `response_format`. `/v1/images/generations` is routed by `api_routes.rs`; the per-call dispatch is built by the runtime. No dedicated YAML knobs. Source: `crates/sbproxy-ai/src/image.rs`.
-
-### `audio`
-
-Request and response shapes for audio transcription and speech synthesis. `TranscriptionRequest { file_url, model, language }`, `TranscriptionResponse { text, duration }`, and `SpeechRequest { input, model, voice }`. `/v1/audio/transcriptions` and `/v1/audio/speech` are recognised by `api_routes.rs`. No dedicated YAML knobs; the audio dispatcher reuses the top-level provider list and routing strategy. Source: `crates/sbproxy-ai/src/audio.rs`.
-
-### `finetune`
-
-Fine-tuning requests are proxied passthrough by the generic surface dispatch (`fine_tuning` in the surface table). There is no `finetune:` config key; writing one is silently ignored. The module's `FinetuneHandler::route_request(path, method)` classifier (`CreateJob`, `ListJobs`, `GetJob(id)`, `CancelJob(id)`, `ListEvents(id)`, `Unknown`) and `FinetuneConfig { enabled: bool }` shape are design-stage code with no serving-path callers. Source: `crates/sbproxy-ai/src/finetune.rs:FinetuneHandler`.
+Assistants, threads, batches, image generation, audio, and fine-tuning remain
+live passthrough surfaces. `classify_surface(method, path)` in
+`crates/sbproxy-ai/src/handler.rs` labels every request with an `AiSurface`,
+and `parse_endpoint(path)` in `crates/sbproxy-ai/src/api_routes.rs` types the
+endpoint subset used by provider capability checks. The gateway forwards the
+request to an eligible provider; it does not emulate those provider APIs
+locally, and there are no per-surface emulation config blocks.
 
 ### `realtime`
 
 Realtime WebSocket proxying ships and is documented in the [Realtime](#realtime-1) section below: the gateway gates the upgrade on provider capability, applies `per_surface_rate_limits.realtime`, and forwards frames byte-transparently. There is no `realtime:` config key on the action; writing one is silently ignored. The knobs that exist are the provider list (a provider that supports Realtime must be configured) and the per-surface rate limit.
 
 The `realtime.rs` module itself is design-stage shape code with no serving-path callers: `RealtimeConfig { enabled, model }`, `RealtimeSession { session_id, model, created_at, status }`, and `RealtimeEvent { event_type, data }` round-trip through serde but nothing constructs them. Source: `crates/sbproxy-ai/src/realtime.rs`.
-
-### `structured_output`
-
-Design-stage; covered above under [Structured output](#structured-output-design-stage). The validator functions (`extract_json`, `validate_response`, `build_schema_instruction`) have no serving-path callers and there is no `structured_output:` config key. Source: `crates/sbproxy-ai/src/structured_output.rs`.
 
 ## Per-request attribution
 

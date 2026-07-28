@@ -56,6 +56,70 @@ fn forward_auth_refusals_require_explicit_invalid_proof_evidence() {
     );
 }
 
+#[tokio::test]
+async fn forward_auth_client_does_not_follow_token_endpoint_redirects() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let redirect_target = std::net::TcpListener::bind("127.0.0.1:0").expect("target listener");
+    redirect_target
+        .set_nonblocking(true)
+        .expect("nonblocking target listener");
+    let target_addr = redirect_target.local_addr().expect("target address");
+    let target_hit = Arc::new(AtomicBool::new(false));
+    let target_hit_thread = Arc::clone(&target_hit);
+    let target_thread = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            match redirect_target.accept() {
+                Ok((mut stream, _)) => {
+                    target_hit_thread.store(true, Ordering::SeqCst);
+                    let mut request = [0_u8; 4096];
+                    let _ = stream.read(&mut request);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("target accept failed: {error}"),
+            }
+        }
+    });
+
+    let redirect = std::net::TcpListener::bind("127.0.0.1:0").expect("redirect listener");
+    let redirect_addr = redirect.local_addr().expect("redirect address");
+    let redirect_thread = std::thread::spawn(move || {
+        let (mut stream, _) = redirect.accept().expect("redirect request");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        let response = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_addr}/token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("redirect response");
+    });
+
+    let response = forward_auth_client()
+        .post(format!("http://{redirect_addr}/token"))
+        .send()
+        .await
+        .expect("token request");
+    redirect_thread.join().expect("redirect server");
+    target_thread.join().expect("target server");
+
+    assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    assert!(
+        !target_hit.load(Ordering::SeqCst),
+        "the credential client must not replay an existing DPoP proof to a redirect target"
+    );
+}
+
 #[test]
 fn swr_write_back_does_not_resurrect_an_invalidated_entry() {
     let store: std::sync::Arc<dyn sbproxy_cache::CacheStore> =

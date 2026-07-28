@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+#
+# Outbound RFC 9449 DPoP with an OAuth client-credentials grant.
+# Mount both referenced files before starting SBproxy.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://api.example.com
+    outbound_credential:
+      type: client_credentials
+      token_endpoint: https://idp.example.com/oauth/token
+      client_id: sbproxy
+      client_secret: file:/run/secrets/oauth-client-secret
+      scope: api.read
+      audience: https://api.example.com
+      dpop:
+        key: file:/run/secrets/api-dpop-private-key.pem
+        alg: ES256
+        jwk:
+          kty: EC
+          crv: P-256
+          x: REPLACE_WITH_BASE64URL_X_COORDINATE
+          y: REPLACE_WITH_BASE64URL_Y_COORDINATE

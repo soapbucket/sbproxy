@@ -1,5 +1,5 @@
 # 402 Challenge contract
-*Last modified: 2026-05-25*
+*Last modified: 2026-07-26*
 
 The wire format the proxy uses when it returns `402 Payment Required`
 to an AI crawler. This document is the canonical reference for the
@@ -276,7 +276,7 @@ signed by the proxy under a key whose JWKS the operator publishes at
 amount, the route, and a per-rail nonce so the agent cannot replay a
 quote across rails or reuse it after expiry.
 
-The `accept_payment` policy verifies the JWS on the agent's retry
+The `ai_crawl_control` policy verifies the JWS on the agent's retry
 before consulting the ledger. A token whose claims do not match the
 retry context (different rail, different route, expired) is rejected
 without a ledger round-trip.
