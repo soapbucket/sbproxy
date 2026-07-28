@@ -943,7 +943,8 @@ impl AiHandlerConfig {
                 }
             }
         }
-        if let Some(compression) = &config.compression {
+        if let Some(compression) = &mut config.compression {
+            compression.apply_state_defaults();
             compression.validate(&config.providers)?;
         }
         for (index, key) in config.virtual_keys.iter().enumerate() {

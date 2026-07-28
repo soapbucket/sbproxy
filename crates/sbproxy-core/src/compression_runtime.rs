@@ -586,6 +586,9 @@ impl CompressionRuntime {
                 .context("compression state is required for summary_buffer")?;
             let ttl = Duration::from_secs(state.ttl_secs);
             match state.backend {
+                CompressionStateBackend::Local => {
+                    bail!("Local compression state adapter is not wired")
+                }
                 CompressionStateBackend::Redis => {
                     let redis = dependencies.redis.clone().context(
                         "Redis compression state requires proxy.l2_cache_settings.driver: redis",

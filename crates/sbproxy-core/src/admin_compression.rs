@@ -780,6 +780,7 @@ fn parse_limit(value: Option<&String>) -> Result<u16, AdminCompressionResponse> 
 
 fn parse_backend(value: &str) -> Result<CompressionBackend, AdminCompressionResponse> {
     match value {
+        "local" => Ok(CompressionBackend::Local),
         "redis" => Ok(CompressionBackend::Redis),
         "mesh" => Ok(CompressionBackend::Mesh),
         _ => Err(bad_request("invalid backend")),
@@ -802,11 +803,13 @@ fn backend_rank(backend: CompressionBackend) -> u8 {
     match backend {
         CompressionBackend::Redis => 0,
         CompressionBackend::Mesh => 1,
+        CompressionBackend::Local => 2,
     }
 }
 
 fn backend_label(backend: CompressionBackend) -> &'static str {
     match backend {
+        CompressionBackend::Local => "local",
         CompressionBackend::Redis => "redis",
         CompressionBackend::Mesh => "mesh",
     }

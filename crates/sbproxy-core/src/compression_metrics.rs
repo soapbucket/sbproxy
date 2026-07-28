@@ -397,6 +397,7 @@ fn bounded_identity_with_sanitizers(
 
 const fn backend_label(backend: Option<CompressionBackend>) -> &'static str {
     match backend {
+        Some(CompressionBackend::Local) => "local",
         Some(CompressionBackend::Redis) => "redis",
         Some(CompressionBackend::Mesh) => "mesh",
         None => "none",
@@ -417,6 +418,7 @@ fn outcome_labels(outcome: LeverOutcome) -> (&'static str, &'static str) {
 
 fn consistency_label(backend: Option<CompressionBackend>) -> &'static str {
     match backend {
+        Some(CompressionBackend::Local) => "serialized",
         Some(CompressionBackend::Redis) => "serialized",
         Some(CompressionBackend::Mesh) => "eventual_lww",
         None => "none",
