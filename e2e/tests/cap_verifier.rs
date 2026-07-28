@@ -247,7 +247,9 @@ fn verified_cap_bypasses_priced_crawl_control() {
     let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
     let harness = ProxyHarness::start_with_yaml(&priced_cap_config(&upstream.base_url(), &pubkey))
         .expect("start");
-    let token = mint_cap(&signing, |_| {});
+    let token = mint_cap(&signing, |claims| {
+        claims["sub"] = json!("openai-gptbot");
+    });
 
     let response = harness
         .get_with_headers(
@@ -257,7 +259,13 @@ fn verified_cap_bypasses_priced_crawl_control() {
         )
         .expect("send");
 
-    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.status,
+        200,
+        "body: {}; proxy stderr: {}",
+        String::from_utf8_lossy(&response.body),
+        harness.stderr_contents()
+    );
     assert_eq!(upstream.captured().len(), 1);
     assert!(!response.headers.contains_key("crawler-payment"));
 }
