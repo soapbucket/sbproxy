@@ -1600,6 +1600,19 @@ mod tests {
         serde_yaml::from_str(yaml).expect("serve config")
     }
 
+    // No `.with_artifact_manager(...)` here or on any fixture below: this
+    // whole crate is unit-tested with no network per its own crate doc,
+    // and a real ArtifactManager would need one to actually fetch
+    // weights. Any test config using this helper must therefore name a
+    // catalog entry with no `variants:` block (v1-shaped), since
+    // `acquire_managed_artifact` requires a configured artifact manager
+    // once a catalog entry has any variant. `glm-4-flash` is the one
+    // builtin entry that stays v1-shaped; every other builtin entry was
+    // pinned to a real `variants:` block. This is a fixture-only
+    // constraint: the real server (`ProductionDeploymentPreparer`, built
+    // in `sbproxy-core::server::model_host::build_production_manager`)
+    // always constructs a real ArtifactManager unconditionally, so this
+    // gate is never reachable there regardless of catalog shape.
     fn l4_runtime(cfg: ModelHostConfig) -> ModelHostRuntime<SpecPortLauncher> {
         ModelHostRuntime::new(
             cfg,
@@ -1613,13 +1626,18 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_ready_spawns_and_returns_a_port() {
-        let rt = l4_runtime(config("models:\n  - model: qwen3-14b\n"));
-        let port = rt.ensure_ready("qwen3-14b").await.expect("ready");
+        // glm-4-flash: the one builtin catalog entry still v1-shaped (no
+        // `variants:`), so resolution here never touches the managed
+        // artifact service `l4_runtime`'s fixture does not configure. See
+        // the comment on `l4_runtime` above for why this specific model
+        // is load-bearing, not an arbitrary placeholder.
+        let rt = l4_runtime(config("models:\n  - model: glm-4-flash\n"));
+        let port = rt.ensure_ready("glm-4-flash").await.expect("ready");
         assert!(port > 0);
         // Base URL points at the loopback port.
-        let url = rt.resolved_base_url("qwen3-14b").await.unwrap();
+        let url = rt.resolved_base_url("glm-4-flash").await.unwrap();
         assert_eq!(url, format!("http://127.0.0.1:{port}/v1"));
-        assert_eq!(rt.resident_models().await, vec!["qwen3-14b".to_string()]);
+        assert_eq!(rt.resident_models().await, vec!["glm-4-flash".to_string()]);
     }
 
     /// Counts observer callbacks so a test can assert the runtime emits
@@ -1720,21 +1738,21 @@ mod tests {
         // WOR-1673: a request addressing a LoRA adapter brings up (and
         // reuses) the base model's engine and resolves to its port.
         let rt = l4_runtime(config(
-            "models:\n  - model: qwen3-14b\n    lora_adapters:\n      - name: coder\n        source: hf:org/coder\n",
+            "models:\n  - model: glm-4-flash\n    lora_adapters:\n      - name: coder\n        source: hf:org/coder\n",
         ));
         let port = rt
             .ensure_ready("coder")
             .await
             .expect("adapter routes to base");
         // The engine is keyed by the base model, not the adapter.
-        assert_eq!(rt.resident_models().await, vec!["qwen3-14b".to_string()]);
+        assert_eq!(rt.resident_models().await, vec!["glm-4-flash".to_string()]);
         // Both the adapter name and the base name resolve to that engine.
         assert_eq!(
             rt.resolved_base_url("coder").await,
             Some(format!("http://127.0.0.1:{port}/v1"))
         );
         assert_eq!(
-            rt.resolved_base_url("qwen3-14b").await,
+            rt.resolved_base_url("glm-4-flash").await,
             Some(format!("http://127.0.0.1:{port}/v1"))
         );
         // A second adapter request reuses the same engine (no respawn).
@@ -1749,7 +1767,7 @@ mod tests {
         // so the load attempt fails cleanly, proving the dynamic path is
         // taken (a static config would not attempt any HTTP load).
         let rt = l4_runtime(config(
-            "models:\n  - model: qwen3-14b\n    max_loras: 1\n    lora_adapters:\n      - name: a\n        source: hf:org/a\n      - name: b\n        source: hf:org/b\n",
+            "models:\n  - model: glm-4-flash\n    max_loras: 1\n    lora_adapters:\n      - name: a\n        source: hf:org/a\n      - name: b\n        source: hf:org/b\n",
         ));
         let err = rt.ensure_ready("a").await.unwrap_err();
         assert!(
@@ -1757,7 +1775,7 @@ mod tests {
             "expected an adapter-load error, got: {err}"
         );
         // The base engine did come up (only the adapter load failed).
-        assert_eq!(rt.resident_models().await, vec!["qwen3-14b".to_string()]);
+        assert_eq!(rt.resident_models().await, vec!["glm-4-flash".to_string()]);
     }
 
     #[tokio::test]
@@ -1766,9 +1784,11 @@ mod tests {
         // fires on_adapter_loaded + updates the resident-adapter gauge,
         // and loading past the cap fires on_adapter_evicted.
         let obs = Arc::new(CountingObserver::default());
+        // glm-4-flash: see l4_runtime's comment above; no artifact
+        // manager is configured here either.
         let rt = ModelHostRuntime::new(
             config(
-                "models:\n  - model: qwen3-14b\n    max_loras: 1\n    lora_adapters:\n      - name: a\n        source: hf:org/a\n      - name: b\n        source: hf:org/b\n",
+                "models:\n  - model: glm-4-flash\n    max_loras: 1\n    lora_adapters:\n      - name: a\n        source: hf:org/a\n      - name: b\n        source: hf:org/b\n",
             ),
             Catalog::builtin(),
             Arc::new(StaticGpuProbe::new(vec![GpuDescriptor::l4()])),
@@ -1794,7 +1814,7 @@ mod tests {
     async fn ensure_failures_are_observed_by_reason() {
         // WOR-1711: an unknown model reports the unknown_model reason.
         let obs = Arc::new(CountingObserver::default());
-        let rt = l4_runtime(config("models:\n  - model: qwen3-14b\n")).with_observer(obs.clone());
+        let rt = l4_runtime(config("models:\n  - model: glm-4-flash\n")).with_observer(obs.clone());
         assert!(rt.ensure_ready("no-such-model").await.is_err());
         assert_eq!(obs.ensure_failures.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -1805,7 +1825,7 @@ mod tests {
         // A host with no GPU cannot fit or admit the model.
         let obs2 = Arc::new(CountingObserver::default());
         let rt2 = ModelHostRuntime::new(
-            config("models:\n  - model: qwen3-14b\n"),
+            config("models:\n  - model: glm-4-flash\n"),
             Catalog::builtin(),
             Arc::new(StaticGpuProbe::new(vec![])),
             Arc::new(FixtureMeta),
@@ -1813,7 +1833,7 @@ mod tests {
             true,
         )
         .with_observer(obs2.clone());
-        assert!(rt2.ensure_ready("qwen3-14b").await.is_err());
+        assert!(rt2.ensure_ready("glm-4-flash").await.is_err());
         assert_eq!(obs2.ensure_failures.load(Ordering::SeqCst), 1);
         let r = obs2.last_fail_reason.lock().unwrap().clone().unwrap();
         assert!(r == "fit" || r == "residency", "unexpected reason: {r}");
@@ -1822,23 +1842,23 @@ mod tests {
     #[tokio::test]
     async fn status_snapshot_reports_resident_models_and_vram() {
         let rt = l4_runtime(config(
-            "models:\n  - model: qwen3-14b\n    keep_alive: 30m\n",
+            "models:\n  - model: glm-4-flash\n    keep_alive: 30m\n",
         ));
         // Configured models remain visible before they are resident.
         let configured = rt.status_snapshot().await;
         assert_eq!(configured.models.len(), 1);
-        assert_eq!(configured.models[0].name, "qwen3-14b");
+        assert_eq!(configured.models[0].name, "glm-4-flash");
         assert_eq!(configured.models[0].state, crate::EngineState::Idle);
         assert!(configured.vram.budget_bytes > 0, "L4 budget reported");
         assert!(!configured.vram.devices.is_empty(), "device listed");
         assert_eq!(configured.vram.devices[0].compute_utilization, None);
         assert!(configured.vram.devices[0].memory_occupancy.is_some());
 
-        rt.ensure_ready("qwen3-14b").await.expect("ready");
+        rt.ensure_ready("glm-4-flash").await.expect("ready");
         let s = rt.status_snapshot().await;
         assert_eq!(s.models.len(), 1);
         let m = &s.models[0];
-        assert_eq!(m.name, "qwen3-14b");
+        assert_eq!(m.name, "glm-4-flash");
         assert!(m.port.is_some(), "ready model has a port");
         assert_eq!(m.keep_alive_secs, Some(1800), "30m keep_alive surfaced");
         assert!(s.vram.used_bytes > 0, "resident model uses budget");
@@ -1847,22 +1867,22 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_emits_observer_events() {
         let obs = Arc::new(CountingObserver::default());
-        let rt = l4_runtime(config("models:\n  - model: qwen3-14b\n")).with_observer(obs.clone());
-        rt.ensure_ready("qwen3-14b").await.expect("ready");
+        let rt = l4_runtime(config("models:\n  - model: glm-4-flash\n")).with_observer(obs.clone());
+        rt.ensure_ready("glm-4-flash").await.expect("ready");
         assert_eq!(obs.ready.load(Ordering::SeqCst), 1, "engine-ready recorded");
         assert_eq!(obs.resident_last.load(Ordering::SeqCst), 1, "resident=1");
         assert!(
             obs.gpu_reports.load(Ordering::SeqCst) >= 1,
             "gpu stats reported"
         );
-        rt.unload("qwen3-14b").await;
+        rt.unload("glm-4-flash").await;
         assert_eq!(obs.evictions.load(Ordering::SeqCst), 1, "eviction recorded");
         assert_eq!(obs.resident_last.load(Ordering::SeqCst), 0, "resident=0");
     }
 
     #[tokio::test]
     async fn ensure_ready_is_idempotent() {
-        let cfg = config("models:\n  - model: qwen3-14b\n");
+        let cfg = config("models:\n  - model: glm-4-flash\n");
         let launcher_calls = Arc::new(AtomicU64::new(0));
         let calls = launcher_calls.clone();
         let rt = ModelHostRuntime::new(
@@ -1875,8 +1895,8 @@ mod tests {
             }),
             true,
         );
-        let p1 = rt.ensure_ready("qwen3-14b").await.unwrap();
-        let p2 = rt.ensure_ready("qwen3-14b").await.unwrap();
+        let p1 = rt.ensure_ready("glm-4-flash").await.unwrap();
+        let p2 = rt.ensure_ready("glm-4-flash").await.unwrap();
         assert_eq!(p1, p2);
         assert_eq!(launcher_calls.load(Ordering::SeqCst), 1, "spawned once");
     }
@@ -1894,7 +1914,7 @@ mod tests {
     async fn no_gpu_rejects_via_fit() {
         // Empty probe -> no GPU -> fit planner returns NoGpu.
         let rt = ModelHostRuntime::new(
-            config("models:\n  - model: qwen3-14b\n"),
+            config("models:\n  - model: glm-4-flash\n"),
             Catalog::builtin(),
             Arc::new(StaticGpuProbe::default()),
             Arc::new(FixtureMeta),
@@ -1902,7 +1922,7 @@ mod tests {
             false,
         );
         assert!(matches!(
-            rt.ensure_ready("qwen3-14b").await,
+            rt.ensure_ready("glm-4-flash").await,
             Err(RuntimeError::Fit(_))
         ));
     }
@@ -1999,8 +2019,15 @@ mod tests {
     async fn health_recheck_returns_live_engine_without_respawn() {
         let launches = Arc::new(AtomicU64::new(0));
         let calls = launches.clone();
+        // glm-4-flash: see l4_runtime's comment above. This test's own
+        // `let Ok(..) = .. else { skip }` pattern (for a genuinely
+        // environment-dependent loopback-bind denial) would otherwise
+        // silently swallow the "managed artifact service is not
+        // configured" error a v2-shaped catalog entry produces here too,
+        // and pass vacuously without exercising the health-recheck
+        // behavior it names.
         let rt = ModelHostRuntime::new(
-            config("models:\n  - model: qwen3-14b\n"),
+            config("models:\n  - model: glm-4-flash\n"),
             Catalog::builtin(),
             Arc::new(StaticGpuProbe::new(vec![GpuDescriptor::l4()])),
             Arc::new(FixtureMeta),
@@ -2010,12 +2037,12 @@ mod tests {
             true,
         )
         .with_health_recheck(true);
-        let Ok(p1) = rt.ensure_ready("qwen3-14b").await else {
+        let Ok(p1) = rt.ensure_ready("glm-4-flash").await else {
             eprintln!("skipping: loopback bind denied");
             return;
         };
         // Second call: the health probe passes, so no respawn.
-        let p2 = rt.ensure_ready("qwen3-14b").await.unwrap();
+        let p2 = rt.ensure_ready("glm-4-flash").await.unwrap();
         assert_eq!(p1, p2);
         assert_eq!(
             launches.load(Ordering::SeqCst),
