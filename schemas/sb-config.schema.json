@@ -1259,7 +1259,7 @@
           "format": "double"
         },
         "propagation": {
-          "description": "Propagation format: `w3c` (default), `b3`, `jaeger`.",
+          "description": "Propagation format. Only `w3c` (the default) is wired; the binary refuses to start with any other value.",
           "default": null,
           "type": [
             "string",

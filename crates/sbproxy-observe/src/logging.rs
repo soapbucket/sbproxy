@@ -177,6 +177,11 @@ impl LoggingConfig {
                 }
             }
         });
+        if let Some(config) = telemetry {
+            if let Err(err) = crate::telemetry::init_otlp_metrics_pipeline(config) {
+                eprintln!("telemetry: failed to initialize OTLP metrics: {err:#}");
+            }
+        }
         let writer = if write_to_stderr {
             fmt::writer::BoxMakeWriter::new(std::io::stderr)
         } else {
