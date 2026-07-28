@@ -953,7 +953,7 @@ pub fn shutdown_otlp_pipeline() {
 /// ...build()` calls tonic's `connect_lazy()`, which synchronously
 /// `tokio::spawn`s its own background task regardless of which runtime
 /// binding `PeriodicReader` uses. See
-/// [`build_on_a_runtime_that_outlives_this_call`].
+/// `build_on_a_runtime_that_outlives_this_call`.
 pub fn init_otlp_metrics_pipeline(config: &TelemetryConfig) -> Result<()> {
     if !config.enabled || !config.export_metrics {
         return Ok(());
