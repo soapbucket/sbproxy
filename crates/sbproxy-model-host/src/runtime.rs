@@ -155,6 +155,12 @@ pub trait ModelHostObserver: Send + Sync {
     ) {
         let _ = (deployment, priority, reason);
     }
+    /// Exact count of requests currently blocked on the shared
+    /// model-preparation concurrency limiter for `model`, i.e. queued
+    /// behind another in-flight cold load.
+    fn set_load_queue_depth(&self, model: &str, depth: i64) {
+        let _ = (model, depth);
+    }
 }
 
 /// A [`ModelHostObserver`] that does nothing; the runtime default.

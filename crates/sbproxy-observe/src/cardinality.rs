@@ -79,6 +79,28 @@ pub fn budget_for_label(label_name: &str) -> usize {
         "action" => 8,
         "result" => 5,
         "reason" => 8,
+        // Model-host / directory labels. `deployment` and `model` are
+        // operator-named and open-ended (catalog entries, not a closed
+        // enum), so they get an explicit, generous cap rather than the
+        // workspace default -- `model` matches the pre-existing 1000
+        // the `sanitize_label_budget_tenant(.., "model", ..)` call sites
+        // in metrics.rs already relied on; do not shrink it for a new,
+        // unrelated consumer. `artifact_error_kind` (ArtifactError),
+        // `exclusion_reason` (ModelDirectoryExclusionReason), `stage`
+        // (ReplicaSelectionTrace), and `placement_reason`
+        // (PlacementRejectionReason) are closed enums; each cap is the
+        // variant count plus headroom to catch drift. `artifact_error_kind`
+        // is deliberately NOT named `kind`: `kind` is a label name
+        // shared by roughly 20 other, unrelated metrics in this
+        // workspace, and this lookup keys on label name alone, not on
+        // metric name -- a cap sized for ArtifactError's 18 variants
+        // would silently apply to every one of them.
+        "deployment" => 1000,
+        "model" => 1000,
+        "artifact_error_kind" => 20,
+        "exclusion_reason" => 20,
+        "stage" => 8,
+        "placement_reason" => 16,
         // Default workspace cap when the label is not in the table.
         _ => 1000,
     }
@@ -395,6 +417,18 @@ mod tests {
         assert_eq!(budget_for_label("content_shape"), 5);
         assert_eq!(budget_for_label("workspace_id"), 1000);
         assert_eq!(budget_for_label("tenant_id"), 1000);
+        assert_eq!(budget_for_label("deployment"), 1000);
+        assert_eq!(budget_for_label("model"), 1000);
+        assert_eq!(budget_for_label("artifact_error_kind"), 20);
+        assert_eq!(budget_for_label("exclusion_reason"), 20);
+        assert_eq!(budget_for_label("stage"), 8);
+        assert_eq!(budget_for_label("placement_reason"), 16);
+        // "kind" itself is deliberately absent from the table: roughly
+        // 20 unrelated metrics share that label name, and a cap sized
+        // for one of them would silently apply to all of them since
+        // this lookup keys on label name alone. It must fall through to
+        // the workspace default, not the artifact-error-sized cap.
+        assert_eq!(budget_for_label("kind"), 1000);
     }
 
     #[test]

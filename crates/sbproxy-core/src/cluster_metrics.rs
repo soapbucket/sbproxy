@@ -40,6 +40,12 @@ const PUBLISHED_METRICS: &[&str] = &[
     // sum meaningfully across nodes.
     "sbproxy_ai_tokens_attributed_total",
     "sbproxy_ai_cost_usd_micros_total",
+    // Model-host cold-load and placement signals: each is per-node but
+    // sums into a meaningful fleet total (total requests queued behind a
+    // cold load, total artifact failures, total placement rejections).
+    "sbproxy_model_host_load_queue_depth",
+    "sbproxy_model_host_artifact_errors_total",
+    "sbproxy_model_host_placement_rejections_total",
 ];
 
 /// Process-global fleet-metrics aggregator, installed when the mesh key

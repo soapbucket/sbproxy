@@ -1372,6 +1372,73 @@ pub fn record_stream_guardrail_decode_fallback() {
     STREAM_GUARDRAIL_DECODE_FALLBACK.inc();
 }
 
+// --- Model directory metrics ---
+
+/// Directory nodes excluded from model routing, by
+/// [`crate::model_directory::ModelDirectoryExclusionReason`]. Counted once
+/// per excluded node per `ModelDirectory::refresh`, so a steady
+/// exclusion shows up as a steady rate rather than a one-shot event.
+static AI_MODEL_DIRECTORY_EXCLUSIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_model_directory_exclusions_total",
+            "Directory nodes excluded from model routing, by exclusion reason"
+        ),
+        &["exclusion_reason"]
+    )
+    .unwrap()
+});
+
+/// Record one directory node classified out of eligible routing on a
+/// `refresh`, by its bounded exclusion reason.
+pub fn record_model_directory_exclusion(reason: &'static str) {
+    AI_MODEL_DIRECTORY_EXCLUSIONS
+        .with_label_values(&[reason])
+        .inc();
+}
+
+#[cfg(test)]
+pub(crate) fn model_directory_exclusion_value(reason: &str) -> f64 {
+    AI_MODEL_DIRECTORY_EXCLUSIONS
+        .with_label_values(&[reason])
+        .get()
+}
+
+// --- Managed-replica routing metrics ---
+
+/// Managed-replica candidates excluded before rendezvous ranking, by the
+/// [`crate::managed_replica::ReplicaSelectionTrace`] stage that dropped
+/// them (`generation`, `health`, `endpoint`, `state`, `adapter`).
+static AI_REPLICA_SELECTION_EXCLUDED: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_replica_selection_excluded_total",
+            "Managed-replica candidates excluded before rendezvous ranking, by stage"
+        ),
+        &["stage"]
+    )
+    .unwrap()
+});
+
+/// Record `count` candidates excluded at one `ReplicaSelectionTrace`
+/// stage for a single routing decision. A no-op for `count == 0` so a
+/// clean routing decision does not touch every stage's series.
+pub fn record_replica_selection_excluded(stage: &'static str, count: usize) {
+    if count == 0 {
+        return;
+    }
+    AI_REPLICA_SELECTION_EXCLUDED
+        .with_label_values(&[stage])
+        .inc_by(count as f64);
+}
+
+#[cfg(test)]
+pub(crate) fn replica_selection_excluded_value(stage: &str) -> f64 {
+    AI_REPLICA_SELECTION_EXCLUDED
+        .with_label_values(&[stage])
+        .get()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2017,5 +2084,24 @@ mod tests {
             !has_cache_for_our_labels,
             "zero cache_read tokens should not land in the metric for this test's labels"
         );
+    }
+
+    #[test]
+    fn model_directory_exclusion_counts_by_reason() {
+        let before = model_directory_exclusion_value("membership_dead");
+        record_model_directory_exclusion("membership_dead");
+        record_model_directory_exclusion("membership_dead");
+        assert!((model_directory_exclusion_value("membership_dead") - before - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn replica_selection_excluded_counts_by_stage_and_skips_zero() {
+        let before = replica_selection_excluded_value("health");
+        // A clean routing decision (0 excluded) must not touch the series.
+        record_replica_selection_excluded("health", 0);
+        assert!((replica_selection_excluded_value("health") - before).abs() < 1e-9);
+
+        record_replica_selection_excluded("health", 3);
+        assert!((replica_selection_excluded_value("health") - before - 3.0).abs() < 1e-9);
     }
 }

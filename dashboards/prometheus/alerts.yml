@@ -124,6 +124,24 @@ groups:
           summary: "Model-host load queue backed up"
           description: "More than 20 requests have been queued waiting for a cold model to load for 5 minutes. Cold starts are not keeping up; consider keep_alive to hold the model resident."
 
+      - alert: SBProxyModelPlaneSecurityRejections
+        expr: sum(rate(sbproxy_model_plane_rejections_total{retry_class="security"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Private model-plane security rejections"
+          description: "Authenticated model-plane requests have been refused on security grounds (identity, TLS, or replay) for 5 minutes. Check peer certificates and clock skew before assuming an attack."
+
+      - alert: SBProxyModelHostAdmissionCrashLoop
+        expr: increase(sbproxy_model_host_admission_rejections_total{reason="crash_loop"}[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Model-host deployment {{ $labels.deployment }} is crash-looping"
+          description: "Deployment {{ $labels.deployment }} has exhausted its engine launch budget and is rejecting admission for 5 minutes. Check the engine logs and reset the crash-loop budget once the underlying failure is fixed."
+
       - alert: SBProxyAIBudgetNearExhaustion
         expr: max by (scope) (sbproxy_ai_budget_utilization_ratio) > 0.9
         for: 5m

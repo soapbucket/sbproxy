@@ -364,6 +364,38 @@ async fn digest_mismatch_leaves_no_ready_snapshot_or_partial_bytes() {
         .any(|job| job.state == OperationState::Failed));
 }
 
+#[derive(Default)]
+struct ArtifactErrorObserver {
+    kind: Mutex<Option<&'static str>>,
+}
+
+impl ArtifactObserver for ArtifactErrorObserver {
+    fn on_job(&self, _job: &OperationJob) {}
+    fn on_artifact_error(&self, kind: &'static str) {
+        *self.kind.lock().unwrap() = Some(kind);
+    }
+}
+
+#[tokio::test]
+async fn digest_mismatch_reports_its_artifact_error_kind_to_the_observer() {
+    let directory = tempdir().expect("temp dir");
+    let served = BTreeMap::from([("weights.safetensors".to_string(), b"wrong bytes".to_vec())]);
+    let expected = BTreeMap::from([("weights.safetensors".to_string(), b"right bytes".to_vec())]);
+    let artifact = artifact('f', &expected);
+    let transport = Arc::new(FakeTransport::new(served));
+    let observer = Arc::new(ArtifactErrorObserver::default());
+    let manager = ArtifactManager::new(directory.path(), transport)
+        .unwrap()
+        .with_observer(observer.clone());
+
+    let error = manager
+        .ensure(&artifact, context())
+        .await
+        .expect_err("digest mismatch fails acquisition");
+    assert!(matches!(error, ArtifactError::DigestMismatch { .. }));
+    assert_eq!(*observer.kind.lock().unwrap(), Some("digest_mismatch"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_managers_share_one_cross_process_artifact_lock() {
     let directory = tempdir().expect("temp dir");
