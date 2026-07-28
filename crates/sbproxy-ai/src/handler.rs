@@ -698,7 +698,7 @@ fn deserialize_routing<'de, D>(deserializer: D) -> Result<RoutingStrategy, D::Er
 where
     D: serde::Deserializer<'de>,
 {
-    use crate::routing::{CascadeConfig, CascadeTier};
+    use crate::routing::{CascadeConfig, CascadeTier, PeakEwmaConfig};
     use serde::de::Error;
 
     // Step 1: capture the raw input. Cascade carries a struct
@@ -745,6 +745,12 @@ where
             tiers: payload.tiers,
             max_total_cost: payload.max_total_cost,
         }));
+    }
+
+    if strategy_name == "peak_ewma" {
+        let config: PeakEwmaConfig = serde_json::from_value(serde_json::Value::Object(obj.clone()))
+            .map_err(Error::custom)?;
+        return Ok(RoutingStrategy::PeakEwma(config));
     }
 
     // WOR-797: cost/quality routing carries cheap_provider /
@@ -937,7 +943,8 @@ impl AiHandlerConfig {
                 }
             }
         }
-        if let Some(compression) = &config.compression {
+        if let Some(compression) = &mut config.compression {
+            compression.apply_state_defaults();
             compression.validate(&config.providers)?;
         }
         for (index, key) in config.virtual_keys.iter().enumerate() {
@@ -1915,6 +1922,47 @@ mod tests {
             "allowed_models": ["some-future-model"]
         });
         assert!(AiHandlerConfig::from_config(json).is_ok());
+    }
+
+    // --- Peak EWMA routing deserialization ---
+
+    #[test]
+    fn peak_ewma_flat_form_uses_default_half_life() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "x"}],
+            "routing": "peak_ewma"
+        }))
+        .expect("flat peak_ewma parses");
+
+        let RoutingStrategy::PeakEwma(config) = config.routing else {
+            panic!("expected peak_ewma");
+        };
+        assert_eq!(config.half_life_secs, 10);
+    }
+
+    #[test]
+    fn peak_ewma_object_form_parses_half_life() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "x"}],
+            "routing": {"strategy": "peak_ewma", "half_life": "30s"}
+        }))
+        .expect("configured peak_ewma parses");
+
+        let RoutingStrategy::PeakEwma(config) = config.routing else {
+            panic!("expected peak_ewma");
+        };
+        assert_eq!(config.half_life_secs, 30);
+    }
+
+    #[test]
+    fn peak_ewma_rejects_zero_half_life() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "x"}],
+            "routing": {"strategy": "peak_ewma", "half_life": 0}
+        }))
+        .expect_err("zero half-life must fail");
+
+        assert!(error.to_string().contains("half_life"));
     }
 
     // --- Cascade routing deserialization ---

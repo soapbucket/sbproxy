@@ -8,17 +8,31 @@ runs, and what the expected wall-clock numbers are. Companion to
 
 ## Container image layout
 
-Two Dockerfiles live at the repo root and share the same layered
+Four Dockerfiles live at the repo root and share the same layered
 cargo-chef layout:
 
 | File | Purpose | Consumer |
 |---|---|---|
 | `Dockerfile.cloudbuild` | Cloud Build / GCR amd64 image. | `gcloud builds submit`; bench loadtest stack. |
 | `Dockerfile.ci` | Kind-based smoke-test image. | `make k8s-operator-smoke`. |
+| `Dockerfile.gateway` | Gateway/authority fleet image: no CUDA. | `ClusterRole::Gateway` and `ClusterRole::Authority` nodes. |
+| `Dockerfile.worker` | Worker fleet image: CUDA runtime + bundled vLLM. | `ClusterRole::Worker` nodes. |
 
-The two files share a five-stage Rust spine; `Dockerfile.ci` is
-exactly that spine, and `Dockerfile.cloudbuild` adds two stages of its
-own (**admin-ui** and **cert-gen**) for seven total:
+`Dockerfile.gateway` and `Dockerfile.worker` are forks of
+`Dockerfile.cloudbuild`: identical through the `builder` stage, and
+diverge only in the final runtime stage (gateway keeps cloudbuild's
+distroless base; worker swaps in a CUDA base with vLLM installed). They
+build the two image shapes a `proxy.cluster` fleet needs, split along
+`ClusterRole` (see `crates/sbproxy-config/src/cluster.rs`): a
+containerized rollout is separate work from the curl-install VM path in
+[`deploy/aws/README.md`](../deploy/aws/README.md) and
+[`deploy/azure/README.md`](../deploy/azure/README.md).
+
+`Dockerfile.cloudbuild` and `Dockerfile.ci` share a five-stage Rust
+spine; `Dockerfile.ci` is exactly that spine, and `Dockerfile.cloudbuild`
+adds two stages of its own (**admin-ui** and **cert-gen**) for seven
+total. `Dockerfile.gateway` and `Dockerfile.worker` reuse the same spine
+through `builder` (see above) rather than repeating it here:
 
 1. **chef-base**: `rust:1.94-bookworm` plus the apt deps (`pkg-config`,
    `libclang-dev`, `build-essential`, `cmake`, `perl`) plus a pinned

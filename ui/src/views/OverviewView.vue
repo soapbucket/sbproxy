@@ -18,11 +18,16 @@ const modelHost = useAsync(() => api.modelHostStatus(), {
   pollMs: 30_000,
   refreshLabel: "Model host status",
 });
+const clusterVram = useAsync(() => api.clusterVram(), {
+  pollMs: 30_000,
+  refreshLabel: "Cluster VRAM",
+});
 
 function refresh() {
   health.run();
   stats.run();
   modelHost.run();
+  clusterVram.run();
 }
 onMounted(refresh);
 
@@ -177,6 +182,38 @@ function optionalNumber(v: unknown): number | undefined {
         </tbody>
       </table>
     </template>
+  </section>
+
+  <!-- Cluster VRAM -->
+  <section class="section">
+    <h2>Cluster VRAM</h2>
+    <ErrorState
+      v-if="clusterVram.error.value"
+      :error="clusterVram.error.value"
+      @retry="clusterVram.run"
+    />
+    <EmptyState
+      v-else-if="!clusterVram.loading.value && !clusterVram.data.value?.cluster.node_count"
+      message="No cluster VRAM data yet. This node may not be in distributed mode, or no worker has reported a device snapshot."
+    />
+    <div class="grid" v-else>
+      <StatCard
+        label="Total VRAM"
+        :value="formatBytes(clusterVram.data.value?.cluster.total_bytes)"
+      />
+      <StatCard
+        label="Used VRAM"
+        :value="formatBytes(clusterVram.data.value?.cluster.used_bytes)"
+      />
+      <StatCard
+        label="Free VRAM"
+        :value="formatBytes(clusterVram.data.value?.cluster.free_bytes)"
+      />
+      <StatCard
+        label="Nodes reporting"
+        :value="clusterVram.data.value?.cluster.node_count ?? 0"
+      />
+    </div>
   </section>
 </template>
 

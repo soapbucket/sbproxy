@@ -9,6 +9,12 @@ const routes = [
     meta: { title: "Overview" },
   },
   {
+    path: "/get-started",
+    name: "get-started",
+    component: () => import("./views/GetStartedView.vue"),
+    meta: { title: "Get started" },
+  },
+  {
     path: "/keys",
     name: "keys",
     component: () => import("./views/KeysView.vue"),
@@ -97,6 +103,12 @@ const routes = [
     name: "model-host",
     component: () => import("./views/ModelHostView.vue"),
     meta: { title: "Model host" },
+  },
+  {
+    path: "/jobs",
+    name: "jobs",
+    component: () => import("./views/JobsView.vue"),
+    meta: { title: "Jobs" },
   },
   {
     path: "/storage",

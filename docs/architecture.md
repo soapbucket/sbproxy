@@ -399,11 +399,11 @@ The legacy default-only compatibility pipeline retains its old cache scope.
 
 `window_fit` is stateless. Explicit-budget fitting preserves the leading
 instruction prefix, newest protocol unit, contiguous recent suffix, and tool
-call/result groups. `summary_buffer` has external state, but its canonical
-record exists only in Redis. Workers keep no canonical conversational state,
-and the cluster mesh is not accepted as a summary backend. Admin deletion and
-purge operate on the same fenced Redis record. There is no OmniRoute runtime,
-import, or migration seam.
+call/result groups. `summary_buffer` defaults to a process-owned Local redb
+store and accepts explicit Redis or mesh state. Redis serializes updates across
+processes; mesh uses the replicated substrate's eventual last-writer-wins
+contract. Admin deletion and purge operate on the same selected store. There is
+no OmniRoute runtime, import, or migration seam.
 
 Compression produces pending per-lever value after it changes the message list.
 The response phase commits that value only for a billable terminal provider
@@ -447,7 +447,7 @@ adapters (Hugging Face TGI, LM Studio, llama.cpp).
 | `prefix_affinity`   | Hash the prompt prefix to a provider so shared-prefix sessions land on the same upstream cache. |
 | `sticky`            | Pin a session key to one provider. Falls back to round robin without a session key. |
 | `race`              | Fan out to every healthy provider in parallel; first non-error response wins, the rest are cancelled. |
-| `peak_ewma`         | Power-of-two-choices over observed latency: sample two eligible providers, route to the recently faster one. |
+| `peak_ewma`         | Power-of-two-choices over time-decayed peak latency and in-flight load: sample two eligible providers, route to the lower effective cost. |
 | `cascade`           | Tiered dispatch from cheapest to most expensive (provider, model) pairs; a response below the tier's quality threshold retries on the next tier. |
 | `cost_quality`      | Score the prompt's difficulty and route simple prompts to a cheap model, hard prompts to a frontier model, on a `cost_threshold` dial. |
 | `outcome_aware`     | Route on realized cost-per-success; see [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md). |

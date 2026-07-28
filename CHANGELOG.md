@@ -12,6 +12,14 @@ the next version cut.
 
 ### Added
 
+- **AI routing and state now carry production authority end to end.** Peak
+  EWMA routing tracks complete provider attempts with configurable decay;
+  Realtime WebSocket upgrades replace caller credentials with one trusted
+  provider credential and apply governed-key budget admission; stateful
+  context compression defaults to a private, restart-durable Local redb store
+  while retaining explicit Redis and mesh choices; and verified crawler CAPs
+  enforce bounded per-subject request rates before policy evaluation while
+  exempting approved traffic from ledger pricing.
 - **Classifier safety guardrails now ship calibrated default centroids.**
   `toxicity`, `jailbreak`, and `content_safety` classifier mode no longer
   requires operator examples. Optional examples extend the versioned

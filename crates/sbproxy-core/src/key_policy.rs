@@ -37,7 +37,9 @@ pub struct StoredPolicyError {
 
 impl StoredPolicyError {
     fn new(kind: StoredPolicyErrorKind) -> Self {
-        Self { kind }
+        let error = Self { kind };
+        sbproxy_observe::metrics::record_key_policy_stored_rejection(error.safe_reason());
+        error
     }
 
     /// Bounded error category suitable for tests and programmatic handling.

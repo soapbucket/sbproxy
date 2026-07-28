@@ -95,7 +95,7 @@ pub use ratelimit::{
     Admission, ModelRateConfig, ModelRateLimiter, RejectReason, Rejection, SurfaceRateConfig,
     SurfaceRateLimiter, DEFAULT_ESTIMATED_TOKENS, DEFAULT_MAX_KEYS,
 };
-pub use routing::{FilteredSelectionFallback, Router, RoutingStrategy};
+pub use routing::{FilteredSelectionFallback, PeakEwmaConfig, Router, RoutingStrategy};
 pub use semantic_cache::{
     CachedAiResponse, CachedHttpResponse, EmbeddingCache, EmbeddingCacheConfig, EmbeddingHit,
     SemanticCache,

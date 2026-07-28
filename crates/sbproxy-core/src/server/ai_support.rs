@@ -818,6 +818,30 @@ pub(crate) fn budget_scope_keys(
     )
 }
 
+/// Build the request's budget scope keys, fetch any cluster-shared usage,
+/// and apply the existing budget gate.
+///
+/// Callers retain ownership of model rewrites, response handling, and
+/// soft-landing behavior. Keeping those concerns outside this helper lets the
+/// regular HTTP and realtime admission paths share hard-limit semantics
+/// without changing their dispatch-specific behavior.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn scoped_budget_preflight(
+    cfg: &sbproxy_ai::BudgetConfig,
+    providers: &[sbproxy_ai::ProviderConfig],
+    workspace_id: &str,
+    api_key: Option<&str>,
+    user: Option<&str>,
+    model: Option<&str>,
+    origin: Option<&str>,
+    tag: Option<&str>,
+) -> (Vec<(usize, String)>, BudgetGate) {
+    let keys = budget_scope_keys(cfg, workspace_id, api_key, user, model, origin, tag);
+    let shared_spend = super::budget_share::read_shared_for_keys(&keys).await;
+    let gate = budget_preflight(cfg, &keys, providers, &shared_spend);
+    (keys, gate)
+}
+
 /// [`budget_scope_keys`] with an explicit clock so the rolling-window
 /// bucketing is deterministic under test. `now_unix_secs` is the UTC Unix
 /// time used to pick each limit's window bucket.
@@ -1003,6 +1027,186 @@ pub(crate) fn budget_preflight(
         }
     }
     BudgetGate::Allow
+}
+
+pub(super) fn realtime_model_from_uri(uri: &http::Uri) -> Option<String> {
+    url::form_urlencoded::parse(uri.query()?.as_bytes())
+        .find_map(|(name, value)| (name == "model").then(|| value.into_owned()))
+}
+
+pub(super) fn replace_realtime_model_query(
+    uri: &http::Uri,
+    model: &str,
+) -> Result<http::Uri, http::uri::InvalidUri> {
+    let mut parameters: Vec<(String, String)> =
+        url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+            .filter(|(name, _)| name != "model")
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect();
+    parameters.push(("model".to_string(), model.to_string()));
+
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(parameters)
+        .finish();
+    format!("{}?{}", uri.path(), query).parse()
+}
+
+#[cfg(test)]
+mod budget_preflight_tests {
+    use super::{budget_preflight, scoped_budget_preflight, BudgetGate};
+    use sbproxy_ai::budget::{BudgetConfig, BudgetLimit, BudgetScope, OnExceedAction};
+    use sbproxy_ai::UsageRecord;
+    use std::collections::HashMap;
+
+    fn workspace_budget(action: OnExceedAction, downgrade_to: Option<&str>) -> BudgetConfig {
+        BudgetConfig {
+            limits: vec![BudgetLimit {
+                scope: BudgetScope::Workspace,
+                max_tokens: Some(100),
+                max_cost_usd: None,
+                period: Some("total".to_string()),
+                downgrade_to: downgrade_to.map(str::to_string),
+            }],
+            on_exceed: action,
+            soft_landing: None,
+        }
+    }
+
+    fn exceeded_shared_usage(key: &str) -> HashMap<String, UsageRecord> {
+        HashMap::from([(
+            key.to_string(),
+            UsageRecord {
+                tokens: 100,
+                cost_usd: 0.0,
+                request_count: 1,
+            },
+        )])
+    }
+
+    #[test]
+    fn budget_preflight_log_allows_an_exceeded_scope() {
+        let key = "workspace:budget-preflight-log";
+        let gate = budget_preflight(
+            &workspace_budget(OnExceedAction::Log, None),
+            &[(0, key.to_string())],
+            &[],
+            &exceeded_shared_usage(key),
+        );
+
+        assert!(matches!(gate, BudgetGate::Allow));
+    }
+
+    #[test]
+    fn budget_preflight_block_returns_the_existing_402_json() {
+        let key = "workspace:budget-preflight-block";
+        let gate = budget_preflight(
+            &workspace_budget(OnExceedAction::Block, None),
+            &[(0, key.to_string())],
+            &[],
+            &exceeded_shared_usage(key),
+        );
+
+        let BudgetGate::Block { status, body } = gate else {
+            panic!("expected budget block");
+        };
+        assert_eq!(status, 402);
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("budget JSON");
+        assert_eq!(body["error"]["type"], "budget_exceeded");
+        assert_eq!(body["error"]["scope"], "workspace");
+        assert_eq!(body["error"]["message"], "token limit exceeded: 100 >= 100");
+    }
+
+    #[test]
+    fn budget_preflight_downgrade_returns_the_configured_model() {
+        let key = "workspace:budget-preflight-downgrade";
+        let gate = budget_preflight(
+            &workspace_budget(OnExceedAction::Downgrade, Some("gpt-4o-mini")),
+            &[(0, key.to_string())],
+            &[],
+            &exceeded_shared_usage(key),
+        );
+
+        assert!(matches!(
+            gate,
+            BudgetGate::Downgrade { model } if model == "gpt-4o-mini"
+        ));
+    }
+
+    #[tokio::test]
+    async fn budget_preflight_scoped_helper_builds_keys_and_preserves_the_gate() {
+        let cfg = BudgetConfig {
+            limits: vec![BudgetLimit {
+                scope: BudgetScope::Workspace,
+                max_tokens: Some(0),
+                max_cost_usd: None,
+                period: Some("total".to_string()),
+                downgrade_to: None,
+            }],
+            on_exceed: OnExceedAction::Block,
+            soft_landing: None,
+        };
+
+        let (keys, gate) = scoped_budget_preflight(
+            &cfg,
+            &[],
+            "budget-preflight-scoped",
+            None,
+            None,
+            None,
+            Some("budget-preflight-scoped"),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            keys,
+            vec![(0, "workspace:budget-preflight-scoped".to_string())]
+        );
+        assert!(matches!(gate, BudgetGate::Block { status: 402, .. }));
+    }
+}
+
+#[cfg(test)]
+mod realtime_model_query_tests {
+    use super::{realtime_model_from_uri, replace_realtime_model_query};
+
+    #[test]
+    fn realtime_model_query_decodes_the_first_value() {
+        let uri: http::Uri = "/v1/realtime?model=gpt-4o%2Frealtime&model=ignored"
+            .parse()
+            .expect("URI");
+
+        assert_eq!(
+            realtime_model_from_uri(&uri).as_deref(),
+            Some("gpt-4o/realtime")
+        );
+    }
+
+    #[test]
+    fn realtime_model_override_adds_a_missing_parameter() {
+        let uri: http::Uri = "/v1/realtime?voice=alloy".parse().expect("URI");
+
+        let replaced = replace_realtime_model_query(&uri, "gpt-4o-mini").expect("rewritten URI");
+
+        assert_eq!(
+            replaced.path_and_query().map(|value| value.as_str()),
+            Some("/v1/realtime?voice=alloy&model=gpt-4o-mini")
+        );
+    }
+
+    #[test]
+    fn realtime_model_override_replaces_duplicates_and_encodes_the_value() {
+        let uri: http::Uri = "/v1/realtime?model=first&voice=alloy&model=second"
+            .parse()
+            .expect("URI");
+
+        let replaced = replace_realtime_model_query(&uri, "gpt 4o/mini").expect("rewritten URI");
+
+        assert_eq!(
+            replaced.path_and_query().map(|value| value.as_str()),
+            Some("/v1/realtime?voice=alloy&model=gpt+4o%2Fmini")
+        );
+    }
 }
 
 /// Stable label for the budget metric `scope` dimension.

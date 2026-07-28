@@ -130,6 +130,16 @@ describe("model management component contracts", () => {
     expect(notices).toContain('role="alert"');
   });
 
+  it("renders cluster placement assignments and live fleet replica load", () => {
+    const table = source("ModelDeploymentTable.vue");
+    expect(table).toContain("assignmentNodesText");
+    expect(table).toContain("row.assignment.assignments");
+    expect(table).toContain("No cluster placement yet");
+    expect(table).toContain("liveReplicaSummary");
+    expect(table).toContain("row.liveReplicas");
+    expect(table).toContain("across the fleet");
+  });
+
   it("wraps long machine values in the modal, evidence, table, and notices", () => {
     for (const component of [
       "ModelDeploymentModal.vue",

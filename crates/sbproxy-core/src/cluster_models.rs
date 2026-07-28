@@ -92,13 +92,76 @@ pub fn placement_input_from_directory(
 }
 
 /// Persist target generation high-water marks before a placement commit.
+///
+/// Also records newly-observed per-node placement rejections in the
+/// just-computed plan, by deployment and bounded reason. Every commit
+/// runs the full planner, so this sees the plan's complete, final
+/// rejection set rather than one candidate rejection mid-evaluation.
 pub fn persist_deployment_generations(
     placement: &sbproxy_model_host::ClusterPlacementState,
 ) -> Result<()> {
+    record_new_placement_rejections(placement);
     if let Some(store) = deployment_generation_store()? {
         store.persist(placement)?;
     }
     Ok(())
+}
+
+type RejectionKey = (String, String);
+
+/// The (deployment, node) -> reason rejection set observed on the
+/// previous commit, so [`record_new_placement_rejections`] can tell a
+/// fresh rejection from one that is still standing.
+fn previous_placement_rejections(
+) -> &'static std::sync::Mutex<BTreeMap<RejectionKey, sbproxy_model_host::PlacementRejectionReason>>
+{
+    static PREVIOUS: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<RejectionKey, sbproxy_model_host::PlacementRejectionReason>>,
+    > = std::sync::OnceLock::new();
+    PREVIOUS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Record only rejections that are new since the last commit: a
+/// (deployment, node) pair that was not rejected before, or one whose
+/// reason changed. `persist_deployment_generations` runs on every
+/// reconcile commit, and a node can stay rejected for the same reason
+/// across many consecutive commits (e.g. persistently unhealthy); counting
+/// every commit's full standing rejection set would make this Counter
+/// measure reconcile-loop frequency rather than actual rejection events.
+fn record_new_placement_rejections(placement: &sbproxy_model_host::ClusterPlacementState) {
+    let mut previous = previous_placement_rejections()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut current = BTreeMap::new();
+    for (deployment_id, status) in placement.deployments() {
+        for (node_id, reason) in &status.target.rejections {
+            current.insert((deployment_id.clone(), node_id.clone()), *reason);
+        }
+    }
+    for ((deployment_id, _node_id), reason) in new_rejections_since(&previous, &current) {
+        sbproxy_observe::metrics::record_model_host_placement_rejection(
+            &deployment_id,
+            reason.as_str(),
+        );
+    }
+    *previous = current;
+}
+
+/// Pure diff: every entry in `current` that is absent from `previous`, or
+/// present there under a different reason. Split out from
+/// [`record_new_placement_rejections`] so the actual dedupe-on-transition
+/// logic is unit-testable without constructing a full
+/// `ClusterPlacementState` (which has no public builder outside the
+/// planner).
+fn new_rejections_since(
+    previous: &BTreeMap<RejectionKey, sbproxy_model_host::PlacementRejectionReason>,
+    current: &BTreeMap<RejectionKey, sbproxy_model_host::PlacementRejectionReason>,
+) -> Vec<(RejectionKey, sbproxy_model_host::PlacementRejectionReason)> {
+    current
+        .iter()
+        .filter(|(key, reason)| previous.get(*key) != Some(*reason))
+        .map(|(key, reason)| (key.clone(), *reason))
+        .collect()
 }
 
 fn deployment_generation_store() -> Result<Option<sbproxy_model_host::FileDeploymentGenerationStore>>
@@ -107,4 +170,72 @@ fn deployment_generation_store() -> Result<Option<sbproxy_model_host::FileDeploy
         .map(sbproxy_model_host::FileDeploymentGenerationStore::open)
         .transpose()
         .map_err(anyhow::Error::from)
+}
+
+#[cfg(test)]
+mod placement_rejection_dedupe_tests {
+    use super::*;
+    use sbproxy_model_host::PlacementRejectionReason;
+
+    fn key(deployment: &str, node: &str) -> RejectionKey {
+        (deployment.to_string(), node.to_string())
+    }
+
+    #[test]
+    fn a_standing_rejection_with_the_same_reason_is_not_reported_again() {
+        let previous = BTreeMap::from([(
+            key("qwen3-32b", "worker-a"),
+            PlacementRejectionReason::NoCapacity,
+        )]);
+        let current = previous.clone();
+        assert!(new_rejections_since(&previous, &current).is_empty());
+    }
+
+    #[test]
+    fn a_brand_new_rejection_is_reported() {
+        let previous = BTreeMap::new();
+        let current = BTreeMap::from([(
+            key("qwen3-32b", "worker-a"),
+            PlacementRejectionReason::NoCapacity,
+        )]);
+        assert_eq!(
+            new_rejections_since(&previous, &current),
+            vec![(
+                key("qwen3-32b", "worker-a"),
+                PlacementRejectionReason::NoCapacity
+            )]
+        );
+    }
+
+    #[test]
+    fn a_reason_change_on_the_same_node_is_reported_as_new() {
+        let previous = BTreeMap::from([(
+            key("qwen3-32b", "worker-a"),
+            PlacementRejectionReason::NoCapacity,
+        )]);
+        let current = BTreeMap::from([(
+            key("qwen3-32b", "worker-a"),
+            PlacementRejectionReason::NodeUnhealthy,
+        )]);
+        assert_eq!(
+            new_rejections_since(&previous, &current),
+            vec![(
+                key("qwen3-32b", "worker-a"),
+                PlacementRejectionReason::NodeUnhealthy
+            )]
+        );
+    }
+
+    #[test]
+    fn a_cleared_rejection_reports_nothing_and_is_not_treated_as_new_later() {
+        // Cleared entirely (the node stopped being rejected): current has
+        // no entry for it at all, so nothing about it is reported, and it
+        // must not resurrect as "new" if it never reappears.
+        let previous = BTreeMap::from([(
+            key("qwen3-32b", "worker-a"),
+            PlacementRejectionReason::NoCapacity,
+        )]);
+        let current = BTreeMap::new();
+        assert!(new_rejections_since(&previous, &current).is_empty());
+    }
 }

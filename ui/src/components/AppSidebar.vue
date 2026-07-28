@@ -5,6 +5,7 @@ const { username, role, logout } = useAuth();
 
 const nav = [
   { to: "/", label: "overview" },
+  { to: "/get-started", label: "get started" },
   { to: "/keys", label: "keys" },
   { to: "/credentials", label: "credentials" },
   { to: "/config", label: "config" },
@@ -20,6 +21,7 @@ const nav = [
   { to: "/cache", label: "cache" },
   { to: "/compression", label: "compression" },
   { to: "/model-host", label: "model host" },
+  { to: "/jobs", label: "jobs" },
   { to: "/storage", label: "storage" },
   { to: "/audit", label: "audit" },
   { to: "/users", label: "users" },

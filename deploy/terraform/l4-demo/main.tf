@@ -122,11 +122,17 @@ resource "google_compute_instance" "demo" {
     # release mode it curl-installs the binary and lets sbproxy acquire
     # the engine, then auto-starts (plain HTTP) or waits for DNS (TLS).
     startup-script = file("${path.module}/${local.startup_script}")
-    sbproxy-config = local.sbproxy_config
-    install-url    = var.install_url
-    auto-start     = tostring(local.auto_start)
-    repo-url       = var.repo_url # source mode only
-    ssh-keys       = "${var.ssh_user}:${var.ssh_public_key}"
+    # release mode's startup-script (startup-release.sh) is a thin GCP
+    # wrapper: the actual install/validate/start logic is the
+    # cloud-agnostic bootstrap-generic.sh, delivered as its own metadata
+    # attribute since GCE only executes one file's content as the
+    # instance startup-script.
+    bootstrap-generic-script = file("${path.module}/bootstrap-generic.sh")
+    sbproxy-config           = local.sbproxy_config
+    install-url              = var.install_url
+    auto-start               = tostring(local.auto_start)
+    repo-url                 = var.repo_url # source mode only
+    ssh-keys                 = "${var.ssh_user}:${var.ssh_public_key}"
     # DLVM images install the NVIDIA driver on first boot when this is set.
     install-nvidia-driver = "True"
   }

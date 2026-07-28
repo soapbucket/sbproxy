@@ -4,7 +4,7 @@
 //! Process-wide managed model runtime and atomic desired-state reconciliation.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,10 +21,10 @@ use crate::{
     BackoffPolicy, Catalog, CompiledDeployment, DeploymentRevision, DeploymentRevisionDraft,
     DeploymentRoute, DeploymentSourceMode, EngineAccel, EngineAvailability, EngineDriver,
     EngineDriverError, EngineFailureReason, EngineHealth, EngineKind, EngineLaunchMethod,
-    EngineProvisioning, FileDeploymentRevisionStore, GpuProbe, KvCacheQuant, LaunchRequest,
-    LegacyHostPolicy, LlamaCppDriver, ModelMetadata, ModelMetadataProvider, NetworkPolicy,
-    OperationJob, ProvisionRequest, PullIntent, ResolveArtifactRequest, RunningEngine,
-    RuntimeDesiredState, SGLangDriver, VllmDriver, WorkerProfile,
+    EngineProvisioning, FileDeploymentRevisionStore, FileJobStore, GpuProbe, KvCacheQuant,
+    LaunchRequest, LegacyHostPolicy, LlamaCppDriver, ModelMetadata, ModelMetadataProvider,
+    NetworkPolicy, OperationJob, ProvisionRequest, PullIntent, ResolveArtifactRequest,
+    RunningEngine, RuntimeDesiredState, SGLangDriver, VllmDriver, WorkerProfile,
 };
 
 /// Extra readiness re-probes before a ready engine is declared unhealthy.
@@ -432,6 +432,10 @@ struct DeploymentSlot {
     observer: Arc<dyn crate::ModelHostObserver>,
     engine: Option<EngineKind>,
     observed: AtomicBool,
+    /// Requests currently blocked on the model-preparation limiter in
+    /// [`Self::memory_estimate`], i.e. queued behind another in-flight
+    /// cold load for this deployment.
+    queue_waiters: AtomicI64,
     lifecycle: Mutex<SlotLifecycle>,
 }
 
@@ -443,6 +447,24 @@ impl std::fmt::Debug for DeploymentSlot {
             .field("generation", &self.generation)
             .field("desired", &self.desired)
             .finish_non_exhaustive()
+    }
+}
+
+/// Decrements `queue_waiters` and republishes the gauge on drop, armed
+/// before the limiter wait so a client disconnect that drops the
+/// `memory_estimate` future mid-await (cancelling `acquire_owned`) still
+/// releases the count. Without this, a cancelled wait would leave the
+/// increment permanently unmatched and the gauge stuck high.
+struct QueueWaiterGuard<'a> {
+    id: &'a str,
+    queue_waiters: &'a AtomicI64,
+    observer: &'a dyn crate::ModelHostObserver,
+}
+
+impl Drop for QueueWaiterGuard<'_> {
+    fn drop(&mut self) {
+        let waiting = self.queue_waiters.fetch_sub(1, Ordering::SeqCst) - 1;
+        self.observer.set_load_queue_depth(self.id, waiting);
     }
 }
 
@@ -476,6 +498,7 @@ impl DeploymentSlot {
             observer,
             engine,
             observed: AtomicBool::new(false),
+            queue_waiters: AtomicI64::new(0),
             lifecycle: Mutex::new(SlotLifecycle {
                 start_epoch: 0,
                 state: DeploymentRuntimeState::Configured,
@@ -585,7 +608,19 @@ impl DeploymentSlot {
             self.admission.resume();
         }
         self.publish_lifecycle_state().await;
-        let result = match limiter.acquire_owned().await {
+        let waiting = self.queue_waiters.fetch_add(1, Ordering::SeqCst) + 1;
+        self.observer.set_load_queue_depth(&self.id, waiting);
+        // Armed before the await: a dropped future (client disconnect)
+        // still runs the decrement, unlike the bare fetch_sub this
+        // replaced, which only ran on a completed await.
+        let waiter_guard = QueueWaiterGuard {
+            id: &self.id,
+            queue_waiters: &self.queue_waiters,
+            observer: self.observer.as_ref(),
+        };
+        let acquired = limiter.acquire_owned().await;
+        drop(waiter_guard);
+        let result = match acquired {
             Ok(_permit) => self.runtime.memory_estimate(intent).await,
             Err(_) => Err(RuntimeManagerError::Prepare(
                 "model preparation limiter is closed".to_string(),
@@ -2917,6 +2952,13 @@ impl ProductionDeploymentPreparer {
         self.artifacts.cached_artifacts()
     }
 
+    /// The durable operation job store backing this preparer's artifact
+    /// cache. Passthrough to [`ArtifactManager::jobs`] so admin surfaces can
+    /// list and poll operations without holding an `ArtifactManager`.
+    pub fn jobs(&self) -> &FileJobStore {
+        self.artifacts.jobs()
+    }
+
     /// Snapshot path-free worker hardware, engine, and verified-cache truth.
     pub fn node_snapshot_inventory(
         &self,
@@ -4340,5 +4382,49 @@ mod provisioning_tests {
         let resolved = provisioning_for(&node, EngineKind::Vllm, true);
         assert_eq!(resolved.launch, EngineLaunchMethod::Venv);
         assert!(resolved.image.is_none());
+    }
+}
+
+#[cfg(test)]
+mod queue_waiter_guard_tests {
+    use super::*;
+    use crate::runtime::ModelHostObserver;
+
+    #[derive(Default)]
+    struct LastDepthObserver {
+        last: std::sync::Mutex<Option<i64>>,
+    }
+    impl crate::ModelHostObserver for LastDepthObserver {
+        fn set_load_queue_depth(&self, _model: &str, depth: i64) {
+            *self.last.lock().expect("last-depth lock") = Some(depth);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_future_dropped_mid_wait_still_releases_the_queue_waiter_count() {
+        // Reproduces a client disconnect during `limiter.acquire_owned().await`:
+        // the holding future is dropped without ever completing the wait.
+        let queue_waiters = AtomicI64::new(0);
+        let observer = LastDepthObserver::default();
+
+        queue_waiters.fetch_add(1, Ordering::SeqCst);
+        observer.set_load_queue_depth("m", 1);
+
+        let held = async {
+            let _guard = QueueWaiterGuard {
+                id: "m",
+                queue_waiters: &queue_waiters,
+                observer: &observer,
+            };
+            std::future::pending::<()>().await;
+        };
+
+        // `held` never resolves on its own, so the timeout always wins and
+        // tokio drops `held` (and the guard inside it) in place, exactly
+        // like a cancelled `memory_estimate` call.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1), held).await;
+
+        assert_eq!(queue_waiters.load(Ordering::SeqCst), 0);
+        assert_eq!(*observer.last.lock().expect("last-depth lock"), Some(0));
     }
 }

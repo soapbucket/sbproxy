@@ -19,6 +19,8 @@ pub const ENROLL_PATH: &str = "/admin/cluster/enroll";
 pub const STATUS_PATH: &str = "/admin/cluster/status";
 /// Authenticated signed cluster deployment read and publication endpoint.
 pub const DEPLOYMENTS_PATH: &str = "/admin/cluster/deployments";
+/// Authenticated cluster-wide VRAM aggregation endpoint.
+pub const VRAM_PATH: &str = "/admin/cluster/vram";
 const METRICS_PATH: &str = "/admin/cluster/metrics";
 const ARTIFACTS_PATH: &str = "/admin/cluster/artifacts";
 /// Authenticated replicated-state listing and replicated delete (WOR-1947).
@@ -126,6 +128,37 @@ struct ClusterNodeAlert {
     model_endpoint: Option<String>,
 }
 
+/// Fleet-wide VRAM totals: the sum of every node's device totals below.
+#[derive(Debug, Clone, Default, Serialize)]
+struct ClusterVramSummary {
+    total_bytes: u64,
+    used_bytes: u64,
+    free_bytes: u64,
+    device_count: usize,
+    node_count: usize,
+}
+
+/// One node's VRAM contribution, reusing the same per-node
+/// `VramStatus`/`DeviceVram` shape `GET /admin/model-host/status` reports
+/// locally (`sbproxy_model_host::runtime`), so a client already parsing
+/// that shape needs no second type. Here `budget_bytes` is this node's
+/// summed device total (not the single-largest-device residency budget
+/// the local route means by the same field).
+#[derive(Debug, Clone, Serialize)]
+struct ClusterVramNode {
+    node_id: String,
+    vram: sbproxy_model_host::VramStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterVramResponse {
+    schema_version: u32,
+    generated_at_unix_ms: u64,
+    directory_collected_at_unix_ms: Option<u64>,
+    cluster: ClusterVramSummary,
+    nodes: Vec<ClusterVramNode>,
+}
+
 /// Whether a path uses its enrollment token instead of admin credentials.
 pub fn is_public_enrollment_path(path: &str) -> bool {
     path.split('?').next() == Some(ENROLL_PATH)
@@ -142,6 +175,7 @@ pub fn dispatch(
     match path {
         STATUS_PATH => Some(dispatch_status(method)),
         DEPLOYMENTS_PATH => Some(dispatch_deployments(method, body)),
+        VRAM_PATH => Some(dispatch_vram(method)),
         METRICS_PATH => Some(dispatch_metrics(method)),
         ARTIFACTS_PATH => Some(dispatch_artifacts(method)),
         ENROLL_PATH => Some(dispatch_enrollment(method, body)),
@@ -572,6 +606,107 @@ fn dispatch_status_with_placement(
             tracing::error!(%error, "serialize cluster status response");
             json(500, serde_json::json!({"error": "cluster status failed"}))
         }
+    }
+}
+
+/// `GET /admin/cluster/vram`: fleet-wide VRAM aggregation. Unlike
+/// `dispatch_status`, this does not require a configured cluster owner;
+/// with no model directory available yet it answers an honest empty
+/// aggregate (zero nodes), the same "no data yet, not an error" pattern
+/// `files_response` uses for the local artifact cache.
+fn dispatch_vram(method: &str) -> (u16, &'static str, String) {
+    if !method.eq_ignore_ascii_case("GET") {
+        return json(405, serde_json::json!({"error": "method not allowed"}));
+    }
+    let view = crate::cluster::current_model_directory().map(|directory| directory.load());
+    cluster_vram_response(view.as_deref(), unix_time_ms())
+}
+
+fn cluster_vram_response(
+    view: Option<&sbproxy_ai::model_directory::ModelDirectoryView>,
+    now: u64,
+) -> (u16, &'static str, String) {
+    let response = build_cluster_vram_response(view, now);
+    match serde_json::to_string(&response) {
+        Ok(body) => (200, "application/json", body),
+        Err(error) => {
+            tracing::error!(%error, "serialize cluster vram response");
+            json(500, serde_json::json!({"error": "cluster vram failed"}))
+        }
+    }
+}
+
+/// Aggregate every node's device totals from the same `ModelDirectoryView`
+/// `cluster_status_response` / `status_node_from_directory` read below,
+/// off each node's retained `NodeModelSnapshot.devices`. Gated on
+/// `model_eligible`, not merely on `snapshot.is_some()`:
+/// `retain_last_snapshot` (`model_directory.rs`) keeps showing a stale,
+/// expired, unreachable, or malformed node's last-known snapshot (so
+/// other admin surfaces can still describe what it was last serving) but
+/// always clears `model_eligible` when it does that. Aggregating off
+/// `snapshot.is_some()` alone would keep counting a dead worker's
+/// last-known VRAM into the fleet total forever. A node that has never
+/// reported, or has since dropped out of eligibility, contributes
+/// nothing rather than a guessed or stale value.
+fn build_cluster_vram_response(
+    view: Option<&sbproxy_ai::model_directory::ModelDirectoryView>,
+    now: u64,
+) -> ClusterVramResponse {
+    let directory_collected_at_unix_ms = view
+        .filter(|view| view.collected_at_unix_ms > 0)
+        .map(|view| view.collected_at_unix_ms);
+    let nodes: Vec<ClusterVramNode> = view
+        .map(|view| view.nodes.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|node| {
+            if !node.model_eligible {
+                return None;
+            }
+            let snapshot = node.snapshot.as_ref()?;
+            let devices: Vec<sbproxy_model_host::DeviceVram> = snapshot
+                .devices
+                .iter()
+                .map(|device| sbproxy_model_host::DeviceVram {
+                    index: device.index,
+                    name: device.name.clone(),
+                    total_bytes: device.total_memory_bytes,
+                    free_bytes: device.available_memory_bytes,
+                    compute_utilization: device
+                        .compute_utilization_millis
+                        .map(|millis| f64::from(millis) / 1000.0),
+                    memory_occupancy: device
+                        .memory_occupancy_millis
+                        .map(|millis| f64::from(millis) / 1000.0),
+                })
+                .collect();
+            let total_bytes: u64 = devices.iter().map(|device| device.total_bytes).sum();
+            let free_bytes: u64 = devices.iter().map(|device| device.free_bytes).sum();
+            let used_bytes = total_bytes.saturating_sub(free_bytes);
+            Some(ClusterVramNode {
+                node_id: node.node_id.clone(),
+                vram: sbproxy_model_host::VramStatus {
+                    budget_bytes: total_bytes,
+                    used_bytes,
+                    free_bytes,
+                    devices,
+                },
+            })
+        })
+        .collect();
+    let cluster = ClusterVramSummary {
+        total_bytes: nodes.iter().map(|node| node.vram.budget_bytes).sum(),
+        used_bytes: nodes.iter().map(|node| node.vram.used_bytes).sum(),
+        free_bytes: nodes.iter().map(|node| node.vram.free_bytes).sum(),
+        device_count: nodes.iter().map(|node| node.vram.devices.len()).sum(),
+        node_count: nodes.len(),
+    };
+    ClusterVramResponse {
+        schema_version: 1,
+        generated_at_unix_ms: now,
+        directory_collected_at_unix_ms,
+        cluster,
+        nodes,
     }
 }
 
@@ -1432,6 +1567,261 @@ mod tests {
             dispatch_status_with("POST", handle, settings, None, 1_200).0,
             405
         );
+    }
+
+    #[test]
+    fn vram_route_is_method_aware() {
+        assert_eq!(dispatch_vram("POST").0, 405);
+    }
+
+    #[test]
+    fn vram_response_with_no_directory_is_an_honest_empty_aggregate() {
+        let response = build_cluster_vram_response(None, 1_200);
+        assert_eq!(response.nodes.len(), 0);
+        assert_eq!(response.cluster.node_count, 0);
+        assert_eq!(response.cluster.total_bytes, 0);
+        assert_eq!(response.directory_collected_at_unix_ms, None);
+    }
+
+    #[test]
+    fn vram_response_aggregates_device_totals_and_skips_nodes_without_a_snapshot() {
+        use sbproxy_ai::model_directory::{
+            DirectoryMember, DirectoryMemberState, DirectorySnapshotEnvelope,
+            DirectorySnapshotRead, ModelDirectory,
+        };
+        use sbproxy_model_host::node_snapshot::{
+            ModelPlaneHealth, NodeDeviceSnapshot, NodeHealthSnapshot, NodeHealthState,
+            NodeIdentitySnapshot, NodeModelSnapshot, NodeRole, NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+        };
+        use sbproxy_model_host::{AcceleratorKind, GpuVendor};
+
+        // worker-a reports two devices; worker-b is a live cluster member
+        // but has never published an accepted snapshot, so it must
+        // contribute nothing to the aggregate rather than a guessed value.
+        let snapshot = NodeModelSnapshot {
+            schema_version: NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+            node: NodeIdentitySnapshot {
+                node_id: "worker-a".to_string(),
+                roles: BTreeSet::from([NodeRole::Worker]),
+                labels: BTreeMap::new(),
+                model_endpoint: Some("https://worker-a.internal:9443".to_string()),
+            },
+            health: NodeHealthSnapshot {
+                state: NodeHealthState::Ready,
+                reason_codes: Vec::new(),
+                model_plane: ModelPlaneHealth::Ready,
+            },
+            engines: Vec::new(),
+            devices: vec![
+                NodeDeviceSnapshot {
+                    index: 0,
+                    vendor: GpuVendor::Nvidia,
+                    accelerator: Some(AcceleratorKind::Cuda),
+                    name: "H100".to_string(),
+                    total_memory_bytes: 80_000_000_000,
+                    available_memory_bytes: 20_000_000_000,
+                    compute_capability: None,
+                    supports_fp8: true,
+                    compute_utilization_millis: Some(250),
+                    memory_occupancy_millis: Some(750),
+                },
+                NodeDeviceSnapshot {
+                    index: 1,
+                    vendor: GpuVendor::Nvidia,
+                    accelerator: Some(AcceleratorKind::Cuda),
+                    name: "H100".to_string(),
+                    total_memory_bytes: 80_000_000_000,
+                    available_memory_bytes: 80_000_000_000,
+                    compute_capability: None,
+                    supports_fp8: true,
+                    compute_utilization_millis: None,
+                    memory_occupancy_millis: None,
+                },
+            ],
+            artifacts: Vec::new(),
+            replicas: Vec::new(),
+            placement_weight: 1,
+            active_deployment_digest: None,
+            generation: 1,
+            published_at_unix_ms: 1_000,
+            expires_at_unix_ms: 31_000,
+        };
+        let directory = ModelDirectory::new();
+        let view = directory
+            .refresh(
+                1_100,
+                vec![
+                    DirectoryMember {
+                        node_id: "worker-a".to_string(),
+                        address: Some("10.0.0.12:7946".to_string()),
+                        state: DirectoryMemberState::Alive,
+                        last_ack_age_ms: 25,
+                        incarnation: 1,
+                    },
+                    DirectoryMember {
+                        node_id: "worker-b".to_string(),
+                        address: Some("10.0.0.13:7946".to_string()),
+                        state: DirectoryMemberState::Alive,
+                        last_ack_age_ms: 25,
+                        incarnation: 1,
+                    },
+                ],
+                BTreeMap::from([(
+                    "worker-a".to_string(),
+                    DirectorySnapshotRead::Present(DirectorySnapshotEnvelope {
+                        publisher_node_id: "worker-a".to_string(),
+                        schema_version: NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+                        generation: 1,
+                        published_at_unix_ms: 1_000,
+                        expires_at_unix_ms: 31_000,
+                        authenticated_identity: None,
+                        payload: serde_json::to_value(snapshot).expect("snapshot JSON"),
+                    }),
+                )]),
+            )
+            .expect("directory view");
+
+        let response = build_cluster_vram_response(Some(&view), 1_200);
+
+        assert_eq!(response.schema_version, 1);
+        assert_eq!(response.directory_collected_at_unix_ms, Some(1_100));
+        assert_eq!(response.nodes.len(), 1);
+        assert_eq!(response.nodes[0].node_id, "worker-a");
+        assert_eq!(response.nodes[0].vram.devices.len(), 2);
+        assert_eq!(response.nodes[0].vram.budget_bytes, 160_000_000_000);
+        assert_eq!(response.nodes[0].vram.free_bytes, 100_000_000_000);
+        assert_eq!(response.nodes[0].vram.used_bytes, 60_000_000_000);
+        assert_eq!(response.cluster.node_count, 1);
+        assert_eq!(response.cluster.device_count, 2);
+        assert_eq!(response.cluster.total_bytes, 160_000_000_000);
+        assert_eq!(response.cluster.free_bytes, 100_000_000_000);
+        assert_eq!(response.cluster.used_bytes, 60_000_000_000);
+        let first_device = &response.nodes[0].vram.devices[0];
+        assert_eq!(first_device.compute_utilization, Some(0.25));
+        assert_eq!(first_device.memory_occupancy, Some(0.75));
+        let second_device = &response.nodes[0].vram.devices[1];
+        assert_eq!(second_device.compute_utilization, None);
+        assert_eq!(second_device.memory_occupancy, None);
+    }
+
+    #[test]
+    fn vram_response_excludes_a_node_whose_retained_snapshot_has_gone_stale() {
+        use sbproxy_ai::model_directory::{
+            DirectoryMember, DirectoryMemberState, DirectorySnapshotEnvelope,
+            DirectorySnapshotRead, ModelDirectory,
+        };
+        use sbproxy_model_host::node_snapshot::{
+            ModelPlaneHealth, NodeDeviceSnapshot, NodeHealthSnapshot, NodeHealthState,
+            NodeIdentitySnapshot, NodeModelSnapshot, NodeRole, NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+        };
+        use sbproxy_model_host::{AcceleratorKind, GpuVendor};
+
+        let snapshot = NodeModelSnapshot {
+            schema_version: NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+            node: NodeIdentitySnapshot {
+                node_id: "worker-c".to_string(),
+                roles: BTreeSet::from([NodeRole::Worker]),
+                labels: BTreeMap::new(),
+                model_endpoint: Some("https://worker-c.internal:9443".to_string()),
+            },
+            health: NodeHealthSnapshot {
+                state: NodeHealthState::Ready,
+                reason_codes: Vec::new(),
+                model_plane: ModelPlaneHealth::Ready,
+            },
+            engines: Vec::new(),
+            devices: vec![NodeDeviceSnapshot {
+                index: 0,
+                vendor: GpuVendor::Nvidia,
+                accelerator: Some(AcceleratorKind::Cuda),
+                name: "H100".to_string(),
+                total_memory_bytes: 80_000_000_000,
+                available_memory_bytes: 20_000_000_000,
+                compute_capability: None,
+                supports_fp8: true,
+                compute_utilization_millis: None,
+                memory_occupancy_millis: None,
+            }],
+            artifacts: Vec::new(),
+            replicas: Vec::new(),
+            placement_weight: 1,
+            active_deployment_digest: None,
+            generation: 1,
+            published_at_unix_ms: 1_000,
+            expires_at_unix_ms: 31_000,
+        };
+        let member = DirectoryMember {
+            node_id: "worker-c".to_string(),
+            address: Some("10.0.0.14:7946".to_string()),
+            state: DirectoryMemberState::Alive,
+            last_ack_age_ms: 25,
+            incarnation: 1,
+        };
+        let directory = ModelDirectory::new();
+
+        // First refresh: worker-c reports a real snapshot and is eligible,
+        // exactly like the healthy case above. This populates the
+        // directory's `last_snapshot` retention for worker-c.
+        let first_view = directory
+            .refresh(
+                1_100,
+                vec![member.clone()],
+                BTreeMap::from([(
+                    "worker-c".to_string(),
+                    DirectorySnapshotRead::Present(DirectorySnapshotEnvelope {
+                        publisher_node_id: "worker-c".to_string(),
+                        schema_version: NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+                        generation: 1,
+                        published_at_unix_ms: 1_000,
+                        expires_at_unix_ms: 31_000,
+                        authenticated_identity: None,
+                        payload: serde_json::to_value(snapshot).expect("snapshot JSON"),
+                    }),
+                )]),
+            )
+            .expect("first directory view");
+        let first_response = build_cluster_vram_response(Some(&first_view), 1_200);
+        assert_eq!(
+            first_response.nodes.len(),
+            1,
+            "sanity: worker-c starts eligible"
+        );
+
+        // Second refresh: worker-c's snapshot has since expired. The
+        // directory keeps worker-c's *last-known* snapshot (so other admin
+        // surfaces can still describe it) but marks it ineligible --
+        // `snapshot.is_some()` alone stays true here, which is exactly the
+        // trap this test guards against.
+        let second_view = directory
+            .refresh(
+                2_100,
+                vec![member],
+                BTreeMap::from([(
+                    "worker-c".to_string(),
+                    DirectorySnapshotRead::Expired {
+                        generation: 1,
+                        expires_at_unix_ms: 31_000,
+                    },
+                )]),
+            )
+            .expect("second directory view");
+        assert!(
+            second_view.nodes[0].snapshot.is_some(),
+            "sanity: the stale snapshot is still retained, not cleared"
+        );
+        assert!(
+            !second_view.nodes[0].model_eligible,
+            "sanity: retain_last_snapshot marks the node ineligible"
+        );
+
+        let response = build_cluster_vram_response(Some(&second_view), 2_200);
+        assert_eq!(
+            response.nodes.len(),
+            0,
+            "a stale-marked node must not contribute its retained VRAM to the fleet total"
+        );
+        assert_eq!(response.cluster.total_bytes, 0);
+        assert_eq!(response.cluster.node_count, 0);
     }
 
     #[test]

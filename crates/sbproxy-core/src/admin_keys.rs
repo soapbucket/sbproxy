@@ -1400,7 +1400,7 @@ fn create_credential(body: Option<&str>) -> Resp {
     if http::header::HeaderName::from_bytes(credential_header.as_bytes()).is_err() {
         return bad_request("header is not a valid HTTP header name");
     }
-    if sbproxy_config::types::FORBIDDEN_SWEEP_HEADERS.contains(&credential_header.as_str()) {
+    if sbproxy_config::types::credential_header_is_reserved(&credential_header) {
         return bad_request("header may not be used to carry a credential");
     }
     let material = match build_material(&plane, &id, c.vault_ref.as_deref(), c.secret.as_deref()) {
@@ -2089,6 +2089,26 @@ mod tests {
         let _g = crate::key_plane::test_plane_guard();
         install_test_plane();
         for bad in ["not a header", "host", "content-length"] {
+            let body = format!(r#"{{"id":"c","secret":"s","header":"{bad}"}}"#);
+            let resp = dispatch("POST", "/admin/credentials", Some(&body)).unwrap();
+            assert_eq!(resp.0, 400, "{bad} must be rejected: {}", resp.2);
+        }
+    }
+
+    #[test]
+    fn a_credential_header_cannot_claim_realtime_protocol_or_proxy_owned_metadata() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        for bad in [
+            "OpenAI-Beta",
+            "SEC-WebSocket-Key",
+            "Upgrade",
+            "TraceParent",
+            "TRACESTATE",
+            "Signature-Input",
+            "Signature",
+            "Signature-Agent",
+        ] {
             let body = format!(r#"{{"id":"c","secret":"s","header":"{bad}"}}"#);
             let resp = dispatch("POST", "/admin/credentials", Some(&body)).unwrap();
             assert_eq!(resp.0, 400, "{bad} must be rejected: {}", resp.2);

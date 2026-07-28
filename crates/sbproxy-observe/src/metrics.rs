@@ -3896,6 +3896,89 @@ pub fn record_model_host_admission_rejection(deployment: &str, priority: &str, r
         .inc();
 }
 
+/// Count a bounded artifact acquisition failure by `ArtifactError` kind
+/// (e.g. `digest_mismatch`, `transport`, `cache_corrupt`; see
+/// `sbproxy-model-host`'s `ArtifactError::kind`).
+pub fn record_model_host_artifact_error(kind: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_model_host_artifact_errors_total",
+            "Model artifact acquisition failures by ArtifactError kind",
+            &["artifact_error_kind"],
+        )
+        .expect("model host artifact-errors counter registers")
+    });
+    // Scoped label name, not the bare "kind" other metrics in this file
+    // use: `budget_for_label` keys on label name globally, and "kind" is
+    // shared by ~20 other metrics with their own, unrelated closed
+    // enums, so a cap sized for ArtifactError's 18 variants must not
+    // apply to any of those.
+    let kind = closed_label(
+        kind,
+        &[
+            "invalid_artifact",
+            "io",
+            "transport",
+            "http_status",
+            "unexpected_response",
+            "size_mismatch",
+            "digest_mismatch",
+            "cache_corrupt",
+            "manual_artifact_missing",
+            "offline_artifact_missing",
+            "startup_artifact_not_selected",
+            "pickle_refused",
+            "pickle_unsafe",
+            "job",
+            "serialization",
+            "clock",
+            "join",
+            "removal_blocked",
+        ],
+        "unknown",
+    );
+    counter.with_label_values(&[kind]).inc();
+}
+
+/// Count a placement plan's per-node rejection by deployment and
+/// `PlacementRejectionReason`.
+pub fn record_model_host_placement_rejection(deployment: &str, reason: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_model_host_placement_rejections_total",
+            "Placement plan node rejections by deployment and reason",
+            &["deployment", "placement_reason"],
+        )
+        .expect("model host placement-rejections counter registers")
+    });
+    let deployment = sanitize_label("deployment", deployment);
+    let reason = closed_label(
+        reason,
+        &[
+            "not_worker",
+            "node_unhealthy",
+            "required_labels",
+            "missing_endpoint",
+            "no_capacity",
+            "variant_incompatible",
+            "accelerator_incompatible",
+            "insufficient_memory",
+            "engine_unavailable",
+            "artifact_not_ready",
+        ],
+        "unknown",
+    );
+    counter
+        .with_label_values(&[deployment.as_str(), reason])
+        .inc();
+}
+
 fn bounded_fraction(value: Option<f64>) -> Option<f64> {
     value
         .filter(|value| value.is_finite())
@@ -3908,6 +3991,45 @@ fn closed_label(value: &str, allowed: &[&'static str], fallback: &'static str) -
         .copied()
         .find(|candidate| *candidate == value)
         .unwrap_or(fallback)
+}
+
+// --- key policy metrics --------------------------------------------------
+//
+// `key_record_to_effective_policy` fails closed on a malformed stored key
+// record rather than lowering it into a partial or best-guess policy. This
+// counts every such rejection by its bounded reason, `invalid_budget` among
+// them, so a stored-policy corruption (or a budget value outside what the
+// gateway can represent) shows up as a rate instead of a silent 401/403.
+
+/// Count a stored key record that failed closed while lowering to an
+/// effective policy, by `StoredPolicyErrorKind` reason
+/// (`sbproxy-core`'s `key_policy` module).
+pub fn record_key_policy_stored_rejection(reason: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_key_policy_stored_rejections_total",
+            "Stored key records rejected while lowering to an effective policy, by reason",
+            &["reason"],
+        )
+        .expect("key policy stored-rejections counter registers")
+    });
+    let reason = closed_label(
+        reason,
+        &[
+            "empty_key_id",
+            "invalid_policy_revision",
+            "tenant_mismatch",
+            "invalid_principal_selector",
+            "invalid_mcp_reference",
+            "invalid_priority",
+            "invalid_budget",
+        ],
+        "unknown",
+    );
+    counter.with_label_values(&[reason]).inc();
 }
 
 // --- k8s operator metrics ----------------------------------------------
@@ -5497,6 +5619,66 @@ mod tests {
         assert!(out.contains(
             "sbproxy_model_host_admission_rejections_total{deployment=\"qwen3-32b\",priority=\"interactive\",reason=\"queue_full\"} 1"
         ));
+    }
+
+    #[test]
+    fn set_model_host_load_queue_depth_reflects_queue_transitions() {
+        // The gauge has to track a request joining the queue and then
+        // leaving it, not just accept a single set() call. Pinned to a
+        // model name unused by any other test in this module so the
+        // render-string assertions below are unambiguous.
+        let model = "load-queue-depth-transition-test-model";
+        set_model_host_load_queue_depth(model, 0);
+        let out = metrics().render();
+        assert!(out.contains(&format!(
+            "sbproxy_model_host_load_queue_depth{{model=\"{model}\"}} 0"
+        )));
+
+        // A second request queues behind the first cold load.
+        set_model_host_load_queue_depth(model, 1);
+        let out = metrics().render();
+        assert!(out.contains(&format!(
+            "sbproxy_model_host_load_queue_depth{{model=\"{model}\"}} 1"
+        )));
+
+        // Both requests dequeue once the load completes.
+        set_model_host_load_queue_depth(model, 0);
+        let out = metrics().render();
+        assert!(out.contains(&format!(
+            "sbproxy_model_host_load_queue_depth{{model=\"{model}\"}} 0"
+        )));
+    }
+
+    #[test]
+    fn model_host_artifact_error_and_placement_rejection_metrics_emit() {
+        record_model_host_artifact_error("digest_mismatch");
+        record_model_host_artifact_error("not_a_real_kind");
+        record_model_host_placement_rejection("qwen3-32b", "insufficient_memory");
+        let out = metrics().render();
+        assert!(out.contains(
+            "sbproxy_model_host_artifact_errors_total{artifact_error_kind=\"digest_mismatch\"} 1"
+        ));
+        assert!(out.contains(
+            "sbproxy_model_host_artifact_errors_total{artifact_error_kind=\"unknown\"} 1"
+        ));
+        assert!(out.contains(
+            "sbproxy_model_host_placement_rejections_total{deployment=\"qwen3-32b\",placement_reason=\"insufficient_memory\"} 1"
+        ));
+    }
+
+    // --- key policy metrics ---
+
+    #[test]
+    fn key_policy_stored_rejection_counts_by_reason() {
+        record_key_policy_stored_rejection("invalid_budget");
+        record_key_policy_stored_rejection("invalid_budget");
+        record_key_policy_stored_rejection("tenant_mismatch");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_key_policy_stored_rejections_total{reason=\"invalid_budget\"} 2")
+        );
+        assert!(out
+            .contains("sbproxy_key_policy_stored_rejections_total{reason=\"tenant_mismatch\"} 1"));
     }
 
     // --- k8s operator metrics ---

@@ -37,6 +37,10 @@ use crate::context::RequestContext;
 /// [`PolicyEnforcer`] trait surface.
 pub struct AiCrawlEnforcer(pub Arc<AiCrawlControlPolicy>);
 
+fn verified_cap_pricing_exemption(principal: &sbproxy_plugin::Principal) -> bool {
+    principal.source == sbproxy_plugin::PrincipalSource::Cap && !principal.sub.trim().is_empty()
+}
+
 impl PolicyEnforcer for AiCrawlEnforcer {
     fn policy_type(&self) -> &'static str {
         "ai_crawl_control"
@@ -93,7 +97,14 @@ impl PolicyEnforcer for AiCrawlEnforcer {
         }
 
         let hostname = ctx.hostname.to_string();
-        let decision = policy.check(method, &hostname, path, req.headers(), agent_id_param);
+        let decision = policy.check_with_pricing_exemption(
+            method,
+            &hostname,
+            path,
+            req.headers(),
+            agent_id_param,
+            verified_cap_pricing_exemption(&ctx.principal),
+        );
         match decision {
             AiCrawlDecision::Allow => Box::pin(async move { Ok(PolicyDecision::Allow) }),
             AiCrawlDecision::AllowCharged { charged_header } => {
@@ -206,5 +217,25 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_pricing_exempt_requires_nonempty_verified_cap_principal() {
+        let mut principal =
+            sbproxy_plugin::Principal::anonymous_for(sbproxy_plugin::TenantId::from("tenant"));
+        principal.source = sbproxy_plugin::PrincipalSource::Cap;
+
+        assert!(!verified_cap_pricing_exemption(&principal));
+
+        principal.sub = "agent_acme_001".to_string();
+        assert!(verified_cap_pricing_exemption(&principal));
+
+        principal.source = sbproxy_plugin::PrincipalSource::Bearer;
+        assert!(!verified_cap_pricing_exemption(&principal));
     }
 }

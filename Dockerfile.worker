@@ -1,0 +1,146 @@
+# syntax=docker/dockerfile:1.7
+#
+# Worker image: the GPU half of the fleet image split. Serves
+# `ClusterRole::Worker` nodes, which host managed model replicas, so
+# unlike the gateway/authority image this carries the CUDA runtime and
+# a bundled vLLM install for safetensors models. The non-GPU half of
+# the split is Dockerfile.gateway; the two share every stage up through
+# `builder` and diverge only in the final runtime stage.
+#
+# Forked from Dockerfile.cloudbuild: identical build stages (compiles
+# the sbproxy binary), diverges only in the runtime stage below. Keep
+# this file, Dockerfile.gateway, and `Dockerfile.ci` (cargo-chef layout)
+# in lockstep on everything above stage 6.
+#
+# Build-time wins (cold ~12min -> ~3-4min, warm <90s on Cloud Build amd64):
+#
+#   1. cargo-chef "recipe.json" extracts the dependency graph from
+#      Cargo.toml + Cargo.lock without any first-party source. The
+#      "cacher" stage cooks (= fetches + compiles) just the deps and
+#      hits Docker's layer cache as long as recipe.json is unchanged.
+#   2. The dep layer survives any change under crates/sbproxy*/src/.
+#      A warm rebuild (only first-party code touched) reuses the
+#      cacher layer wholesale and only re-runs the final binary link.
+#   3. BuildKit cache mounts on /root/.cargo/registry and /root/.cargo/git
+#      keep the cargo registry warm across distinct image builds even
+#      when the layer cache is cold. Note: we DO NOT mount target/ as a
+#      cache because the cooked artifacts must live in the cacher layer
+#      for the builder stage to COPY them.
+#
+# REQUIRES BuildKit (export DOCKER_BUILDKIT=1 or use `docker buildx build`).
+#
+# Set `--build-arg CARGO_PROFILE=release` to build the full LTO release
+# profile. The default `release-fast` skips fat LTO for faster iteration.
+
+# --- Stage 1: chef-base ------------------------------------------------
+# Shared toolchain layer. Pins Rust + cargo-chef + apt deps so all
+# downstream stages start from the same base.
+FROM rust:1.94-bookworm AS chef-base
+WORKDIR /src
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      pkg-config libclang-dev \
+      build-essential cmake perl \
+      protobuf-compiler \
+ && rm -rf /var/lib/apt/lists/*
+# Pin cargo-chef so a registry republish cannot perturb the build.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo install --locked cargo-chef@0.1.71
+
+# --- Stage 2: planner --------------------------------------------------
+# Reads the workspace and emits recipe.json. The recipe is a digest of
+# every Cargo.toml / Cargo.lock in the tree; first-party source bodies
+# do not affect it, which is the property that makes warm rebuilds fast.
+# --- Stage: admin-ui ---------------------------------------------------
+# Build the admin SPA so the binary can embed it. ui/dist is gitignored,
+# so the image build must produce it; the builder stage copies it in
+# before cargo compiles with `embed-admin-ui`.
+FROM node:22-slim AS admin-ui
+WORKDIR /ui
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci
+COPY ui/ .
+RUN npm run build
+
+FROM chef-base AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# --- Stage 3: cacher ---------------------------------------------------
+# Compiles every dependency in the workspace using only recipe.json.
+# This is the layer the warm path reuses. Touching anything under
+# crates/*/src/ does NOT invalidate this stage. target/ is a regular
+# directory here (no cache mount) so the cooked artifacts persist into
+# the layer for the builder stage to COPY.
+FROM chef-base AS cacher
+ARG CARGO_PROFILE=release-fast
+COPY --from=planner /src/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo chef cook --profile "${CARGO_PROFILE}" --bin sbproxy --features embed-admin-ui --recipe-path recipe.json
+
+# --- Stage 4: builder --------------------------------------------------
+# Copies the cooked dep artifacts from the cacher stage, then the
+# first-party source, and links the final binary. The cargo registry
+# is cache-mounted so a stray `cargo update` between layers does not
+# force a full re-fetch. Same binary as Dockerfile.gateway: gpu-nvidia
+# and model-weights stay in the default feature set (NVML is dlopen'd,
+# never linked), so this build produces the one artifact that adapts to
+# its host at runtime -- the image split only changes what OS-level
+# runtime dependencies ship alongside it.
+FROM chef-base AS builder
+ARG CARGO_PROFILE=release-fast
+COPY --from=cacher /src/target target
+COPY . .
+COPY --from=admin-ui /ui/dist ui/dist
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo build --profile "${CARGO_PROFILE}" --bin sbproxy --features embed-admin-ui --locked \
+ && cp "/src/target/${CARGO_PROFILE}/sbproxy" /usr/local/bin/sbproxy
+
+# --- Stage 5: cert-gen -------------------------------------------------
+# Mints a self-signed loadtest cert so the bench stack has something to
+# terminate TLS with. Production images mount real certs over
+# /etc/sbproxy/ at runtime.
+FROM debian:bookworm-slim AS cert-gen
+RUN apt-get update && apt-get install -y --no-install-recommends openssl \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /out/etc/sbproxy \
+ && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -subj "/CN=loadtest.test" \
+      -keyout /out/etc/sbproxy/tls.key -out /out/etc/sbproxy/tls.crt \
+ && chmod 644 /out/etc/sbproxy/tls.crt /out/etc/sbproxy/tls.key
+
+# --- Stage 6: runtime ---------------------------------------------------
+# CUDA runtime + a bundled vLLM, for ClusterRole::Worker nodes. Not
+# distroless: vLLM needs a Python interpreter, pip-installed wheels, and
+# the CUDA runtime libraries its kernels dlopen at launch, none of which
+# fit a scratch/distroless base. The tag tracks the driver's minimum
+# supported CUDA runtime; bump it alongside the fleet's driver baseline.
+#
+# python3-dev + build-essential mirror the deploy/terraform/l4-demo
+# bootstrap comment: vLLM's Triton JIT compiles a CUDA shim at engine
+# startup and needs a C toolchain + Python headers, or the engine core
+# fails. Bundling vLLM at image-build time (rather than sbproxy's uvx
+# acquisition path) means a worker never JIT-installs on the first
+# request; sbproxy still finds it on PATH the same as any other
+# already-installed engine (see doctor's vllm_acquisition "path" option).
+#
+# This image only bundles vLLM (safetensors). A GGUF/llama.cpp serve
+# entry with `accel: cuda` still needs the pinned source build --
+# llama_release.rs's asset_infix_accel deliberately refuses to silently
+# substitute the CPU-bound Vulkan prebuilt for a CUDA request -- so a
+# worker serving GGUF-on-CUDA needs that build added separately; it is
+# out of scope here.
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3 python3-pip python3-dev build-essential ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && pip3 install --no-cache-dir vllm
+COPY --from=builder /usr/local/bin/sbproxy /usr/local/bin/sbproxy
+COPY --from=cert-gen /out/etc/sbproxy/tls.crt /etc/sbproxy/tls.crt
+COPY --from=cert-gen /out/etc/sbproxy/tls.key /etc/sbproxy/tls.key
+ENTRYPOINT ["/usr/local/bin/sbproxy"]
+CMD ["serve", "-f", "/etc/sbproxy/sb.yml"]

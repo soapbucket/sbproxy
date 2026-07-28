@@ -32,7 +32,7 @@ pub use bot_auth_directory::{
     DEFAULT_NEGATIVE_TTL_SECS, DEFAULT_STALE_GRACE_SECS, FETCH_DEADLINE, MAX_DIRECTORY_TTL_SECS,
     MIN_DIRECTORY_TTL_SECS,
 };
-pub use cap::{CapConfig, CapError, CapTokenView, CapVerdict, CapVerifier};
+pub use cap::{CapConfig, CapError, CapRateLimitInfo, CapTokenView, CapVerdict, CapVerifier};
 pub use trust_tier::{compute_trust_tier, TrustSignals, TrustTier, NAMED_AGENT_SCORE_THRESHOLD};
 
 use base64::Engine;
