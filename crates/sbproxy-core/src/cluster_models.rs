@@ -164,6 +164,14 @@ fn new_rejections_since(
         .collect()
 }
 
+fn deployment_generation_store() -> Result<Option<sbproxy_model_host::FileDeploymentGenerationStore>>
+{
+    crate::cluster::current_cluster_state_directory()
+        .map(sbproxy_model_host::FileDeploymentGenerationStore::open)
+        .transpose()
+        .map_err(anyhow::Error::from)
+}
+
 #[cfg(test)]
 mod placement_rejection_dedupe_tests {
     use super::*;
@@ -230,12 +238,4 @@ mod placement_rejection_dedupe_tests {
         let current = BTreeMap::new();
         assert!(new_rejections_since(&previous, &current).is_empty());
     }
-}
-
-fn deployment_generation_store() -> Result<Option<sbproxy_model_host::FileDeploymentGenerationStore>>
-{
-    crate::cluster::current_cluster_state_directory()
-        .map(sbproxy_model_host::FileDeploymentGenerationStore::open)
-        .transpose()
-        .map_err(anyhow::Error::from)
 }
