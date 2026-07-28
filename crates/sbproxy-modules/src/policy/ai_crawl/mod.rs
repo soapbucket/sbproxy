@@ -1101,6 +1101,9 @@ pub use http_ledger::{HttpLedger, HttpLedgerConfig};
 fn build_http_ledger(yaml: LedgerYamlConfig) -> anyhow::Result<HttpLedger> {
     use std::time::Duration;
 
+    let per_attempt_timeout = Duration::from_millis(yaml.timeout_ms);
+    let client = build_http_ledger_client(&yaml.trust_roots, per_attempt_timeout)?;
+
     let key_hex = if let Some(ref sref) = yaml.secret_ref {
         resolve_secret_ref(sref, "ai_crawl_control.ledger")?
     } else if let Some(ref inline) = yaml.key_hex {
@@ -1131,7 +1134,7 @@ fn build_http_ledger(yaml: LedgerYamlConfig) -> anyhow::Result<HttpLedger> {
         workspace_id: yaml.workspace_id,
         agent_id: "unknown".to_string(),
         agent_vendor: "unknown".to_string(),
-        per_attempt_timeout: Duration::from_millis(yaml.timeout_ms),
+        per_attempt_timeout,
         // Total timeout is the simple sum of (max_attempts * per-attempt
         // timeout) plus the worst-case sum of backoffs. Operators who
         // need a tighter or looser deadline can pass it via a future
@@ -1148,7 +1151,41 @@ fn build_http_ledger(yaml: LedgerYamlConfig) -> anyhow::Result<HttpLedger> {
         breaker_open_duration: Duration::from_millis(breaker.open_duration_ms),
     };
 
-    HttpLedger::new(cfg)
+    let ledger = HttpLedger::new(cfg)?;
+    Ok(match client {
+        Some(client) => ledger.with_client(client),
+        None => ledger,
+    })
+}
+
+#[cfg(feature = "http-ledger")]
+fn build_http_ledger_client(
+    trust_roots: &[String],
+    timeout: std::time::Duration,
+) -> anyhow::Result<Option<reqwest::blocking::Client>> {
+    if trust_roots.is_empty() {
+        return Ok(None);
+    }
+
+    let mut builder = reqwest::blocking::Client::builder().timeout(timeout);
+    for (idx, pem) in trust_roots.iter().enumerate() {
+        let certs = reqwest::Certificate::from_pem_bundle(pem.as_bytes()).map_err(|e| {
+            anyhow::anyhow!("ai_crawl_control.ledger.trust_roots[{idx}]: invalid PEM bundle: {e}")
+        })?;
+        if certs.is_empty() {
+            anyhow::bail!(
+                "ai_crawl_control.ledger.trust_roots[{idx}]: invalid PEM bundle: no certificates found"
+            );
+        }
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+
+    let client = builder.build().map_err(|e| {
+        anyhow::anyhow!("ai_crawl_control.ledger.trust_roots: client build failed: {e}")
+    })?;
+    Ok(Some(client))
 }
 #[cfg(feature = "http-ledger")]
 mod http_ledger;

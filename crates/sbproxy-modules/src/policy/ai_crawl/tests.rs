@@ -619,6 +619,27 @@ fn ledger_yaml_block_resolves_secret_ref_env() {
     std::env::remove_var("SBPROXY_TEST_LEDGER_HMAC");
 }
 
+#[cfg(feature = "http-ledger")]
+#[test]
+fn ledger_trust_root_rejects_malformed_pem_at_config_load() {
+    let err = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "ledger": {
+            "url": "https://ledger.internal",
+            "key_id": "k1",
+            "key_hex": "00",
+            "trust_roots": ["not a PEM certificate"],
+        }
+    }))
+    .expect_err("malformed private root must fail config load");
+
+    assert!(
+        err.to_string()
+            .starts_with("ai_crawl_control.ledger.trust_roots[0]: invalid PEM bundle:"),
+        "actionable trust-root error: {err}"
+    );
+}
+
 // --- G3.4 / G3.5 multi-rail challenge tests ---
 
 /// Build a multi-rail-enabled policy for tests. Uses a deterministic

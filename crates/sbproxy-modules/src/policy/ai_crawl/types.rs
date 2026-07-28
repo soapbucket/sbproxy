@@ -1378,6 +1378,11 @@ pub struct LedgerYamlConfig {
     /// Base URL of the ledger. Plain `http://` is rejected at
     /// construction time; operators must use `https://`.
     pub url: String,
+    /// Optional PEM-encoded CA certificates trusted in addition to the
+    /// system trust store. Each entry may contain one or more
+    /// `-----BEGIN CERTIFICATE-----` blocks.
+    #[serde(default)]
+    pub trust_roots: Vec<String>,
     /// HMAC key id (selects which key on the ledger side validates
     /// the signature).
     #[serde(alias = "hmac_key_id", alias = "key-id")]

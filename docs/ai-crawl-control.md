@@ -146,6 +146,7 @@ policies:
     currency: USD
     ledger:
       url: "https://ledger.internal"   # required; plain http:// is rejected
+      trust_roots: []                  # optional PEM CA bundles for private PKI
       key_id: "sb-ledger-2026-q2"
       secret_ref:
         env: SBPROXY_LEDGER_HMAC_KEY   # env var holding the hex-encoded HMAC key
@@ -164,7 +165,9 @@ policies:
 
 The HMAC key resolves through `secret_ref`, which takes either `env: <VAR>` (an environment variable holding the hex-encoded key) or `secret: <name>` (a logical secret resolved through the secrets layer). For dev configs and tests only, an inline `key_hex:` is honoured when `secret_ref` is absent; it should not appear in a production `sb.yml`. The agent identity fields on the redeem payload come from the request-time agent-class resolver, not from ledger config.
 
-The client refuses to construct against a non-HTTPS `url` at config-load time. Plain HTTP is a hard error because the request envelope carries an HMAC over the body, and TLS is the only thing keeping the body itself confidential.
+For a ledger signed by a private CA, each `trust_roots` entry may contain one or more PEM `CERTIFICATE` blocks. These certificates are added to the system trust store rather than replacing it, so public HTTPS endpoints continue to validate normally. Malformed or empty PEM bundles fail at config load.
+
+The client refuses to construct against a non-HTTPS `url` at config-load time. Plain HTTP is a hard error because the request envelope carries an HMAC over the body, and TLS is the only thing keeping the body itself confidential. A `ledger:` block also fails config load when the binary was built without the `http-ledger` feature; it never falls back silently to `valid_tokens`.
 
 ### Request envelope
 
