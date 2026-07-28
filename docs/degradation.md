@@ -23,7 +23,8 @@ What happens when each dependency that SBproxy talks to is unavailable, and how 
 | ACME CA (Let's Encrypt) | Renewal request fails | Existing cert keeps serving until expiry. With no usable cert, an HTTP-01 self-signed bootstrap is served and an `ERROR` is logged loudly. | Retry with exponential backoff (1m to 24h) | `sbproxy_acme_renewals_total{result}` |
 | Upstream DNS (`service_discovery`) | Resolver timeout / NXDOMAIN | The cached A/AAAA set keeps serving past TTL until the next refresh succeeds. New unseen hostnames fall back to Pingora's connect-time resolver. | Auto on next refresh | None dedicated; resolver failures are logged at WARN |
 | Vault / secrets backend (`proxy.secrets.backends`) | Fetch fails | Unresolved provider URI references fail startup; backend-local caches retain already resolved values where supported. | Backend reconnect/re-fetch behavior | `sbproxy_vault_resolution_total{backend,result}` |
-| Webhook receivers (`on_request` / `on_response` / alerting) | Send fails | Webhook delivery is fire-and-forget by design. A failed POST is logged at WARN; the request itself is not affected. | None needed; next event tries again | `sbproxy_outbound_webhook_attempts_total{result}` |
+| Origin callback hooks (`origins.*.on_request` / `on_response`) | Send fails | Fire-and-forget for audit-mode callbacks; the triggering request or response is unaffected. Enrichment-mode (`enrich: true`) callbacks are awaited inline with their own `timeout`, but a failed or timed-out enrichment still lets the request flow (no `X-Inject-*` headers applied, nothing else changes). A failed delivery is logged at WARN. | None needed; the next matching request/response fires independently | None dedicated; failures are logged at WARN |
+| Alert-channel webhook delivery (`proxy.alerting.channels[].type: webhook`) | Send fails | Webhook delivery is fire-and-forget. A failed POST is logged at WARN and the firing alert still reaches any other configured channel. | None needed; the next alert evaluation tries again | None dedicated; failures are logged at WARN |
 
 ## Detailed reference
 
@@ -330,11 +331,25 @@ See [`examples/service-discovery/sb.yml`](../examples/service-discovery/sb.yml).
 
 ---
 
-### Webhook receivers
+### Origin callback hooks
 
-**When down:** `on_request`, `on_response`, or alert-channel POSTs fail (connect error, timeout, non-2xx).
+**When down:** an `origins.*.on_request` or `on_response` webhook POST fails (connect error, timeout, non-2xx).
 
-**Fallback:** webhook delivery is fire-and-forget. The request that triggered the webhook is unaffected. The failure is logged at WARN with the URL and event type. There is no retry queue today; the next event is sent independently.
+**Fallback:** audit-mode callbacks (the default) are fire-and-forget; the triggering request or response proceeds unaffected regardless of delivery outcome. Enrichment-mode callbacks (`enrich: true`) are awaited inline, bounded by their own `timeout` (default 5s); a failure or timeout there just means no `X-Inject-*` response headers get applied, not a failed request. The failure is logged at WARN with the URL and event type (`on_request` / `on_response`). There is no retry queue; the next matching request or response fires independently.
+
+**Log level:** `WARN` per failed delivery (`debug!` on success).
+
+**Alert:** off by default.
+
+**Config:** see the `on_request` / `on_response` origin fields and the `Webhook envelope and signing` section in [configuration.md](configuration.md#webhook-envelope-and-signing).
+
+---
+
+### Alert-channel webhook delivery
+
+**When down:** an alert-channel `webhook` POST fails (connect error, timeout, non-2xx).
+
+**Fallback:** webhook delivery is fire-and-forget. The firing alert still reaches any other configured channel. The failure is logged at WARN with the URL. There is no retry queue today; the next alert evaluation sends independently.
 
 **Log level:** `WARN` per failed delivery.
 
