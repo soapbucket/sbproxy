@@ -25,6 +25,7 @@
         "alerting": null,
         "cache_reserve": null,
         "cluster": null,
+        "compression_state": null,
         "config_authority": null,
         "correlation_id": {
           "echo_response": true,
@@ -487,6 +488,18 @@
           "anyOf": [
             {
               "$ref": "#/definitions/ResponseCacheStoreConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "compression_state": {
+          "description": "Process-owned path configuration for durable Local compression state.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CompressionStateRuntimeConfig"
             },
             {
               "type": "null"
@@ -4985,6 +4998,21 @@
           }
         }
       }
+    },
+    "CompressionStateRuntimeConfig": {
+      "description": "Process-owned settings for the embedded compression-state database.\n\nThis block controls where the process opens its durable Local backend. It is intentionally independent of route-level compression policy.",
+      "type": "object",
+      "properties": {
+        "local_path": {
+          "description": "Explicit absolute path to the redb database file.\n\nWhen omitted, startup selects the first suitable platform state directory. Validation checks only the string contract; filesystem availability is a startup concern.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "MessengerSettings": {
       "description": "Configuration for the shared message bus used by inter-component events (config updates, semantic-cache purges, etc.).\n\nThe `driver` selects the backend implementation: * `\"memory\"` - in-process bounded mpsc channels (single-replica use only). * `\"redis\"`  - Redis Streams over the DSN in `params.dsn`. * `\"sqs\"`    - AWS SQS; requires `params.queue_url`, `params.region`, `params.api_key`. * `\"gcp_pubsub\"` - GCP Pub/Sub; requires `params.project`, `params.topic`, `params.subscription`, `params.access_token`.\n\nUnknown drivers cause `build_messenger` to return an error; the caller decides whether to treat that as fatal or fall back to no-bus semantics.",

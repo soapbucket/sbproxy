@@ -599,6 +599,21 @@ fn default_resolver_cache_size() -> usize {
 
 // --- Server Config ---
 
+/// Process-owned settings for the embedded compression-state database.
+///
+/// This block controls where the process opens its durable Local backend.
+/// It is intentionally independent of route-level compression policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompressionStateRuntimeConfig {
+    /// Explicit absolute path to the redb database file.
+    ///
+    /// When omitted, startup selects the first suitable platform state
+    /// directory. Validation checks only the string contract; filesystem
+    /// availability is a startup concern.
+    pub local_path: Option<String>,
+}
+
 /// Server-level proxy configuration parsed from the top-level `proxy:`
 /// block of sb.yml.
 ///
@@ -707,6 +722,9 @@ pub struct ProxyServerConfig {
     /// so an existing config keeps the backend it has today.
     #[serde(default)]
     pub response_cache_store: Option<ResponseCacheStoreConfig>,
+    /// Process-owned path configuration for durable Local compression state.
+    #[serde(default)]
+    pub compression_state: Option<CompressionStateRuntimeConfig>,
     /// Optional shared message bus for inter-component eventing (config
     /// updates, semantic-cache purges, etc.). When unset, components that
     /// need a bus degrade to no-op semantics.
@@ -873,6 +891,7 @@ impl Default for ProxyServerConfig {
             l2_cache: None,
             cache_reserve: None,
             response_cache_store: None,
+            compression_state: None,
             messenger_settings: None,
             ai_providers_file: None,
             device_parser_file: None,

@@ -118,6 +118,8 @@ use serde_yaml::{Mapping, Value};
 /// - `proxy.model_host`: signed deployment bundles already own that
 ///   state through their own channel. Two signed writers on one piece of
 ///   state is a correctness hazard, so this channel declines it.
+/// - `proxy.compression_state`: the embedded database path names local
+///   machine storage and can only be selected by the process owner.
 /// - `source`: the authority overlays the base document. It does not get
 ///   to choose which repository the base document comes from, which
 ///   would let it swap out its own input.
@@ -129,6 +131,7 @@ pub const AUTHORITY_DENIED_PATHS: &[&str] = &[
     "proxy.secrets",
     "proxy.config_authority",
     "proxy.model_host",
+    "proxy.compression_state",
     "source",
 ];
 
