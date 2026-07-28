@@ -105,6 +105,13 @@ jobs:
         env:
           PEBBLE_VA_ALWAYS_VALID: "1"
           PEBBLE_VA_NOSLEEP: "1"
+          # Pebble rejects 5% of nonces by default to exercise client
+          # retry, which our ACME client does not implement yet, so the
+          # lane fails probabilistically on most runs (an issuance is
+          # ~20 JWS posts). Pin to deterministic until the client
+          # retries badNonce per RFC 8555 s6.5; then restore the
+          # default so the retry path stays exercised.
+          PEBBLE_WA_NONCE_REJECT: "0"
     steps:
       - uses: actions/checkout@v5
 
