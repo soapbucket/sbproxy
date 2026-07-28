@@ -123,7 +123,9 @@ fn key_lifecycle_mint_use_revoke_rotate() {
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     let token = v["token"].as_str().unwrap().to_string();
     let key_id = v["key"]["key_id"].as_str().unwrap().to_string();
-    assert!(token.starts_with("sk-"));
+    // Minted tokens are sbp_<id>_<secret> so they are distinguishable
+    // from upstream provider keys; sk- is the legacy/config-seeded shape.
+    assert!(token.starts_with("sbp_"));
     assert!(
         !body.contains("secret_hash"),
         "response must not leak the hash"
@@ -135,11 +137,28 @@ fn key_lifecycle_mint_use_revoke_rotate() {
         "a valid minted key must pass auth"
     );
 
-    // A bogus virtual-key-shaped token is rejected at the gate.
+    // A bogus token in OUR minted shape (sbp_...) is unambiguously ours
+    // and must be rejected at the gate. Corrupt the real token's secret
+    // half so the shape stays valid but the credential cannot resolve.
+    let mut corrupted = token.clone();
+    let flipped = if corrupted.ends_with('0') { '1' } else { '0' };
+    corrupted.pop();
+    corrupted.push(flipped);
+    assert_eq!(
+        ai_request(&base, &corrupted),
+        401,
+        "a minted-shape token with a wrong secret must be 401"
+    );
+
+    // An sk-shaped token that resolves to nothing is NOT ours: it could
+    // be the caller's real upstream provider key, so it forwards to the
+    // upstream (dead here, hence 502) instead of being swallowed by the
+    // key gate. Store-down behavior for the same shape is covered by the
+    // fail-closed outage test below.
     assert_eq!(
         ai_request(&base, "sk-bogus-secretsecret"),
-        401,
-        "an unknown key must be 401"
+        502,
+        "a foreign-shaped unknown key must pass through to the upstream"
     );
 
     // Revoke -> the next request with that key is denied (instant revoke).

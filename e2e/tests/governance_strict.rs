@@ -137,7 +137,7 @@ proxy:
         url: "{redis_url}"
       lease_ttl_secs: 30
       terminal_retention_secs: 60
-      failure_mode_allow: false
+      failure_mode: closed
     seed:
       keys:
         - key_id: {key_id}
