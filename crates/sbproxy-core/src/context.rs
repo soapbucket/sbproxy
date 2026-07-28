@@ -953,13 +953,13 @@ pub struct RequestContext {
     /// Every downstream key predicate reads this retained snapshot rather
     /// than resolving mutable key state again.
     pub effective_key_policy: Option<sbproxy_ai::effective_key_policy::EffectiveKeyPolicy>,
-    /// Key record resolved by the pre-auth inbound-key phase, before the
-    /// origin's configured auth provider runs.
+    /// Authenticated key record retained for later proxy phases.
     ///
-    /// Set only when a minted token was swept out of a configured header and
-    /// verified. The AI gateway reads this instead of re-reading
-    /// `authorization`, which the sweep may have already consumed: without it a
-    /// swept key would dispatch ungoverned with no error and no log.
+    /// Usually set by the pre-auth sweep for a minted token. The AI gateway
+    /// also sets it when its legacy bearer or OIDC mapping resolves a record
+    /// later, preserving credential bindings needed by the upstream phase.
+    /// Downstream code reads this instead of re-reading `authorization`, which
+    /// an earlier phase may already have consumed.
     pub resolved_inbound_key: Option<Box<sbproxy_keystore::record::KeyRecord>>,
     /// Lowercase name of the header the minted key arrived in.
     ///

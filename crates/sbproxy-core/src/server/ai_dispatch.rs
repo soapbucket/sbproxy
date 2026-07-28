@@ -564,19 +564,14 @@ async fn prepare_ai_request_identity(
     ctx: &mut RequestContext,
     key_plane: Option<&crate::key_plane::KeyPlane>,
 ) -> std::result::Result<PreparedAiIdentity, (u16, String)> {
-    let resolved_request_key = resolve_request_virtual_key(
-        ctx,
-        session,
-        config,
-        &ctx.principal,
-        key_plane,
-        ctx.tenant_id.as_str(),
-    )
-    .await
-    .map_err(|(status, message)| {
-        warn!(status, reason = %message, "AI proxy: virtual key denied");
-        (status, message)
-    })?;
+    let origin_tenant_id = ctx.tenant_id.to_string();
+    let resolved_request_key =
+        resolve_request_virtual_key(ctx, session, config, key_plane, &origin_tenant_id)
+            .await
+            .map_err(|(status, message)| {
+                warn!(status, reason = %message, "AI proxy: virtual key denied");
+                (status, message)
+            })?;
 
     governed_key_requirement(config.require_governed_key, resolved_request_key.as_ref()).map_err(
         |(status, message)| {
@@ -877,10 +872,9 @@ async fn resolve_dynamic_virtual_key(
 }
 
 async fn resolve_request_virtual_key(
-    ctx: &RequestContext,
+    ctx: &mut RequestContext,
     session: &Session,
     config: &AiHandlerConfig,
-    principal: &sbproxy_plugin::Principal,
     plane: Option<&crate::key_plane::KeyPlane>,
     origin_tenant_id: &str,
 ) -> std::result::Result<Option<ResolvedRequestKey>, (u16, String)> {
@@ -906,12 +900,18 @@ async fn resolve_request_virtual_key(
     if let Some(plane) = plane {
         match resolve_dynamic_virtual_key(plane, raw_key.as_deref()).await {
             DynamicKeyOutcome::Resolved(record) => {
-                return lower_stored_request_key(&record, origin_tenant_id).map(Some);
+                return lower_and_preserve_stored_request_key(ctx, record, origin_tenant_id)
+                    .map(Some);
             }
             DynamicKeyOutcome::NotApplicable => {
-                match resolve_oidc_mapped_key(plane, principal).await {
+                match resolve_oidc_mapped_key(plane, &ctx.principal).await {
                     DynamicKeyOutcome::Resolved(record) => {
-                        return lower_stored_request_key(&record, origin_tenant_id).map(Some);
+                        return lower_and_preserve_stored_request_key(
+                            ctx,
+                            record,
+                            origin_tenant_id,
+                        )
+                        .map(Some);
                     }
                     DynamicKeyOutcome::NotApplicable => {}
                     DynamicKeyOutcome::Deny(status, message) => return Err((status, message)),
@@ -953,6 +953,22 @@ fn lower_stored_request_key(
         );
         (403, "credential policy is invalid".to_string())
     })
+}
+
+/// Preserve the authenticated record for later Pingora phases after lowering
+/// its secret-free policy for AI dispatch.
+///
+/// Dynamic bearer and OIDC mapping can resolve after the pre-auth sweep. The
+/// upstream phase still needs the original record's credential binding, so
+/// retain it on the request context only after policy validation succeeds.
+fn lower_and_preserve_stored_request_key(
+    ctx: &mut RequestContext,
+    record: Box<sbproxy_keystore::record::KeyRecord>,
+    origin_tenant_id: &str,
+) -> std::result::Result<ResolvedRequestKey, (u16, String)> {
+    let resolved = lower_stored_request_key(&record, origin_tenant_id)?;
+    ctx.resolved_inbound_key = Some(record);
+    Ok(resolved)
 }
 
 const UNNAMED_VIRTUAL_KEY_PRINCIPAL: &str = "<unnamed>";
@@ -9506,6 +9522,32 @@ mod dynamic_key_resolution_tests {
         let admission = crate::server::model_host::lane_class_for(context.ai_lane_priority);
 
         assert_eq!(admission, sbproxy_model_host::PriorityClass::Interactive);
+    }
+
+    #[test]
+    fn dynamically_resolved_record_retains_bound_upstream_credential() {
+        let mut record = KeyRecord::new("bound-key", "hash", chrono::Utc::now());
+        record.credential_id = Some("credential-1".into());
+        let mut context = RequestContext::new();
+
+        let resolved =
+            lower_and_preserve_stored_request_key(&mut context, Box::new(record), "tenant-a")
+                .expect("valid stored policy");
+
+        assert_eq!(
+            context
+                .resolved_inbound_key
+                .as_deref()
+                .and_then(|record| record.credential_id.as_deref()),
+            Some("credential-1")
+        );
+        assert_eq!(
+            resolved
+                .effective_policy
+                .as_ref()
+                .map(|policy| policy.key_id.as_str()),
+            Some("bound-key")
+        );
     }
 
     #[test]
