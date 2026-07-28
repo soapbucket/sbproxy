@@ -476,7 +476,11 @@ origins:
 
 Keys are the `AiSurface` labels emitted on metrics (`chat_completions`, `models`, `embeddings`, `assistants`, `threads`, `batches`, `fine_tuning`, `files`, `realtime`, `image_generation`, `image_edits`, `image_variations`, `audio_transcription`, `audio_speech`, `moderations`, `reranking`). Surfaces without an entry are uncapped. When the cap fires, the proxy returns 429 before any upstream call.
 
-The sliding window is one minute, shared across all configured origins (state is process-global). Audio-seconds-per-hour caps for realtime sessions are reserved for the realtime dispatch phase.
+The sliding window is one minute, shared across all configured origins
+(state is process-global). Realtime runs configured hard-budget admission
+before its WebSocket upgrade, but the byte-transparent relay does not inspect
+or charge individual frames. Frame-derived audio or token caps therefore
+remain unavailable on the OSS path.
 
 ## Guardrails
 
@@ -912,9 +916,19 @@ action:
 
 - A limit fires the first time `usage >= max_tokens` or `usage >= max_cost_usd`. Limits are checked in declaration order and the first match wins.
 - `on_exceed: log` records a warning and a `sbproxy_ai_budget_utilization_ratio` gauge update, then lets the request through.
-- `on_exceed: downgrade` swaps the request's model to the firing limit's `downgrade_to` and proceeds. If `downgrade_to` is unset, the request is blocked.
+- `on_exceed: downgrade` swaps the request's model to the firing limit's
+  `downgrade_to` and proceeds. When that field is unset, the gateway selects
+  the cheapest configured model it can price; it blocks only when no target is
+  available.
 - Setting only `max_tokens` and leaving `max_cost_usd` unset (or vice versa) is supported. A limit with neither field is a no-op.
 - Multiple limits on the same scope with different `period` values (for example daily and monthly) accrue in separate window buckets. Each limit is checked against its own key; the tightest binding that is exceeded fires first in declaration order. There is no separate org/team/project hierarchy tracker: `BudgetScope` is the single enum (`workspace`, `api_key`, `user`, `model`, `origin`, `tag`) used by `BudgetLimit`.
+- Realtime WebSocket requests run the same hard-limit preflight before the
+  upgrade. `block` returns 402 without an upstream WebSocket handshake, `log`
+  permits the upgrade, and `downgrade` replaces every inbound `model` query
+  value with one effective model while preserving unrelated query parameters.
+  Realtime frames are byte-transparent and do not debit token or cost
+  counters, so this is admission control over usage already recorded by other
+  requests, not per-frame accounting.
 
 ### Soft-landing (predictive budgets)
 
@@ -1350,7 +1364,12 @@ locally, and there are no per-surface emulation config blocks.
 
 ### `realtime`
 
-Realtime WebSocket proxying ships and is documented in the [Realtime](#realtime-1) section below: the gateway gates the upgrade on provider capability, applies `per_surface_rate_limits.realtime`, and forwards frames byte-transparently. There is no `realtime:` config key on the action; writing one is silently ignored. The knobs that exist are the provider list (a provider that supports Realtime must be configured) and the per-surface rate limit.
+Realtime WebSocket proxying ships and is documented in the [Realtime](#realtime-1) section below: the gateway gates the upgrade on provider capability, applies `per_surface_rate_limits.realtime`, and forwards frames byte-transparently. There is no `realtime:` config key on the action; writing one is silently ignored. Realtime instead uses the action's shared provider, rate-limit, budget, and governed-key settings.
+
+The action-level `budget` block and governed-key identity also participate in
+pre-upgrade admission. Provider and bound key-plane credentials are selected
+at the final outbound header seam; origin `outbound_credential` resolvers do
+not run for Realtime.
 
 The `realtime.rs` module itself is design-stage shape code with no serving-path callers: `RealtimeConfig { enabled, model }`, `RealtimeSession { session_id, model, created_at, status }`, and `RealtimeEvent { event_type, data }` round-trip through serde but nothing constructs them. Source: `crates/sbproxy-ai/src/realtime.rs`.
 
@@ -1560,10 +1579,40 @@ What runs before the upgrade:
 - Surface classification stamps `ai.surface = "realtime"` on the request span and the access log.
 - The 501 capability gate fires if no configured provider supports Realtime.
 - The per-surface rate limit (`per_surface_rate_limits.realtime`) fires before the upgrade is attempted, returning 429 when the cap is hit.
+- Governed-key identity is resolved before dispatch. Its immutable public key
+  id scopes any per-key budget; the plaintext key is never used as a budget
+  key or stored on the realtime request context.
+- Hard budget admission uses the action budget merged with the governed key's
+  budget. `block` returns the existing 402 `budget_exceeded` JSON response,
+  `log` warns and continues, and `downgrade` makes the target model
+  authoritative in the upstream query.
+- One trusted upstream credential is selected: a credential bound to the
+  governed key wins, otherwise the selected provider's nonblank `api_key` is
+  used. If neither exists, the request fails closed with 503 and no upstream
+  WebSocket handshake.
 - The active-sessions gauge `sbproxy_ai_realtime_sessions_active` ticks up.
+
+Credential headers are finalized after ordinary header modifiers and Lua
+scripts. The proxy removes caller-controlled `Authorization`,
+`Proxy-Authorization`, `DPoP`, `x-api-key`, `api-key`, `x-goog-api-key`,
+`x-sb-api`, every resolved/configured inbound key header, and the selected
+credential's own header, then inserts exactly one trusted credential. This
+means a Lua script cannot replace the provider credential. WebSocket
+handshake metadata (`Upgrade`, `Connection`, and every `Sec-WebSocket-*`
+header) and `OpenAI-Beta` are preserved.
+
+Realtime deliberately skips the origin-level `outbound_credential` and DPoP
+minting paths. Those mechanisms retain their existing semantics for ordinary
+HTTP proxy requests, but they neither authorize nor add a second credential
+to a Realtime upgrade.
 
 What runs during the session:
 - Pingora forwards WebSocket frames byte-transparently. The proxy does not inspect individual frames (per-frame guardrails are not on the OSS path; they would require terminate-and-relay, which is reserved for an enterprise build).
+- Admission is evaluated once. A hot policy/config update applies to new
+  upgrades; a socket that already received 101 continues relaying frames and
+  can complete its close handshake.
+- There is no per-frame token, cost, or audio accounting. In particular, an
+  accepted session is not rechecked against a budget after each frame.
 
 What runs at session close (the `logging` hook):
 - The active-sessions gauge ticks down.
