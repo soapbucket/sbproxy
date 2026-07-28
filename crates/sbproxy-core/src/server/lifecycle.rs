@@ -2053,6 +2053,11 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     server.run(pingora_core::server::RunArgs::default());
     drop(_model_plane_shutdown);
     drop(_model_runtime_shutdown);
+    // Flush any spans still queued in the batch span processor; export
+    // runs on its own background worker that Pingora's shutdown does
+    // not wait on, so spans in flight at the signal were silently
+    // dropped without this.
+    sbproxy_observe::telemetry::shutdown_otlp_pipeline();
     Ok(())
 }
 
