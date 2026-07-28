@@ -4444,7 +4444,8 @@ pub struct ObservabilityTelemetryConfig {
     /// Keep any completed trace at or above this wall-clock latency.
     #[serde(default)]
     pub keep_slower_than_secs: Option<f64>,
-    /// Propagation format: `w3c` (default), `b3`, `jaeger`.
+    /// Propagation format. Only `w3c` (the default) is wired; the
+    /// binary refuses to start with any other value.
     #[serde(default)]
     pub propagation: Option<String>,
     /// Free-form resource attributes attached to every span.

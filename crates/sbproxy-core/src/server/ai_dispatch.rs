@@ -1253,6 +1253,17 @@ pub(super) async fn handle_ai_proxy(
     // must be `Send`. The surface field is carried by the explicit
     // `debug!` above and by the per-surface metrics below.
     let ai_span = sbproxy_ai::tracing_spans::ai_request_span(surface_label, &method_str);
+    // Parent the exported span on the caller's trace when the inbound
+    // request carried a genuine traceparent/B3 header (request_phase.rs
+    // populated both trace_ctx and the is_remote flag). Explicit and
+    // request-scoped: no ambient/thread-local OTel state is touched, so
+    // there is nothing to leak and nothing for a later, unrelated
+    // request on a reused worker thread to inherit.
+    sbproxy_observe::telemetry::parent_span_on_remote_trace_context(
+        &ai_span,
+        ctx.trace_ctx.as_ref(),
+        ctx.trace_parent_is_remote,
+    );
     // WOR-1098: stamp the resolved tenant onto the request span so OTel
     // exporters can filter traces by tenant. The origin match has
     // already populated `ctx.tenant_id` (defaulting to `__default__`

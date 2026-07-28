@@ -1161,6 +1161,16 @@ fn main() {
     let log_filter = resolve_log_filter(&cli.globals);
     let log_format = cli.globals.log_format.unwrap_or_default();
     let runtime_telemetry = runtime_telemetry_config_for_cli(&cli);
+    if let Some(config) = runtime_telemetry.as_ref() {
+        if let Err(err) = config.validate_export_metrics() {
+            eprintln!("Fatal: {err}");
+            std::process::exit(1);
+        }
+        if let Err(err) = config.validate_propagation() {
+            eprintln!("Fatal: {err}");
+            std::process::exit(1);
+        }
+    }
     let log_to_stderr = cli.check || !matches!(&cli.cmd, None | Some(Cmd::Serve(_)));
     init_tracing(
         log_filter,
@@ -1972,6 +1982,33 @@ fn handle_validate_subcommand(args: &ValidateArgs) -> anyhow::Result<i32> {
             let yaml = resolve_source_for_cli(&yaml, args.no_fetch, &path_str)?;
             let compiled = sbproxy_config::compile_config(&yaml)
                 .map_err(|e| anyhow::anyhow!("config '{path_str}' did not compile:\n{e:#}"))?;
+            // Boot-time telemetry validation (export_metrics/enabled
+            // consistency, supported propagation values) should reject
+            // here too, not just at `sbproxy serve`. Probe with only
+            // the fields those two checks read, not the full
+            // runtime_telemetry_config mapping: that function also
+            // resolves header secret references and hard-exits the
+            // process on an unresolved one, which `validate` must
+            // never do.
+            if let Some(telemetry) = compiled
+                .server
+                .observability
+                .as_ref()
+                .and_then(|observability| observability.telemetry.as_ref())
+            {
+                let probe = sbproxy_observe::TelemetryConfig {
+                    enabled: telemetry.enabled,
+                    export_metrics: telemetry.export_metrics,
+                    propagation: telemetry.propagation.clone(),
+                    ..sbproxy_observe::TelemetryConfig::default()
+                };
+                probe.validate_export_metrics().map_err(|e| {
+                    anyhow::anyhow!("config '{path_str}': {e} (this would fail at boot)")
+                })?;
+                probe.validate_propagation().map_err(|e| {
+                    anyhow::anyhow!("config '{path_str}': {e} (this would fail at boot)")
+                })?;
+            }
             let pipeline =
                 sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled)
                     .map_err(|e| {
@@ -9016,6 +9053,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_telemetry_config_rejects_unsupported_propagation_at_boot_validation() {
+        let raw = sbproxy_config::ObservabilityTelemetryConfig {
+            enabled: true,
+            propagation: Some("b3".to_string()),
+            ..sbproxy_config::ObservabilityTelemetryConfig::default()
+        };
+
+        let mapped = runtime_telemetry_config(&raw);
+        let error = mapped
+            .validate_propagation()
+            .expect_err("b3 propagation is not wired");
+        let message = error.to_string();
+        assert!(message.contains("b3"), "{message}");
+        assert!(message.contains("w3c"), "{message}");
+    }
+
     /// The version line is load-bearing: the marketing site `Hero.vue`
     /// and the Homebrew formula assert on the exact shape. This pins
     /// the format string so any drift is caught at test time.
@@ -9172,6 +9226,32 @@ mod tests {
             handle_validate_subcommand(&validate_args(&path, true)).unwrap(),
             2
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_rejects_unsupported_propagation_that_boot_rejects() {
+        let path = temp_config(
+            "proxy:\n  http_bind_port: 8080\n  observability:\n    telemetry:\n      propagation: b3\norigins:\n  \"x.local\":\n    action:\n      type: proxy\n      url: https://test.sbproxy.dev\n",
+        );
+        let err = handle_validate_subcommand(&validate_args(&path, false))
+            .expect_err("propagation: b3 must fail validate the same way it fails boot");
+        let message = format!("{err:#}");
+        assert!(message.contains("b3"), "{message}");
+        assert!(message.contains("w3c"), "{message}");
+        assert_eq!(
+            handle_validate_subcommand(&validate_args(&path, true)).unwrap(),
+            2
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_rejects_export_metrics_without_enabled_that_boot_rejects() {
+        let path = temp_config(
+            "proxy:\n  http_bind_port: 8080\n  observability:\n    telemetry:\n      export_metrics: true\norigins:\n  \"x.local\":\n    action:\n      type: proxy\n      url: https://test.sbproxy.dev\n",
+        );
+        assert!(handle_validate_subcommand(&validate_args(&path, false)).is_err());
         let _ = std::fs::remove_file(&path);
     }
 

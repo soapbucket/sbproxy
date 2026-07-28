@@ -585,6 +585,14 @@ pub struct RequestContext {
     // --- Distributed tracing ---
     /// W3C Trace Context for this request (parsed from `traceparent` or generated fresh).
     pub trace_ctx: Option<sbproxy_observe::TraceContext>,
+    /// `true` when `trace_ctx` came from actually parsing an inbound
+    /// `traceparent`/B3 header, `false` when it is a locally
+    /// synthesized root (`TraceContext::new_random`). Read at the
+    /// AI-dispatch span-creation site to decide whether to parent the
+    /// exported span on the caller's trace; carried explicitly here
+    /// rather than via any ambient/thread-local OTel state so nothing
+    /// can leak or bleed across requests on a reused worker thread.
+    pub trace_parent_is_remote: bool,
 
     // --- Response cache state ---
     /// Computed cache key for this request. Populated in `request_filter` when
@@ -1294,6 +1302,7 @@ impl RequestContext {
             crawl_challenge: None,
             crawl_charged: None,
             trace_ctx: None,
+            trace_parent_is_remote: false,
             cache_key: None,
             cache_body_buf: None,
             cache_status: None,

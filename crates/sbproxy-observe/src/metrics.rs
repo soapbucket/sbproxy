@@ -992,8 +992,11 @@ pub fn current_trace_ids() -> (String, String) {
     use opentelemetry::trace::TraceContextExt;
 
     // Prefer the per-`tracing::Span` context when the
-    // `tracing-opentelemetry` layer is wired; fall back to the
-    // task-local context populated by `extract_from_headers`.
+    // `tracing-opentelemetry` layer is wired (seeded explicitly by
+    // `sbproxy_observe::telemetry::parent_span_on_remote_trace_context`
+    // at each span's creation site, not any ambient state); fall back
+    // to the task-local context as a last resort, though nothing in
+    // this crate populates it today.
     let cx_span = tracing_opentelemetry::OpenTelemetrySpanExt::context(&tracing::Span::current());
     let cx = if cx_span.has_active_span() {
         cx_span

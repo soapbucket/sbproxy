@@ -213,8 +213,6 @@ The Wave 1 substrate adds five labels: `agent_id`, `agent_class`, `agent_vendor`
 | SLO-AUDIT-WRITE | Audit | batch-write success | 100% | 24h | Page (immediate) |
 | SLO-AUDIT-LATENCY | Audit | emit-to-durable latency p99 | < 5 s | 1h sustained | Ticket |
 | SLO-DR-RESTORE | DR | restore drill | succeed monthly | calendar | Page on missed |
-| SLO-WEBHOOK-IN | Webhooks (in) | inbound verification success | 99.9% | 7d | Ticket |
-| SLO-WEBHOOK-OUT | Webhooks (out) | outbound delivery success (incl. retries) | 99% | 7d | Ticket |
 | SLO-CONFIG-RELOAD | Config | hot-reload success | 100% | 24h | Page |
 | SLO-BOT-AUTH-DIR | Bot Auth | directory freshness (TTL not exceeded) | 99.9% | 7d | Ticket |
 | SLO-CARD-BUDGET | Substrate | per-metric series count under cap | 100% | continuous | Log-only (CI gate) |
@@ -282,7 +280,6 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 | `sbproxy_capture_budget_dropped_total` | 2 000 | Labels: `workspace` (sanitised), `dimension` (token\|cost\|attribution\|other). Subset of `sbproxy_capture_dropped_total` for the budget-exhausted reason; carried separately so a budget-tuning loop can isolate this signal. |
 | `sbproxy_dedup_cache_size` | 1 | Gauge; current entry count in the in-memory dedup cache. Drives the LRU-eviction alert. |
 | `sbproxy_mirror_state_drift_total` | 1 | Counter; per-request increments when the request-mirror's primary and shadow responses diverge enough that a downstream replay would notice. Always sample to a debug log so the trigger is investigatable. |
-| `sbproxy_outbound_webhook_attempts_total` | 8 000 | Labels: `tenant_id`, `event_type` (sanitised), `result` (ok\|http_4xx\|http_5xx\|timeout\|retry_exhausted). Per-tenant outbound webhook delivery counter; pair with the SLO-WEBHOOK-OUT row above for the success-rate burn. |
 | `sbproxy_policy_audit_events_total` | 1 200 | Labels: `verdict` (allow\|deny\|warn), `surface` (http\|mcp\|a2a\|admin), `policy_id` (sanitised). Per-event audit-channel counter; the policy-decision path emits one per evaluated policy. |
 | `sbproxy_policy_audit_events_dropped_total` | 40 | Labels: `tenant` (sanitised). Counts the policy-audit events dropped because the per-tenant queue was full. A non-zero rate here means the operator should raise `policy.audit.queue_size` or shed load. |
 | `sbproxy_policy_decision_duration_seconds_bucket` | 60 | Labels: `surface`; histogram buckets 100us..1s. Time-to-decision per policy surface. Pair with `sbproxy_policy_evaluation_duration_seconds_bucket` for end-to-end policy latency. |
@@ -640,7 +637,7 @@ The test injects fixture inputs covering every member of the typed `RedactedFiel
 
 OpenTelemetry SDK, pinned to the `0.27.x` family. The tracer is initialized once at boot from `proxy.observability.telemetry` in `sb.yml` (see "Configuration" above).
 
-OTLP gRPC (port 4317) is the default exporter. HTTP/protobuf (port 4318) is supported for environments that block gRPC. The `stdout` exporter is for local debugging only.
+OTLP gRPC (port 4327, the Day-1 reference stack's collector port) is the default exporter. HTTP/protobuf (port 4318) is supported for environments that block gRPC. The `stdout` exporter is for local debugging only.
 
 Every signal carries detected resource attributes so multi-node telemetry stays distinguishable downstream: `host.name`, `os.type`, `process.pid`, and a `service.instance.id` of the form `<host>:<pid>`, plus `k8s.pod.name` / `k8s.namespace.name` / `k8s.node.name` when the conventional downward-API env vars (`K8S_POD_NAME`, `K8S_POD_NAMESPACE`, `K8S_NODE_NAME`) are set, plus any `OTEL_RESOURCE_ATTRIBUTES` pairs. Keys set in `resource_attrs` win over detection, so explicit config always beats the detector.
 
@@ -664,7 +661,6 @@ Span names follow `sbproxy.<pillar>.<verb>`:
 | `sbproxy.rail.settle` | Outbound payment-rail settlement |
 | `sbproxy.transform.shape` | Content transform |
 | `sbproxy.audit.emit` | Append audit-log entry |
-| `sbproxy.notify.deliver` | Outbound webhook delivery |
 
 Span attributes include the OTel semantic conventions (`http.request.method`, `http.response.status_code`, `server.address`) plus the SBproxy-specific set (`sbproxy.request_id`, `sbproxy.tenant_id`, `sbproxy.route`, `sbproxy.agent_id`, `sbproxy.agent_class`, `sbproxy.rail`, `sbproxy.shape`, `sbproxy.ledger.idempotency_key`).
 
