@@ -607,6 +607,77 @@ fn insert_outbound_credential_header(
         })
 }
 
+/// A realtime credential kept only on the request stack.
+///
+/// Deliberately does not implement `Debug`: the value is an upstream secret
+/// and must never become loggable through request context diagnostics.
+struct RealtimeCredential {
+    header: String,
+    value: String,
+}
+
+fn realtime_provider_credential(
+    provider: &sbproxy_ai::ProviderConfig,
+) -> Option<RealtimeCredential> {
+    provider
+        .api_key
+        .as_deref()
+        .filter(|api_key| !api_key.trim().is_empty())?;
+    let (header, value) = provider.auth_header();
+    Some(RealtimeCredential { header, value })
+}
+
+fn choose_realtime_credential(
+    bound: Option<RealtimeCredential>,
+    provider: Option<RealtimeCredential>,
+) -> anyhow::Result<RealtimeCredential> {
+    bound
+        .or(provider)
+        .context("realtime credential unavailable")
+}
+
+fn is_realtime_handshake_metadata(header: &str) -> bool {
+    const WEBSOCKET_PREFIX: &str = "sec-websocket-";
+
+    header.eq_ignore_ascii_case("openai-beta")
+        || header
+            .get(..WEBSOCKET_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(WEBSOCKET_PREFIX))
+}
+
+fn scrub_realtime_credentials(
+    request: &mut RequestHeader,
+    inbound_key_headers: &[String],
+    authoritative_header: &str,
+) {
+    for header in [
+        "authorization",
+        "proxy-authorization",
+        "dpop",
+        "x-api-key",
+        "api-key",
+        "x-goog-api-key",
+        "x-sb-api",
+    ] {
+        request.remove_header(header);
+    }
+    for header in inbound_key_headers {
+        if !is_realtime_handshake_metadata(header) {
+            request.remove_header(header);
+        }
+    }
+    request.remove_header(authoritative_header);
+}
+
+fn apply_realtime_credential(
+    request: &mut RequestHeader,
+    credential: &RealtimeCredential,
+    inbound_key_headers: &[String],
+) -> Result<()> {
+    scrub_realtime_credentials(request, inbound_key_headers, &credential.header);
+    insert_outbound_credential_header(request, credential.header.clone(), &credential.value)
+}
+
 fn ensure_dpop_credential_source(
     bound_credential_id: Option<&str>,
     origin_dpop_enabled: bool,
@@ -1139,6 +1210,23 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        let is_realtime = ctx.ai_realtime_dispatch.is_some();
+        let mut realtime_inbound_key_headers = Vec::new();
+        if is_realtime {
+            if let Some(header) = ctx.inbound_key_header.as_ref() {
+                realtime_inbound_key_headers.push(header.clone());
+            }
+            if let Some(plane) = crate::key_plane::current_key_plane() {
+                realtime_inbound_key_headers.extend(
+                    plane
+                        .inbound()
+                        .headers
+                        .iter()
+                        .map(|header| header.name.clone()),
+                );
+            }
+        }
+
         // Collect header modifications into owned Vecs, then drop the pipeline
         // guard before calling Pingora's insert_header (requires 'static borrows).
         let mut req_to_set: Vec<(String, String)> = Vec::new();
@@ -1161,6 +1249,7 @@ impl ProxyHttp for SbProxy {
             std::sync::Arc<sbproxy_modules::auth::dpop_outbound::DpopRuntime>,
             String,
         )> = None;
+        let mut realtime_provider_auth: Option<RealtimeCredential> = None;
         // WOR-805: outbound Web Bot Auth signer + Signature-Agent for
         // this origin, cloned (Arc) out of the pipeline so they outlive
         // the pipeline guard dropped below.
@@ -1252,6 +1341,16 @@ impl ProxyHttp for SbProxy {
                 } else {
                     &pipeline.actions[idx]
                 };
+                if let (Some(dispatch), Action::AiProxy(ai)) =
+                    (ctx.ai_realtime_dispatch.as_ref(), effective_action)
+                {
+                    realtime_provider_auth = ai
+                        .config
+                        .providers
+                        .iter()
+                        .find(|provider| provider.name.as_str() == dispatch.provider_name)
+                        .and_then(realtime_provider_credential);
+                }
 
                 // WOR-819: REST -> gRPC transcoding. When the resolved
                 // grpc action carries a compiled transcoder and the
@@ -1715,9 +1814,10 @@ impl ProxyHttp for SbProxy {
             .resolved_inbound_key
             .as_deref()
             .and_then(|record| record.credential_id.clone());
-        let origin_dpop_enabled = outbound_cred
-            .as_ref()
-            .is_some_and(|credential| credential.is_dpop_enabled());
+        let origin_dpop_enabled = !is_realtime
+            && outbound_cred
+                .as_ref()
+                .is_some_and(|credential| credential.is_dpop_enabled());
         if origin_dpop_enabled {
             // Never forward a caller-supplied proof as the proxy's proof.
             upstream_request.remove_header("dpop");
@@ -1736,6 +1836,7 @@ impl ProxyHttp for SbProxy {
             ));
         }
 
+        let mut realtime_bound_auth: Option<RealtimeCredential> = None;
         if let Some(credential_id) = bound_credential_id {
             let Some(plane) = crate::key_plane::current_key_plane() else {
                 warn!(
@@ -1756,11 +1857,18 @@ impl ProxyHttp for SbProxy {
                 .await
             {
                 Ok(resolved) => {
-                    insert_outbound_credential_header(
-                        upstream_request,
-                        resolved.header,
-                        &resolved.value,
-                    )?;
+                    if is_realtime {
+                        realtime_bound_auth = Some(RealtimeCredential {
+                            header: resolved.header,
+                            value: resolved.value,
+                        });
+                    } else {
+                        insert_outbound_credential_header(
+                            upstream_request,
+                            resolved.header,
+                            &resolved.value,
+                        )?;
+                    }
                 }
                 Err(e) => {
                     // Fail CLOSED, unlike the origin-level resolver below.
@@ -1781,7 +1889,7 @@ impl ProxyHttp for SbProxy {
                     ));
                 }
             }
-        } else if let Some(cred_cfg) = outbound_cred.as_ref() {
+        } else if let Some(cred_cfg) = outbound_cred.as_ref().filter(|_| !is_realtime) {
             let inbound_bearer: Option<String> = session
                 .req_header()
                 .headers
@@ -1853,6 +1961,24 @@ impl ProxyHttp for SbProxy {
                 }
             }
         }
+        let realtime_auth = if is_realtime {
+            Some(
+                choose_realtime_credential(realtime_bound_auth, realtime_provider_auth).map_err(
+                    |_| {
+                        warn!(
+                            origin = %ctx.hostname,
+                            "AI realtime credential unavailable; refusing the request"
+                        );
+                        pingora_error::Error::explain(
+                            pingora_error::ErrorType::HTTPStatus(503),
+                            "realtime credential unavailable",
+                        )
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
 
         // Apply Lua script request modifiers
         for script in &lua_scripts {
@@ -1882,6 +2008,10 @@ impl ProxyHttp for SbProxy {
                     )
                 })?;
             upstream_request.set_uri(rewritten);
+        }
+
+        if let Some(credential) = realtime_auth.as_ref() {
+            apply_realtime_credential(upstream_request, credential, &realtime_inbound_key_headers)?;
         }
 
         // --- Distributed tracing: inject child traceparent into upstream request ---
@@ -5532,6 +5662,117 @@ mod tests {
             request.headers.get("authorization").unwrap(),
             "Bearer inbound-token"
         );
+    }
+
+    #[test]
+    fn realtime_scrub_removes_caller_credentials_but_preserves_websocket_headers() {
+        let mut request = pingora_http::RequestHeader::build("GET", b"/v1/realtime", None).unwrap();
+        for (name, value) in [
+            ("authorization", "Bearer caller-secret"),
+            ("proxy-authorization", "Basic caller-secret"),
+            ("dpop", "caller-proof"),
+            ("x-api-key", "caller-secret"),
+            ("api-key", "caller-secret"),
+            ("x-goog-api-key", "caller-secret"),
+            ("x-sb-api", "caller-secret"),
+            ("x-custom-inbound-key", "caller-secret"),
+        ] {
+            request.insert_header(name, value).unwrap();
+        }
+        for (name, value) in [
+            ("upgrade", "websocket"),
+            ("connection", "Upgrade"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("openai-beta", "realtime=v1"),
+        ] {
+            request.insert_header(name, value).unwrap();
+        }
+
+        scrub_realtime_credentials(
+            &mut request,
+            &[
+                "x-custom-inbound-key".to_string(),
+                "Sec-WebSocket-Key".to_string(),
+                "OpenAI-Beta".to_string(),
+            ],
+            "authorization",
+        );
+
+        for name in [
+            "authorization",
+            "proxy-authorization",
+            "dpop",
+            "x-api-key",
+            "api-key",
+            "x-goog-api-key",
+            "x-sb-api",
+            "x-custom-inbound-key",
+        ] {
+            assert!(
+                request.headers.get(name).is_none(),
+                "{name} must be removed"
+            );
+        }
+        assert_eq!(request.headers.get("upgrade").unwrap(), "websocket");
+        assert_eq!(request.headers.get("connection").unwrap(), "Upgrade");
+        assert_eq!(
+            request.headers.get("sec-websocket-key").unwrap(),
+            "dGhlIHNhbXBsZSBub25jZQ=="
+        );
+        assert_eq!(request.headers.get("openai-beta").unwrap(), "realtime=v1");
+    }
+
+    #[test]
+    fn realtime_bound_credential_wins_over_provider_auth() {
+        let credential = choose_realtime_credential(
+            Some(RealtimeCredential {
+                header: "authorization".to_string(),
+                value: "Bearer bound-secret".to_string(),
+            }),
+            Some(RealtimeCredential {
+                header: "authorization".to_string(),
+                value: "Bearer provider-secret".to_string(),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(credential.header, "authorization");
+        assert_eq!(credential.value, "Bearer bound-secret");
+    }
+
+    #[test]
+    fn realtime_missing_provider_credential_fails_closed() {
+        let provider: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "openai",
+            "api_key": "   "
+        }))
+        .unwrap();
+
+        let provider_auth = realtime_provider_credential(&provider);
+        assert!(provider_auth.is_none(), "blank API keys are unavailable");
+        assert!(choose_realtime_credential(None, provider_auth).is_err());
+    }
+
+    #[test]
+    fn realtime_final_credential_overwrites_lua_authorization() {
+        let mut request = pingora_http::RequestHeader::build("GET", b"/v1/realtime", None).unwrap();
+        request
+            .insert_header("authorization", "Bearer lua-secret")
+            .unwrap();
+
+        apply_realtime_credential(
+            &mut request,
+            &RealtimeCredential {
+                header: "authorization".to_string(),
+                value: "Bearer provider-secret".to_string(),
+            },
+            &[],
+        )
+        .unwrap();
+
+        let mut values = request.headers.get_all(http::header::AUTHORIZATION).iter();
+        assert_eq!(values.next().unwrap(), "Bearer provider-secret");
+        assert!(values.next().is_none());
     }
 
     #[test]
