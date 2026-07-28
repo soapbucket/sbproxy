@@ -1,7 +1,7 @@
 //! Runtime binding for ordered AI context compression.
 
 use crate::compression_store::{
-    MeshCompressionStore, MeshCompressionStoreConfig, RedisCompressionStore,
+    LocalCompressionStore, MeshCompressionStore, MeshCompressionStoreConfig, RedisCompressionStore,
     RedisCompressionStoreConfig,
 };
 use anyhow::{bail, Context as _};
@@ -21,8 +21,20 @@ use sbproxy_platform::storage::{AsyncRedisConfig, AsyncRedisKVStore, KVStore};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+const LOCAL_STATE_FILE_NAME: &str = "compression-state.redb";
+const SERVICE_STATE_DIR: &str = "/var/lib/sbproxy";
+
+/// How the Local compression backend binds during live or validation builds.
+#[derive(Clone)]
+enum LocalStateDependency {
+    Unavailable,
+    Live(Arc<LocalCompressionStore>),
+    ValidationOnly,
+}
 
 /// How the mesh compression backend can bind to the replicated substrate.
 #[derive(Clone)]
@@ -41,6 +53,7 @@ enum MeshStateDependency {
 #[derive(Clone)]
 struct RuntimeDependencies {
     redis: Option<Arc<AsyncRedisKVStore>>,
+    local: LocalStateDependency,
     mesh: MeshStateDependency,
     ai_client: Arc<AiClient>,
     writer_node: String,
@@ -51,8 +64,10 @@ impl RuntimeDependencies {
         server: &sbproxy_config::ProxyServerConfig,
         l2_store: Option<&dyn KVStore>,
         redis_required: bool,
+        local_required: bool,
     ) -> anyhow::Result<Self> {
         let redis = redis_dependency(server, l2_store, redis_required)?;
+        let local = local_state_dependency(server, local_required)?;
         let cluster = crate::cluster::current_cluster_handle();
         let writer_node = cluster
             .as_ref()
@@ -65,6 +80,7 @@ impl RuntimeDependencies {
             .map_or(MeshStateDependency::Unavailable, MeshStateDependency::Live);
         Ok(Self {
             redis,
+            local,
             mesh,
             ai_client: crate::server::ai_client(),
             writer_node,
@@ -75,8 +91,14 @@ impl RuntimeDependencies {
         server: &sbproxy_config::ProxyServerConfig,
         l2_store: Option<&dyn KVStore>,
         redis_required: bool,
+        local_required: bool,
     ) -> anyhow::Result<Self> {
         let redis = redis_dependency(server, l2_store, redis_required)?;
+        let local = if local_required {
+            LocalStateDependency::ValidationOnly
+        } else {
+            LocalStateDependency::Unavailable
+        };
         let writer_node = server
             .cluster
             .as_ref()
@@ -93,6 +115,7 @@ impl RuntimeDependencies {
         };
         Ok(Self {
             redis,
+            local,
             mesh,
             ai_client: Arc::new(AiClient::new()),
             writer_node,
@@ -103,9 +126,19 @@ impl RuntimeDependencies {
     fn empty_for_test() -> Self {
         Self {
             redis: None,
+            local: LocalStateDependency::Unavailable,
             mesh: MeshStateDependency::Unavailable,
             ai_client: Arc::new(AiClient::new()),
             writer_node: "test-node".to_string(),
+        }
+    }
+}
+
+impl LocalStateDependency {
+    fn admin_store(&self) -> Option<Arc<dyn CompressionSessionStore>> {
+        match self {
+            Self::Live(store) => Some(store.clone() as Arc<dyn CompressionSessionStore>),
+            Self::Unavailable | Self::ValidationOnly => None,
         }
     }
 }
@@ -132,6 +165,198 @@ fn redis_dependency(
     }
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalPlatform {
+    MacOs,
+    Unix,
+    Windows,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocalPathInputs<'a> {
+    explicit: Option<&'a Path>,
+    service_dir_writable: bool,
+    xdg_state_home: Option<&'a Path>,
+    home: Option<&'a Path>,
+    platform: LocalPlatform,
+}
+
+fn resolve_local_state_path(inputs: LocalPathInputs<'_>) -> anyhow::Result<PathBuf> {
+    if let Some(explicit) = inputs.explicit {
+        return Ok(explicit.to_path_buf());
+    }
+    if inputs.platform == LocalPlatform::Windows {
+        bail!(
+            "Local compression state on Windows requires an explicit \
+             proxy.compression_state.local_path"
+        );
+    }
+    if inputs.service_dir_writable {
+        return Ok(Path::new(SERVICE_STATE_DIR).join(LOCAL_STATE_FILE_NAME));
+    }
+    if let Some(xdg) = inputs.xdg_state_home.filter(|path| path.is_absolute()) {
+        return Ok(xdg.join("sbproxy").join(LOCAL_STATE_FILE_NAME));
+    }
+    if let Some(home) = inputs.home.filter(|path| path.is_absolute()) {
+        return Ok(match inputs.platform {
+            LocalPlatform::MacOs => home
+                .join("Library")
+                .join("Application Support")
+                .join("sbproxy")
+                .join(LOCAL_STATE_FILE_NAME),
+            LocalPlatform::Unix => home
+                .join(".local")
+                .join("state")
+                .join("sbproxy")
+                .join(LOCAL_STATE_FILE_NAME),
+            LocalPlatform::Windows => unreachable!("Windows was rejected above"),
+        });
+    }
+    bail!(
+        "Local compression state could not select a writable process path; \
+         configure proxy.compression_state.local_path"
+    )
+}
+
+fn configured_local_state_path(server: &sbproxy_config::ProxyServerConfig) -> Option<PathBuf> {
+    server
+        .compression_state
+        .as_ref()
+        .and_then(|state| state.local_path.as_deref())
+        .map(PathBuf::from)
+}
+
+fn current_local_platform() -> LocalPlatform {
+    #[cfg(target_os = "windows")]
+    {
+        LocalPlatform::Windows
+    }
+    #[cfg(target_os = "macos")]
+    {
+        LocalPlatform::MacOs
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        LocalPlatform::Unix
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        LocalPlatform::Unix
+    }
+}
+
+fn state_home_from_environment(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
+fn service_state_dir_writable() -> bool {
+    let directory = Path::new(SERVICE_STATE_DIR);
+    if std::fs::create_dir_all(directory).is_err() {
+        return false;
+    }
+    let probe = directory.join(format!(
+        ".compression-state-write-probe-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe);
+    match opened {
+        Ok(_) => {
+            let _ = std::fs::remove_file(probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn required_local_state_path(
+    server: &sbproxy_config::ProxyServerConfig,
+) -> anyhow::Result<PathBuf> {
+    let explicit = configured_local_state_path(server);
+    let xdg_state_home = state_home_from_environment("XDG_STATE_HOME");
+    let home = state_home_from_environment("HOME");
+    resolve_local_state_path(LocalPathInputs {
+        explicit: explicit.as_deref(),
+        service_dir_writable: explicit.is_none() && service_state_dir_writable(),
+        xdg_state_home: xdg_state_home.as_deref(),
+        home: home.as_deref(),
+        platform: current_local_platform(),
+    })
+}
+
+fn existing_local_state_path(server: &sbproxy_config::ProxyServerConfig) -> Option<PathBuf> {
+    if let Some(explicit) = configured_local_state_path(server) {
+        return explicit.is_file().then_some(explicit);
+    }
+    if current_local_platform() == LocalPlatform::Windows {
+        return None;
+    }
+    let service = Path::new(SERVICE_STATE_DIR).join(LOCAL_STATE_FILE_NAME);
+    if service.is_file() {
+        return Some(service);
+    }
+    if let Some(xdg) = state_home_from_environment("XDG_STATE_HOME") {
+        let candidate = xdg.join("sbproxy").join(LOCAL_STATE_FILE_NAME);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    state_home_from_environment("HOME").and_then(|home| {
+        let candidate = match current_local_platform() {
+            LocalPlatform::MacOs => home
+                .join("Library")
+                .join("Application Support")
+                .join("sbproxy")
+                .join(LOCAL_STATE_FILE_NAME),
+            LocalPlatform::Unix => home
+                .join(".local")
+                .join("state")
+                .join("sbproxy")
+                .join(LOCAL_STATE_FILE_NAME),
+            LocalPlatform::Windows => return None,
+        };
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+fn local_state_dependency(
+    server: &sbproxy_config::ProxyServerConfig,
+    required: bool,
+) -> anyhow::Result<LocalStateDependency> {
+    if required {
+        let path = required_local_state_path(server)?;
+        let store = LocalCompressionStore::open_from_sync_context(&path).with_context(|| {
+            format!(
+                "open required Local compression state at {}",
+                path.display()
+            )
+        })?;
+        return Ok(LocalStateDependency::Live(Arc::new(store)));
+    }
+
+    let Some(path) = existing_local_state_path(server) else {
+        return Ok(LocalStateDependency::Unavailable);
+    };
+    match LocalCompressionStore::open_from_sync_context(&path) {
+        Ok(store) => Ok(LocalStateDependency::Live(Arc::new(store))),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "existing dormant Local compression state is unavailable to Admin"
+            );
+            Ok(LocalStateDependency::Unavailable)
+        }
+    }
+}
+
 /// Build the canonical Redis adapter for Admin lifecycle operations even when
 /// no active origin currently enables `summary_buffer`.
 pub(crate) fn redis_admin_store(
@@ -154,6 +379,62 @@ pub(crate) fn mesh_admin_store() -> Option<Arc<dyn CompressionSessionStore>> {
     let store =
         MeshCompressionStore::new(replicated, MeshCompressionStoreConfig::default()).ok()?;
     Some(Arc::new(store))
+}
+
+/// Discard-only stand-in bound during configuration validation. Validation
+/// checks dependency selection without creating or opening a database.
+struct ValidationOnlyLocalStore;
+
+#[async_trait]
+impl CompressionSessionStore for ValidationOnlyLocalStore {
+    fn backend(&self) -> CompressionBackend {
+        CompressionBackend::Local
+    }
+
+    fn consistency(&self) -> CompressionConsistency {
+        CompressionConsistency::Serialized
+    }
+
+    async fn load(
+        &self,
+        _id: &CompressionRecordId,
+    ) -> Result<Option<CompressionSessionRecord>, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+
+    async fn acquire_update(
+        &self,
+        _id: &CompressionRecordId,
+        _lease_ttl: Duration,
+    ) -> Result<Option<UpdatePermit>, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+
+    async fn commit(
+        &self,
+        _permit: &UpdatePermit,
+        _expected_logical_version: Option<u64>,
+        _record: &CompressionSessionRecord,
+        _ttl: Duration,
+    ) -> Result<(), CommitError> {
+        Err(CommitError::Unavailable)
+    }
+
+    async fn release(&self, _permit: UpdatePermit) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    async fn list(&self, _request: &ListRequest) -> Result<ListPage, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+
+    async fn delete(&self, _id: &CompressionRecordId) -> Result<DeleteResult, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+
+    async fn purge(&self, _request: &PurgeRequest) -> Result<PurgePage, StoreError> {
+        Err(StoreError::Unavailable)
+    }
 }
 
 /// Discard-only stand-in bound during configuration validation, where no
@@ -288,6 +569,7 @@ pub struct CompressionExecution<'a> {
 #[derive(Default)]
 pub struct CompressionRuntimeRegistry {
     by_origin: Vec<Option<Arc<CompressionRuntimeSet>>>,
+    local_admin_store: Option<Arc<dyn CompressionSessionStore>>,
 }
 
 impl CompressionRuntimeRegistry {
@@ -297,8 +579,12 @@ impl CompressionRuntimeRegistry {
         l2_store: Option<&dyn KVStore>,
         actions: &[sbproxy_modules::Action],
     ) -> anyhow::Result<Self> {
-        let dependencies =
-            RuntimeDependencies::from_process(server, l2_store, actions_require_redis(actions))?;
+        let dependencies = RuntimeDependencies::from_process(
+            server,
+            l2_store,
+            actions_require_redis(actions),
+            actions_require_local(actions),
+        )?;
         Self::with_dependencies(actions, dependencies)
     }
 
@@ -309,8 +595,12 @@ impl CompressionRuntimeRegistry {
         l2_store: Option<&dyn KVStore>,
         actions: &[sbproxy_modules::Action],
     ) -> anyhow::Result<Self> {
-        let dependencies =
-            RuntimeDependencies::for_validation(server, l2_store, actions_require_redis(actions))?;
+        let dependencies = RuntimeDependencies::for_validation(
+            server,
+            l2_store,
+            actions_require_redis(actions),
+            actions_require_local(actions),
+        )?;
         Self::with_dependencies(actions, dependencies)
     }
 
@@ -318,6 +608,7 @@ impl CompressionRuntimeRegistry {
         actions: &[sbproxy_modules::Action],
         dependencies: RuntimeDependencies,
     ) -> anyhow::Result<Self> {
+        let local_admin_store = dependencies.local.admin_store();
         let mut by_origin = Vec::with_capacity(actions.len());
         for action in actions {
             let sbproxy_modules::Action::AiProxy(action) = action else {
@@ -336,7 +627,10 @@ impl CompressionRuntimeRegistry {
             .context("building AI compression runtime")?;
             by_origin.push(Some(Arc::new(runtime_set)));
         }
-        Ok(Self { by_origin })
+        Ok(Self {
+            by_origin,
+            local_admin_store,
+        })
     }
 
     /// Return the default runtime pinned to one compiled origin, if enabled.
@@ -358,6 +652,18 @@ impl CompressionRuntimeRegistry {
     pub fn is_empty(&self) -> bool {
         self.by_origin.is_empty()
     }
+
+    pub(crate) fn local_admin_store(&self) -> Option<&Arc<dyn CompressionSessionStore>> {
+        self.local_admin_store.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_local_admin_store_for_test(store: Arc<dyn CompressionSessionStore>) -> Self {
+        Self {
+            by_origin: Vec::new(),
+            local_admin_store: Some(store),
+        }
+    }
 }
 
 fn actions_require_redis(actions: &[sbproxy_modules::Action]) -> bool {
@@ -372,12 +678,42 @@ fn actions_require_redis(actions: &[sbproxy_modules::Action]) -> bool {
     })
 }
 
+fn actions_require_local(actions: &[sbproxy_modules::Action]) -> bool {
+    actions.iter().any(|action| {
+        let sbproxy_modules::Action::AiProxy(action) = action else {
+            return false;
+        };
+        action
+            .config
+            .effective_compression_policy()
+            .is_some_and(|policy| policy_requires_local(&policy))
+    })
+}
+
 fn policy_requires_redis(policy: &CompressionPolicy) -> bool {
     pipeline_requires_redis(policy.state.as_ref(), &policy.levers)
         || policy
             .profiles
             .values()
             .any(|profile| pipeline_requires_redis(profile.state.as_ref(), &profile.levers))
+}
+
+fn policy_requires_local(policy: &CompressionPolicy) -> bool {
+    pipeline_requires_local(policy.state.as_ref(), &policy.levers)
+        || policy
+            .profiles
+            .values()
+            .any(|profile| pipeline_requires_local(profile.state.as_ref(), &profile.levers))
+}
+
+fn pipeline_requires_local(
+    state: Option<&CompressionStateConfig>,
+    levers: &[CompressionLeverConfig],
+) -> bool {
+    levers
+        .iter()
+        .any(|lever| matches!(lever, CompressionLeverConfig::SummaryBuffer(_)))
+        && state.is_none_or(|state| state.backend == CompressionStateBackend::Local)
 }
 
 /// Whether one pipeline binds the Redis compression state adapter. A
@@ -397,10 +733,11 @@ fn pipeline_requires_redis(
 
 impl CompressionRuntimeSet {
     fn build(
-        policy: CompressionPolicy,
+        mut policy: CompressionPolicy,
         handler: &AiHandlerConfig,
         dependencies: RuntimeDependencies,
     ) -> anyhow::Result<Self> {
+        policy.apply_state_defaults();
         let default_policy = CompressionPolicy {
             state: policy.state,
             allow_admin_content_inspection: policy.allow_admin_content_inspection,
@@ -586,9 +923,17 @@ impl CompressionRuntime {
                 .context("compression state is required for summary_buffer")?;
             let ttl = Duration::from_secs(state.ttl_secs);
             match state.backend {
-                CompressionStateBackend::Local => {
-                    bail!("Local compression state adapter is not wired")
-                }
+                CompressionStateBackend::Local => match &dependencies.local {
+                    LocalStateDependency::Live(store) => {
+                        Some(store.clone() as Arc<dyn CompressionSessionStore>)
+                    }
+                    LocalStateDependency::ValidationOnly => {
+                        Some(Arc::new(ValidationOnlyLocalStore))
+                    }
+                    LocalStateDependency::Unavailable => bail!(
+                        "Local compression state requires a writable process-owned database path"
+                    ),
+                },
                 CompressionStateBackend::Redis => {
                     let redis = dependencies.redis.clone().context(
                         "Redis compression state requires proxy.l2_cache_settings.driver: redis",
@@ -620,7 +965,7 @@ impl CompressionRuntime {
                     MeshStateDependency::Unavailable => bail!(
                         "mesh compression state requires proxy.cluster.replication: \
                          configure cluster replication on every node, or select the \
-                         default backend: redis"
+                         process-owned backend: local"
                     ),
                 },
             }
@@ -896,9 +1241,10 @@ fn destination_allowed(value: &str, allowed: &[String], blocked: &[String]) -> b
 #[cfg(test)]
 mod tests {
     use super::{
-        policy_behavior_fingerprint, policy_requires_redis, redis_dependency, CompressionExecution,
-        CompressionRuntime, CompressionRuntimeRegistry, CompressionRuntimeSet, MeshStateDependency,
-        RuntimeDependencies,
+        policy_behavior_fingerprint, policy_requires_local, policy_requires_redis,
+        redis_dependency, resolve_local_state_path, CompressionExecution, CompressionRuntime,
+        CompressionRuntimeRegistry, CompressionRuntimeSet, LocalPathInputs, LocalPlatform,
+        LocalStateDependency, MeshStateDependency, RuntimeDependencies,
     };
     use async_trait::async_trait;
     use rcgen::{CertificateParams, KeyPair};
@@ -1123,6 +1469,386 @@ mod tests {
             }
         }))
         .expect("handler fixture")
+    }
+
+    fn handler_with_omitted_summary_state() -> AiHandlerConfig {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "summary-provider",
+                "api_key": "test-key",
+                "models": ["summary-model"]
+            }],
+            "compression": {
+                "levers": [{
+                    "type": "summary_buffer",
+                    "min_tokens": 100,
+                    "retain_recent_messages": 2,
+                    "target_summary_tokens": 20,
+                    "summarizer": {
+                        "provider": "summary-provider",
+                        "model": "summary-model",
+                        "timeout": "2s"
+                    }
+                }]
+            }
+        }))
+        .expect("omitted state defaults")
+    }
+
+    #[test]
+    fn local_path_precedence_is_platform_explicit_and_pure() {
+        use std::path::Path;
+
+        let explicit = resolve_local_state_path(LocalPathInputs {
+            explicit: Some(Path::new("/configured/state.redb")),
+            service_dir_writable: true,
+            xdg_state_home: Some(Path::new("/xdg")),
+            home: Some(Path::new("/home/operator")),
+            platform: LocalPlatform::Unix,
+        })
+        .unwrap();
+        assert_eq!(explicit, Path::new("/configured/state.redb"));
+
+        let windows_explicit = resolve_local_state_path(LocalPathInputs {
+            explicit: Some(Path::new("C:\\configured\\state.redb")),
+            service_dir_writable: false,
+            xdg_state_home: None,
+            home: None,
+            platform: LocalPlatform::Windows,
+        })
+        .unwrap();
+        assert_eq!(windows_explicit, Path::new("C:\\configured\\state.redb"));
+
+        let service = resolve_local_state_path(LocalPathInputs {
+            explicit: None,
+            service_dir_writable: true,
+            xdg_state_home: Some(Path::new("/xdg")),
+            home: Some(Path::new("/home/operator")),
+            platform: LocalPlatform::Unix,
+        })
+        .unwrap();
+        assert_eq!(
+            service,
+            Path::new("/var/lib/sbproxy/compression-state.redb")
+        );
+
+        let xdg = resolve_local_state_path(LocalPathInputs {
+            explicit: None,
+            service_dir_writable: false,
+            xdg_state_home: Some(Path::new("/xdg")),
+            home: Some(Path::new("/home/operator")),
+            platform: LocalPlatform::MacOs,
+        })
+        .unwrap();
+        assert_eq!(xdg, Path::new("/xdg/sbproxy/compression-state.redb"));
+
+        let macos = resolve_local_state_path(LocalPathInputs {
+            explicit: None,
+            service_dir_writable: false,
+            xdg_state_home: None,
+            home: Some(Path::new("/Users/operator")),
+            platform: LocalPlatform::MacOs,
+        })
+        .unwrap();
+        assert_eq!(
+            macos,
+            Path::new("/Users/operator/Library/Application Support/sbproxy/compression-state.redb")
+        );
+
+        let unix = resolve_local_state_path(LocalPathInputs {
+            explicit: None,
+            service_dir_writable: false,
+            xdg_state_home: None,
+            home: Some(Path::new("/home/operator")),
+            platform: LocalPlatform::Unix,
+        })
+        .unwrap();
+        assert_eq!(
+            unix,
+            Path::new("/home/operator/.local/state/sbproxy/compression-state.redb")
+        );
+
+        let relative_xdg_falls_back_to_home = resolve_local_state_path(LocalPathInputs {
+            explicit: None,
+            service_dir_writable: false,
+            xdg_state_home: Some(Path::new("relative-state")),
+            home: Some(Path::new("/home/operator")),
+            platform: LocalPlatform::Unix,
+        })
+        .unwrap();
+        assert_eq!(
+            relative_xdg_falls_back_to_home,
+            Path::new("/home/operator/.local/state/sbproxy/compression-state.redb")
+        );
+
+        assert!(resolve_local_state_path(LocalPathInputs {
+            explicit: None,
+            service_dir_writable: true,
+            xdg_state_home: Some(Path::new("C:\\state")),
+            home: Some(Path::new("C:\\Users\\operator")),
+            platform: LocalPlatform::Windows,
+        })
+        .is_err());
+        assert!(resolve_local_state_path(LocalPathInputs {
+            explicit: None,
+            service_dir_writable: false,
+            xdg_state_home: None,
+            home: None,
+            platform: LocalPlatform::Unix,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn omitted_summary_state_requires_local_while_stateless_and_explicit_backends_do_not() {
+        let omitted = handler_with_omitted_summary_state()
+            .effective_compression_policy()
+            .unwrap()
+            .into_owned();
+        assert!(policy_requires_local(&omitted));
+
+        let stateless = stateless_handler(vec![serde_json::json!({
+            "type": "rag_select",
+            "min_tokens": 1,
+            "max_chunks": 1,
+            "min_relevance_percent": 0
+        })])
+        .effective_compression_policy()
+        .unwrap()
+        .into_owned();
+        assert!(!policy_requires_local(&stateless));
+
+        for backend in ["redis", "mesh"] {
+            let policy = handler(backend)
+                .effective_compression_policy()
+                .unwrap()
+                .into_owned();
+            assert!(!policy_requires_local(&policy), "{backend}");
+        }
+    }
+
+    fn dependencies_with_local(local: LocalStateDependency) -> RuntimeDependencies {
+        RuntimeDependencies {
+            redis: None,
+            local,
+            mesh: MeshStateDependency::Unavailable,
+            ai_client: Arc::new(sbproxy_ai::AiClient::new()),
+            writer_node: "node-a".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn omitted_and_explicit_local_bind_the_same_serialized_store() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("compression-state.redb");
+        let local = Arc::new(
+            crate::compression_store::LocalCompressionStore::open(&path)
+                .await
+                .unwrap(),
+        );
+        let dependencies = dependencies_with_local(LocalStateDependency::Live(local));
+
+        for handler in [handler_with_omitted_summary_state(), handler("local")] {
+            let runtime = CompressionRuntime::build(
+                handler.effective_compression_policy().unwrap().into_owned(),
+                &handler,
+                dependencies.clone(),
+            )
+            .unwrap();
+            let store = runtime.admin_store().unwrap();
+            assert_eq!(store.backend(), CompressionBackend::Local);
+            assert_eq!(store.consistency(), CompressionConsistency::Serialized);
+        }
+
+        for backend in ["redis", "mesh"] {
+            let handler = handler(backend);
+            let error = CompressionRuntime::build(
+                handler.effective_compression_policy().unwrap().into_owned(),
+                &handler,
+                dependencies.clone(),
+            )
+            .expect_err("an explicit backend must never fall back to Local");
+            assert!(
+                error.to_string().contains(if backend == "redis" {
+                    "requires proxy.l2_cache_settings.driver: redis"
+                } else {
+                    "requires proxy.cluster.replication"
+                }),
+                "{backend}: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn default_and_profile_local_pipelines_share_one_process_handle() {
+        let handler = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "summary-provider",
+                "api_key": "test-key",
+                "models": ["summary-model"]
+            }],
+            "compression": {
+                "levers": [{
+                    "type": "summary_buffer",
+                    "min_tokens": 100,
+                    "retain_recent_messages": 2,
+                    "target_summary_tokens": 20,
+                    "summarizer": {
+                        "provider": "summary-provider",
+                        "model": "summary-model",
+                        "timeout": "2s"
+                    }
+                }],
+                "profiles": {
+                    "brief": {
+                        "levers": [{
+                            "type": "summary_buffer",
+                            "min_tokens": 200,
+                            "retain_recent_messages": 1,
+                            "target_summary_tokens": 10,
+                            "summarizer": {
+                                "provider": "summary-provider",
+                                "model": "summary-model",
+                                "timeout": "2s"
+                            }
+                        }]
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("compression-state.redb");
+        let server = sbproxy_config::ProxyServerConfig {
+            compression_state: Some(sbproxy_config::CompressionStateRuntimeConfig {
+                local_path: Some(path.to_string_lossy().into_owned()),
+            }),
+            ..sbproxy_config::ProxyServerConfig::default()
+        };
+        let dependencies = RuntimeDependencies::from_process(&server, None, false, true).unwrap();
+        assert!(
+            path.is_file(),
+            "required startup opens the configured database"
+        );
+        let set = CompressionRuntimeSet::build(
+            handler.effective_compression_policy().unwrap().into_owned(),
+            &handler,
+            dependencies,
+        )
+        .unwrap();
+        let default = set.select_default();
+        let profile = set
+            .select(&sbproxy_ai::compression::CompressionSelector::Profile(
+                "brief".to_string(),
+            ))
+            .unwrap();
+        let default_store = default.runtime().unwrap().admin_store().unwrap();
+        let profile_store = profile.runtime().unwrap().admin_store().unwrap();
+
+        assert_eq!(default_store.backend(), CompressionBackend::Local);
+        assert_eq!(profile_store.backend(), CompressionBackend::Local);
+        assert!(Arc::ptr_eq(default_store, profile_store));
+    }
+
+    #[test]
+    fn validation_and_stateless_runtime_construction_create_no_local_database() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("must-not-exist.redb");
+        let server = sbproxy_config::ProxyServerConfig {
+            compression_state: Some(sbproxy_config::CompressionStateRuntimeConfig {
+                local_path: Some(path.to_string_lossy().into_owned()),
+            }),
+            ..sbproxy_config::ProxyServerConfig::default()
+        };
+
+        let validation = RuntimeDependencies::for_validation(&server, None, false, true).unwrap();
+        let handler = handler_with_omitted_summary_state();
+        let runtime = CompressionRuntime::build(
+            handler.effective_compression_policy().unwrap().into_owned(),
+            &handler,
+            validation,
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.admin_store().unwrap().backend(),
+            CompressionBackend::Local
+        );
+        assert!(!path.exists(), "validation must not touch the filesystem");
+
+        let stateless_dependencies =
+            RuntimeDependencies::from_process(&server, None, false, false).unwrap();
+        assert!(matches!(
+            stateless_dependencies.local,
+            LocalStateDependency::Unavailable
+        ));
+        let handler = stateless_handler(vec![serde_json::json!({
+            "type": "rag_select",
+            "min_tokens": 1,
+            "max_chunks": 1,
+            "min_relevance_percent": 0
+        })]);
+        let runtime = CompressionRuntime::build(
+            handler.effective_compression_policy().unwrap().into_owned(),
+            &handler,
+            stateless_dependencies,
+        )
+        .unwrap();
+        assert!(runtime.admin_store().is_none());
+        assert!(
+            !path.exists(),
+            "stateless pipelines must not create a database"
+        );
+    }
+
+    #[test]
+    fn required_local_open_is_fatal_and_names_the_configured_path() {
+        let directory = TempDir::new().unwrap();
+        let blocked_parent = directory.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"block directory creation").unwrap();
+        let path = blocked_parent.join("compression-state.redb");
+        let server = sbproxy_config::ProxyServerConfig {
+            compression_state: Some(sbproxy_config::CompressionStateRuntimeConfig {
+                local_path: Some(path.to_string_lossy().into_owned()),
+            }),
+            ..sbproxy_config::ProxyServerConfig::default()
+        };
+
+        let error = match RuntimeDependencies::from_process(&server, None, false, true) {
+            Ok(_) => panic!("a required Local open must fail startup"),
+            Err(error) => error,
+        };
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains(&path.to_string_lossy().into_owned()),
+            "{chain}"
+        );
+        assert!(
+            chain.contains("open required Local compression state"),
+            "{chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_unused_local_database_is_retained_for_admin() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("dormant.redb");
+        let seeded = crate::compression_store::LocalCompressionStore::open(&path)
+            .await
+            .unwrap();
+        drop(seeded);
+        let server = sbproxy_config::ProxyServerConfig {
+            compression_state: Some(sbproxy_config::CompressionStateRuntimeConfig {
+                local_path: Some(path.to_string_lossy().into_owned()),
+            }),
+            ..sbproxy_config::ProxyServerConfig::default()
+        };
+
+        let registry = CompressionRuntimeRegistry::from_process(&server, None, &[]).unwrap();
+        let store = registry
+            .local_admin_store()
+            .expect("an existing database remains manageable without an active pipeline");
+        assert_eq!(store.backend(), CompressionBackend::Local);
+        assert_eq!(store.consistency(), CompressionConsistency::Serialized);
     }
 
     fn stateless_handler(levers: Vec<serde_json::Value>) -> AiHandlerConfig {
@@ -1367,6 +2093,7 @@ origins:
     fn dependencies_with_mesh(mesh: MeshStateDependency) -> RuntimeDependencies {
         RuntimeDependencies {
             redis: None,
+            local: LocalStateDependency::Unavailable,
             mesh,
             ai_client: Arc::new(sbproxy_ai::AiClient::new()),
             writer_node: "node-a".to_string(),
@@ -1393,7 +2120,7 @@ origins:
             error.to_string().contains("proxy.cluster.replication"),
             "boot error must name the missing dependency: {error}"
         );
-        assert!(error.to_string().contains("backend: redis"));
+        assert!(error.to_string().contains("backend: local"));
     }
 
     #[test]

@@ -7,6 +7,9 @@ pub mod mesh;
 /// Strict lease-serialized Redis adapter.
 pub mod redis;
 
+#[cfg(test)]
+mod test_contract;
+
 pub use local::LocalCompressionStore;
 pub use mesh::{MeshCompressionStore, MeshCompressionStoreConfig};
 pub use redis::{RedisCompressionStore, RedisCompressionStoreConfig};

@@ -93,6 +93,40 @@ impl LocalCompressionStore {
         Self::open_with_clock(path.as_ref().to_path_buf(), Arc::new(SystemClock)).await
     }
 
+    /// Open from a synchronous pipeline-construction call while keeping redb
+    /// work on Tokio's blocking pool.
+    pub(crate) fn open_from_sync_context(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let opened = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            handle.spawn_blocking(move || {
+                let _ = sender.send(open_shared_database(path));
+            });
+            receiver.recv().map_err(|error| {
+                anyhow::anyhow!("Local compression state open task failed: {error}")
+            })?
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    anyhow::anyhow!("build Local compression state startup runtime: {error}")
+                })?
+                .block_on(async move {
+                    tokio::task::spawn_blocking(move || open_shared_database(path))
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("Local compression state open task failed: {error}")
+                        })?
+                })
+        }?;
+        Ok(Self {
+            database: opened.0,
+            canonical_path: Arc::new(opened.1),
+            clock: Arc::new(SystemClock),
+        })
+    }
+
     async fn open_with_clock(path: PathBuf, clock: Arc<dyn LocalClock>) -> anyhow::Result<Self> {
         let (database, canonical_path) =
             tokio::task::spawn_blocking(move || open_shared_database(path))
