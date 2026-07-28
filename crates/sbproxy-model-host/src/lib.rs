@@ -88,6 +88,8 @@ pub use admission::{
     AdmissionCounts, AdmissionGate, AdmissionPermit, AdmissionReason, AdmissionRejection,
     DrainReport,
 };
+#[cfg(feature = "hf-xet-transport")]
+pub use artifact::HfHubArtifactTransport;
 #[cfg(feature = "weights")]
 pub use artifact::HttpArtifactTransport;
 pub use artifact::{
