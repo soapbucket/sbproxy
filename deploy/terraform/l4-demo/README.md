@@ -66,9 +66,14 @@ No DNS, no source build, no manual engine install. For public HTTPS, set
 ### Cloud-agnostic variant
 
 `cloud-init.yaml` is the same bootstrap as plain user-data for any GPU box
-whose image carries the NVIDIA driver (a GCP DLVM, an AWS DLAMI, ...):
-edit the bearer token and pass it as the instance user-data. It
-curl-installs sbproxy, lets it acquire the engine, and serves.
+whose image carries the NVIDIA driver (a GCP DLVM, an AWS DLAMI, an Azure
+NVads image, ...): edit the bearer token and pass it as the instance
+user-data. It fetches [`bootstrap-generic.sh`](bootstrap-generic.sh) --
+the same cloud-agnostic script `startup-release.sh` above wraps for GCP
+-- curl-installs sbproxy, runs `sbproxy doctor` to validate the host, lets
+it acquire the engine, and serves. [`deploy/aws/README.md`](../../aws/README.md)
+and [`deploy/azure/README.md`](../../azure/README.md) walk the same
+`cloud-init.yaml` through each cloud's own instance-creation command.
 
 ## Serving models: both reference types
 

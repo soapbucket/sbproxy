@@ -5,9 +5,12 @@ import type {
   CatalogResponse,
   CatalogVariant,
   ClusterDeploymentAuthority,
+  ClusterDeploymentRolloutStatus,
+  ClusterNode,
   DeploymentDocument,
   DeploymentRuntimeState,
   ModelDeployment,
+  NodeReplicaSnapshot,
 } from "../api";
 import {
   applyDeploymentChange,
@@ -77,6 +80,81 @@ function clusterAuthority(
     active_revision: 7,
     active_content_digest: "a".repeat(64),
     signer_node_id: "authority-a",
+  };
+}
+
+function clusterDeploymentRolloutStatus(
+  deploymentId: string,
+): ClusterDeploymentRolloutStatus {
+  return {
+    deployment_id: deploymentId,
+    model: "qwen2.5",
+    generation: 1,
+    desired_replicas: 1,
+    placed_replicas: 0,
+    unplaced_replicas: 1,
+    phase: "starting",
+    target_ready: false,
+    timed_out: false,
+    handoff_deadline_unix_ms: 0,
+    assignments: [],
+    retained: [],
+    draining: [],
+    rejections: {},
+  };
+}
+
+function nodeReplicaSnapshot(
+  deploymentId: string,
+  overrides: Partial<NodeReplicaSnapshot> = {},
+): NodeReplicaSnapshot {
+  return {
+    deployment: deploymentId,
+    deployment_generation: 1,
+    model: "qwen2.5",
+    variant: null,
+    engine: "llama_cpp",
+    state: "ready",
+    endpoint: null,
+    artifact_digest: null,
+    selected_devices: [],
+    reserved_memory_bytes: null,
+    active_requests: 0,
+    queue_depth: 0,
+    adapters: [],
+    reason_code: null,
+    ...overrides,
+  };
+}
+
+function clusterNodeWithReplicas(
+  node_id: string,
+  replicas: NodeReplicaSnapshot[],
+): ClusterNode {
+  return {
+    node_id,
+    local: false,
+    membership_state: "alive",
+    address: null,
+    last_ack_age_ms: 0,
+    incarnation: 1,
+    health: "healthy",
+    unhealthy: false,
+    unhealthy_reasons: [],
+    roles: ["worker"],
+    labels: {},
+    model_endpoint: null,
+    model_eligible: true,
+    exclusion_reason: null,
+    snapshot_age_ms: null,
+    snapshot_generation: null,
+    observed_schema_version: null,
+    normalized_schema_version: null,
+    reported_health: null,
+    engine_count: 0,
+    device_count: 0,
+    ready_artifact_count: 0,
+    replicas,
   };
 }
 
@@ -855,11 +933,15 @@ describe("model management presentation", () => {
         deploymentId: "configured",
         desired: desired.configured,
         runtime: null,
+        assignment: null,
+        liveReplicas: [],
       },
       {
         deploymentId: "stopped",
         desired: desired.stopped,
         runtime: runtime[0],
+        assignment: null,
+        liveReplicas: [],
       },
     ]);
   });
@@ -889,6 +971,8 @@ describe("model management presentation", () => {
         deploymentId: "runtime-only",
         desired: null,
         runtime: runtime[0],
+        assignment: null,
+        liveReplicas: [],
       },
     ]);
   });
@@ -914,8 +998,45 @@ describe("model management presentation", () => {
       };
 
       expect(deploymentRows({}, [runtime])).toEqual([
-        { deploymentId: identifier, desired: null, runtime },
+        {
+          deploymentId: identifier,
+          desired: null,
+          runtime,
+          assignment: null,
+          liveReplicas: [],
+        },
       ]);
     },
   );
+
+  it("unions cluster assignment and live-replica deployment ids into the row set", () => {
+    const assignment = clusterDeploymentRolloutStatus("cluster-only");
+    const replicaA = nodeReplicaSnapshot("live-only", {
+      active_requests: 2,
+      queue_depth: 1,
+    });
+    const replicaB = nodeReplicaSnapshot("live-only", {
+      active_requests: 3,
+      queue_depth: 0,
+    });
+    const nodeA = clusterNodeWithReplicas("worker-a", [replicaA]);
+    const nodeB = clusterNodeWithReplicas("worker-b", [replicaB]);
+
+    expect(deploymentRows(null, [], [assignment], [nodeA, nodeB])).toEqual([
+      {
+        deploymentId: "cluster-only",
+        desired: null,
+        runtime: null,
+        assignment,
+        liveReplicas: [],
+      },
+      {
+        deploymentId: "live-only",
+        desired: null,
+        runtime: null,
+        assignment: null,
+        liveReplicas: [replicaA, replicaB],
+      },
+    ]);
+  });
 });

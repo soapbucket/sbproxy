@@ -9,6 +9,7 @@ use super::*;
 #[cfg(test)]
 use crate::key_policy::StoredPolicyErrorKind;
 use crate::key_policy::{key_record_to_effective_policy, StoredPolicyError};
+use crate::model_discovery::ErrorEnvelope;
 
 /// Outcome of resolving an inbound bearer token against the dynamic key plane
 /// (WOR-1551).
@@ -708,6 +709,45 @@ fn governance_limits_from_policy(
         total_micro_usd,
         window_millis: 60_000,
     })
+}
+
+/// Build the governance-store lookup key for `GET /v1/key/usage`, scoped
+/// strictly to the resolved caller's own key id and policy revision. The
+/// route takes no key id parameter, so this is the only key it can ever
+/// answer for. Returns the same rejection [`governed_key_requirement`]
+/// uses for a request with no governed policy, since there is nothing to
+/// look up for a key that carries none.
+fn key_usage_snapshot_key(
+    resolved: Option<&ResolvedRequestKey>,
+) -> std::result::Result<sbproxy_ai::governance::SnapshotKey, (u16, &'static str)> {
+    let policy = resolved
+        .and_then(ResolvedRequestKey::policy)
+        .ok_or((401, "governed credential required"))?;
+    Ok(sbproxy_ai::governance::SnapshotKey {
+        key_id: policy.key_id.clone(),
+        policy_revision: policy.policy_revision,
+        limits: governance_limits_from_policy(policy).unwrap_or_default(),
+    })
+}
+
+/// Answer `GET /v1/key/usage`: the resolved caller's own
+/// [`sbproxy_ai::governance::GovernanceSnapshot`], wrapped the same way
+/// the admin-plane key-usage lookup wraps it (`{"usage": <snapshot>}`), so
+/// a caller already parsing that shape can reuse it here.
+async fn key_usage_response(
+    store: &dyn sbproxy_ai::governance::GovernanceStore,
+    resolved: Option<&ResolvedRequestKey>,
+) -> std::result::Result<serde_json::Value, (u16, &'static str)> {
+    let snapshot_key = key_usage_snapshot_key(resolved)?;
+    match store.snapshot(snapshot_key).await {
+        Ok(snapshot) => Ok(serde_json::json!({ "usage": snapshot })),
+        // Same client-facing message the governed-key reserve path sends
+        // on a 503 for this same error further down in `handle_ai_proxy`.
+        Err(sbproxy_ai::governance::GovernanceError::BackendUnavailable { .. }) => {
+            Err((503, "governed key admission backend unavailable"))
+        }
+        Err(_) => Err((500, "governance snapshot failed")),
+    }
 }
 
 /// Decide the pre-request monetary ceiling for a governance reserve
@@ -1564,6 +1604,43 @@ pub(super) async fn handle_ai_proxy(
         }
     }
 
+    // Self-service key introspection (compatibility): the resolved
+    // caller's own governance usage, answered locally like `/v1/models`
+    // and the LiteLLM-parity endpoints further below. This is not a
+    // `classify_surface` surface and needs no configured provider at
+    // all, so it runs after the per-surface rate limit and provider-
+    // capability gates above (both of which already exempt `Unknown`)
+    // but before the gate just below, which 501s an `Unknown` path
+    // with no OpenAI-format provider to forward it to; that gate does
+    // not apply here since this path is never forwarded anywhere. It
+    // is scoped strictly to `resolved_request_vk`'s own key id, so
+    // there is no parameter path to another key's usage.
+    if method == http::Method::GET
+        && matches!(
+            path.split('?')
+                .next()
+                .unwrap_or(path.as_str())
+                .trim_end_matches('/'),
+            "/v1/key/usage"
+        )
+    {
+        let Some(plane) = key_plane.as_ref() else {
+            send_error(session, 401, "governed credential required").await?;
+            return Ok(());
+        };
+        let store = plane.governance_store();
+        match key_usage_response(store.as_ref(), resolved_request_vk.as_ref()).await {
+            Ok(body) => {
+                let bytes = serde_json::to_vec(&body).unwrap_or_default();
+                send_response(session, 200, "application/json", &bytes).await?;
+            }
+            Err((status, message)) => {
+                send_error(session, status, message).await?;
+            }
+        }
+        return Ok(());
+    }
+
     // WOR-752 Finding B: an unrecognized (`Unknown`) path can only be
     // forwarded verbatim. That is correct forward-compat for an
     // OpenAI-format upstream (a new OpenAI path the catalog has not
@@ -1679,17 +1756,14 @@ pub(super) async fn handle_ai_proxy(
                 send_response(session, 200, "application/json", &bytes).await?;
                 return Ok(());
             }
-            let body = serde_json::json!({
-                "error": {
-                    "message": format!(
-                        "provider {} serves its model locally; `GET {}` has no upstream \
-                         to forward to. The engine starts on the first completion request.",
-                        provider.name, path
-                    ),
-                    "type": "engine_not_ready",
-                }
-            });
-            let bytes = serde_json::to_vec(&body).unwrap_or_default();
+            let message = format!(
+                "provider {} serves its model locally; `GET {}` has no upstream \
+                 to forward to. The engine starts on the first completion request.",
+                provider.name, path
+            );
+            let bytes = ErrorEnvelope::new("engine_not_ready", &message)
+                .request_id(ctx.request_id.as_str())
+                .to_bytes();
             send_response(session, 503, "application/json", &bytes).await?;
             return Ok(());
         }
@@ -2819,16 +2893,15 @@ pub(super) async fn handle_ai_proxy(
                         sbproxy_ai::tracing_spans::error_type::BUDGET_EXCEEDED,
                         "governed key cost limit cannot be pre-gated: model has no rate",
                     );
-                    let deny_body = serde_json::json!({
-                        "error": {
-                            "type": "budget_exceeded",
-                            "scope": "governed_key",
-                            "message": "this key has a monetary limit but the resolved \
+                    let bytes = ErrorEnvelope::new(
+                        "budget_exceeded",
+                        "this key has a monetary limit but the resolved \
                                 model has no estimable rate; denying rather than \
                                 admitting with an unenforced cost limit",
-                        }
-                    });
-                    let bytes = serde_json::to_vec(&deny_body).unwrap_or_default();
+                    )
+                    .scope("governed_key")
+                    .request_id(ctx.request_id.as_str())
+                    .to_bytes();
                     send_response(session, 402, "application/json", &bytes).await?;
                     return Ok(());
                 }
@@ -2875,14 +2948,13 @@ pub(super) async fn handle_ai_proxy(
                         .max(1);
                     let retry = retry_after_secs.to_string();
                     let extra: Option<(&str, &str)> = Some(("retry-after", &retry));
-                    send_response_with_extra(
-                        session,
-                        429,
-                        "application/json",
-                        br#"{"error":{"message":"governed key limit exceeded","type":"rate_limit_error"}}"#,
-                        extra,
-                    )
-                    .await?;
+                    let bytes =
+                        ErrorEnvelope::new("rate_limit_error", "governed key limit exceeded")
+                            .request_id(ctx.request_id.as_str())
+                            .retryable(true)
+                            .to_bytes();
+                    send_response_with_extra(session, 429, "application/json", &bytes, extra)
+                        .await?;
                     return Ok(());
                 }
                 Err(sbproxy_ai::governance::GovernanceError::BackendUnavailable { backend }) => {
@@ -3001,14 +3073,11 @@ pub(super) async fn handle_ai_proxy(
                     sbproxy_ai::tracing_spans::error_type::RATE_LIMITED,
                     "model rate limit exceeded",
                 );
-                send_response_with_extra(
-                    session,
-                    429,
-                    "application/json",
-                    br#"{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#,
-                    extra,
-                )
-                .await?;
+                let bytes = ErrorEnvelope::new("rate_limit_error", "rate limit exceeded")
+                    .request_id(ctx.request_id.as_str())
+                    .retryable(true)
+                    .to_bytes();
+                send_response_with_extra(session, 429, "application/json", &bytes, extra).await?;
                 return Ok(());
             }
         }
@@ -3119,14 +3188,13 @@ pub(super) async fn handle_ai_proxy(
                 sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                 "guardrail configuration failed to compile",
             );
-            let error_body = serde_json::json!({
-                "error": {
-                    "message": "AI guardrail configuration failed to compile",
-                    "type": "configuration_error",
-                    "code": "guardrail_configuration_error",
-                }
-            });
-            let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+            let body_bytes = ErrorEnvelope::new(
+                "configuration_error",
+                "AI guardrail configuration failed to compile",
+            )
+            .code("guardrail_configuration_error")
+            .request_id(ctx.request_id.as_str())
+            .to_bytes();
             send_response(session, 500, "application/json", &body_bytes).await?;
             return Ok(());
         }
@@ -3177,14 +3245,10 @@ pub(super) async fn handle_ai_proxy(
                         &reason,
                     );
                     mark_guardrail_block(ctx, name.to_string());
-                    let error_body = serde_json::json!({
-                        "error": {
-                            "message": reason,
-                            "type": "guardrail_violation",
-                            "code": name,
-                        }
-                    });
-                    let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+                    let body_bytes = ErrorEnvelope::new("guardrail_violation", &reason)
+                        .code(&name)
+                        .request_id(ctx.request_id.as_str())
+                        .to_bytes();
                     send_response(session, 400, "application/json", &body_bytes).await?;
                     return Ok(());
                 }
@@ -3236,14 +3300,10 @@ pub(super) async fn handle_ai_proxy(
                             &reason,
                         );
                         mark_guardrail_block(ctx, decision.security_labels.join(","));
-                        let error_body = serde_json::json!({
-                            "error": {
-                                "message": reason,
-                                "type": "guardrail_violation",
-                                "code": decision.security_labels.join(","),
-                            }
-                        });
-                        let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+                        let body_bytes = ErrorEnvelope::new("guardrail_violation", &reason)
+                            .code(&decision.security_labels.join(","))
+                            .request_id(ctx.request_id.as_str())
+                            .to_bytes();
                         send_response(session, 400, "application/json", &body_bytes).await?;
                         return Ok(());
                     }
@@ -3268,14 +3328,10 @@ pub(super) async fn handle_ai_proxy(
                         // 400, so stamp the precise outcome for the
                         // value-vs-waste metric.
                         mark_guardrail_block(ctx, block.name.clone());
-                        let error_body = serde_json::json!({
-                            "error": {
-                                "message": block.reason,
-                                "type": "guardrail_violation",
-                                "code": block.name,
-                            }
-                        });
-                        let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+                        let body_bytes = ErrorEnvelope::new("guardrail_violation", &block.reason)
+                            .code(&block.name)
+                            .request_id(ctx.request_id.as_str())
+                            .to_bytes();
                         send_response(session, 400, "application/json", &body_bytes).await?;
                         return Ok(());
                     }
@@ -3312,14 +3368,10 @@ pub(super) async fn handle_ai_proxy(
                     // 400, so stamp the precise outcome for the
                     // value-vs-waste metric.
                     mark_guardrail_block(ctx, block.name.clone());
-                    let error_body = serde_json::json!({
-                        "error": {
-                            "message": block.reason,
-                            "type": "guardrail_violation",
-                            "code": block.name,
-                        }
-                    });
-                    let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+                    let body_bytes = ErrorEnvelope::new("guardrail_violation", &block.reason)
+                        .code(&block.name)
+                        .request_id(ctx.request_id.as_str())
+                        .to_bytes();
                     send_response(session, 400, "application/json", &body_bytes).await?;
                     return Ok(());
                 }
@@ -3346,14 +3398,10 @@ pub(super) async fn handle_ai_proxy(
                         // WOR-1496: stamp the precise outcome (the wire
                         // status is a generic 400).
                         mark_guardrail_block(ctx, block.name.clone());
-                        let error_body = serde_json::json!({
-                            "error": {
-                                "message": block.reason,
-                                "type": "guardrail_violation",
-                                "code": block.name,
-                            }
-                        });
-                        let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+                        let body_bytes = ErrorEnvelope::new("guardrail_violation", &block.reason)
+                            .code(&block.name)
+                            .request_id(ctx.request_id.as_str())
+                            .to_bytes();
                         send_response(session, 400, "application/json", &body_bytes).await?;
                         return Ok(());
                     }
@@ -3415,13 +3463,9 @@ pub(super) async fn handle_ai_proxy(
         if decision.is_block() {
             warn!(ai.surface = surface_label, "AI policy: blocked request");
             ctx.ai_outcome = Some("policy_block".to_string());
-            let error_body = serde_json::json!({
-                "error": {
-                    "message": "blocked by AI policy",
-                    "type": "ai_policy_block",
-                }
-            });
-            let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+            let body_bytes = ErrorEnvelope::new("ai_policy_block", "blocked by AI policy")
+                .request_id(ctx.request_id.as_str())
+                .to_bytes();
             send_response(session, 403, "application/json", &body_bytes).await?;
             return Ok(());
         }
@@ -3473,14 +3517,10 @@ pub(super) async fn handle_ai_proxy(
                 reason = error.reason(),
                 "AI compression: request policy rejected"
             );
-            let body = serde_json::json!({
-                "error": {
-                    "message": error.client_message(),
-                    "type": "invalid_request_error",
-                    "code": "invalid_compression_selector"
-                }
-            });
-            let body = serde_json::to_vec(&body).unwrap_or_default();
+            let body = ErrorEnvelope::new("invalid_request_error", error.client_message())
+                .code("invalid_compression_selector")
+                .request_id(ctx.request_id.as_str())
+                .to_bytes();
             send_response(session, 400, "application/json", &body).await?;
             return Ok(());
         }
@@ -3520,14 +3560,10 @@ pub(super) async fn handle_ai_proxy(
                 reason = error.reason(),
                 "AI compression: request policy rejected"
             );
-            let body = serde_json::json!({
-                "error": {
-                    "message": error.client_message(),
-                    "type": "invalid_request_error",
-                    "code": "invalid_compression_selector"
-                }
-            });
-            let body = serde_json::to_vec(&body).unwrap_or_default();
+            let body = ErrorEnvelope::new("invalid_request_error", error.client_message())
+                .code("invalid_compression_selector")
+                .request_id(ctx.request_id.as_str())
+                .to_bytes();
             send_response(session, 400, "application/json", &body).await?;
             return Ok(());
         }
@@ -4083,11 +4119,12 @@ pub(super) async fn handle_ai_proxy(
     if disallow_training {
         provider_order.retain(|&i| config.providers[i].no_prompt_training);
         if provider_order.is_empty() {
-            let err = serde_json::json!({"error": {
-                "message": "disallow_prompt_training requested but no configured provider is marked no_prompt_training",
-                "type": "no_compliant_provider",
-            }});
-            let body_bytes = serde_json::to_vec(&err).unwrap_or_default();
+            let body_bytes = ErrorEnvelope::new(
+                "no_compliant_provider",
+                "disallow_prompt_training requested but no configured provider is marked no_prompt_training",
+            )
+            .request_id(ctx.request_id.as_str())
+            .to_bytes();
             send_response(session, 400, "application/json", &body_bytes).await?;
             return Ok(());
         }
@@ -4545,17 +4582,14 @@ pub(super) async fn handle_ai_proxy(
                                     context_limit = fit.context_limit,
                                     "AI proxy: refusing an over-context prompt for a local model"
                                 );
-                                let deny_body = serde_json::json!({
-                                    "error": {
-                                        "type": "context_length_exceeded",
-                                        "message": format!(
-                                            "prompt is {} tokens but the served model's context \
-                                             window is {}; shorten the prompt or messages",
-                                            fit.tokens, fit.context_limit
-                                        ),
-                                    }
-                                });
-                                let bytes = serde_json::to_vec(&deny_body).unwrap_or_default();
+                                let message = format!(
+                                    "prompt is {} tokens but the served model's context \
+                                     window is {}; shorten the prompt or messages",
+                                    fit.tokens, fit.context_limit
+                                );
+                                let bytes = ErrorEnvelope::new("context_length_exceeded", &message)
+                                    .request_id(ctx.request_id.as_str())
+                                    .to_bytes();
                                 send_response(session, 400, "application/json", &bytes).await?;
                                 return Ok(());
                             }
@@ -5801,14 +5835,16 @@ pub(super) async fn relay_ai_response_with_cache(
                 );
             }
         }
-        let error_body = serde_json::json!({
-            "error": {
-                "message": block.reason,
-                "type": "guardrail_violation",
-                "code": block.name,
-            }
-        });
-        let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+        let mut envelope =
+            ErrorEnvelope::new("guardrail_violation", &block.reason).code(&block.name);
+        // Unlike every other retrofit site in this file, `ctx` here is
+        // `Option<&mut RequestContext>` (this relay path also serves
+        // callers with no request context), so request_id can only be
+        // populated when one was actually supplied.
+        if let Some(request_ctx) = ctx.as_ref() {
+            envelope = envelope.request_id(request_ctx.request_id.as_str());
+        }
+        let body_bytes = envelope.to_bytes();
         return send_response(session, 403, "application/json", &body_bytes).await;
     }
 
@@ -10300,6 +10336,86 @@ mod governance_limits_from_policy_tests {
         assert_eq!(limits.tokens_per_window, None);
         assert_eq!(limits.total_tokens, None);
         assert_eq!(limits.total_micro_usd, None);
+    }
+}
+
+#[cfg(test)]
+mod key_usage_route_tests {
+    use super::*;
+    use sbproxy_ai::governance::{InMemoryGovernanceConfig, InMemoryGovernanceStore};
+    use sbproxy_keystore::record::KeyRecord;
+
+    #[test]
+    fn key_usage_snapshot_key_rejects_a_caller_with_no_governed_policy() {
+        // No resolved key at all (anonymous caller).
+        assert_eq!(
+            key_usage_snapshot_key(None),
+            Err((401, "governed credential required"))
+        );
+
+        // A statically configured key with no `key_id` never resolves a
+        // policy, the same "legacy" case `governed_key_requirement`
+        // rejects.
+        let legacy: sbproxy_ai::identity::VirtualKeyConfig =
+            serde_json::from_value(serde_json::json!({"key": "legacy-secret", "name": "legacy"}))
+                .expect("legacy key");
+        let legacy = ResolvedRequestKey::from_configured(legacy, "tenant-a");
+        assert_eq!(
+            key_usage_snapshot_key(Some(&legacy)),
+            Err((401, "governed credential required"))
+        );
+    }
+
+    #[test]
+    fn key_usage_snapshot_key_scopes_to_the_resolved_callers_own_id() {
+        let mut record = KeyRecord::new("usage-key", "secret-hash", chrono::Utc::now());
+        record.max_requests_per_minute = Some(60);
+        let resolved =
+            ResolvedRequestKey::from_record(&record, "tenant-a").expect("valid stored policy");
+
+        let snapshot_key = key_usage_snapshot_key(Some(&resolved))
+            .expect("a governed key resolves its own snapshot key");
+
+        // There is no parameter path to another key's id: the snapshot key
+        // is always the resolved caller's own `key_id`.
+        assert_eq!(snapshot_key.key_id, "usage-key");
+        assert_eq!(snapshot_key.limits.requests_per_window, Some(60));
+    }
+
+    #[tokio::test]
+    async fn key_usage_response_returns_the_resolved_callers_own_snapshot() {
+        let mut record = KeyRecord::new("usage-response-key", "secret-hash", chrono::Utc::now());
+        record.max_requests_per_minute = Some(60);
+        let resolved =
+            ResolvedRequestKey::from_record(&record, "tenant-a").expect("valid stored policy");
+        let store = InMemoryGovernanceStore::new(InMemoryGovernanceConfig::default())
+            .expect("in-memory governance store");
+
+        let body = key_usage_response(&store, Some(&resolved))
+            .await
+            .expect("a governed key returns its own usage");
+
+        let usage: sbproxy_ai::governance::GovernanceSnapshot =
+            serde_json::from_value(body["usage"].clone())
+                .expect("the response wraps a GovernanceSnapshot under \"usage\"");
+        assert_eq!(usage.key_id, "usage-response-key");
+        assert_eq!(usage.requests_per_window.limit, Some(60));
+        assert_eq!(usage.requests_per_window.used, 0);
+    }
+
+    #[tokio::test]
+    async fn key_usage_response_rejects_a_caller_with_no_governed_key() {
+        // Same 401 status and message `governed_key_requirement` uses
+        // elsewhere in this file for a request with no governed
+        // credential: an anonymous caller has no usage to show.
+        let store = InMemoryGovernanceStore::new(InMemoryGovernanceConfig::default())
+            .expect("in-memory governance store");
+
+        let err = key_usage_response(&store, None)
+            .await
+            .expect_err("an unresolved caller has no key to look up");
+
+        assert_eq!(err, (401, "governed credential required"));
     }
 }
 

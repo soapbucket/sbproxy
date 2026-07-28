@@ -30,6 +30,11 @@ const props = defineProps<{
   existingDeploymentIds: readonly string[];
   initialDeploymentId?: string | null;
   initialDeployment?: ModelDeployment | null;
+  /** Preselect a catalog model (and optionally an exact variant) when
+   *  opening a fresh "Add deployment" draft, e.g. from a Get Started
+   *  card. Ignored once `initialDeployment` is set (editing). */
+  preselectModel?: string | null;
+  preselectVariant?: string | null;
   saving?: boolean;
   canSave?: boolean;
   submitError?: string | null;
@@ -62,12 +67,20 @@ function uniqueDeploymentId(model: string): string {
   return `${base}-${suffix}`;
 }
 
-const firstModel = catalogModels.value[0]?.id ?? "";
+const preselectedModel =
+  props.preselectModel && Object.hasOwn(props.catalog.models, props.preselectModel)
+    ? props.preselectModel
+    : null;
+const firstModel = preselectedModel ?? catalogModels.value[0]?.id ?? "";
 const originalModel = props.initialDeployment?.model ?? null;
 const originalDeploymentId = props.initialDeploymentId ?? null;
 const initialDraft = props.initialDeployment && originalDeploymentId
   ? deploymentFormFromDeployment(originalDeploymentId, props.initialDeployment)
-  : deploymentFormDefaults(uniqueDeploymentId(firstModel), firstModel, null);
+  : deploymentFormDefaults(
+      uniqueDeploymentId(firstModel),
+      firstModel,
+      props.preselectVariant ?? null,
+    );
 const localMode = computed(() => props.mode === "local_put");
 if (localMode.value) {
   initialDraft.replicas = "1";

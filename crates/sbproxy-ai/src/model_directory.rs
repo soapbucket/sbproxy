@@ -483,6 +483,15 @@ impl ModelDirectory {
         let candidate_replicas = build_replica_index(&nodes, &active_generations);
         let eligible_replicas = build_eligible_replica_index(&candidate_replicas);
         let summary = summarize(&nodes, &eligible_replicas, deployment_digest_mismatch);
+        // Every node's classification is final at this point (all
+        // exclusion assignments above have already run), so this is the
+        // one place per refresh that sees the complete, final exclusion
+        // set rather than one candidate reason mid-evaluation.
+        for node in &nodes {
+            if let Some(reason) = node.exclusion_reason {
+                crate::ai_metrics::record_model_directory_exclusion(reason.as_str());
+            }
+        }
         let view = Arc::new(ModelDirectoryView {
             schema_version: DIRECTORY_SCHEMA_VERSION,
             collected_at_unix_ms,

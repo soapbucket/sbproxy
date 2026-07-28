@@ -1158,9 +1158,9 @@ mod tests {
         let local = Arc::new(LocalCompressionStore::open(&path).await.unwrap());
         let pipeline = crate::pipeline::CompiledPipeline {
             compression_runtimes:
-                crate::compression_runtime::CompressionRuntimeRegistry::with_local_admin_store_for_test(
-                    local,
-                ),
+            crate::compression_runtime::CompressionRuntimeRegistry::with_local_admin_store_for_test(
+                local,
+            ),
             ..Default::default()
         };
 
