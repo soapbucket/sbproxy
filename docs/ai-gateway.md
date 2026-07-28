@@ -1321,18 +1321,19 @@ default. Explicit-budget fitting preserves leading system and developer
 instructions, the newest complete turn, contiguous recent history, and
 OpenAI/Anthropic tool-call groupings.
 
-A stateful summary requires a captured session ID and the configured Redis L2
-service. Request workers retain no canonical session summary in process.
-`proxy.cluster.replication` provides a durable replicated mesh substrate, but
-compression's legacy mesh adapter is not integrated with or validated against
-its `ReplicatedStore` session and Admin lifecycle semantics. Public
-`backend: mesh` selection therefore remains rejected as a separate, unshipped
-integration. There is no OmniRoute dependency, import, or migration path.
+A stateful summary requires a captured session ID. A stateful pipeline with no
+explicit `state` block uses a process-owned Local redb file with a 24-hour TTL.
+Choose `backend: redis` explicitly for serialized state shared across processes,
+or `backend: mesh` for an eventually consistent Redis-free fleet already
+running `proxy.cluster.replication`. Explicit backends fail startup when their
+dependency is unavailable and never fall back to Local. There is no OmniRoute
+dependency, import, or migration path.
+
 The legacy `resilience.llm_aware.context_compress` switch remains a shorthand
 for one `window_fit` lever only when the explicit block is absent.
 
 The complete configuration, session and structured-content safety rules,
-Redis state guarantees, failure table, metrics, logs, and PromQL are
+state-backend guarantees, failure table, metrics, logs, and PromQL are
 in [AI context compression](ai-context-compression.md).
 
 ### Context overflow (design stage)
@@ -1592,7 +1593,6 @@ What runs before the upgrade:
   governed key wins, otherwise the selected provider's nonblank `api_key` is
   used. If neither exists, the request fails closed with 503 and no upstream
   WebSocket handshake.
-- The active-sessions gauge `sbproxy_ai_realtime_sessions_active` ticks up.
 
 Credential headers are finalized after ordinary header modifiers and Lua
 scripts. The proxy removes caller-controlled `Authorization`,
@@ -1610,6 +1610,11 @@ minting paths. Those mechanisms retain their existing semantics for ordinary
 HTTP proxy requests, but they neither authorize nor add a second credential
 to a Realtime upgrade.
 
+After the provider accepts the upgrade with `101 Switching Protocols`, the
+active-sessions gauge `sbproxy_ai_realtime_sessions_active` ticks up. A
+non-`101` provider response does not change that gauge and does not emit
+session-duration or realtime billing events.
+
 What runs during the session:
 - Pingora forwards WebSocket frames byte-transparently. The proxy does not inspect individual frames (per-frame guardrails are not on the OSS path; they would require terminate-and-relay, which is reserved for an enterprise build).
 - Admission is evaluated once. A hot policy/config update applies to new
@@ -1619,7 +1624,7 @@ What runs during the session:
   accepted session is not rechecked against a budget after each frame.
 
 What runs at session close (the `logging` hook):
-- The active-sessions gauge ticks down.
+- For an accepted session, the active-sessions gauge ticks down.
 - `sbproxy_ai_realtime_session_duration_seconds` records the wall-clock session lifetime.
 - An `AiBillingEvent` fires with `usage = AudioSeconds { seconds = wall_clock }` so operators see realtime usage on the standard billing event bus. Cost is reported as 0.0 in OSS until the realtime rate card lands in the pricing helper; downstream consumers can compute cost from the duration.
 

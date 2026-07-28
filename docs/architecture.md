@@ -399,11 +399,11 @@ The legacy default-only compatibility pipeline retains its old cache scope.
 
 `window_fit` is stateless. Explicit-budget fitting preserves the leading
 instruction prefix, newest protocol unit, contiguous recent suffix, and tool
-call/result groups. `summary_buffer` has external state, but its canonical
-record exists only in Redis. Workers keep no canonical conversational state,
-and the cluster mesh is not accepted as a summary backend. Admin deletion and
-purge operate on the same fenced Redis record. There is no OmniRoute runtime,
-import, or migration seam.
+call/result groups. `summary_buffer` defaults to a process-owned Local redb
+store and accepts explicit Redis or mesh state. Redis serializes updates across
+processes; mesh uses the replicated substrate's eventual last-writer-wins
+contract. Admin deletion and purge operate on the same selected store. There is
+no OmniRoute runtime, import, or migration seam.
 
 Compression produces pending per-lever value after it changes the message list.
 The response phase commits that value only for a billable terminal provider

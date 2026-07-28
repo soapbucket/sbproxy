@@ -850,7 +850,7 @@ fn open_shared_database(path: PathBuf) -> anyhow::Result<(Arc<Database>, PathBuf
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Local compression state path must have a parent"))?;
-    std::fs::create_dir_all(parent).map_err(|error| {
+    create_owner_only_directory(parent).map_err(|error| {
         anyhow::anyhow!(
             "create Local compression state directory {}: {error}",
             parent.display()
@@ -934,6 +934,19 @@ fn open_shared_database(path: PathBuf) -> anyhow::Result<(Arc<Database>, PathBuf
     })?;
     handles.insert(canonical_path.clone(), Arc::downgrade(&database));
     Ok((database, canonical_path))
+}
+
+#[cfg(unix)]
+fn create_owner_only_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_owner_only_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
 }
 
 #[cfg(unix)]
