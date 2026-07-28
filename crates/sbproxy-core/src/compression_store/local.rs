@@ -593,12 +593,12 @@ impl CompressionSessionStore for LocalCompressionStore {
                         let table = write
                             .open_table(RECORDS)
                             .map_err(|_| StoreError::Unavailable)?;
-                        let mut range = match cursor.as_ref() {
+                        let range = match cursor.as_ref() {
                             Some(cursor) => table.range::<&[u8; 32]>((Excluded(cursor), Unbounded)),
                             None => table.range::<&[u8; 32]>(..),
                         }
                         .map_err(|_| StoreError::Unavailable)?;
-                        while let Some(entry) = range.next() {
+                        for entry in range {
                             if scanned == MAX_SCAN_ROWS {
                                 stopped_early = true;
                                 break;
@@ -756,12 +756,12 @@ impl CompressionSessionStore for LocalCompressionStore {
                         let table = write
                             .open_table(RECORDS)
                             .map_err(|_| StoreError::Unavailable)?;
-                        let mut range = match cursor.as_ref() {
+                        let range = match cursor.as_ref() {
                             Some(cursor) => table.range::<&[u8; 32]>((Excluded(cursor), Unbounded)),
                             None => table.range::<&[u8; 32]>(..),
                         }
                         .map_err(|_| StoreError::Unavailable)?;
-                        while let Some(entry) = range.next() {
+                        for entry in range {
                             if scanned == MAX_SCAN_ROWS {
                                 stopped_early = true;
                                 break;
@@ -969,6 +969,7 @@ fn enforce_owner_only_database_file(path: &Path) -> std::io::Result<()> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .mode(0o600)
         .open(path)?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))

@@ -97,6 +97,9 @@ pub async fn spawn_echo_ws_server() -> EchoWebSocketServer {
             };
             let connection_captured = Arc::clone(&task_captured);
             tokio::spawn(async move {
+                // tungstenite fixes this callback's error type to a full HTTP
+                // response, so its size is outside this test helper's control.
+                #[allow(clippy::result_large_err)]
                 let callback = move |request: &Request, response: Response| {
                     let mut headers: HashMap<String, Vec<String>> = HashMap::new();
                     for (name, value) in request.headers() {
