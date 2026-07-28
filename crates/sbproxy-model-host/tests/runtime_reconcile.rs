@@ -320,6 +320,9 @@ struct FixtureRuntimeFacts {
     max_active_starts: AtomicUsize,
     fail_start: Mutex<BTreeSet<String>>,
     fail_start_once: Mutex<BTreeSet<String>>,
+    // Overrides the reason `start` fails with for an id in `fail_start` or
+    // `fail_start_once`; absent defaults to `EngineEarlyExit`.
+    fail_start_reason: Mutex<BTreeMap<String, EngineFailureReason>>,
     fail_stop: Mutex<BTreeSet<String>>,
     fail_health: Mutex<BTreeSet<String>>,
     // id -> number of health probes to fail transiently before recovering.
@@ -434,8 +437,16 @@ impl PreparedDeploymentRuntime for FixturePreparedRuntime {
         self.facts.active_starts.fetch_sub(1, Ordering::SeqCst);
         let fail_once = self.facts.fail_start_once.lock().unwrap().remove(&self.id);
         if fail_once || self.facts.fail_start.lock().unwrap().contains(&self.id) {
+            let reason = self
+                .facts
+                .fail_start_reason
+                .lock()
+                .unwrap()
+                .get(&self.id)
+                .copied()
+                .unwrap_or(EngineFailureReason::EngineEarlyExit);
             return Err(RuntimeManagerError::Engine(EngineDriverError::new(
-                EngineFailureReason::EngineEarlyExit,
+                reason,
                 format!("fixture deployment {} failed to start", self.id),
                 "repair the fixture and reset it",
                 true,
@@ -803,6 +814,213 @@ async fn ready_generation_detects_a_process_that_exited_after_readiness() {
     );
     assert!(status.port.is_none());
     assert!(manager.residency_reservations().await.is_empty());
+}
+
+#[tokio::test]
+async fn failed_deployment_self_heals_on_the_next_ensure_ready_call() {
+    // Regression: `Failed` used to be terminal until an operator called
+    // `reset()`. A killed engine (`kill -9`, exercised live by
+    // `scripts/certify-model-host.sh`'s recovery check) must come back on
+    // its own the next time a request needs the deployment.
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired("self-heal", &[("a", false, 30)], 1))
+        .await
+        .unwrap();
+    let first = manager.ensure_ready("a").await.unwrap();
+    preparer.facts.processes.lock().unwrap()["a"]
+        .stopped
+        .store(true, Ordering::SeqCst);
+
+    manager
+        .ensure_ready("a")
+        .await
+        .expect_err("an exited ready process must not remain routable");
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Failed
+    );
+
+    let recovered = manager
+        .ensure_ready("a")
+        .await
+        .expect("a non-crash-loop Failed deployment must relaunch on the next request");
+    assert_ne!(
+        recovered.port, first.port,
+        "the relaunch is a brand new engine process, not the dead one"
+    );
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Ready
+    );
+    assert_eq!(
+        preparer.facts.starts.lock().unwrap().get("a").copied(),
+        Some(2),
+        "initial start plus one self-heal relaunch"
+    );
+}
+
+#[tokio::test]
+async fn admission_lets_a_non_crash_loop_failed_deployment_relaunch() {
+    // The gateway's real request path calls `admit` before `ensure_ready`
+    // (see sbproxy-core's `ManagedModelPermit`), so the self-heal in
+    // `ensure_ready` alone is unreachable from a live request unless
+    // `admit` also stops treating every `Failed` deployment as terminal.
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired("admit-self-heal", &[("a", false, 30)], 1))
+        .await
+        .unwrap();
+    manager.ensure_ready("a").await.unwrap();
+    preparer.facts.processes.lock().unwrap()["a"]
+        .stopped
+        .store(true, Ordering::SeqCst);
+    manager.maintenance_tick(tokio::time::Instant::now()).await;
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Failed
+    );
+
+    let permit = manager
+        .admit("a", sbproxy_model_host::PriorityClass::Standard)
+        .await
+        .expect("a non-crash-loop failure must still admit new requests");
+    manager
+        .ensure_ready_for_generation(
+            "a",
+            permit.generation(),
+            permit.start_epoch(),
+            sbproxy_model_host::PriorityClass::Standard,
+        )
+        .await
+        .expect("an admitted request must relaunch the engine");
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Ready
+    );
+}
+
+#[tokio::test]
+async fn crash_looped_deployment_does_not_relaunch_on_every_request() {
+    // Once the retained failure is already `crash_loop` (the exhausted
+    // launch-retry budget `EngineSupervisor` owns in production), every
+    // later request must keep returning the cached error instead of
+    // attempting a new launch on every single call.
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    preparer
+        .facts
+        .fail_start_reason
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), EngineFailureReason::CrashLoop);
+    preparer
+        .facts
+        .fail_start
+        .lock()
+        .unwrap()
+        .insert("a".to_string());
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired("crash-loop-bound", &[("a", false, 30)], 1))
+        .await
+        .unwrap();
+
+    manager.ensure_ready("a").await.unwrap_err();
+    let starts_after_first_failure = preparer.facts.starts.lock().unwrap().get("a").copied();
+    let second = manager.ensure_ready("a").await.unwrap_err();
+    assert_eq!(
+        second.reason_code(),
+        "crash_loop",
+        "the retained crash_loop failure must reach the caller, not a generic draining error"
+    );
+    manager.ensure_ready("a").await.unwrap_err();
+    assert_eq!(
+        preparer.facts.starts.lock().unwrap().get("a").copied(),
+        starts_after_first_failure,
+        "a retained crash_loop reason must stop attempting a relaunch"
+    );
+}
+
+#[tokio::test]
+async fn failed_deployment_with_a_stuck_process_does_not_auto_relaunch() {
+    // Regression: the self-heal above must not fire while a process from
+    // a failed stop() is still owned (a SIGKILL-resistant engine, the
+    // exact scenario `failed_health_cleanup_retains_process_ownership_and_residency`
+    // encodes). Launching a second engine while the first still holds its
+    // residency/VRAM reservation would corrupt or double-consume it, so
+    // this must behave like reset() (see its `Failed if
+    // lifecycle.running.is_none()` guard): keep returning the cached
+    // error until the stuck process is cleared.
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired("stuck-process", &[("a", false, 30)], 1))
+        .await
+        .unwrap();
+    manager.ensure_ready("a").await.unwrap();
+    preparer
+        .facts
+        .fail_health
+        .lock()
+        .unwrap()
+        .insert("a".to_string());
+    preparer
+        .facts
+        .fail_stop
+        .lock()
+        .unwrap()
+        .insert("a".to_string());
+
+    manager.maintenance_tick(tokio::time::Instant::now()).await;
+    let failed = manager.status("a").await.unwrap();
+    assert_eq!(
+        failed.state,
+        sbproxy_model_host::DeploymentRuntimeState::Failed
+    );
+    assert!(
+        failed.port.is_some(),
+        "the possibly-live process must still be owned for this regression to be meaningful"
+    );
+
+    let starts_before = preparer.facts.starts.lock().unwrap().get("a").copied();
+    let error = manager
+        .ensure_ready("a")
+        .await
+        .expect_err("a stuck process must block the self-heal, not be joined by a second engine");
+    // The retained failure is the stop() failure (`fail_stop`'s
+    // EngineInternal), not the original health-check failure: when
+    // refresh_ready_health's own cleanup stop() also fails, it overwrites
+    // the surfaced error with the cleanup failure (see its `Err(cleanup_error)
+    // => cleanup_error` arm) precisely so the "why is this process still
+    // owned" reason is what is retained, not the earlier symptom.
+    assert_eq!(error.reason_code(), "engine_internal");
+    assert_eq!(
+        preparer.facts.starts.lock().unwrap().get("a").copied(),
+        starts_before,
+        "no relaunch attempt while the old process is still owned"
+    );
+    assert!(
+        manager
+            .admit("a", sbproxy_model_host::PriorityClass::Standard)
+            .await
+            .is_err(),
+        "admit must also keep rejecting while the old process is still owned"
+    );
+
+    // Clearing the stuck process, as an operator would via `stop`, frees
+    // the deployment for the self-heal to resume.
+    preparer.facts.fail_stop.lock().unwrap().remove("a");
+    manager.stop("a").await.unwrap();
+    manager
+        .ensure_ready("a")
+        .await
+        .expect("once the stale process is cleared, requests reach the engine again");
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Ready
+    );
 }
 
 #[tokio::test]
