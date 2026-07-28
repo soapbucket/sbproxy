@@ -3896,7 +3896,7 @@ pub fn record_model_host_admission_rejection(deployment: &str, priority: &str, r
         .inc();
 }
 
-/// Count a bounded artifact acquisition failure by [`ArtifactError`] kind
+/// Count a bounded artifact acquisition failure by `ArtifactError` kind
 /// (e.g. `digest_mismatch`, `transport`, `cache_corrupt`; see
 /// `sbproxy-model-host`'s `ArtifactError::kind`).
 pub fn record_model_host_artifact_error(kind: &str) {
@@ -3944,7 +3944,7 @@ pub fn record_model_host_artifact_error(kind: &str) {
 }
 
 /// Count a placement plan's per-node rejection by deployment and
-/// [`PlacementRejectionReason`].
+/// `PlacementRejectionReason`.
 pub fn record_model_host_placement_rejection(deployment: &str, reason: &str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;
@@ -4002,7 +4002,7 @@ fn closed_label(value: &str, allowed: &[&'static str], fallback: &'static str) -
 // gateway can represent) shows up as a rate instead of a silent 401/403.
 
 /// Count a stored key record that failed closed while lowering to an
-/// effective policy, by [`StoredPolicyErrorKind`] reason
+/// effective policy, by `StoredPolicyErrorKind` reason
 /// (`sbproxy-core`'s `key_policy` module).
 pub fn record_key_policy_stored_rejection(reason: &str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
