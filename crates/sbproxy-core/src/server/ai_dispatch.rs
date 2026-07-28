@@ -499,6 +499,65 @@ fn bounded_config_revision(config_revision: &str) -> String {
     format!("h:{}", &digest[..PEER_POLICY_DIGEST_PREFIX_LEN])
 }
 
+struct PreparedAiIdentity {
+    resolved_request_key: Option<ResolvedRequestKey>,
+    policy_revision: String,
+}
+
+async fn prepare_ai_request_identity(
+    session: &Session,
+    config: &AiHandlerConfig,
+    pipeline: &CompiledPipeline,
+    ctx: &mut RequestContext,
+    key_plane: Option<&crate::key_plane::KeyPlane>,
+) -> std::result::Result<PreparedAiIdentity, (u16, String)> {
+    let resolved_request_key = resolve_request_virtual_key(
+        ctx,
+        session,
+        config,
+        &ctx.principal,
+        key_plane,
+        ctx.tenant_id.as_str(),
+    )
+    .await
+    .map_err(|(status, message)| {
+        warn!(status, reason = %message, "AI proxy: virtual key denied");
+        (status, message)
+    })?;
+
+    governed_key_requirement(config.require_governed_key, resolved_request_key.as_ref()).map_err(
+        |(status, message)| {
+            warn!(
+                reason = "governed_key_required",
+                "AI proxy: request did not resolve a governed credential"
+            );
+            (status, message.to_string())
+        },
+    )?;
+
+    if let Some(key) = resolved_request_key.as_ref() {
+        ctx.effective_key_policy = key.effective_policy.clone();
+        apply_resolved_virtual_key_context(session, config, ctx, key)
+            .map_err(|(status, message)| (status, message.to_string()))?;
+    }
+
+    let policy_revision =
+        peer_policy_revision(resolved_request_key.as_ref(), &pipeline.config_revision).map_err(
+            |_| {
+                warn!(
+                    reason = "policy_digest_failed",
+                    "AI proxy: effective credential policy rejected"
+                );
+                (403, "credential policy is invalid".to_string())
+            },
+        )?;
+
+    Ok(PreparedAiIdentity {
+        resolved_request_key,
+        policy_revision,
+    })
+}
+
 fn merged_request_budget<'a>(
     origin: Option<&'a sbproxy_ai::BudgetConfig>,
     policy: Option<&sbproxy_ai::effective_key_policy::EffectiveKeyPolicy>,
@@ -533,6 +592,43 @@ fn immutable_budget_key_id(ctx: &RequestContext) -> Option<String> {
             let key_id = ctx.principal.api_key_id();
             (!key_id.is_empty()).then(|| key_id.to_string())
         })
+}
+
+// Task 2 wires this shared admission seam into realtime action dispatch.
+#[allow(dead_code)]
+pub(super) async fn realtime_budget_gate(
+    session: &Session,
+    config: &AiHandlerConfig,
+    pipeline: &CompiledPipeline,
+    hostname: &str,
+    ctx: &mut RequestContext,
+    model: Option<&str>,
+) -> std::result::Result<BudgetGate, (u16, String)> {
+    let key_plane = crate::key_plane::current_key_plane();
+    let _prepared =
+        prepare_ai_request_identity(session, config, pipeline, ctx, key_plane.as_deref()).await?;
+
+    let Some(effective_budget) =
+        merged_request_budget(config.budget.as_ref(), ctx.effective_key_policy.as_ref())
+    else {
+        return Ok(BudgetGate::Allow);
+    };
+    let api_key_id = immutable_budget_key_id(ctx);
+    let user =
+        req_header_value(session, "x-user-id").or_else(|| req_header_value(session, "x-end-user"));
+    let tag = req_header_value(session, "x-sbproxy-tag");
+    let (_, gate) = scoped_budget_preflight(
+        effective_budget.as_ref(),
+        &config.providers,
+        hostname,
+        api_key_id.as_deref(),
+        user.as_deref(),
+        model,
+        Some(hostname),
+        tag.as_deref(),
+    )
+    .await;
+    Ok(gate)
 }
 
 /// Translate a resolved effective key policy into governance limits.
@@ -1271,54 +1367,18 @@ pub(super) async fn handle_ai_proxy(
     // dispatch branch can return or contact a provider/cache. The key plane and
     // policy snapshots stay pinned for the rest of this request.
     let key_plane = crate::key_plane::current_key_plane();
-    let resolved_request_vk = match resolve_request_virtual_key(
-        ctx,
-        session,
-        config,
-        &ctx.principal,
-        key_plane.as_deref(),
-        ctx.tenant_id.as_str(),
-    )
-    .await
-    {
-        Ok(key) => key,
-        Err((status, message)) => {
-            warn!(status, reason = %message, "AI proxy: virtual key denied");
-            send_error(session, status, &message).await?;
-            return Ok(());
-        }
-    };
-    if let Err((status, message)) =
-        governed_key_requirement(config.require_governed_key, resolved_request_vk.as_ref())
-    {
-        warn!(
-            reason = "governed_key_required",
-            "AI proxy: request did not resolve a governed credential"
-        );
-        send_error(session, status, message).await?;
-        return Ok(());
-    }
-    if let Some(key) = resolved_request_vk.as_ref() {
-        ctx.effective_key_policy = key.effective_policy.clone();
-        if let Err((status, message)) =
-            apply_resolved_virtual_key_context(session, config, ctx, key)
+    let prepared_identity =
+        match prepare_ai_request_identity(session, config, pipeline, ctx, key_plane.as_deref())
+            .await
         {
-            send_error(session, status, message).await?;
-            return Ok(());
-        }
-    }
-    let peer_policy_revision =
-        match peer_policy_revision(resolved_request_vk.as_ref(), &pipeline.config_revision) {
-            Ok(version) => version,
-            Err(_) => {
-                warn!(
-                    reason = "policy_digest_failed",
-                    "AI proxy: effective credential policy rejected"
-                );
-                send_error(session, 403, "credential policy is invalid").await?;
+            Ok(prepared) => prepared,
+            Err((status, message)) => {
+                send_error(session, status, &message).await?;
                 return Ok(());
             }
         };
+    let resolved_request_vk = prepared_identity.resolved_request_key;
+    let peer_policy_revision = prepared_identity.policy_revision;
     ai_span.record("sbproxy.policy_version", peer_policy_revision.as_str());
     let effective_policy = ctx.effective_key_policy.as_ref();
     let trace_key_id = effective_policy
@@ -2485,20 +2545,18 @@ pub(super) async fn handle_ai_proxy(
         } else {
             Some(model.as_str())
         };
-        let keys = budget_scope_keys(
+        let (keys, gate) = scoped_budget_preflight(
             budget_cfg,
+            &config.providers,
             hostname,
             budget_api_key_id.as_deref(),
             user_header.as_deref(),
             model_for_scope,
             Some(hostname),
             tag_header.as_deref(),
-        );
-        // WOR-1722: pre-fetch the cluster-shared spend for these keys so
-        // the preflight enforces against the fleet total (empty map, hence
-        // local-only, when shared budgets are off).
-        let shared_spend = super::budget_share::read_shared_for_keys(&keys).await;
-        match budget_preflight(budget_cfg, &keys, &config.providers, &shared_spend) {
+        )
+        .await;
+        match gate {
             BudgetGate::Allow => {
                 // WOR-1544: predictive soft-landing. Below the hard cap,
                 // warn and then downgrade as a scope approaches its
