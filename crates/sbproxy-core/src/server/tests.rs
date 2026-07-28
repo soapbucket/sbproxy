@@ -6,6 +6,23 @@
 use super::*;
 
 #[test]
+fn cap_principal_preserves_verified_subject() {
+    let view = sbproxy_modules::auth::CapTokenView {
+        jti: "cap-jti".to_string(),
+        subject: "agent_acme_001".to_string(),
+        max_rps: 1.0,
+        max_bytes_per_day: 1024,
+        route_glob: "/**".to_string(),
+    };
+
+    let principal = cap_principal_from_verified_token(test_tenant(), &view);
+
+    assert_eq!(principal.sub, "agent_acme_001");
+    assert_eq!(principal.source, sbproxy_plugin::PrincipalSource::Cap);
+    assert!(!principal.is_anonymous());
+}
+
+#[test]
 fn forward_auth_refusals_require_explicit_invalid_proof_evidence() {
     let no_challenge = reqwest::header::HeaderMap::new();
     assert_eq!(
@@ -53,6 +70,70 @@ fn forward_auth_refusals_require_explicit_invalid_proof_evidence() {
         forward_auth_denial_trust_outcome(503, &invalid_proof),
         AuthTrustOutcome::BackendFailure,
         "backend failures remain neutral even if an upstream header is misleading"
+    );
+}
+
+#[tokio::test]
+async fn forward_auth_client_does_not_follow_token_endpoint_redirects() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let redirect_target = std::net::TcpListener::bind("127.0.0.1:0").expect("target listener");
+    redirect_target
+        .set_nonblocking(true)
+        .expect("nonblocking target listener");
+    let target_addr = redirect_target.local_addr().expect("target address");
+    let target_hit = Arc::new(AtomicBool::new(false));
+    let target_hit_thread = Arc::clone(&target_hit);
+    let target_thread = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            match redirect_target.accept() {
+                Ok((mut stream, _)) => {
+                    target_hit_thread.store(true, Ordering::SeqCst);
+                    let mut request = [0_u8; 4096];
+                    let _ = stream.read(&mut request);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("target accept failed: {error}"),
+            }
+        }
+    });
+
+    let redirect = std::net::TcpListener::bind("127.0.0.1:0").expect("redirect listener");
+    let redirect_addr = redirect.local_addr().expect("redirect address");
+    let redirect_thread = std::thread::spawn(move || {
+        let (mut stream, _) = redirect.accept().expect("redirect request");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        let response = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_addr}/token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("redirect response");
+    });
+
+    let response = forward_auth_client()
+        .post(format!("http://{redirect_addr}/token"))
+        .send()
+        .await
+        .expect("token request");
+    redirect_thread.join().expect("redirect server");
+    target_thread.join().expect("target server");
+
+    assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    assert!(
+        !target_hit.load(Ordering::SeqCst),
+        "the credential client must not replay an existing DPoP proof to a redirect target"
     );
 }
 
@@ -548,6 +629,7 @@ async fn bot_auth_rejects_signature_bound_to_different_path() {
         "expected Deny(401) when @target-uri does not match signed path; got {:?}",
         match result {
             AuthResult::Allow { .. } => "Allow",
+            AuthResult::RateLimited(_) => "RateLimited",
             AuthResult::Deny(s, _) => Box::leak(format!("Deny({s})").into_boxed_str()),
             AuthResult::DenyWithHeaders(s, _, _) => {
                 Box::leak(format!("DenyWithHeaders({s})").into_boxed_str())
@@ -723,6 +805,7 @@ impl AuthProvider for ErrorAuthProvider {
 fn auth_result_label(r: &AuthResult) -> String {
     match r {
         AuthResult::Allow { .. } => "Allow".to_string(),
+        AuthResult::RateLimited(_) => "RateLimited".to_string(),
         AuthResult::Deny(s, m) => format!("Deny({s}, {m:?})"),
         AuthResult::DenyWithHeaders(s, m, h) => {
             format!("DenyWithHeaders({s}, {m:?}, {} headers)", h.len())

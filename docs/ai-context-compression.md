@@ -1,15 +1,15 @@
 # AI context compression
 
-*Last modified: 2026-07-20*
+*Last modified: 2026-07-27*
 
 SBproxy can transform an AI chat request through an ordered, route-local
 compression pipeline before provider selection and dispatch. A route can keep
 one default pipeline and declare named profiles for different callers. Use
 the retrieval-aware stateless levers for explicitly marked context, then use
 `window_fit` for a final deterministic input bound. Add `summary_buffer` when
-conversations need a compact running summary stored in a shared state backend
-(Redis by default, or the replicated mesh substrate) so gateway workers can
-restart and successive turns can land on different replicas.
+conversations need a compact running summary. With no `state` block,
+`summary_buffer` uses a process-owned Local redb database with a 24-hour TTL.
+Select Redis or mesh explicitly when summaries must move between replicas.
 
 This page is the canonical operator guide for compression configuration,
 runtime behavior, state, degradation, and telemetry.
@@ -35,16 +35,16 @@ separate named profiles on one route.
 
 | Lever | State | Purpose | Typical position |
 |---|---|---|---|
-| `summary_buffer` | Configured Redis L2 service | Replace eligible older text history with a bounded, incremental summary | First |
+| `summary_buffer` | Local by default; explicit Redis or mesh | Replace eligible older text history with a bounded, incremental summary | First |
 | `rag_select` | None | Retain the most relevant chunks in explicitly marked retrieval blocks | Before serialization |
 | `compact_serialization` | None | Compact safe marked JSON and uniform scalar object rows | After selection |
 | `position_reorder` | None | Move highly ranked chunks toward block edges | Before the final bound |
 | `window_fit` | None | Apply the legacy newest-to-oldest message-selection heuristic within the known model window | Last |
 
-Request workers do not retain canonical summaries in process. Canonical
-session summary state lives only in the configured Redis L2 service. A worker
-can restart or a later request can land on another replica without relying on
-worker-local conversation memory.
+Canonical session summaries are never held only in worker memory. Local state
+survives a restart of the same process deployment through its redb file, but it
+is not shared between replicas. Explicit Redis or mesh state allows a later
+request to land on another replica.
 
 The compression record key is an opaque digest over the tenant, normalized AI
 origin, captured session ID, and a stable summary-policy fingerprint. The
@@ -254,10 +254,11 @@ authoritative, including `levers: []`.
 ## Profiles and request selection
 
 Named profiles live under the route's `compression.profiles` map. Each profile
-has its own `levers` and optional Redis `state`. Profile names contain from 1
-to 64 bytes, start with a lowercase ASCII letter or digit, and then use only
-lowercase ASCII letters, digits, `_`, or `-`. The reserved values `on` and
-`off` cannot be profile names.
+has its own `levers` and optional `state` backend; stateful profiles default to
+the process-local durable backend when `state` is omitted. Profile names
+contain from 1 to 64 bytes, start with a lowercase ASCII letter or digit, and
+then use only lowercase ASCII letters, digits, `_`, or `-`. The reserved values
+`on` and `off` cannot be profile names.
 
 ```yaml
 origins:
@@ -385,7 +386,7 @@ origin, and captured session:
 - Appended history sends only newly covered messages plus the prior summary to
   the summarizer, then advances the logical version.
 - A record at or past its logical expiration skips with `state_expired`, even
-  during the short interval before Redis physically removes it.
+  during the short interval before the selected backend physically removes it.
 - A changed protected prefix, edited covered message, shortened history, or
   different history fork skips with `branch_mismatch`. SBproxy does not reuse
   or overwrite the record for the mismatched branch.
@@ -423,6 +424,70 @@ Request-scoped credential governance and the effective AI budget still apply:
 Empty, malformed, or oversized summary output fails validation. The provider's
 reported output count and a conservative local estimate must both fit
 `target_summary_tokens`.
+
+## Local state (default)
+
+A default or named pipeline that contains `summary_buffer` and omits `state`
+is normalized independently to:
+
+```yaml
+state:
+  backend: local
+  ttl: 24h
+```
+
+An explicit `backend: local` uses the same adapter and requires an explicit
+positive `ttl`. Explicit Redis and mesh choices stay on the selected backend;
+an unavailable dependency is a startup error and never falls back to Local.
+Pipelines containing only stateless levers such as `rag_select` do not open or
+create a Local database.
+
+`proxy.compression_state.local_path` may pin the process database:
+
+```yaml
+proxy:
+  compression_state:
+    local_path: /var/lib/sbproxy/compression-state.redb
+```
+
+The explicit path must be absolute, nonempty, no longer than 4096 bytes, and
+contain no control characters. Configuration validation checks this string
+contract without touching the filesystem. Runtime startup then selects the
+path in this exact order:
+
+1. `proxy.compression_state.local_path`, when configured.
+2. `/var/lib/sbproxy/compression-state.redb` when `/var/lib/sbproxy` is
+   writable.
+3. `$XDG_STATE_HOME/sbproxy/compression-state.redb`.
+4. On macOS,
+   `$HOME/Library/Application Support/sbproxy/compression-state.redb`.
+5. On other Unix systems,
+   `$HOME/.local/state/sbproxy/compression-state.redb`.
+
+Only absolute XDG and home paths participate. Windows requires an explicit
+path. Startup fails when a required Local database cannot be selected or
+opened, and the error names the selected path.
+An existing Local database may still be opened for Admin lifecycle operations
+after every Local `summary_buffer` policy is removed; a missing dormant path is
+never created just for Admin.
+
+Local is a one-process durability boundary. Do not place its file on a shared
+network mount or point several SBproxy processes at it; use Redis or mesh for a
+fleet. Within one process, redb transactions, persisted leases, monotonic
+fences, and logical-version compare-and-set serialize updates. A
+crash-held lease expires after its bounded lease time (the summarizer timeout
+plus the fixed state-operation margin), and the next process can continue.
+Every redb operation runs on Tokio's blocking pool rather than an async request
+worker. Local reports `consistency="serialized"`.
+
+The redb file stores generated summary text in plaintext. Protect the file,
+parent directory, snapshots, and backups with OS permissions and storage
+encryption appropriate for prompt data. Admin list responses remain
+content-free, and the content endpoint still requires Admin authorization,
+handler opt-in, and a successful audit write. TTL expiry, delete, and purge
+make records unavailable, but redb may retain freed pages for reuse instead of
+shrinking the file immediately; capacity should be planned around the file's
+high-water allocation.
 
 ## Redis state
 
@@ -502,31 +567,29 @@ compression runtime remains covered by
 `sbproxy_ai_compression_redis_coordination_total`; it does not double-count its
 async operations in the synchronous families.
 
-## Choosing a state backend: Redis or mesh
+## Choosing a state backend
 
-`compression.state.backend` accepts `redis` and `mesh`. Redis is the default
-recommendation. It serializes every update with a distributed lease, a
-monotonic fence, and an atomic compare-and-set, so a cross-node update race is
-prevented before any write happens. Choose `mesh` for a Redis-free fleet that
-already runs `proxy.cluster.replication` and can accept eventually consistent
-session summaries.
+`compression.state.backend` accepts `local`, `redis`, and `mesh`. Omitted state
+on a `summary_buffer` pipeline means Local with a 24-hour TTL. Choose Redis for
+serialized cross-process updates, or mesh for a Redis-free fleet that already
+runs `proxy.cluster.replication` and can accept eventual consistency.
 
-The two contracts are different; do not treat them as interchangeable:
+The contracts are different; do not treat them as interchangeable:
 
-| Property | `redis` | `mesh` |
-|---|---|---|
-| External dependency | Redis service via `proxy.l2_cache_settings` | None beyond `proxy.cluster.replication` |
-| Update serialization | Distributed lease and fence across all workers | Worker-local lease only; cross-node writers race |
-| Compare-and-set | Atomic inside one Lua script | Conditional put with read-back verification |
-| Concurrent equal-version writers | Blocked by the lease or rejected before writing | Deterministic last-writer-wins merge; the loser fails with a stale-version error, the survivor is flagged `conflict_detected` |
-| Reported consistency | `serialized` | `eventual_lww` |
-| Durability | Redis persistence configuration | `factor` replicated copies, quorum acknowledgements, redb shards under `state_dir` |
-| Partition behavior | The unreachable side fails open per request | Divergence converges through the causal merge after the heal; deletes cannot resurrect |
+| Property | `local` | `redis` | `mesh` |
+|---|---|---|---|
+| External dependency | One process-owned redb file | Redis service via `proxy.l2_cache_settings` | None beyond `proxy.cluster.replication` |
+| Update serialization | Persisted lease and fence for one process database | Distributed lease and fence across all workers | Worker-local lease only; cross-node writers race |
+| Compare-and-set | Atomic redb write transaction | Atomic inside one Lua script | Conditional put with read-back verification |
+| Concurrent equal-version writers | Serialized or rejected before commit | Blocked by the lease or rejected before writing | Deterministic last-writer-wins merge; the loser fails with a stale-version error, the survivor is flagged `conflict_detected` |
+| Reported consistency | `serialized` | `serialized` | `eventual_lww` |
+| Durability | Same-node process restarts at the selected path | Redis persistence configuration | `factor` replicated copies, quorum acknowledgements, redb shards under `state_dir` |
+| Fleet behavior | Not shared; use one file from one process | Shared across Redis clients | Replicated and convergent across mesh nodes |
 
-Enabling cluster replication by itself changes nothing here: compression stays
-on whatever backend the configuration selects, and a route without a `state`
-block keeps none. The backend switch is always the explicit
-`compression.state.backend` value.
+Enabling Redis or cluster replication by itself changes nothing here. An
+explicit backend always remains on that backend, while omitted state on a
+stateful summary pipeline always selects Local. A policy containing no
+`summary_buffer` remains stateless and creates no Local database.
 
 ### Mesh state
 
@@ -585,12 +648,13 @@ and `mesh_tombstone_gc_*` families.
 
 | Field | Required | Constraint |
 |---|---|---|
-| `compression.state.backend` | For `summary_buffer` | `redis` (default recommendation) or `mesh` (requires `proxy.cluster.replication`) |
-| `compression.state.ttl` | For `summary_buffer` | Positive seconds or human duration |
+| `compression.state` | No | A pipeline with `summary_buffer` defaults independently to Local state with a 24-hour TTL; stateless pipelines keep no state |
+| `compression.state.backend` | In an explicit `state` block | `local`, `redis`, or `mesh`; explicit choices never fall back |
+| `compression.state.ttl` | In an explicit `state` block | Positive seconds or human duration |
 | `compression.allow_admin_content_inspection` | No | Default `false`; enables audited Admin-only content inspection for configured origins |
 | `compression.levers` | No | Ordered list; an explicit empty list disables compression |
 | `compression.profiles` | No | Route-local map of named pipelines selectable by a request, governed key, or CEL |
-| `compression.profiles.<name>.state` | For a profile with `summary_buffer` | `redis` or `mesh`; independent of the route default state |
+| `compression.profiles.<name>.state` | No | Defaults independently to Local/24h when that profile contains `summary_buffer`; never inherits route state |
 | `compression.profiles.<name>.levers` | No | Ordered levers for this named profile; an empty list selects no runtime |
 | `summary_buffer.min_tokens` | Yes | Greater than zero |
 | `summary_buffer.retain_recent_messages` | Yes | Greater than zero |
@@ -620,10 +684,10 @@ single-record deletion, and bounded purge are documented in the
 `allow_admin_content_inspection: false` unless an audited operational workflow
 requires content access. Do not operate on backend keys directly.
 
-Metadata listing and purge use bounded pages and opaque cursors on both
-backends: a Redis-backed store scans its shared Redis namespace, and a
-mesh-backed store walks the replicated substrate's topology-safe fleet
-pagination.
+Metadata listing and purge use bounded pages and opaque cursors on all
+backends. Local performs a bounded metadata-only redb scan, Redis scans its
+shared namespace, and mesh walks the replicated substrate's topology-safe
+fleet pagination.
 
 ## Semantic cache interaction
 
@@ -682,21 +746,22 @@ otherwise it records `skipped`, `no_savings`.
 | Below threshold, insufficient history, unknown window, or no need | `skipped` when the lever produces no candidate | Working messages and state remain unchanged |
 | Structured or multimodal material would be summarized | `skipped`, `structured_request` | Protected material is never sent to the summarizer |
 | Stored digest does not match the incoming branch | `skipped`, `branch_mismatch` | Existing record is not reused or overwritten |
-| Stored record reached its logical expiry | `skipped`, `state_expired` | Expired summary is not reused; Redis removes the record at its TTL |
+| Stored record reached its logical expiry | `skipped`, `state_expired` | Expired summary is not reused; the selected backend removes or hides it at its TTL |
 | Update permit is contended | `skipped`, `lock_contended` | No unbounded wait; later levers run |
 | Credential or budget denies internal summarization | `skipped`, `policy_denied` or `budget_denied` | No summarizer call and no state write |
 | Summarizer input is too large | `skipped`, `summarizer_input_too_large` | No summarizer call and no state write |
-| State load or commit is unavailable | `failed`, `state_unavailable` | Last committed messages continue; no local state fallback |
+| State load or commit is unavailable | `failed`, `state_unavailable` | Last committed messages continue; no backend substitution occurs |
 | Lease, fence, or logical version changed | `failed`, `lease_lost` or `stale_version` | Candidate is not committed to the request |
 | Summarizer times out or provider fails | `failed`, `summarizer_timeout` or `summarizer_provider` | Last committed messages continue |
 | Summary output is empty, malformed, or too large | `failed`, `invalid_summary` | No state write and no message replacement |
 | Candidate violates its commit rule | `skipped`, `no_savings` | A strict lever must reduce the estimate; every lever rejects expansion |
 | Protected prefix or newest protocol unit exceeds an explicit budget | `skipped`, `not_eligible` | The messages received by `window_fit` continue unchanged; earlier levers may already have committed changes |
 
-Configuration errors are different from runtime degradation. A
-`summary_buffer` without `compression.state`, an unavailable selected runtime
-wiring, an invalid summarizer reference, or an invalid numeric constraint is
-rejected at load or startup rather than silently weakened.
+Configuration errors are different from runtime degradation. An unavailable
+explicit Redis or mesh dependency, an unopenable required Local path, an
+invalid summarizer reference, or an invalid numeric constraint is rejected at
+load or startup rather than silently weakened. Omitting state for
+`summary_buffer` is valid and selects Local/24h.
 
 ### Closed outcomes and reasons
 
@@ -765,8 +830,8 @@ double-counted in the request distribution.
 | `sbproxy_ai_compression_value_cost_saved_micros_total` | Counter | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Gross target-model input cost avoided on terminal provider success, in micro-USD |
 
 `lever` is `summary_buffer`, `window_fit`, `rag_select`,
-`compact_serialization`, or `position_reorder`. `backend` is `redis`, `mesh`,
-or `none`. Request `cache_bypass` is `true` or `false`. State `operation` is
+`compact_serialization`, or `position_reorder`. `backend` is `local`, `redis`,
+`mesh`, or `none`. Request `cache_bypass` is `true` or `false`. State `operation` is
 `get`, `commit`, `delete`, `list`, or `purge`; its `outcome` is `ok`,
 `missing`, or `error`.
 
@@ -908,8 +973,8 @@ The top-level fields are `event`, `tenant_id`, `api_key_id`, `outcome`,
 `levers_applied`, `latency_ms`, `backend`, `consistency`, `cache_bypass`,
 `selection_source`, `selection_outcome`, `lever_outcomes`, and `targets`.
 
-`backend` is `redis` or `none`. The corresponding `consistency` value is
-`serialized` or `none`.
+`backend` is `local`, `redis`, `mesh`, or `none`. The corresponding
+`consistency` value is `serialized`, `eventual_lww`, or `none`.
 
 `lever_outcomes` is a JSON-encoded list containing only `lever`, `outcome`,
 `reason`, `backend`, `before_tokens`, `after_tokens`, `tokens_saved`, and
@@ -1017,21 +1082,26 @@ sanitized; the repository does not describe them as production captures.
    `window_fit` in the recommended order only after each lever's structural
    evidence and telemetry are understood. Widen the named profile gradually.
 6. For stateful history, make callers send and reuse a stable captured session
-   ULID, then validate the shared Redis L2 service on every replica.
+   ULID. Start with the Local default on one process; configure Redis or mesh
+   explicitly before distributing sessions across replicas.
 7. Put `summary_buffer` before `window_fit` with conservative thresholds,
-   recent-tail size, summary target, and timeout. Watch state errors, Redis
-   coordination, request savings, and summarizer spend before widening it.
+   recent-tail size, summary target, and timeout. Watch state errors,
+   coordination when applicable, request savings, and summarizer spend before
+   widening it.
 8. Use the authenticated Admin API for metadata, deletion, and purge. Leave
    content inspection disabled unless an audited incident workflow requires it.
 
 To disable the new pipeline explicitly, set `compression.levers: []`. Existing
-Redis records remain until their TTL expires; re-enabling the same policy before
-expiry can reuse them. Metadata, delete, and purge remain available through the
-Admin API as long as the global Redis L2 configuration remains present, even
-when no active handler uses `summary_buffer`; content inspection stays disabled
-without an active origin opt-in. To keep only stateless protection, remove
-`summary_buffer`, its `state` block, and leave `window_fit` configured. A newly
-committed summary refreshes its TTL, while an exact-summary reuse does not.
+records remain until their TTL expires; re-enabling the same policy before
+expiry can reuse them. Metadata, delete, and purge remain available while the
+selected external backend is configured. An existing Local database is retained
+for Admin discovery without creating a missing file, even when no active
+handler uses `summary_buffer`; content inspection stays disabled without an
+active origin opt-in. To keep only stateless protection, remove
+`summary_buffer` and its `state` block, then leave `rag_select`, `window_fit`,
+or the other stateless levers configured. A stateless-only process does not
+create a Local database. A newly committed summary refreshes its TTL, while an
+exact-summary reuse does not.
 
 SBproxy has no OmniRoute runtime dependency, compatibility layer, state import,
 or migration path for context compression. Configure SBproxy policies directly

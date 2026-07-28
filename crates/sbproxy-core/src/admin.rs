@@ -86,8 +86,10 @@ pub struct AdminTls {
 pub struct AdminOperator {
     /// Login username.
     pub username: String,
-    /// Login password.
-    pub password: String,
+    /// HMAC-SHA256 hash of the login password, hex-encoded. Verified with
+    /// `sbproxy_keystore::crypto::verify_secret` against the operator
+    /// pepper resolved for this `AdminState`.
+    pub password_hash: String,
     /// Role governing which admin actions this operator may perform.
     pub role: AdminRole,
 }
@@ -504,6 +506,12 @@ pub struct AdminState {
     pub log_events: tokio::sync::broadcast::Sender<String>,
     /// Fallible audit sink guarding compression summary-content inspection.
     compression_audit: Arc<dyn crate::admin_compression::CompressionAuditSink>,
+    /// Pepper for hashing/verifying `AdminOperator.password_hash`.
+    /// Defaults to [`crate::key_plane::default_admin_operator_pepper`] so
+    /// operator login works with no `key_management:` block at all; the
+    /// binary overrides it via [`AdminState::with_operator_pepper`] once it
+    /// has resolved `key_management.crypto.pepper` from the loaded config.
+    operator_pepper: Vec<u8>,
 }
 
 impl AdminState {
@@ -526,6 +534,7 @@ impl AdminState {
             revoked_sessions: Mutex::new(std::collections::HashSet::new()),
             log_events: tokio::sync::broadcast::channel(256).0,
             compression_audit: Arc::new(crate::admin_compression::TracingCompressionAuditSink),
+            operator_pepper: crate::key_plane::default_admin_operator_pepper(),
         }
     }
 
@@ -577,6 +586,10 @@ impl AdminState {
 
     /// Verify login credentials against the top-level admin and the
     /// configured operators (WOR-1716), returning the matched role.
+    ///
+    /// Operator passwords are hashed at rest: verification recomputes
+    /// `HMAC-SHA256(pass, operator_pepper)` and compares it,
+    /// constant-time, to the stored `password_hash`.
     pub fn check_operator_login(&self, user: &str, pass: &str) -> Option<AdminRole> {
         if self.check_auth(user, pass) {
             return Some(AdminRole::Admin);
@@ -585,7 +598,12 @@ impl AdminState {
             .operators
             .iter()
             .find(|o| {
-                o.username == user && constant_time_eq(o.password.as_bytes(), pass.as_bytes())
+                o.username == user
+                    && sbproxy_keystore::crypto::verify_secret(
+                        pass,
+                        &self.operator_pepper,
+                        &o.password_hash,
+                    )
             })
             .map(|o| o.role)
     }
@@ -613,6 +631,19 @@ impl AdminState {
             .loaded_config_content_hash
             .lock()
             .expect("loaded config sha256 mutex poisoned") = Some(hex.into());
+        self
+    }
+
+    /// Builder-style setter for the operator-password pepper.
+    ///
+    /// The binary calls this with `key_plane::resolve_admin_operator_pepper`
+    /// once it has read `key_management.crypto.pepper` from the loaded
+    /// config, so `check_operator_login` verifies against the same pepper
+    /// `sbproxy admin hash-password` used to produce the stored hash.
+    /// Tests that exercise operator login call it directly with a fixed
+    /// test pepper instead of going through config.
+    pub fn with_operator_pepper(mut self, pepper: impl Into<Vec<u8>>) -> Self {
+        self.operator_pepper = pepper.into();
         self
     }
 
@@ -1967,6 +1998,16 @@ fn escape_json(s: &str) -> String {
     out
 }
 
+/// One entry in the `GET /api/operators` response: who can sign in and
+/// with what role. No `password_hash` field at all, rather than merely
+/// omitting it from serialization, so the hash can never reach this route
+/// by accident.
+#[derive(Serialize)]
+struct OperatorSummary {
+    username: String,
+    role: AdminRole,
+}
+
 // --- Request Handler ---
 
 /// WOR-1130: pull a single query-string value out of a request target
@@ -2306,6 +2347,30 @@ pub fn handle_admin_request(
                 500,
                 "application/json",
                 format!(r#"{{"error":"serialization failed: {e}"}}"#),
+            ),
+        };
+    }
+    // Read-only list of configured operators for the admin console's
+    // Operators view. Config-only, no CRUD: operators are managed by
+    // editing `proxy.admin.operators` and reloading. GET-only by
+    // construction (no POST/PUT/DELETE arm), so RBAC needs no extra
+    // gating: read routes are already open to every authenticated role.
+    if path_only == "/api/operators" {
+        let summaries: Vec<OperatorSummary> = state
+            .config
+            .operators
+            .iter()
+            .map(|o| OperatorSummary {
+                username: o.username.clone(),
+                role: o.role,
+            })
+            .collect();
+        return match serde_json::to_string(&summaries) {
+            Ok(body) => (200, "application/json", body),
+            Err(_) => (
+                500,
+                "application/json",
+                r#"{"error":"serialization failed"}"#.to_string(),
             ),
         };
     }
@@ -4977,7 +5042,10 @@ mod tests {
             password: "secret".to_string(),
             operators: vec![AdminOperator {
                 username: "reader".to_string(),
-                password: "reader-secret".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "reader-secret",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
                 role: AdminRole::ReadOnly,
             }],
             ..AdminConfig::default()
@@ -5464,7 +5532,10 @@ mod tests {
             password: "secret".to_string(),
             operators: vec![AdminOperator {
                 username: "reader".to_string(),
-                password: "reader-secret".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "reader-secret",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
                 role: AdminRole::ReadOnly,
             }],
             ..AdminConfig::default()
@@ -5492,7 +5563,10 @@ mod tests {
             password: "secret".to_string(),
             operators: vec![AdminOperator {
                 username: "reader".to_string(),
-                password: "reader-secret".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "reader-secret",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
                 role: AdminRole::ReadOnly,
             }],
             ..AdminConfig::default()
@@ -6456,16 +6530,20 @@ origins:
     #[test]
     fn operator_login_roles() {
         // WOR-1716: top-level admin is full-access; a configured operator
-        // gets its declared role; wrong password fails.
+        // gets its declared role; wrong password fails. The operator's
+        // password is hashed at rest and verified against a pinned
+        // pepper, not compared as plaintext.
+        let pepper = b"test-pepper";
+        let hash = sbproxy_keystore::crypto::hash_secret("ropass", pepper);
         let cfg = AdminConfig {
             operators: vec![AdminOperator {
                 username: "ro".to_string(),
-                password: "ropass".to_string(),
+                password_hash: hash,
                 role: AdminRole::ReadOnly,
             }],
             ..AdminConfig::default()
         };
-        let state = AdminState::new(cfg);
+        let state = AdminState::new(cfg).with_operator_pepper(pepper.to_vec());
         assert_eq!(
             state.check_operator_login("admin", "changeme"),
             Some(AdminRole::Admin)
@@ -6476,6 +6554,39 @@ origins:
         );
         assert_eq!(state.check_operator_login("ro", "bad"), None);
         assert_eq!(state.check_operator_login("nobody", "x"), None);
+    }
+
+    #[test]
+    fn empty_password_hash_denies_every_login() {
+        // A blank password_hash (e.g. an unresolved ${VAR}) must never
+        // verify, including against an empty presented password.
+        let cfg = AdminConfig {
+            operators: vec![AdminOperator {
+                username: "ro".to_string(),
+                password_hash: String::new(),
+                role: AdminRole::ReadOnly,
+            }],
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(cfg);
+        assert_eq!(state.check_operator_login("ro", ""), None);
+        assert_eq!(state.check_operator_login("ro", "anything"), None);
+    }
+
+    #[test]
+    fn malformed_password_hash_denies_login() {
+        // A password_hash that isn't valid hex (a typo'd or hand-edited
+        // value) must fail closed rather than panic or somehow verify.
+        let cfg = AdminConfig {
+            operators: vec![AdminOperator {
+                username: "ro".to_string(),
+                password_hash: "not-valid-hex-zzz".to_string(),
+                role: AdminRole::ReadOnly,
+            }],
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(cfg);
+        assert_eq!(state.check_operator_login("ro", "whatever"), None);
     }
 
     #[test]
@@ -7012,15 +7123,16 @@ origins:
     #[test]
     fn admin_users_lists_roles_and_never_passwords() {
         let mut cfg = make_state().config.clone();
+        let pepper = crate::key_plane::default_admin_operator_pepper();
         cfg.operators = vec![
             AdminOperator {
                 username: "viewer".to_string(),
-                password: "viewer-secret".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret("viewer-secret", &pepper),
                 role: AdminRole::ReadOnly,
             },
             AdminOperator {
                 username: "oncall".to_string(),
-                password: "oncall-secret".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret("oncall-secret", &pepper),
                 role: AdminRole::Admin,
             },
         ];
@@ -7045,6 +7157,33 @@ origins:
         assert_eq!(users[1]["role"], "read_only");
         assert_eq!(users[1]["primary"], false);
         assert_eq!(users[2]["role"], "admin");
+    }
+
+    #[test]
+    fn operators_route_lists_usernames_and_roles_without_hashes() {
+        let mut cfg = make_state().config.clone();
+        cfg.operators = vec![AdminOperator {
+            username: "ro".to_string(),
+            password_hash: "deadbeef".to_string(),
+            role: AdminRole::ReadOnly,
+        }];
+        let state = AdminState::new(cfg);
+        let auth = basic_auth("admin", "secret");
+        let (status, _, body) =
+            handle_admin_request("GET", "/api/operators", &state, Some(&auth), None);
+        assert_eq!(status, 200);
+        assert!(body.contains("\"ro\""));
+        assert!(
+            !body.contains("deadbeef"),
+            "password_hash must never appear in the API response"
+        );
+    }
+
+    #[test]
+    fn operators_route_requires_auth() {
+        let state = make_state();
+        let (status, _, _) = handle_admin_request("GET", "/api/operators", &state, None, None);
+        assert_eq!(status, 401);
     }
 
     #[test]

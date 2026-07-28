@@ -93,12 +93,13 @@ the canonical reference for the flags and the model assumptions.
 1. The KV-cache bonus and lognormal-noise sigma are unvalidated
    against production traffic. The doc calls them out so a reader
    can challenge them.
-2. The bench writes to `Router::record_latency` with `Relaxed`
-   atomic semantics. Two strategies (`lowest_latency`, `peak_ewma`)
-   read the same field as ground truth. The most recent write
-   wins; under the bench's single-threaded sample loop this is
-   deterministic, but under multi-threaded production traffic the
-   reads see slightly stale numbers.
+2. The bench feeds observations through `Router::record_latency`.
+   `lowest_latency` reads the latest relaxed atomic value, while
+   `peak_ewma` updates its time-decayed estimator and includes the
+   current in-flight count. The single-threaded sample loop advances
+   very little wall time relative to the default 10-second half-life,
+   so this benchmark emphasizes immediate spike and queue response,
+   not long idle recovery.
 3. `prefix_affinity` looks bad with uniform prompts. The default
    prefix-Zipf of 1.1 ships the strategy in its strong configuration;
    operators considering it should match against their own traffic

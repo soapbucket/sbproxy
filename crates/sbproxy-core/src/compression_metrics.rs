@@ -397,6 +397,7 @@ fn bounded_identity_with_sanitizers(
 
 const fn backend_label(backend: Option<CompressionBackend>) -> &'static str {
     match backend {
+        Some(CompressionBackend::Local) => "local",
         Some(CompressionBackend::Redis) => "redis",
         Some(CompressionBackend::Mesh) => "mesh",
         None => "none",
@@ -417,6 +418,7 @@ fn outcome_labels(outcome: LeverOutcome) -> (&'static str, &'static str) {
 
 fn consistency_label(backend: Option<CompressionBackend>) -> &'static str {
     match backend {
+        Some(CompressionBackend::Local) => "serialized",
         Some(CompressionBackend::Redis) => "serialized",
         Some(CompressionBackend::Mesh) => "eventual_lww",
         None => "none",
@@ -656,8 +658,8 @@ pub(crate) fn record_compression_run(
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_identity_with_sanitizers, outcome_log, record_compression_run,
-        record_compression_selection, record_compression_selection_event,
+        backend_label, bounded_identity_with_sanitizers, consistency_label, outcome_log,
+        record_compression_run, record_compression_selection, record_compression_selection_event,
         record_compression_state_operation, record_redis_compression_coordination, target_log,
         CompressionStateOperation, CompressionStateOutcome, RedisCompressionCoordinationEvent,
     };
@@ -675,6 +677,15 @@ mod tests {
     struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
 
     struct SharedLogGuard(Arc<Mutex<Vec<u8>>>);
+
+    #[test]
+    fn local_backend_uses_closed_local_and_serialized_labels() {
+        assert_eq!(backend_label(Some(CompressionBackend::Local)), "local");
+        assert_eq!(
+            consistency_label(Some(CompressionBackend::Local)),
+            "serialized"
+        );
+    }
 
     impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogWriter {
         type Writer = SharedLogGuard;

@@ -175,6 +175,37 @@ pub(super) async fn handle_action(
                     }
                 };
 
+                let requested_model = realtime_model_from_uri(&session.req_header().uri);
+                let budget_model = requested_model.as_deref().filter(|model| !model.is_empty());
+                let model_override = match realtime_budget_gate(
+                    session,
+                    &ai.config,
+                    pipeline,
+                    &hostname,
+                    ctx,
+                    budget_model,
+                )
+                .await
+                {
+                    Ok(BudgetGate::Allow) => None,
+                    Ok(BudgetGate::Block { status, body }) => {
+                        send_response(session, status, "application/json", &body).await?;
+                        return Ok(true);
+                    }
+                    Ok(BudgetGate::Downgrade { model }) => Some(model),
+                    Err((status, message)) => {
+                        send_error(session, status, &message).await?;
+                        return Ok(true);
+                    }
+                };
+                if let Some(model) = model_override
+                    .as_deref()
+                    .or(requested_model.as_deref())
+                    .filter(|model| !model.is_empty())
+                {
+                    ctx.ai_model = Some(model.to_string());
+                }
+
                 // Parse the provider's base URL into (host, port, tls).
                 // Realtime uses wss:// to api.openai.com; provider base_url
                 // is typically https://api.openai.com/v1, which gives us
@@ -206,18 +237,18 @@ pub(super) async fn handle_action(
                     upstream_host: host.clone(),
                     upstream_port: port,
                     upstream_tls: tls,
+                    model_override,
                     started_at: std::time::Instant::now(),
                     surface_label: "realtime",
                 });
                 ctx.ai_provider = Some(provider.name.to_string());
-                sbproxy_ai::ai_metrics::inc_realtime_sessions_active();
                 info!(
                     ai.surface = surface_label,
                     provider = %provider.name,
                     upstream_host = %host,
                     upstream_port = port,
                     upstream_tls = tls,
-                    "AI realtime: session opening, handing off to Pingora for transparent forwarding"
+                    "AI realtime: connection attempt opening, handing off to Pingora for transparent forwarding"
                 );
 
                 // Let Pingora's normal flow continue: `upstream_peer`

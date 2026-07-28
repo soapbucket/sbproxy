@@ -1,24 +1,17 @@
 //! Q1.2: HTTP ledger protocol e2e.
 //!
 //! Boots a tiny `axum` mock server that mimics the JSON-over-HTTPS
-//! ledger surface defined in ,
+//! ledger protocol,
 //! drives an `ai_crawl_control` origin against it, and asserts the
 //! contract holds for retry, idempotency, circuit breaker, HMAC
 //! signing, and the error envelope mapping.
 //!
-//! The `HttpLedger` client and its `ledger:` YAML wiring have both
-//! landed: `AiCrawlControlConfig::from_config` threads `config.ledger`
-//! through `build_http_ledger` into an `HttpLedger` when the
-//! `http-ledger` feature is on (default-on in the binary), covered by a
-//! unit test in `ai_crawl/tests.rs`. The tests here stay `#[ignore]`d on
-//! a different blocker: this mock serves plain `http://` (axum +
-//! `TcpListener`) while `HttpLedger` mandates `https://` with a trusted
-//! cert, so the config-built client rejects the endpoint at
-//! construction. Reactivation needs an HTTPS mock ledger (self-signed
-//! cert) plus a TLS-trust path for the config-built client. See each
-//! test's reason; tracked as an e2e harness gap with WOR-1133.
+//! Each mock owns an ephemeral private CA and a CA-signed server
+//! certificate whose SAN covers `127.0.0.1`. The proxy receives that CA
+//! through `ledger.trust_roots`, exercising the same certificate
+//! verification path private production ledgers use.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -29,15 +22,18 @@ use axum::{
     routing::post,
     Json, Router,
 };
+use axum_server::tls_rustls::RustlsConfig;
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    KeyPair, KeyUsagePurpose, SanType,
+};
 use serde_json::{json, Value};
-use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 // --- Mock ledger configuration ---
 
 /// Knobs the e2e tests set on a per-instance basis.
 #[derive(Debug, Default, Clone)]
-#[allow(dead_code)] // some knobs are wired by tests still landing on G1.3
 struct LedgerKnobs {
     /// Reject the first N requests with 503 before serving 200.
     fail_first_n: usize,
@@ -48,8 +44,6 @@ struct LedgerKnobs {
     /// Reject when a previously-seen `Idempotency-Key` arrives with a
     /// different request body hash.
     reject_replayed_idempotency_key: bool,
-    /// HMAC key the server uses to verify `X-Sb-Ledger-Signature`.
-    hmac_key_hex: String,
 }
 
 #[derive(Debug, Default)]
@@ -66,7 +60,6 @@ struct LedgerState {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // key_id is asserted on by tests still landing on G1.3
 struct CapturedLedgerCall {
     /// `Idempotency-Key` header the proxy sent.
     idempotency_key: String,
@@ -79,10 +72,19 @@ struct CapturedLedgerCall {
     body: Vec<u8>,
 }
 
-/// Spin up an axum `/v1/ledger/redeem` server on `127.0.0.1:0`.
-/// Returns the bound socket address and a shared state handle so tests
-/// can read counters and captured calls.
-async fn spawn_mock_ledger(knobs: LedgerKnobs) -> (SocketAddr, Arc<LedgerState>) {
+/// Handle to an HTTPS mock ledger and its private trust root.
+struct MockLedger {
+    addr: SocketAddr,
+    state: Arc<LedgerState>,
+    root_pem: String,
+}
+
+/// Spin up an HTTPS axum `/v1/ledger/redeem` server on
+/// `127.0.0.1:0`. The leaf is signed by a fresh private CA and carries
+/// an IP SAN for the exact address used by the tests.
+async fn spawn_mock_ledger(knobs: LedgerKnobs) -> MockLedger {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let state = Arc::new(LedgerState {
         knobs,
         ..Default::default()
@@ -92,15 +94,78 @@ async fn spawn_mock_ledger(knobs: LedgerKnobs) -> (SocketAddr, Arc<LedgerState>)
         .route("/v1/ledger/healthz", post(handle_healthz))
         .with_state(state.clone());
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let ca_key = KeyPair::generate().expect("generate ledger test CA key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ledger CA params");
+    ca_params.distinguished_name = DistinguishedName::new();
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "sbproxy ledger test CA");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+    let ca_cert = ca_params.self_signed(&ca_key).expect("self-sign test CA");
+
+    let leaf_key = KeyPair::generate().expect("generate ledger TLS key");
+    let mut leaf_params = CertificateParams::new(Vec::<String>::new()).expect("ledger leaf params");
+    leaf_params.distinguished_name = DistinguishedName::new();
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, "sbproxy ledger test server");
+    leaf_params.subject_alt_names = vec![SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST))];
+    leaf_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &ca_cert, &ca_key)
+        .expect("sign ledger TLS certificate");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local_addr");
+
+    let tls_config = RustlsConfig::from_pem(
+        leaf_cert.pem().into_bytes(),
+        leaf_key.serialize_pem().into_bytes(),
+    )
+    .await
+    .expect("ledger rustls config");
     tokio::spawn(async move {
-        // Best-effort serve. Errors only surface in the test driver
-        // when the proxy fails to round-trip; surface them via the
-        // captured-call list rather than panicking the runtime.
-        let _ = axum::serve(listener, app.into_make_service()).await;
+        let _ = axum_server::from_tcp_rustls(listener, tls_config)
+            .serve(app.into_make_service())
+            .await;
     });
-    (addr, state)
+
+    let root_pem = ca_cert.pem();
+    let root = reqwest::Certificate::from_pem(root_pem.as_bytes()).expect("parse test CA");
+    let probe_client = reqwest::Client::builder()
+        .add_root_certificate(root)
+        .build()
+        .expect("build ledger readiness client");
+    let health_url = format!("https://{addr}/v1/ledger/healthz");
+    let mut ready = false;
+    for _ in 0..100 {
+        if probe_client
+            .post(&health_url)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(ready, "HTTPS mock ledger did not become ready");
+
+    MockLedger {
+        addr,
+        state,
+        root_pem,
+    }
 }
 
 async fn handle_redeem(
@@ -233,52 +298,66 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 // --- Test bodies ---
 
-/// Tokio runtime helper: every test spawns the mock server on a
-/// dedicated current-thread runtime so the mock and the harness do
-/// not collide.
+/// Tokio runtime helper. The TLS accept loop must keep making progress
+/// while the test thread blocks in the synchronous proxy harness.
 fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("runtime")
 }
 
-#[test]
-#[ignore = "WOR-1129: the `ledger:` block IS wired - AiCrawlControlConfig::from_config threads config.ledger through build_http_ledger into an HttpLedger when the http-ledger feature is on (default-on in the binary), unit-tested in ai_crawl/tests.rs. The real blocker is this mock: it serves plain http:// (axum + TcpListener) while HttpLedger mandates https:// with a trusted cert, so the config-built client rejects the endpoint at construction. Reactivation needs an HTTPS mock ledger (self-signed cert) plus a TLS-trust path for the config-built client (build_http_ledger uses a default reqwest client). Tracked as an e2e harness gap with WOR-1133."]
-fn test_happy_path_redeem_returns_200() {
-    let runtime = rt();
-    let (addr, state) = runtime.block_on(spawn_mock_ledger(LedgerKnobs {
-        hmac_key_hex: "0011223344".to_string(),
-        ..Default::default()
-    }));
-
-    // The proxy config below assumes G1.3 surfaces a `ledger.url` and
-    // `ledger.hmac_key_file` knob on `ai_crawl_control`. The exact
-    // YAML key names will be confirmed when G1.3 lands; until then
-    // this test stays ignored and the assertion shape documents the
-    // intent.
-    let config = format!(
+fn proxy_config(mock_ledger: &MockLedger) -> String {
+    let indented_root = mock_ledger
+        .root_pem
+        .lines()
+        .map(|line| format!("              {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
         r#"
 proxy:
   http_bind_port: 0
 origins:
   "blog.localhost":
-    action:
-      type: static
-      status_code: 200
-      content_type: text/html
-      body: "<h1>article</h1>"
+    action: {{ type: static, status_code: 200, content_type: text/html, body: "ok" }}
     policies:
       - type: ai_crawl_control
         currency: USD
         price: 0.001
         ledger:
-          url: "http://{addr}/v1/ledger"
-          hmac_key_id: "test-key-1"
-          hmac_key_hex: "0011223344"
+          url: "https://127.0.0.1:{port}"
+          key_id: "test-key-1"
+          key_hex: "0011223344"
+          timeout_ms: 1000
+          trust_roots:
+            - |
+{indented_root}
 "#,
-        addr = addr
+        port = mock_ledger.addr.port()
+    )
+}
+
+fn breaker_proxy_config(mock_ledger: &MockLedger) -> String {
+    let mut config = proxy_config(mock_ledger);
+    config.push_str(
+        r#"          retry:
+            max_attempts: 1
+          breaker:
+            failure_threshold: 2
+            success_threshold: 1
+            open_duration_ms: 60000
+"#,
     );
+    config
+}
+
+#[test]
+fn test_happy_path_redeem_returns_200() {
+    let runtime = rt();
+    let mock = runtime.block_on(spawn_mock_ledger(LedgerKnobs::default()));
+    let config = proxy_config(&mock);
 
     let harness = sbproxy_e2e::ProxyHarness::start_with_yaml(&config).expect("start proxy");
     let resp = harness
@@ -294,38 +373,22 @@ origins:
     assert_eq!(resp.status, 200);
 
     // Mock server should have seen exactly one redeem call.
-    let captured = runtime.block_on(async { state.captured.lock().await.clone() });
+    let captured = runtime.block_on(async { mock.state.captured.lock().await.clone() });
     assert_eq!(captured.len(), 1, "exactly one redeem call");
     assert!(!captured[0].idempotency_key.is_empty());
     assert!(captured[0].signature.starts_with("v1="));
+    assert_eq!(captured[0].key_id, "test-key-1");
 }
 
 #[test]
-#[ignore = "WOR-1129: the `ledger:` block is wired (from_config -> build_http_ledger -> HttpLedger; unit-tested). Real blocker is the same as test_happy_path_redeem_returns_200: the mock serves plain http:// but HttpLedger mandates https:// with a trusted cert. Needs an HTTPS mock + TLS-trust path for the config-built client. Tracked with WOR-1133."]
 fn test_retry_with_idempotency_key() {
     let runtime = rt();
-    let (addr, state) = runtime.block_on(spawn_mock_ledger(LedgerKnobs {
+    let mock = runtime.block_on(spawn_mock_ledger(LedgerKnobs {
         fail_first_n: 2,
-        hmac_key_hex: "0011223344".to_string(),
+        reject_replayed_idempotency_key: true,
         ..Default::default()
     }));
-    let config = format!(
-        r#"
-proxy:
-  http_bind_port: 0
-origins:
-  "blog.localhost":
-    action: {{ type: static, status_code: 200, content_type: text/html, body: "ok" }}
-    policies:
-      - type: ai_crawl_control
-        currency: USD
-        price: 0.001
-        ledger:
-          url: "http://{addr}/v1/ledger"
-          hmac_key_id: "test-key-1"
-          hmac_key_hex: "0011223344"
-"#
-    );
+    let config = proxy_config(&mock);
     let harness = sbproxy_e2e::ProxyHarness::start_with_yaml(&config).expect("start proxy");
     let resp = harness
         .get_with_headers(
@@ -339,7 +402,7 @@ origins:
         .expect("send");
     assert_eq!(resp.status, 200, "retry-after-fails recovers");
 
-    let captured = runtime.block_on(async { state.captured.lock().await.clone() });
+    let captured = runtime.block_on(async { mock.state.captured.lock().await.clone() });
     assert_eq!(
         captured.len(),
         3,
@@ -354,37 +417,19 @@ origins:
 }
 
 #[test]
-#[ignore = "WOR-1129: the `ledger:` block IS surfaced (config.ledger -> build_http_ledger -> HttpLedger, unit-tested). Real blocker is the plain-http mock vs HttpLedger`s https:// requirement; needs an HTTPS mock + TLS-trust path for the config-built client. Tracked with WOR-1133."]
 fn test_circuit_breaker_opens_after_consecutive_failures() {
     let runtime = rt();
-    let (addr, state) = runtime.block_on(spawn_mock_ledger(LedgerKnobs {
+    let mock = runtime.block_on(spawn_mock_ledger(LedgerKnobs {
         always_503: true,
-        hmac_key_hex: "0011223344".to_string(),
         ..Default::default()
     }));
-    let config = format!(
-        r#"
-proxy:
-  http_bind_port: 0
-origins:
-  "blog.localhost":
-    action: {{ type: static, status_code: 200, content_type: text/html, body: "ok" }}
-    policies:
-      - type: ai_crawl_control
-        currency: USD
-        price: 0.001
-        ledger:
-          url: "http://{addr}/v1/ledger"
-          hmac_key_id: "test-key-1"
-          hmac_key_hex: "0011223344"
-          on_ledger_failure: fail_closed
-"#
-    );
+    let config = breaker_proxy_config(&mock);
     let harness = sbproxy_e2e::ProxyHarness::start_with_yaml(&config).expect("start proxy");
 
-    // Drive enough requests to trip the breaker (ADR: 10 failures in
-    // a 30 s sliding window).
-    for _ in 0..15 {
+    // The first two logical requests fail at the ledger and trip the
+    // explicitly configured threshold. The remaining three must be
+    // rejected by the open breaker without another network call.
+    for _ in 0..5 {
         let _ = harness.get_with_headers(
             "/article",
             "blog.localhost",
@@ -394,44 +439,24 @@ origins:
             ],
         );
     }
-    // Once the breaker is open, the next attempt should not hit the
-    // network at all. Capture count should be < requests sent.
-    let captured = runtime.block_on(async { state.captured.lock().await.clone() });
-    assert!(
-        captured.len() < 15,
-        "breaker open => later attempts skip network, got {} hits",
-        captured.len()
+    // Once the breaker is open, later logical requests do not hit the
+    // network. The always-503 branch intentionally returns before
+    // request capture, so use its dedicated network-hit counter.
+    let received = mock.state.received.load(Ordering::SeqCst);
+    assert_eq!(
+        received, 2,
+        "breaker should stop network calls after its second consecutive failure"
     );
 }
 
 #[test]
-#[ignore = "WOR-1129: the `ledger:` block IS surfaced (config.ledger -> build_http_ledger -> HttpLedger, unit-tested). Real blocker is the plain-http mock vs HttpLedger`s https:// requirement; needs an HTTPS mock + TLS-trust path for the config-built client. Tracked with WOR-1133."]
 fn test_hmac_signature_binds_to_body() {
     // The mock server captures the raw body and the signature header.
     // The test recomputes the canonical signing string per ADR and
     // verifies the HMAC matches; flipping a byte must break verify.
     let runtime = rt();
-    let (addr, state) = runtime.block_on(spawn_mock_ledger(LedgerKnobs {
-        hmac_key_hex: "0011223344".to_string(),
-        ..Default::default()
-    }));
-    let config = format!(
-        r#"
-proxy:
-  http_bind_port: 0
-origins:
-  "blog.localhost":
-    action: {{ type: static, status_code: 200, content_type: text/html, body: "ok" }}
-    policies:
-      - type: ai_crawl_control
-        currency: USD
-        price: 0.001
-        ledger:
-          url: "http://{addr}/v1/ledger"
-          hmac_key_id: "test-key-1"
-          hmac_key_hex: "0011223344"
-"#
-    );
+    let mock = runtime.block_on(spawn_mock_ledger(LedgerKnobs::default()));
+    let config = proxy_config(&mock);
     let harness = sbproxy_e2e::ProxyHarness::start_with_yaml(&config).expect("start proxy");
     let _ = harness.get_with_headers(
         "/article",
@@ -441,7 +466,7 @@ origins:
             ("crawler-payment", "tok_hmac"),
         ],
     );
-    let captured = runtime.block_on(async { state.captured.lock().await.clone() });
+    let captured = runtime.block_on(async { mock.state.captured.lock().await.clone() });
     assert!(!captured.is_empty(), "ledger received the call");
 
     // The captured signature must verify against the captured body
@@ -466,37 +491,37 @@ origins:
     mac.update(canonical.as_bytes());
     let expected = format!("v1={}", hex::encode(mac.finalize().into_bytes()));
     assert_eq!(call.signature, expected, "HMAC matches canonical body");
+
+    let mut tampered_body = call.body.clone();
+    *tampered_body.last_mut().expect("nonempty body") ^= 1;
+    let tampered_canonical = format!(
+        "1\n{}\n{}\n{}\n{}\nPOST\n/v1/ledger/redeem\n{}",
+        request_id,
+        timestamp,
+        nonce,
+        workspace,
+        sha256_hex(&tampered_body)
+    );
+    let mut tampered_mac = <HmacSha256 as KeyInit>::new_from_slice(&key).unwrap();
+    tampered_mac.update(tampered_canonical.as_bytes());
+    let tampered_signature = format!("v1={}", hex::encode(tampered_mac.finalize().into_bytes()));
+    assert_ne!(
+        call.signature, tampered_signature,
+        "changing the body invalidates the signature"
+    );
 }
 
 #[test]
-#[ignore = "WOR-1129: the `ledger:` YAML wiring is present (config.ledger -> build_http_ledger -> HttpLedger, unit-tested). Real blocker is the plain-http mock vs HttpLedger`s https:// requirement; needs an HTTPS mock + TLS-trust path for the config-built client. Tracked with WOR-1133."]
 fn test_error_envelope_retryable_false_maps_to_402() {
     // Per ADR: a non-retryable error envelope (e.g.
     // `ledger.signature_invalid`) maps to 402 at the proxy edge so
     // the agent retries with a fresh token.
     let runtime = rt();
-    let (addr, _state) = runtime.block_on(spawn_mock_ledger(LedgerKnobs {
+    let mock = runtime.block_on(spawn_mock_ledger(LedgerKnobs {
         always_401: true,
-        hmac_key_hex: "0011223344".to_string(),
         ..Default::default()
     }));
-    let config = format!(
-        r#"
-proxy:
-  http_bind_port: 0
-origins:
-  "blog.localhost":
-    action: {{ type: static, status_code: 200, content_type: text/html, body: "ok" }}
-    policies:
-      - type: ai_crawl_control
-        currency: USD
-        price: 0.001
-        ledger:
-          url: "http://{addr}/v1/ledger"
-          hmac_key_id: "test-key-1"
-          hmac_key_hex: "0011223344"
-"#
-    );
+    let config = proxy_config(&mock);
     let harness = sbproxy_e2e::ProxyHarness::start_with_yaml(&config).expect("start proxy");
     let resp = harness
         .get_with_headers(
@@ -515,32 +540,13 @@ origins:
 }
 
 #[test]
-#[ignore = "WOR-1129: the `ledger:` YAML wiring is present (config.ledger -> build_http_ledger -> HttpLedger, unit-tested). Real blocker is the plain-http mock vs HttpLedger`s https:// requirement; needs an HTTPS mock + TLS-trust path for the config-built client. Tracked with WOR-1133."]
 fn test_error_envelope_retryable_true_maps_to_503() {
     let runtime = rt();
-    let (addr, _state) = runtime.block_on(spawn_mock_ledger(LedgerKnobs {
+    let mock = runtime.block_on(spawn_mock_ledger(LedgerKnobs {
         always_503: true,
-        hmac_key_hex: "0011223344".to_string(),
         ..Default::default()
     }));
-    let config = format!(
-        r#"
-proxy:
-  http_bind_port: 0
-origins:
-  "blog.localhost":
-    action: {{ type: static, status_code: 200, content_type: text/html, body: "ok" }}
-    policies:
-      - type: ai_crawl_control
-        currency: USD
-        price: 0.001
-        ledger:
-          url: "http://{addr}/v1/ledger"
-          hmac_key_id: "test-key-1"
-          hmac_key_hex: "0011223344"
-          on_ledger_failure: fail_closed
-"#
-    );
+    let config = proxy_config(&mock);
     let harness = sbproxy_e2e::ProxyHarness::start_with_yaml(&config).expect("start proxy");
     let resp = harness
         .get_with_headers(
@@ -551,7 +557,7 @@ origins:
         .expect("send");
     assert_eq!(
         resp.status, 503,
-        "retryable ledger failure with fail_closed => 503 to agent"
+        "retryable ledger failure fails closed with 503"
     );
 }
 
@@ -559,22 +565,23 @@ origins:
 
 /// Confirm the mock-server itself works end-to-end without the proxy.
 /// This guards against a refactor of `axum`'s extractor types breaking
-/// every Q1.2 test silently. Also exercises the `fail_first_n` and
-/// `reject_replayed_idempotency_key` knobs so the test fixture is
-/// known-good before a maintainer drops the `#[ignore]` on the proxy
-/// tests above.
+/// every Q1.2 test silently. Also exercises the TLS listener and
+/// `fail_first_n` knob independently of the proxy.
 #[test]
 fn mock_ledger_self_test() {
     let runtime = rt();
     runtime.block_on(async {
-        let (addr, state) = spawn_mock_ledger(LedgerKnobs {
+        let mock = spawn_mock_ledger(LedgerKnobs {
             fail_first_n: 1,
-            hmac_key_hex: "0011223344".to_string(),
             ..Default::default()
         })
         .await;
-        let client = reqwest::Client::new();
-        let url = format!("http://{addr}/v1/ledger/redeem");
+        let root = reqwest::Certificate::from_pem(mock.root_pem.as_bytes()).expect("parse test CA");
+        let client = reqwest::Client::builder()
+            .add_root_certificate(root)
+            .build()
+            .expect("build trusted client");
+        let url = format!("https://{}/v1/ledger/redeem", mock.addr);
 
         // First attempt: fail_first_n => 503.
         let resp = client
@@ -604,7 +611,7 @@ fn mock_ledger_self_test() {
             .expect("second call");
         assert_eq!(resp.status().as_u16(), 200);
 
-        let captured = state.captured.lock().await;
+        let captured = mock.state.captured.lock().await;
         assert_eq!(captured.len(), 2);
         assert_eq!(captured[0].idempotency_key, "k1");
         assert_eq!(captured[1].idempotency_key, "k1");

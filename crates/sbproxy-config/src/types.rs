@@ -599,6 +599,21 @@ fn default_resolver_cache_size() -> usize {
 
 // --- Server Config ---
 
+/// Process-owned settings for the embedded compression-state database.
+///
+/// This block controls where the process opens its durable Local backend.
+/// It is intentionally independent of route-level compression policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompressionStateRuntimeConfig {
+    /// Explicit absolute path to the redb database file.
+    ///
+    /// When omitted, startup selects the first suitable platform state
+    /// directory. Validation checks only the string contract; filesystem
+    /// availability is a startup concern.
+    pub local_path: Option<String>,
+}
+
 /// Server-level proxy configuration parsed from the top-level `proxy:`
 /// block of sb.yml.
 ///
@@ -707,6 +722,9 @@ pub struct ProxyServerConfig {
     /// so an existing config keeps the backend it has today.
     #[serde(default)]
     pub response_cache_store: Option<ResponseCacheStoreConfig>,
+    /// Process-owned path configuration for durable Local compression state.
+    #[serde(default)]
+    pub compression_state: Option<CompressionStateRuntimeConfig>,
     /// Optional shared message bus for inter-component eventing (config
     /// updates, semantic-cache purges, etc.). When unset, components that
     /// need a bus degrade to no-op semantics.
@@ -873,6 +891,7 @@ impl Default for ProxyServerConfig {
             l2_cache: None,
             cache_reserve: None,
             response_cache_store: None,
+            compression_state: None,
             messenger_settings: None,
             ai_providers_file: None,
             device_parser_file: None,
@@ -1928,6 +1947,29 @@ pub const FORBIDDEN_SWEEP_HEADERS: &[&str] = &[
     "cookie",
 ];
 
+/// Whether a header is unavailable as an inbound or outbound credential
+/// carrier.
+///
+/// In addition to headers that cannot be swept safely, credentials may not
+/// claim realtime handshake metadata, distributed tracing state, or outbound
+/// Web Bot Auth signature fields. Those values have independent protocol
+/// meaning and are written by the proxy.
+pub fn credential_header_is_reserved(header: &str) -> bool {
+    let lower = header.trim().to_ascii_lowercase();
+    FORBIDDEN_SWEEP_HEADERS.contains(&lower.as_str())
+        || matches!(
+            lower.as_str(),
+            "upgrade"
+                | "openai-beta"
+                | "traceparent"
+                | "tracestate"
+                | "signature-input"
+                | "signature"
+                | "signature-agent"
+        )
+        || lower.starts_with("sec-websocket-")
+}
+
 fn default_inbound_headers() -> Vec<InboundHeaderConfig> {
     vec![
         InboundHeaderConfig {
@@ -1962,9 +2004,9 @@ impl KeyInboundConfig {
                     entry.name
                 ));
             }
-            if FORBIDDEN_SWEEP_HEADERS.contains(&lower.as_str()) {
+            if credential_header_is_reserved(&lower) {
                 return Err(format!(
-                    "key_management.inbound.headers: {:?} may not be swept for a key",
+                    "key_management.inbound.headers: {:?} may not carry a key",
                     entry.name
                 ));
             }
@@ -3494,8 +3536,10 @@ pub struct AdminTlsConfig {
 pub struct AdminOperator {
     /// Login username.
     pub username: String,
-    /// Login password.
-    pub password: String,
+    /// HMAC-SHA256 hash of the login password, hex-encoded, using the same
+    /// pepper as the inbound key plane (sbproxy-keystore::crypto).
+    /// Compute with `sbproxy admin hash-password`.
+    pub password_hash: String,
     /// Role governing which admin actions this operator may perform.
     #[serde(default)]
     pub role: AdminRole,
@@ -3953,13 +3997,15 @@ fn default_capture_max_value_bytes() -> usize {
 }
 
 /// Header names excluded from `*` and glob matches. Listing one of
-/// these by exact name still works (intentional opt-in).
+/// these by exact name still works as an intentional opt-in, except
+/// `dpop`: sender-constraining proofs are never loggable.
 pub const SENSITIVE_HEADER_DENYLIST: &[&str] = &[
     "authorization",
     "cookie",
     "set-cookie",
     "proxy-authorization",
     "x-api-key",
+    "dpop",
     // Default sidecar header for a minted virtual key. It matches none of the
     // `-key` / `-secret` / `-token` suffix rules the log redactor uses, so
     // without this entry a `capture_headers: ["*"]` glob logs a live key.
@@ -4055,8 +4101,12 @@ impl CompiledHeaderAllowlist {
 
     /// Decide whether `header_name` (already lowercased) should be
     /// captured. The denylist always wins for `*` and glob matches;
-    /// exact matches override the denylist.
+    /// exact matches override the denylist except for DPoP proofs,
+    /// which are never loggable.
     pub fn matches(&self, header_name: &str) -> bool {
+        if header_name == "dpop" {
+            return false;
+        }
         if self.exact.contains(header_name) {
             return true;
         }
@@ -4907,6 +4957,91 @@ pub enum CredentialPolicy {
     },
 }
 
+/// Schema-only mirror of the deferred outbound credential enum. Runtime
+/// parsing remains in `sbproxy-modules`; this keeps generated editor tooling
+/// precise without introducing a crate dependency cycle.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[allow(dead_code)]
+enum OutboundCredentialSchema {
+    TokenExchange {
+        token_endpoint: String,
+        audience: String,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        subject_token_issuers: Vec<String>,
+        #[serde(default)]
+        allowed_audiences: Vec<String>,
+        #[serde(default = "default_outbound_act_depth")]
+        act_depth_cap: usize,
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        client_secret: Option<String>,
+        #[serde(default)]
+        dpop: Option<OutboundDpopSchema>,
+    },
+    ClientCredentials {
+        token_endpoint: String,
+        client_id: String,
+        client_secret: String,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        audience: Option<String>,
+        #[serde(default)]
+        dpop: Option<OutboundDpopSchema>,
+    },
+    VaultSecret {
+        secret: String,
+        #[serde(default = "default_outbound_credential_header")]
+        header: String,
+        #[serde(default = "default_outbound_credential_scheme")]
+        scheme: String,
+        #[serde(default)]
+        dpop: Option<OutboundDpopSchema>,
+    },
+}
+
+fn default_outbound_act_depth() -> usize {
+    4
+}
+
+fn default_outbound_credential_header() -> String {
+    "authorization".to_string()
+}
+
+fn default_outbound_credential_scheme() -> String {
+    "Bearer".to_string()
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct OutboundDpopSchema {
+    /// Existing provider URI or `file:` secret reference. Inline PEM is
+    /// rejected and SBproxy never generates this key.
+    key: String,
+    /// Public-only JWK matching the referenced private key.
+    jwk: serde_json::Value,
+    /// Asymmetric signing algorithm accepted for RFC 9449 proofs.
+    alg: OutboundDpopAlgorithmSchema,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+enum OutboundDpopAlgorithmSchema {
+    ES256,
+    ES384,
+    RS256,
+    RS384,
+    RS512,
+    PS256,
+    PS384,
+    PS512,
+    EdDSA,
+}
+
 /// A single origin config as it appears in YAML.
 /// Plugin-specific fields are kept as `serde_json::Value` for deferred parsing.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -5143,6 +5278,7 @@ pub struct RawOriginConfig {
     /// `sbproxy-modules`). Secret fields use the standard `${ENV}`
     /// interpolation, resolved at config load.
     #[serde(default)]
+    #[schemars(with = "Option<OutboundCredentialSchema>")]
     pub outbound_credential: Option<serde_json::Value>,
     /// Opt this origin into outbound Web Bot Auth signing (WOR-805).
     /// When `true` and `proxy.web_bot_auth` is configured, the proxy
@@ -8695,6 +8831,30 @@ mod inbound_key_header_tests {
             let cfg = KeyInboundConfig {
                 headers: vec![InboundHeaderConfig {
                     name: (*forbidden).to_string(),
+                    scheme: String::new(),
+                }],
+                require: false,
+                provider_hints: Vec::new(),
+            };
+            assert!(cfg.validate().is_err(), "{forbidden} must be rejected");
+        }
+    }
+
+    #[test]
+    fn inbound_validation_rejects_realtime_protocol_and_proxy_owned_headers() {
+        for forbidden in [
+            "OpenAI-Beta",
+            "SEC-WebSocket-Key",
+            "Upgrade",
+            "TraceParent",
+            "TRACESTATE",
+            "Signature-Input",
+            "Signature",
+            "Signature-Agent",
+        ] {
+            let cfg = KeyInboundConfig {
+                headers: vec![InboundHeaderConfig {
+                    name: forbidden.to_string(),
                     scheme: String::new(),
                 }],
                 require: false,

@@ -483,10 +483,68 @@ fn ledger_happy_path_passes_request() {
 }
 
 #[test]
+fn cap_pricing_exemption_skips_ledger_and_402() {
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "valid_tokens": [],
+    }))
+    .unwrap()
+    .with_ledger(Arc::new(AlwaysTransient));
+    let headers = payment_headers("GPTBot/1.0", "crawler-payment", "must-not-redeem");
+
+    assert_eq!(
+        policy.check_with_pricing_exemption("GET", "x.com", "/article", &headers, None, true),
+        AiCrawlDecision::Allow
+    );
+}
+
+#[test]
+fn cap_pricing_exemption_does_not_bypass_content_signals() {
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "valid_tokens": [],
+        "crawler_user_agents": ["ClaudeBot"],
+        "content_signals": { "ai_train": false },
+    }))
+    .unwrap();
+    let headers = ua_headers("ClaudeBot/1.0");
+
+    assert!(matches!(
+        policy.check_with_pricing_exemption("GET", "x.com", "/article", &headers, None, true),
+        AiCrawlDecision::SignalBlocked { .. }
+    ));
+}
+
+#[test]
 fn money_from_units_rounds_to_micros() {
     let m = Money::from_units(0.001234567, "USD");
     assert_eq!(m.amount_micros, 1235);
     assert_eq!(m.currency, "USD");
+}
+
+#[cfg(not(feature = "http-ledger"))]
+#[test]
+fn ledger_yaml_block_fails_closed_without_http_ledger_feature() {
+    let err = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "ledger": {
+            "url": "https://ledger.internal",
+            "key_id": "k1",
+            "key_hex": "00",
+        }
+    }))
+    .expect_err("ledger config must not silently fall back without HTTP support");
+
+    assert_eq!(
+        err.to_string(),
+        "ai_crawl_control: `ledger:` requires the `http-ledger` feature; enable it or remove the `ledger:` block"
+    );
+
+    AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "valid_tokens": ["dev-token"],
+    }))
+    .expect("config without a ledger block remains valid");
 }
 
 #[cfg(feature = "http-ledger")]
@@ -559,6 +617,27 @@ fn ledger_yaml_block_resolves_secret_ref_env() {
     let dbg = format!("{:?}", policy);
     assert!(dbg.contains("ledger.internal"), "{dbg}");
     std::env::remove_var("SBPROXY_TEST_LEDGER_HMAC");
+}
+
+#[cfg(feature = "http-ledger")]
+#[test]
+fn ledger_trust_root_rejects_malformed_pem_at_config_load() {
+    let err = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "ledger": {
+            "url": "https://ledger.internal",
+            "key_id": "k1",
+            "key_hex": "00",
+            "trust_roots": ["not a PEM certificate"],
+        }
+    }))
+    .expect_err("malformed private root must fail config load");
+
+    assert!(
+        err.to_string()
+            .starts_with("ai_crawl_control.ledger.trust_roots[0]: invalid PEM bundle:"),
+        "actionable trust-root error: {err}"
+    );
 }
 
 // --- G3.4 / G3.5 multi-rail challenge tests ---

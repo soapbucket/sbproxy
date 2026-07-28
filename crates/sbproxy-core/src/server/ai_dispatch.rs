@@ -43,6 +43,59 @@ fn update_router_quota_from_response(
     router.update_quota_from_headers(provider_name, &headers, status);
 }
 
+/// Run one selected provider attempt with shared load-balancer observation.
+///
+/// The in-flight guard is cancellation-safe. Successful response-header
+/// completion records latency for every forwarding surface; transport errors
+/// release the slot but remain owned by the router's failure signals.
+async fn run_routed_provider_attempt<T, E>(
+    router: &sbproxy_ai::Router,
+    provider_idx: usize,
+    attempt: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let _in_flight = router.track_in_flight(provider_idx);
+    let started = std::time::Instant::now();
+    let result = attempt.await;
+    if result.is_ok() {
+        let elapsed_us = u64::try_from(started.elapsed().as_micros())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        router.record_latency(provider_idx, elapsed_us);
+    }
+    result
+}
+
+#[cfg(test)]
+mod routed_provider_observation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn routed_attempt_is_visible_as_in_flight_before_completion() {
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai", "api_key": "test"},
+                {"name": "anthropic", "api_key": "test"}
+            ],
+            "routing": {"strategy": "peak_ewma", "half_life": "10s"}
+        }))
+        .expect("valid AI config");
+        let router = config.router();
+        router.record_latency(0, 1_000);
+        router.record_latency(1, 1_000);
+
+        run_routed_provider_attempt(&router, 0, async {
+            assert_eq!(
+                router.select(&config.providers),
+                Some(1),
+                "the active attempt must raise provider 0's effective cost"
+            );
+            Ok::<(), ()>(())
+        })
+        .await
+        .expect("attempt succeeds");
+    }
+}
+
 fn effective_policy_to_virtual_key(
     policy: &sbproxy_ai::effective_key_policy::EffectiveKeyPolicy,
 ) -> sbproxy_ai::identity::VirtualKeyConfig {
@@ -500,6 +553,60 @@ fn bounded_config_revision(config_revision: &str) -> String {
     format!("h:{}", &digest[..PEER_POLICY_DIGEST_PREFIX_LEN])
 }
 
+struct PreparedAiIdentity {
+    resolved_request_key: Option<ResolvedRequestKey>,
+    policy_revision: String,
+}
+
+async fn prepare_ai_request_identity(
+    session: &Session,
+    config: &AiHandlerConfig,
+    pipeline: &CompiledPipeline,
+    ctx: &mut RequestContext,
+    key_plane: Option<&crate::key_plane::KeyPlane>,
+) -> std::result::Result<PreparedAiIdentity, (u16, String)> {
+    let origin_tenant_id = ctx.tenant_id.to_string();
+    let resolved_request_key =
+        resolve_request_virtual_key(ctx, session, config, key_plane, &origin_tenant_id)
+            .await
+            .map_err(|(status, message)| {
+                warn!(status, reason = %message, "AI proxy: virtual key denied");
+                (status, message)
+            })?;
+
+    governed_key_requirement(config.require_governed_key, resolved_request_key.as_ref()).map_err(
+        |(status, message)| {
+            warn!(
+                reason = "governed_key_required",
+                "AI proxy: request did not resolve a governed credential"
+            );
+            (status, message.to_string())
+        },
+    )?;
+
+    if let Some(key) = resolved_request_key.as_ref() {
+        ctx.effective_key_policy = key.effective_policy.clone();
+        apply_resolved_virtual_key_context(session, config, ctx, key)
+            .map_err(|(status, message)| (status, message.to_string()))?;
+    }
+
+    let policy_revision =
+        peer_policy_revision(resolved_request_key.as_ref(), &pipeline.config_revision).map_err(
+            |_| {
+                warn!(
+                    reason = "policy_digest_failed",
+                    "AI proxy: effective credential policy rejected"
+                );
+                (403, "credential policy is invalid".to_string())
+            },
+        )?;
+
+    Ok(PreparedAiIdentity {
+        resolved_request_key,
+        policy_revision,
+    })
+}
+
 fn merged_request_budget<'a>(
     origin: Option<&'a sbproxy_ai::BudgetConfig>,
     policy: Option<&sbproxy_ai::effective_key_policy::EffectiveKeyPolicy>,
@@ -534,6 +641,41 @@ fn immutable_budget_key_id(ctx: &RequestContext) -> Option<String> {
             let key_id = ctx.principal.api_key_id();
             (!key_id.is_empty()).then(|| key_id.to_string())
         })
+}
+
+pub(super) async fn realtime_budget_gate(
+    session: &Session,
+    config: &AiHandlerConfig,
+    pipeline: &CompiledPipeline,
+    hostname: &str,
+    ctx: &mut RequestContext,
+    model: Option<&str>,
+) -> std::result::Result<BudgetGate, (u16, String)> {
+    let key_plane = crate::key_plane::current_key_plane();
+    let _prepared =
+        prepare_ai_request_identity(session, config, pipeline, ctx, key_plane.as_deref()).await?;
+
+    let Some(effective_budget) =
+        merged_request_budget(config.budget.as_ref(), ctx.effective_key_policy.as_ref())
+    else {
+        return Ok(BudgetGate::Allow);
+    };
+    let api_key_id = immutable_budget_key_id(ctx);
+    let user =
+        req_header_value(session, "x-user-id").or_else(|| req_header_value(session, "x-end-user"));
+    let tag = req_header_value(session, "x-sbproxy-tag");
+    let (_, gate) = scoped_budget_preflight(
+        effective_budget.as_ref(),
+        &config.providers,
+        hostname,
+        api_key_id.as_deref(),
+        user.as_deref(),
+        model,
+        Some(hostname),
+        tag.as_deref(),
+    )
+    .await;
+    Ok(gate)
 }
 
 /// Translate a resolved effective key policy into governance limits.
@@ -770,10 +912,9 @@ async fn resolve_dynamic_virtual_key(
 }
 
 async fn resolve_request_virtual_key(
-    ctx: &RequestContext,
+    ctx: &mut RequestContext,
     session: &Session,
     config: &AiHandlerConfig,
-    principal: &sbproxy_plugin::Principal,
     plane: Option<&crate::key_plane::KeyPlane>,
     origin_tenant_id: &str,
 ) -> std::result::Result<Option<ResolvedRequestKey>, (u16, String)> {
@@ -799,12 +940,18 @@ async fn resolve_request_virtual_key(
     if let Some(plane) = plane {
         match resolve_dynamic_virtual_key(plane, raw_key.as_deref()).await {
             DynamicKeyOutcome::Resolved(record) => {
-                return lower_stored_request_key(&record, origin_tenant_id).map(Some);
+                return lower_and_preserve_stored_request_key(ctx, record, origin_tenant_id)
+                    .map(Some);
             }
             DynamicKeyOutcome::NotApplicable => {
-                match resolve_oidc_mapped_key(plane, principal).await {
+                match resolve_oidc_mapped_key(plane, &ctx.principal).await {
                     DynamicKeyOutcome::Resolved(record) => {
-                        return lower_stored_request_key(&record, origin_tenant_id).map(Some);
+                        return lower_and_preserve_stored_request_key(
+                            ctx,
+                            record,
+                            origin_tenant_id,
+                        )
+                        .map(Some);
                     }
                     DynamicKeyOutcome::NotApplicable => {}
                     DynamicKeyOutcome::Deny(status, message) => return Err((status, message)),
@@ -846,6 +993,22 @@ fn lower_stored_request_key(
         );
         (403, "credential policy is invalid".to_string())
     })
+}
+
+/// Preserve the authenticated record for later Pingora phases after lowering
+/// its secret-free policy for AI dispatch.
+///
+/// Dynamic bearer and OIDC mapping can resolve after the pre-auth sweep. The
+/// upstream phase still needs the original record's credential binding, so
+/// retain it on the request context only after policy validation succeeds.
+fn lower_and_preserve_stored_request_key(
+    ctx: &mut RequestContext,
+    record: Box<sbproxy_keystore::record::KeyRecord>,
+    origin_tenant_id: &str,
+) -> std::result::Result<ResolvedRequestKey, (u16, String)> {
+    let resolved = lower_stored_request_key(&record, origin_tenant_id)?;
+    ctx.resolved_inbound_key = Some(record);
+    Ok(resolved)
 }
 
 const UNNAMED_VIRTUAL_KEY_PRINCIPAL: &str = "<unnamed>";
@@ -1311,54 +1474,18 @@ pub(super) async fn handle_ai_proxy(
     // dispatch branch can return or contact a provider/cache. The key plane and
     // policy snapshots stay pinned for the rest of this request.
     let key_plane = crate::key_plane::current_key_plane();
-    let resolved_request_vk = match resolve_request_virtual_key(
-        ctx,
-        session,
-        config,
-        &ctx.principal,
-        key_plane.as_deref(),
-        ctx.tenant_id.as_str(),
-    )
-    .await
-    {
-        Ok(key) => key,
-        Err((status, message)) => {
-            warn!(status, reason = %message, "AI proxy: virtual key denied");
-            send_error(session, status, &message).await?;
-            return Ok(());
-        }
-    };
-    if let Err((status, message)) =
-        governed_key_requirement(config.require_governed_key, resolved_request_vk.as_ref())
-    {
-        warn!(
-            reason = "governed_key_required",
-            "AI proxy: request did not resolve a governed credential"
-        );
-        send_error(session, status, message).await?;
-        return Ok(());
-    }
-    if let Some(key) = resolved_request_vk.as_ref() {
-        ctx.effective_key_policy = key.effective_policy.clone();
-        if let Err((status, message)) =
-            apply_resolved_virtual_key_context(session, config, ctx, key)
+    let prepared_identity =
+        match prepare_ai_request_identity(session, config, pipeline, ctx, key_plane.as_deref())
+            .await
         {
-            send_error(session, status, message).await?;
-            return Ok(());
-        }
-    }
-    let peer_policy_revision =
-        match peer_policy_revision(resolved_request_vk.as_ref(), &pipeline.config_revision) {
-            Ok(version) => version,
-            Err(_) => {
-                warn!(
-                    reason = "policy_digest_failed",
-                    "AI proxy: effective credential policy rejected"
-                );
-                send_error(session, 403, "credential policy is invalid").await?;
+            Ok(prepared) => prepared,
+            Err((status, message)) => {
+                send_error(session, status, &message).await?;
                 return Ok(());
             }
         };
+    let resolved_request_vk = prepared_identity.resolved_request_key;
+    let peer_policy_revision = prepared_identity.policy_revision;
     ai_span.record("sbproxy.policy_version", peer_policy_revision.as_str());
     let effective_policy = ctx.effective_key_policy.as_ref();
     let trace_key_id = effective_policy
@@ -1631,20 +1758,20 @@ pub(super) async fn handle_ai_proxy(
         }
 
         ctx.record_admin_ai_attempt(&provider.name);
-        let resp = AI_CLIENT
-            .load()
-            .forward_get_request(provider, &path)
-            .await
-            .map_err(|e| {
-                record_ai_transport_failure(
-                    &ai_span,
-                    Some(provider.name.as_str()),
-                    &e,
-                    "AI upstream GET request failed",
-                );
-                warn!(error = %e, "AI proxy: upstream GET request failed");
-                Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
-            })?;
+        let resp = run_routed_provider_attempt(&router, provider_idx, async {
+            AI_CLIENT.load().forward_get_request(provider, &path).await
+        })
+        .await
+        .map_err(|e| {
+            record_ai_transport_failure(
+                &ai_span,
+                Some(provider.name.as_str()),
+                &e,
+                "AI upstream GET request failed",
+            );
+            warn!(error = %e, "AI proxy: upstream GET request failed");
+            Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
+        })?;
         record_ai_provider_response_failure(
             &ai_span,
             provider.name.as_str(),
@@ -1770,25 +1897,28 @@ pub(super) async fn handle_ai_proxy(
             };
 
         ctx.record_admin_ai_attempt(&provider.name);
-        let resp = AI_CLIENT
-            .load()
-            .forward_with_method(provider, &method_str, &path, body_opt.as_ref())
-            .await
-            .map_err(|e| {
-                record_ai_transport_failure(
-                    &ai_span,
-                    Some(provider.name.as_str()),
-                    &e,
-                    "AI upstream method-aware request failed",
-                );
-                warn!(
-                    error = %e,
-                    method = %method_str,
-                    ai.surface = surface.label(),
-                    "AI proxy: upstream method-aware request failed"
-                );
-                Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
-            })?;
+        let resp = run_routed_provider_attempt(&router, provider_idx, async {
+            AI_CLIENT
+                .load()
+                .forward_with_method(provider, &method_str, &path, body_opt.as_ref())
+                .await
+        })
+        .await
+        .map_err(|e| {
+            record_ai_transport_failure(
+                &ai_span,
+                Some(provider.name.as_str()),
+                &e,
+                "AI upstream method-aware request failed",
+            );
+            warn!(
+                error = %e,
+                method = %method_str,
+                ai.surface = surface.label(),
+                "AI proxy: upstream method-aware request failed"
+            );
+            Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
+        })?;
         record_ai_provider_response_failure(
             &ai_span,
             provider.name.as_str(),
@@ -2067,78 +2197,84 @@ pub(super) async fn handle_ai_proxy(
             ctx.record_admin_ai_attempt(&provider.name);
             let distributed_managed =
                 crate::server::model_host::distributed_managed_provider(provider);
-            let response_result: anyhow::Result<reqwest::Response> = if distributed_managed {
-                let origin = ctx
-                    .origin_idx
-                    .and_then(|index| ctx.pipeline.config.origins.get(index))
-                    .map(|origin| origin.origin_id.to_string())
-                    .unwrap_or_else(|| ctx.hostname.to_string());
-                let preferred_region = ctx
-                    .principal
-                    .attrs
-                    .metadata
-                    .get("region")
-                    .cloned()
-                    .or_else(|| ctx.request_geo.clone());
-                let prefix_key = format!(
-                    "{}:{}",
-                    ctx.tenant_id,
-                    requested_model.as_deref().unwrap_or_default()
-                );
-                match crate::server::model_host::distributed_managed_upstream(
-                    crate::server::model_host::ManagedDistributedRequest {
-                        origin: &origin,
-                        provider,
-                        requested_model: requested_model.as_deref(),
-                        request_id: ctx.request_id.as_str(),
-                        tenant_id: ctx.tenant_id.as_str(),
-                        governed_key_id: ctx.principal.api_key_id(),
-                        policy_revision: &peer_policy_revision,
-                        path: &path,
-                        body: forwarded_body.clone(),
-                        content_type: Some(&request_content_type),
-                        priority: crate::server::model_host::lane_class_for(ctx.ai_lane_priority),
-                        prefix_key: prefix_key.as_bytes(),
-                        preferred_region: preferred_region.as_deref(),
-                        requested_adapter: None,
-                        max_body_bytes: maximum,
-                    },
-                )
-                .await
-                {
-                    Ok(Some(upstream)) => {
-                        ctx.ai_logical_model = Some(upstream.public_model.clone());
-                        ctx.ai_serve_model = Some(upstream.public_model);
-                        ctx.managed_model_permit = upstream.local_permit;
-                        ctx.managed_route_class = upstream.route_class;
-                        ctx.managed_route_trace = Some(upstream.trace);
-                        Ok(upstream.response)
-                    }
-                    Ok(None) => Err(anyhow::anyhow!(
-                        "distributed managed provider did not produce an attempt"
-                    )),
-                    Err(error) => {
-                        if let Some(trace) = error.trace() {
-                            ctx.managed_route_trace = Some(trace.clone());
+            let response_result: anyhow::Result<reqwest::Response> =
+                run_routed_provider_attempt(&router, provider_idx, async {
+                    if distributed_managed {
+                        let origin = ctx
+                            .origin_idx
+                            .and_then(|index| ctx.pipeline.config.origins.get(index))
+                            .map(|origin| origin.origin_id.to_string())
+                            .unwrap_or_else(|| ctx.hostname.to_string());
+                        let preferred_region = ctx
+                            .principal
+                            .attrs
+                            .metadata
+                            .get("region")
+                            .cloned()
+                            .or_else(|| ctx.request_geo.clone());
+                        let prefix_key = format!(
+                            "{}:{}",
+                            ctx.tenant_id,
+                            requested_model.as_deref().unwrap_or_default()
+                        );
+                        match crate::server::model_host::distributed_managed_upstream(
+                            crate::server::model_host::ManagedDistributedRequest {
+                                origin: &origin,
+                                provider,
+                                requested_model: requested_model.as_deref(),
+                                request_id: ctx.request_id.as_str(),
+                                tenant_id: ctx.tenant_id.as_str(),
+                                governed_key_id: ctx.principal.api_key_id(),
+                                policy_revision: &peer_policy_revision,
+                                path: &path,
+                                body: forwarded_body.clone(),
+                                content_type: Some(&request_content_type),
+                                priority: crate::server::model_host::lane_class_for(
+                                    ctx.ai_lane_priority,
+                                ),
+                                prefix_key: prefix_key.as_bytes(),
+                                preferred_region: preferred_region.as_deref(),
+                                requested_adapter: None,
+                                max_body_bytes: maximum,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(Some(upstream)) => {
+                                ctx.ai_logical_model = Some(upstream.public_model.clone());
+                                ctx.ai_serve_model = Some(upstream.public_model);
+                                ctx.managed_model_permit = upstream.local_permit;
+                                ctx.managed_route_class = upstream.route_class;
+                                ctx.managed_route_trace = Some(upstream.trace);
+                                Ok(upstream.response)
+                            }
+                            Ok(None) => Err(anyhow::anyhow!(
+                                "distributed managed provider did not produce an attempt"
+                            )),
+                            Err(error) => {
+                                if let Some(trace) = error.trace() {
+                                    ctx.managed_route_trace = Some(trace.clone());
+                                }
+                                if let Some(reason) = error.public_reason() {
+                                    ctx.managed_fallback_reason = Some(reason);
+                                }
+                                Err(anyhow::Error::new(error))
+                            }
                         }
-                        if let Some(reason) = error.public_reason() {
-                            ctx.managed_fallback_reason = Some(reason);
-                        }
-                        Err(anyhow::Error::new(error))
+                    } else {
+                        AI_CLIENT
+                            .load()
+                            .forward_bytes(
+                                provider,
+                                &method_str,
+                                &path,
+                                forwarded_body.clone(),
+                                &request_content_type,
+                            )
+                            .await
                     }
-                }
-            } else {
-                AI_CLIENT
-                    .load()
-                    .forward_bytes(
-                        provider,
-                        &method_str,
-                        &path,
-                        forwarded_body.clone(),
-                        &request_content_type,
-                    )
-                    .await
-            };
+                })
+                .await;
             match response_result {
                 Ok(response) => {
                     // WOR-1881: refresh quota snapshots before failover reselect.
@@ -2559,20 +2695,18 @@ pub(super) async fn handle_ai_proxy(
         } else {
             Some(model.as_str())
         };
-        let keys = budget_scope_keys(
+        let (keys, gate) = scoped_budget_preflight(
             budget_cfg,
+            &config.providers,
             hostname,
             budget_api_key_id.as_deref(),
             user_header.as_deref(),
             model_for_scope,
             Some(hostname),
             tag_header.as_deref(),
-        );
-        // WOR-1722: pre-fetch the cluster-shared spend for these keys so
-        // the preflight enforces against the fleet total (empty map, hence
-        // local-only, when shared budgets are off).
-        let shared_spend = super::budget_share::read_shared_for_keys(&keys).await;
-        match budget_preflight(budget_cfg, &keys, &config.providers, &shared_spend) {
+        )
+        .await;
+        match gate {
             BudgetGate::Allow => {
                 // WOR-1544: predictive soft-landing. Below the hard cap,
                 // warn and then downgrade as a scope approaches its
@@ -4267,8 +4401,14 @@ pub(super) async fn handle_ai_proxy(
             }
             let path_ref = path.as_str();
             let cl = &client;
+            let attempt_router = std::sync::Arc::clone(&router);
             futs.push(async move {
-                let r = cl.forward_request(provider, path_ref, &attempt_body).await;
+                let r = run_routed_provider_attempt(
+                    &attempt_router,
+                    idx,
+                    cl.forward_request(provider, path_ref, &attempt_body),
+                )
+                .await;
                 (idx, r)
             });
         }
@@ -4282,7 +4422,6 @@ pub(super) async fn handle_ai_proxy(
             match res {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
-                    router.record_latency(idx, race_start.elapsed().as_micros() as u64);
                     // WOR-1881: race losers still contribute quota signals.
                     update_router_quota_from_response(&router, &config.providers[idx].name, &resp);
                     let outcome = if (200..300).contains(&status) {
@@ -4619,107 +4758,112 @@ pub(super) async fn handle_ai_proxy(
             provider = %provider.name,
             attempt = attempt,
         );
-        let result: anyhow::Result<reqwest::Response> = if distributed_managed {
-            let managed_body = serde_json::to_vec(&attempt_body)
-                .map(bytes::Bytes::from)
-                .map_err(anyhow::Error::from);
-            match managed_body {
-                Ok(managed_body) => {
-                    let origin = ctx
-                        .origin_idx
-                        .and_then(|index| ctx.pipeline.config.origins.get(index))
-                        .map(|origin| origin.origin_id.to_string())
-                        .unwrap_or_else(|| ctx.hostname.to_string());
-                    let prefix_key = extract_prefix_key(&attempt_body, 1024);
-                    let requested_adapter = attempt_body
-                        .get("adapter")
-                        .or_else(|| attempt_body.get("lora_adapter"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string);
-                    let preferred_region = ctx
-                        .principal
-                        .attrs
-                        .metadata
-                        .get("region")
-                        .cloned()
-                        .or_else(|| ctx.request_geo.clone());
-                    let maximum = config
-                        .max_body_size
-                        .filter(|maximum| *maximum > 0)
-                        .unwrap_or(64 * 1024 * 1024)
-                        .min(1024 * 1024 * 1024);
-                    let managed = crate::server::model_host::distributed_managed_upstream(
-                        crate::server::model_host::ManagedDistributedRequest {
-                            origin: &origin,
-                            provider,
-                            requested_model: (!model.is_empty()).then_some(model.as_str()),
-                            request_id: ctx.request_id.as_str(),
-                            tenant_id: ctx.tenant_id.as_str(),
-                            governed_key_id: ctx.principal.api_key_id(),
-                            policy_revision: &peer_policy_revision,
-                            path: &path,
-                            body: managed_body,
-                            content_type: Some("application/json"),
-                            priority: crate::server::model_host::lane_class_for(
-                                ctx.ai_lane_priority,
-                            ),
-                            prefix_key: &prefix_key,
-                            preferred_region: preferred_region.as_deref(),
-                            requested_adapter: requested_adapter.as_deref(),
-                            max_body_bytes: maximum,
-                        },
-                    )
-                    .instrument(attempt_span)
-                    .await;
-                    match managed {
-                        Ok(Some(upstream)) => {
-                            local_public_model = Some(upstream.public_model);
-                            ctx.managed_model_permit = upstream.local_permit;
-                            ctx.managed_route_class = upstream.route_class;
-                            ctx.managed_route_trace = Some(upstream.trace);
-                            Ok(upstream.response)
+        let result: anyhow::Result<reqwest::Response> =
+            run_routed_provider_attempt(&router, provider_idx, async {
+                if distributed_managed {
+                    let managed_body = serde_json::to_vec(&attempt_body)
+                        .map(bytes::Bytes::from)
+                        .map_err(anyhow::Error::from);
+                    match managed_body {
+                        Ok(managed_body) => {
+                            let origin = ctx
+                                .origin_idx
+                                .and_then(|index| ctx.pipeline.config.origins.get(index))
+                                .map(|origin| origin.origin_id.to_string())
+                                .unwrap_or_else(|| ctx.hostname.to_string());
+                            let prefix_key = extract_prefix_key(&attempt_body, 1024);
+                            let requested_adapter = attempt_body
+                                .get("adapter")
+                                .or_else(|| attempt_body.get("lora_adapter"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string);
+                            let preferred_region = ctx
+                                .principal
+                                .attrs
+                                .metadata
+                                .get("region")
+                                .cloned()
+                                .or_else(|| ctx.request_geo.clone());
+                            let maximum = config
+                                .max_body_size
+                                .filter(|maximum| *maximum > 0)
+                                .unwrap_or(64 * 1024 * 1024)
+                                .min(1024 * 1024 * 1024);
+                            let managed = crate::server::model_host::distributed_managed_upstream(
+                                crate::server::model_host::ManagedDistributedRequest {
+                                    origin: &origin,
+                                    provider,
+                                    requested_model: (!model.is_empty()).then_some(model.as_str()),
+                                    request_id: ctx.request_id.as_str(),
+                                    tenant_id: ctx.tenant_id.as_str(),
+                                    governed_key_id: ctx.principal.api_key_id(),
+                                    policy_revision: &peer_policy_revision,
+                                    path: &path,
+                                    body: managed_body,
+                                    content_type: Some("application/json"),
+                                    priority: crate::server::model_host::lane_class_for(
+                                        ctx.ai_lane_priority,
+                                    ),
+                                    prefix_key: &prefix_key,
+                                    preferred_region: preferred_region.as_deref(),
+                                    requested_adapter: requested_adapter.as_deref(),
+                                    max_body_bytes: maximum,
+                                },
+                            )
+                            .instrument(attempt_span)
+                            .await;
+                            match managed {
+                                Ok(Some(upstream)) => {
+                                    local_public_model = Some(upstream.public_model);
+                                    ctx.managed_model_permit = upstream.local_permit;
+                                    ctx.managed_route_class = upstream.route_class;
+                                    ctx.managed_route_trace = Some(upstream.trace);
+                                    Ok(upstream.response)
+                                }
+                                Ok(None) => Err(anyhow::anyhow!(
+                                    "distributed managed provider did not produce an attempt"
+                                )),
+                                Err(error) => {
+                                    if let Some(trace) = error.trace() {
+                                        ctx.managed_route_trace = Some(trace.clone());
+                                    }
+                                    if let Some(reason) = error.public_reason() {
+                                        ctx.managed_fallback_reason = Some(reason);
+                                    }
+                                    Err(anyhow::Error::new(error))
+                                }
+                            }
                         }
-                        Ok(None) => Err(anyhow::anyhow!(
-                            "distributed managed provider did not produce an attempt"
-                        )),
-                        Err(error) => {
-                            if let Some(trace) = error.trace() {
-                                ctx.managed_route_trace = Some(trace.clone());
-                            }
-                            if let Some(reason) = error.public_reason() {
-                                ctx.managed_fallback_reason = Some(reason);
-                            }
-                            Err(anyhow::Error::new(error))
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    async {
+                        if let Some((bypass_body, native_path)) = upstream_call {
+                            AI_CLIENT
+                                .load()
+                                .forward_native_bypass(
+                                    provider,
+                                    &method_str,
+                                    native_path,
+                                    bypass_body,
+                                )
+                                .await
+                        } else {
+                            AI_CLIENT
+                                .load()
+                                .forward_request(provider, &path, &attempt_body)
+                                .await
                         }
                     }
+                    .instrument(attempt_span)
+                    .await
                 }
-                Err(error) => Err(error),
-            }
-        } else {
-            async {
-                if let Some((bypass_body, native_path)) = upstream_call {
-                    AI_CLIENT
-                        .load()
-                        .forward_native_bypass(provider, &method_str, native_path, bypass_body)
-                        .await
-                } else {
-                    AI_CLIENT
-                        .load()
-                        .forward_request(provider, &path, &attempt_body)
-                        .await
-                }
-            }
-            .instrument(attempt_span)
-            .await
-        };
+            })
+            .await;
         ctx.ai_serve_model = local_public_model.clone();
 
         match result {
             Ok(resp) => {
-                // WOR-798: feed the latency-aware LB. Record the upstream
-                // round-trip latency for this provider so `peak_ewma` /
-                // `lowest_latency` reflect live data on the next request.
-                router.record_latency(provider_idx, attempt_start.elapsed().as_micros() as u64);
                 let status = resp.status().as_u16();
                 // WOR-1881: update quota snapshots before retry/reselect so
                 // headroom and reset-aware strategies see this response's
@@ -9414,6 +9558,32 @@ mod dynamic_key_resolution_tests {
         let admission = crate::server::model_host::lane_class_for(context.ai_lane_priority);
 
         assert_eq!(admission, sbproxy_model_host::PriorityClass::Interactive);
+    }
+
+    #[test]
+    fn dynamically_resolved_record_retains_bound_upstream_credential() {
+        let mut record = KeyRecord::new("bound-key", "hash", chrono::Utc::now());
+        record.credential_id = Some("credential-1".into());
+        let mut context = RequestContext::new();
+
+        let resolved =
+            lower_and_preserve_stored_request_key(&mut context, Box::new(record), "tenant-a")
+                .expect("valid stored policy");
+
+        assert_eq!(
+            context
+                .resolved_inbound_key
+                .as_deref()
+                .and_then(|record| record.credential_id.as_deref()),
+            Some("credential-1")
+        );
+        assert_eq!(
+            resolved
+                .effective_policy
+                .as_ref()
+                .map(|policy| policy.key_id.as_str()),
+            Some("bound-key")
+        );
     }
 
     #[test]

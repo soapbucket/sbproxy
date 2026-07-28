@@ -3,22 +3,10 @@
 //! Routes a request through the
 //! [`JudgeClient`](sbproxy_ai::judge::JudgeClient) at evaluation time
 //! and translates the verdict into a
-//! [`PolicyDecision`](sbproxy_plugin::PolicyDecision). The policy is
-//! the run-time half of the WOR-147 NL policy authoring story: NL
-//! goes through the [`NlCompiler`](crate::policy::nl_compiler::NlCompiler)
-//! at authoring time, the resulting prompt template is stored in
-//! this policy's config, and live traffic is judged against it on
-//! every request.
-//!
-//! The OSS slice does not link the Cedar evaluator. A
-//! `semantic_constraint` policy in OSS is therefore a "raw prompt"
-//! policy: the configured `prompt_template` is rendered against the
-//! request context and sent straight to the judge. The
-//! `policy_id` field is recorded for audit linkage to a pinned
-//! [`CompiledPolicy`](crate::policy::compiled_policy_store::CompiledPolicy)
-//! when one is available; the OSS path does not consult the
-//! [`CompiledPolicyStore`](crate::policy::compiled_policy_store::CompiledPolicyStore)
-//! at evaluation time.
+//! [`PolicyDecision`](sbproxy_plugin::PolicyDecision). The policy
+//! routes each request through the configured judge. The prompt
+//! template is rendered against the request context and sent straight
+//! to the judge at evaluation time.
 //!
 //! ## Verdict mapping
 //!
@@ -63,6 +51,7 @@ use tracing::warn;
 /// budget) so multiple `semantic_constraint` blocks in one origin can
 /// point at different providers without sharing state.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticConstraintConfig {
     /// minijinja template rendered against the request context to
     /// produce the prompt sent to the judge.
@@ -72,15 +61,6 @@ pub struct SemanticConstraintConfig {
     /// allowed; this is the "monitor mode" used during rollout.
     #[serde(default)]
     pub violations_block: bool,
-    /// Optional reference to a pinned
-    /// [`CompiledPolicy`](crate::policy::compiled_policy_store::CompiledPolicy)
-    /// in the [`CompiledPolicyStore`](crate::policy::compiled_policy_store::CompiledPolicyStore).
-    /// Stored as a string at the YAML layer (the workspace `uuid`
-    /// crate is built without the `serde` feature) and parsed by the
-    /// caller. OSS records the value on the audit event but does not
-    /// consult the store at evaluation time.
-    #[serde(default)]
-    pub policy_id: Option<String>,
     /// Per-policy judge wiring. Required; a `semantic_constraint`
     /// policy without a configured judge cannot evaluate.
     pub judge: JudgeWiring,
@@ -132,7 +112,6 @@ impl std::fmt::Debug for SemanticConstraintPolicy {
         f.debug_struct("SemanticConstraintPolicy")
             .field("prompt_template", &self.config.prompt_template)
             .field("violations_block", &self.config.violations_block)
-            .field("policy_id", &self.config.policy_id)
             .finish()
     }
 }
@@ -143,7 +122,14 @@ impl SemanticConstraintPolicy {
     /// The JSON shape is the deserialised form of
     /// [`SemanticConstraintConfig`]. The `judge` block is required;
     /// every other field except `prompt_template` is optional.
-    pub fn from_config(value: serde_json::Value) -> Result<Self> {
+    pub fn from_config(mut value: serde_json::Value) -> Result<Self> {
+        // `compile_policy` dispatches on the shared top-level discriminator,
+        // while this module owns the remaining closed config shape. Remove
+        // only that discriminator so `deny_unknown_fields` can still reject
+        // stale keys such as the deleted NL-to-Cedar `policy_id`.
+        if let Some(object) = value.as_object_mut() {
+            object.remove("type");
+        }
         let config: SemanticConstraintConfig = serde_json::from_value(value)?;
         if config.prompt_template.trim().is_empty() {
             return Err(anyhow!(
@@ -313,7 +299,6 @@ mod tests {
         SemanticConstraintConfig {
             prompt_template: "classify {{ request.path }}".to_string(),
             violations_block,
-            policy_id: None,
             judge: JudgeWiring {
                 endpoint: "http://127.0.0.1:1/".to_string(),
                 api_key_env: "SBPROXY_SC_TEST_KEY".to_string(),
@@ -474,6 +459,20 @@ mod tests {
         });
         let policy = SemanticConstraintPolicy::from_config(json).expect("minimal config compiles");
         assert!(!policy.config.violations_block);
-        assert!(policy.config.policy_id.is_none());
+    }
+
+    #[test]
+    fn from_config_rejects_removed_policy_id() {
+        let json = serde_json::json!({
+            "prompt_template": "classify {{ request.path }}",
+            "policy_id": "legacy-compiled-policy",
+            "judge": {
+                "endpoint": "http://127.0.0.1:1/",
+                "api_key_env": "SBPROXY_SC_TEST_KEY",
+            }
+        });
+        let err = SemanticConstraintPolicy::from_config(json)
+            .expect_err("removed NL-to-Cedar policy_id must be rejected");
+        assert!(err.to_string().contains("policy_id"));
     }
 }

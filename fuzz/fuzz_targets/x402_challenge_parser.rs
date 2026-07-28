@@ -9,9 +9,8 @@
 //!
 //! Feeds arbitrary bytes into a JSON parse of the multi-rail 402
 //! body envelope.
-//! Replace with a call to the production parser
-//! (`sbproxy_modules::policy::accept_payment::parse_402_body`) once
-//! that public entry-point lands.
+//! Keep this standalone harness until the multi-rail challenge format
+//! has a production parser to fuzz.
 
 #![no_main]
 

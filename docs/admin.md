@@ -146,7 +146,10 @@ session discovery, and cluster enrollment use their route-specific rules;
 logout does not require a CSRF header.
 
 Roles (`operators`) give role-based access. Each operator logs in with
-its own credentials and gets a role:
+its own credentials and gets a role. Operators are config-only: there is
+no admin API to create or edit them, and the admin console's Operators
+page is read-only. `password_hash` is an HMAC-SHA256 hash, hex-encoded,
+computed with `sbproxy admin hash-password`:
 
 ```yaml
 proxy:
@@ -156,10 +159,10 @@ proxy:
     password: change-this
     operators:
       - username: oncall
-        password: rotate-me
+        password_hash: ${ONCALL_PASSWORD_HASH}
         role: read_only   # GET/read endpoints only; mutations return 403
       - username: deployer
-        password: rotate-me-too
+        password_hash: ${DEPLOYER_PASSWORD_HASH}
         role: admin        # every route
 ```
 
@@ -169,6 +172,13 @@ pass the general Admin gate emit a structured event on the
 `sbproxy::admin::audit` tracing target with the operator's identity. Session
 establishment, discovery, and logout use their route-specific behavior.
 Persistence depends on the configured tracing sink.
+
+The pepper `password_hash` is verified against comes from
+`key_management.crypto.pepper` when that's set. Without it, `password_hash`
+is hashed against a fixed pepper built into the binary, the same for every
+install, so a leaked `password_hash` is crackable offline by anyone with the
+source. Pin `key_management.crypto.pepper` in production; it does not
+require enabling the rest of `key_management:`.
 
 ## Remote access and CORS
 

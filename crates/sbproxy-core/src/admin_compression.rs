@@ -160,6 +160,21 @@ impl CompressionAdminRegistry {
                 });
             }
         }
+        // The Local database is process-owned and opened only while the
+        // immutable pipeline snapshot is constructed. Retain that exact
+        // handle for Admin so requests never discover or open filesystem
+        // state themselves.
+        if !stores
+            .iter()
+            .any(|entry| entry.backend == CompressionBackend::Local)
+        {
+            if let Some(store) = pipeline.compression_runtimes.local_admin_store() {
+                stores.push(AdminStore {
+                    backend: CompressionBackend::Local,
+                    store: store.clone(),
+                });
+            }
+        }
         Self::finish(stores, origins)
     }
 
@@ -780,6 +795,7 @@ fn parse_limit(value: Option<&String>) -> Result<u16, AdminCompressionResponse> 
 
 fn parse_backend(value: &str) -> Result<CompressionBackend, AdminCompressionResponse> {
     match value {
+        "local" => Ok(CompressionBackend::Local),
         "redis" => Ok(CompressionBackend::Redis),
         "mesh" => Ok(CompressionBackend::Mesh),
         _ => Err(bad_request("invalid backend")),
@@ -802,11 +818,13 @@ fn backend_rank(backend: CompressionBackend) -> u8 {
     match backend {
         CompressionBackend::Redis => 0,
         CompressionBackend::Mesh => 1,
+        CompressionBackend::Local => 2,
     }
 }
 
 fn backend_label(backend: CompressionBackend) -> &'static str {
     match backend {
+        CompressionBackend::Local => "local",
         CompressionBackend::Redis => "redis",
         CompressionBackend::Mesh => "mesh",
     }
@@ -914,6 +932,7 @@ mod tests {
         CompressionAuditEvent, CompressionAuditSink,
     };
     use crate::admin::AdminPrincipal;
+    use crate::compression_store::LocalCompressionStore;
     use async_trait::async_trait;
     use sbproxy_ai::compression::{
         CommitError, CompressionBackend, CompressionConsistency, CompressionRecordId,
@@ -926,9 +945,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tempfile::TempDir;
 
     #[derive(Default)]
     struct TestStore {
+        backend: Option<CompressionBackend>,
         records: Mutex<HashMap<CompressionRecordId, CompressionSessionRecord>>,
         load_calls: Mutex<u64>,
         list_requests: Mutex<Vec<ListRequest>>,
@@ -941,7 +962,7 @@ mod tests {
     #[async_trait]
     impl CompressionSessionStore for TestStore {
         fn backend(&self) -> CompressionBackend {
-            CompressionBackend::Redis
+            self.backend.unwrap_or(CompressionBackend::Redis)
         }
 
         fn consistency(&self) -> CompressionConsistency {
@@ -1091,13 +1112,17 @@ mod tests {
     }
 
     fn registry(store: Arc<TestStore>, allow_content: bool) -> CompressionAdminRegistry {
+        registry_for_backend(store, CompressionBackend::Redis, allow_content)
+    }
+
+    fn registry_for_backend(
+        store: Arc<TestStore>,
+        backend: CompressionBackend,
+        allow_content: bool,
+    ) -> CompressionAdminRegistry {
         CompressionAdminRegistry::from_parts(
             vec![store],
-            vec![(
-                "api.example.com".to_string(),
-                CompressionBackend::Redis,
-                allow_content,
-            )],
+            vec![("api.example.com".to_string(), backend, allow_content)],
         )
     }
 
@@ -1124,6 +1149,108 @@ mod tests {
             "external records must remain manageable after summary_buffer is disabled"
         );
         assert!(registry.origins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_summary_policy_keeps_the_process_owned_local_admin_store() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("compression-state.redb");
+        let local = Arc::new(LocalCompressionStore::open(&path).await.unwrap());
+        let pipeline = crate::pipeline::CompiledPipeline {
+            compression_runtimes:
+            crate::compression_runtime::CompressionRuntimeRegistry::with_local_admin_store_for_test(
+                local,
+            ),
+            ..Default::default()
+        };
+
+        let registry = CompressionAdminRegistry::from_pipeline(&pipeline);
+        let selected = registry.selected_stores(Some(CompressionBackend::Local));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].store.backend(), CompressionBackend::Local);
+        assert_eq!(
+            selected[0].store.consistency(),
+            CompressionConsistency::Serialized
+        );
+        assert!(registry.origins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_admin_filter_order_and_content_authorization_are_closed() {
+        let local = Arc::new(TestStore {
+            backend: Some(CompressionBackend::Local),
+            ..TestStore::default()
+        });
+        let mesh = Arc::new(TestStore {
+            backend: Some(CompressionBackend::Mesh),
+            ..TestStore::default()
+        });
+        let redis = Arc::new(TestStore::default());
+        let ordered = CompressionAdminRegistry::from_parts(
+            vec![local.clone(), mesh, redis],
+            vec![(
+                "api.example.com".to_string(),
+                CompressionBackend::Local,
+                false,
+            )],
+        );
+        assert_eq!(
+            ordered
+                .stores
+                .iter()
+                .map(|entry| entry.backend)
+                .collect::<Vec<_>>(),
+            vec![
+                CompressionBackend::Redis,
+                CompressionBackend::Mesh,
+                CompressionBackend::Local
+            ]
+        );
+        assert_eq!(
+            ordered
+                .selected_stores(Some(CompressionBackend::Local))
+                .len(),
+            1
+        );
+
+        let record_id = id(77);
+        local
+            .records
+            .lock()
+            .unwrap()
+            .insert(record_id, record("local sensitive summary", u64::MAX));
+        let audit = RecordingAudit::default();
+        let admin = principal(AdminRole::Admin, false);
+        let disabled = dispatch_with_registry(
+            "GET",
+            &format!("/admin/compression/sessions/{record_id}/content"),
+            None,
+            Some(&admin),
+            None,
+            &registry_for_backend(local.clone(), CompressionBackend::Local, false),
+            &audit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(disabled.status, 403);
+        assert!(!disabled.body.contains("local sensitive summary"));
+
+        let enabled = dispatch_with_registry(
+            "GET",
+            &format!("/admin/compression/sessions/{record_id}/content"),
+            None,
+            Some(&admin),
+            None,
+            &registry_for_backend(local, CompressionBackend::Local, true),
+            &audit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(enabled.status, 200);
+        assert!(enabled.body.contains("local sensitive summary"));
+        assert!(enabled
+            .headers
+            .contains(&("Cache-Control".to_string(), "no-store".to_string())));
     }
 
     #[tokio::test]

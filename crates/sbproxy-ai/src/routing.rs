@@ -1,12 +1,15 @@
 //! Routing strategies for selecting AI providers.
 
+mod peak_ewma;
+
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use sbproxy_platform::circuitbreaker::CircuitBreaker;
 use sbproxy_platform::outlier::{OutlierDetector, OutlierDetectorConfig};
-use serde::Deserialize;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer};
 
 use crate::provider::ProviderConfig;
 use crate::provider_ratelimit::{ProviderQuotaSnapshot, ProviderRateLimitTracker};
@@ -36,8 +39,7 @@ pub fn provider_allowed_by_policy(
 }
 
 /// Strategy for selecting a provider.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone)]
 pub enum RoutingStrategy {
     /// Rotate through providers in order, one request at a time.
     RoundRobin,
@@ -86,15 +88,8 @@ pub enum RoutingStrategy {
     /// Trades doubled spend for halved latency on the chat-first-token
     /// path; useful when every millisecond of TTFT matters.
     Race,
-    /// Power-of-Two-Choices over observed latency (Helicone-style):
-    /// sample two eligible providers and route to the one with the
-    /// lower recently-observed latency. Cuts tail latency under skewed
-    /// load versus always picking the single lowest-latency provider
-    /// (which herds). An untried provider is explored first; with a
-    /// single eligible provider it is returned directly. The signal is
-    /// the most recent observed latency; an EWMA-decay refinement is a
-    /// follow-up.
-    PeakEwma,
+    /// Power-of-Two-Choices over time-decayed latency and in-flight load.
+    PeakEwma(PeakEwmaConfig),
     /// Try a sequence of (provider, model) tiers from cheapest to
     /// most expensive. Each tier's response is graded against a
     /// quality threshold; if the response falls below threshold,
@@ -126,6 +121,119 @@ pub enum RoutingStrategy {
     /// report remaining capacity sort first. Unknown/stale signals sort
     /// last and never invent a reset time.
     ResetAware,
+}
+
+/// Default half-life for Peak EWMA latency decay.
+pub const DEFAULT_PEAK_EWMA_HALF_LIFE_SECS: u64 = 10;
+
+/// Configuration for [`RoutingStrategy::PeakEwma`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeakEwmaConfig {
+    /// Seconds of decay before an idle provider re-enters at neutral cost.
+    pub half_life_secs: u64,
+}
+
+impl Default for PeakEwmaConfig {
+    fn default() -> Self {
+        Self {
+            half_life_secs: DEFAULT_PEAK_EWMA_HALF_LIFE_SECS,
+        }
+    }
+}
+
+impl PeakEwmaConfig {
+    /// Configured half-life as a duration.
+    pub fn half_life(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.half_life_secs)
+    }
+}
+
+impl<'de> Deserialize<'de> for PeakEwmaConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(
+                default = "default_peak_ewma_half_life_secs",
+                rename = "half_life",
+                deserialize_with = "sbproxy_config::duration::deserialize_secs"
+            )]
+            half_life_secs: u64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.half_life_secs == 0 {
+            return Err(D::Error::custom(
+                "peak_ewma routing half_life must be greater than zero",
+            ));
+        }
+        Ok(Self {
+            half_life_secs: wire.half_life_secs,
+        })
+    }
+}
+
+fn default_peak_ewma_half_life_secs() -> u64 {
+    DEFAULT_PEAK_EWMA_HALF_LIFE_SECS
+}
+
+impl<'de> Deserialize<'de> for RoutingStrategy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.as_str() == Some("peak_ewma") {
+            return Ok(Self::PeakEwma(PeakEwmaConfig::default()));
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Wire {
+            RoundRobin,
+            Weighted,
+            FallbackChain,
+            Random,
+            LowestLatency,
+            LeastConnections,
+            CostOptimized,
+            TokenRate,
+            LeastTokenUsage,
+            PrefixAffinity,
+            Sticky,
+            Race,
+            PeakEwma(PeakEwmaConfig),
+            Cascade(CascadeConfig),
+            CostQuality(crate::cost_quality::CostQualityConfig),
+            OutcomeAware,
+            Headroom,
+            ResetAware,
+        }
+
+        let wire = serde_json::from_value::<Wire>(value).map_err(D::Error::custom)?;
+        Ok(match wire {
+            Wire::RoundRobin => Self::RoundRobin,
+            Wire::Weighted => Self::Weighted,
+            Wire::FallbackChain => Self::FallbackChain,
+            Wire::Random => Self::Random,
+            Wire::LowestLatency => Self::LowestLatency,
+            Wire::LeastConnections => Self::LeastConnections,
+            Wire::CostOptimized => Self::CostOptimized,
+            Wire::TokenRate => Self::TokenRate,
+            Wire::LeastTokenUsage => Self::LeastTokenUsage,
+            Wire::PrefixAffinity => Self::PrefixAffinity,
+            Wire::Sticky => Self::Sticky,
+            Wire::Race => Self::Race,
+            Wire::PeakEwma(config) => Self::PeakEwma(config),
+            Wire::Cascade(config) => Self::Cascade(config),
+            Wire::CostQuality(config) => Self::CostQuality(config),
+            Wire::OutcomeAware => Self::OutcomeAware,
+            Wire::Headroom => Self::Headroom,
+            Wire::ResetAware => Self::ResetAware,
+        })
+    }
 }
 
 /// Configuration for the [`RoutingStrategy::Cascade`] variant.
@@ -180,6 +288,8 @@ pub struct Router {
     // --- Per-provider state (sized at creation time) ---
     /// Observed p50 latency in microseconds per provider.
     latencies: Vec<AtomicU64>,
+    /// Time-decayed, peak-sensitive latency state for Peak EWMA routing.
+    peak_ewma: Option<peak_ewma::PeakEwmaEstimator>,
     /// In-flight request count per provider.
     connections: Vec<AtomicU32>,
     /// Tokens used in the current minute per provider.
@@ -206,6 +316,21 @@ pub struct Router {
     last_filtered_fallback: parking_lot::Mutex<Option<FilteredSelectionFallback>>,
 }
 
+/// Cancellation-safe accounting for one provider attempt.
+#[must_use = "dropping the guard releases the provider's in-flight slot"]
+pub struct ProviderInFlightGuard<'a> {
+    router: &'a Router,
+    provider_idx: Option<usize>,
+}
+
+impl Drop for ProviderInFlightGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(provider_idx) = self.provider_idx {
+            self.router.record_disconnect(provider_idx);
+        }
+    }
+}
+
 impl std::fmt::Debug for Router {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Router")
@@ -223,11 +348,19 @@ impl Router {
         let tokens_used = (0..num_providers).map(|_| AtomicU64::new(0)).collect();
         let token_limits = vec![0; num_providers];
         let health = (0..num_providers).map(|_| AtomicU8::new(0)).collect();
+        let peak_ewma = match &strategy {
+            RoutingStrategy::PeakEwma(config) => Some(peak_ewma::PeakEwmaEstimator::new(
+                num_providers,
+                config.half_life(),
+            )),
+            _ => None,
+        };
 
         Self {
             strategy,
             counter: AtomicU64::new(0),
             latencies,
+            peak_ewma,
             connections,
             tokens_used,
             token_limits,
@@ -372,6 +505,9 @@ impl Router {
     pub fn record_latency(&self, provider_idx: usize, latency_us: u64) {
         if let Some(slot) = self.latencies.get(provider_idx) {
             slot.store(latency_us, Ordering::Relaxed);
+            if let Some(estimator) = &self.peak_ewma {
+                estimator.observe(provider_idx, latency_us);
+            }
         }
     }
 
@@ -382,10 +518,27 @@ impl Router {
         }
     }
 
+    /// Track one provider attempt until the returned guard is dropped.
+    ///
+    /// The guard balances success, failure, early-return, and future
+    /// cancellation paths. An unknown provider index produces an inert guard.
+    pub fn track_in_flight(&self, provider_idx: usize) -> ProviderInFlightGuard<'_> {
+        let provider_idx = self.connections.get(provider_idx).map(|slot| {
+            slot.fetch_add(1, Ordering::Relaxed);
+            provider_idx
+        });
+        ProviderInFlightGuard {
+            router: self,
+            provider_idx,
+        }
+    }
+
     /// Decrement the in-flight connection count for a provider.
     pub fn record_disconnect(&self, provider_idx: usize) {
         if let Some(slot) = self.connections.get(provider_idx) {
-            slot.fetch_sub(1, Ordering::Relaxed);
+            let _ = slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
         }
     }
 
@@ -671,7 +824,7 @@ impl Router {
                     Some(enabled[counter as usize % enabled.len()].0)
                 }
             }
-            RoutingStrategy::PeakEwma => {
+            RoutingStrategy::PeakEwma(_) => {
                 clear_fallback();
                 if enabled.len() == 1 {
                     return Some(enabled[0].0);
@@ -684,12 +837,18 @@ impl Router {
                 if b == a {
                     b = (a + 1) % enabled.len();
                 }
-                let lat = |i: usize| {
-                    self.latencies
-                        .get(enabled[i].0)
-                        .map_or(0, |l| l.load(Ordering::Relaxed))
+                let cost = |pool_idx: usize| {
+                    let provider_idx = enabled[pool_idx].0;
+                    let in_flight = self
+                        .connections
+                        .get(provider_idx)
+                        .map_or(0, |value| value.load(Ordering::Relaxed));
+                    self.peak_ewma
+                        .as_ref()
+                        .and_then(|estimator| estimator.score(provider_idx, in_flight))
+                        .unwrap_or(f64::INFINITY)
                 };
-                Some(enabled[if lat(a) <= lat(b) { a } else { b }].0)
+                Some(enabled[if cost(a) <= cost(b) { a } else { b }].0)
             }
             RoutingStrategy::LeastConnections => {
                 clear_fallback();
@@ -1016,7 +1175,7 @@ impl Router {
             RoutingStrategy::PrefixAffinity => "prefix_affinity",
             RoutingStrategy::Sticky => "sticky",
             RoutingStrategy::Race => "race",
-            RoutingStrategy::PeakEwma => "peak_ewma",
+            RoutingStrategy::PeakEwma(_) => "peak_ewma",
             RoutingStrategy::Cascade(_) => "cascade",
             RoutingStrategy::CostQuality(_) => "cost_quality",
             RoutingStrategy::OutcomeAware => "outcome_aware",
@@ -1258,6 +1417,13 @@ mod tests {
         let json = serde_json::json!("sticky");
         let strategy: RoutingStrategy = serde_json::from_value(json).unwrap();
         assert!(matches!(strategy, RoutingStrategy::Sticky));
+
+        let json = serde_json::json!("peak_ewma");
+        let strategy: RoutingStrategy = serde_json::from_value(json).unwrap();
+        let RoutingStrategy::PeakEwma(config) = strategy else {
+            panic!("expected peak_ewma");
+        };
+        assert_eq!(config.half_life_secs, 10);
     }
 
     // --- WOR-798: LeastTokenUsage + record_tokens_for_provider ---
@@ -1473,7 +1639,7 @@ mod tests {
             "round_robin"
         );
         assert_eq!(
-            Router::new(RoutingStrategy::PeakEwma, 1).strategy_name(),
+            Router::new(RoutingStrategy::PeakEwma(PeakEwmaConfig::default()), 1).strategy_name(),
             "peak_ewma"
         );
         assert_eq!(
@@ -1668,7 +1834,10 @@ mod tests {
             make_provider("slow", 1, None, true),
             make_provider("fast", 1, None, true),
         ];
-        let router = Router::new(RoutingStrategy::PeakEwma, providers.len());
+        let router = Router::new(
+            RoutingStrategy::PeakEwma(PeakEwmaConfig::default()),
+            providers.len(),
+        );
         router.record_latency(0, 5000);
         router.record_latency(1, 1000);
         // With two eligible providers, P2C samples both, so it always
@@ -1681,14 +1850,60 @@ mod tests {
     #[test]
     fn peak_ewma_single_provider_returns_it() {
         let providers = vec![make_provider("only", 1, None, true)];
-        let router = Router::new(RoutingStrategy::PeakEwma, providers.len());
+        let router = Router::new(
+            RoutingStrategy::PeakEwma(PeakEwmaConfig::default()),
+            providers.len(),
+        );
         assert_eq!(router.select(&providers).unwrap(), 0);
+    }
+
+    #[test]
+    fn peak_ewma_in_flight_load_breaks_equal_latency_tie() {
+        let providers = vec![
+            make_provider("queued", 1, None, true),
+            make_provider("idle", 1, None, true),
+        ];
+        let router = Router::new(
+            RoutingStrategy::PeakEwma(PeakEwmaConfig::default()),
+            providers.len(),
+        );
+        router.record_latency(0, 1_000);
+        router.record_latency(1, 1_000);
+        router.record_connect(0);
+
+        for _ in 0..10 {
+            assert_eq!(router.select(&providers), Some(1));
+        }
+
+        router.record_disconnect(0);
+        let selections = (0..10)
+            .map(|_| router.select(&providers).expect("provider"))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(selections, std::collections::HashSet::from([0, 1]));
+    }
+
+    #[test]
+    fn in_flight_guard_balances_on_drop_and_ignores_unknown_provider() {
+        let router = Router::new(RoutingStrategy::LeastConnections, 2);
+        assert_eq!(router.connections[0].load(Ordering::Relaxed), 0);
+
+        {
+            let _guard = router.track_in_flight(0);
+            assert_eq!(router.connections[0].load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(router.connections[0].load(Ordering::Relaxed), 0);
+
+        {
+            let _guard = router.track_in_flight(99);
+        }
+        assert_eq!(router.connections[0].load(Ordering::Relaxed), 0);
+        assert_eq!(router.connections[1].load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn peak_ewma_deserializes_from_snake_case() {
         let s: RoutingStrategy = serde_json::from_value(serde_json::json!("peak_ewma")).unwrap();
-        assert!(matches!(s, RoutingStrategy::PeakEwma));
+        assert!(matches!(s, RoutingStrategy::PeakEwma(_)));
     }
 
     // --- LeastConnections Tests ---

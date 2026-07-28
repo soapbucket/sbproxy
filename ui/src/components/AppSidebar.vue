@@ -25,6 +25,7 @@ const nav = [
   { to: "/storage", label: "storage" },
   { to: "/audit", label: "audit" },
   { to: "/users", label: "users" },
+  { to: "/operators", label: "operators" },
   { to: "/cluster", label: "cluster" },
 ];
 </script>

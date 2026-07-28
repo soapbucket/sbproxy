@@ -10,9 +10,6 @@
 //! Fail-open is the convention throughout. Traits that can fail typically
 //! return `Option<T>` and expect callers to log at debug and continue when
 //! `None` is returned.
-//!
-//! See the design spec at
-//! `docs/superpowers/specs/2026-04-22-sbproxy-grpc-classifier-integration-design.md`.
 
 use async_trait::async_trait;
 use bytes::Bytes;

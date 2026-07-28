@@ -1258,6 +1258,18 @@ pub(super) async fn request_filter(
         // current GraphQL action validates the final modified request.
         ctx.graphql_validation_pending = true;
     }
+    // RFC 9449 permits one retry when a protected resource challenges
+    // with a nonce. Enable Pingora's bounded replay buffer before any
+    // request body is consumed so that retry is safe for body-bearing
+    // methods as well as bodyless requests.
+    if pipeline
+        .outbound_creds
+        .get(origin_idx)
+        .and_then(Option::as_ref)
+        .is_some_and(|credential| credential.is_dpop_enabled())
+    {
+        session.as_mut().enable_retry_buffering();
+    }
 
     // WOR-1053: stamp the matched origin's tenant on the request
     // context so downstream auth / policy / vault resolution can
@@ -2527,7 +2539,10 @@ pub(super) async fn request_filter(
             // `request_body_filter` buffers the body and runs
             // `verify_content_digest` against the Content-Digest
             // header value the signature attests to.
-            let auth_succeeded = matches!(auth_result, AuthResult::Allow { .. });
+            let auth_succeeded = matches!(
+                auth_result,
+                AuthResult::Allow { .. } | AuthResult::RateLimited(_)
+            );
             if auth_succeeded && matches!(auth, Auth::BotAuth(_)) {
                 #[cfg(feature = "agent-class")]
                 if let Some(keyid) = bot_auth_keyid.as_deref() {
@@ -2561,6 +2576,29 @@ pub(super) async fn request_filter(
                 AuthResult::Allow { sub, source } => {
                     ctx.auth_result = Some(sbproxy_plugin::AuthDecision::Allow { sub, source });
                     sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, true);
+                }
+                AuthResult::RateLimited(info) => {
+                    ctx.auth_result = Some(sbproxy_plugin::AuthDecision::allow_anonymous());
+                    sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, true);
+                    crate::trust_tier::finalize(ctx, false);
+                    let extra_headers = vec![
+                        ("X-RateLimit-Limit".to_string(), info.limit.to_string()),
+                        (
+                            "X-RateLimit-Remaining".to_string(),
+                            info.remaining.to_string(),
+                        ),
+                        ("X-RateLimit-Reset".to_string(), info.reset_secs.to_string()),
+                        ("Retry-After".to_string(), info.reset_secs.to_string()),
+                    ];
+                    ctx.rate_limit_info = Some(info);
+                    send_error_with_extra_headers(
+                        session,
+                        429,
+                        "cap: rate limit exceeded",
+                        &extra_headers,
+                    )
+                    .await?;
+                    return Ok(true);
                 }
                 AuthResult::Deny(status, ref msg) => {
                     sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, false);

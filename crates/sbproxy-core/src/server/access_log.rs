@@ -345,18 +345,34 @@ pub(super) fn log_capture_header_warnings(cfg: &sbproxy_config::AccessLogConfig)
     let (_, resp_warnings) =
         sbproxy_config::CompiledHeaderAllowlist::compile(&cfg.capture_headers.response);
     for header in &req_warnings {
-        tracing::warn!(
-            header = %header,
-            "access_log.capture_headers.request includes a sensitive header by exact match; \
-             values will be captured (redact_secrets still strips known token shapes)",
-        );
+        if header == "dpop" {
+            tracing::warn!(
+                header = %header,
+                "access_log.capture_headers.request includes DPoP by exact match; \
+                 the non-loggable proof header will be ignored",
+            );
+        } else {
+            tracing::warn!(
+                header = %header,
+                "access_log.capture_headers.request includes a sensitive header by exact match; \
+                 values will be captured (redact_secrets still strips known token shapes)",
+            );
+        }
     }
     for header in &resp_warnings {
-        tracing::warn!(
-            header = %header,
-            "access_log.capture_headers.response includes a sensitive header by exact match; \
-             values will be captured (redact_secrets still strips known token shapes)",
-        );
+        if header == "dpop" {
+            tracing::warn!(
+                header = %header,
+                "access_log.capture_headers.response includes DPoP by exact match; \
+                 the non-loggable proof header will be ignored",
+            );
+        } else {
+            tracing::warn!(
+                header = %header,
+                "access_log.capture_headers.response includes a sensitive header by exact match; \
+                 values will be captured (redact_secrets still strips known token shapes)",
+            );
+        }
     }
 }
 
@@ -1204,5 +1220,52 @@ mod outcome_tests {
         // An unknown override degrades to `other` rather than leaking an
         // unbounded label.
         assert_eq!(ai_outcome_label(200, Some("bogus")), "other");
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::capture_headers_for_log;
+
+    const DPOP_PROOF: &str = concat!(
+        "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2",
+        "IjoiUC0yNTYiLCJ4IjoibDh0RnIzRjdrS3Rjb2J4NWVmMHlONUR1ejN0RDdmWUZQUmRaeFk1",
+        "VlFKMCIsInkiOiI0cE4tNUo3azZKbTZUdmVXZEVLd3FWRE1IWVE1bk5vVEhUY0xRa0cxZDVN",
+        "In19.",
+        "eyJqdGkiOiJmNmE4ZjMyZC00YzY1LTRjMjctYThiOS0zMDQ3ZjY4ZTI3MTUiLCJodG0iOiJH",
+        "RVQiLCJodHUiOiJodHRwczovL2FwaS5leGFtcGxlLmNvbS9yZXNvdXJjZSIsImlhdCI6MTc4",
+        "NTA5MTIwMH0.",
+        "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1",
+        "Njc4OWFiY2RlZg",
+    );
+
+    #[test]
+    fn emitted_access_log_json_never_contains_captured_dpop_proof() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("dpop", http::HeaderValue::from_static(DPOP_PROOF));
+
+        for pattern in ["*", "d*", "dpop"] {
+            let (allowlist, _) =
+                sbproxy_config::CompiledHeaderAllowlist::compile(&[pattern.to_string()]);
+            let captured = capture_headers_for_log(&headers, &allowlist, 4096, false, &[]);
+            let line = sbproxy_observe::AccessLogEntry::builder()
+                .request_headers(captured)
+                .build()
+                .redacted_json_line()
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+            assert!(
+                value
+                    .get("request_headers")
+                    .and_then(|headers| headers.get("dpop"))
+                    .is_none(),
+                "capture pattern {pattern:?} emitted a DPoP field: {line}"
+            );
+            assert!(
+                !line.contains(DPOP_PROOF),
+                "capture pattern {pattern:?} emitted a compact DPoP proof: {line}"
+            );
+        }
     }
 }

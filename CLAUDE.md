@@ -236,6 +236,13 @@ Surface curl, Homebrew, and Docker for install; surface CEL, Lua,
 JavaScript, and WebAssembly for extension. Do not push readers at
 `cargo install` or "implement this trait" from buyer-facing docs.
 
+## Planning documents
+
+Implementation plans, specs, and other internal working documents do not
+belong in `docs/` - that tree is buyer-facing. Save planning artifacts
+under `.claude/plans/` (already gitignored) unless a specific task
+explicitly directs otherwise.
+
 ## Cutover state
 
 The active git history of this Rust implementation starts at `v1.0.0`.
