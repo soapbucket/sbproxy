@@ -4388,6 +4388,7 @@ mod provisioning_tests {
 #[cfg(test)]
 mod queue_waiter_guard_tests {
     use super::*;
+    use crate::runtime::ModelHostObserver;
 
     #[derive(Default)]
     struct LastDepthObserver {
