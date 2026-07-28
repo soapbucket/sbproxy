@@ -272,12 +272,23 @@ routing:
 
 ### peak_ewma
 
-Power-of-two-choices over observed latency: sample two eligible providers and route to the one with the lower recently observed latency. Cuts tail latency under skewed load versus always picking the single lowest-latency provider, which herds traffic. An untried provider is explored first.
+Power-of-two-choices over time-decayed latency and current in-flight load:
+sample two eligible providers and route to the lower effective cost. A latency
+spike takes effect immediately, then its excess over the pool's neutral
+latency decays by half during each configured half-life. In-flight requests
+multiply the cost, so a provider that has just started queueing is
+deprioritized before a slow response completes. Providers without observations
+use the same nonzero pool-neutral score.
 
 ```yaml
 routing:
   strategy: peak_ewma
+  half_life: 10s
 ```
+
+The default half-life is `10s`. Shorter values react and recover faster;
+longer values retain spike penalties longer. Provider eligibility and
+power-of-two candidate sampling are unchanged.
 
 ### cascade
 

@@ -1220,6 +1220,13 @@ origins:
 
 Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `token_rate`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky`, `race`, `cascade`, `cost_quality`, `outcome_aware`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each; `outcome_aware` has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md).
 
+Peak EWMA accepts the object form:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `routing.strategy` | string | `round_robin` | Set to `peak_ewma` for power-of-two choices over decayed latency and in-flight cost. |
+| `routing.half_life` | duration | `10s` | Time for a provider's excess latency penalty to decay halfway toward the pool-neutral latency. |
+
 `default_model` is a per-provider field, not an action-level field. Set it on each `providers[]` entry.
 
 #### AI provider fields (`providers[]`)
