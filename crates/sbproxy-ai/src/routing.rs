@@ -1,5 +1,7 @@
 //! Routing strategies for selecting AI providers.
 
+mod peak_ewma;
+
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -286,6 +288,8 @@ pub struct Router {
     // --- Per-provider state (sized at creation time) ---
     /// Observed p50 latency in microseconds per provider.
     latencies: Vec<AtomicU64>,
+    /// Time-decayed, peak-sensitive latency state for Peak EWMA routing.
+    peak_ewma: Option<peak_ewma::PeakEwmaEstimator>,
     /// In-flight request count per provider.
     connections: Vec<AtomicU32>,
     /// Tokens used in the current minute per provider.
@@ -329,11 +333,19 @@ impl Router {
         let tokens_used = (0..num_providers).map(|_| AtomicU64::new(0)).collect();
         let token_limits = vec![0; num_providers];
         let health = (0..num_providers).map(|_| AtomicU8::new(0)).collect();
+        let peak_ewma = match &strategy {
+            RoutingStrategy::PeakEwma(config) => Some(peak_ewma::PeakEwmaEstimator::new(
+                num_providers,
+                config.half_life(),
+            )),
+            _ => None,
+        };
 
         Self {
             strategy,
             counter: AtomicU64::new(0),
             latencies,
+            peak_ewma,
             connections,
             tokens_used,
             token_limits,
@@ -478,6 +490,9 @@ impl Router {
     pub fn record_latency(&self, provider_idx: usize, latency_us: u64) {
         if let Some(slot) = self.latencies.get(provider_idx) {
             slot.store(latency_us, Ordering::Relaxed);
+            if let Some(estimator) = &self.peak_ewma {
+                estimator.observe(provider_idx, latency_us);
+            }
         }
     }
 
@@ -790,12 +805,18 @@ impl Router {
                 if b == a {
                     b = (a + 1) % enabled.len();
                 }
-                let lat = |i: usize| {
-                    self.latencies
-                        .get(enabled[i].0)
-                        .map_or(0, |l| l.load(Ordering::Relaxed))
+                let cost = |pool_idx: usize| {
+                    let provider_idx = enabled[pool_idx].0;
+                    let in_flight = self
+                        .connections
+                        .get(provider_idx)
+                        .map_or(0, |value| value.load(Ordering::Relaxed));
+                    self.peak_ewma
+                        .as_ref()
+                        .and_then(|estimator| estimator.score(provider_idx, in_flight))
+                        .unwrap_or(f64::INFINITY)
                 };
-                Some(enabled[if lat(a) <= lat(b) { a } else { b }].0)
+                Some(enabled[if cost(a) <= cost(b) { a } else { b }].0)
             }
             RoutingStrategy::LeastConnections => {
                 clear_fallback();
@@ -1802,6 +1823,31 @@ mod tests {
             providers.len(),
         );
         assert_eq!(router.select(&providers).unwrap(), 0);
+    }
+
+    #[test]
+    fn peak_ewma_in_flight_load_breaks_equal_latency_tie() {
+        let providers = vec![
+            make_provider("queued", 1, None, true),
+            make_provider("idle", 1, None, true),
+        ];
+        let router = Router::new(
+            RoutingStrategy::PeakEwma(PeakEwmaConfig::default()),
+            providers.len(),
+        );
+        router.record_latency(0, 1_000);
+        router.record_latency(1, 1_000);
+        router.record_connect(0);
+
+        for _ in 0..10 {
+            assert_eq!(router.select(&providers), Some(1));
+        }
+
+        router.record_disconnect(0);
+        let selections = (0..10)
+            .map(|_| router.select(&providers).expect("provider"))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(selections, std::collections::HashSet::from([0, 1]));
     }
 
     #[test]
