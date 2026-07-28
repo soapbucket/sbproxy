@@ -1908,6 +1908,14 @@ export interface AdminUsersResponse {
   users: AdminUser[];
 }
 
+/** A configured RBAC operator, as reported by `/api/operators`. Never
+ *  carries a password_hash. Config-only: managed by editing
+ *  `proxy.admin.operators` and reloading, not through this API. */
+export interface OperatorSummary {
+  username: string;
+  role: "admin" | "read_only";
+}
+
 // Windowed spend from the durable usage rollups (WOR-1875).
 export interface SpendWindowBucket {
   ts_secs: number;
@@ -2117,6 +2125,9 @@ export const api = {
   // Who can sign in to this console. Passwords are never returned;
   // accounts are managed in config, not through this route.
   adminUsers: () => getJson<AdminUsersResponse>("/api/admin/users"),
+  // Configured RBAC operators only (excludes the top-level admin
+  // credential). password_hash is never returned.
+  operators: () => getJson<OperatorSummary[]>("/api/operators"),
 
   // Windowed spend history from the durable rollups (WOR-1875).
   spendWindow: (window: string, groupBy: string) =>

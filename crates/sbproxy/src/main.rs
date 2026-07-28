@@ -180,6 +180,8 @@ enum Cmd {
     Projections(ProjectionsCmd),
     /// AI gateway tools (usage ledger verification, ...).
     Ai(AiCmd),
+    /// Admin-account maintenance (password hashing, ...).
+    Admin(AdminCliCmd),
     /// Serve a certified catalog model in one command, with no YAML.
     /// Resolves an immutable artifact, generates local admin auth, warms
     /// the managed deployment, then advertises its OpenAI-compatible endpoint.
@@ -748,6 +750,32 @@ struct LedgerVerifyArgs {
 }
 
 #[derive(clap::Args, Debug)]
+struct AdminCliCmd {
+    #[command(subcommand)]
+    sub: AdminSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum AdminSub {
+    /// Hash a password with the same HMAC-SHA256-plus-pepper primitive
+    /// `proxy.admin.operators[].password_hash` is verified against, for
+    /// pasting the result into config.
+    HashPassword(HashPasswordArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct HashPasswordArgs {
+    /// Password to hash. Prefer `--password-stdin`: a literal value here
+    /// stays in the shell history.
+    #[arg(long = "password")]
+    password: Option<String>,
+    /// Read the password from stdin (first line, trailing newline
+    /// trimmed) instead of `--password`.
+    #[arg(long = "password-stdin", action = ArgAction::SetTrue)]
+    password_stdin: bool,
+}
+
+#[derive(clap::Args, Debug)]
 struct ProjectionsCmd {
     #[command(subcommand)]
     sub: ProjectionsSub,
@@ -1252,6 +1280,13 @@ fn main() {
         }
         Some(Cmd::Ai(cmd)) => {
             run_subcommand("ai", 2, handle_ai_subcommand(&cmd));
+        }
+        Some(Cmd::Admin(cmd)) => {
+            run_subcommand(
+                "admin",
+                2,
+                handle_admin_subcommand(&cmd, global_config_path.as_deref()),
+            );
         }
         Some(Cmd::Run(args)) => {
             let code = handle_run_subcommand(&args, grace);
@@ -6930,6 +6965,74 @@ fn handle_ledger_verify(args: &LedgerVerifyArgs) -> anyhow::Result<i32> {
     Ok(if result.ok { 0 } else { 1 })
 }
 
+fn handle_admin_subcommand(
+    cmd: &AdminCliCmd,
+    global_config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    match &cmd.sub {
+        AdminSub::HashPassword(args) => handle_admin_hash_password(args, global_config_path),
+    }
+}
+
+/// `sbproxy admin hash-password`: print the `password_hash` value to paste
+/// into `proxy.admin.operators[].password_hash`.
+///
+/// Resolves the pepper the same way the running server does: from
+/// `key_management.crypto.pepper` in `-f/--config` when set, else the
+/// fixed default, so the printed hash verifies against a server booted
+/// from the same config.
+fn handle_admin_hash_password(
+    args: &HashPasswordArgs,
+    global_config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    handle_admin_hash_password_to(args, global_config_path, &mut std::io::stdout())
+}
+
+/// The testable core of `handle_admin_hash_password`: writes the hash to
+/// `out` instead of stdout, so tests can assert on it without capturing the
+/// process's real stdout.
+fn handle_admin_hash_password_to(
+    args: &HashPasswordArgs,
+    global_config_path: Option<&std::path::Path>,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<i32> {
+    let password = match (args.password.as_deref(), args.password_stdin) {
+        (Some(_), true) => {
+            anyhow::bail!("pass either --password or --password-stdin, not both")
+        }
+        (Some(p), false) => p.to_string(),
+        (None, true) => {
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .map_err(|e| anyhow::anyhow!("failed to read password from stdin: {e}"))?;
+            line.trim_end_matches(['\n', '\r']).to_string()
+        }
+        (None, false) => anyhow::bail!(
+            "missing password\n\nusage: sbproxy admin hash-password --password-stdin\n   or: sbproxy admin hash-password --password <value>"
+        ),
+    };
+
+    let key_management = global_config_path
+        .map(|path| -> anyhow::Result<_> {
+            let yaml = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("failed to read config '{}': {e}", path.display()))?;
+            let compiled = sbproxy_config::compile_config(&yaml)
+                .map_err(|e| anyhow::anyhow!("config did not compile: {e:#}"))?;
+            Ok(compiled.server.key_management)
+        })
+        .transpose()?
+        .flatten();
+    let pepper = sbproxy_core::key_plane::resolve_admin_operator_pepper(key_management.as_ref())
+        .map_err(|e| anyhow::anyhow!("resolve admin operator pepper: {e}"))?;
+    writeln!(
+        out,
+        "{}",
+        sbproxy_core::key_plane::hash_admin_operator_password(&password, &pepper)
+    )?;
+    Ok(0)
+}
+
 fn handle_config_import_litellm(args: &ImportLitellmArgs) -> anyhow::Result<i32> {
     let path_str = args.config_path.to_string_lossy();
     let yaml = std::fs::read_to_string(&args.config_path)
@@ -9367,5 +9470,58 @@ origins:
             out: None,
         };
         assert!(handle_plan_subcommand(&args).is_err());
+    }
+
+    // --- admin hash-password handler ---
+
+    #[test]
+    fn hash_password_with_no_config_uses_the_default_pepper() {
+        let args = HashPasswordArgs {
+            password: Some("hunter2".to_string()),
+            password_stdin: false,
+        };
+        let mut out = Vec::new();
+        let code = handle_admin_hash_password_to(&args, None, &mut out).unwrap();
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).unwrap().trim().to_string();
+        let expected = sbproxy_core::key_plane::hash_admin_operator_password(
+            "hunter2",
+            &sbproxy_core::key_plane::default_admin_operator_pepper(),
+        );
+        assert_eq!(printed, expected);
+    }
+
+    #[test]
+    fn hash_password_prefers_a_pinned_key_management_pepper() {
+        let path = temp_config(
+            "proxy:\n  http_bind_port: 8080\n  key_management:\n    crypto:\n      pepper: pinned-pepper\norigins:\n  \"x.local\":\n    action:\n      type: proxy\n      url: https://test.sbproxy.dev\n",
+        );
+        let args = HashPasswordArgs {
+            password: Some("hunter2".to_string()),
+            password_stdin: false,
+        };
+        let mut out = Vec::new();
+        let code = handle_admin_hash_password_to(&args, Some(&path), &mut out).unwrap();
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).unwrap().trim().to_string();
+        let expected =
+            sbproxy_core::key_plane::hash_admin_operator_password("hunter2", b"pinned-pepper");
+        assert_eq!(printed, expected);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hash_password_requires_exactly_one_input_source() {
+        let neither = HashPasswordArgs {
+            password: None,
+            password_stdin: false,
+        };
+        assert!(handle_admin_hash_password_to(&neither, None, &mut Vec::new()).is_err());
+
+        let both = HashPasswordArgs {
+            password: Some("x".to_string()),
+            password_stdin: true,
+        };
+        assert!(handle_admin_hash_password_to(&both, None, &mut Vec::new()).is_err());
     }
 }

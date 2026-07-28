@@ -49,10 +49,10 @@ proxy:
     cors_origins: []
     operators:
       - username: oncall
-        password: ${ONCALL_PASSWORD}
+        password_hash: ${ONCALL_PASSWORD_HASH}
         role: read_only
       - username: deployer
-        password: ${DEPLOYER_PASSWORD}
+        password_hash: ${DEPLOYER_PASSWORD_HASH}
         role: admin
     tls:
       cert: /etc/sbproxy/admin-cert.pem
