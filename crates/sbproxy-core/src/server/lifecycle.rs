@@ -1123,6 +1123,44 @@ pub(super) fn spawn_shutdown_phase_logger(
 /// handles config reload on file change,
 /// which is equivalent to SIGHUP-based reload in traditional
 /// servers.
+/// Resolve the admin-operator password pepper, failing loud only when it is
+/// actually needed.
+///
+/// Reads `key_management.crypto.pepper` straight from config (independent
+/// of whether the dynamic key plane is enabled) and falls back to
+/// [`crate::key_plane::default_admin_operator_pepper`] when unset, so
+/// operator login works with no `key_management:` block at all.
+///
+/// An unresolvable pepper reference (e.g. `env:` naming an unset variable)
+/// only fails boot when `operators_configured` is true: `proxy.admin.operators`
+/// entries carry a `password_hash` that must verify against this pepper, so
+/// a bad reference there matches the repo's resolve-at-boot-or-fail-loud
+/// convention for secret references. With no operators configured, nothing
+/// depends on the pepper resolving, so a bad reference degrades to a logged
+/// warning and the default pepper, the same way `key_plane::init_key_plane`
+/// degrades rather than aborting boot.
+fn resolve_or_default_admin_operator_pepper(
+    key_management: Option<&sbproxy_config::types::KeyManagementConfig>,
+    operators_configured: bool,
+) -> anyhow::Result<Vec<u8>> {
+    match crate::key_plane::resolve_admin_operator_pepper(key_management) {
+        Ok(pepper) => Ok(pepper),
+        Err(e) if !operators_configured => {
+            tracing::warn!(
+                error = %e,
+                "key_management.crypto.pepper did not resolve, but no proxy.admin.operators \
+                 are configured, so nothing needs it; falling back to the default \
+                 admin-operator pepper"
+            );
+            Ok(crate::key_plane::default_admin_operator_pepper())
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "resolve admin operator pepper (required: proxy.admin.operators is configured, \
+             and their password_hash values must verify against it): {e}"
+        )),
+    }
+}
+
 pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     use pingora_core::apps::HttpServerOptions;
     use pingora_core::server::configuration::ServerConf as PingoraServerConf;
@@ -1806,7 +1844,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                         .iter()
                         .map(|o| crate::admin::AdminOperator {
                             username: o.username.clone(),
-                            password: o.password.clone(),
+                            password_hash: o.password_hash.clone(),
                             role: o.role,
                         })
                         .collect()
@@ -1848,9 +1886,19 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                     None
                 }
             });
+        // Resolve the operator-password pepper before constructing
+        // AdminState, so `check_operator_login` verifies against the same
+        // pepper `sbproxy admin hash-password` used to produce the stored
+        // hash. See `resolve_or_default_admin_operator_pepper` for the
+        // fail-loud-only-if-needed policy.
+        let operator_pepper = resolve_or_default_admin_operator_pepper(
+            server_config.key_management.as_ref(),
+            !admin_cfg.operators.is_empty(),
+        )?;
         let mut admin_state_inner = crate::admin::AdminState::new(admin_cfg)
             .with_config_path(config_path)
-            .with_loaded_config_content_hash(initial_content_hash.clone());
+            .with_loaded_config_content_hash(initial_content_hash.clone())
+            .with_operator_pepper(operator_pepper);
         if let Some(p) = prompt_persistence {
             admin_state_inner = admin_state_inner.with_prompt_persistence(p);
         }
@@ -3543,6 +3591,66 @@ origins:
         // installed state.
         sbproxy_observe::logging::install_op_redact_config(
             sbproxy_observe::logging::OpRedactState::empty(),
+        );
+    }
+
+    // --- resolve_or_default_admin_operator_pepper ---
+
+    fn bad_pepper_key_management() -> sbproxy_config::types::KeyManagementConfig {
+        sbproxy_config::types::KeyManagementConfig {
+            crypto: sbproxy_config::types::KeyCryptoConfig {
+                pepper: Some(
+                    "env:SBPROXY_TEST_LIFECYCLE_PEPPER_DOES_NOT_EXIST_ANYWHERE".to_string(),
+                ),
+                master_key: None,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn admin_operator_pepper_falls_back_and_warns_when_no_operators_need_it() {
+        let cfg = bad_pepper_key_management();
+        let pepper = resolve_or_default_admin_operator_pepper(Some(&cfg), false)
+            .expect("an unresolvable pepper must not fail boot with no operators configured");
+        assert_eq!(pepper, crate::key_plane::default_admin_operator_pepper());
+    }
+
+    #[test]
+    fn admin_operator_pepper_fails_loud_when_operators_are_configured() {
+        let cfg = bad_pepper_key_management();
+        let error = resolve_or_default_admin_operator_pepper(Some(&cfg), true)
+            .expect_err("an unresolvable pepper must fail boot when operators depend on it");
+        assert!(
+            error.to_string().contains("proxy.admin.operators"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn admin_operator_pepper_resolves_with_no_key_management_regardless_of_operators() {
+        assert_eq!(
+            resolve_or_default_admin_operator_pepper(None, false).unwrap(),
+            crate::key_plane::default_admin_operator_pepper()
+        );
+        assert_eq!(
+            resolve_or_default_admin_operator_pepper(None, true).unwrap(),
+            crate::key_plane::default_admin_operator_pepper()
+        );
+    }
+
+    #[test]
+    fn admin_operator_pepper_prefers_a_pinned_value_when_operators_are_configured() {
+        let cfg = sbproxy_config::types::KeyManagementConfig {
+            crypto: sbproxy_config::types::KeyCryptoConfig {
+                pepper: Some("pinned-pepper".to_string()),
+                master_key: None,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_or_default_admin_operator_pepper(Some(&cfg), true).unwrap(),
+            b"pinned-pepper".to_vec()
         );
     }
 }

@@ -3494,8 +3494,10 @@ pub struct AdminTlsConfig {
 pub struct AdminOperator {
     /// Login username.
     pub username: String,
-    /// Login password.
-    pub password: String,
+    /// HMAC-SHA256 hash of the login password, hex-encoded, using the same
+    /// pepper as the inbound key plane (sbproxy-keystore::crypto).
+    /// Compute with `sbproxy admin hash-password`.
+    pub password_hash: String,
     /// Role governing which admin actions this operator may perform.
     #[serde(default)]
     pub role: AdminRole,

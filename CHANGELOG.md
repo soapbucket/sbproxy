@@ -21,6 +21,24 @@ the next version cut.
   deterministic regeneration live in
   [`docs/ai-default-centroids-evaluation.md`](docs/ai-default-centroids-evaluation.md).
 
+### Changed
+
+- **Admin operator passwords are now hashed at rest [BREAKING].**
+  `proxy.admin.operators[].password` is replaced by `password_hash`, an
+  HMAC-SHA256 hash (hex-encoded) using the same pepper the inbound key
+  plane hashes virtual keys with. A plaintext `password` field under
+  `operators:` no longer parses. Compute the hash with the new `sbproxy
+  admin hash-password` CLI helper (`--password` or `--password-stdin`),
+  which resolves `key_management.crypto.pepper` from config when set and
+  falls back to a fixed default otherwise, so hashing works with no
+  `key_management:` block configured. That default is a fixed public
+  constant, the same in every install, so a leaked `password_hash` is
+  offline-crackable unless `key_management.crypto.pepper` is pinned; pin
+  it in production. The admin console gains a read-only Operators page
+  (`GET /api/operators`) listing configured operator usernames and roles;
+  operators stay config-only, with no admin API to add, remove, or
+  re-role one.
+
 ## [1.8.0] - 2026-07-27
 
 Trust tier becomes live policy input, config authority grows a command

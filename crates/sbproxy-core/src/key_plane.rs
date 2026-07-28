@@ -396,6 +396,54 @@ fn resolve_secret_material(reference: &str) -> Result<Vec<u8>> {
     Ok(reference.as_bytes().to_vec())
 }
 
+/// Fixed fallback pepper for admin-operator password hashing, used when no
+/// `key_management.crypto.pepper` is configured. Lets
+/// `proxy.admin.operators` and `sbproxy admin hash-password` work with no
+/// `key_management:` block at all, which is the common case. It is a
+/// fixed, source-visible constant, so it offers no real secrecy: a leaked
+/// `password_hash` is offline-crackable unless a real pepper is pinned.
+/// Unlike [`build_crypto`]'s ephemeral-random fallback (fine for the dynamic
+/// key plane, whose hashes are computed and verified within the same
+/// process lifetime), this pepper must be stable across a restart and
+/// across the separate `hash-password` CLI invocation, so it cannot be
+/// random. Pin `key_management.crypto.pepper` for anything beyond a single
+/// trusted node; that value always takes precedence over this default.
+const DEFAULT_ADMIN_OPERATOR_PEPPER: &[u8] = b"sbproxy-admin-operator-default-pepper-v1";
+
+/// The fallback pepper [`resolve_admin_operator_pepper`] uses when no
+/// `key_management.crypto.pepper` is configured. Exposed separately so
+/// `AdminState::new` has an infallible default to start from.
+pub fn default_admin_operator_pepper() -> Vec<u8> {
+    DEFAULT_ADMIN_OPERATOR_PEPPER.to_vec()
+}
+
+/// Resolve the pepper used to hash and verify `AdminOperator.password_hash`.
+///
+/// Independent of whether the dynamic key plane is enabled: reads
+/// `key_management.crypto.pepper` directly from config when set (the same
+/// `env:`/`file:`/inline resolution `build_crypto` uses for the key plane's
+/// own pepper), so the running server and the offline `sbproxy admin
+/// hash-password` CLI agree without either needing a live installed key
+/// plane. Falls back to [`default_admin_operator_pepper`] when
+/// `key_management` is `None` or carries no pepper, so admin login works
+/// with no `key_management:` block configured at all.
+pub fn resolve_admin_operator_pepper(
+    key_management: Option<&KeyManagementConfig>,
+) -> Result<Vec<u8>> {
+    match key_management.and_then(|cfg| cfg.crypto.pepper.as_ref()) {
+        Some(reference) => resolve_secret_material(reference),
+        None => Ok(default_admin_operator_pepper()),
+    }
+}
+
+/// Hash a password for `AdminOperator.password_hash`. Thin wrapper over
+/// `sbproxy_keystore::crypto::hash_secret` so callers outside
+/// this crate (the `sbproxy admin hash-password` CLI) do not need their own
+/// `sbproxy-keystore` dependency for this one call.
+pub fn hash_admin_operator_password(password: &str, pepper: &[u8]) -> String {
+    sbproxy_keystore::crypto::hash_secret(password, pepper)
+}
+
 /// Build the `KeyCrypto` handle from config, generating ephemeral secrets
 /// with a warning when the operator did not pin them.
 fn build_crypto(cfg: &KeyManagementConfig) -> Result<KeyCrypto> {
@@ -1157,6 +1205,57 @@ mod tests {
             .unwrap()
             .expect("seeded key present in secrets-manager store");
         assert_eq!(rec.name.as_deref(), Some("sm-seeded"));
+    }
+
+    #[test]
+    fn admin_operator_pepper_falls_back_to_the_default_with_no_key_management() {
+        // Admin login must work with no `key_management:` block at all,
+        // since that's the common case.
+        assert_eq!(
+            resolve_admin_operator_pepper(None).unwrap(),
+            default_admin_operator_pepper()
+        );
+        let cfg = KeyManagementConfig::default();
+        assert_eq!(
+            resolve_admin_operator_pepper(Some(&cfg)).unwrap(),
+            default_admin_operator_pepper()
+        );
+    }
+
+    #[test]
+    fn admin_operator_pepper_prefers_a_pinned_key_management_pepper() {
+        let cfg = KeyManagementConfig {
+            crypto: KeyCryptoConfig {
+                pepper: Some("pinned-pepper".to_string()),
+                master_key: None,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_admin_operator_pepper(Some(&cfg)).unwrap(),
+            b"pinned-pepper".to_vec()
+        );
+    }
+
+    #[test]
+    fn admin_operator_pepper_reports_an_unresolvable_reference() {
+        let cfg = KeyManagementConfig {
+            crypto: KeyCryptoConfig {
+                pepper: Some("env:SBPROXY_TEST_ADMIN_PEPPER_DOES_NOT_EXIST".to_string()),
+                master_key: None,
+            },
+            ..Default::default()
+        };
+        assert!(resolve_admin_operator_pepper(Some(&cfg)).is_err());
+    }
+
+    #[test]
+    fn hash_admin_operator_password_matches_the_keystore_primitive() {
+        let pepper = b"p";
+        assert_eq!(
+            hash_admin_operator_password("pw", pepper),
+            sbproxy_keystore::crypto::hash_secret("pw", pepper)
+        );
     }
 }
 

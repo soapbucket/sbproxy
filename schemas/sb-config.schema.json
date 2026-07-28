@@ -1493,7 +1493,7 @@
       "description": "An admin operator identity with a role, for RBAC (WOR-1716).",
       "type": "object",
       "required": [
-        "password",
+        "password_hash",
         "username"
       ],
       "properties": {
@@ -1501,8 +1501,8 @@
           "description": "Login username.",
           "type": "string"
         },
-        "password": {
-          "description": "Login password.",
+        "password_hash": {
+          "description": "HMAC-SHA256 hash of the login password, hex-encoded, using the same pepper as the inbound key plane (sbproxy-keystore::crypto). Compute with `sbproxy admin hash-password`.",
           "type": "string"
         },
         "role": {
