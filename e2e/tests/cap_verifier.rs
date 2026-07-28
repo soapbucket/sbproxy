@@ -100,6 +100,19 @@ origins:
     )
 }
 
+fn priced_cap_config(upstream_url: &str, pubkey_b64url: &str) -> String {
+    let mut config = cap_config(upstream_url, pubkey_b64url);
+    config.push_str(
+        r#"    policies:
+      - type: ai_crawl_control
+        price: 0.001
+        currency: USD
+        valid_tokens: []
+"#,
+    );
+    config
+}
+
 // --- Tests ---
 
 #[test]
@@ -226,6 +239,27 @@ fn cap_subject_rate_limit_returns_authenticated_429() {
         1,
         "only the admitted request may reach upstream"
     );
+}
+
+#[test]
+fn verified_cap_bypasses_priced_crawl_control() {
+    let (signing, pubkey) = fresh_keypair();
+    let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
+    let harness = ProxyHarness::start_with_yaml(&priced_cap_config(&upstream.base_url(), &pubkey))
+        .expect("start");
+    let token = mint_cap(&signing, |_| {});
+
+    let response = harness
+        .get_with_headers(
+            "/blog/article",
+            "cap.localhost",
+            &[("cap-token", &token), ("user-agent", "GPTBot/1.0")],
+        )
+        .expect("send");
+
+    assert_eq!(response.status, 200);
+    assert_eq!(upstream.captured().len(), 1);
+    assert!(!response.headers.contains_key("crawler-payment"));
 }
 
 #[test]

@@ -483,6 +483,39 @@ fn ledger_happy_path_passes_request() {
 }
 
 #[test]
+fn cap_pricing_exemption_skips_ledger_and_402() {
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "valid_tokens": [],
+    }))
+    .unwrap()
+    .with_ledger(Arc::new(AlwaysTransient));
+    let headers = payment_headers("GPTBot/1.0", "crawler-payment", "must-not-redeem");
+
+    assert_eq!(
+        policy.check_with_pricing_exemption("GET", "x.com", "/article", &headers, None, true),
+        AiCrawlDecision::Allow
+    );
+}
+
+#[test]
+fn cap_pricing_exemption_does_not_bypass_content_signals() {
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "valid_tokens": [],
+        "crawler_user_agents": ["ClaudeBot"],
+        "content_signals": { "ai_train": false },
+    }))
+    .unwrap();
+    let headers = ua_headers("ClaudeBot/1.0");
+
+    assert!(matches!(
+        policy.check_with_pricing_exemption("GET", "x.com", "/article", &headers, None, true),
+        AiCrawlDecision::SignalBlocked { .. }
+    ));
+}
+
+#[test]
 fn money_from_units_rounds_to_micros() {
     let m = Money::from_units(0.001234567, "USD");
     assert_eq!(m.amount_micros, 1235);

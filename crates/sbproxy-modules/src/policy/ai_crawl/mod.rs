@@ -387,6 +387,20 @@ impl AiCrawlControlPolicy {
         headers: &http::HeaderMap,
         agent_id: Option<&str>,
     ) -> AiCrawlDecision {
+        self.check_with_pricing_exemption(method, host, path, headers, agent_id, false)
+    }
+
+    /// Inspect the request and decide whether it pays through, allowing
+    /// a verified CAP principal to skip only the pricing path.
+    pub fn check_with_pricing_exemption(
+        &self,
+        method: &str,
+        host: &str,
+        path: &str,
+        headers: &http::HeaderMap,
+        agent_id: Option<&str>,
+        pricing_exempt: bool,
+    ) -> AiCrawlDecision {
         // Only GET / HEAD are subject to crawl charging - no point
         // 402-ing a POST that already has its own payment semantics.
         if !matches!(method, "GET" | "HEAD") {
@@ -436,6 +450,12 @@ impl AiCrawlControlPolicy {
                     };
                 }
             }
+        }
+        // A verified CAP principal is exempt from crawler pricing and
+        // ledger redemption, but not from method, crawler, free-path,
+        // or Content Signals decisions above.
+        if pricing_exempt {
+            return AiCrawlDecision::Allow;
         }
         // --- G1.2 Accept-aware tier resolution ---
         //
