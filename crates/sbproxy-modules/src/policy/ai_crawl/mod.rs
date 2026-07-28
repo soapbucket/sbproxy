@@ -159,26 +159,20 @@ impl AiCrawlControlPolicy {
         let mut ledger: Arc<dyn Ledger> =
             Arc::new(InMemoryLedger::new(config.valid_tokens.clone()));
 
-        // G1.3 wire: when the operator authored a `ledger:` block and
-        // the binary was built with `http-ledger`, swap the in-memory
-        // ledger for the real HTTP client. With the feature off the
-        // block still deserialises (so YAML written against the
-        // larger schema parses cleanly) but the policy stays on the
-        // in-memory ledger and a warning is logged.
+        // G1.3 wire: when the operator authored a `ledger:` block,
+        // either construct the real HTTP client or fail closed. Falling
+        // back to the in-memory ledger would silently accept a production
+        // config without contacting its configured payment backend.
+        #[cfg(not(feature = "http-ledger"))]
+        if config.ledger.is_some() {
+            anyhow::bail!(
+                "ai_crawl_control: `ledger:` requires the `http-ledger` feature; enable it or remove the `ledger:` block"
+            );
+        }
+        #[cfg(feature = "http-ledger")]
         if let Some(ledger_yaml) = config.ledger.clone() {
-            #[cfg(feature = "http-ledger")]
-            {
-                let http_ledger = build_http_ledger(ledger_yaml)?;
-                ledger = Arc::new(http_ledger);
-            }
-            #[cfg(not(feature = "http-ledger"))]
-            {
-                let _ = ledger_yaml;
-                tracing::warn!(
-                    "ai_crawl_control: `ledger:` block ignored because the \
-                     `http-ledger` feature is off; falling back to in-memory ledger"
-                );
-            }
+            let http_ledger = build_http_ledger(ledger_yaml)?;
+            ledger = Arc::new(http_ledger);
         }
 
         // G3.4 multi-rail challenge plan compilation. When the operator

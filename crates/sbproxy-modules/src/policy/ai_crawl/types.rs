@@ -1306,10 +1306,9 @@ pub struct AiCrawlControlConfig {
     /// fallback (the in-memory ledger is constructed regardless and
     /// only swapped out when this block parses cleanly).
     ///
-    /// Requires the `http-ledger` cargo feature to be on. With the
-    /// feature off, the field still deserialises (so YAML written
-    /// against the larger schema parses cleanly) but is ignored at
-    /// policy construction.
+    /// Requires the `http-ledger` cargo feature to be on. Policy
+    /// construction fails closed when this block is present in a build
+    /// without that feature.
     #[serde(default)]
     pub ledger: Option<LedgerYamlConfig>,
     /// Optional multi-rail challenge configuration. When

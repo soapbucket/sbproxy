@@ -522,6 +522,31 @@ fn money_from_units_rounds_to_micros() {
     assert_eq!(m.currency, "USD");
 }
 
+#[cfg(not(feature = "http-ledger"))]
+#[test]
+fn ledger_yaml_block_fails_closed_without_http_ledger_feature() {
+    let err = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "ledger": {
+            "url": "https://ledger.internal",
+            "key_id": "k1",
+            "key_hex": "00",
+        }
+    }))
+    .expect_err("ledger config must not silently fall back without HTTP support");
+
+    assert_eq!(
+        err.to_string(),
+        "ai_crawl_control: `ledger:` requires the `http-ledger` feature; enable it or remove the `ledger:` block"
+    );
+
+    AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "valid_tokens": ["dev-token"],
+    }))
+    .expect("config without a ledger block remains valid");
+}
+
 #[cfg(feature = "http-ledger")]
 #[test]
 fn http_ledger_rejects_plain_http_endpoint() {
