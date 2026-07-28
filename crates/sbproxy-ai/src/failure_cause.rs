@@ -10,7 +10,7 @@
 //!
 //! The classifier is the seam the richer LLM-aware actions build on:
 //! a context-window failure can drive compress-and-retry over
-//! [`crate::context_compress`], and a content-policy failure can drive a
+//! [`crate::compression`], and a content-policy failure can drive a
 //! redact-and-retry, each selected by [`FailureCause::fallback_trigger`].
 
 use serde::Deserialize;

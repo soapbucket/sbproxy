@@ -25,9 +25,9 @@
 //!   we delegate to it.
 //! - Anthropic Claude does not publish its BPE vocabulary. We fall back to
 //!   a documented `UTF-8 bytes / 4 + 1` heuristic for any model the tiktoken
-//!   prefix table cannot identify. This is the same heuristic the older
-//!   [`crate::context_compress::estimate_message_tokens`] uses and matches
-//!   Anthropic's own published rule of thumb. Reconcile against the real
+//!   prefix table cannot identify. This is the same heuristic the deterministic
+//!   [`crate::compression`] window-fit lever uses and matches Anthropic's own
+//!   published rule of thumb. Reconcile against the real
 //!   `usage.input_tokens` in the response corrects any drift, and the
 //!   `sbproxy_ai_token_estimate_error_ratio` histogram surfaces the gap.
 //!
