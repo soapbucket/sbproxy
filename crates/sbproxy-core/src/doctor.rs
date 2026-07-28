@@ -261,6 +261,41 @@ pub struct GitBinary {
     pub version: Option<String>,
 }
 
+/// POSIX shared memory (`/dev/shm`), which vLLM's multiprocess
+/// tensor-parallel workers use for cross-process tensor handles. A
+/// too-small tmpfs there is invisible until a multi-worker vLLM launch
+/// crashes with a shared-memory allocation failure, so `doctor` reports
+/// it up front rather than at that crash. All fields are `None` on a
+/// host with no `/dev/shm` (e.g. macOS): that is a fact, not an error.
+#[derive(Debug, Clone, Serialize)]
+pub struct SharedMemoryInfo {
+    /// The mount checked, `None` when this host has no `/dev/shm`.
+    pub path: Option<PathBuf>,
+    /// Total size in bytes, when readable.
+    pub total_bytes: Option<u64>,
+    /// Available bytes, when readable.
+    pub available_bytes: Option<u64>,
+}
+
+/// Whether the weight-cache mount has enough free space for
+/// `serve.cache_budget_gib`, checked once a `serve:` config is
+/// supplied (see [`DoctorReport::with_serve_config`]). `cache_budget_gib`
+/// sizes the eviction threshold, not a hard cap the OS enforces, so
+/// this is an early warning about a mount that cannot even hold the
+/// configured budget, not a guarantee the cache will stay under it.
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheBudgetCheck {
+    /// The configured `serve.cache_budget_gib`, when set. `None` means
+    /// the cache is unbounded and this check has nothing to compare.
+    pub budget_gib: Option<f64>,
+    /// Free space on `model_cache_dir`'s filesystem in GiB, when
+    /// readable.
+    pub free_gib: Option<f64>,
+    /// `false` only when both values are known and free space is less
+    /// than the configured budget.
+    pub sufficient: bool,
+}
+
 /// The full diagnostics report. Serializes to the JSON shape
 /// `sbproxy doctor --format json` emits.
 #[derive(Debug, Clone, Serialize)]
@@ -299,9 +334,16 @@ pub struct DoctorReport {
     pub model_cache_exists: bool,
     /// Free bytes on the filesystem holding the cache dir, when readable.
     pub model_cache_free_bytes: Option<u64>,
+    /// `/dev/shm` size, relevant to vLLM's multiprocess tensor-parallel
+    /// workers.
+    pub shared_memory: SharedMemoryInfo,
     /// Per-serve-entry resolution + fit, when a `serve:` config was
     /// supplied (empty otherwise).
     pub serve_entries: Vec<ServeEntryReport>,
+    /// Whether the weight-cache mount has enough free space for
+    /// `serve.cache_budget_gib`, when a `serve:` config was supplied
+    /// (`None` otherwise).
+    pub cache_budget_check: Option<CacheBudgetCheck>,
     /// The `serve:` readiness verdict for this host.
     pub local_serving: LocalServing,
 }
@@ -409,6 +451,7 @@ impl DoctorReport {
         let model_cache_dir = sbproxy_model_host::resolve_cache_dir_default(None);
         let model_cache_exists = model_cache_dir.is_dir();
         let model_cache_free_bytes = free_disk_bytes(&model_cache_dir);
+        let shared_memory = shared_memory_info();
 
         let local_serving = serving_verdict(&gpus, &drivers, &engines);
 
@@ -428,7 +471,9 @@ impl DoctorReport {
             model_cache_dir,
             model_cache_exists,
             model_cache_free_bytes,
+            shared_memory,
             serve_entries: Vec::new(),
+            cache_budget_check: None,
             local_serving,
         }
     }
@@ -444,6 +489,10 @@ impl DoctorReport {
         catalog: &sbproxy_model_host::Catalog,
     ) -> Self {
         self.serve_entries = self.evaluate_serve(serve, catalog);
+        self.cache_budget_check = Some(cache_budget_check(
+            serve.cache_budget_gib,
+            self.model_cache_free_bytes,
+        ));
         self
     }
 
@@ -750,6 +799,32 @@ impl DoctorReport {
             out.push_str(&format!("  ({:.0} GiB free)", free as f64 / GIB));
         }
         out.push('\n');
+
+        if let Some(check) = &self.cache_budget_check {
+            if let Some(budget) = check.budget_gib {
+                out.push_str(&format!("  cache budget: {budget:.0} GiB configured"));
+                if let Some(free) = check.free_gib {
+                    out.push_str(&format!(", {free:.0} GiB free on the mount"));
+                }
+                out.push_str(if check.sufficient {
+                    "\n"
+                } else {
+                    " (INSUFFICIENT: the mount cannot hold the configured budget)\n"
+                });
+            }
+        }
+
+        out.push_str("\nshared memory (/dev/shm)\n");
+        match self.shared_memory.total_bytes {
+            Some(total) => {
+                out.push_str(&format!("  {:.1} GiB total", total as f64 / GIB));
+                if let Some(avail) = self.shared_memory.available_bytes {
+                    out.push_str(&format!(", {:.1} GiB available", avail as f64 / GIB));
+                }
+                out.push('\n');
+            }
+            None => out.push_str("  not present on this host\n"),
+        }
 
         if !self.serve_entries.is_empty() {
             out.push_str("\nconfigured models\n");
@@ -1170,6 +1245,68 @@ fn free_disk_bytes(dir: &Path) -> Option<u64> {
     Some(avail_kib.saturating_mul(1024))
 }
 
+/// Probe `/dev/shm` via `df -Pk`, mirroring [`free_disk_bytes`]'s
+/// approach but keeping the total column too. Every field is `None` on
+/// a host with no `/dev/shm` (e.g. macOS) or where `df` cannot be
+/// read; never an error.
+fn shared_memory_info() -> SharedMemoryInfo {
+    let path = Path::new("/dev/shm");
+    if !path.exists() {
+        return SharedMemoryInfo {
+            path: None,
+            total_bytes: None,
+            available_bytes: None,
+        };
+    }
+    let absent = SharedMemoryInfo {
+        path: Some(path.to_path_buf()),
+        total_bytes: None,
+        available_bytes: None,
+    };
+    let Ok(out) = Command::new("df").args(["-Pk"]).arg(path).output() else {
+        return absent;
+    };
+    if !out.status.success() {
+        return absent;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Second line: 2nd column = total 1K-blocks, 4th column = available.
+    let Some(line) = text.lines().nth(1) else {
+        return absent;
+    };
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let total_bytes = fields
+        .get(1)
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|kib| kib.saturating_mul(1024));
+    let available_bytes = fields
+        .get(3)
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|kib| kib.saturating_mul(1024));
+    SharedMemoryInfo {
+        path: Some(path.to_path_buf()),
+        total_bytes,
+        available_bytes,
+    }
+}
+
+/// Whether the weight-cache mount has enough free space for
+/// `serve.cache_budget_gib`. An unset budget and an unreadable
+/// free-space probe both report `sufficient: true`: neither is
+/// evidence of a problem, only of nothing to compare.
+fn cache_budget_check(budget_gib: Option<f64>, free_bytes: Option<u64>) -> CacheBudgetCheck {
+    let free_gib = free_bytes.map(|bytes| bytes as f64 / GIB);
+    let sufficient = match (budget_gib, free_gib) {
+        (Some(budget), Some(free)) => free >= budget,
+        _ => true,
+    };
+    CacheBudgetCheck {
+        budget_gib,
+        free_gib,
+        sufficient,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1188,6 +1325,7 @@ mod tests {
             "local_serving",
             "drivers",
             "huggingface",
+            "shared_memory",
         ] {
             assert!(json.get(key).is_some(), "missing key {key}");
         }
@@ -1325,5 +1463,93 @@ mod tests {
                 .unwrap();
         let entries = report.evaluate_serve(&serve, &Catalog::builtin());
         assert_eq!(entries[0].fit.verdict, "unknown");
+    }
+
+    #[test]
+    fn shared_memory_info_never_panics_and_serializes() {
+        // Smoke test mirroring collect_never_panics_and_serializes: a host
+        // with no /dev/shm (macOS) or an unreadable df must report `None`
+        // fields, never panic.
+        let info = shared_memory_info();
+        let json = serde_json::to_value(&info).expect("shared memory info serializes");
+        assert!(json.get("total_bytes").is_some());
+        assert!(json.get("available_bytes").is_some());
+    }
+
+    #[test]
+    fn cache_budget_check_flags_insufficient_free_space() {
+        let five_gib: u64 = 5 * 1024 * 1024 * 1024;
+        let fifty_gib: u64 = 50 * 1024 * 1024 * 1024;
+
+        let insufficient = cache_budget_check(Some(20.0), Some(five_gib));
+        assert!(
+            !insufficient.sufficient,
+            "5 GiB free must not cover a 20 GiB budget"
+        );
+        assert_eq!(insufficient.budget_gib, Some(20.0));
+
+        let sufficient = cache_budget_check(Some(20.0), Some(fifty_gib));
+        assert!(sufficient.sufficient, "50 GiB free covers a 20 GiB budget");
+
+        // No configured budget (unbounded cache) has nothing to compare,
+        // so it must not be reported as a problem.
+        let unbounded = cache_budget_check(None, Some(five_gib));
+        assert!(unbounded.sufficient);
+
+        // An unreadable free-space probe is also not evidence of a
+        // problem, only of nothing to compare.
+        let unreadable = cache_budget_check(Some(20.0), None);
+        assert!(unreadable.sufficient);
+    }
+
+    #[test]
+    fn vulkan_prebuilt_on_linux_still_flags_cpu_bound_not_gpu_accelerated() {
+        // Landmine regression (see llama_release.rs's asset_infix_accel,
+        // and main.rs's `run_acceleration` CLI-level vulkan rejection):
+        // llama.cpp's only Linux prebuilt is a Vulkan build that runs on
+        // CPU where the NVIDIA Vulkan driver is absent -- the shape of
+        // the GCP Deep Learning VM, which has the CUDA driver but no
+        // Vulkan ICD. `available: true` on that acquisition option means
+        // "sbproxy can fetch a working binary," never "this will be GPU
+        // accelerated." The two checks added in this change (shared
+        // memory, cache budget) are disk/IPC facts that must not blur
+        // into a false "GPU ready" signal for this host shape.
+        let env = EngineEnvView {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            container: false,
+            brew: false,
+            uv: false,
+            pip: false,
+            embedded_feature: false,
+        };
+        let llama = engine_report("llama_cpp", "llama-server", &env);
+        let prebuilt = llama
+            .acquisition
+            .iter()
+            .find(|o| o.method == "prebuilt-release")
+            .expect("linux always offers the prebuilt-release option");
+        assert!(
+            prebuilt.available,
+            "the Vulkan asset is still a viable acquisition"
+        );
+        assert!(
+            prebuilt.detail.contains("Vulkan") && prebuilt.detail.contains("CPU"),
+            "the detail must keep naming the CPU-bound Vulkan caveat: {}",
+            prebuilt.detail
+        );
+
+        // Neither new check claims GPU acceleration: they are pure
+        // disk/IPC facts, independent of the engine-acquisition path.
+        let json = serde_json::to_value(shared_memory_info()).expect("serializes");
+        assert!(
+            json.get("total_bytes").is_some(),
+            "shared memory check reports a fact field, not a readiness verdict"
+        );
+        let check = cache_budget_check(Some(20.0), Some(5 * 1024 * 1024 * 1024));
+        assert!(
+            !check.sufficient,
+            "cache budget check is a disk-space fact and must not report ready just because a GPU was detected"
+        );
     }
 }
