@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-26*
+*Last modified: 2026-07-27*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -78,7 +78,10 @@ sbproxy validate /etc/sbproxy/production.yml
 sbproxy --config /etc/sbproxy/production.yml --check
 ```
 
-The config has two main sections: `proxy` (server-level settings) and `origins` (per-hostname routing and behavior). Optional shared-state blocks (`l2_cache_settings`, `messenger_settings`) live nested under `proxy`.
+The config has two main sections: `proxy` (server-level settings) and `origins`
+(per-hostname routing and behavior). Optional shared-state blocks
+(`l2_cache_settings`, `messenger_settings`) and process-owned
+`compression_state` live nested under `proxy`.
 
 ---
 
@@ -250,6 +253,7 @@ proxy:
 | `cluster` | object | unset | Canonical local or distributed cluster identity, membership, mTLS, enrollment, snapshot, and signed deployment-authority settings. |
 | `model_host` | object | unset | Canonical managed-model authority, cache, engines, deployments, placement, and rollout policy. |
 | `l2_cache_settings` | object | | Optional shared-state backend. Alias: `l2_cache`. |
+| `compression_state` | object | unset | Process-owned Local AI summary-state path. See [compression_state](#compression_state). |
 | `response_cache_store` | object | unset | Picks the backing store for the shared response cache and optionally encrypts entries at rest. See [Choosing the backing store](#choosing-the-backing-store). When unset, the store is Redis if `l2_cache_settings` is configured and an in-process map otherwise. |
 | `messenger_settings` | object | | Optional shared message bus for inter-component eventing. |
 | `trusted_proxies` | array of CIDR strings | `[]` | Source ranges whose inbound `X-Forwarded-For` / `X-Real-IP` / `Forwarded` headers are honoured. Connections from outside the list have those headers stripped on ingress so they cannot spoof identity. IPv6 CIDRs work. See [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers). |
@@ -665,6 +669,38 @@ Do not roll a secure deployment back to a release that predates these fields.
 Older releases are safe only for unauthenticated plaintext database-zero
 deployments because they did not preserve TLS, authentication, or database
 selection.
+
+### compression_state
+
+`proxy.compression_state` configures the process-owned redb file used when an
+AI `summary_buffer` pipeline selects `backend: local`. A `summary_buffer` with
+no action-level `state` block defaults to Local with a 24-hour TTL.
+
+```yaml
+proxy:
+  compression_state:
+    local_path: /var/lib/sbproxy/compression-state.redb
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `local_path` | string | platform selection | Absolute redb database path. It must be nonempty, at most 4096 bytes, and contain no control characters. |
+
+Configuration validation checks only the path string and performs no
+filesystem I/O. At runtime, an explicit path wins. Without one, SBproxy tries
+a writable `/var/lib/sbproxy/compression-state.redb`, then
+`$XDG_STATE_HOME/sbproxy/compression-state.redb`, then
+`$HOME/Library/Application Support/sbproxy/compression-state.redb` on macOS or
+`$HOME/.local/state/sbproxy/compression-state.redb` on other Unix systems.
+Only absolute environment paths participate. Windows requires an explicit
+path. A required path that cannot be opened fails startup and names the path.
+
+The file is a one-process durability boundary, not shared fleet state. It
+contains generated summaries in plaintext, so protect the directory, file,
+snapshots, and backups as prompt data. Deleted and expired pages are reusable,
+but redb may keep the file at its high-water allocation instead of shrinking it
+immediately. Use explicit Redis or mesh state for traffic that can move between
+processes.
 
 ### messenger_settings
 
@@ -1267,10 +1303,8 @@ result to the resolved target model's context window:
 
 ```yaml
 proxy:
-  l2_cache_settings:
-    driver: redis
-    params:
-      dsn: redis://redis.internal:6379/0
+  compression_state:
+    local_path: /var/lib/sbproxy/compression-state.redb
 
 origins:
   "ai.example.com":
@@ -1284,9 +1318,6 @@ origins:
           api_key: ${ANTHROPIC_API_KEY}
           models: [claude-haiku-4-5]
       compression:
-        state:
-          backend: redis
-          ttl: 24h
         allow_admin_content_inspection: false
         levers:
           - type: summary_buffer
@@ -1315,13 +1346,13 @@ Policy fields:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `state` | object | unset | External state used by `summary_buffer`. Required when any `summary_buffer` lever is present. It may be omitted for a policy containing only `window_fit`. |
-| `state.backend` | enum | required | `redis` for lease-serialized, fenced compare-and-set storage. There is no in-process or mesh session-state backend. |
-| `state.ttl` | duration | required | Positive record lifetime. Accepts integer seconds or strings such as `60s`, `5m`, `2h30m`, and `1d`. Newly committed summaries refresh the lifetime; exact-summary reuse does not write or refresh it. |
+| `state` | object | Local/24h for `summary_buffer`; unset otherwise | State used by `summary_buffer`. Omission is stateless when no summary lever is present. |
+| `state.backend` | enum | `local` when state is synthesized | `local` for one process-owned redb file, `redis` for cross-process serialized state, or `mesh` for replicated eventual-LWW state. Explicit choices never fall back. |
+| `state.ttl` | duration | `24h` when state is synthesized | Positive record lifetime. Accepts integer seconds or strings such as `60s`, `5m`, `2h30m`, and `1d`. Newly committed summaries refresh the lifetime; exact-summary reuse does not write or refresh it. |
 | `allow_admin_content_inspection` | bool | `false` | Permit the Admin-only, audit-first content endpoint for records from this handler. Metadata remains available to authenticated readers. This flag alone never grants access. |
 | `levers` | list | `[]` | Compression levers in execution order. An explicitly empty list disables compression for this handler. |
 | `profiles` | map | `{}` | Route-local named compression pipelines. Each entry has its own `levers` and optional `state`. Names use lowercase ASCII letters, digits, `_`, or `-`, begin with a letter or digit, contain from 1 to 64 bytes, and cannot be `on` or `off`. |
-| `profiles.<name>.state` | object | unset | External state for this named profile. Required when the profile contains `summary_buffer`; it does not inherit the route default state. |
+| `profiles.<name>.state` | object | Local/24h for a summary profile | State for this named profile. Each profile defaults independently and does not inherit route state. |
 | `profiles.<name>.levers` | list | `[]` | Ordered levers for this named profile. |
 
 `summary_buffer` fields:
@@ -1369,20 +1400,24 @@ a disabled summarizer provider, and a summarizer model not available through
 that provider or denied by the handler policy. A stateful backend that is not
 available also fails pipeline construction instead of silently falling back:
 
+- `backend: local` opens one process-owned database selected through
+  `proxy.compression_state`; a required open failure is fatal. Configuration
+  validation never creates or probes the file.
 - `backend: redis` requires `proxy.l2_cache_settings.driver: redis`. For this
   feature, `params.dsn` must be a `redis://` or `rediss://` URL with a host.
-- `backend: mesh` is rejected. `proxy.cluster.replication` supplies a durable
-  replicated substrate, but compression's legacy mesh adapter is not integrated
-  with or validated against `ReplicatedStore` for the required session and Admin
-  lifecycle semantics. That integration remains a separate, unshipped change.
-- `window_fit` is stateless and needs neither dependency.
+- `backend: mesh` requires `proxy.cluster.replication` on every node and binds
+  to that live replicated substrate.
+- `rag_select`, `compact_serialization`, `position_reorder`, and `window_fit`
+  are stateless. A policy containing only these levers creates no Local
+  database and needs no Redis or mesh dependency.
 
-Request workers retain no conversational state between requests. The
-stateful lever stores its canonical running-summary record in Redis under an
-opaque ID; raw session identifiers and raw turns are not
-stored in that record. There is no OmniRoute import path, migration format, or
-runtime dependency. Enabling this feature starts and maintains native SBproxy
-state only.
+Request workers retain no memory-only conversational state between requests.
+The stateful lever stores its canonical running-summary record in the selected
+Local, Redis, or mesh backend under an opaque ID; raw session identifiers and
+raw turns are not stored in that record. Local survives restart at the same
+file path but does not share records with another process. There is no
+OmniRoute import path, migration format, or runtime dependency. Enabling this
+feature starts and maintains native SBproxy state only.
 
 For compatibility, the older boolean remains accepted:
 
