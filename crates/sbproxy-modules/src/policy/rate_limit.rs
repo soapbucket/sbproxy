@@ -230,11 +230,19 @@ impl TokenBucket {
         (self.tokens + elapsed.as_secs_f64() * self.refill_rate).min(self.max_tokens)
     }
 
-    fn reset_secs_at(&self, now: Instant) -> u64 {
+    fn full_refill_reset_secs_at(&self, now: Instant) -> u64 {
         if self.refill_rate <= 0.0 {
             return 0;
         }
         let deficit = self.max_tokens - self.projected_tokens_at(now);
+        (deficit / self.refill_rate).ceil() as u64
+    }
+
+    fn next_token_reset_secs_at(&self, now: Instant) -> u64 {
+        if self.refill_rate <= 0.0 {
+            return 0;
+        }
+        let deficit = (1.0 - self.projected_tokens_at(now)).max(0.0);
         (deficit / self.refill_rate).ceil() as u64
     }
 
@@ -325,7 +333,7 @@ impl DynamicKeyedTokenBuckets {
                     .expect("a full dynamic bucket registry has an LRU entry");
                 (
                     candidate.projected_tokens_at(now) >= candidate.max_tokens,
-                    candidate.reset_secs_at(now).max(1),
+                    candidate.full_refill_reset_secs_at(now).max(1),
                 )
             };
             if !evictable {
@@ -348,11 +356,16 @@ impl DynamicKeyedTokenBuckets {
 
     fn consume(bucket: &mut TokenBucket, now: Instant) -> DynamicRateLimitInfo {
         let allowed = bucket.try_acquire(1.0);
+        let reset_secs = if allowed {
+            bucket.full_refill_reset_secs_at(now)
+        } else {
+            bucket.next_token_reset_secs_at(now)
+        };
         DynamicRateLimitInfo {
             allowed,
             limit: bucket.max_tokens as u64,
             remaining: bucket.tokens.floor() as u64,
-            reset_secs: bucket.reset_secs_at(now),
+            reset_secs,
         }
     }
 }
@@ -957,6 +970,28 @@ mod tests {
                 .check_at("agent-b", 0.1, start + std::time::Duration::from_secs(10),)
                 .allowed,
             "a fully refilled LRU bucket may be safely reused"
+        );
+    }
+
+    #[test]
+    fn dynamic_keyed_buckets_distinguish_next_token_from_full_refill_reset() {
+        let buckets = DynamicKeyedTokenBuckets::new(1);
+        let now = Instant::now();
+
+        assert!(buckets.check_at("agent-a", 1.1, now).allowed);
+        assert!(buckets.check_at("agent-a", 1.1, now).allowed);
+        let exhausted = buckets.check_at("agent-a", 1.1, now);
+        assert!(!exhausted.allowed);
+        assert_eq!(
+            exhausted.reset_secs, 1,
+            "an exhausted known key waits only for its next token"
+        );
+
+        let saturated = buckets.check_at("agent-b", 1.1, now);
+        assert!(!saturated.allowed);
+        assert_eq!(
+            saturated.reset_secs, 2,
+            "an unseen key waits until the LRU candidate is fully reusable"
         );
     }
 
