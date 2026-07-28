@@ -13,10 +13,10 @@
 //!   because it never traverses the data plane's own dispatch path.
 //! - `POST /admin/api/playground/dispatch` runs the same shape of request
 //!   through the *real* data-plane pipeline instead, impersonating a
-//!   chosen virtual key via a short-lived [`ticket`] so key policy,
+//!   chosen virtual key via a short-lived `ticket` so key policy,
 //!   governance, routing, and guardrails all apply exactly as they would
 //!   for that key's real traffic. See its own doc comment and
-//!   [`handle_dispatch`] for how impersonation is proven safe.
+//!   `handle_dispatch` for how impersonation is proven safe.
 //!
 //! All three are handled in the async admin connection handler rather
 //! than the blocking request dispatcher, because the chat and dispatch
@@ -85,7 +85,7 @@ pub(crate) mod ticket {
         STORE.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    /// Mint a fresh single-use ticket naming `key_id`, valid for [`TTL`].
+    /// Mint a fresh single-use ticket naming `key_id`, valid for `TTL`.
     /// Returns the full bearer token (`PREFIX` + random hex).
     pub(crate) fn mint(key_id: &str) -> String {
         mint_with_ttl(key_id, TTL)
@@ -558,7 +558,7 @@ async fn managed_chat(
 /// Unlike `handle_chat`, this never calls the engine or `AiClient`
 /// directly: it confirms `key_id` names a real, active key (the same
 /// cache-backed lookup `resolve_dynamic_virtual_key` uses at request
-/// time, not a fabricated credential), mints a single-use [`ticket`],
+/// time, not a fabricated credential), mints a single-use `ticket`,
 /// then performs a genuine loopback HTTP call into this server's own
 /// data-plane listener for `origin` with the ticket as the bearer token.
 /// The pre-auth sweep in `server::request_phase` resolves the ticket to
