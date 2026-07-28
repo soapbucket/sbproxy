@@ -56,6 +56,9 @@ const routes = [
   { path: "/admin/ui/users", file: "admin-users.png" },
   { path: "/admin/ui/cluster", file: "admin-cluster.png" },
   { path: "/admin/ui/sessions", file: "admin-sessions.png" },
+  { path: "/admin/ui/operators", file: "admin-operators.png" },
+  { path: "/admin/ui/get-started", file: "admin-get-started.png" },
+  { path: "/admin/ui/jobs", file: "admin-jobs.png" },
 ];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
