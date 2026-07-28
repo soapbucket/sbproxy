@@ -185,6 +185,31 @@ impl ArtifactError {
             Self::SizeMismatch { .. } | Self::DigestMismatch { .. } | Self::PickleUnsafe { .. }
         )
     }
+
+    /// Stable bounded category for observability, one per variant. Carries
+    /// no path, digest, URL, or other acquisition-specific detail.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidArtifact(_) => "invalid_artifact",
+            Self::Io { .. } => "io",
+            Self::Transport(_) => "transport",
+            Self::HttpStatus { .. } => "http_status",
+            Self::UnexpectedResponse { .. } => "unexpected_response",
+            Self::SizeMismatch { .. } => "size_mismatch",
+            Self::DigestMismatch { .. } => "digest_mismatch",
+            Self::CacheCorrupt { .. } => "cache_corrupt",
+            Self::ManualArtifactMissing { .. } => "manual_artifact_missing",
+            Self::OfflineArtifactMissing { .. } => "offline_artifact_missing",
+            Self::StartupArtifactNotSelected { .. } => "startup_artifact_not_selected",
+            Self::PickleRefused { .. } => "pickle_refused",
+            Self::PickleUnsafe { .. } => "pickle_unsafe",
+            Self::Job(_) => "job",
+            Self::Serialization(_) => "serialization",
+            Self::Clock(_) => "clock",
+            Self::Join(_) => "join",
+            Self::RemovalBlocked { .. } => "removal_blocked",
+        }
+    }
 }
 
 /// Why a cache miss is being acquired.
@@ -224,6 +249,13 @@ pub struct AcquisitionContext {
 pub trait ArtifactObserver: Send + Sync {
     /// Publish one durable job state or progress update.
     fn on_job(&self, job: &OperationJob);
+
+    /// An artifact acquisition failed with the given [`ArtifactError::kind`].
+    /// Default no-op so an embedder that only cares about job progress
+    /// need not implement this.
+    fn on_artifact_error(&self, kind: &'static str) {
+        let _ = kind;
+    }
 }
 
 #[derive(Debug)]
@@ -324,6 +356,7 @@ impl ArtifactManager {
                     Some(&error.to_string()),
                 )?;
                 self.observer.on_job(&failed);
+                self.observer.on_artifact_error(error.kind());
                 Err(error)
             }
         }

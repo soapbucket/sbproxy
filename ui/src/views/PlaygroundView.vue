@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
-import { api, ApiError, type PlaygroundChatResult } from "../api";
+import { api, ApiError, type AdminKeySummary, type PlaygroundChatResult } from "../api";
 import { useAsync } from "../composables/useAsync";
 import { formatMs, formatNumber, formatUsd } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
@@ -10,12 +10,23 @@ import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
 
 const endpointsReq = useAsync(() => api.playgroundEndpoints());
-onMounted(endpointsReq.run);
+const keysReq = useAsync(() => api.keysList());
+function refresh() {
+  endpointsReq.run();
+  keysReq.run();
+}
+onMounted(refresh);
 
 const endpoints = computed(() => endpointsReq.data.value?.endpoints ?? []);
+// Only an active key can dispatch; a blocked or revoked one would just
+// deny once impersonated, so leave it out of the picker.
+const activeKeys = computed<AdminKeySummary[]>(() =>
+  (keysReq.data.value?.keys ?? []).filter((key) => key.status === "active"),
+);
 
 const selectedOrigin = ref("");
 const selectedModel = ref("");
+const selectedKeyId = ref("");
 const prompt = ref("");
 const sending = ref(false);
 const result = ref<PlaygroundChatResult | null>(null);
@@ -37,12 +48,17 @@ function onOriginChange() {
   selectedModel.value = originModels.value[0] ?? "";
 }
 
-// Pick a sensible default once endpoints arrive.
+// Pick a sensible default once endpoints (or keys) arrive.
 const ready = computed(() => endpoints.value.length > 0);
 watch(endpoints, (eps) => {
   if (!selectedOrigin.value && eps.length) {
     selectedOrigin.value = eps[0].origin;
     onOriginChange();
+  }
+});
+watch(activeKeys, (keys) => {
+  if (!selectedKeyId.value && keys.length) {
+    selectedKeyId.value = keys[0].key_id;
   }
 });
 
@@ -60,7 +76,14 @@ const showRaw = ref(false);
 const debugMode = ref(false);
 
 async function send() {
-  if (!selectedOrigin.value || !prompt.value.trim() || sending.value) return;
+  if (
+    !selectedOrigin.value ||
+    !selectedKeyId.value ||
+    !prompt.value.trim() ||
+    sending.value
+  ) {
+    return;
+  }
   sending.value = true;
   chatError.value = null;
   result.value = null;
@@ -70,7 +93,12 @@ async function send() {
   };
   if (selectedModel.value) request.model = selectedModel.value;
   try {
-    result.value = await api.playgroundChat({
+    // Real dispatch: this runs the request through the actual data-plane
+    // pipeline for the selected virtual key (key policy, governance,
+    // routing, guardrails all apply), rather than the bypass path
+    // `playgroundChat` used to call directly.
+    result.value = await api.playgroundDispatch({
+      key_id: selectedKeyId.value,
       origin: selectedOrigin.value,
       request,
       debug: debugMode.value,
@@ -89,7 +117,7 @@ async function send() {
     subtitle="Send a chat completion to any AI endpoint this server is configured with, and see the response, token usage, cost, and latency."
   >
     <template #actions>
-      <button class="sb-btn sb-btn--sm" @click="endpointsReq.run">Refresh endpoints</button>
+      <button class="sb-btn sb-btn--sm" @click="refresh">Refresh</button>
     </template>
   </PageHeader>
 
@@ -103,6 +131,12 @@ async function send() {
     message="No AI endpoints are configured on this server. Add an ai_proxy origin to use the playground."
   />
   <template v-else>
+    <ErrorState
+      v-if="keysReq.error.value"
+      :error="keysReq.error.value"
+      title="Could not load virtual keys"
+      @retry="keysReq.run"
+    />
     <div class="sb-card form">
       <div class="row">
         <label>
@@ -125,6 +159,18 @@ async function send() {
             placeholder="model name (provider catalog)"
           />
         </label>
+        <label>
+          <span class="lbl">Dispatch as key</span>
+          <select v-model="selectedKeyId" class="sb-input" :disabled="!activeKeys.length">
+            <option v-if="!activeKeys.length" value="">No active keys</option>
+            <option v-for="k in activeKeys" :key="k.key_id" :value="k.key_id">
+              {{ k.name || k.key_id }}
+            </option>
+          </select>
+          <span v-if="keysReq.succeeded.value && !activeKeys.length" class="sb-faint hint">
+            No active virtual keys. Create one on the Keys page first.
+          </span>
+        </label>
       </div>
       <label class="prompt-label">
         <span class="lbl">Prompt</span>
@@ -145,7 +191,8 @@ async function send() {
         <span class="sb-faint hint">Ctrl/Cmd + Enter to send</span>
         <button
           class="sb-btn sb-btn--primary"
-          :disabled="sending || !prompt.trim() || !selectedOrigin"
+          :disabled="sending || !prompt.trim() || !selectedOrigin || !selectedKeyId"
+          :title="!selectedKeyId ? 'Choose an active virtual key to dispatch as' : undefined"
           @click="send"
         >
           {{ sending ? "Sending..." : "Send" }}
@@ -216,7 +263,7 @@ async function send() {
 }
 .row {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr 1fr 1fr;
   gap: var(--sb-space-4);
 }
 label {

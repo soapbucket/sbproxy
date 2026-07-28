@@ -61,6 +61,20 @@ cargo clippy --workspace --all-targets -- -D warnings
 step "cargo doc"
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 
+step "ui typecheck and test"
+if ! command -v npm >/dev/null 2>&1; then
+  printf 'npm not found on PATH; install Node.js (https://nodejs.org) to run the UI gate. This step is required by CI, so it cannot be skipped here.\n' >&2
+  exit 1
+fi
+# npm writes node_modules/.package-lock.json reflecting the exact lockfile
+# it last installed from; reuse an install that already matches the
+# current lockfile instead of running `npm ci` (which deletes and
+# reinstalls node_modules) on every gate run.
+if [ ! -f ui/node_modules/.package-lock.json ] || [ ui/package-lock.json -nt ui/node_modules/.package-lock.json ]; then
+  (cd ui && npm ci)
+fi
+(cd ui && npm run typecheck && npm run test -- --run)
+
 step "config schema and reader coverage"
 bash "$ROOT/scripts/check-config-schema.sh"
 bash "$ROOT/scripts/check-config-readers.sh"

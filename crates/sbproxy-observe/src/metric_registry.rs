@@ -850,6 +850,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_model_directory_exclusions_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_model_directory_exclusion"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["exclusion_reason"],
+        description: "Directory nodes excluded from model routing, by exclusion reason.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_native_bypass_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_native_bypass"),
@@ -973,6 +984,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &[],
         description: "Currently open OpenAI Realtime API WebSocket sessions.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_ai_replica_selection_excluded_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_replica_selection_excluded"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["stage"],
+        description: "Managed-replica candidates excluded before rendezvous ranking, by stage.",
         dead_reason: None,
     },
     MetricCapability {
@@ -1667,6 +1689,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_key_policy_stored_rejections_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_key_policy_stored_rejection"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["reason"],
+        description: "Stored key records rejected while lowering to an effective policy, by reason.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_label_cardinality_overflow_per_tenant_total",
         kind: MetricKind::Counter,
         writer: Writer::Field("counter"),
@@ -1869,6 +1902,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_model_host_artifact_errors_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_model_host_artifact_error"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["artifact_error_kind"],
+        description: "Model artifact acquisition failures by ArtifactError kind.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_model_host_deployment_state",
         kind: MetricKind::Gauge,
         writer: Writer::Recorder("set_model_host_deployment_state"),
@@ -1948,20 +1992,13 @@ pub const METRICS: &[MetricCapability] = &[
     MetricCapability {
         name: "sbproxy_model_host_load_queue_depth",
         kind: MetricKind::Gauge,
-        writer: Writer::Nothing,
-        support: SupportLevel::ConfigOnly,
+        writer: Writer::Recorder("set_model_host_load_queue_depth"),
+        support: SupportLevel::Stable,
         compat: CompatTier::Alpha,
         registry: Registry::Default,
         labels: &["model"],
         description: "Requests queued while a model loads, by model.",
-        dead_reason: Some(
-            "nothing calls it. The setter (set_model_host_load_queue_depth, \
-             crates/sbproxy-observe/src/metrics.rs) exists and is unit-tested, but the actual \
-             queueing during a cold model load happens in sbproxy-model-host, which WOR-1903 \
-             owns exclusively while a scalar-to-set refactor lands there (see the matching \
-             REFERENCE_EXEMPTIONS entry below for SBProxyModelHostLoadQueueBackedUp). Do not \
-             wire this from this lane; WOR-1898 picks it back up once WOR-1903 clears",
-        ),
+        dead_reason: None,
     },
     MetricCapability {
         name: "sbproxy_model_host_lora_evictions_total",
@@ -1983,6 +2020,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &[],
         description: "LoRA adapters loaded onto a base engine (dynamic-paging cache misses).",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_model_host_placement_rejections_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_model_host_placement_rejection"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["deployment", "placement_reason"],
+        description: "Placement plan node rejections by deployment and reason.",
         dead_reason: None,
     },
     MetricCapability {
@@ -2734,13 +2782,7 @@ pub const METRICS: &[MetricCapability] = &[
 /// whole difference between "known dead" as a decision and "known dead" as an
 /// accident. Everything here is a panel or rule that draws a flat zero today
 /// and will draw real data when its ticket lands.
-pub const REFERENCE_EXEMPTIONS: &[ReferenceExemption] = &[ReferenceExemption {
-    metric: "sbproxy_model_host_load_queue_depth",
-    reason: "SBProxyModelHostLoadQueueBackedUp alerts on a gauge nobody sets, \
-                 so it cannot fire. The setter lives in sbproxy-model-host, which \
-                 WOR-1903 owns exclusively while the scalar-to-set refactor lands. \
-                 Wired by WOR-1898 once that clears.",
-}];
+pub const REFERENCE_EXEMPTIONS: &[ReferenceExemption] = &[];
 
 // --- Tenant-scoping guard (multi-tenant enforcement) ---
 //
@@ -2910,7 +2952,7 @@ pub fn tenant_label_gaps(
 pub fn render_markdown() -> String {
     let mut out = String::from(
         "# Metrics stability\n\
-         *Last modified: 2026-07-23*\n\n\
+         *Last modified: 2026-07-27*\n\n\
          *Generated from the executable metric registry. Do not hand-edit; run \
          `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > \
          docs/metrics-stability.md`.*\n\n\

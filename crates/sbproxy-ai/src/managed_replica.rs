@@ -172,6 +172,15 @@ impl ManagedReplicaRouter {
             }
         });
 
+        crate::ai_metrics::record_replica_selection_excluded(
+            "generation",
+            trace.excluded_generation,
+        );
+        crate::ai_metrics::record_replica_selection_excluded("health", trace.excluded_health);
+        crate::ai_metrics::record_replica_selection_excluded("endpoint", trace.excluded_endpoint);
+        crate::ai_metrics::record_replica_selection_excluded("state", trace.excluded_state);
+        crate::ai_metrics::record_replica_selection_excluded("adapter", trace.excluded_adapter);
+
         ManagedReplicaSelection { candidates, trace }
     }
 }

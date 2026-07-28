@@ -70,6 +70,13 @@
       "description": "State backends safe to select from public compression configuration.",
       "oneOf": [
         {
+          "description": "Durable lease-serialized state in the process-owned embedded database.",
+          "type": "string",
+          "enum": [
+            "local"
+          ]
+        },
+        {
           "description": "Strict Redis lease, fence, and compare-and-set storage.",
           "type": "string",
           "enum": [

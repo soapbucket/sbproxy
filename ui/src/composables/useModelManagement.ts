@@ -242,6 +242,8 @@ export function useModelManagement() {
     deploymentRows(
       canonicalDesiredDeployments.value,
       runtimeDeployments.value,
+      clusterStatusReq.data.value?.deployments ?? [],
+      clusterStatusReq.data.value?.nodes ?? [],
     ),
   );
   const hasSafePersistentRevision = computed(

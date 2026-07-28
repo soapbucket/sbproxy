@@ -474,6 +474,21 @@ impl sbproxy_model_host::ModelHostObserver for MetricsObserver {
             reason.as_str(),
         );
     }
+    fn set_load_queue_depth(&self, model: &str, depth: i64) {
+        sbproxy_observe::metrics::set_model_host_load_queue_depth(model, depth);
+    }
+}
+
+/// Records artifact acquisition failures into the `sbproxy_model_host_*`
+/// metrics. Job-progress events are not consumed here; the durable job
+/// store (`ArtifactManager::jobs`) remains the source of truth for those.
+struct ArtifactMetricsObserver;
+
+impl sbproxy_model_host::ArtifactObserver for ArtifactMetricsObserver {
+    fn on_job(&self, _job: &sbproxy_model_host::OperationJob) {}
+    fn on_artifact_error(&self, kind: &'static str) {
+        sbproxy_observe::metrics::record_model_host_artifact_error(kind);
+    }
 }
 
 /// The GPU probe for the runtime. Also used by [`crate::doctor`] so the
@@ -949,6 +964,18 @@ impl ProductionModelRuntime {
             .expect("model runtime snapshot-preparer lock")
             .clone();
         preparer.map(|preparer| preparer.cached_artifacts())
+    }
+
+    /// The durable operation job store backing this node's artifact cache,
+    /// when a production preparer is active. `None` until a model host is
+    /// configured, because no job store is open before that.
+    pub fn job_store(&self) -> Option<sbproxy_model_host::FileJobStore> {
+        let preparer = self
+            .snapshot_preparer
+            .read()
+            .expect("model runtime snapshot-preparer lock")
+            .clone();
+        preparer.map(|preparer| preparer.jobs().clone())
     }
 
     /// Count a managed deployment's prompt tokens against the model's own
@@ -1899,7 +1926,8 @@ fn build_production_manager(
     let transport = artifact_transport().map_err(anyhow::Error::msg)?;
     let artifacts = Arc::new(
         ArtifactManager::new(cache_root.clone(), transport)
-            .map_err(|error| anyhow::anyhow!("open model artifact cache: {error}"))?,
+            .map_err(|error| anyhow::anyhow!("open model artifact cache: {error}"))?
+            .with_observer(Arc::new(ArtifactMetricsObserver)),
     );
     let metadata = Arc::new(ConfigDirMetadataProvider {
         cache_root,
@@ -2881,6 +2909,52 @@ pub(crate) fn lane_class_for(priority: Option<sbproxy_ai::identity::KeyPriority>
     }
 }
 
+/// Build a `ProductionModelRuntime` with a real, empty production preparer:
+/// a durable artifact cache and job store open over `cache_root`, no
+/// configured deployments. Lets tests outside this module (e.g.
+/// `admin_model_host`) exercise the job-store-backed admin surfaces without
+/// standing up a full pipeline or touching the network.
+#[cfg(test)]
+pub(crate) fn test_runtime_with_job_store(cache_root: &Path) -> ProductionModelRuntime {
+    let catalog = Arc::new(Catalog::builtin());
+    let artifacts = Arc::new(
+        ArtifactManager::new(
+            cache_root.to_path_buf(),
+            Arc::new(sbproxy_model_host::UnavailableArtifactTransport),
+        )
+        .expect("open fixture artifact cache"),
+    );
+    let metadata = Arc::new(ConfigDirMetadataProvider {
+        cache_root: cache_root.to_path_buf(),
+        revision: "main".to_string(),
+        catalog: Arc::clone(&catalog),
+    });
+    let preparer = Arc::new(sbproxy_model_host::ProductionDeploymentPreparer::new(
+        Arc::clone(&catalog),
+        artifacts,
+        make_probe(),
+        metadata,
+        sbproxy_model_host::NetworkPolicy::Allowed,
+    ));
+    let manager = Arc::new(
+        sbproxy_model_host::ModelRuntimeManager::new(
+            catalog.catalog_revision.clone(),
+            preparer.clone(),
+        )
+        .expect("fixture manager"),
+    );
+    ProductionModelRuntime {
+        active: ArcSwap::from(manager),
+        active_catalog: ArcSwap::from(catalog),
+        foundation: RwLock::new(None),
+        snapshot_preparer: RwLock::new(Some(preparer)),
+        cluster_state: RwLock::new(None),
+        model_plane_health: AtomicU8::new(MODEL_PLANE_UNAVAILABLE),
+        epoch: AtomicU64::new(0),
+        commit_lock: tokio::sync::Mutex::new(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2904,6 +2978,43 @@ mod tests {
             context_limit: 100,
         }
         .fits());
+    }
+
+    #[test]
+    fn production_runtime_exposes_its_job_store() {
+        // Once a production preparer is active, `job_store` exposes the
+        // same durable `FileJobStore` the artifact cache writes
+        // pull/verify operations into, so admin lifecycle routes can
+        // enqueue and poll jobs through it too.
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = test_runtime_with_job_store(directory.path());
+
+        let job_store = runtime
+            .job_store()
+            .expect("job store is open once a production preparer is active");
+        let job = job_store
+            .create(
+                sbproxy_model_host::OperationKind::Load,
+                "fixture-deployment".to_string(),
+            )
+            .expect("create fixture job");
+
+        assert_eq!(
+            job_store
+                .get(&job.id)
+                .expect("read back fixture job")
+                .expect("fixture job is present"),
+            job
+        );
+    }
+
+    #[test]
+    fn empty_runtime_has_no_job_store() {
+        // Mirrors `cached_artifacts`/`artifact_cache_root`: before any
+        // model host is configured there is no open artifact cache, so
+        // there is no durable job store to hand back either.
+        let runtime = ProductionModelRuntime::empty().expect("empty runtime");
+        assert!(runtime.job_store().is_none());
     }
 
     #[test]

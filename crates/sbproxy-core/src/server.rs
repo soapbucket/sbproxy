@@ -1961,6 +1961,9 @@ enum AuthResult {
         /// Origin of `sub`.
         source: Option<sbproxy_plugin::AuthSubjectSource>,
     },
+    /// Authentication passed, but the authenticated principal exhausted
+    /// an auth-provider-owned request budget.
+    RateLimited(sbproxy_modules::RateLimitInfo),
     /// Auth failed with this status code and message.
     Deny(u16, String),
     /// Auth failed with this status code, message, and provider-supplied
@@ -1979,6 +1982,19 @@ impl AuthResult {
             sub: None,
             source: None,
         }
+    }
+}
+
+fn cap_principal_from_verified_token(
+    tenant_id: sbproxy_plugin::TenantId,
+    view: &sbproxy_modules::auth::CapTokenView,
+) -> sbproxy_plugin::Principal {
+    sbproxy_plugin::Principal {
+        tenant_id,
+        sub: view.subject.clone(),
+        source: sbproxy_plugin::PrincipalSource::Cap,
+        virtual_key: None,
+        attrs: sbproxy_plugin::PrincipalAttrs::default(),
     }
 }
 
@@ -2698,16 +2714,27 @@ async fn check_auth_with_tls_outcome(
             // the code coming from `CapError::www_auth_code()` (e.g.
             // `invalid_token`, `path_not_authorized`).
             match verifier.verify(&req, &host, path, resolved_agent_id) {
-                CapVerdict::Verified(_view) => {
-                    let principal = sbproxy_plugin::Principal {
-                        tenant_id: tenant_id.clone(),
-                        sub: String::new(),
-                        source: sbproxy_plugin::PrincipalSource::Cap,
-                        virtual_key: None,
-                        attrs: sbproxy_plugin::PrincipalAttrs::default(),
-                    };
+                CapVerdict::Verified(view) => {
+                    let principal = cap_principal_from_verified_token(tenant_id.clone(), &view);
                     (
                         AuthResult::allow_anonymous(),
+                        Some(principal),
+                        AuthTrustOutcome::Allowed,
+                    )
+                }
+                CapVerdict::RateLimited(info) => {
+                    let principal =
+                        cap_principal_from_verified_token(tenant_id.clone(), &info.token);
+                    (
+                        AuthResult::RateLimited(sbproxy_modules::RateLimitInfo {
+                            allowed: false,
+                            limit: info.limit,
+                            remaining: info.remaining,
+                            reset_secs: info.reset_secs,
+                            headers_enabled: true,
+                            include_retry_after: true,
+                            include_ratelimit_policy: false,
+                        }),
                         Some(principal),
                         AuthTrustOutcome::Allowed,
                     )
@@ -2753,7 +2780,7 @@ async fn check_auth_with_tls_outcome(
         Auth::Oidc(cfg) => {
             let result = oidc_check(cfg.as_ref(), headers);
             let trust_outcome = match &result {
-                AuthResult::Allow { .. } => AuthTrustOutcome::Allowed,
+                AuthResult::Allow { .. } | AuthResult::RateLimited(_) => AuthTrustOutcome::Allowed,
                 AuthResult::Deny(status, _) | AuthResult::DenyWithHeaders(status, _, _)
                     if *status >= 500 =>
                 {

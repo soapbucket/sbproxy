@@ -74,6 +74,8 @@ jobs:
               - 'crates/sbproxy-observe/**'
               - 'crates/sbproxy-modules/src/policy/**'
               - '.github/workflows/ci.yml'
+            ui:
+              - 'ui/**'
 
       # The workspace's full target/ + ~/.cargo/registry/ tops 14 GB on
       # GitHub-hosted runners (tract-onnx, tokenizers, kube, pingora,
@@ -226,6 +228,19 @@ jobs:
             | tar xz -C /tmp
           sudo install "/tmp/prometheus-${PROMTOOL_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
           bash scripts/check-prometheus-rules.sh
+
+      - uses: actions/setup-node@v4
+        if: steps.filter.outputs.ui == 'true'
+        with:
+          node-version: 22
+
+      - name: ui typecheck and test
+        if: steps.filter.outputs.ui == 'true'
+        working-directory: ui
+        run: |
+          npm ci
+          npm run typecheck
+          npm run test -- --run
 
       - name: cleanup build artifacts
         if: always() && steps.filter.outputs.code == 'true'

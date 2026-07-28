@@ -177,6 +177,7 @@ serde.workspace = true
 # TlsFingerprintConfig parses
 # proxy.extensions.tls_fingerprint from the operator YAML.
 serde_yaml.workspace = true
+redb.workspace = true
 
 # Regex for forward-rule path constraints and whole-path matchers
 regex.workspace = true

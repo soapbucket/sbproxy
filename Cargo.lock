@@ -8893,6 +8893,7 @@ dependencies = [
  "prometheus 0.14.0",
  "rand 0.8.6",
  "rcgen",
+ "redb",
  "regex",
  "reqwest 0.12.28",
  "rustls",

@@ -72,7 +72,10 @@ fn strategies() -> Vec<(&'static str, RoutingStrategy)> {
         ("random", RoutingStrategy::Random),
         ("least_connections", RoutingStrategy::LeastConnections),
         ("lowest_latency", RoutingStrategy::LowestLatency),
-        ("peak_ewma", RoutingStrategy::PeakEwma),
+        (
+            "peak_ewma",
+            RoutingStrategy::PeakEwma(sbproxy_ai::PeakEwmaConfig::default()),
+        ),
         ("least_token_usage", RoutingStrategy::LeastTokenUsage),
         ("prefix_affinity", RoutingStrategy::PrefixAffinity),
     ]
@@ -196,6 +199,7 @@ fn build_providers(n: usize) -> Vec<ProviderConfig> {
         .map(|i| ProviderConfig {
             name: ProviderName::from(format!("p{i}")),
             provider_type: None,
+            deployment: None,
             api_key: None,
             base_url: None,
             models: Vec::new(),
@@ -212,6 +216,7 @@ fn build_providers(n: usize) -> Vec<ProviderConfig> {
             disable_forwarded_host_header: false,
             allow_private_base_url: false,
             no_prompt_training: false,
+            serve: None,
         })
         .collect()
 }

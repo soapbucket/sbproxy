@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-07-26*
+*Last modified: 2026-07-27*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -787,12 +787,15 @@ a broken link.
 
 ## AI compression session state
 
-These routes operate on the external running-summary state used by
+These routes operate on the durable running-summary state used by
 `origins[].action.compression` policies on `ai_proxy` handlers. They expose only
-the globally configured Redis compression store for metadata, deletion, and
-purge operations. Summary-content inspection additionally requires an active
-origin policy that opts in. Records use opaque, canonical 64-character
-lowercase hexadecimal IDs. See
+the Local, Redis, and mesh adapters captured by the current immutable pipeline
+for metadata, deletion, and purge operations. Admin requests never open a Local
+database themselves. An existing process-owned Local database remains
+discoverable after its last active `summary_buffer` policy is removed, while a
+missing dormant path is not created for Admin. Summary-content inspection
+additionally requires an active origin policy that opts in. Records use opaque,
+canonical 64-character lowercase hexadecimal IDs. See
 [AI context compression](ai-context-compression.md) for the data-plane policy,
 session identity, and request eligibility rules.
 
@@ -818,8 +821,8 @@ record endpoint places the same object in `record`.
 | Field | Type | Description |
 |---|---|---|
 | `id` | string | Opaque canonical record ID, 64 lowercase hexadecimal characters. |
-| `backend` | string | `redis` or `mesh`. |
-| `consistency` | string | `serialized` for Redis records, `eventual_lww` for mesh records. |
+| `backend` | string | `local`, `redis`, or `mesh`. |
+| `consistency` | string | `serialized` for Local and Redis records, `eventual_lww` for mesh records. |
 | `schema_version` | int | External record serialization schema version. |
 | `tenant_id` | string | Tenant isolation and filtering boundary. |
 | `origin` | string | Normalized AI handler hostname. |
@@ -831,11 +834,11 @@ record endpoint places the same object in `record`.
 | `summarizer_provider` | string | Configured internal summarizer provider name. |
 | `summarizer_model` | string | Configured internal summarizer model name. |
 | `writer_node` | string | Configured cluster node ID, or the literal `standalone` outside cluster mode. It is not a credential or guaranteed unique process ID. |
-| `conflict_detected` | bool | Always `false` for the serialized Redis backend. On the mesh backend, `true` when the record survived a deterministic merge of competing equal-version updates. |
+| `conflict_detected` | bool | Always `false` for serialized Local and Redis backends. On the mesh backend, `true` when the record survived a deterministic merge of competing equal-version updates. |
 | `created_at_unix_ms` | int | Creation time in Unix milliseconds. |
 | `updated_at_unix_ms` | int | Last update time in Unix milliseconds. |
 | `expires_at_unix_ms` | int | Backend expiration time in Unix milliseconds. |
-| `kind` | string | `live` for Redis records returned by these endpoints. Mesh records can also report `tombstone` while a replicated deletion marker is retained; tombstone entries carry empty content metadata. |
+| `kind` | string | `live` for Local and Redis records returned by these endpoints. Mesh records can also report `tombstone` while a replicated deletion marker is retained; tombstone entries carry empty content metadata. |
 
 Metadata never contains `summary`, a raw session ID, raw messages, protected or
 covered message digests, or credential material. The opaque ID is derived from
@@ -881,17 +884,22 @@ Supported query parameters:
 |---|---|---|
 | `tenant` | non-empty string | Exact tenant filter. |
 | `origin` | non-empty hostname | Origin filter. Input is trimmed, lowercased, and has a trailing dot removed. |
-| `backend` | `redis`, `mesh` | Restrict the scan to one configured backend. Any other value returns `400`. |
+| `backend` | `local`, `redis`, `mesh` | Restrict the scan to one configured backend. Any other value returns `400`. |
 | `conflict` | `true`, `false` | Match `conflict_detected`. |
 | `cursor` | opaque string | Continue from `next_cursor` returned by the preceding list call. |
 | `limit` | positive integer | Page size. Defaults to 100; values above the maximum of 500 are clamped to 500. |
 
 Parameters may appear only once. Unknown or duplicate parameters, invalid
 booleans or backends, a zero or non-integer limit, and an invalid cursor return
-`400`. Redis listing scans the shared Redis namespace through bounded pages and
-an opaque cursor. Redis expires records at their TTL, so expired records are
-not retained as a separate Admin-visible collection and cannot be filtered.
-Mesh listing walks the replicated substrate's topology-safe fleet pagination:
+`400`. Without a backend filter, the cross-store order is Redis, mesh, then
+Local, and the Admin cursor carries both the selected store and its opaque
+store cursor. Local listing performs a bounded redb scan and returns only
+content-free metadata; it never serializes a summary into the
+response. Redis listing scans the shared Redis namespace through bounded pages.
+Local and Redis expire records at their TTL, so expired records are not
+retained as a separate Admin-visible collection and cannot be filtered. Mesh
+listing walks the replicated substrate's
+topology-safe fleet pagination:
 a record held by any current cluster member is listed, a cursor keeps working
 while nodes join or leave, and a record replicated on several nodes can appear
 in more than one page, so collapse results by `id`. If a current member cannot
@@ -969,8 +977,8 @@ expired records return `404`; a disabled handler returns
 
 ### `DELETE /admin/compression/sessions/{id}`
 
-Deletion runs against the globally configured Redis compression store. Success is always
-`200`, including when no live record existed:
+Deletion runs against every adapter captured by the current pipeline snapshot.
+Success is always `200`, including when no live record existed:
 
 ```json
 {
@@ -979,26 +987,30 @@ Deletion runs against the globally configured Redis compression store. Success i
 }
 ```
 
-`deleted` is true when Redis removed live state. Redis does not return a
-logical version, so `logical_versions` is empty. Repeating the delete is safe
-and returns `"deleted": false`.
+`deleted` is true when Local or Redis removed live state, or mesh committed a
+new tombstone. Local and Redis do not return a logical version. Mesh includes
+its tombstone version as `logical_versions.mesh`; with no mesh store the map is
+empty. Repeating the delete is safe and returns `"deleted": false` after every
+selected backend has already removed or tombstoned the record.
 
-Redis atomically removes the record and active lease, then increments a
-retained fence so an in-flight writer cannot recreate deleted state. A later
-eligible request with the same captured session can create a new record;
-deletion clears summary state, not the caller's session identity.
+Local atomically removes the record and active lease in one redb transaction;
+an in-flight permit then fails closed. Redis atomically removes the record and
+lease and advances its retained deletion fence. Mesh writes a replicated
+tombstone. A later eligible request with the same captured session can create a
+new record; deletion clears summary state, not the caller's session identity.
 
 ### `POST /admin/compression/sessions/purge`
 
-Purge deletes one bounded Redis page. The JSON body is strict and
-accepts only these fields:
+Purge deletes one bounded page from the selected adapter. With no backend
+filter, continuation advances through Redis, mesh, then Local. The JSON body is
+strict and accepts only these fields:
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `tenant` | string | unset | Exact tenant scope. Must not be empty. |
 | `origin` | string | unset | Normalized origin scope. Must not be empty. |
 | `conflict` | bool | unset | Match the record's `conflict_detected` value. This narrows a tenant or origin scope but is not a destructive boundary by itself. |
-| `backend` | string | unset | `redis`. This narrows execution but is not, by itself, a destructive scope. |
+| `backend` | string | unset | `local`, `redis`, or `mesh`. This narrows execution but is not, by itself, a destructive scope. |
 | `cursor` | string | unset | Opaque `next_cursor` from the preceding purge call. It is not a destructive scope. |
 | `limit` | int | 100 | Positive page size. Values above the maximum of 500 are clamped to 500. It is not a destructive scope. |
 | `all` | bool | `false` | Permit an otherwise unscoped purge. When true, exact confirmation is mandatory. |
@@ -1006,7 +1018,7 @@ accepts only these fields:
 
 Without `all`, at least one of `tenant` or `origin` must be present. `conflict`,
 backend, cursor, and limit may narrow that scope but do not establish a deletion
-boundary. Requests such as `{"conflict":false}` or `{"backend":"redis"}` are
+boundary. Requests such as `{"conflict":false}` or `{"backend":"local"}` are
 rejected. An all-record purge
 must use this exact shape, optionally with `backend`, `cursor`, or `limit`:
 
@@ -1031,10 +1043,10 @@ Repeating a deletion is safe.
 Invalid requests and cursors return `400`. An unavailable backend returns
 `503 {"error":"compression state unavailable"}`. Corrupt or unsupported
 record bytes return `503` when an operation must decode them, including list,
-detail, purge, and content inspection. Delete removes the addressed Redis bytes
-without decoding them. List and detail never return a partial metadata body on
-those errors. Delete and purge are idempotent; retry with the same ID, scope,
-and cursor after a transient backend failure.
+detail, purge, and content inspection. Local and Redis deletion can remove
+addressed corrupt bytes without returning content. List and detail never return
+a partial metadata body on those errors. Delete and purge are idempotent; retry
+with the same ID, scope, and cursor after a transient backend failure.
 
 ### Curl examples
 

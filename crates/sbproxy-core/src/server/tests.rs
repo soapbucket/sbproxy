@@ -6,6 +6,23 @@
 use super::*;
 
 #[test]
+fn cap_principal_preserves_verified_subject() {
+    let view = sbproxy_modules::auth::CapTokenView {
+        jti: "cap-jti".to_string(),
+        subject: "agent_acme_001".to_string(),
+        max_rps: 1.0,
+        max_bytes_per_day: 1024,
+        route_glob: "/**".to_string(),
+    };
+
+    let principal = cap_principal_from_verified_token(test_tenant(), &view);
+
+    assert_eq!(principal.sub, "agent_acme_001");
+    assert_eq!(principal.source, sbproxy_plugin::PrincipalSource::Cap);
+    assert!(!principal.is_anonymous());
+}
+
+#[test]
 fn forward_auth_refusals_require_explicit_invalid_proof_evidence() {
     let no_challenge = reqwest::header::HeaderMap::new();
     assert_eq!(
@@ -612,6 +629,7 @@ async fn bot_auth_rejects_signature_bound_to_different_path() {
         "expected Deny(401) when @target-uri does not match signed path; got {:?}",
         match result {
             AuthResult::Allow { .. } => "Allow",
+            AuthResult::RateLimited(_) => "RateLimited",
             AuthResult::Deny(s, _) => Box::leak(format!("Deny({s})").into_boxed_str()),
             AuthResult::DenyWithHeaders(s, _, _) => {
                 Box::leak(format!("DenyWithHeaders({s})").into_boxed_str())
@@ -787,6 +805,7 @@ impl AuthProvider for ErrorAuthProvider {
 fn auth_result_label(r: &AuthResult) -> String {
     match r {
         AuthResult::Allow { .. } => "Allow".to_string(),
+        AuthResult::RateLimited(_) => "RateLimited".to_string(),
         AuthResult::Deny(s, m) => format!("Deny({s}, {m:?})"),
         AuthResult::DenyWithHeaders(s, m, h) => {
             format!("DenyWithHeaders({s}, {m:?}, {} headers)", h.len())

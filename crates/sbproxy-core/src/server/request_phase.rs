@@ -137,6 +137,19 @@ pub(super) async fn resolve_inbound_key(
     headers: &http::HeaderMap,
     ctx: &mut RequestContext,
 ) -> InboundKeyPhase {
+    // Playground impersonation ticket: always presented as a Bearer token
+    // on `Authorization`, independent of the operator's configured sweep
+    // headers (`plane.inbound().headers`), since this is an
+    // internal admin-minted credential rather than a caller-presented
+    // key. A hit resolves straight to the impersonated key's real, stored
+    // policy through the same `ctx.resolved_inbound_key` path an
+    // ordinarily-presented minted key uses below; a header that carries
+    // no ticket-shaped token at all falls through to the ordinary sweep
+    // unchanged.
+    if let Some(outcome) = resolve_impersonation_ticket(plane, headers, ctx).await {
+        return outcome;
+    }
+
     let (header, token) = match crate::inbound_key::sweep_headers(headers, plane.inbound()) {
         crate::inbound_key::SweepOutcome::None => return InboundKeyPhase::NotPresent,
         crate::inbound_key::SweepOutcome::Ambiguous => {
@@ -200,6 +213,91 @@ pub(super) async fn resolve_inbound_key(
 
 fn finalize_inbound_key_trust(ctx: &mut RequestContext, trust_outcome: AuthTrustOutcome) {
     crate::trust_tier::finalize(ctx, trust_outcome.is_suspicious());
+}
+
+/// Recognize and consume a playground impersonation ticket
+/// (`admin_playground::ticket`) presented as `Authorization: Bearer
+/// <sbpgtkt_...>`. Returns `None` when the header carries no
+/// ticket-shaped token at all (absent, not Bearer, or a different
+/// prefix), so the caller falls through to the ordinary sweep unchanged.
+/// Once a ticket-shaped token has actually been presented, this always
+/// returns `Some`: a wrong/expired/reused ticket denies with the same
+/// 401 an unknown minted key gets, rather than silently falling through
+/// to whatever auth the origin has configured.
+///
+/// Redemption is bound to a loopback peer: `admin_playground`'s dispatch
+/// route is the only legitimate minter and it always redeems its own
+/// ticket via a direct loopback call, so nothing outside this process
+/// should ever be able to present one. Checked before consuming (not
+/// after), so a wrong-peer attempt cannot burn a ticket the legitimate
+/// loopback caller still needs.
+async fn resolve_impersonation_ticket(
+    plane: &crate::key_plane::KeyPlane,
+    headers: &http::HeaderMap,
+    ctx: &mut RequestContext,
+) -> Option<InboundKeyPhase> {
+    let auth = headers.get("authorization")?.to_str().ok()?;
+    let token = auth
+        .strip_prefix("Bearer ")
+        .or_else(|| auth.strip_prefix("bearer "))
+        .unwrap_or(auth)
+        .trim();
+    if !token.starts_with(crate::admin_playground::ticket::PREFIX) {
+        return None;
+    }
+    if !ctx.client_ip.is_some_and(|ip| ip.is_loopback()) {
+        return Some(InboundKeyPhase::Deny {
+            status: 401,
+            message: "invalid key".to_string(),
+            trust_outcome: AuthTrustOutcome::InvalidProof,
+        });
+    }
+    let Some(key_id) = crate::admin_playground::ticket::consume(token) else {
+        return Some(InboundKeyPhase::Deny {
+            status: 401,
+            message: "invalid key".to_string(),
+            trust_outcome: AuthTrustOutcome::InvalidProof,
+        });
+    };
+    let now = chrono::Utc::now();
+    Some(match plane.cache().resolve_key(&key_id).await {
+        Err(e) => {
+            if plane.failure_mode_allow() {
+                tracing::warn!(
+                    error = %e,
+                    "key store unavailable; failure_mode_allow set, falling through to configured auth"
+                );
+                InboundKeyPhase::NotPresent
+            } else {
+                InboundKeyPhase::Deny {
+                    status: 503,
+                    message: "key store unavailable".to_string(),
+                    trust_outcome: AuthTrustOutcome::BackendFailure,
+                }
+            }
+        }
+        Ok(None) => InboundKeyPhase::Deny {
+            status: 401,
+            message: "invalid key".to_string(),
+            trust_outcome: AuthTrustOutcome::InvalidProof,
+        },
+        Ok(Some(rec)) => {
+            if !rec.is_usable(now) {
+                InboundKeyPhase::Deny {
+                    status: 403,
+                    message: "key is not active".to_string(),
+                    trust_outcome: AuthTrustOutcome::InvalidProof,
+                }
+            } else {
+                // Same field a normally-swept key stamps, so the ticket
+                // (like the key it names) is stripped before the request
+                // goes upstream and never leaks past this process.
+                ctx.inbound_key_header = Some("authorization".to_string());
+                ctx.resolved_inbound_key = Some(Box::new(rec));
+                InboundKeyPhase::Resolved
+            }
+        }
+    })
 }
 
 /// Handle an incoming request before proxying. See the trait method
@@ -2441,7 +2539,10 @@ pub(super) async fn request_filter(
             // `request_body_filter` buffers the body and runs
             // `verify_content_digest` against the Content-Digest
             // header value the signature attests to.
-            let auth_succeeded = matches!(auth_result, AuthResult::Allow { .. });
+            let auth_succeeded = matches!(
+                auth_result,
+                AuthResult::Allow { .. } | AuthResult::RateLimited(_)
+            );
             if auth_succeeded && matches!(auth, Auth::BotAuth(_)) {
                 #[cfg(feature = "agent-class")]
                 if let Some(keyid) = bot_auth_keyid.as_deref() {
@@ -2475,6 +2576,29 @@ pub(super) async fn request_filter(
                 AuthResult::Allow { sub, source } => {
                     ctx.auth_result = Some(sbproxy_plugin::AuthDecision::Allow { sub, source });
                     sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, true);
+                }
+                AuthResult::RateLimited(info) => {
+                    ctx.auth_result = Some(sbproxy_plugin::AuthDecision::allow_anonymous());
+                    sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, true);
+                    crate::trust_tier::finalize(ctx, false);
+                    let extra_headers = vec![
+                        ("X-RateLimit-Limit".to_string(), info.limit.to_string()),
+                        (
+                            "X-RateLimit-Remaining".to_string(),
+                            info.remaining.to_string(),
+                        ),
+                        ("X-RateLimit-Reset".to_string(), info.reset_secs.to_string()),
+                        ("Retry-After".to_string(), info.reset_secs.to_string()),
+                    ];
+                    ctx.rate_limit_info = Some(info);
+                    send_error_with_extra_headers(
+                        session,
+                        429,
+                        "cap: rate limit exceeded",
+                        &extra_headers,
+                    )
+                    .await?;
+                    return Ok(true);
                 }
                 AuthResult::Deny(status, ref msg) => {
                     sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, false);
@@ -5397,6 +5521,15 @@ mod inbound_key_phase_tests {
         RequestContext::default()
     }
 
+    /// A context whose peer looks like the admin server's own loopback
+    /// dispatch call, the only shape an impersonation ticket is ever
+    /// allowed to redeem from.
+    fn loopback_ctx() -> RequestContext {
+        let mut c = ctx();
+        c.client_ip = Some("127.0.0.1".parse().unwrap());
+        c
+    }
+
     fn assert_denial(
         outcome: InboundKeyPhase,
         expected_status: u16,
@@ -5522,6 +5655,103 @@ mod inbound_key_phase_tests {
         let outcome = resolve_inbound_key(&plane, &headers(&[("x-api-key", &token)]), &mut c).await;
 
         assert_denial(outcome, 503, AuthTrustOutcome::BackendFailure);
+    }
+
+    #[tokio::test]
+    async fn an_impersonation_ticket_resolves_to_the_named_key() {
+        let (plane, token, _) = plane_with_keys().await;
+        let key_id = token[4..20].to_string();
+        let ticket = crate::admin_playground::ticket::mint(&key_id);
+        let mut c = loopback_ctx();
+        let h = headers(&[("authorization", &format!("Bearer {ticket}"))]);
+        let outcome = resolve_inbound_key(&plane, &h, &mut c).await;
+        assert!(matches!(outcome, InboundKeyPhase::Resolved), "{outcome:?}");
+        assert_eq!(
+            c.resolved_inbound_key
+                .as_ref()
+                .map(|rec| rec.key_id.clone()),
+            Some(key_id)
+        );
+        // Same stripping path a normal minted key uses, so the ticket
+        // never reaches the upstream origin.
+        assert_eq!(c.inbound_key_header.as_deref(), Some("authorization"));
+    }
+
+    #[tokio::test]
+    async fn a_consumed_impersonation_ticket_cannot_be_replayed() {
+        let (plane, token, _) = plane_with_keys().await;
+        let key_id = token[4..20].to_string();
+        let ticket = crate::admin_playground::ticket::mint(&key_id);
+        let h = headers(&[("authorization", &format!("Bearer {ticket}"))]);
+
+        let mut first = loopback_ctx();
+        assert!(matches!(
+            resolve_inbound_key(&plane, &h, &mut first).await,
+            InboundKeyPhase::Resolved
+        ));
+
+        let mut second = loopback_ctx();
+        let outcome = resolve_inbound_key(&plane, &h, &mut second).await;
+        assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
+    }
+
+    #[tokio::test]
+    async fn an_impersonation_ticket_for_a_revoked_key_denies_403() {
+        let (plane, _, revoked) = plane_with_keys().await;
+        let key_id = revoked[4..20].to_string();
+        let ticket = crate::admin_playground::ticket::mint(&key_id);
+        let mut c = loopback_ctx();
+        let h = headers(&[("authorization", &format!("Bearer {ticket}"))]);
+        let outcome = resolve_inbound_key(&plane, &h, &mut c).await;
+        assert_denial(outcome, 403, AuthTrustOutcome::InvalidProof);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_impersonation_ticket_denies_401() {
+        let (plane, _, _) = plane_with_keys().await;
+        let mut c = loopback_ctx();
+        let h = headers(&[(
+            "authorization",
+            &format!("Bearer {}deadbeef", crate::admin_playground::ticket::PREFIX),
+        )]);
+        let outcome = resolve_inbound_key(&plane, &h, &mut c).await;
+        assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
+    }
+
+    #[tokio::test]
+    async fn an_impersonation_ticket_from_a_non_loopback_peer_denies_401_and_is_not_consumed() {
+        let (plane, token, _) = plane_with_keys().await;
+        let key_id = token[4..20].to_string();
+        let ticket = crate::admin_playground::ticket::mint(&key_id);
+        let h = headers(&[("authorization", &format!("Bearer {ticket}"))]);
+
+        // A valid, unexpired, never-redeemed ticket presented from
+        // somewhere other than the admin server's own loopback dispatch
+        // must be denied exactly like an unknown one.
+        let mut off_loopback = ctx();
+        off_loopback.client_ip = Some("10.0.0.5".parse().unwrap());
+        let outcome = resolve_inbound_key(&plane, &h, &mut off_loopback).await;
+        assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
+
+        // The wrong-peer attempt must not have burned the ticket: the
+        // legitimate loopback caller can still redeem it afterward.
+        let mut loopback = loopback_ctx();
+        let outcome = resolve_inbound_key(&plane, &h, &mut loopback).await;
+        assert!(matches!(outcome, InboundKeyPhase::Resolved), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_normal_bearer_token_is_unaffected_by_ticket_recognition() {
+        // The normal minted-key path (not a ticket at all) must be
+        // untouched: same outcome as before this feature existed.
+        let (plane, token, _) = plane_with_keys().await;
+        let mut c = ctx();
+        let h = headers(&[("authorization", &format!("Bearer {token}"))]);
+        assert!(matches!(
+            resolve_inbound_key(&plane, &h, &mut c).await,
+            InboundKeyPhase::Resolved
+        ));
+        assert_eq!(c.inbound_key_header.as_deref(), Some("authorization"));
     }
 
     #[test]

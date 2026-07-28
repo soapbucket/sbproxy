@@ -599,6 +599,21 @@ fn default_resolver_cache_size() -> usize {
 
 // --- Server Config ---
 
+/// Process-owned settings for the embedded compression-state database.
+///
+/// This block controls where the process opens its durable Local backend.
+/// It is intentionally independent of route-level compression policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompressionStateRuntimeConfig {
+    /// Explicit absolute path to the redb database file.
+    ///
+    /// When omitted, startup selects the first suitable platform state
+    /// directory. Validation checks only the string contract; filesystem
+    /// availability is a startup concern.
+    pub local_path: Option<String>,
+}
+
 /// Server-level proxy configuration parsed from the top-level `proxy:`
 /// block of sb.yml.
 ///
@@ -707,6 +722,9 @@ pub struct ProxyServerConfig {
     /// so an existing config keeps the backend it has today.
     #[serde(default)]
     pub response_cache_store: Option<ResponseCacheStoreConfig>,
+    /// Process-owned path configuration for durable Local compression state.
+    #[serde(default)]
+    pub compression_state: Option<CompressionStateRuntimeConfig>,
     /// Optional shared message bus for inter-component eventing (config
     /// updates, semantic-cache purges, etc.). When unset, components that
     /// need a bus degrade to no-op semantics.
@@ -873,6 +891,7 @@ impl Default for ProxyServerConfig {
             l2_cache: None,
             cache_reserve: None,
             response_cache_store: None,
+            compression_state: None,
             messenger_settings: None,
             ai_providers_file: None,
             device_parser_file: None,
@@ -1928,6 +1947,29 @@ pub const FORBIDDEN_SWEEP_HEADERS: &[&str] = &[
     "cookie",
 ];
 
+/// Whether a header is unavailable as an inbound or outbound credential
+/// carrier.
+///
+/// In addition to headers that cannot be swept safely, credentials may not
+/// claim realtime handshake metadata, distributed tracing state, or outbound
+/// Web Bot Auth signature fields. Those values have independent protocol
+/// meaning and are written by the proxy.
+pub fn credential_header_is_reserved(header: &str) -> bool {
+    let lower = header.trim().to_ascii_lowercase();
+    FORBIDDEN_SWEEP_HEADERS.contains(&lower.as_str())
+        || matches!(
+            lower.as_str(),
+            "upgrade"
+                | "openai-beta"
+                | "traceparent"
+                | "tracestate"
+                | "signature-input"
+                | "signature"
+                | "signature-agent"
+        )
+        || lower.starts_with("sec-websocket-")
+}
+
 fn default_inbound_headers() -> Vec<InboundHeaderConfig> {
     vec![
         InboundHeaderConfig {
@@ -1962,9 +2004,9 @@ impl KeyInboundConfig {
                     entry.name
                 ));
             }
-            if FORBIDDEN_SWEEP_HEADERS.contains(&lower.as_str()) {
+            if credential_header_is_reserved(&lower) {
                 return Err(format!(
-                    "key_management.inbound.headers: {:?} may not be swept for a key",
+                    "key_management.inbound.headers: {:?} may not carry a key",
                     entry.name
                 ));
             }
@@ -8789,6 +8831,30 @@ mod inbound_key_header_tests {
             let cfg = KeyInboundConfig {
                 headers: vec![InboundHeaderConfig {
                     name: (*forbidden).to_string(),
+                    scheme: String::new(),
+                }],
+                require: false,
+                provider_hints: Vec::new(),
+            };
+            assert!(cfg.validate().is_err(), "{forbidden} must be rejected");
+        }
+    }
+
+    #[test]
+    fn inbound_validation_rejects_realtime_protocol_and_proxy_owned_headers() {
+        for forbidden in [
+            "OpenAI-Beta",
+            "SEC-WebSocket-Key",
+            "Upgrade",
+            "TraceParent",
+            "TRACESTATE",
+            "Signature-Input",
+            "Signature",
+            "Signature-Agent",
+        ] {
+            let cfg = KeyInboundConfig {
+                headers: vec![InboundHeaderConfig {
+                    name: forbidden.to_string(),
                     scheme: String::new(),
                 }],
                 require: false,
