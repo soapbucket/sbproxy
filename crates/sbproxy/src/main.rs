@@ -2902,11 +2902,12 @@ fn handle_service_install(args: &ServiceInstallArgs) -> anyhow::Result<i32> {
         paths.config.parent(),
         paths.plist.parent(),
         paths.stdout_log.parent(),
-    ] {
-        if let Some(dir) = dir {
-            std::fs::create_dir_all(dir)
-                .map_err(|error| anyhow::anyhow!("create '{}': {error}", dir.display()))?;
-        }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        std::fs::create_dir_all(dir)
+            .map_err(|error| anyhow::anyhow!("create '{}': {error}", dir.display()))?;
     }
 
     // The config must persist for launchd to reread on every future load,
