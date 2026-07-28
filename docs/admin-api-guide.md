@@ -1,6 +1,6 @@
 # Admin API guide
 
-*Last modified: 2026-07-25*
+*Last modified: 2026-07-28*
 
 This is the task-oriented "how do I call it" guide to the embedded admin
 server: enabling it, authenticating, and a curl cookbook for the routes
@@ -261,6 +261,62 @@ curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" -X POST \
   }' | jq '{status, model, usage, cost_usd, latency_ms}'
 ```
 
+**Run a chat completion through the real pipeline instead** (impersonates
+a chosen virtual key with a short-lived, single-use ticket and makes a
+genuine loopback call into the server's own data-plane listener, so key
+policy, governance, routing, and guardrails apply exactly as they would
+for that key's own traffic. Plain-HTTP origins only; an origin with
+`force_ssl` set answers `501`):
+
+```bash
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" -X POST \
+  "${SB_ADMIN_URL}/admin/api/playground/dispatch" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "key_id": "key_abc123",
+    "origin": "ai.example.com",
+    "request": {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "ping"}]}
+  }' | jq '{status, model, usage, cost_usd, latency_ms}'
+```
+
+**Load or evict a model and follow the job to completion.** `load` and
+`evict` answer `202` with a `job_id` and `poll_url` when a durable job
+store is configured, rather than blocking the request on the engine work;
+with no job store configured (no production model host) they fall back
+to the previous synchronous `200`:
+
+```bash
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" -X POST "${SB_ADMIN_URL}/admin/model-host/load" \
+  -H 'Content-Type: application/json' \
+  -d '{"deployment": "qwen2.5-0.5b-instruct"}'
+# {"schema_version":1,"deployment":"qwen2.5-0.5b-instruct","state":"queued",
+#  "job_id":"01J...","poll_url":"/admin/model-host/jobs/01J..."}
+
+# Poll it directly:
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" "${SB_ADMIN_URL}/admin/model-host/jobs/01J..." | jq
+
+# List every retained job (active plus recent terminal history):
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" "${SB_ADMIN_URL}/admin/model-host/jobs" \
+  | jq '.jobs[] | {id, kind, state}'
+```
+
+**Or tail the job instead of polling it.** Each event carries an `id:`
+line (its replay sequence number); an `EventSource` client echoes that
+back as `Last-Event-ID` on reconnect, and the server replays anything
+missed since that sequence before resuming the live tail. The stream
+closes on its own once the job reaches a terminal state:
+
+```bash
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" -H "Accept: text/event-stream" \
+  "${SB_ADMIN_URL}/admin/model-host/jobs/01J.../stream"
+
+# Resume after the connection drops, replaying anything published since
+# sequence 3:
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
+  -H "Accept: text/event-stream" -H "Last-Event-ID: 3" \
+  "${SB_ADMIN_URL}/admin/model-host/jobs/01J.../stream"
+```
+
 **Spend and the recent-request log:**
 
 ```bash
@@ -287,6 +343,27 @@ returns a single-node view otherwise):
 ```bash
 curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" "${SB_ADMIN_URL}/admin/cluster/status" \
   | jq '{summary, unhealthy_nodes}'
+```
+
+**Fleet VRAM** (summed across every currently eligible cluster node; a
+node that has dropped out of eligibility, is stale, or has never
+reported contributes nothing, rather than a guessed or stale value):
+
+```bash
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" "${SB_ADMIN_URL}/admin/cluster/vram" \
+  | jq '{cluster, nodes}'
+```
+
+**A key reading its own usage.** Unlike everything else in this
+cookbook, `GET /v1/key/usage` is a **data-plane** route: it answers on
+`proxy.http_bind_port` (not the admin port), and it authenticates with
+the caller's own virtual key bearer token, not an admin credential.
+There is no key-id parameter; it always answers for whichever key
+presented the bearer token:
+
+```bash
+curl -fsS -H "Authorization: Bearer ${SB_VIRTUAL_KEY}" \
+  "http://127.0.0.1:8080/v1/key/usage" | jq
 ```
 
 ## Where to go next

@@ -34,6 +34,82 @@ the next version cut.
   token and resource requests. Method and URI binding, access-token hashes,
   nonce challenges, retry bounds, and proof-header redaction are enforced.
   See [`docs/outbound-dpop.md`](docs/outbound-dpop.md).
+- **The admin API exposes model-host lifecycle jobs.** `GET
+  /admin/model-host/jobs` and `GET /admin/model-host/jobs/{id}` list and read
+  durable load/evict operations. `GET /admin/model-host/jobs/{id}/stream`
+  tails one job's progress as `text/event-stream`, with `Last-Event-ID`
+  reconnect replay. `POST /admin/model-host/load` and `/evict` now answer
+  `202` with a `job_id` and `poll_url` when a durable job store is
+  configured, instead of blocking the request until the engine finishes;
+  with no job store configured they keep the previous synchronous `200`
+  contract. See [`docs/admin-api-guide.md`](docs/admin-api-guide.md).
+- **The admin console playground dispatches through the real request
+  pipeline.** `POST /admin/api/playground/dispatch` impersonates a chosen
+  virtual key with a short-lived, single-use ticket and makes a genuine
+  loopback call into the server's own data-plane listener, so key policy,
+  governance, routing, and guardrails run exactly as they would for that
+  key's real traffic. Plain-HTTP AI origins only; an origin with
+  `force_ssl` set answers `501`. The existing `POST
+  /admin/api/playground/chat` (calls the AI client directly, bypassing the
+  data plane) is unchanged.
+- **A data-plane route reports a caller's own usage.** `GET /v1/key/usage`
+  returns the resolved caller's governance snapshot (requests, tokens,
+  spend, remaining budget), scoped strictly to its own key id. There is no
+  key-id parameter, so a key can never read another key's usage.
+- **Fleet VRAM aggregation and new admin console views.** `GET
+  /admin/cluster/vram` sums VRAM totals across every currently eligible
+  cluster node. The admin console adds a Get Started onboarding view, a
+  Jobs view backed by the new job API, four axes per deployment on the
+  Model host view instead of two (desired / runtime / assignment /
+  live-replica state), and a per-replica disclosure in the cluster node
+  roster.
+- **`sbproxy service install|uninstall|status` runs a model as a background
+  launchd agent on macOS.** `install` generates the same secure loopback
+  config `sbproxy run` would, persists it under `~/Library/Application
+  Support/sbproxy/service/`, and registers a per-user `launchd` agent that
+  restarts on failure; `uninstall` unloads and removes it; `status` reports
+  whether it is registered and running. See
+  [`docs/manual.md`](docs/manual.md).
+- **Recommended-model catalog entries are pinned.** Six of the seven
+  built-in `models.yaml` recommended entries now carry exact `variants:`
+  blocks (sha256, size, revision) instead of resolving loosely at pull
+  time.
+- **Worker and gateway container images are split, with a generic cloud
+  bootstrap script.** `Dockerfile.worker` (CUDA + vLLM) and
+  `Dockerfile.gateway` (lightweight, no GPU stack) replace one combined
+  image. `deploy/terraform/l4-demo/bootstrap-generic.sh` is a
+  cloud-agnostic install/validate/start script driven entirely by
+  environment variables, used by both the GCP Terraform path and
+  `cloud-init.yaml`. See [`docs/build.md`](docs/build.md).
+- **vLLM prefix caching is a config flag.** `enable_prefix_caching` on a
+  managed vLLM deployment emits `--enable-prefix-caching`. See
+  [`docs/model-host.md`](docs/model-host.md).
+- **An opt-in Xet-aware weight transport is available behind a feature
+  flag.** The new `hf-xet-transport` Cargo feature (off by default) adds a
+  second artifact transport built on `hf-hub` 1.0's managed, Xet-aware
+  client. It is not wired into the default build or either production
+  transport call site yet; this ships the transport for a follow-up to
+  adopt.
+- **Six new AI providers.** AI21 Labs (Jamba), Clarifai, Inception Labs
+  (Mercury), Azure AI Foundry Models, Snowflake Cortex, and Sarvam AI,
+  bringing the native provider catalog to 72. See
+  [`docs/providers.md`](docs/providers.md).
+- **OTLP metrics export actually exports.** `telemetry.export_metrics:
+  true` previously did nothing; boot now wires the metrics pipeline, and
+  fails loud if `export_metrics: true` is set without `enabled: true`.
+- **Six new self-host observability metrics, with alerts and dashboard
+  panels.** The previously dead `sbproxy_model_host_load_queue_depth` gauge
+  is now wired to a real signal, and five new counters cover artifact
+  acquisition failures (`sbproxy_model_host_artifact_errors_total`),
+  model-directory exclusions
+  (`sbproxy_ai_model_directory_exclusions_total`), replica-selection
+  exclusions (`sbproxy_ai_replica_selection_excluded_total`), placement
+  rejections (`sbproxy_model_host_placement_rejections_total`), and the
+  key-policy budget fail-closed path
+  (`sbproxy_key_policy_stored_rejections_total`). See
+  [`docs/metrics-stability.md`](docs/metrics-stability.md).
+- **CI gates on the admin UI's typecheck and tests.** Previously nothing in
+  CI ran `npm run typecheck` or `npm run test` for the admin console.
 
 ### Removed
 
@@ -77,6 +153,47 @@ the next version cut.
   (`GET /api/operators`) listing configured operator usernames and roles;
   operators stay config-only, with no admin API to add, remove, or
   re-role one.
+- **Unsupported `telemetry.propagation` values now fail boot.** Previously
+  any value other than `w3c` parsed successfully and was silently ignored,
+  since the installed propagator was always W3C regardless of what
+  `proxy.observability.telemetry.propagation` said. Boot now rejects it,
+  naming the unsupported value and the one supported value.
+- **Speculative decoding config is validated instead of silently dropped.**
+  A `speculative` block on a deployment pinned to a non-vLLM engine now
+  fails validation; previously it parsed and did nothing, since only vLLM
+  emits the corresponding engine flags. n-gram speculation on vLLM is
+  newly accepted. Draft-model speculation stays rejected, pending a
+  VRAM-headroom check at a real prepare-time call site.
+- **The HTTP OTLP transport's default endpoint is corrected.** With
+  `transport: http` and no explicit `endpoint`, sbproxy now defaults to
+  `http://localhost:4318/v1/traces` instead of the gRPC-oriented default
+  with no path suffix appended.
+
+### Fixed
+
+- **OTLP spans are flushed on graceful shutdown.** A
+  `shutdown_otlp_pipeline` call existed but nothing in the binary invoked
+  it; spans still in flight at shutdown could be dropped.
+- **Exported spans join the caller's trace.** An inbound `traceparent`
+  header is now honored when seeding an exported span's parent context.
+  Previously every exported span got a fresh random root trace ID
+  regardless of the caller's own trace.
+- **A latent boot panic in the gRPC OTLP exporter is fixed.** Building the
+  gRPC trace or metrics exporter synchronously spawned a background task
+  with no ambient Tokio runtime present at that point in boot, which
+  panicked with `telemetry.enabled: true` and the (default) gRPC
+  transport. Masked previously because the only test coverage of this path
+  ran inside `#[tokio::test]`, which supplies a runtime.
+- **Killed engines auto-recover on the next request.** A managed
+  deployment whose engine process died after reaching `ready` (for
+  example, `kill -9`, not a crash loop) previously stayed failed until an
+  operator called `POST /admin/model-host/reset`. It now retries the same
+  relaunch a fresh deployment uses; a deployment that is genuinely
+  crash-looping still fails closed.
+- **Stale cluster nodes no longer inflate fleet VRAM totals.** The cluster
+  VRAM aggregator counted a node's last-known VRAM forever, even after it
+  dropped out of eligibility. It now excludes any node that is not
+  currently model-eligible.
 
 ## [1.8.0] - 2026-07-27
 

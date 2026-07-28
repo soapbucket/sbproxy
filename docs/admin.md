@@ -1,6 +1,6 @@
 # Admin server
 
-*Last modified: 2026-07-25*
+*Last modified: 2026-07-28*
 
 sbproxy has a built-in admin server: a small control-plane HTTP endpoint,
 separate from the data plane, for operating a running proxy. It exposes
@@ -233,13 +233,13 @@ walkthrough with a curl cookbook lives in
 | Session | `/admin/login`, `/admin/logout`, `/admin/session`. Browser-session establishment and CSRF. |
 | Config and pipeline | `/admin/config`, `/admin/reload`, `/admin/drift`, `/admin/log-level`, `/api/health/targets`, the OpenAPI mirror. |
 | API keys and credentials | Full virtual-key and upstream-credential lifecycle: mint, list, edit policy, revoke, block, rotate, delete. |
-| Model host | Catalog, desired-state deployments, runtime status, lifecycle (load/stop/reset), the artifact cache, and the local-serving + compression value report. |
-| Cluster | Roster and health, signed deployment publication, one-time enrollment, fleet metrics, the replicated-state substrate. |
+| Model host | Catalog, desired-state deployments, runtime status, lifecycle (load/stop/reset), durable operation jobs with SSE progress, the artifact cache, and the local-serving + compression value report. |
+| Cluster | Roster and health, signed deployment publication, one-time enrollment, fleet metrics, fleet-wide VRAM aggregation, the replicated-state substrate. |
 | AI compression session state | Content-free session metadata, admin-gated content inspection, delete, and bounded purge. See [ai-context-compression.md](ai-context-compression.md). |
 | Cache | Response-cache status/purge, semantic-cache decisions, key-policy cache invalidation. |
 | Prompts | The runtime prompt-overlay snapshot, versioning, and pinning. |
 | Observability | `/metrics`, the request log and its live stream, spend, audit, and rate-limit budget state. |
-| Chat playground | Run a real chat completion against any configured AI endpoint from the dashboard. |
+| Chat playground | Run a chat completion against any configured AI endpoint from the dashboard, either straight against the AI client or impersonating a virtual key through the real request pipeline. |
 
 Two things worth calling out here because they affect how you read the config
 reference below:
@@ -267,12 +267,13 @@ See [observability.md](observability.md).
 
 ## The built-in web UI
 
-A Vue single-page app drives every endpoint above: keys and credentials,
-config and drift, logs (with live tail), metrics, spend, AI performance,
-guardrails, prompts, a chat playground, the response/semantic cache, model
-host management, artifact storage, audit, and the full cluster roster and
-health rail. It is off by default and lives behind a cargo feature so the
-lean binary carries no front-end assets.
+A Vue single-page app drives every endpoint above: a Get Started
+onboarding flow, keys and credentials, config and drift, logs (with live
+tail), metrics, spend, AI performance, guardrails, prompts, a chat
+playground, model-host jobs (with live SSE progress), the response/
+semantic cache, model host management, artifact storage, audit, and the
+full cluster roster and health rail. It is off by default and lives
+behind a cargo feature so the lean binary carries no front-end assets.
 
 Build and enable it:
 
@@ -291,8 +292,29 @@ before using it over anything but loopback.
 
 ![The Overview page: health ok, per-component checks, a request-log count, and the model host section](assets/admin-overview.png)
 
-See [admin-ui.md](admin-ui.md) for a page-by-page reference: what each of
-the seventeen pages shows, what it can mutate, and which API paths back it.
+### New console views
+
+- **Get Started** (`/get-started`) walks through picking and deploying a
+  first model, reusing the same deploy flow as the Model host page.
+- **Jobs** (`/jobs`) lists durable model-host operation jobs (load,
+  evict) and tails one job's progress live, backed by the admin job API's
+  SSE stream with `Last-Event-ID` reconnect.
+- **Model host** now reports four axes per deployment instead of two:
+  desired state, local runtime state, cluster assignment, and live
+  replica state.
+- The cluster node roster gains a per-replica disclosure: expand a node
+  to see the individual model replicas it is currently serving.
+- **Chat playground** now dispatches through the real request pipeline:
+  pick a virtual key and the console impersonates it, so the request runs
+  through key policy, governance, routing, and guardrails exactly like
+  that key's own traffic, instead of calling the AI client directly.
+  Plain-HTTP AI origins only; an origin requiring TLS is not yet
+  supported from the playground. The direct, bypass-everything call is
+  still available as its own API route (`POST
+  /admin/api/playground/chat`) for scripting.
+
+See [admin-ui.md](admin-ui.md) for a page-by-page reference: what each
+page shows, what it can mutate, and which API paths back it.
 
 ## Security notes
 

@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-07-26*
+*Last modified: 2026-07-28*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -153,7 +153,15 @@ sbproxy cluster {init|token create|enroll|status}
 sbproxy update [--self] [--engines] [--models] [--check] [--yes]
                         [--cache-dir <path>] [--format text|json]
 sbproxy ai ledger <subcommand>
+sbproxy admin hash-password [--password <value> | --password-stdin]
 sbproxy doctor [--format text|json]
+sbproxy service install <catalog-id> [--name <alias>] [--variant <id>]
+                              [--engine auto|vllm|llama_cpp]
+                              [--accel auto|cuda|metal|cpu]
+                              [--port <port>] [--admin-port <port>]
+                              [--cache-dir <path>] [--dry-run] [--format text|json]
+sbproxy service uninstall [--format text|json]
+sbproxy service status [--format text|json]
 sbproxy completions {bash|zsh|fish|powershell|elvish}
 sbproxy version
 sbproxy --version
@@ -175,7 +183,9 @@ The full subcommand set, one line each:
 | `cluster` | Initialize cluster identity, create one-time enrollment tokens, enroll nodes, or inspect the complete roster, placement, and unhealthy-node alerts. |
 | `update` | Update the engines and cached models (add `--self` for the binary): check the engine release feed and cached models, then fetch, verify, and swap what is out of date, with confirmation. `--check` reports only. Pinned or `path`/`brew`/`apt`-managed artifacts are reported, never replaced, unless the run targets them. |
 | `ai` | AI gateway tools; `ai ledger` verifies the usage ledger. |
+| `admin` | Admin-account maintenance: `hash-password` prints the `password_hash` value for `proxy.admin.operators[].password_hash`. |
 | `doctor` | Diagnose what this binary can do on the current host. |
+| `service` | Install, remove, or check a per-user `launchd` agent (macOS only) that runs a certified catalog model in the background; reuses the same secure config generation as `run`. |
 | `completions` | Print a shell-completion script for the requested shell. |
 | `version` | Print the version line. Synonym for `--version`. |
 
@@ -528,6 +538,49 @@ rejected because it lacks the complete catalog v2 identity. The private
 temporary config is removed whenever the command returns, including startup and
 readiness failures.
 
+### `service` - run a model as a background launchd agent (macOS)
+
+`service install` takes the same model/engine/accel/port/variant surface as
+`run` (flattened onto the same flags) and generates the identical secure
+config: loopback bind, admin enabled with a random local password. The
+difference is what happens to the result: `run` serves it in the
+foreground of the current process; `install` persists the config and
+wraps it in a per-user `launchd` agent instead, so it keeps running (and
+restarts on failure or reboot) after the terminal closes.
+
+```bash
+sbproxy service install qwen2.5-0.5b-instruct --variant q4_k_m
+sbproxy service status
+sbproxy service uninstall
+```
+
+`install` writes three things under `$HOME`:
+
+- The config: `~/Library/Application Support/sbproxy/service/sb.yml`.
+  Unlike `run`'s private temporary config, this one is not removed on
+  exit; `launchd` rereads it on every future load, so it has to outlive
+  the command that wrote it. A prior install's config is replaced
+  outright, along with the admin password embedded in it.
+- The agent definition: `~/Library/LaunchAgents/dev.sbproxy.agent.plist`,
+  labeled `dev.sbproxy.agent`. One agent per host: installing again
+  replaces it rather than adding a second one, mirroring how `run` serves
+  one model at a time. The plist sets `RunAtLoad` and `KeepAlive`, so
+  `launchd` starts it now and relaunches it if the process ever exits.
+- Logs: `~/Library/Logs/sbproxy/service.log` (stdout) and
+  `service.err.log` (stderr), where `launchd` redirects the child
+  process's output.
+
+`--dry-run` (inherited from `run`'s flags) prints the plist and the
+generated config without installing or loading anything. `service
+status` asks `launchctl list` whether the agent is registered and
+running, and exits 0 when it is running, 1 otherwise (registered-but-
+stopped and never-installed alike), so it composes with
+`sbproxy service status || <restart it>` in a script. `service
+uninstall` unloads the agent and removes its plist; it is idempotent,
+reporting nothing removed rather than failing when no agent was
+installed. All three subcommands refuse to run on a non-macOS host,
+since `launchd` is macOS-only; use `run` or `serve` elsewhere.
+
 ### `models` - artifact and runtime lifecycle
 
 All JSON forms use `schema_version: 1` and a command name. Progress from pulls
@@ -668,6 +721,31 @@ With `auto: true`, an `sbproxy update` run reports only and swaps nothing,
 so an unattended host never mutates a binary out from under itself.
 `--format json` always emits the machine-readable freshness report and
 takes no action; the acting path prints its progress on the text path.
+
+### `admin hash-password` - hash an operator password
+
+Prints the `password_hash` value to paste into
+`proxy.admin.operators[].password_hash`. Takes exactly one input source:
+
+```bash
+sbproxy admin hash-password --password 'correct horse battery staple'
+
+# Prefer stdin over --password: a literal value on the command line
+# stays in the shell history.
+printf '%s' 'correct horse battery staple' | sbproxy admin hash-password --password-stdin
+```
+
+The hash is HMAC-SHA256 of the password, keyed with the pepper, then
+hex-encoded. The pepper is resolved the same way the running server
+resolves it, so a hash printed here verifies against a server booted
+from the same config: pass `-f/--config` and, when that file sets
+`key_management.crypto.pepper`, the command reads it from there; without
+`-f`, or when the config has no `key_management` block, it falls back to
+a fixed default pepper built into the binary. That default is the same
+in every install, so a `password_hash` hashed against it is
+offline-crackable by anyone with the source; pin
+`key_management.crypto.pepper` before relying on this for anything
+beyond local development. See [admin.md](admin.md#authentication-and-roles).
 
 ### `completions` - shell tab-completion scripts
 
