@@ -18,6 +18,23 @@ models:
     license: apache-2.0
     family: qwen
     min_vram_hint_gib: 20.0
+    context_length: 40960
+    variants:
+      - id: q4_k_m
+        format: gguf
+        quant: Q4_K_M
+        engines: [llama_cpp]
+        source: hf:Qwen/Qwen3-32B-GGUF
+        revision: 938a7432affaec9157f883a87164e2646ae17555
+        files:
+          - path: Qwen3-32B-Q4_K_M.gguf
+            sha256: efd971561896866f0e910cce52761ca77b1b138090c7f15fe284676d57d1f689
+            size_bytes: 19762149024
+        requirements:
+          accelerators: [cpu, metal, cuda]
+          min_memory_bytes: 21474836480
+        stability: preview
+        certification: official-gguf-2026-07-27
 
   qwen3-30b-a3b:
     hf_repo: Qwen/Qwen3-30B-A3B
@@ -26,6 +43,23 @@ models:
     license: apache-2.0
     family: qwen
     min_vram_hint_gib: 18.0
+    context_length: 40960
+    variants:
+      - id: q4_k_m
+        format: gguf
+        quant: Q4_K_M
+        engines: [llama_cpp]
+        source: hf:Qwen/Qwen3-30B-A3B-GGUF
+        revision: e4d4bafdfb96a411a163846265362aceb0b9c63a
+        files:
+          - path: Qwen3-30B-A3B-Q4_K_M.gguf
+            sha256: 0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5
+            size_bytes: 18556685824
+        requirements:
+          accelerators: [cpu, metal, cuda]
+          min_memory_bytes: 19327352832
+        stability: preview
+        certification: official-gguf-2026-07-27
 
   qwen3-14b:
     hf_repo: Qwen/Qwen3-14B
@@ -34,6 +68,23 @@ models:
     license: apache-2.0
     family: qwen
     min_vram_hint_gib: 10.0
+    context_length: 40960
+    variants:
+      - id: q4_k_m
+        format: gguf
+        quant: Q4_K_M
+        engines: [llama_cpp]
+        source: hf:Qwen/Qwen3-14B-GGUF
+        revision: 530227a7d994db8eca5ab5ced2fb692b614357fd
+        files:
+          - path: Qwen3-14B-Q4_K_M.gguf
+            sha256: 500a8806e85ee9c83f3ae08420295592451379b4f8cf2d0f41c15dffeb6b81f0
+            size_bytes: 9001752960
+        requirements:
+          accelerators: [cpu, metal, cuda]
+          min_memory_bytes: 10737418240
+        stability: preview
+        certification: official-gguf-2026-07-27
 
   qwen3-8b:
     hf_repo: Qwen/Qwen3-8B
@@ -42,7 +93,29 @@ models:
     license: apache-2.0
     family: qwen
     min_vram_hint_gib: 6.0
+    context_length: 40960
+    variants:
+      - id: q4_k_m
+        format: gguf
+        quant: Q4_K_M
+        engines: [llama_cpp]
+        source: hf:Qwen/Qwen3-8B-GGUF
+        revision: 7c41481f57cb95916b40956ab2f0b139b296d974
+        files:
+          - path: Qwen3-8B-Q4_K_M.gguf
+            sha256: d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785
+            size_bytes: 5027783488
+        requirements:
+          accelerators: [cpu, metal, cuda]
+          min_memory_bytes: 6442450944
+        stability: preview
+        certification: official-gguf-2026-07-27
 
+  # hf_repo does not resolve on Hugging Face: THUDM renamed its org to
+  # zai-org, and no THUDM/zai-org repo named GLM-4-Flash exists there.
+  # "GLM-4-Flash" is Zhipu/Z.ai's hosted API-tier product name (via
+  # bigmodel.cn), not a published open-weight checkpoint, so there is no
+  # base repo to pin a GGUF variant against. Left unpinned.
   glm-4-flash:
     hf_repo: THUDM/GLM-4-Flash
     quants: [bf16, Q4_K_M]
@@ -58,6 +131,23 @@ models:
     license: apache-2.0
     family: gpt-oss
     min_vram_hint_gib: 13.0
+    context_length: 131072
+    variants:
+      - id: q4_k_m
+        format: gguf
+        quant: Q4_K_M
+        engines: [llama_cpp]
+        source: hf:unsloth/gpt-oss-20b-GGUF
+        revision: d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4
+        files:
+          - path: gpt-oss-20b-Q4_K_M.gguf
+            sha256: c27536640e410032865dc68781d80a08b98f8db5e93575919af8ccc0568aeb4f
+            size_bytes: 11624759488
+        requirements:
+          accelerators: [cpu, metal, cuda]
+          min_memory_bytes: 13958643712
+        stability: preview
+        certification: community-gguf-2026-07-27
 
   llama-3.1-8b-instruct:
     hf_repo: meta-llama/Llama-3.1-8B-Instruct
@@ -66,6 +156,23 @@ models:
     license: llama3.1
     family: llama
     min_vram_hint_gib: 6.0
+    context_length: 131072
+    variants:
+      - id: q4_k_m
+        format: gguf
+        quant: Q4_K_M
+        engines: [llama_cpp]
+        source: hf:bartowski/Meta-Llama-3.1-8B-Instruct-GGUF
+        revision: bf5b95e96dac0462e2a09145ec66cae9a3f12067
+        files:
+          - path: Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+            sha256: 7b064f5842bf9532c91456deda288a1b672397a54fa729aa665952863033557c
+            size_bytes: 4920739232
+        requirements:
+          accelerators: [cpu, metal, cuda]
+          min_memory_bytes: 6442450944
+        stability: preview
+        certification: community-gguf-2026-07-27
 
   # Small immutable artifact used to exercise the complete managed
   # artifact path without claiming production certification yet.
