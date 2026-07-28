@@ -9280,7 +9280,7 @@ origins:
     #[test]
     fn validate_rejects_unsupported_legacy_managed_fields() {
         let path = temp_config(
-            "origins:\n  ai.local:\n    action:\n      type: ai_proxy\n      providers:\n        - name: local\n          serve:\n            models:\n              - model: qwen3-14b\n                speculative: {}\n",
+            "origins:\n  ai.local:\n    action:\n      type: ai_proxy\n      providers:\n        - name: local\n          serve:\n            models:\n              - model: qwen3-14b\n                engine: llama_cpp\n                speculative: {}\n",
         );
         assert!(handle_validate_subcommand(&validate_args(&path, false)).is_err());
         assert_eq!(
