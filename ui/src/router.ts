@@ -129,6 +129,12 @@ const routes = [
     meta: { title: "Users" },
   },
   {
+    path: "/operators",
+    name: "operators",
+    component: () => import("./views/OperatorsView.vue"),
+    meta: { title: "Operators" },
+  },
+  {
     path: "/login",
     name: "login",
     component: () => import("./views/LoginView.vue"),
