@@ -72,7 +72,10 @@ fn strategies() -> Vec<(&'static str, RoutingStrategy)> {
         ("random", RoutingStrategy::Random),
         ("least_connections", RoutingStrategy::LeastConnections),
         ("lowest_latency", RoutingStrategy::LowestLatency),
-        ("peak_ewma", RoutingStrategy::PeakEwma),
+        (
+            "peak_ewma",
+            RoutingStrategy::PeakEwma(sbproxy_ai::PeakEwmaConfig::default()),
+        ),
         ("least_token_usage", RoutingStrategy::LeastTokenUsage),
         ("prefix_affinity", RoutingStrategy::PrefixAffinity),
     ]
