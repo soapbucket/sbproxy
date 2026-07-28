@@ -197,6 +197,10 @@ enum Cmd {
     /// capability features, visible GPUs, inference engines on PATH,
     /// and whether a `serve:` provider could admit a model here.
     Doctor(DoctorArgs),
+    /// Install, remove, or check a per-user launchd agent that keeps a
+    /// certified catalog model running in the background (macOS only).
+    /// Reuses the same secure config generation as `sbproxy run`.
+    Service(ServiceCmd),
     /// Print a shell-completion script to stdout for the requested
     /// shell. Pipe into the shell's completion sink.
     Completions {
@@ -1067,6 +1071,50 @@ struct DoctorArgs {
     format: OutputFormat,
 }
 
+#[derive(clap::Args, Debug)]
+struct ServiceCmd {
+    #[command(subcommand)]
+    sub: ServiceSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceSub {
+    /// Generate a secure config, write a launchd agent, and load it.
+    Install(ServiceInstallArgs),
+    /// Unload the launchd agent and remove its plist.
+    Uninstall(ServiceUninstallArgs),
+    /// Report whether the agent is registered with launchd and running.
+    Status(ServiceStatusArgs),
+}
+
+/// `sbproxy service install`: the exact same model/engine/accel/port/
+/// variant surface as `sbproxy run` (flattened), so the two commands
+/// resolve identically. The difference is what happens to the result:
+/// `run` serves it in this process; `install` persists it and wraps it
+/// in a launchd agent instead.
+#[derive(clap::Args, Debug)]
+struct ServiceInstallArgs {
+    #[command(flatten)]
+    run: RunArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct ServiceUninstallArgs {
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct ServiceStatusArgs {
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
 enum OutputFormat {
     #[default]
@@ -1275,6 +1323,9 @@ fn main() {
         }
         Some(Cmd::Doctor(args)) => {
             run_subcommand("doctor", 2, handle_doctor_subcommand(&args));
+        }
+        Some(Cmd::Service(cmd)) => {
+            run_subcommand("service", 2, handle_service_subcommand(&cmd));
         }
         Some(Cmd::Completions { shell }) => {
             print_completions(shell);
@@ -2682,6 +2733,317 @@ fn write_private_run_config(path: &std::path::Path, yaml: &[u8]) -> anyhow::Resu
     Ok(())
 }
 
+// --- `service` handler: launchd agent install/uninstall/status (macOS) ---
+//
+// `sbproxy-platform` (storage/messenger/circuit-breaker/DNS/health) has no
+// precedent for OS service integration and nothing in its dependency graph
+// is CLI-shaped, so this lives next to `prepare_run`/`RunArgs` in the
+// binary crate instead, alongside the other host-integration code already
+// here (`atomic_replace_binary`, `raise_fd_limit`, `tighten_directory_permissions`).
+
+/// launchd label for the single per-user sbproxy agent. One agent per
+/// host: a second `service install` replaces it rather than adding a
+/// second one, mirroring how `sbproxy run` serves one model at a time.
+const SERVICE_LABEL: &str = "dev.sbproxy.agent";
+
+/// Filesystem locations the `service` subcommands read and write,
+/// resolved from `$HOME` once so every handler agrees on the same
+/// paths. The config lives under Application Support: unlike
+/// `PrivateRunDirectory`'s config, it must outlive the process that
+/// wrote it, since launchd rereads it on every future load. The plist
+/// lives in the standard per-user launchd agent directory. The two log
+/// paths are where launchd redirects the child's stdout/stderr.
+struct ServicePaths {
+    config: PathBuf,
+    plist: PathBuf,
+    stdout_log: PathBuf,
+    stderr_log: PathBuf,
+}
+
+fn service_paths() -> anyhow::Result<ServicePaths> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("$HOME is not set"))?;
+    Ok(ServicePaths {
+        config: home.join("Library/Application Support/sbproxy/service/sb.yml"),
+        plist: home
+            .join("Library/LaunchAgents")
+            .join(format!("{SERVICE_LABEL}.plist")),
+        stdout_log: home.join("Library/Logs/sbproxy/service.log"),
+        stderr_log: home.join("Library/Logs/sbproxy/service.err.log"),
+    })
+}
+
+/// Escape the five XML predefined entities. Every value interpolated
+/// into [`render_service_plist`] is a filesystem path, but escaping is
+/// cheap and a wrong plist silently fails to load rather than erroring
+/// loudly, so this is not worth skipping.
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Render the launchd property list that runs `binary serve <config>`
+/// at load and restarts it if it exits. Pure string building: no
+/// filesystem or `launchctl` access, so it is covered by a plain unit
+/// test.
+fn render_service_plist(binary: &std::path::Path, paths: &ServicePaths) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>{label}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{binary}</string>
+		<string>serve</string>
+		<string>{config}</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>{stdout}</string>
+	<key>StandardErrorPath</key>
+	<string>{stderr}</string>
+</dict>
+</plist>
+"#,
+        label = SERVICE_LABEL,
+        binary = xml_escape(&binary.to_string_lossy()),
+        config = xml_escape(&paths.config.to_string_lossy()),
+        stdout = xml_escape(&paths.stdout_log.to_string_lossy()),
+        stderr = xml_escape(&paths.stderr_log.to_string_lossy()),
+    )
+}
+
+fn handle_service_subcommand(cmd: &ServiceCmd) -> anyhow::Result<i32> {
+    match &cmd.sub {
+        ServiceSub::Install(args) => handle_service_install(args),
+        ServiceSub::Uninstall(args) => handle_service_uninstall(args),
+        ServiceSub::Status(args) => handle_service_status(args),
+    }
+}
+
+/// `sbproxy service install <model>`: resolve the same secure config
+/// `sbproxy run` would generate (loopback bind, admin enabled with a
+/// random local password), persist it, and register a launchd agent
+/// that serves it in the background. `--dry-run` (inherited from the
+/// flattened `RunArgs`) prints the plist and config without installing.
+fn handle_service_install(args: &ServiceInstallArgs) -> anyhow::Result<i32> {
+    use zeroize::Zeroize;
+
+    if !cfg!(target_os = "macos") {
+        anyhow::bail!("launchd services are macOS-only; use `sbproxy run` or `sbproxy serve`");
+    }
+
+    let mut prepared = prepare_run(&args.run)?;
+    let paths = service_paths()?;
+
+    if args.run.dry_run {
+        let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("sbproxy"));
+        println!(
+            "# would install launchd agent '{}' for {}:{} at {}\n{}\n{}",
+            SERVICE_LABEL,
+            prepared.artifact.logical_model,
+            prepared.artifact.variant_id,
+            paths.plist.display(),
+            render_service_plist(&binary, &paths),
+            prepared.yaml,
+        );
+        prepared.admin_password.zeroize();
+        prepared.yaml.zeroize();
+        return Ok(0);
+    }
+
+    for dir in [
+        paths.config.parent(),
+        paths.plist.parent(),
+        paths.stdout_log.parent(),
+    ] {
+        if let Some(dir) = dir {
+            std::fs::create_dir_all(dir)
+                .map_err(|error| anyhow::anyhow!("create '{}': {error}", dir.display()))?;
+        }
+    }
+
+    // The config must persist for launchd to reread on every future load,
+    // unlike `PrivateRunDirectory`'s, which is removed on drop. A prior
+    // install's config is replaced outright: `write_private_run_config`
+    // insists on creating a new file, and the old admin password embedded
+    // in it is going away with the plist that referenced it.
+    if paths.config.exists() {
+        std::fs::remove_file(&paths.config).map_err(|error| {
+            anyhow::anyhow!("remove stale '{}': {error}", paths.config.display())
+        })?;
+    }
+    if let Err(error) = write_private_run_config(&paths.config, prepared.yaml.as_bytes()) {
+        prepared.admin_password.zeroize();
+        prepared.yaml.zeroize();
+        return Err(error);
+    }
+    prepared.yaml.zeroize();
+
+    let binary = std::env::current_exe()
+        .map_err(|error| anyhow::anyhow!("resolve current executable: {error}"))?;
+    let plist = render_service_plist(&binary, &paths);
+    std::fs::write(&paths.plist, plist)
+        .map_err(|error| anyhow::anyhow!("write '{}': {error}", paths.plist.display()))?;
+
+    // Clear out a prior load of the same label first: `launchctl load` on
+    // an already-loaded label is a silent no-op, so a second install (a
+    // new port, model, or password) would never take effect without
+    // this. Absence is the common case and not an error.
+    let _ = std::process::Command::new("launchctl")
+        .arg("unload")
+        .arg(&paths.plist)
+        .output();
+    let output = std::process::Command::new("launchctl")
+        .arg("load")
+        .arg("-w")
+        .arg(&paths.plist)
+        .output()
+        .map_err(|error| anyhow::anyhow!("launchctl load: {error}"))?;
+    prepared.admin_password.zeroize();
+    if !output.status.success() {
+        anyhow::bail!(
+            "launchctl load '{}' failed: {}",
+            paths.plist.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    match args.format {
+        OutputFormat::Text => println!(
+            "Installed {} as launchd agent '{}'.\nConfig: {}\nPlist:  {}\nLogs:   {}\n",
+            prepared.name,
+            SERVICE_LABEL,
+            paths.config.display(),
+            paths.plist.display(),
+            paths.stdout_log.display(),
+        ),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&cli_command_envelope(
+                "service.install",
+                serde_json::json!({
+                    "label": SERVICE_LABEL,
+                    "model": prepared.name,
+                    "config_path": paths.config.to_string_lossy(),
+                    "plist_path": paths.plist.to_string_lossy(),
+                    "stdout_log": paths.stdout_log.to_string_lossy(),
+                    "stderr_log": paths.stderr_log.to_string_lossy(),
+                }),
+            ))?
+        ),
+    }
+    Ok(0)
+}
+
+/// `sbproxy service uninstall`: unload the agent and remove its plist.
+/// Idempotent: uninstalling an agent that was never installed reports
+/// nothing removed rather than failing, since the end state either way
+/// is what the operator asked for.
+fn handle_service_uninstall(args: &ServiceUninstallArgs) -> anyhow::Result<i32> {
+    if !cfg!(target_os = "macos") {
+        anyhow::bail!("launchd services are macOS-only");
+    }
+
+    let paths = service_paths()?;
+    let existed = paths.plist.exists();
+    if existed {
+        let _ = std::process::Command::new("launchctl")
+            .arg("unload")
+            .arg(&paths.plist)
+            .output();
+        std::fs::remove_file(&paths.plist)
+            .map_err(|error| anyhow::anyhow!("remove '{}': {error}", paths.plist.display()))?;
+    }
+
+    match args.format {
+        OutputFormat::Text => {
+            if existed {
+                println!("Uninstalled launchd agent '{SERVICE_LABEL}'.");
+            } else {
+                println!("No launchd agent '{SERVICE_LABEL}' was installed.");
+            }
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&cli_command_envelope(
+                "service.uninstall",
+                serde_json::json!({ "label": SERVICE_LABEL, "removed": existed }),
+            ))?
+        ),
+    }
+    Ok(0)
+}
+
+/// `sbproxy service status`: ask `launchctl list` whether the agent is
+/// registered, and whether it currently has a PID. Exit 0 when running,
+/// 1 otherwise (registered-but-stopped and never-installed alike), so a
+/// caller can `sbproxy service status || restart-it` without parsing
+/// output.
+fn handle_service_status(args: &ServiceStatusArgs) -> anyhow::Result<i32> {
+    if !cfg!(target_os = "macos") {
+        anyhow::bail!("launchd services are macOS-only");
+    }
+
+    let output = std::process::Command::new("launchctl")
+        .arg("list")
+        .arg(SERVICE_LABEL)
+        .output()
+        .map_err(|error| anyhow::anyhow!("launchctl list: {error}"))?;
+    let registered = output.status.success();
+    let pid = if registered {
+        parse_launchctl_list_pid(&String::from_utf8_lossy(&output.stdout))
+    } else {
+        None
+    };
+    let running = pid.is_some();
+
+    match args.format {
+        OutputFormat::Text => {
+            if !registered {
+                println!("{SERVICE_LABEL}: not installed");
+            } else if let Some(pid) = pid {
+                println!("{SERVICE_LABEL}: running (pid {pid})");
+            } else {
+                println!("{SERVICE_LABEL}: registered, not running");
+            }
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&cli_command_envelope(
+                "service.status",
+                serde_json::json!({
+                    "label": SERVICE_LABEL,
+                    "registered": registered,
+                    "running": running,
+                    "pid": pid,
+                }),
+            ))?
+        ),
+    }
+    Ok(if running { 0 } else { 1 })
+}
+
+/// Extract the `"PID" = <n>;` value from `launchctl list <label>`'s
+/// stdout. Absent means the agent is loaded but not currently running.
+fn parse_launchctl_list_pid(text: &str) -> Option<u32> {
+    text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("\"PID\" = ")?;
+        rest.trim_end_matches(';').parse::<u32>().ok()
+    })
+}
+
 // --- `models` handler (WOR-1803) ---
 
 fn handle_models_subcommand(
@@ -3324,7 +3686,13 @@ fn handle_models_stop(args: &ModelsStopArgs) -> anyhow::Result<i32> {
             "{}",
             serde_json::to_string_pretty(&cli_command_envelope("models.stop", stopped))?
         ),
-        OutputFormat::Text => println!("{} stopped", args.deployment),
+        OutputFormat::Text => {
+            let state = stopped
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("stopped");
+            println!("{} {state}", args.deployment);
+        }
     }
     Ok(0)
 }
@@ -7684,6 +8052,87 @@ mod tests {
         assert_eq!(yaml["proxy"]["admin"]["port"], 9091);
         assert_eq!(prepared.admin_password.len(), 64);
         assert!(!prepared.yaml.contains("serve:"));
+    }
+
+    #[test]
+    fn service_install_cli_surface_flattens_run_args() {
+        let cli = Cli::try_parse_from([
+            "sbproxy",
+            "service",
+            "install",
+            "qwen3-14b",
+            "--port",
+            "9000",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        let Some(Cmd::Service(ServiceCmd {
+            sub: ServiceSub::Install(args),
+        })) = cli.cmd
+        else {
+            panic!("service install parsed to the wrong command");
+        };
+        assert_eq!(args.run.model, "qwen3-14b");
+        assert_eq!(args.run.port, 9000);
+        assert!(matches!(args.format, OutputFormat::Json));
+    }
+
+    #[test]
+    fn service_install_reuses_run_config_generation() {
+        // `service install` flattens `RunArgs` and calls the exact same
+        // `prepare_run` as `sbproxy run`, so the launchd-installed
+        // service gets the same loopback-bind, admin-enabled, random-
+        // password config as a foreground `run`.
+        let args = ServiceInstallArgs {
+            run: RunArgs {
+                model: "qwen2.5-0.5b-instruct".to_string(),
+                name: Some("service-test".to_string()),
+                port: 8080,
+                engine: "auto".to_string(),
+                accel: "auto".to_string(),
+                cache_dir: None,
+                variant: Some("q4_k_m".to_string()),
+                admin_port: Some(9092),
+                dry_run: false,
+            },
+            format: OutputFormat::Text,
+        };
+        let prepared = prepare_run(&args.run).expect("prepare canonical service config");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&prepared.yaml).unwrap();
+        assert_eq!(prepared.name, "service-test");
+        assert_eq!(yaml["proxy"]["admin"]["enabled"], true);
+        assert_eq!(yaml["proxy"]["admin"]["bind"], "127.0.0.1");
+        assert_eq!(yaml["proxy"]["admin"]["port"], 9092);
+        assert_eq!(prepared.admin_password.len(), 64);
+        assert!(!prepared.yaml.contains("serve:"));
+    }
+
+    #[test]
+    fn service_plist_contains_program_arguments_and_serve() {
+        let paths = ServicePaths {
+            config: PathBuf::from("/Users/test/Library/Application Support/sbproxy/service/sb.yml"),
+            plist: PathBuf::from(format!(
+                "/Users/test/Library/LaunchAgents/{SERVICE_LABEL}.plist"
+            )),
+            stdout_log: PathBuf::from("/Users/test/Library/Logs/sbproxy/service.log"),
+            stderr_log: PathBuf::from("/Users/test/Library/Logs/sbproxy/service.err.log"),
+        };
+        let plist = render_service_plist(std::path::Path::new("/usr/local/bin/sbproxy"), &paths);
+        assert!(plist.contains("<key>ProgramArguments</key>"));
+        assert!(plist.contains("<string>serve</string>"));
+        assert!(plist.contains("<string>/usr/local/bin/sbproxy</string>"));
+        assert!(plist.contains(&format!("<string>{SERVICE_LABEL}</string>")));
+        assert!(plist.contains("/Users/test/Library/Application Support/sbproxy/service/sb.yml"));
+    }
+
+    #[test]
+    fn launchctl_list_pid_parses_running_and_missing() {
+        let running = "{\n\t\"LimitLoadToSessionType\" = \"Aqua\";\n\t\"Label\" = \"dev.sbproxy.agent\";\n\t\"OnDemand\" = false;\n\t\"LastExitStatus\" = 0;\n\t\"PID\" = 4321;\n};\n";
+        assert_eq!(parse_launchctl_list_pid(running), Some(4321));
+        let loaded_not_running =
+            "{\n\t\"Label\" = \"dev.sbproxy.agent\";\n\t\"LastExitStatus\" = 0;\n};\n";
+        assert_eq!(parse_launchctl_list_pid(loaded_not_running), None);
     }
 
     #[test]

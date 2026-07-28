@@ -3174,6 +3174,9 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     // build, so it is the one admin response worth revalidating rather
     // than resending.
     let mut if_none_match: Option<String> = None;
+    // Job-progress SSE reconnect: the sequence number of the last event
+    // this client saw, so the stream can replay only what it missed.
+    let mut last_event_id: Option<String> = None;
     for line in lines {
         if line.is_empty() {
             break;
@@ -3203,6 +3206,11 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             .or_else(|| line.strip_prefix("if-none-match:"))
         {
             if_none_match = Some(rest.trim().to_string());
+        } else if let Some(rest) = line
+            .strip_prefix("Last-Event-ID:")
+            .or_else(|| line.strip_prefix("last-event-id:"))
+        {
+            last_event_id = Some(rest.trim().to_string());
         }
     }
     // WOR-1717: CORS headers for an allowed cross-origin caller (echoed on
@@ -3485,6 +3493,27 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
         let _ = write_admin_response_headed(sock, status, ct, resp.as_bytes(), &cors).await;
         return;
     }
+    // Real-dispatch impersonation: same shape as CHAT_PATH above (async,
+    // POST, admin-only via the RBAC gate that already ran on `principal`),
+    // but runs the request through the real data-plane pipeline instead
+    // of calling the engine / AiClient directly.
+    if pg_path == crate::admin_playground::DISPATCH_PATH && method.eq_ignore_ascii_case("POST") {
+        if principal.is_none() {
+            let _ = write_admin_response_headed(
+                sock,
+                401,
+                "application/json",
+                br#"{"error":"Unauthorized"}"#,
+                &cors,
+            )
+            .await;
+            return;
+        }
+        let (status, ct, resp) =
+            crate::admin_playground::handle_dispatch(body_owned.as_deref()).await;
+        let _ = write_admin_response_headed(sock, status, ct, resp.as_bytes(), &cors).await;
+        return;
+    }
 
     // WOR-1718: SSE tail of the request log. Handled here rather than in
     // `handle_admin_request` because it must own the socket and stream
@@ -3535,6 +3564,99 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             }
         }
         return;
+    }
+
+    // Job-progress SSE tail with `Last-Event-ID` replay. Handled here for
+    // the same reason as the request-log tail above: it must own the
+    // socket. Each event carries an `id:` line (its replay-buffer
+    // sequence number), which is what lets a client's `EventSource` echo
+    // `Last-Event-ID` automatically on reconnect. The stream closes once
+    // the job reaches a terminal state, rather than holding the
+    // connection open forever.
+    let job_stream_path = path.split('?').next().unwrap_or(path);
+    if let Some(job_id) = job_stream_path
+        .strip_prefix("/admin/model-host/jobs/")
+        .and_then(|rest| rest.strip_suffix("/stream"))
+    {
+        if !job_id.is_empty() && method.eq_ignore_ascii_case("GET") {
+            if principal.is_none() {
+                let _ = write_admin_response_headed(
+                    sock,
+                    401,
+                    "application/json",
+                    br#"{"error":"Unauthorized"}"#,
+                    &cors,
+                )
+                .await;
+                return;
+            }
+            use tokio::io::AsyncWriteExt;
+            let mut head = String::from(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n",
+            );
+            for (k, v) in &cors {
+                head.push_str(k);
+                head.push_str(": ");
+                head.push_str(v);
+                head.push_str("\r\n");
+            }
+            head.push_str("\r\n");
+            if sock.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = sock.write_all(b": connected\n\n").await;
+            // Subscribe before replaying, so an event published while we
+            // are still writing the replay batch is not lost between the
+            // two steps; `last_sent` then dedups anything the live feed
+            // redelivers that the replay already covered.
+            let mut live = crate::admin_model_host::job_event_log().subscribe();
+            let after = last_event_id
+                .as_deref()
+                .and_then(|value| value.parse::<u64>().ok());
+            let mut last_sent = after;
+            for event in crate::admin_model_host::job_event_log().replay(job_id, after) {
+                if last_sent.is_some_and(|sent| event.sequence <= sent) {
+                    continue;
+                }
+                let Ok(json) = serde_json::to_string(&event.job) else {
+                    continue;
+                };
+                let frame = format!("id: {}\ndata: {json}\n\n", event.sequence);
+                if sock.write_all(frame.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = sock.flush().await;
+                last_sent = Some(event.sequence);
+                if event.job.state.is_terminal() {
+                    return;
+                }
+            }
+            loop {
+                match live.recv().await {
+                    Ok(event) if event.job.id == job_id => {
+                        if last_sent.is_some_and(|sent| event.sequence <= sent) {
+                            continue;
+                        }
+                        let Ok(json) = serde_json::to_string(&event.job) else {
+                            continue;
+                        };
+                        let frame = format!("id: {}\ndata: {json}\n\n", event.sequence);
+                        if sock.write_all(frame.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = sock.flush().await;
+                        last_sent = Some(event.sequence);
+                        if event.job.state.is_terminal() {
+                            break;
+                        }
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            return;
+        }
     }
 
     // WOR-1715: the built-in admin UI serves a real Vite bundle,
@@ -3971,6 +4093,163 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 404 Not Found"));
         assert!(!response.contains("request_body_too_large"));
+    }
+
+    #[tokio::test]
+    async fn job_stream_replays_missed_events_after_reconnect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = sbproxy_model_host::FileJobStore::open(directory.path(), 256).unwrap();
+        let job = store
+            .create(
+                sbproxy_model_host::OperationKind::Pull,
+                "reconnect-fixture".to_string(),
+            )
+            .unwrap();
+        let job_id = job.id.clone();
+        // `job_event_log` is process-global, so its sequence counter is
+        // not necessarily zero at the start of this test (another test in
+        // the same binary may have published first); capture the real
+        // assigned sequence rather than assuming one.
+        let queued_sequence = crate::admin_model_host::job_event_log().publish(&job);
+
+        let auth = basic_auth("admin", "secret");
+        let state = std::sync::Arc::new(make_state());
+
+        // First connection: sees the job's initial `queued` event, then
+        // drops before the job progresses further.
+        let (mut client1, server1) = tokio::io::duplex(16 * 1024);
+        let handler1 = tokio::spawn({
+            let state = state.clone();
+            async move {
+                handle_admin_connection(
+                    server1,
+                    "job-stream-1",
+                    &AdminRateLimiter::new(1_000_000),
+                    state,
+                )
+                .await
+            }
+        });
+        let request = format!(
+            "GET /admin/model-host/jobs/{job_id}/stream HTTP/1.1\r\nAuthorization: {auth}\r\n\r\n"
+        );
+        client1.write_all(request.as_bytes()).await.unwrap();
+
+        let mut seen = String::new();
+        let mut buf = [0u8; 4096];
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !seen.contains("\"state\":\"queued\"") {
+                let n = client1.read(&mut buf).await.unwrap();
+                assert!(n > 0, "stream closed before the queued event arrived");
+                seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        })
+        .await
+        .expect("first connection saw the queued event");
+        assert!(seen.starts_with("HTTP/1.1 200 OK"), "{seen}");
+        assert!(seen.contains("Content-Type: text/event-stream"), "{seen}");
+        assert!(seen.contains(&format!("id: {queued_sequence}\n")), "{seen}");
+        drop(client1);
+
+        // The job progresses past what the first client saw, then reaches
+        // its terminal state.
+        let downloading = store
+            .transition(
+                &job_id,
+                sbproxy_model_host::OperationState::Downloading,
+                sbproxy_model_host::OperationProgress {
+                    completed_bytes: 5,
+                    total_bytes: 10,
+                    current_file: None,
+                },
+                None,
+            )
+            .unwrap();
+        let downloading_sequence = crate::admin_model_host::job_event_log().publish(&downloading);
+        // A `Pull` job cannot go straight from `downloading` to `ready`; it
+        // passes through `verifying` first (see `transition_allowed` in
+        // sbproxy-model-host's jobs.rs).
+        let verifying = store
+            .transition(
+                &job_id,
+                sbproxy_model_host::OperationState::Verifying,
+                sbproxy_model_host::OperationProgress {
+                    completed_bytes: 10,
+                    total_bytes: 10,
+                    current_file: None,
+                },
+                None,
+            )
+            .unwrap();
+        let verifying_sequence = crate::admin_model_host::job_event_log().publish(&verifying);
+        let ready = store
+            .transition(
+                &job_id,
+                sbproxy_model_host::OperationState::Ready,
+                sbproxy_model_host::OperationProgress {
+                    completed_bytes: 10,
+                    total_bytes: 10,
+                    current_file: None,
+                },
+                None,
+            )
+            .unwrap();
+        let ready_sequence = crate::admin_model_host::job_event_log().publish(&ready);
+
+        // The first connection settles on its own once the job reaches a
+        // terminal state (its next write either fails against the dropped
+        // client, or succeeds and it closes on seeing `ready`); either way
+        // it does not hang the test.
+        tokio::time::timeout(std::time::Duration::from_secs(5), handler1)
+            .await
+            .expect("first connection settled")
+            .unwrap();
+
+        // Reconnect with `Last-Event-ID` set to the event the first client
+        // already saw: only the events after it replay, in order, with
+        // none missed and none repeated.
+        let (mut client2, server2) = tokio::io::duplex(16 * 1024);
+        let handler2 = tokio::spawn(async move {
+            handle_admin_connection(
+                server2,
+                "job-stream-2",
+                &AdminRateLimiter::new(1_000_000),
+                state,
+            )
+            .await
+        });
+        let request = format!(
+            "GET /admin/model-host/jobs/{job_id}/stream HTTP/1.1\r\nAuthorization: {auth}\r\nLast-Event-ID: {queued_sequence}\r\n\r\n"
+        );
+        client2.write_all(request.as_bytes()).await.unwrap();
+        client2.shutdown().await.unwrap();
+        let mut response = String::new();
+        client2.read_to_string(&mut response).await.unwrap();
+        handler2.await.unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(
+            !response.contains(&format!("id: {queued_sequence}\n")),
+            "{response}"
+        );
+        assert!(!response.contains("\"state\":\"queued\""), "{response}");
+        assert!(
+            response.contains(&format!("id: {downloading_sequence}\n")),
+            "{response}"
+        );
+        assert!(response.contains("\"state\":\"downloading\""), "{response}");
+        assert!(
+            response.contains(&format!("id: {verifying_sequence}\n")),
+            "{response}"
+        );
+        assert!(response.contains("\"state\":\"verifying\""), "{response}");
+        assert!(
+            response.contains(&format!("id: {ready_sequence}\n")),
+            "{response}"
+        );
+        assert!(response.contains("\"state\":\"ready\""), "{response}");
     }
 
     // One simulated connection carrying a single bare GET for `path`,

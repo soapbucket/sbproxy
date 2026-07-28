@@ -32,9 +32,28 @@
 //! no budget configured it answers 409, because there is no target to
 //! collect toward. Both mutate the cache and sit behind the shared
 //! admin auth gate.
+//!
+//! `GET /admin/model-host/jobs` lists durable operation jobs (queued,
+//! in-flight, and retained terminal history) from the same `FileJobStore`
+//! the artifact cache writes pull/verify operations into.
+//! `GET /admin/model-host/jobs/{id}` reads one job by ID. Both answer an
+//! honest empty list / 404 when no production model host is configured
+//! yet, mirroring `files`. `GET /admin/model-host/jobs/{id}/stream`
+//! (handled in `admin::handle_admin_connection`, not here, because it
+//! must own the socket) tails one job's durable state as
+//! `text/event-stream`, with `Last-Event-ID` replay across a reconnect.
+//!
+//! `POST /admin/model-host/load` and `POST /admin/model-host/evict`
+//! (aliased at `/stop` and `/drain`) enqueue a durable job for the
+//! requested deployment and answer `202` with a `job_id` and `poll_url`
+//! immediately, rather than blocking the admin request on the engine
+//! work; the job settles to `ready` or `failed` in the background. When
+//! no production model host is configured (no durable job store is open)
+//! they fall back to blocking on the lifecycle call directly and
+//! answering its outcome, exactly as before.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -745,6 +764,33 @@ pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<Resp> {
         }
         return Some(remove_artifact_response(digest));
     }
+    // Durable operation job list/detail. `/{id}/stream` is intercepted
+    // earlier, in `admin::handle_admin_connection`, because it must own
+    // the socket to stream `text/event-stream`; it never reaches here.
+    if let Some(rest) = path_only.strip_prefix("/admin/model-host/jobs") {
+        if rest.is_empty() {
+            if !method.eq_ignore_ascii_case("GET") {
+                return Some((
+                    405,
+                    JSON,
+                    r#"{"error":"method not allowed; use GET"}"#.to_string(),
+                ));
+            }
+            return Some(jobs_list_response());
+        }
+        if let Some(job_id) = rest.strip_prefix('/') {
+            if !job_id.is_empty() && !job_id.contains('/') {
+                if !method.eq_ignore_ascii_case("GET") {
+                    return Some((
+                        405,
+                        JSON,
+                        r#"{"error":"method not allowed; use GET"}"#.to_string(),
+                    ));
+                }
+                return Some(job_detail_response(job_id));
+            }
+        }
+    }
     match path_only {
         "/admin/model-host/status" => {
             if !method.eq_ignore_ascii_case("GET") {
@@ -864,58 +910,185 @@ fn model_from_body(body: Option<&str>) -> Result<String, Resp> {
 }
 
 fn load_response(body: Option<&str>) -> Resp {
-    let runtime = crate::server::model_host::model_runtime_manager();
+    load_response_with(crate::server::model_host::model_runtime_manager(), body)
+}
+
+fn load_response_with(runtime: Arc<ProductionModelRuntime>, body: Option<&str>) -> Resp {
     let model = match model_from_body(body) {
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    // Blocking-pool thread (spawn_blocking dispatcher); block on the async
-    // load, matching status_response.
-    let result = tokio::runtime::Handle::current().block_on(async {
-        let running = runtime.ensure_ready(&model).await?;
-        let status = runtime.status(&model).await;
-        Ok::<_, sbproxy_model_host::RuntimeManagerError>((running, status))
-    });
-    match result {
-        Ok((running, status)) => (
-            200,
-            JSON,
-            serde_json::json!({
-                "deployment": model,
-                "state": "ready",
-                "port": running.port,
-                "job_id": status.and_then(|status| status.job_id),
-            })
-            .to_string(),
-        ),
-        Err(error) => runtime_error_response("load", error),
-    }
+    let Some(store) = runtime.job_store() else {
+        // No production model host is configured, so no durable job store
+        // is open; fall back to the pre-existing contract and block on the
+        // load directly. Blocking-pool thread (spawn_blocking dispatcher);
+        // block on the async load, matching status_response.
+        let result = tokio::runtime::Handle::current().block_on(async {
+            let running = runtime.ensure_ready(&model).await?;
+            let status = runtime.status(&model).await;
+            Ok::<_, sbproxy_model_host::RuntimeManagerError>((running, status))
+        });
+        return match result {
+            Ok((running, status)) => (
+                200,
+                JSON,
+                serde_json::json!({
+                    "deployment": model,
+                    "state": "ready",
+                    "port": running.port,
+                    "job_id": status.and_then(|status| status.job_id),
+                })
+                .to_string(),
+            ),
+            Err(error) => runtime_error_response("load", error),
+        };
+    };
+    enqueue_lifecycle_job(
+        runtime,
+        store,
+        sbproxy_model_host::OperationKind::Load,
+        model,
+    )
 }
 
 fn evict_response(body: Option<&str>) -> Resp {
-    let runtime = crate::server::model_host::model_runtime_manager();
+    evict_response_with(crate::server::model_host::model_runtime_manager(), body)
+}
+
+fn evict_response_with(runtime: Arc<ProductionModelRuntime>, body: Option<&str>) -> Resp {
     let model = match model_from_body(body) {
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    let result = tokio::runtime::Handle::current().block_on(async {
-        let report = runtime.drain(&model).await?;
-        let status = runtime.status(&model).await;
-        Ok::<_, sbproxy_model_host::RuntimeManagerError>((report, status))
-    });
-    match result {
-        Ok((report, status)) => (
-            200,
-            JSON,
-            serde_json::json!({
-                "deployment": model,
-                "state": "stopped",
-                "drain": report,
-                "job_id": status.and_then(|status| status.job_id),
-            })
-            .to_string(),
+    let Some(store) = runtime.job_store() else {
+        // No production model host is configured; fall back to the
+        // pre-existing contract and block on the drain directly.
+        let result = tokio::runtime::Handle::current().block_on(async {
+            let report = runtime.drain(&model).await?;
+            let status = runtime.status(&model).await;
+            Ok::<_, sbproxy_model_host::RuntimeManagerError>((report, status))
+        });
+        return match result {
+            Ok((report, status)) => (
+                200,
+                JSON,
+                serde_json::json!({
+                    "deployment": model,
+                    "state": "stopped",
+                    "drain": report,
+                    "job_id": status.and_then(|status| status.job_id),
+                })
+                .to_string(),
+            ),
+            Err(error) => runtime_error_response("stop", error),
+        };
+    };
+    enqueue_lifecycle_job(
+        runtime,
+        store,
+        sbproxy_model_host::OperationKind::Drain,
+        model,
+    )
+}
+
+#[derive(Debug, Serialize)]
+struct LifecycleJobResponse {
+    schema_version: u32,
+    deployment: String,
+    state: &'static str,
+    job_id: String,
+    poll_url: String,
+}
+
+/// Enqueue a durable operation job for a load/evict lifecycle route and
+/// answer `202` immediately with a poll link, rather than blocking the
+/// admin request on the underlying engine work. The actual `ensure_ready`
+/// / `drain` call runs on the same Tokio runtime in the background and
+/// settles the job to `ready` or `failed`.
+fn enqueue_lifecycle_job(
+    runtime: Arc<ProductionModelRuntime>,
+    store: sbproxy_model_host::FileJobStore,
+    kind: sbproxy_model_host::OperationKind,
+    deployment: String,
+) -> Resp {
+    let job = match store.create(kind, deployment.clone()) {
+        Ok(job) => job,
+        Err(error) => {
+            tracing::error!(%error, "create lifecycle operation job");
+            return (
+                502,
+                JSON,
+                r#"{"error":"operation job store unavailable; inspect server logs"}"#.to_string(),
+            );
+        }
+    };
+    job_event_log().publish(&job);
+    let job_id = job.id.clone();
+    tokio::runtime::Handle::current().spawn(run_lifecycle_job(
+        runtime,
+        store,
+        kind,
+        deployment.clone(),
+        job_id.clone(),
+    ));
+    json_response(
+        202,
+        &LifecycleJobResponse {
+            schema_version: MANAGEMENT_SCHEMA_VERSION,
+            deployment,
+            state: "queued",
+            poll_url: format!("/admin/model-host/jobs/{job_id}"),
+            job_id,
+        },
+    )
+}
+
+/// Background half of [`enqueue_lifecycle_job`]: run the actual lifecycle
+/// call and settle the durable job to its terminal state. The redacted
+/// `reason_code` (never the raw error, which can carry a private path) is
+/// what a failed job's `error` field carries.
+async fn run_lifecycle_job(
+    runtime: Arc<ProductionModelRuntime>,
+    store: sbproxy_model_host::FileJobStore,
+    kind: sbproxy_model_host::OperationKind,
+    deployment: String,
+    job_id: String,
+) {
+    let operation = match kind {
+        sbproxy_model_host::OperationKind::Drain => "stop",
+        _ => "load",
+    };
+    let outcome = match kind {
+        sbproxy_model_host::OperationKind::Drain => {
+            runtime.drain(&deployment).await.map(|_report| ())
+        }
+        _ => runtime.ensure_ready(&deployment).await.map(|_running| ()),
+    };
+    let transition = match outcome {
+        Ok(()) => store.transition(
+            &job_id,
+            sbproxy_model_host::OperationState::Ready,
+            sbproxy_model_host::OperationProgress::default(),
+            None,
         ),
-        Err(error) => runtime_error_response("stop", error),
+        Err(error) => {
+            let message = format!(
+                "{operation} failed ({}); inspect server logs",
+                error.reason_code()
+            );
+            store.transition(
+                &job_id,
+                sbproxy_model_host::OperationState::Failed,
+                sbproxy_model_host::OperationProgress::default(),
+                Some(message.as_str()),
+            )
+        }
+    };
+    match transition {
+        Ok(job) => {
+            job_event_log().publish(&job);
+        }
+        Err(error) => tracing::error!(%error, job_id, "settle lifecycle operation job"),
     }
 }
 
@@ -940,6 +1113,209 @@ fn reset_response(body: Option<&str>) -> Resp {
         ),
         Err(error) => runtime_error_response("reset", error),
     }
+}
+
+#[derive(Debug, Serialize)]
+struct JobsListResponse {
+    schema_version: u32,
+    jobs: Vec<sbproxy_model_host::OperationJob>,
+}
+
+#[derive(Debug, Serialize)]
+struct JobDetailResponse {
+    schema_version: u32,
+    job: sbproxy_model_host::OperationJob,
+}
+
+fn unknown_job_response(job_id: &str) -> Resp {
+    json_response(
+        404,
+        &serde_json::json!({
+            "error": "operation job was not found",
+            "job_id": job_id,
+        }),
+    )
+}
+
+/// Build `GET /admin/model-host/jobs`: every active job plus retained
+/// terminal history from the durable `FileJobStore`. With no production
+/// model host configured (no durable job store open) this answers an
+/// honest empty list, mirroring `files_response`.
+fn jobs_list_response() -> Resp {
+    jobs_list_response_with(crate::server::model_host::model_runtime_manager())
+}
+
+fn jobs_list_response_with(runtime: Arc<ProductionModelRuntime>) -> Resp {
+    let Some(store) = runtime.job_store() else {
+        return json_response(
+            200,
+            &JobsListResponse {
+                schema_version: MANAGEMENT_SCHEMA_VERSION,
+                jobs: Vec::new(),
+            },
+        );
+    };
+    match store.list() {
+        Ok(jobs) => json_response(
+            200,
+            &JobsListResponse {
+                schema_version: MANAGEMENT_SCHEMA_VERSION,
+                jobs,
+            },
+        ),
+        Err(error) => {
+            tracing::error!(%error, "list operation jobs");
+            (
+                502,
+                JSON,
+                r#"{"error":"operation job list unavailable; inspect server logs"}"#.to_string(),
+            )
+        }
+    }
+}
+
+/// Build `GET /admin/model-host/jobs/{id}`: one job by ID. A malformed ID
+/// (not a ULID) is a `400`, matching how the artifact-digest route rejects
+/// a malformed digest; a well-formed but absent ID is a `404`.
+fn job_detail_response(job_id: &str) -> Resp {
+    job_detail_response_with(crate::server::model_host::model_runtime_manager(), job_id)
+}
+
+fn job_detail_response_with(runtime: Arc<ProductionModelRuntime>, job_id: &str) -> Resp {
+    // Job IDs are a path segment used to address job files, so format is
+    // rejected up front, the same as `is_artifact_digest`.
+    if job_id.parse::<ulid::Ulid>().is_err() {
+        return json_response(
+            400,
+            &serde_json::json!({
+                "error": "operation job ID must be a ULID",
+                "job_id": job_id,
+            }),
+        );
+    }
+    let Some(store) = runtime.job_store() else {
+        return unknown_job_response(job_id);
+    };
+    match store.get(job_id) {
+        Ok(Some(job)) => json_response(
+            200,
+            &JobDetailResponse {
+                schema_version: MANAGEMENT_SCHEMA_VERSION,
+                job,
+            },
+        ),
+        Ok(None) => unknown_job_response(job_id),
+        Err(error) => {
+            tracing::error!(%error, "read operation job");
+            (
+                502,
+                JSON,
+                r#"{"error":"operation job read failed; inspect server logs"}"#.to_string(),
+            )
+        }
+    }
+}
+
+/// One durable job snapshot plus the monotonic sequence number an SSE
+/// client resumes after via `Last-Event-ID`. Sequence numbers are
+/// process-local and reset on restart, same as `AdminState::log_events`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct JobEvent {
+    pub(crate) sequence: u64,
+    pub(crate) job: sbproxy_model_host::OperationJob,
+}
+
+/// Retained replay events per job. Bounded so a long-lived process cannot
+/// grow this without limit; durable truth stays in `FileJobStore`, this
+/// only smooths over a client's brief disconnect.
+const JOB_EVENT_HISTORY_PER_JOB: usize = 64;
+/// Distinct jobs tracked for replay before the oldest is evicted.
+const JOB_EVENT_TRACKED_JOBS: usize = 512;
+
+#[derive(Debug, Default)]
+struct JobEventLogState {
+    next_sequence: u64,
+    order: VecDeque<String>,
+    by_job: BTreeMap<String, VecDeque<JobEvent>>,
+}
+
+/// In-memory replay buffer plus live broadcast tail backing
+/// `GET /admin/model-host/jobs/{id}/stream`. Never the source of truth
+/// (that is `FileJobStore`); a restart drops it same as `log_events`.
+#[derive(Debug)]
+pub(crate) struct JobEventLog {
+    state: Mutex<JobEventLogState>,
+    live: tokio::sync::broadcast::Sender<JobEvent>,
+}
+
+impl JobEventLog {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(JobEventLogState::default()),
+            live: tokio::sync::broadcast::channel(256).0,
+        }
+    }
+
+    /// Publish one job snapshot: append it to that job's bounded replay
+    /// history and fan it out to live SSE subscribers. Returns the
+    /// sequence number assigned to this event, for callers (tests, mainly)
+    /// that need to name it in a later `Last-Event-ID`.
+    pub(crate) fn publish(&self, job: &sbproxy_model_host::OperationJob) -> u64 {
+        let event = {
+            let mut state = self.state.lock().expect("job event log lock");
+            let sequence = state.next_sequence;
+            state.next_sequence += 1;
+            let event = JobEvent {
+                sequence,
+                job: job.clone(),
+            };
+            if !state.by_job.contains_key(&job.id) {
+                state.order.push_back(job.id.clone());
+                if state.order.len() > JOB_EVENT_TRACKED_JOBS {
+                    if let Some(oldest) = state.order.pop_front() {
+                        state.by_job.remove(&oldest);
+                    }
+                }
+            }
+            let history = state.by_job.entry(job.id.clone()).or_default();
+            history.push_back(event.clone());
+            if history.len() > JOB_EVENT_HISTORY_PER_JOB {
+                history.pop_front();
+            }
+            event
+        };
+        let sequence = event.sequence;
+        let _ = self.live.send(event);
+        sequence
+    }
+
+    /// Retained events for `job_id` with a sequence strictly greater than
+    /// `after` (`None` replays the full retained history).
+    pub(crate) fn replay(&self, job_id: &str, after: Option<u64>) -> Vec<JobEvent> {
+        let state = self.state.lock().expect("job event log lock");
+        state
+            .by_job
+            .get(job_id)
+            .map(|history| {
+                history
+                    .iter()
+                    .filter(|event| after.is_none_or(|after| event.sequence > after))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<JobEvent> {
+        self.live.subscribe()
+    }
+}
+
+/// Process-wide job-progress event log backing the SSE stream. Lazily
+/// built on first use, matching `model_runtime_manager`'s `OnceLock`.
+pub(crate) fn job_event_log() -> &'static JobEventLog {
+    static LOG: OnceLock<JobEventLog> = OnceLock::new();
+    LOG.get_or_init(JobEventLog::new)
 }
 
 fn runtime_serving_summary(
@@ -2375,6 +2751,186 @@ models:
             assert_eq!(ct, JSON);
             assert!(body.contains("\"reason_code\":\"unknown_deployment\""));
         }
+    }
+
+    #[test]
+    fn jobs_list_route_reports_jobs_from_the_durable_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::server::model_host::test_runtime_with_job_store(
+            directory.path(),
+        ));
+        let store = runtime
+            .job_store()
+            .expect("fixture runtime has a job store");
+        let job = store
+            .create(
+                sbproxy_model_host::OperationKind::Pull,
+                "fixture-job-subject".to_string(),
+            )
+            .expect("create fixture job");
+
+        let (status, ct, body) = jobs_list_response_with(runtime);
+        assert_eq!(status, 200);
+        assert_eq!(ct, JSON);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("jobs list json");
+        assert_eq!(response["schema_version"], 1);
+        let jobs = response["jobs"].as_array().expect("jobs array");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["id"], job.id);
+        assert_eq!(jobs[0]["subject"], "fixture-job-subject");
+        assert_eq!(jobs[0]["state"], "queued");
+    }
+
+    #[test]
+    fn job_detail_route_returns_the_matching_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::server::model_host::test_runtime_with_job_store(
+            directory.path(),
+        ));
+        let store = runtime
+            .job_store()
+            .expect("fixture runtime has a job store");
+        let job = store
+            .create(
+                sbproxy_model_host::OperationKind::Pull,
+                "fixture-job-subject".to_string(),
+            )
+            .expect("create fixture job");
+
+        let (status, ct, body) = job_detail_response_with(runtime, &job.id);
+        assert_eq!(status, 200);
+        assert_eq!(ct, JSON);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("job detail json");
+        assert_eq!(response["schema_version"], 1);
+        assert_eq!(response["job"]["id"], job.id);
+        assert_eq!(response["job"]["subject"], "fixture-job-subject");
+    }
+
+    #[test]
+    fn job_detail_route_answers_not_found_for_an_unknown_id() {
+        // No production model host is configured for the process-global
+        // runtime `dispatch` reads, so there is no durable job store open;
+        // a well-formed ID is an honest 404, mirroring
+        // `artifact_delete_returns_not_found_for_an_unknown_digest`.
+        let job_id = ulid::Ulid::new().to_string();
+        let (code, ct, body) = dispatch("GET", &format!("/admin/model-host/jobs/{job_id}"), None)
+            .expect("job detail route");
+        assert_eq!(code, 404);
+        assert_eq!(ct, JSON);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("error json");
+        assert_eq!(response["job_id"], job_id);
+    }
+
+    #[test]
+    fn job_detail_route_rejects_a_malformed_id() {
+        let (code, _, _) =
+            dispatch("GET", "/admin/model-host/jobs/not-a-ulid", None).expect("job detail route");
+        assert_eq!(code, 400);
+    }
+
+    #[test]
+    fn jobs_list_route_rejects_non_get() {
+        let (code, _, _) =
+            dispatch("POST", "/admin/model-host/jobs", None).expect("jobs list route");
+        assert_eq!(code, 405);
+    }
+
+    #[test]
+    fn jobs_list_route_reports_an_empty_list_without_a_model_host() {
+        // Mirrors `files_route_reports_an_empty_inventory_without_a_model_host`:
+        // no production model host means no durable job store is open, so
+        // the honest answer is an empty list rather than an error.
+        let (code, ct, body) =
+            dispatch("GET", "/admin/model-host/jobs", None).expect("jobs list route");
+        assert_eq!(code, 200);
+        assert_eq!(ct, JSON);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("jobs list json");
+        assert_eq!(response["schema_version"], 1);
+        assert_eq!(response["jobs"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn load_route_enqueues_a_durable_job_and_answers_202() {
+        // `enqueue_lifecycle_job` only spawns the background lifecycle call
+        // (never blocks on it), so this can run directly on the test's
+        // Tokio runtime without the `spawn_blocking` wrapper the
+        // no-job-store fallback below needs.
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::server::model_host::test_runtime_with_job_store(
+            directory.path(),
+        ));
+
+        let (status, ct, body) =
+            load_response_with(runtime, Some(r#"{"deployment":"fixture-deployment"}"#));
+        assert_eq!(status, 202, "{body}");
+        assert_eq!(ct, JSON);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("load response json");
+        assert_eq!(response["schema_version"], 1);
+        assert_eq!(response["deployment"], "fixture-deployment");
+        assert_eq!(response["state"], "queued");
+        let job_id = response["job_id"].as_str().expect("job_id present");
+        assert!(!job_id.is_empty());
+        assert_eq!(
+            response["poll_url"],
+            format!("/admin/model-host/jobs/{job_id}")
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_route_enqueues_a_durable_job_and_answers_202() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::server::model_host::test_runtime_with_job_store(
+            directory.path(),
+        ));
+
+        let (status, ct, body) =
+            evict_response_with(runtime, Some(r#"{"deployment":"fixture-deployment"}"#));
+        assert_eq!(status, 202, "{body}");
+        assert_eq!(ct, JSON);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("evict response json");
+        assert_eq!(response["schema_version"], 1);
+        assert_eq!(response["deployment"], "fixture-deployment");
+        assert_eq!(response["state"], "queued");
+        let job_id = response["job_id"].as_str().expect("job_id present");
+        assert!(!job_id.is_empty());
+        assert_eq!(
+            response["poll_url"],
+            format!("/admin/model-host/jobs/{job_id}")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_and_evict_without_a_model_host_keep_the_synchronous_contract() {
+        // No production model host is configured for the process-global
+        // runtime `dispatch` reads, so there is no durable job store open;
+        // both routes fall back to their pre-existing synchronous 404 for
+        // an unknown deployment rather than enqueueing an unpollable job.
+        // Pinned alongside `lifecycle_routes_return_stable_unknown_deployment_reason`
+        // so the two contracts (job-store-backed vs. fallback) cannot
+        // silently drift apart. The fallback path blocks on the runtime
+        // handle, so (like that test) it runs on a blocking-pool thread.
+        let (load_status, _, _) = tokio::task::spawn_blocking(|| {
+            dispatch(
+                "POST",
+                "/admin/model-host/load",
+                Some(r#"{"deployment":"definitely-missing"}"#),
+            )
+            .expect("load route")
+        })
+        .await
+        .unwrap();
+        assert_eq!(load_status, 404);
+        let (evict_status, _, _) = tokio::task::spawn_blocking(|| {
+            dispatch(
+                "POST",
+                "/admin/model-host/evict",
+                Some(r#"{"deployment":"definitely-missing"}"#),
+            )
+            .expect("evict route")
+        })
+        .await
+        .unwrap();
+        assert_eq!(evict_status, 404);
     }
 
     #[test]
