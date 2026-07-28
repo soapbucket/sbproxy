@@ -1101,28 +1101,6 @@ pub(super) fn spawn_shutdown_phase_logger(
         .ok();
 }
 
-/// Create and start a Pingora server with the given config file path.
-///
-/// This function:
-/// 1. Reads and compiles the YAML config
-/// 2. Compiles it into a pipeline with module instances
-/// 3. Loads it into the hot-reload store
-/// 4. Starts a file watcher for config hot-reload
-/// 5. Creates a Pingora server with an HTTP proxy service
-/// 6. Starts the server (blocks forever)
-///
-/// Pingora handles SIGTERM (graceful shutdown) and SIGINT (fast
-/// shutdown) internally inside `Server::run`. We subscribe
-/// to Pingora's execution-phase broadcast (see
-/// `spawn_shutdown_phase_logger`) so a structured tracing event is
-/// emitted when a shutdown signal arrives; operators can grep for
-/// `shutdown_signal_received` in the logs to see the drain start.
-/// The grace period comes from the [`GraceConfig`] the binary passes
-/// in (preferring `shutdown_grace_ms` over `grace_time_secs`), resolved
-/// to seconds by `resolve_shutdown_grace_seconds`. The file watcher
-/// handles config reload on file change,
-/// which is equivalent to SIGHUP-based reload in traditional
-/// servers.
 /// Resolve the admin-operator password pepper, failing loud only when it is
 /// actually needed.
 ///
@@ -1161,6 +1139,28 @@ fn resolve_or_default_admin_operator_pepper(
     }
 }
 
+/// Create and start a Pingora server with the given config file path.
+///
+/// This function:
+/// 1. Reads and compiles the YAML config
+/// 2. Compiles it into a pipeline with module instances
+/// 3. Loads it into the hot-reload store
+/// 4. Starts a file watcher for config hot-reload
+/// 5. Creates a Pingora server with an HTTP proxy service
+/// 6. Starts the server (blocks forever)
+///
+/// Pingora handles SIGTERM (graceful shutdown) and SIGINT (fast
+/// shutdown) internally inside `Server::run`. We subscribe
+/// to Pingora's execution-phase broadcast (see
+/// `spawn_shutdown_phase_logger`) so a structured tracing event is
+/// emitted when a shutdown signal arrives; operators can grep for
+/// `shutdown_signal_received` in the logs to see the drain start.
+/// The grace period comes from the [`GraceConfig`] the binary passes
+/// in (preferring `shutdown_grace_ms` over `grace_time_secs`), resolved
+/// to seconds by `resolve_shutdown_grace_seconds`. The file watcher
+/// handles config reload on file change,
+/// which is equivalent to SIGHUP-based reload in traditional
+/// servers.
 pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     use pingora_core::apps::HttpServerOptions;
     use pingora_core::server::configuration::ServerConf as PingoraServerConf;
