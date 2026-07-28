@@ -68,6 +68,37 @@ pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
     }
 }
 
+/// Sequentially read a file's full contents to warm the OS page cache,
+/// without holding the bytes. Narrowed scope: the vLLM and llama.cpp
+/// subprocess engines read a weight file themselves after sbproxy hands
+/// them a path, and sbproxy never loads the weights into its own
+/// process, so warming the page cache ahead of that read is the whole
+/// lever available here, not an in-process streaming loader. A cold
+/// page cache (a fresh box, or one whose cache was evicted since the
+/// last serve) otherwise means the engine's own first read pays full
+/// disk latency; a warm one, so the engine reads from RAM. Returns the
+/// number of bytes read, so a caller can confirm it walked the whole
+/// file, or an error string on a read failure.
+pub async fn prefetch_into_page_cache(path: &Path) -> Result<u64, String> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("open {} for prefetch: {e}", path.display()))?;
+    let mut buf = vec![0u8; 1 << 20]; // 1 MiB read-ahead chunks.
+    let mut total = 0u64;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("prefetch {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+    }
+    Ok(total)
+}
+
 /// Resolve a `file:` weight source (WOR-1681): weights already on disk,
 /// fetched over no network. Confirms the path exists and, when an
 /// `expected_sha256` is given, verifies it before the engine reads it.
@@ -181,5 +212,24 @@ mod tests {
         assert!(resolve_local_source(&f, Some("deadbeef")).is_err());
         // Missing path -> error.
         assert!(resolve_local_source(Path::new("/no/such/model"), None).is_err());
+    }
+
+    // --- OS page-cache prefetch ---
+
+    #[tokio::test]
+    async fn prefetch_reads_through_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("weights.bin");
+        let contents = vec![7u8; 3 * (1 << 20) + 12345]; // >1 chunk, uneven tail
+        std::fs::write(&f, &contents).unwrap();
+        let read = prefetch_into_page_cache(&f).await.unwrap();
+        assert_eq!(read, contents.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn prefetch_of_a_missing_file_is_an_error() {
+        assert!(prefetch_into_page_cache(Path::new("/no/such/weights"))
+            .await
+            .is_err());
     }
 }
