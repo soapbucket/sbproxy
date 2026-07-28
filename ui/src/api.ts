@@ -354,6 +354,8 @@ export interface DeviceVram {
   name?: string;
   total_bytes?: number;
   free_bytes?: number;
+  compute_utilization?: number;
+  memory_occupancy?: number;
 }
 export interface LocalServing {
   ready?: boolean;
@@ -501,6 +503,21 @@ export interface AdminKey {
 export interface CreatedKey {
   token: string;
   key: AdminKey;
+}
+
+/** Minimal, strictly-typed key listing for selectors (e.g. the playground's
+ *  virtual-key picker). `api.keys()` above stays loosely typed for the
+ *  full Keys view; this mirrors the same `GET /admin/keys` response. */
+export type AdminKeyStatus = "active" | "blocked" | "revoked";
+
+export interface AdminKeySummary {
+  key_id: string;
+  name: string | null;
+  status: AdminKeyStatus;
+}
+
+export interface AdminKeysListResponse {
+  keys: AdminKeySummary[];
 }
 
 export type KeyPolicyMutationKind = "patch" | "action";
@@ -1498,6 +1515,36 @@ export interface ClusterStatusResponse {
   unhealthy_nodes: ClusterNodeAlert[];
 }
 
+/** Cluster-wide VRAM aggregation. Distinct from `ModelHostStatus.vram`
+ *  above, which is this node's own local view only. */
+export interface ClusterVramStatus {
+  budget_bytes: number;
+  used_bytes: number;
+  free_bytes: number;
+  devices: DeviceVram[];
+}
+
+export interface ClusterVramNode {
+  node_id: string;
+  vram: ClusterVramStatus;
+}
+
+export interface ClusterVramSummary {
+  total_bytes: number;
+  used_bytes: number;
+  free_bytes: number;
+  device_count: number;
+  node_count: number;
+}
+
+export interface ClusterVramResponse {
+  schema_version: number;
+  generated_at_unix_ms: number;
+  directory_collected_at_unix_ms: number | null;
+  cluster: ClusterVramSummary;
+  nodes: ClusterVramNode[];
+}
+
 export type ArtifactFormat = "safetensors" | "gguf" | "pickle";
 export type SupportLevel =
   | "stable"
@@ -1654,6 +1701,59 @@ export interface GcReport {
   deleted_artifacts: string[];
   skipped_artifacts: Record<string, string>;
   budget_unsatisfied_bytes: number;
+}
+
+/* ---- Durable operation jobs (queued / in-flight lifecycle work) ---- */
+
+export type OperationKind =
+  | "pull"
+  | "verify"
+  | "provision"
+  | "launch"
+  | "load"
+  | "drain"
+  | "stop"
+  | "rollout"
+  | "delete"
+  | "reset";
+
+export type OperationState =
+  | "queued"
+  | "downloading"
+  | "verifying"
+  | "ready"
+  | "failed"
+  | "deleting"
+  | "deleted";
+
+export interface OperationProgress {
+  completed_bytes: number;
+  total_bytes: number;
+  current_file: string | null;
+}
+
+// Mirrors sbproxy_model_host::jobs::OperationJob. `subject` is the
+// deployment id or artifact digest the operation acts on.
+export interface OperationJob {
+  id: string;
+  kind: OperationKind;
+  subject: string;
+  state: OperationState;
+  progress: OperationProgress;
+  created_at_ms: number;
+  updated_at_ms: number;
+  terminal_at_ms: number | null;
+  error: string | null;
+}
+
+export interface JobsListResponse {
+  schema_version: number;
+  jobs: OperationJob[];
+}
+
+export interface JobDetailResponse {
+  schema_version: number;
+  job: OperationJob;
 }
 
 export interface ClusterDeploymentBundleDraft {
@@ -1858,6 +1958,9 @@ export interface PlaygroundChatRequest {
 }
 export interface PlaygroundChatResult {
   origin?: string;
+  // Present on responses from `playgroundDispatch`: the virtual key the
+  // request was dispatched as.
+  key_id?: string;
   status?: number;
   model?: string;
   response?: Record<string, unknown>;
@@ -1866,6 +1969,14 @@ export interface PlaygroundChatResult {
   latency_ms?: number;
   debug?: { request_id?: string; config_revision?: string };
   error?: string;
+}
+/** Body for `playgroundDispatch`: same as `PlaygroundChatRequest` plus the
+ *  virtual key to impersonate through the real data-plane dispatch path. */
+export interface PlaygroundDispatchRequest {
+  key_id: string;
+  origin: string;
+  request: Record<string, unknown>;
+  debug?: boolean;
 }
 export interface CacheStatus {
   enabled: boolean;
@@ -2028,9 +2139,19 @@ export const api = {
       `/admin/model-host/artifacts/${encodeURIComponent(digest)}`,
     ),
   modelHostGc: () => sendJson<GcReport>("POST", "/admin/model-host/gc"),
+  // Durable operation jobs (queued/in-flight lifecycle + pull/verify work).
+  modelHostJobs: () => getJson<JobsListResponse>("/admin/model-host/jobs"),
+  modelHostJob: (id: string) =>
+    getJson<JobDetailResponse>(`/admin/model-host/jobs/${encodeURIComponent(id)}`),
+  // SSE tail of one job's durable state, with `Last-Event-ID` replay across
+  // a reconnect (the browser's EventSource resends it automatically).
+  modelHostJobStreamUrl: (id: string) =>
+    `/admin/model-host/jobs/${encodeURIComponent(id)}/stream`,
 
   // Keys
   keys: () => getJson<unknown>("/admin/keys"),
+  // Typed, minimal key listing for selectors; see `AdminKeySummary` above.
+  keysList: () => getJson<AdminKeysListResponse>("/admin/keys"),
   keyPolicySchema: async () =>
     decodeKeyPolicySchema(
       await getJson<unknown>("/admin/keys/policy-schema"),
@@ -2144,6 +2265,12 @@ export const api = {
     getJson<PlaygroundEndpoints>("/admin/api/playground/endpoints"),
   playgroundChat: (body: PlaygroundChatRequest) =>
     sendJson<PlaygroundChatResult>("POST", "/admin/api/playground/chat", body),
+  // Real dispatch: runs the request through the actual data-plane pipeline
+  // for a chosen virtual key (key policy, governance, routing, and
+  // guardrails all apply), rather than calling the engine/AiClient
+  // directly the way `playgroundChat` above does.
+  playgroundDispatch: (body: PlaygroundDispatchRequest) =>
+    sendJson<PlaygroundChatResult>("POST", "/admin/api/playground/dispatch", body),
 
   // Cache (WOR-1754 / WOR-1755)
   // Runtime log level (WOR-1759)
@@ -2183,6 +2310,7 @@ export const api = {
       draft,
     ),
   clusterMetrics: () => getJson<ClusterMetrics>("/admin/cluster/metrics"),
+  clusterVram: () => getJson<ClusterVramResponse>("/admin/cluster/vram"),
 
   // Rate-limit budget state + manual resume (WOR-1764).
   budgetSnapshot: () => getJson<WorkspaceStatus[]>("/api/rate_limits/budget"),

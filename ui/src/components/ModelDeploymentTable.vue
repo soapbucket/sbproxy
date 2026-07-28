@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { DeploymentRuntimeState } from "../api";
 import { formatReasonCode } from "../lib/cluster-health";
-import { formatBytes } from "../lib/format";
+import { formatBytes, shortId } from "../lib/format";
 import {
   deploymentRemovalGuard,
   type ModelDeploymentRow,
@@ -114,6 +114,28 @@ function labels(row: ModelDeploymentRow): string {
     ? entries.map(([key, value]) => `${key}=${value}`).join(", ")
     : "Any eligible worker";
 }
+
+function assignmentNodesText(row: ModelDeploymentRow): string | null {
+  if (!row.assignment) return null;
+  if (!row.assignment.assignments.length) return "No cluster placement yet";
+  return `Assigned to ${row.assignment.assignments
+    .map((assignment) => assignment.node_id)
+    .join(", ")}`;
+}
+
+function liveReplicaSummary(row: ModelDeploymentRow): string | null {
+  if (!row.liveReplicas.length) return null;
+  const activeRequests = row.liveReplicas.reduce(
+    (total, replica) => total + replica.active_requests,
+    0,
+  );
+  const queueDepth = row.liveReplicas.reduce(
+    (total, replica) => total + replica.queue_depth,
+    0,
+  );
+  const count = row.liveReplicas.length;
+  return `${count} live ${count === 1 ? "replica" : "replicas"} across the fleet · ${activeRequests} active · ${queueDepth} queued`;
+}
 </script>
 
 <template>
@@ -168,6 +190,12 @@ function labels(row: ModelDeploymentRow): string {
                 <span v-if="row.runtime.memory" class="table-detail">
                   {{ formatBytes(row.runtime.memory.total_bytes) }} reserved
                 </span>
+                <span v-if="row.runtime?.artifact_digest" class="table-detail">
+                  Artifact
+                  <span class="sb-mono" :title="row.runtime.artifact_digest">{{
+                    shortId(row.runtime.artifact_digest, 12, 8)
+                  }}</span>
+                </span>
                 <span v-if="throughputText(row)" class="table-detail">
                   {{ throughputText(row) }}
                 </span>
@@ -179,6 +207,9 @@ function labels(row: ModelDeploymentRow): string {
                 <StatusBadge label="Not observed" tone="neutral" />
                 <span class="table-detail">No local runtime status is currently reported.</span>
               </template>
+              <span v-if="liveReplicaSummary(row)" class="table-detail">
+                {{ liveReplicaSummary(row) }}
+              </span>
             </td>
             <td>
               <template v-if="row.desired">
@@ -199,6 +230,9 @@ function labels(row: ModelDeploymentRow): string {
                 </span>
               </template>
               <span v-else class="table-detail">Desired policy could not be loaded.</span>
+              <span v-if="assignmentNodesText(row)" class="table-detail">
+                {{ assignmentNodesText(row) }}
+              </span>
             </td>
             <td class="actions-cell">
               <div class="action-group" :aria-label="`Lifecycle actions for ${row.deploymentId}`">
