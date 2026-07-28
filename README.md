@@ -4,7 +4,7 @@
 
 <h1 align="center">SBproxy</h1>
 
-*Last modified: 2026-07-22*
+*Last modified: 2026-07-28*
 
 <h3 align="center">The self-hosted AI gateway.</h3>
 

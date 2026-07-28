@@ -10,6 +10,8 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+## [1.9.0] - 2026-07-28
+
 ### Added
 
 - **AI routing and state now carry production authority end to end.** Peak

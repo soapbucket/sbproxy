@@ -8625,7 +8625,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -8861,7 +8861,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy-core"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -8893,7 +8893,7 @@ dependencies = [
  "prometheus 0.14.0",
  "rand 0.8.6",
  "rcgen",
- "redb",
+ "redb 2.6.3",
  "regex",
  "reqwest 0.12.28",
  "rustls",
@@ -9262,7 +9262,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy-observe"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
