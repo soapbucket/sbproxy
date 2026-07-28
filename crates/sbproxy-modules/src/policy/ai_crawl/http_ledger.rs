@@ -1,9 +1,12 @@
 //! HTTP ledger client.
 //!
 //! Sync (blocking) by design: the [`Ledger`] trait is sync because
-//! the policy fast-path lives inside Pingora's request filter, which
-//! does not own a tokio runtime handle. We use `reqwest::blocking`
-//! the same way the WAF rule-feed loader does at config-compile.
+//! the policy fast-path lives inside Pingora's request filter. We use
+//! `reqwest::blocking` the same way the WAF rule-feed loader does at
+//! config-compile. When the filter runs on a tokio worker thread,
+//! `redeem` bridges through `block_in_place` so the blocking client's
+//! internal runtime never drops in a blocking-forbidden context (a
+//! debug-build panic since tokio 1.52).
 //! For high-rps deployments the circuit breaker bounds the cost of
 //! a slow ledger to one round-trip + breaker-open period.
 use std::sync::Arc;
@@ -170,6 +173,38 @@ impl HttpLedger {
 
 impl Ledger for HttpLedger {
     fn redeem(
+        &self,
+        token: &str,
+        host: &str,
+        path: &str,
+        expected_amount_micros: u64,
+        expected_currency: &str,
+    ) -> Result<RedeemResult, LedgerError> {
+        // The retry loop below sleeps and drives reqwest's blocking
+        // client, whose internal runtime must not be dropped on an
+        // async worker thread (tokio panics on that in debug builds).
+        // When called from a multi-thread runtime worker, tell tokio
+        // this thread is intentionally blocking; anywhere else the
+        // call is already on a plain thread and runs directly.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| {
+                    self.redeem_blocking(
+                        token,
+                        host,
+                        path,
+                        expected_amount_micros,
+                        expected_currency,
+                    )
+                })
+            }
+            _ => self.redeem_blocking(token, host, path, expected_amount_micros, expected_currency),
+        }
+    }
+}
+
+impl HttpLedger {
+    fn redeem_blocking(
         &self,
         token: &str,
         host: &str,
