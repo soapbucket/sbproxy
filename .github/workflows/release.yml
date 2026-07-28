@@ -471,10 +471,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Draft notes are the tagged version's CHANGELOG section, not
+          # the whole file: GitHub caps release bodies at 125k
+          # characters and the full CHANGELOG passed that at v1.9.0.
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { on = 1; print; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > /tmp/release-notes.md
+          if ! [ -s /tmp/release-notes.md ]; then
+            echo "no CHANGELOG section found for ${version}" >&2
+            exit 1
+          fi
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
-            --notes-file CHANGELOG.md \
+            --notes-file /tmp/release-notes.md \
             --draft \
             dist/*
 
