@@ -254,10 +254,11 @@ authoritative, including `levers: []`.
 ## Profiles and request selection
 
 Named profiles live under the route's `compression.profiles` map. Each profile
-has its own `levers` and optional Redis `state`. Profile names contain from 1
-to 64 bytes, start with a lowercase ASCII letter or digit, and then use only
-lowercase ASCII letters, digits, `_`, or `-`. The reserved values `on` and
-`off` cannot be profile names.
+has its own `levers` and optional `state` backend; stateful profiles default to
+the process-local durable backend when `state` is omitted. Profile names
+contain from 1 to 64 bytes, start with a lowercase ASCII letter or digit, and
+then use only lowercase ASCII letters, digits, `_`, or `-`. The reserved values
+`on` and `off` cannot be profile names.
 
 ```yaml
 origins:
@@ -385,7 +386,7 @@ origin, and captured session:
 - Appended history sends only newly covered messages plus the prior summary to
   the summarizer, then advances the logical version.
 - A record at or past its logical expiration skips with `state_expired`, even
-  during the short interval before Redis physically removes it.
+  during the short interval before the selected backend physically removes it.
 - A changed protected prefix, edited covered message, shortened history, or
   different history fork skips with `branch_mismatch`. SBproxy does not reuse
   or overwrite the record for the mismatched branch.

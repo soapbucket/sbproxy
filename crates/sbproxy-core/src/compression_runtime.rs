@@ -253,9 +253,8 @@ fn state_home_from_environment(name: &str) -> Option<PathBuf> {
         .filter(|path| path.is_absolute())
 }
 
-fn service_state_dir_writable() -> bool {
-    let directory = Path::new(SERVICE_STATE_DIR);
-    if std::fs::create_dir_all(directory).is_err() {
+fn existing_directory_writable(directory: &Path) -> bool {
+    if !directory.is_dir() {
         return false;
     }
     let probe = directory.join(format!(
@@ -274,6 +273,10 @@ fn service_state_dir_writable() -> bool {
         }
         Err(_) => false,
     }
+}
+
+fn service_state_dir_writable() -> bool {
+    existing_directory_writable(Path::new(SERVICE_STATE_DIR))
 }
 
 fn required_local_state_path(
@@ -1241,10 +1244,10 @@ fn destination_allowed(value: &str, allowed: &[String], blocked: &[String]) -> b
 #[cfg(test)]
 mod tests {
     use super::{
-        policy_behavior_fingerprint, policy_requires_local, policy_requires_redis,
-        redis_dependency, resolve_local_state_path, CompressionExecution, CompressionRuntime,
-        CompressionRuntimeRegistry, CompressionRuntimeSet, LocalPathInputs, LocalPlatform,
-        LocalStateDependency, MeshStateDependency, RuntimeDependencies,
+        existing_directory_writable, policy_behavior_fingerprint, policy_requires_local,
+        policy_requires_redis, redis_dependency, resolve_local_state_path, CompressionExecution,
+        CompressionRuntime, CompressionRuntimeRegistry, CompressionRuntimeSet, LocalPathInputs,
+        LocalPlatform, LocalStateDependency, MeshStateDependency, RuntimeDependencies,
     };
     use async_trait::async_trait;
     use rcgen::{CertificateParams, KeyPair};
@@ -1597,6 +1600,15 @@ mod tests {
             platform: LocalPlatform::Unix,
         })
         .is_err());
+    }
+
+    #[test]
+    fn writable_probe_never_creates_a_missing_service_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let missing = root.path().join("service-state");
+
+        assert!(!existing_directory_writable(&missing));
+        assert!(!missing.exists());
     }
 
     #[test]

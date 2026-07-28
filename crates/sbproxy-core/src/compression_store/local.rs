@@ -856,6 +856,12 @@ fn open_shared_database(path: PathBuf) -> anyhow::Result<(Arc<Database>, PathBuf
             parent.display()
         )
     })?;
+    enforce_owner_only_directory(parent).map_err(|error| {
+        anyhow::anyhow!(
+            "secure Local compression state directory {}: {error}",
+            parent.display()
+        )
+    })?;
     let canonical_path = if path.exists() {
         std::fs::canonicalize(&path)
     } else {
@@ -865,6 +871,12 @@ fn open_shared_database(path: PathBuf) -> anyhow::Result<(Arc<Database>, PathBuf
         anyhow::anyhow!(
             "resolve Local compression state path {}: {error}",
             path.display()
+        )
+    })?;
+    enforce_owner_only_database_file(&canonical_path).map_err(|error| {
+        anyhow::anyhow!(
+            "secure Local compression state database {}: {error}",
+            canonical_path.display()
         )
     })?;
 
@@ -922,6 +934,36 @@ fn open_shared_database(path: PathBuf) -> anyhow::Result<(Arc<Database>, PathBuf
     })?;
     handles.insert(canonical_path.clone(), Arc::downgrade(&database));
     Ok((database, canonical_path))
+}
+
+#[cfg(unix)]
+fn enforce_owner_only_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn enforce_owner_only_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn enforce_owner_only_database_file(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn enforce_owner_only_database_file(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 async fn run_store_blocking<T: Send + 'static>(
@@ -1351,6 +1393,41 @@ mod tests {
         assert_eq!(first.backend(), CompressionBackend::Local);
         assert_eq!(first.consistency(), CompressionConsistency::Serialized);
         assert!(first.shares_database_handle_with(&second));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn creates_and_tightens_owner_only_database_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let parent = root.path().join("state");
+        let path = parent.join("compression.redb");
+        let store = LocalCompressionStore::open(&path).await.unwrap();
+        drop(store);
+
+        assert_eq!(
+            std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let reopened = LocalCompressionStore::open(&path).await.unwrap();
+        drop(reopened);
+
+        assert_eq!(
+            std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[tokio::test]
