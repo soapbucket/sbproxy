@@ -636,18 +636,36 @@ fn choose_realtime_credential(
         .context("realtime credential unavailable")
 }
 
-fn is_realtime_handshake_metadata(header: &str) -> bool {
-    const WEBSOCKET_PREFIX: &str = "sec-websocket-";
+fn realtime_credential_headers(
+    bound: Option<&RealtimeCredential>,
+    provider: Option<&RealtimeCredential>,
+    origin: Option<&sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig>,
+) -> Vec<String> {
+    use sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig;
 
-    header.eq_ignore_ascii_case("openai-beta")
-        || header
-            .get(..WEBSOCKET_PREFIX.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(WEBSOCKET_PREFIX))
+    let mut headers = Vec::with_capacity(3);
+    for header in bound
+        .into_iter()
+        .chain(provider)
+        .map(|credential| credential.header.as_str())
+        .chain(origin.map(|credential| match credential {
+            OutboundCredentialConfig::TokenExchange(_)
+            | OutboundCredentialConfig::ClientCredentials(_) => "authorization",
+            OutboundCredentialConfig::VaultSecret(config) => config.header.as_str(),
+        }))
+    {
+        let canonical = header.trim().to_ascii_lowercase();
+        if !headers.contains(&canonical) {
+            headers.push(canonical);
+        }
+    }
+    headers
 }
 
 fn scrub_realtime_credentials(
     request: &mut RequestHeader,
     inbound_key_headers: &[String],
+    credential_headers: &[String],
     authoritative_header: &str,
 ) {
     for header in [
@@ -661,21 +679,53 @@ fn scrub_realtime_credentials(
     ] {
         request.remove_header(header);
     }
-    for header in inbound_key_headers {
-        if !is_realtime_handshake_metadata(header) {
-            request.remove_header(header);
-        }
+    for header in inbound_key_headers.iter().chain(credential_headers) {
+        let canonical = header.trim().to_ascii_lowercase();
+        request.remove_header(&canonical);
     }
-    request.remove_header(authoritative_header);
+    let authoritative = authoritative_header.trim().to_ascii_lowercase();
+    request.remove_header(&authoritative);
 }
 
 fn apply_realtime_credential(
     request: &mut RequestHeader,
     credential: &RealtimeCredential,
     inbound_key_headers: &[String],
+    credential_headers: &[String],
 ) -> Result<()> {
-    scrub_realtime_credentials(request, inbound_key_headers, &credential.header);
+    for header in credential_headers
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(credential.header.as_str()))
+    {
+        if sbproxy_config::types::credential_header_is_reserved(header) {
+            return Err(pingora_error::Error::explain(
+                pingora_error::ErrorType::HTTPStatus(503),
+                "realtime credential header is reserved",
+            ));
+        }
+    }
+    scrub_realtime_credentials(
+        request,
+        inbound_key_headers,
+        credential_headers,
+        &credential.header,
+    );
     insert_outbound_credential_header(request, credential.header.clone(), &credential.value)
+}
+
+fn realtime_response_accepts_session(status: u16) -> bool {
+    status == http::StatusCode::SWITCHING_PROTOCOLS.as_u16()
+}
+
+fn take_accepted_realtime_dispatch(
+    dispatch: &mut Option<crate::context::RealtimeDispatchCtx>,
+    response_status: u16,
+) -> Option<crate::context::RealtimeDispatchCtx> {
+    let dispatch = dispatch.take();
+    realtime_response_accepts_session(response_status)
+        .then_some(dispatch)
+        .flatten()
 }
 
 fn ensure_dpop_credential_source(
@@ -1217,13 +1267,7 @@ impl ProxyHttp for SbProxy {
                 realtime_inbound_key_headers.push(header.clone());
             }
             if let Some(plane) = crate::key_plane::current_key_plane() {
-                realtime_inbound_key_headers.extend(
-                    plane
-                        .inbound()
-                        .headers
-                        .iter()
-                        .map(|header| header.name.clone()),
-                );
+                realtime_inbound_key_headers.extend(plane.inbound().header_names());
             }
         }
 
@@ -1961,6 +2005,11 @@ impl ProxyHttp for SbProxy {
                 }
             }
         }
+        let realtime_credential_headers = realtime_credential_headers(
+            realtime_bound_auth.as_ref(),
+            realtime_provider_auth.as_ref(),
+            outbound_cred.as_ref(),
+        );
         let realtime_auth = if is_realtime {
             Some(
                 choose_realtime_credential(realtime_bound_auth, realtime_provider_auth).map_err(
@@ -2008,10 +2057,6 @@ impl ProxyHttp for SbProxy {
                     )
                 })?;
             upstream_request.set_uri(rewritten);
-        }
-
-        if let Some(credential) = realtime_auth.as_ref() {
-            apply_realtime_credential(upstream_request, credential, &realtime_inbound_key_headers)?;
         }
 
         // --- Distributed tracing: inject child traceparent into upstream request ---
@@ -2245,6 +2290,19 @@ impl ProxyHttp for SbProxy {
                 })?;
             ctx.outbound_dpop_active = true;
             ctx.outbound_dpop_htu = Some(htu);
+        }
+
+        // Credential authority is the final outbound-header seam. Caller,
+        // configured modifier, Lua, tracing, and signature headers have all
+        // been applied; scrub every known carrier before installing exactly
+        // one selected provider credential.
+        if let Some(credential) = realtime_auth.as_ref() {
+            apply_realtime_credential(
+                upstream_request,
+                credential,
+                &realtime_inbound_key_headers,
+                &realtime_credential_headers,
+            )?;
         }
 
         Ok(())
@@ -3128,8 +3186,15 @@ impl ProxyHttp for SbProxy {
             }
         }
 
-        // Capture response status for metrics in the logging phase.
-        ctx.response_status = Some(upstream_response.status.as_u16());
+        // Capture response status for metrics in the logging phase. A
+        // realtime dispatch becomes an active session only once the provider
+        // accepts the WebSocket handshake.
+        let response_status = upstream_response.status.as_u16();
+        if ctx.ai_realtime_dispatch.is_some() && realtime_response_accepts_session(response_status)
+        {
+            sbproxy_ai::ai_metrics::inc_realtime_sessions_active();
+        }
+        ctx.response_status = Some(response_status);
 
         // --- Distributed tracing: echo traceparent/tracestate to downstream client ---
         if let Some(ref trace_ctx) = ctx.trace_ctx {
@@ -5127,6 +5192,8 @@ impl ProxyHttp for SbProxy {
         // Decrement active connections gauge (global + per-origin).
         metrics().active_connections.dec();
 
+        let status_u16 = final_response_status(ctx, session.response_written());
+
         // Phase 7: AI realtime WebSocket session-close hook. When the
         // request opened a realtime session, observe duration, tick
         // the active-sessions gauge down, and emit a session-end
@@ -5136,7 +5203,8 @@ impl ProxyHttp for SbProxy {
         // (not transparent forwarding); the duration approximation
         // is the right OSS-v1 substitute since the session
         // lifetime IS the audio call.
-        if let Some(rd) = ctx.ai_realtime_dispatch.take() {
+        if let Some(rd) = take_accepted_realtime_dispatch(&mut ctx.ai_realtime_dispatch, status_u16)
+        {
             let duration_secs = rd.started_at.elapsed().as_secs_f64();
             let close_reason = if e.is_some() {
                 "error"
@@ -5182,7 +5250,6 @@ impl ProxyHttp for SbProxy {
         // Record request metrics.
         let method = session.req_header().method.as_str().to_string();
         let hostname = ctx.hostname.to_string();
-        let status_u16 = final_response_status(ctx, session.response_written());
 
         // WOR-1921: compression savings become realized value only after the
         // terminal provider response succeeds. Always take the pending value
@@ -5690,11 +5757,8 @@ mod tests {
 
         scrub_realtime_credentials(
             &mut request,
-            &[
-                "x-custom-inbound-key".to_string(),
-                "Sec-WebSocket-Key".to_string(),
-                "OpenAI-Beta".to_string(),
-            ],
+            &["x-custom-inbound-key".to_string()],
+            &[],
             "authorization",
         );
 
@@ -5767,12 +5831,148 @@ mod tests {
                 value: "Bearer provider-secret".to_string(),
             },
             &[],
+            &[],
         )
         .unwrap();
 
         let mut values = request.headers.get_all(http::header::AUTHORIZATION).iter();
         assert_eq!(values.next().unwrap(), "Bearer provider-secret");
         assert!(values.next().is_none());
+    }
+
+    #[test]
+    fn realtime_final_credential_scrubs_all_custom_carriers_case_insensitively() {
+        let mut request = pingora_http::RequestHeader::build("GET", b"/v1/realtime", None).unwrap();
+        for (name, value) in [
+            ("x-custom-inbound", "caller-secret"),
+            ("x-custom-provider", "caller-provider-secret"),
+            ("x-custom-bound", "lua-bound-secret"),
+            ("openai-beta", "realtime=v1"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ] {
+            request.insert_header(name, value).unwrap();
+        }
+        request
+            .append_header("X-Custom-Provider", "lua-provider-secret")
+            .unwrap();
+
+        apply_realtime_credential(
+            &mut request,
+            &RealtimeCredential {
+                header: "X-Custom-Bound".to_string(),
+                value: "bound-secret".to_string(),
+            },
+            &["X-CUSTOM-INBOUND".to_string()],
+            &[
+                "X-CUSTOM-PROVIDER".to_string(),
+                "x-custom-bound".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert!(request.headers.get("x-custom-inbound").is_none());
+        assert!(request.headers.get("x-custom-provider").is_none());
+        let mut bound_values = request.headers.get_all("x-custom-bound").iter();
+        assert_eq!(bound_values.next().unwrap(), "bound-secret");
+        assert!(bound_values.next().is_none());
+        assert_eq!(request.headers.get("openai-beta").unwrap(), "realtime=v1");
+        assert_eq!(
+            request.headers.get("sec-websocket-key").unwrap(),
+            "dGhlIHNhbXBsZSBub25jZQ=="
+        );
+    }
+
+    #[test]
+    fn realtime_carriers_include_the_origin_resolver_presentation_header() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "type": "token_exchange",
+                    "token_endpoint": "https://issuer.example/token",
+                    "audience": "https://api.example"
+                }),
+                "authorization",
+            ),
+            (
+                serde_json::json!({
+                    "type": "client_credentials",
+                    "token_endpoint": "https://issuer.example/token",
+                    "client_id": "client",
+                    "client_secret": "secret"
+                }),
+                "authorization",
+            ),
+            (
+                serde_json::json!({
+                    "type": "vault_secret",
+                    "secret": "secret",
+                    "header": "X-Origin-Secret"
+                }),
+                "x-origin-secret",
+            ),
+        ];
+
+        for (config, expected_header) in cases {
+            let config = serde_json::from_value(config).unwrap();
+            assert_eq!(
+                realtime_credential_headers(None, None, Some(&config)),
+                [expected_header]
+            );
+        }
+    }
+
+    #[test]
+    fn realtime_rejects_protocol_and_proxy_owned_credential_headers() {
+        for header in [
+            "OpenAI-Beta",
+            "SEC-WebSocket-Key",
+            "Upgrade",
+            "TraceParent",
+            "TRACESTATE",
+            "Signature-Input",
+            "Signature",
+            "Signature-Agent",
+        ] {
+            let mut request =
+                pingora_http::RequestHeader::build("GET", b"/v1/realtime", None).unwrap();
+            let result = apply_realtime_credential(
+                &mut request,
+                &RealtimeCredential {
+                    header: header.to_string(),
+                    value: "provider-secret".to_string(),
+                },
+                &[],
+                &[],
+            );
+
+            assert!(result.is_err(), "{header} must fail closed");
+        }
+    }
+
+    #[test]
+    fn realtime_session_accounting_requires_a_101_handshake() {
+        let dispatch = || {
+            Some(crate::context::RealtimeDispatchCtx {
+                provider_name: "openai".to_string(),
+                upstream_host: "api.openai.com".to_string(),
+                upstream_port: 443,
+                upstream_tls: true,
+                model_override: None,
+                started_at: std::time::Instant::now(),
+                surface_label: "realtime",
+            })
+        };
+
+        let mut rejected = dispatch();
+        assert!(take_accepted_realtime_dispatch(&mut rejected, 401).is_none());
+        assert!(rejected.is_none(), "failed dispatch state must be consumed");
+
+        let mut accepted = dispatch();
+        assert!(take_accepted_realtime_dispatch(&mut accepted, 101).is_some());
+        assert!(
+            accepted.is_none(),
+            "accepted dispatch state must be consumed"
+        );
     }
 
     #[test]

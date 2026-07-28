@@ -1597,9 +1597,11 @@ What runs before the upgrade:
 Credential headers are finalized after ordinary header modifiers and Lua
 scripts. The proxy removes caller-controlled `Authorization`,
 `Proxy-Authorization`, `DPoP`, `x-api-key`, `api-key`, `x-goog-api-key`,
-`x-sb-api`, every resolved/configured inbound key header, and the selected
-credential's own header, then inserts exactly one trusted credential. This
-means a Lua script cannot replace the provider credential. WebSocket
+`x-sb-api`, every resolved/configured inbound key header, the origin
+`outbound_credential` presentation header, and the selected credential's own
+header, then inserts exactly one trusted credential. This means a Lua script
+cannot replace the provider credential. Credential carriers cannot claim
+WebSocket handshake, tracing, or Web Bot Auth signature headers. WebSocket
 handshake metadata (`Upgrade`, `Connection`, and every `Sec-WebSocket-*`
 header) and `OpenAI-Beta` are preserved.
 

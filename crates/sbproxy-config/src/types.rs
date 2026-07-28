@@ -1947,6 +1947,29 @@ pub const FORBIDDEN_SWEEP_HEADERS: &[&str] = &[
     "cookie",
 ];
 
+/// Whether a header is unavailable as an inbound or outbound credential
+/// carrier.
+///
+/// In addition to headers that cannot be swept safely, credentials may not
+/// claim realtime handshake metadata, distributed tracing state, or outbound
+/// Web Bot Auth signature fields. Those values have independent protocol
+/// meaning and are written by the proxy.
+pub fn credential_header_is_reserved(header: &str) -> bool {
+    let lower = header.trim().to_ascii_lowercase();
+    FORBIDDEN_SWEEP_HEADERS.contains(&lower.as_str())
+        || matches!(
+            lower.as_str(),
+            "upgrade"
+                | "openai-beta"
+                | "traceparent"
+                | "tracestate"
+                | "signature-input"
+                | "signature"
+                | "signature-agent"
+        )
+        || lower.starts_with("sec-websocket-")
+}
+
 fn default_inbound_headers() -> Vec<InboundHeaderConfig> {
     vec![
         InboundHeaderConfig {
@@ -1981,9 +2004,9 @@ impl KeyInboundConfig {
                     entry.name
                 ));
             }
-            if FORBIDDEN_SWEEP_HEADERS.contains(&lower.as_str()) {
+            if credential_header_is_reserved(&lower) {
                 return Err(format!(
-                    "key_management.inbound.headers: {:?} may not be swept for a key",
+                    "key_management.inbound.headers: {:?} may not carry a key",
                     entry.name
                 ));
             }
@@ -8808,6 +8831,30 @@ mod inbound_key_header_tests {
             let cfg = KeyInboundConfig {
                 headers: vec![InboundHeaderConfig {
                     name: (*forbidden).to_string(),
+                    scheme: String::new(),
+                }],
+                require: false,
+                provider_hints: Vec::new(),
+            };
+            assert!(cfg.validate().is_err(), "{forbidden} must be rejected");
+        }
+    }
+
+    #[test]
+    fn inbound_validation_rejects_realtime_protocol_and_proxy_owned_headers() {
+        for forbidden in [
+            "OpenAI-Beta",
+            "SEC-WebSocket-Key",
+            "Upgrade",
+            "TraceParent",
+            "TRACESTATE",
+            "Signature-Input",
+            "Signature",
+            "Signature-Agent",
+        ] {
+            let cfg = KeyInboundConfig {
+                headers: vec![InboundHeaderConfig {
+                    name: forbidden.to_string(),
                     scheme: String::new(),
                 }],
                 require: false,

@@ -242,14 +242,13 @@ pub(super) async fn handle_action(
                     surface_label: "realtime",
                 });
                 ctx.ai_provider = Some(provider.name.to_string());
-                sbproxy_ai::ai_metrics::inc_realtime_sessions_active();
                 info!(
                     ai.surface = surface_label,
                     provider = %provider.name,
                     upstream_host = %host,
                     upstream_port = port,
                     upstream_tls = tls,
-                    "AI realtime: session opening, handing off to Pingora for transparent forwarding"
+                    "AI realtime: connection attempt opening, handing off to Pingora for transparent forwarding"
                 );
 
                 // Let Pingora's normal flow continue: `upstream_peer`
