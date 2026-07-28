@@ -197,7 +197,11 @@ impl TokenBucket {
     }
 
     fn refill_at(&mut self, now: Instant) {
-        let elapsed = now.saturating_duration_since(self.last_refill);
+        // Callers capture time before contending on a shared bucket lock.
+        // Preserve the newest timestamp so a delayed older caller cannot make
+        // a later request earn the same refill interval twice.
+        let now = now.max(self.last_refill);
+        let elapsed = now.duration_since(self.last_refill);
         self.refill_with_elapsed(elapsed.as_secs_f64());
         self.last_refill = now;
     }
@@ -937,6 +941,39 @@ mod tests {
         assert!(
             buckets
                 .check_at("agent", 2.0, start + std::time::Duration::from_millis(500),)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn dynamic_keyed_buckets_ignore_stale_observation_time() {
+        let buckets = DynamicKeyedTokenBuckets::new(1);
+        let start = Instant::now();
+
+        assert!(buckets.check_at("agent", 1.0, start).allowed);
+        assert!(
+            buckets
+                .check_at("agent", 1.0, start + std::time::Duration::from_secs(1))
+                .allowed
+        );
+        assert!(
+            !buckets
+                .check_at("agent", 1.0, start + std::time::Duration::from_millis(500),)
+                .allowed
+        );
+        assert!(
+            !buckets
+                .check_at(
+                    "agent",
+                    1.0,
+                    start + std::time::Duration::from_millis(1_500),
+                )
+                .allowed,
+            "a stale caller must not move the refill clock backward"
+        );
+        assert!(
+            buckets
+                .check_at("agent", 1.0, start + std::time::Duration::from_secs(2))
                 .allowed
         );
     }
