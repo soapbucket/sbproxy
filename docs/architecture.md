@@ -447,7 +447,7 @@ adapters (Hugging Face TGI, LM Studio, llama.cpp).
 | `prefix_affinity`   | Hash the prompt prefix to a provider so shared-prefix sessions land on the same upstream cache. |
 | `sticky`            | Pin a session key to one provider. Falls back to round robin without a session key. |
 | `race`              | Fan out to every healthy provider in parallel; first non-error response wins, the rest are cancelled. |
-| `peak_ewma`         | Power-of-two-choices over observed latency: sample two eligible providers, route to the recently faster one. |
+| `peak_ewma`         | Power-of-two-choices over time-decayed peak latency and in-flight load: sample two eligible providers, route to the lower effective cost. |
 | `cascade`           | Tiered dispatch from cheapest to most expensive (provider, model) pairs; a response below the tier's quality threshold retries on the next tier. |
 | `cost_quality`      | Score the prompt's difficulty and route simple prompts to a cheap model, hard prompts to a frontier model, on a `cost_threshold` dial. |
 | `outcome_aware`     | Route on realized cost-per-success; see [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md). |
