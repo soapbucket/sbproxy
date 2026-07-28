@@ -492,11 +492,21 @@ impl DeploymentSlot {
 
     async fn accepts_start_epoch(&self, expected: u64) -> bool {
         let lifecycle = self.lifecycle.lock().await;
-        lifecycle.start_epoch == expected
-            && !matches!(
-                lifecycle.state,
-                DeploymentRuntimeState::Draining | DeploymentRuntimeState::Failed
-            )
+        // Only Draining excludes new orchestration work here. `Failed`
+        // deliberately passes through regardless of whether it is
+        // eligible for an automatic relaunch: `ensure_ready`,
+        // `memory_estimate`, and `admit` each have their own `Failed` arm
+        // that decides relaunch vs. surfacing the retained failure, and
+        // that retained error (e.g. `engine_health_failed`, or the
+        // crash-loop error) is what a caller should see, not a generic
+        // "draining" rejection manufactured by rejecting here instead.
+        // Every transition into `Draining` bumps `start_epoch` in the
+        // same critical section that sets the state (see `begin_draining`,
+        // `reset`, recreate rollback, and idle eviction), so the epoch
+        // check alone still catches a real concurrent drain: a caller
+        // holding a pre-drain `expected` can never match the bumped
+        // epoch.
+        lifecycle.start_epoch == expected && lifecycle.state != DeploymentRuntimeState::Draining
     }
 
     async fn accepts_drain_owner(&self, owner_epoch: u64) -> bool {
@@ -547,12 +557,21 @@ impl DeploymentSlot {
                     return Err(RuntimeManagerError::Draining(self.id.clone()));
                 }
                 DeploymentRuntimeState::Failed => {
-                    return Err(lifecycle.last_error.clone().unwrap_or_else(|| {
-                        RuntimeManagerError::Prepare(format!(
-                            "deployment {:?} failed without a retained reason",
-                            self.id
-                        ))
-                    }));
+                    if !failed_state_can_auto_relaunch(&lifecycle) {
+                        return Err(lifecycle.last_error.clone().unwrap_or_else(|| {
+                            RuntimeManagerError::Prepare(format!(
+                                "deployment {:?} failed without a retained reason",
+                                self.id
+                            ))
+                        }));
+                    }
+                    // Eligible: this is the gate `ensure_ready_inner` calls
+                    // before `ensure_ready` itself, so the self-heal there
+                    // is unreachable unless this one also retries instead
+                    // of returning the stale cached error.
+                    lifecycle.state = DeploymentRuntimeState::Preparing;
+                    lifecycle.last_error = None;
+                    false
                 }
                 _ => {
                     let was_stopped = lifecycle.state == DeploymentRuntimeState::Stopped;
@@ -787,12 +806,33 @@ impl DeploymentSlot {
                     return Err(RuntimeManagerError::Draining(self.id.clone()));
                 }
                 DeploymentRuntimeState::Failed => {
-                    return Err(lifecycle.last_error.clone().unwrap_or_else(|| {
-                        RuntimeManagerError::Prepare(format!(
-                            "deployment {:?} failed without a retained reason",
-                            self.id
-                        ))
-                    }));
+                    if !failed_state_can_auto_relaunch(&lifecycle) {
+                        return Err(lifecycle.last_error.clone().unwrap_or_else(|| {
+                            RuntimeManagerError::Prepare(format!(
+                                "deployment {:?} failed without a retained reason",
+                                self.id
+                            ))
+                        }));
+                    }
+                    // Eligible: no process remains owned (a stop() that
+                    // failed keeps `running` set, and that case is not
+                    // eligible above) and the retained failure is not
+                    // crash-looped, so this is a post-ready engine death
+                    // (`kill -9`) or a launch failure that has not
+                    // exhausted its retry budget. Retry the same relaunch
+                    // a freshly `Configured` deployment uses instead of
+                    // returning the stale cached error forever.
+                    // `EngineSupervisor` (inside the activation) retains
+                    // its own crash-loop state and starts returning the
+                    // exhausted-budget error immediately once retries stop
+                    // being worthwhile, so a genuinely broken engine still
+                    // stops retrying; it just takes one more relaunch
+                    // attempt here to observe that.
+                    let future = self.start_activation(intent, limiter.clone());
+                    lifecycle.state = DeploymentRuntimeState::Preparing;
+                    lifecycle.last_error = None;
+                    lifecycle.activation = Some(future.clone());
+                    future
                 }
                 DeploymentRuntimeState::Configured
                 | DeploymentRuntimeState::Assigned
@@ -1188,23 +1228,25 @@ impl DeploymentSlot {
                     ));
                 }
                 DeploymentRuntimeState::Failed => {
-                    let crash_loop = lifecycle.last_error.as_ref().is_some_and(|error| {
-                        matches!(
-                            error,
-                            RuntimeManagerError::Engine(driver)
-                                if driver.reason() == EngineFailureReason::CrashLoop
-                        )
-                    });
-                    return Err(crate::AdmissionRejection::new(
-                        if crash_loop {
-                            crate::AdmissionReason::CrashLoop
-                        } else {
-                            crate::AdmissionReason::EngineUnhealthy
-                        },
-                        "deployment runtime is failed",
-                        true,
-                        None,
-                    ));
+                    if !failed_state_can_auto_relaunch(&lifecycle) {
+                        let crash_loop = lifecycle.last_error.as_ref().is_some_and(is_crash_loop);
+                        return Err(crate::AdmissionRejection::new(
+                            if crash_loop {
+                                crate::AdmissionReason::CrashLoop
+                            } else {
+                                crate::AdmissionReason::EngineUnhealthy
+                            },
+                            "deployment runtime is failed",
+                            true,
+                            None,
+                        ));
+                    }
+                    // Eligible: admit so `ensure_ready` drives the same
+                    // relaunch a freshly `Configured` deployment uses. The
+                    // gateway calls `admit` before `ensure_ready` (see
+                    // `ManagedModelPermit`), so rejecting here would keep
+                    // every request out and the self-heal in
+                    // `ensure_ready` unreachable.
                 }
                 DeploymentRuntimeState::Configured
                 | DeploymentRuntimeState::Assigned
@@ -4014,6 +4056,34 @@ fn compile_canonical_deployments(
             )
         })
         .collect()
+}
+
+/// Whether a retained runtime error is the exhausted launch-retry budget
+/// `EngineSupervisor` marks once retries stop being worthwhile. Distinct
+/// from a one-shot failure (a post-ready `kill -9`, or a launch attempt
+/// that has not yet burned through its budget), which is still eligible
+/// for an automatic relaunch.
+fn is_crash_loop(error: &RuntimeManagerError) -> bool {
+    matches!(
+        error,
+        RuntimeManagerError::Engine(driver) if driver.reason() == EngineFailureReason::CrashLoop
+    )
+}
+
+/// Whether a `Failed` deployment is eligible for the automatic relaunch
+/// `admit`, `memory_estimate`, and `ensure_ready` each attempt in their own
+/// `Failed` arm: the retained failure is not crash-looped, and no process
+/// remains owned from a `stop()` that failed. This mirrors `reset()`'s own
+/// guard (see its `Failed if lifecycle.running.is_none()` arm): a process
+/// that survived a shutdown attempt must not be joined by a second,
+/// freshly launched one, since the two would corrupt or double-count the
+/// deployment's residency reservation. `accepts_start_epoch` deliberately
+/// does not call this: it lets every `Failed` deployment through so the
+/// three arms above can decide and surface the real retained error,
+/// instead of a generic "draining" rejection manufactured by excluding
+/// `Failed` at that earlier, coarser gate.
+fn failed_state_can_auto_relaunch(lifecycle: &SlotLifecycle) -> bool {
+    lifecycle.running.is_none() && !lifecycle.last_error.as_ref().is_some_and(is_crash_loop)
 }
 
 fn runtime_error_reason_code(error: &RuntimeManagerError) -> &'static str {
