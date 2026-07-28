@@ -2,11 +2,20 @@
 // Copyright 2026 Soap Bucket LLC
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use sbproxy_model_host::{
     capability_registry, CapabilityDomain, ModelHostConfig, SupportLevel,
     CAPABILITY_REGISTRY_VERSION,
 };
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crates/sbproxy-model-host -> crates -> repo root")
+        .to_path_buf()
+}
 
 #[test]
 fn registry_covers_every_domain_and_validates() {
@@ -205,6 +214,20 @@ fn generated_schema_labels_every_nonstable_field() {
     capability_registry()
         .validate_schema_descriptions()
         .expect("preview, config-only, and unsupported fields must be labeled in JSON Schema");
+}
+
+#[test]
+fn the_committed_model_host_capabilities_doc_is_current() {
+    let path = repo_root().join("docs/model-host-capabilities.md");
+    let committed = std::fs::read_to_string(&path).expect("read docs/model-host-capabilities.md");
+
+    assert_eq!(
+        committed,
+        capability_registry().render_markdown(),
+        "docs/model-host-capabilities.md is stale. Regenerate it:\n\n    \
+         cargo run -q -p sbproxy-model-host --bin generate-model-host-capabilities > \
+         docs/model-host-capabilities.md\n"
+    );
 }
 
 #[test]

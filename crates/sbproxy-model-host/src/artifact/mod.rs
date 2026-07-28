@@ -22,6 +22,8 @@ pub(crate) use gc::explicit_protection_reason;
 pub use gc::{CacheProtection, GcReport, PruneReport, RemoveArtifactReport};
 #[cfg(feature = "weights")]
 pub(crate) use http::authorize_engine_download;
+#[cfg(feature = "hf-xet-transport")]
+pub use http::HfHubArtifactTransport;
 #[cfg(feature = "weights")]
 pub use http::HttpArtifactTransport;
 pub use http::{
@@ -760,8 +762,14 @@ impl ArtifactManager {
                 .open(&partial)
                 .await
                 .map_err(|error| io_error("open local artifact partial", &partial, error))?;
-            let copied = tokio::io::copy(&mut reader, &mut writer)
-                .await
+            // Warm the OS page cache for the source file, concurrently
+            // with the copy that reads it into the cache partial below.
+            // Advisory only: a prefetch failure never fails staging, only
+            // the copy's own result is checked.
+            let prefetch = crate::weights::prefetch_into_page_cache(&source);
+            let copy = tokio::io::copy(&mut reader, &mut writer);
+            let (_prefetch_result, copy_result) = tokio::join!(prefetch, copy);
+            let copied = copy_result
                 .map_err(|error| io_error("stage local artifact file", &partial, error))?;
             writer
                 .sync_all()

@@ -62,7 +62,12 @@ ed25519-dalek = "2"
 # OTLP-logs surface that WOR-1046 plumbs into the sink dispatcher;
 # the trace + metrics surfaces remain wired the same way as before.
 opentelemetry = { version = "0.27", features = ["trace", "metrics", "logs"] }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace", "metrics", "logs"] }
+# rt-tokio-current-thread: the OTLP metrics PeriodicReader needs this
+# binding (not plain rt-tokio) so it spawns its own dedicated
+# thread+runtime instead of assuming an ambient multi-thread Tokio
+# runtime, which does not exist yet at the point main() initializes
+# telemetry (Pingora builds its runtime later).
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "rt-tokio-current-thread", "trace", "metrics", "logs"] }
 opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client", "grpc-tonic", "trace", "metrics", "logs"] }
 opentelemetry-semantic-conventions = "0.27"
 tracing-opentelemetry = "0.28"

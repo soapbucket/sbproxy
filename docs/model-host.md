@@ -793,6 +793,7 @@ Each entry accepts these settings.
 | `max_context` | Context length to plan VRAM for and pass to the engine. |
 | `keep_alive` | Idle time before the engine unloads, as a duration like `30m` or `1h`. Omitting it keeps the engine resident until eviction. |
 | `kv_quant` | KV-cache quantization: `auto` (default), `f16`, `fp8`, `int8`, or `int4`. |
+| `enable_prefix_caching` | Enable vLLM's automatic prefix caching, reusing KV blocks across requests that share a prompt prefix. |
 | `pinned` | Keep the model resident and never evict it to make room. |
 | `gguf_file` | Exact GGUF filename to serve from a multi-file llama.cpp repo. |
 | `extra_args` | Extra engine flags appended after the runtime's own arguments, one argv element each, filtered against an allowlist. |

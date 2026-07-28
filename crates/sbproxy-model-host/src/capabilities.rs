@@ -1047,6 +1047,10 @@ fn field_is_active(path: &str, config: &ModelHostConfig) -> bool {
             .models
             .iter()
             .any(|entry| entry.kv_quant != KvCacheQuant::Auto),
+        "serve.models[].enable_prefix_caching" => config
+            .models
+            .iter()
+            .any(|entry| entry.enable_prefix_caching.is_some()),
         "serve.models[].speculative" => config
             .models
             .iter()
@@ -1466,8 +1470,14 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
         consumer: None,
     },
     ConfigFieldCapability {
+        path: "serve.models[].enable_prefix_caching",
+        status: SupportLevel::Preview,
+        capability_id: "engine.typed_managed_drivers",
+        consumer: None,
+    },
+    ConfigFieldCapability {
         path: "serve.models[].speculative",
-        status: SupportLevel::Unsupported,
+        status: SupportLevel::Preview,
         capability_id: "engine.typed_managed_drivers",
         consumer: None,
     },
