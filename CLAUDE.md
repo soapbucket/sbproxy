@@ -243,6 +243,25 @@ belong in `docs/` - that tree is buyer-facing. Save planning artifacts
 under `.claude/plans/` (already gitignored) unless a specific task
 explicitly directs otherwise.
 
+## Provider catalog
+
+The AI provider list ships from `crates/sbproxy-ai/data/ai_providers.yml`.
+When adding or changing a provider, update every surface in the same
+commit:
+
+1. Regenerate the embedded copy:
+   `gzip -9 -n -c crates/sbproxy-ai/data/ai_providers.yml > crates/sbproxy-ai/data/ai_providers.yml.gz`
+2. Mirror the change in `docs/providers.md`'s table (hand-maintained;
+   nothing generates it).
+3. Update the hardcoded provider count everywhere: grep the whole repo
+   for the old number. It appears roughly 30 times across 20+ files
+   (README, docs/ai-gateway.md, every use-case doc, the comparison
+   table, root `llms.txt`); check each hit's context before editing so
+   an unrelated number is not caught.
+4. Regenerate `docs/llms-full.txt` via `scripts/regen-llms-full.sh`.
+5. The sbproxy.dev site keeps its own copy of the provider docs; flag
+   the change for the site repo.
+
 ## Cutover state
 
 The active git history of this Rust implementation starts at `v1.0.0`.
