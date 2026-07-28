@@ -1,8 +1,8 @@
 # Prompt injection v2
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-27*
 
-The successor to the v1 `prompt_injection` heuristic guardrail. The v2 policy splits detection from enforcement: a swappable detector returns a numeric score plus a categorical label, and the policy maps the score onto an action (`tag` (default), `block`, or `log`). The OSS build ships the heuristic detector (`detector: heuristic-v1`) which performs case-insensitive substring matching against the OWASP-LLM-01 vocabulary and a small "suspicious" cue list. Future builds register additional detectors (such as an ONNX classifier) via the inventory registry; the policy config stays the same. Scope: the OSS scaffold scans the request URI and non-auth headers at request-filter time so the tag-action path can stamp trust headers before the upstream request is built. Body-aware detection lands with the ONNX classifier follow-up (see `examples/prompt-injection-sidecar/`).
+The successor to the legacy `injection` / `prompt_injection` guardrail names. The v2 policy splits detection from enforcement: a swappable detector returns a numeric score plus a categorical label, and the policy maps the score onto an action (`tag` (default), `block`, or `log`). This example explicitly pins `detector: heuristic-v1`, so it remains self-contained and never inspects local model artifacts. Omitting the field instead activates verified in-process auto-selection when a complete model and tokenizer pair is staged.
 
 ## Run
 
@@ -51,7 +51,7 @@ curl -s -H 'Host: log.local' \
 ## What this exercises
 
 - `policy.type: prompt_injection_v2` with `action: tag | block | log`
-- `detector: heuristic-v1` - the built-in OSS detector backed by OWASP-LLM-01 substrings
+- Explicit `detector: heuristic-v1` - the built-in detector backed by the shared canonical injection matcher
 - `threshold: 0.5` - score in [0.0, 1.0]; the policy fires when score >= threshold
 - Tag mode stamps `x-prompt-injection-score` and `x-prompt-injection-label` headers on the upstream request
 - Block mode returns the configured body and content type; log mode writes a structured warn

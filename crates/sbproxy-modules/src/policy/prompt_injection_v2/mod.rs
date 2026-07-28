@@ -5,13 +5,13 @@
 //! returns a score in `[0.0, 1.0]` plus a categorical label, and the
 //! policy maps the score onto an action (`tag`, `block`, `log`).
 //!
-//! The OSS build ships only the heuristic detector
-//! ([`HeuristicDetector`]). Future builds register additional
-//! detectors (e.g. an ONNX classifier) via the inventory registry
-//! exposed by [`Detector`] and the `register_prompt_injection_detector!`
-//! macro. The v1 policy is unchanged: this module lives alongside it
-//! and operators upgrade explicitly by switching the policy `type`
-//! from `prompt_injection` to `prompt_injection_v2`.
+//! The OSS build ships heuristic, in-process ONNX, and sidecar
+//! detectors. When `detector` is omitted, a complete verified local
+//! artifact pair selects in-process inference; an entirely absent pair
+//! selects the heuristic. Explicit detector names always win. The
+//! inventory registry exposed by [`Detector`] and the
+//! `register_prompt_injection_detector!` macro remains the extension
+//! point for custom detectors.
 
 mod body_aware;
 mod detector;
@@ -80,7 +80,7 @@ pub enum PromptInjectionV2Outcome {
     },
 }
 
-/// Default detector name when the operator does not specify one.
+/// Heuristic detector used when auto-selection finds no local artifacts.
 pub const DEFAULT_DETECTOR: &str = HEURISTIC_DETECTOR_NAME;
 
 /// Default score threshold above which the policy fires.
@@ -101,9 +101,10 @@ pub const DEFAULT_BLOCK_BODY: &str = "prompt injection detected";
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     /// Name of the detector to use (must be registered via the
-    /// inventory registry). Defaults to `heuristic-v1`.
-    #[serde(default = "default_detector")]
-    detector: String,
+    /// inventory registry). Omission enables verified local
+    /// auto-selection.
+    #[serde(default)]
+    detector: Option<String>,
     /// Score threshold; the policy fires when `score >= threshold`.
     /// Defaults to `0.5`.
     #[serde(default = "default_threshold")]
@@ -143,9 +144,6 @@ struct RawConfig {
     enable_body_aware: bool,
 }
 
-fn default_detector() -> String {
-    DEFAULT_DETECTOR.to_string()
-}
 fn default_threshold() -> f64 {
     DEFAULT_THRESHOLD
 }
@@ -196,49 +194,57 @@ impl PromptInjectionV2Policy {
     ///
     /// Unknown detector names are a hard error so misconfigured
     /// configs surface at startup rather than the first request. The
-    /// default detector is always available because the OSS build
-    /// registers `heuristic-v1`.
+    /// fallback detector is always available because the OSS build
+    /// registers `heuristic-v1`. Omission attempts verified local
+    /// in-process selection before using that fallback.
     pub fn from_config(value: serde_json::Value) -> Result<Self> {
         let raw: RawConfig = serde_json::from_value(value)
             .map_err(|e| anyhow!("prompt_injection_v2 config: {e}"))?;
+        Self::from_raw_with_auto_loader(raw, inprocess::InprocessDetector::from_auto_config)
+    }
+
+    fn from_raw_with_auto_loader<F>(raw: RawConfig, auto_loader: F) -> Result<Self>
+    where
+        F: FnOnce(&serde_json::Value) -> Result<inprocess::AutoInprocessSelection>,
+    {
         if !(0.0..=1.0).contains(&raw.threshold) {
             return Err(anyhow!(
                 "prompt_injection_v2 threshold must be in [0.0, 1.0], got {}",
                 raw.threshold
             ));
         }
-        // The sidecar detector needs configuration (endpoint, model,
-        // fail policy) so it goes through its own constructor that
-        // forwards `detector_config`. Everything else uses the zero-arg
-        // inventory factory.
-        let detector = if raw.detector == "onnx" {
-            // WOR-612: the in-process ONNX detector was removed so the
-            // proxy never parses a model graph in its own address space
-            // (a malicious/oversized model could OOM it). Run the
-            // classifier sidecar and select `detector: "sidecar"` instead.
-            return Err(anyhow!(
-                "prompt_injection_v2 detector \"onnx\" (in-process ONNX) was removed: \
-                 run the classifier sidecar and use detector: \"sidecar\" instead \
-                 (see docs/prompt-injection-v2.md)"
-            ));
-        } else if raw.detector == sidecar::SIDECAR_DETECTOR_NAME {
-            sidecar::SidecarDetector::from_config(&raw.detector_config)?
-        } else if raw.detector == inprocess::INPROCESS_DETECTOR_NAME {
-            // WOR-1224: opt-in in-process ONNX classify. Bounded by a
-            // max_model_bytes guard; prefer detector: "sidecar" for isolation.
-            inprocess::InprocessDetector::from_config(&raw.detector_config)?
+        let (detector, detector_name) = if let Some(name) = raw.detector.as_deref() {
+            (
+                resolve_explicit_detector(name, &raw.detector_config)?,
+                name.to_string(),
+            )
         } else {
-            lookup_detector(&raw.detector).ok_or_else(|| {
-                anyhow!(
-                    "prompt_injection_v2 detector {:?} not registered; available: {}",
-                    raw.detector,
-                    registered_detector_names().join(", ")
-                )
-            })?
+            match auto_loader(&raw.detector_config)? {
+                inprocess::AutoInprocessSelection::Loaded(detector) => {
+                    (detector, INPROCESS_DETECTOR_NAME.to_string())
+                }
+                inprocess::AutoInprocessSelection::Absent {
+                    model_path,
+                    tokenizer_path,
+                } => {
+                    tracing::info!(
+                        target: "sbproxy::prompt_injection_v2",
+                        detector = HEURISTIC_DETECTOR_NAME,
+                        model_path = %model_path.display(),
+                        tokenizer_path = %tokenizer_path.display(),
+                        "verified in-process artifacts are absent; using heuristic detector",
+                    );
+                    (
+                        lookup_detector(HEURISTIC_DETECTOR_NAME)
+                            .expect("the built-in heuristic detector is registered"),
+                        HEURISTIC_DETECTOR_NAME.to_string(),
+                    )
+                }
+            }
         };
         Ok(Self {
             detector,
-            detector_name: raw.detector,
+            detector_name,
             threshold: raw.threshold,
             action: raw.action,
             score_header: raw.score_header,
@@ -348,6 +354,34 @@ impl PromptInjectionV2Policy {
     }
 }
 
+fn resolve_explicit_detector(
+    name: &str,
+    detector_config: &serde_json::Value,
+) -> Result<Arc<dyn Detector>> {
+    // The sidecar and in-process detectors need configuration, so they go
+    // through their constructors. Everything else uses the zero-argument
+    // inventory factory. An explicit name never invokes auto-selection.
+    if name == "onnx" {
+        return Err(anyhow!(
+            "prompt_injection_v2 detector \"onnx\" was removed; use detector: \
+             \"inprocess\" or detector: \"sidecar\" (see docs/prompt-injection-v2.md)"
+        ));
+    }
+    if name == sidecar::SIDECAR_DETECTOR_NAME {
+        return sidecar::SidecarDetector::from_config(detector_config);
+    }
+    if name == inprocess::INPROCESS_DETECTOR_NAME {
+        return inprocess::InprocessDetector::from_config(detector_config);
+    }
+    lookup_detector(name).ok_or_else(|| {
+        anyhow!(
+            "prompt_injection_v2 detector {:?} not registered; available: {}",
+            name,
+            registered_detector_names().join(", ")
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,10 +416,196 @@ mod tests {
 
     #[test]
     fn from_config_resolves_default_detector() {
-        let p = PromptInjectionV2Policy::from_config(serde_json::json!({})).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = PromptInjectionV2Policy::from_config(serde_json::json!({
+            "detector_config": {
+                "model_path": dir.path().join("missing-model.onnx"),
+                "tokenizer_path": dir.path().join("missing-tokenizer.json"),
+            }
+        }))
+        .unwrap();
         assert_eq!(p.detector_name(), HEURISTIC_DETECTOR_NAME);
         assert_eq!(p.action(), PromptInjectionAction::Tag);
         assert_eq!(p.threshold(), DEFAULT_THRESHOLD);
+    }
+
+    #[test]
+    fn omitted_detector_rejects_a_partial_artifact_pair() {
+        let err = PromptInjectionV2Policy::from_config(serde_json::json!({
+            "detector_config": {
+                "model_path": "/tmp/only-model.onnx",
+            }
+        }))
+        .expect_err("partial auto-selection must not silently choose the heuristic");
+
+        assert!(err.to_string().contains("model_path"));
+        assert!(err.to_string().contains("tokenizer_path"));
+    }
+
+    #[test]
+    fn omitted_detector_does_not_downgrade_a_tampered_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.onnx");
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&model, b"tampered model").unwrap();
+        std::fs::write(&tokenizer, b"tampered tokenizer").unwrap();
+
+        let err = PromptInjectionV2Policy::from_config(serde_json::json!({
+            "detector_config": {
+                "model_path": model,
+                "tokenizer_path": tokenizer,
+                "model_sha256":
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                "tokenizer_sha256":
+                    "0000000000000000000000000000000000000000000000000000000000000002",
+            }
+        }))
+        .expect_err("a present unverified pair must fail instead of downgrading");
+
+        assert!(err.to_string().contains("sha256"));
+    }
+
+    #[test]
+    fn explicit_heuristic_ignores_artifact_configuration() {
+        let policy = PromptInjectionV2Policy::from_config(serde_json::json!({
+            "detector": "heuristic-v1",
+            "detector_config": {
+                "model_path": "/tmp/only-model.onnx",
+                "model_sha256": "not-a-digest",
+            }
+        }))
+        .expect("an explicit heuristic selection must win");
+
+        assert_eq!(policy.detector_name(), HEURISTIC_DETECTOR_NAME);
+    }
+
+    #[test]
+    fn omitted_detector_reports_inprocess_when_verified_loader_succeeds() {
+        let raw: RawConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        let policy = PromptInjectionV2Policy::from_raw_with_auto_loader(raw, |_| {
+            Ok(inprocess::AutoInprocessSelection::Loaded(stub(
+                0.1,
+                DetectionLabel::Clean,
+            )))
+        })
+        .unwrap();
+
+        assert_eq!(policy.detector_name(), INPROCESS_DETECTOR_NAME);
+    }
+
+    #[test]
+    fn omitted_detector_with_verified_files_uses_the_real_inprocess_loader() {
+        use prost11::Message as _;
+        use sha2::Digest as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model.onnx");
+        let tokenizer_path = dir.path().join("tokenizer.json");
+        let model = tract_onnx::pb::ModelProto {
+            ir_version: 8,
+            producer_name: "sbproxy-test".to_string(),
+            opset_import: vec![tract_onnx::pb::OperatorSetIdProto {
+                domain: String::new(),
+                version: 13,
+            }],
+            graph: Some(tract_onnx::pb::GraphProto {
+                name: "constant-classifier".to_string(),
+                initializer: vec![tract_onnx::pb::TensorProto {
+                    dims: vec![1, 2],
+                    data_type: tract_onnx::pb::tensor_proto::DataType::Float as i32,
+                    float_data: vec![0.9, 0.1],
+                    name: "logits".to_string(),
+                    ..Default::default()
+                }],
+                output: vec![tract_onnx::pb::ValueInfoProto {
+                    name: "logits".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut model_bytes = Vec::new();
+        model.encode(&mut model_bytes).unwrap();
+        std::fs::write(&model_path, &model_bytes).unwrap();
+        let tokenizer_bytes = br#"{
+          "version":"1.0",
+          "truncation":null,
+          "padding":null,
+          "added_tokens":[],
+          "normalizer":null,
+          "pre_tokenizer":{"type":"Whitespace"},
+          "post_processor":null,
+          "decoder":null,
+          "model":{"type":"WordLevel","vocab":{"[UNK]":0,"hello":1},"unk_token":"[UNK]"}
+        }"#;
+        std::fs::write(&tokenizer_path, tokenizer_bytes).unwrap();
+        let model_sha256 = hex::encode(sha2::Sha256::digest(&model_bytes));
+        let tokenizer_sha256 = hex::encode(sha2::Sha256::digest(tokenizer_bytes));
+
+        let policy = PromptInjectionV2Policy::from_config(serde_json::json!({
+            "detector_config": {
+                "model_path": model_path,
+                "tokenizer_path": tokenizer_path,
+                "model_sha256": model_sha256,
+                "tokenizer_sha256": tokenizer_sha256,
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(policy.detector_name(), INPROCESS_DETECTOR_NAME);
+    }
+
+    #[test]
+    fn absent_auto_artifacts_log_once_and_select_the_heuristic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Metadata, Subscriber};
+
+        #[derive(Clone)]
+        struct TargetCounter(Arc<AtomicUsize>);
+
+        impl Subscriber for TargetCounter {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                metadata.target() == "sbproxy::prompt_injection_v2"
+            }
+
+            fn new_span(&self, _span: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+
+            fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+            fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+            fn event(&self, event: &Event<'_>) {
+                if event.metadata().target() == "sbproxy::prompt_injection_v2" {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            fn enter(&self, _span: &Id) {}
+
+            fn exit(&self, _span: &Id) {}
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("missing-model.onnx");
+        let tokenizer_path = dir.path().join("missing-tokenizer.json");
+        let events = Arc::new(AtomicUsize::new(0));
+        let subscriber = TargetCounter(Arc::clone(&events));
+        let policy = tracing::subscriber::with_default(subscriber, || {
+            PromptInjectionV2Policy::from_config(serde_json::json!({
+                "detector_config": {
+                    "model_path": model_path,
+                    "tokenizer_path": tokenizer_path,
+                }
+            }))
+            .unwrap()
+        });
+
+        assert_eq!(policy.detector_name(), HEURISTIC_DETECTOR_NAME);
+        assert_eq!(events.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -444,6 +664,7 @@ mod tests {
     #[test]
     fn block_action_round_trips() {
         let p = PromptInjectionV2Policy::from_config(serde_json::json!({
+            "detector": "heuristic-v1",
             "action": "block",
         }))
         .unwrap();
@@ -453,6 +674,7 @@ mod tests {
     #[test]
     fn log_action_round_trips() {
         let p = PromptInjectionV2Policy::from_config(serde_json::json!({
+            "detector": "heuristic-v1",
             "action": "log",
         }))
         .unwrap();

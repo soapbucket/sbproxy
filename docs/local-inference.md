@@ -1,5 +1,5 @@
 # Local inference (embeddings and prompt-injection classify)
-*Last modified: 2026-07-26*
+*Last modified: 2026-07-27*
 
 SBproxy can run three AI-gateway features on local ONNX models instead of paid
 APIs:
@@ -12,7 +12,7 @@ APIs:
 
 For running a full **LLM** locally (the gateway pulls weights, fits an engine
 to the GPU, and supervises it), see [model-host.md](model-host.md). This page
-covers the two ONNX auxiliary features; the model host covers chat/completion
+covers the three ONNX auxiliary features; the model host covers chat/completion
 serving.
 
 Running these locally means no per-call API cost, no prompt egress (the prompt
@@ -25,16 +25,17 @@ There are two ways to run local inference:
 - **Sidecar (recommended).** A small co-located process holds the model. A bad
   or oversized model can only OOM the sidecar, which the proxy restarts; it
   never takes the proxy down.
-- **In-process (opt-in).** The model loads inside the proxy for a true single
-  binary. Simpler to deploy, but a model parse runs in the proxy's address
-  space, so it is gated behind explicit config and a size guard.
+- **In-process.** The model loads inside the proxy for a true single binary.
+  Prompt-injection can select it automatically from a complete verified
+  artifact pair; operators can also select it explicitly. Model parsing runs
+  in the proxy address space, so size and integrity checks run first.
 
 ## Models
 
 | Use | Default model | License | Size |
 |---|---|---|---|
 | Embeddings | `all-MiniLM-L6-v2` (384-dim) | Apache-2.0 | ~90 MB |
-| Prompt-injection classify | `protectai/deberta-v3-base-prompt-injection-v2` | Apache-2.0 | ~70 MB int8 |
+| Prompt-injection classify | No built-in default | Operator-reviewed; Apache-2.0 or MIT recommended | 200 MiB default maximum |
 
 Both are operator-supplied runtime data, not bundled with the binary. Download
 them once and point the sidecar (or the in-process config) at the files.
@@ -50,16 +51,20 @@ curl -fSL -o /var/lib/sbproxy/models/minilm/model.onnx \
 curl -fSL -o /var/lib/sbproxy/models/minilm/tokenizer.json \
   https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/5641a7880f40ebf4035d05e60c5f9b7a9c272c84/tokenizer.json
 
-# Prompt-injection classifier
-curl -fSL -o /var/lib/sbproxy/models/injection/model.onnx \
-  https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2/resolve/main/onnx/model.onnx
-curl -fSL -o /var/lib/sbproxy/models/injection/tokenizer.json \
-  https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2/resolve/main/tokenizer.json
 ```
 
-Air-gapped sites: download on a connected host, verify the SHA-256 against the
-upstream model card, then copy the files into place. The engine validates a
-pinned hash when one is configured, and otherwise trusts the local file.
+There is deliberately no copy-paste prompt-injection download URL. The model
+audit found that first-party, clearly licensed candidates were larger than the
+unchanged 200 MiB default, while smaller community exports lacked sufficient
+artifact provenance or weight licensing. Do not stage a moving
+`resolve/main` artifact for automatic security enforcement. Choose an
+immutable, reviewed model/tokenizer pair, record both SHA-256 digests, confirm
+its label order, and then copy it into place.
+
+Air-gapped sites follow the same process on a connected host before transfer.
+In-process prompt-injection loading always requires both SHA-256 pins (either
+in config or from a complete trusted registry entry); a local file is never
+trusted merely because it exists.
 
 ## Run the sidecar
 
@@ -150,14 +155,15 @@ origins:
           fail_closed: false     # a sidecar outage degrades to "clean" (allow)
 ```
 
-The default detector is `heuristic-v1` (a zero-dependency regex pass). Choosing
-`detector: sidecar` runs the ONNX classifier in the sidecar.
+An explicit `detector: sidecar` always wins. If `detector` is omitted instead,
+SBproxy attempts verified in-process auto-selection and uses
+`heuristic-v1` only when both resolved local artifacts are absent.
 
-## In-process opt-in
+## Verified in-process selection
 
 For a single binary, run either feature in-process. This loads a model into the
-proxy address space, so it is gated behind explicit config and a
-`max_model_bytes` guard. Prefer the sidecar for isolation.
+proxy address space. SBproxy enforces size and integrity checks before parsing;
+prefer the sidecar when process isolation matters.
 
 Each block sits in the same place as its sidecar form (the AI origin's
 `action.semantic_cache`, and the origin's `policies`); only `source` /
@@ -178,13 +184,32 @@ origins:
       - type: prompt_injection_v2
         threshold: 0.8
         action: block
-        detector: inprocess
+        # Omit detector for verified auto-selection. Use
+        # detector: inprocess to require this mode explicitly.
         detector_config:
           model_path: /var/lib/sbproxy/models/injection/model.onnx
           tokenizer_path: /var/lib/sbproxy/models/injection/tokenizer.json
+          model_sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          tokenizer_sha256: abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+          labels: [SAFE, INJECTION]
           injection_label: INJECTION
           max_model_bytes: 209715200   # 200 MB guard
+          max_tokenizer_bytes: 209715200
 ```
+
+Configured paths take precedence. With no paths configured, auto-selection
+checks `<user-cache-dir>/sbproxy/models/prompt-injection-v2/model.onnx` and
+`tokenizer.json` (falling back to
+`./.sbproxy-cache/models/prompt-injection-v2/`). Both absent selects the
+heuristic with one startup log. A partial pair, unreadable or oversize file,
+missing/mismatched digest, incomplete signature group, or parse error stops
+startup. An explicit `detector: heuristic-v1` skips artifact inspection.
+
+Optional detached Ed25519 verification adds
+`model_signature_path`, `tokenizer_signature_path`, and
+`signature_public_key`; configure all three or none. See
+[prompt-injection-v2.md](prompt-injection-v2.md) for the full failure contract
+and latency-measurement status.
 
 In-process semantic cache embeddings:
 

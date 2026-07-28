@@ -27,26 +27,6 @@
 //! 4. Submit a PR; the review must include the upstream model card
 //!    URL and the LICENSE the model ships under.
 //!
-//! # Procedure for filling in an empty SHA
-//!
-//! Some entries land with empty `model_sha256` / `tokenizer_sha256`
-//! values when the build sandbox cannot reach the upstream URL. Those
-//! placeholders are temporary: the
-//! `no_known_model_has_unpinned_sha256` test in this module fails the
-//! build the moment any entry is committed without a hash. The
-//! one-time follow-up to populate the values is:
-//!
-//! 1. Run the proxy locally with the relevant detector enabled. On
-//!    first request, the file is fetched and cached under the
-//!    operator's on-disk classifier cache (`SBPROXY_CACHE_DIR` or the
-//!    OS default).
-//! 2. `sha256sum <cache-path>/model.onnx` and
-//!    `sha256sum <cache-path>/tokenizer.json` to compute the hashes.
-//! 3. Paste the lowercase hex values into the matching `KnownModel`
-//!    entry below and update `revision_pinned_at` to today.
-//! 4. Re-enable the assertion test (drop the `#[ignore]` it carried
-//!    while values were pending) and submit the PR.
-//!
 //! See `docs/model-pinning.md` for the longer narrative version,
 //! including how operators verify a hash against an upstream model
 //! card before committing.
@@ -62,9 +42,8 @@ pub struct KnownModel {
     pub name: &'static str,
     /// HTTPS URL of the ONNX file on the upstream model host.
     pub model_url: &'static str,
-    /// SHA-256 hash of the ONNX file in lowercase hex. Empty string
-    /// means "to be computed on first download"; entries should not
-    /// stay in that state past the next release.
+    /// SHA-256 hash of the ONNX file in lowercase hex. Empty strings are
+    /// invalid in the production registry.
     pub model_sha256: &'static str,
     /// HTTPS URL of the tokenizer file on the upstream model host.
     pub tokenizer_url: &'static str,
@@ -80,13 +59,11 @@ pub struct KnownModel {
 impl KnownModel {
     /// Returns `(model_sha, tokenizer_sha)` when both pins are present
     /// in lowercase hex, or `None` when either one is still pending
-    /// computation (empty string).
+    /// computation (empty string). Registry validation rejects such
+    /// entries; `None` remains useful for validating an entry before it
+    /// is proposed for inclusion.
     ///
-    /// Detectors that load this model use the `Some` form to harden
-    /// the download path against tampering, and fall back to the
-    /// `None` form (no validation) when the entry is freshly added
-    /// and the operator is the one who will compute the hashes
-    /// locally.
+    /// Detectors must never load the `None` form.
     pub fn pinned_pair(&self) -> Option<(&'static str, &'static str)> {
         if self.model_sha256.is_empty() || self.tokenizer_sha256.is_empty() {
             None
@@ -97,48 +74,6 @@ impl KnownModel {
 }
 
 // --- Registry ---
-
-/// Production prompt-injection model.
-///
-/// Source: `protectai/deberta-v3-base-prompt-injection-v2` on Hugging
-/// Face. Apache-2.0 licensed. The DeBERTa-v3-base classifier produces
-/// a 2-class output (`SAFE`, `INJECTION`); the ONNX export under
-/// `onnx/model.onnx` matches that vocabulary, and the tokenizer
-/// included in the repo at `tokenizer.json` is the matching SentencePiece
-/// BPE tokenizer.
-///
-/// SHA-256 hashes are deliberately empty in the initial landing of
-/// this registry: the build sandbox where this code is reviewed has
-/// no outbound network access and we will not commit a hash we have
-/// not verified. The model loader treats an unpinned entry as "skip
-/// SHA validation"; operators who
-/// run the proxy in production should populate the hashes locally on
-/// first download (the file lands in the on-disk cache and you can
-/// `sha256sum` it) and submit a follow-up PR with the values, or set
-/// the explicit `model_sha256` / `tokenizer_sha256` fields in their
-/// own policy config to take over the pin.
-pub const PROMPT_INJECTION_V2_MODEL: KnownModel = KnownModel {
-    name: "prompt-injection-v2",
-    model_url: concat!(
-        "https://huggingface.co/protectai/",
-        "deberta-v3-base-prompt-injection-v2/resolve/main/onnx/model.onnx"
-    ),
-    // Empty until the WOR-190 follow-up lands the computed value.
-    // See the module-level "Procedure for filling in an empty SHA"
-    // section. Until that PR ships, the detector treats this entry
-    // as unpinned (no SHA validation), which is the same posture as
-    // supplying the URL directly in policy config without
-    // `model_sha256`. The `no_known_model_has_unpinned_sha256` test
-    // in this module is `#[ignore]`'d for the same reason.
-    model_sha256: "",
-    tokenizer_url: concat!(
-        "https://huggingface.co/protectai/",
-        "deberta-v3-base-prompt-injection-v2/resolve/main/tokenizer.json"
-    ),
-    tokenizer_sha256: "",
-    license: "Apache-2.0",
-    revision_pinned_at: "2026-04-27",
-};
 
 /// Default sentence-embedding model for the AI gateway semantic cache and
 /// the in-process / sidecar embedder.
@@ -171,7 +106,7 @@ pub const ALL_MINILM_L6_V2_MODEL: KnownModel = KnownModel {
 
 /// Every entry the registry knows about. Add new pins here; tests
 /// assert that the array stays unique by `name`.
-pub const KNOWN_MODELS: &[KnownModel] = &[PROMPT_INJECTION_V2_MODEL, ALL_MINILM_L6_V2_MODEL];
+pub const KNOWN_MODELS: &[KnownModel] = &[ALL_MINILM_L6_V2_MODEL];
 
 static INDEX: OnceLock<HashMap<&'static str, &'static KnownModel>> = OnceLock::new();
 
@@ -207,11 +142,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_contains_prompt_injection_v2() {
-        let m = lookup("prompt-injection-v2").expect("registered");
-        assert!(m.model_url.starts_with("https://huggingface.co/"));
-        assert!(m.tokenizer_url.starts_with("https://huggingface.co/"));
-        assert_eq!(m.license, "Apache-2.0");
+    fn registry_does_not_trust_an_unqualified_prompt_injection_model() {
+        assert!(lookup("prompt-injection-v2").is_none());
     }
 
     #[test]
@@ -262,8 +194,8 @@ mod tests {
 
     /// Supply-chain guard: a `KnownModel` registry entry must
     /// not be merged with an empty or sentinel SHA-256 value. Without
-    /// this assertion the detector silently degrades to "unpinned"
-    /// posture and a future re-introduction would not trip review.
+    /// this assertion a future registry entry could accidentally weaken
+    /// the verified-loading contract without tripping review.
     ///
     /// The test enumerates the obvious unsafe values:
     ///
@@ -275,12 +207,7 @@ mod tests {
     /// The latter two are the same byte sequence; both forms are
     /// listed for clarity at the call site.
     ///
-    /// Currently `#[ignore]`'d because the in-tree
-    /// `PROMPT_INJECTION_V2_MODEL` entry ships with empty SHAs (the
-    /// build sandbox cannot reach Hugging Face). Re-enable in the
-    /// WOR-190 follow-up PR that pastes the computed values.
     #[test]
-    #[ignore = "ignored until SHA values land per WOR-190 follow-up; re-enable in that PR"]
     fn no_known_model_has_unpinned_sha256() {
         const ZERO_HEX_64: &str =
             "0000000000000000000000000000000000000000000000000000000000000000";
@@ -294,6 +221,11 @@ mod tests {
                 assert!(
                     !value.is_empty(),
                     "KnownModel {:?} has empty {label}; populate via the procedure in `docs/model-pinning.md`",
+                    entry.name,
+                );
+                assert!(
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "KnownModel {:?} has malformed {label}; expected exactly 64 hexadecimal characters",
                     entry.name,
                 );
                 assert_ne!(

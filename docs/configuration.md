@@ -1503,7 +1503,7 @@ per_surface_rate_limits:
 | `output` | list | `[]` | Guardrails evaluated against the model output. |
 | `mesh` | object | unset | Runs input detectors as a cascade and fuses verdicts under a quorum rule (`block_threshold`, `redact_on_flag`, `cache`, `cache_capacity`, `latency_budget_ms`). See [ai-guardrail-mesh.md](ai-guardrail-mesh.md). |
 
-Each `input` / `output` entry is an object with a `type` field and type-specific config. Built-in types: `pii`, `secrets`, `injection` (alias `prompt_injection`), `toxicity`, `jailbreak`, `content_safety`, `schema`, `regex`, `regex_guard`, `context_poisoning`, `agent_alignment`, `classifier`. See [ai-gateway.md](ai-gateway.md#guardrails) for per-guardrail fields.
+Each `input` / `output` entry is an object with a `type` field and type-specific config. Built-in types: `pii`, `secrets`, `injection` (deprecated compatibility alias `prompt_injection`), `toxicity`, `jailbreak`, `content_safety`, `schema`, `regex`, `regex_guard`, `context_poisoning`, `agent_alignment`, `classifier`. The two injection names preserve their existing blocking fields but use the same canonical heuristic matcher as `prompt_injection_v2`. See [ai-gateway.md](ai-gateway.md#guardrails) for per-guardrail fields.
 
 ##### Safety guardrail modes
 
@@ -2365,14 +2365,19 @@ The scan covers the request URI (path + query) and request headers; auth-class h
 
 ### prompt_injection_v2
 
-Successor to the v1 `prompt_injection` heuristic. The v2 policy splits detection from enforcement: a swappable detector returns a score in `[0.0, 1.0]` plus a categorical label, and the policy maps the score onto an action. The OSS build registers a heuristic detector by default (`detector: heuristic-v1`) so the policy works out of the box. Future builds register additional detectors (e.g. an ONNX classifier) without touching the policy core.
+Successor to the legacy `injection` / `prompt_injection` guardrail names. The v2 policy splits detection from enforcement: a swappable detector returns a score in `[0.0, 1.0]` plus a categorical label, and the policy maps the score onto an action. When `detector` is omitted, a complete verified local model pair selects `inprocess`; when both artifacts are absent, SBproxy logs the resolved paths once and selects `heuristic-v1`. Partial or invalid artifacts fail startup rather than silently downgrading.
 
 ```yaml
 policies:
   - type: prompt_injection_v2
     action: tag                         # tag (default) | block | log
-    detector: heuristic-v1              # default; lookup is link-time
+    # detector omitted: verified local auto-selection
     threshold: 0.5                      # fires when score >= threshold
+    detector_config:
+      model_path: /var/lib/sbproxy/models/injection/model.onnx
+      tokenizer_path: /var/lib/sbproxy/models/injection/tokenizer.json
+      model_sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      tokenizer_sha256: abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
     score_header: x-prompt-injection-score
     label_header: x-prompt-injection-label
     block_body: 'prompt injection detected'
@@ -2381,7 +2386,16 @@ policies:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `detector` | string | `heuristic-v1` | Detector name. Resolved against the inventory registry; unknown names fail at compile time. |
+| `detector` | string | auto | Explicit `heuristic-v1`, `inprocess`, `sidecar`, or a registered custom name. Omission selects a verified local pair when present, otherwise the heuristic. Explicit choices always win. |
+| `detector_config.model_path` | path | classifier cache | Local ONNX path. In auto mode, configured paths take precedence over `<user-cache-dir>/sbproxy/models/prompt-injection-v2/model.onnx`. |
+| `detector_config.tokenizer_path` | path | classifier cache | Matching tokenizer path. Both paths must be configured together; partial presence is an error. |
+| `detector_config.model_sha256` | string | trusted registry pin | Required with `tokenizer_sha256` unless `detector_config.model` names a registry entry with a complete trusted pair. |
+| `detector_config.tokenizer_sha256` | string | trusted registry pin | Required with `model_sha256`; 64 hexadecimal characters. |
+| `detector_config.model_signature_path` | path | none | Optional detached Ed25519 signature over the model SHA-256 digest. Configure with tokenizer signature and public key. |
+| `detector_config.tokenizer_signature_path` | path | none | Optional detached Ed25519 signature over the tokenizer digest. |
+| `detector_config.signature_public_key` | string | none | Ed25519 key as 64 hex characters or a `PUBLIC KEY` PEM block. All three signature fields are required together. |
+| `detector_config.max_model_bytes` | integer | `209715200` | Model size budget checked before parsing. |
+| `detector_config.max_tokenizer_bytes` | integer | `209715200` | Tokenizer size budget checked before parsing. |
 | `threshold` | float | `0.5` | Score threshold in `[0.0, 1.0]`; the policy fires when `score >= threshold`. |
 | `action` | string | `tag` | `tag` stamps the score / label headers on the upstream. `block` returns `403` with `block_body`. `log` writes a structured warn under `sbproxy::prompt_injection_v2`. |
 | `score_header` | string | `x-prompt-injection-score` | Header carrying the numeric score (formatted as `"%.3f"`) on `action: tag`. |
@@ -2389,7 +2403,7 @@ policies:
 | `block_body` | string | `prompt injection detected` | Response body returned on `action: block`. |
 | `block_content_type` | string | `text/plain` | Content-Type for the block body. |
 
-The OSS scaffold scans the request URI + non-auth headers (`Authorization`, `Cookie`, `Set-Cookie` are excluded so tokens carried by design don't self-flag) at request-filter time. Tag mode stamps the score / label headers via the existing trust-headers channel before `upstream_request_filter` builds the upstream request; block mode rejects with `403` immediately. Body-aware detection (the prompt typically lives in the JSON body) is on the roadmap and lands with the ONNX classifier follow-up. See [prompt-injection-v2.md](prompt-injection-v2.md) for the trait shape, the eval harness, and how to register a custom detector.
+The generic policy scans the request URI + non-auth headers (`Authorization`, `Cookie`, `Set-Cookie` are excluded so tokens carried by design don't self-flag) at request-filter time. Tag mode stamps the score / label headers via the existing trust-headers channel before `upstream_request_filter` builds the upstream request; block mode rejects with `403` immediately. Set `enable_body_aware: true` on an AI origin after measuring false positives to scan parsed prompt bodies as well. See [prompt-injection-v2.md](prompt-injection-v2.md) for auto-selection failure boundaries, the eval harness, and custom detector registration.
 
 ### waf
 

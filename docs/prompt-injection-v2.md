@@ -1,12 +1,13 @@
 # prompt_injection_v2
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-27*
 
 Successor to the v1 `prompt_injection` heuristic guardrail. The v2
 policy splits *detection* from *enforcement*: a swappable detector
 returns a numeric score plus a categorical label, and the policy maps
-the score onto an action. The OSS build ships a heuristic detector by
-default so the policy works out of the box; the trait is shaped so a
-future ONNX classifier can plug in without touching the policy core.
+the score onto an action. The OSS build includes heuristic, in-process
+ONNX, and sidecar detectors. When `detector` is omitted, SBproxy uses a
+verified in-process model if a complete artifact pair is staged and
+otherwise logs one startup event and uses the heuristic.
 
 ## Why a v2 policy
 
@@ -22,8 +23,11 @@ behaviour as the default detector while exposing a richer interface:
 - Pluggable detector slot. Configs reference detectors by name; the
   inventory registry rejects unknown names at compile time.
 
-The v1 policy is unchanged. Operators upgrade by switching the policy
-`type` from `prompt_injection` to `prompt_injection_v2`.
+The legacy AI guardrail names `injection` and `prompt_injection` remain
+compatible. They preserve their boolean blocking configuration while
+delegating to the same canonical heuristic matcher as v2. Operators
+upgrade the enforcement surface by switching the policy `type` to
+`prompt_injection_v2`.
 
 ## The Detector trait
 
@@ -50,33 +54,59 @@ pre-loads state at startup, not in `detect` itself.
 
 | Name | Description |
 |------|-------------|
-| `heuristic-v1` | Case-insensitive substring matching against the OWASP-LLM-01 vocabulary plus a small "suspicious" cue list. Default; works out of the box. |
+| `heuristic-v1` | Case-insensitive substring matching against the OWASP-LLM-01 vocabulary plus a small "suspicious" cue list. Explicit choice and the no-artifact auto fallback. |
 | `sidecar` | Runs inference in a separate process over gRPC instead of in the proxy. The proxy holds one client; the sidecar (minimal OSS or richer enterprise) implements the shared `InferenceService`. Isolates the model runtime so a bad model cannot exhaust the proxy. Fail-open by default. See [Running detection out of process](#running-detection-out-of-process-the-sidecar-detector). |
-| `inprocess` | Runs the ONNX classifier inside the proxy via the pure-Rust tract engine. No second process, but the model parse and inference share the proxy's address space, so it is gated behind an explicit opt-in plus a `max_model_bytes` size guard. Prefer `sidecar` for isolation; use `inprocess` for a single-binary deploy. See [In-process detection](#in-process-detection-the-inprocess-detector). |
+| `inprocess` | Runs the ONNX classifier inside the proxy via the pure-Rust tract engine. It can be selected explicitly or automatically when `detector` is omitted and a complete verified pair is staged. Prefer `sidecar` for process isolation. See [In-process detection](#in-process-detection-the-inprocess-detector). |
 
 ### In-process detection (the `inprocess` detector)
 
-For a single binary, run the ONNX classifier in the proxy. The original in-process detector was removed because an unsandboxed model parse could exhaust the proxy; this brings it back only behind the explicit `detector: inprocess` choice plus a hard `max_model_bytes` cap, and the operator supplies the model and tokenizer paths (OSS ships no weights).
+For a single binary, run the ONNX classifier in the proxy. SBproxy
+checks regular-file/readability constraints, the model and tokenizer
+size budgets, mandatory SHA-256 pins, optional detached Ed25519
+signatures, and only then parses either artifact. OSS ships no
+prompt-injection weights.
 
 ```yaml
 policies:
   - type: prompt_injection_v2
     action: block
-    detector: inprocess
+    # Omit detector for verified auto-selection. Setting
+    # detector: inprocess makes the same pair an explicit requirement.
     threshold: 0.8
     detector_config:
-      # On-disk ONNX model + tokenizer the operator provides.
       model_path: /var/lib/sbproxy/models/injection/model.onnx
       tokenizer_path: /var/lib/sbproxy/models/injection/tokenizer.json
-      # Label the model emits for an injection verdict (case-insensitive).
+      model_sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      tokenizer_sha256: abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
       injection_label: INJECTION
-      # Optional class labels indexed by output class; omit to report class_<n>.
-      # labels: ["SAFE", "INJECTION"]
-      # Hard upper bound on the model file size in bytes (default 200 MB).
+      labels: ["SAFE", "INJECTION"]
       max_model_bytes: 209715200
+      max_tokenizer_bytes: 209715200
+      # Optional signatures are all-or-nothing:
+      # model_signature_path: /var/lib/sbproxy/models/injection/model.onnx.sig
+      # tokenizer_signature_path: /var/lib/sbproxy/models/injection/tokenizer.json.sig
+      # signature_public_key: "<64 hex characters or Ed25519 PUBLIC KEY PEM>"
 ```
 
-The detector loads the model at config-compile time (the slow path), so a missing or oversized model fails fast at startup rather than on the first request. `detect` then runs cheap tract inference per prompt and maps the top label and score onto the v2 vocabulary using the same cutoffs as the sidecar detector: at or above `threshold` is `injection`, `[0.3, threshold)` is `suspicious`, below `0.3` is `clean`. A non-injection top label is read as confidence the prompt is benign, so its score is inverted. Inference failures fail open (clean); operators who want fail-closed should use the sidecar detector. Because the model loads eagerly, this detector cannot appear in the `examples/` validation sweep; see `docs/local-inference.md` for the full deployment recipe.
+When `detector` is omitted, configured paths take precedence. If neither
+path is configured, SBproxy checks
+`<user-cache-dir>/sbproxy/models/prompt-injection-v2/model.onnx` and
+`tokenizer.json` (or `./.sbproxy-cache/models/...` when the OS has no
+user cache directory). Both files absent selects `heuristic-v1` and
+logs the detector plus both resolved paths exactly once. Partial
+presence, unreadable files, oversize files, missing or mismatched pins,
+invalid signatures, or parse failures stop startup; none silently
+downgrades protection. An explicit `detector` always wins, so explicit
+`heuristic-v1` does not inspect artifact configuration.
+
+The detector loads at config-compile time. `detect` maps the top label
+and score onto the v2 vocabulary using the same cutoffs as the sidecar:
+at or above `threshold` is `injection`, `[0.3, threshold)` is
+`suspicious`, and below `0.3` is `clean`. A non-injection top label is
+read as confidence the prompt is benign, so its score is inverted.
+Request-time inference failures retain the established fail-open
+behavior; use the sidecar's fail-closed option if that availability
+policy is required.
 
 ## Registering a custom detector
 
@@ -160,14 +190,16 @@ heuristic detector. `detector: sidecar` runs the model out of process
 behind a gRPC contract and is the preferred choice: a malformed or
 oversized model can only take down the sidecar, not the proxy.
 `detector: inprocess` runs the same tract-based ONNX classifier inside
-the proxy address space; it is opt-in, guarded by a hard
-`max_model_bytes` size cap, and you supply the model and tokenizer
-paths. The legacy `detector: onnx` name is the only thing that was
-removed; it fails at config load with a pointer to the sidecar.
+the proxy address space; omission can also select it through the
+verified artifact rules above. The legacy `detector: onnx` name was
+removed and fails at config load with a pointer to supported choices.
 
-The trained model weights do not ship in OSS. There is no default model
-baked into the build and no model artifact in any release asset; you
-supply the ONNX file and tokenizer to whichever detector you pick.
+The trained model weights do not ship in OSS. The registry intentionally
+has no trusted `prompt-injection-v2` entry: the audited first-party
+Apache-2.0 candidates exceeded the unchanged 200 MiB default limit,
+while smaller community exports lacked sufficient license or artifact
+provenance. Supply an immutable, reviewed pair and both digests; SBproxy
+will not download or trust a moving `resolve/main` URL automatically.
 
 The eval gate (precision and recall >= 0.7 against the bundled golden
 corpora) is opt-in: the test at
@@ -233,9 +265,8 @@ is handled by `fail_closed`:
 ### Running the OSS sidecar
 
 The sidecar is a separate binary built from this workspace. The OSS
-build does not ship model weights; supply your own ONNX file and
-tokenizer (the `protectai/deberta-v3-base-prompt-injection-v2`
-artifacts work well):
+build does not ship model weights; supply your own reviewed ONNX file
+and matching tokenizer:
 
 ```bash
 cargo run -p sbproxy-classifier-sidecar -- \
@@ -383,12 +414,10 @@ via the existing trust-headers channel before
 carried by design don't self-flag.
 
 Body-aware detection (the prompt typically lives in the JSON body of
-an `ai_proxy` request) is intentionally out of scope for the OSS
-scaffold. Stamping headers from the body filter is too late: Pingora
-has already called `upstream_request_filter` and built the upstream
-request by then. Body-aware detection lands with the ONNX classifier
-follow-up, which will run inside `ai_proxy` (where the body is parsed
-into `messages` already) rather than as a generic policy.
+an `ai_proxy` request) is available through `enable_body_aware: true`.
+It is disabled by default so operators can measure false positives
+before adding it to the AI hot path. URI and header scanning remains
+the generic policy path.
 
 Real-world patterns the scaffold catches today:
 
@@ -403,7 +432,7 @@ Real-world patterns the scaffold catches today:
 The heuristic detector is a substring matcher. It does not handle:
 
 - **Obfuscation.** `i.gn.o.r.e p.r.e.v.i.o.u.s i.n.s.t.r.u.c.t.i.o.n.s`
-  evades the patterns. Future detectors will tokenise.
+  evades the patterns; a learned detector may handle it better.
 - **Translation.** Patterns are English-only.
 - **Indirect injection.** Prompts that smuggle the attack through a
   retrieved document (RAG poisoning) sail through; the detector only
@@ -411,7 +440,7 @@ The heuristic detector is a substring matcher. It does not handle:
 - **Novel phrasings.** Anything outside the published OWASP-LLM-01
   vocabulary is missed unless it happens to share a substring.
 
-These are the gaps the ONNX classifier in the Fail-4 follow-up closes.
+These are the gaps an eligible ONNX classifier is intended to reduce.
 
 ## When to graduate to a vendor
 
@@ -428,11 +457,22 @@ prompts.
 |--|--|--|
 | Where | Inside `ai_proxy` guardrails pipeline | Standalone policy on any origin |
 | Output | Boolean block | Score + label |
-| Detector | Hard-coded substring match | Swappable trait |
+| Detector | Canonical shared heuristic matcher | Swappable trait; heuristic adapter uses the same matcher |
 | Default action | Block | Tag |
-| Status | Stable; no behaviour change | New; OSS scaffold |
+| Status | Compatibility surface | Preferred policy surface |
 
-The two coexist. We will collapse the heuristic implementation into
-a shared helper once the v2 detector trait is stable; today the
-patterns are duplicated with a `// TODO` comment in
-`crates/sbproxy-modules/src/policy/prompt_injection_v2/heuristic.rs`.
+The legacy names preserve `patterns` and `detect_common` behavior but
+delegate matching to the same engine as `heuristic-v1`. New
+configurations should use `prompt_injection_v2`; the aliases remain to
+avoid breaking existing deployments.
+
+## Latency measurement
+
+The verification run used an Apple M4 Max (arm64, 36 GiB RAM) and was
+prepared to measure a release build after one warm-up inference over a
+fixed short prompt. No request-latency number is reported: the model
+audit produced no immutable, clearly licensed and provenance-qualified
+prompt-injection ONNX pair under the 200 MiB limit. Reporting an
+oversized or substituted model would not measure the default contract.
+The both-absent default path runs the existing heuristic and adds no
+per-request model work.
