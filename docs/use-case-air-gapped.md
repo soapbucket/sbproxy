@@ -1,12 +1,12 @@
 # Air-gapped AI: weights, prompts, and verdicts that never leave your network
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-07-27*
 
 > **Compatibility form** — this walkthrough still uses provider `serve:`. Prefer `proxy.model_host` + `provider_type: managed_model` for new deployments; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/).
 
 ![Terminal recording: sbproxy doctor reports the host, the manifest shows a file: source with pinned sha256 digests, validate and plan pass with no network access, and a prompt injection attempt is blocked on the box](assets/use-case-air-gapped.gif)
 
-Some networks end at a wall. Classified enclaves, medical records systems, industrial control rooms, ships at sea: places where the compliance answer to "what does this process send out" has to be "nothing", and where an auditor will ask you to prove it. Every hosted AI product is disqualified before the conversation starts, and so is any gateway whose guardrails quietly call a moderation API. SBproxy's pitch is "Call any model. Serve your own. Govern both." Behind the wall you keep the second and third parts: the same Apache-2.0 binary that routes to 66 providers on a connected network serves the weights on your own GPUs on a disconnected one, and the governance plane (guardrails, budgets, the usage ledger) runs in the same process either way. This page extends the [sovereign / multi-cloud story](getting-started-sovereign-multicloud.md) from credentials to the weights themselves.
+Some networks end at a wall. Classified enclaves, medical records systems, industrial control rooms, ships at sea: places where the compliance answer to "what does this process send out" has to be "nothing", and where an auditor will ask you to prove it. Every hosted AI product is disqualified before the conversation starts, and so is any gateway whose guardrails quietly call a moderation API. SBproxy's pitch is "Call any model. Serve your own. Govern both." Behind the wall you keep the second and third parts: the same Apache-2.0 binary that routes to 72 providers on a connected network serves the weights on your own GPUs on a disconnected one, and the governance plane (guardrails, budgets, the usage ledger) runs in the same process either way. This page extends the [sovereign / multi-cloud story](getting-started-sovereign-multicloud.md) from credentials to the weights themselves.
 
 ## What you will build
 

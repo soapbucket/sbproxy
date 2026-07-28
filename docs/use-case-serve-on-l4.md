@@ -1,12 +1,12 @@
 # Serve Qwen, GLM, or Gemma on one cloud L4
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-07-27*
 
 ![sbproxy validate, plan, and doctor running the serve preflight for this page's config on a machine with no GPU](assets/use-case-serve-on-l4.gif)
 
 *The recording is the CPU/Metal stand-in this page actually runs today: `sbproxy validate`, `plan`, and `doctor` walking this page's llama.cpp + GGUF config on a machine with no GPU, refusing to start an engine it cannot serve. It is not NVIDIA L4 evidence — see [NVIDIA L4 (planned)](#nvidia-l4-planned) below for why, and for what the certified path looks like.*
 
-You have GCP credits and a model you want to run on your own terms. The open-weight releases from Qwen, GLM, and Gemma are good enough for real work now, but most serving guides stop at a bare `vllm serve` with nothing in front of it and no plan for the day you need a hosted fallback. SBproxy is built for exactly this gap: "Call any model. Serve your own. Govern both." One Apache-2.0 binary routes to 66 providers or serves the weights on your own GPUs. This page has two halves: a `serve:` config plus preflight tooling you can run right now, on whatever CPU or Apple Silicon box you have open, and the planned procedure for the certified NVIDIA L4 path — from `gcloud compute instances create` to a first vLLM/SGLang completion — which is not yet backed by live hardware evidence.
+You have GCP credits and a model you want to run on your own terms. The open-weight releases from Qwen, GLM, and Gemma are good enough for real work now, but most serving guides stop at a bare `vllm serve` with nothing in front of it and no plan for the day you need a hosted fallback. SBproxy is built for exactly this gap: "Call any model. Serve your own. Govern both." One Apache-2.0 binary routes to 72 providers or serves the weights on your own GPUs. This page has two halves: a `serve:` config plus preflight tooling you can run right now, on whatever CPU or Apple Silicon box you have open, and the planned procedure for the certified NVIDIA L4 path — from `gcloud compute instances create` to a first vLLM/SGLang completion — which is not yet backed by live hardware evidence.
 
 A status note before you read further, and definitely before you spend money. Nothing below [NVIDIA L4 (planned)](#nvidia-l4-planned) has run on an L4. NVIDIA vLLM and SGLang container, multi-GPU, and multi-node GCP validation is reserved for the final integration PR; the deterministic driver and capacity suites run in CI today. Use [model-host-certification.md](model-host-certification.md) for the evidence ledger, and do not read the GGUF walkthrough below as proof of anything about NVIDIA GPUs — llama.cpp does not serve them. See [model-host.md](model-host.md#managed-engines) for the exact engine policy.
 

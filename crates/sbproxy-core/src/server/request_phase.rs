@@ -992,10 +992,20 @@ pub(super) async fn request_filter(
         let traceparent = headers.get("traceparent").and_then(|v| v.to_str().ok());
         let tracestate = headers.get("tracestate").and_then(|v| v.to_str().ok());
 
-        ctx.trace_ctx = if let Some(tp) = traceparent {
+        // Only the genuine-parse outcomes land here; a synthesized
+        // random root falls out to `None` below. This distinction
+        // (`ctx.trace_parent_is_remote`) matters downstream: the
+        // AI-dispatch span-creation site uses it to decide whether to
+        // parent the exported span on the caller's trace via
+        // `sbproxy_observe::telemetry::parent_span_on_remote_trace_context`,
+        // an explicit, request-scoped call rather than any
+        // ambient/thread-local OTel state (which used to leak one
+        // Context per request and could bleed a previous request's
+        // trace onto a later one with no traceparent of its own, on a
+        // reused worker thread).
+        let remote_trace_ctx = if let Some(tp) = traceparent {
             // Try W3C traceparent first.
             sbproxy_observe::trace_ctx::w3c::TraceContext::parse_with_state(tp, tracestate)
-                .or_else(|| Some(sbproxy_observe::TraceContext::new_random()))
         } else {
             // Fall back to B3 single header.
             let b3_ctx = headers
@@ -1020,12 +1030,15 @@ pub(super) async fn request_filter(
                             tid, sid, sampled, parent,
                         )
                         .map(|b3| b3.to_w3c())
-                        .or_else(|| Some(sbproxy_observe::TraceContext::new_random()))
                     }
-                    _ => Some(sbproxy_observe::TraceContext::new_random()),
+                    _ => None,
                 }
             }
         };
+
+        ctx.trace_parent_is_remote = remote_trace_ctx.is_some();
+        ctx.trace_ctx =
+            Some(remote_trace_ctx.unwrap_or_else(sbproxy_observe::TraceContext::new_random));
     }
 
     // --- ACME HTTP-01 challenge interception ---

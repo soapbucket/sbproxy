@@ -57,7 +57,8 @@ Registry version: `1`
 | `serve.models[].max_context` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].extra_args` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].kv_quant` | `preview` | `engine.typed_managed_drivers` | `none` |
-| `serve.models[].speculative` | `unsupported` | `engine.typed_managed_drivers` | `none` |
+| `serve.models[].enable_prefix_caching` | `preview` | `engine.typed_managed_drivers` | `none` |
+| `serve.models[].speculative` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].chunked_prefill` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].lora_adapters` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].pinned` | `preview` | `lifecycle.single_node_residency` | `none` |

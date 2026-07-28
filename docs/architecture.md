@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-07-27*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -68,7 +68,7 @@ sbproxy/
                                           encoding, format_convert, normalize,
                                           payload_limit, replace_strings,
                                           html_to_markdown, sse_chunking, noop
-    sbproxy-ai/           - AI gateway: 66 native providers, routing,
+    sbproxy-ai/           - AI gateway: 72 native providers, routing,
                               guardrails, budget enforcement, virtual keys,
                               semantic cache, usage ledger.
     sbproxy-extension/    - Scripting and extension runtimes:
@@ -422,7 +422,7 @@ their own YAML; the registry is held behind an `ArcSwap` and rebuilt on hot relo
 Request serialization and response normalization are handled by the shared client plus
 the format translators (Anthropic, Gemini, Bedrock).
 
-66 native providers ship in-tree alongside a native Anthropic
+72 native providers ship in-tree alongside a native Anthropic
 translator. The `model` field passes straight through to the upstream,
 so the gateway reaches 200+ models without enumerating them.
 Direct adapters include OpenAI, Anthropic, Google Gemini, Azure

@@ -1215,7 +1215,7 @@ origins:
 
 ### ai_proxy
 
-Route requests across LLM providers with automatic failover, cost tracking, and content-based routing. Supports 66 native providers behind one OpenAI-compatible API; the model name passes straight through, so any model a provider serves is reachable. For full details, see [ai-gateway.md](ai-gateway.md) and [providers.md](providers.md).
+Route requests across LLM providers with automatic failover, cost tracking, and content-based routing. Supports 72 native providers behind one OpenAI-compatible API; the model name passes straight through, so any model a provider serves is reachable. For full details, see [ai-gateway.md](ai-gateway.md) and [providers.md](providers.md).
 
 ```yaml
 origins:

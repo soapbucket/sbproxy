@@ -1,7 +1,7 @@
 # Supported providers
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-27*
 
-SBproxy ships native adapters for 66 LLM providers behind one OpenAI-compatible API. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them. Most adapters speak the OpenAI wire format and pass through unchanged. Anthropic, Bedrock, and Gemini use in-tree translators for OpenAI-shaped chat or embedding clients; SageMaker, Oracle, Watsonx, and other `Custom` formats pass through in their native shape.
+SBproxy ships native adapters for 72 LLM providers behind one OpenAI-compatible API. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them. Most adapters speak the OpenAI wire format and pass through unchanged. Anthropic, Bedrock, and Gemini use in-tree translators for OpenAI-shaped chat or embedding clients; SageMaker, Oracle, Watsonx, and other `Custom` formats pass through in their native shape.
 
 The catalog is plain YAML and you can extend it yourself: see [Extending the provider catalog](#extending-the-provider-catalog).
 
@@ -77,8 +77,14 @@ Each provider has a default base URL and auth format. Override `base_url` if you
 | `qianfan` | Baidu Qianfan (ERNIE) | OpenAI | `Authorization: Bearer` | `https://qianfan.baidubce.com/v2` |
 | `stepfun` | StepFun | OpenAI | `Authorization: Bearer` | `https://api.stepfun.com/v1` |
 | `mixedbread` | Mixedbread (embeddings only)[^embed-only] | OpenAI | `Authorization: Bearer` | `https://api.mixedbread.com/v1` |
+| `azure_foundry` | Azure AI Foundry Models | OpenAI | `api-key` | `https://{resource}.services.ai.azure.com/openai/v1` |
+| `snowflake` | Snowflake Cortex | OpenAI | `Authorization: Bearer` | `https://{account}.snowflakecomputing.com/api/v2/cortex/v1` |
+| `ai21` | AI21 Labs (Jamba) | OpenAI | `Authorization: Bearer` | `https://api.ai21.com/studio/v1` |
+| `clarifai` | Clarifai | OpenAI | `Authorization: Key` | `https://api.clarifai.com/v2/ext/openai/v1` |
+| `inception` | Inception Labs (Mercury) | OpenAI | `Authorization: Bearer` | `https://api.inceptionlabs.ai/v1` |
+| `sarvam` | Sarvam AI | OpenAI | `Authorization: Bearer` | `https://api.sarvam.ai/v1` |
 
-The `cloudflare`, `vertex`, and `runpod` defaults contain path template parameters (`{account_id}`, `{location}`, `{project_id}`, `{endpoint_id}`). Fill them in by overriding `base_url` per-origin, typically with environment-or-config interpolation (for example `base_url: https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/openai/v1`). Paths left with literal placeholders will reach the upstream as-is and 404.
+The `cloudflare`, `vertex`, `runpod`, `azure_foundry`, and `snowflake` defaults contain path template parameters (`{account_id}`, `{location}`, `{project_id}`, `{endpoint_id}`, `{resource}`, `{account}`). Fill them in by overriding `base_url` per-origin, typically with environment-or-config interpolation (for example `base_url: https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/openai/v1`). Paths left with literal placeholders will reach the upstream as-is and 404.
 
 [^vertex-oauth]: Vertex AI requires a short-lived OAuth2 access token rather than a static API key. Generate one with `gcloud auth print-access-token` (or your service account flow) and rotate it before expiry. SBproxy forwards the configured `api_key` verbatim as the bearer token.
 

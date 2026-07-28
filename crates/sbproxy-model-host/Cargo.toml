@@ -42,6 +42,13 @@ tokenizer = ["dep:tokenizers", "dep:minijinja"]
 # tree (candle etc.), so it is strictly opt-in and absent from the
 # default build + the lean lockfile path.
 embedded = ["dep:mistralrs", "dep:axum"]
+# Xet-aware weight download through hf-hub's managed client: a chunk
+# already local or shared with another cached file is never re-fetched.
+# Additive to `weights`, not a replacement for it -- hf-hub pulls its
+# own reqwest/hyper stack and hf-xet's chunking layer, a sizeable
+# dependency addition, so it stays strictly opt-in pending a real
+# download pass on a live host to confirm the two transports agree.
+hf-xet-transport = ["weights", "dep:hf-hub", "dep:tokio-util"]
 
 [dependencies]
 sbproxy-util.workspace = true
@@ -64,15 +71,25 @@ bytes = { workspace = true }
 zeroize = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
+# `hf-xet-transport` feature only: streams the hf-hub-downloaded local
+# file back through the `ArtifactTransport` body type.
+tokio-util = { workspace = true, features = ["io"], optional = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
 url = { workspace = true }
 nvml-wrapper = { version = "0.10", optional = true }
 # Weight download is a plain HTTP GET that follows HF's redirect to the
 # resolve-cache/Xet backend; reqwest's default redirect policy resolves
-# the relative Location the hub returns, which the old hf-hub 0.3 client
-# could not. No hf-hub dependency.
+# the relative Location the hub returns. This gets the request to the
+# right backend but not real chunk-level dedup, which needs the Xet CAS
+# protocol itself -- see the `hf-xet-transport` feature below.
 reqwest = { workspace = true, optional = true }
+# `hf-xet-transport` feature only: hf-hub 1.0 speaks the Xet
+# chunk-deduplication protocol transparently through its managed,
+# content-addressed download client (`HF_HUB_CACHE`); the sbproxy
+# transport seam wraps its completed local file rather than
+# reimplementing CAS chunking here.
+hf-hub = { version = "1.0", optional = true }
 # Token counting + chat-template rendering, behind the `tokenizer`
 # feature. Versions match the existing workspace users (classifiers /
 # extension) so no new lock entries are pulled.

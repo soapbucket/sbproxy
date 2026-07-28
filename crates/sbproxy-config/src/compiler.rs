@@ -2455,6 +2455,168 @@ origins:
         assert!(compiled.server.http3.is_none());
     }
 
+    /// Minimal `tracing::Subscriber` that records the `config_key` field
+    /// of every event, regardless of level or target. Proves the boot
+    /// warning in `compile_config` (above) actually fires as a `tracing`
+    /// event, not just that `key_registry::configured_config_only_keys`
+    /// returns the right entries in isolation.
+    struct ConfigOnlyWarningCapture {
+        keys: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for ConfigOnlyWarningCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        /// Deliberately `sometimes`, never `always`: `tracing` caches one
+        /// `Interest` per callsite for the whole process, and the boot
+        /// warning's callsite is shared with every other `compile_config`
+        /// test running in parallel on other threads. `sometimes` forces
+        /// `tracing` to call `enabled` on the *emitting* thread for every
+        /// event, so this capture answers only for its own thread and the
+        /// cached value can never go stale in either direction.
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+        /// Keeps the process-wide max-level hint at `TRACE` while this
+        /// subscriber is registered, so `tracing::warn!`'s static level
+        /// fast path (`LevelFilter::current()`) cannot filter the event
+        /// before interest is even consulted.
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor<'a>(&'a mut Option<String>);
+            impl tracing::field::Visit for Visitor<'_> {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "config_key" {
+                        *self.0 = Some(value.to_string());
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "config_key" {
+                        *self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut key = None;
+            event.record(&mut Visitor(&mut key));
+            if let Some(key) = key {
+                self.keys.lock().unwrap().push(key);
+            }
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// A registered-but-silent subscriber whose only job is to keep
+    /// `tracing`'s global callsite-interest cache honest for the capture
+    /// above. It is never installed as anyone's default; it exists purely
+    /// as a second entry in the process-wide dispatcher list.
+    ///
+    /// Why this is needed (tracing-core 0.1.36):
+    ///
+    /// * `Dispatchers::rebuilder` takes a "just one dispatcher" fast path
+    ///   whenever at most one dispatcher is registered
+    ///   (`callsite.rs:544-549`), and that path computes a callsite's
+    ///   interest from *the calling thread's* default subscriber
+    ///   (`callsite.rs:561-573`). On any sibling test thread that default
+    ///   is `NoSubscriber`, whose `register_callsite` returns
+    ///   `Interest::never()` (`subscriber.rs:676-678`). The result is
+    ///   written to the one process-wide cache slot
+    ///   (`callsite.rs:505-506`), and a callsite registers exactly once
+    ///   (`callsite.rs:308-321`), so the first sibling thread to reach the
+    ///   boot warning wins and disables it for *every* thread, this test
+    ///   included. Registering a second dispatcher turns the fast path off
+    ///   and forces interest to be computed from the live dispatcher list,
+    ///   which contains the capture above.
+    /// * The pin hints `LevelFilter::OFF`, which matters for ordering:
+    ///   `MAX_LEVEL` starts at `OFF` (`metadata.rs:245`) so no thread can
+    ///   reach a callsite at all until some dispatcher raises it. Because
+    ///   the pin keeps it at `OFF`, the door stays shut until the capture
+    ///   registers, and `register_dispatch` clears `has_just_one` before
+    ///   `rebuild_interest` raises the max level (`callsite.rs:484-488`,
+    ///   `551-557`, `407-421`) -- so there is no window in which a sibling
+    ///   thread can poison the cache.
+    struct InterestPin;
+
+    impl tracing::Subscriber for InterestPin {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::never()
+        }
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::OFF)
+        }
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, _event: &tracing::Event<'_>) {}
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn compile_config_warns_when_an_operator_sets_a_config_only_key() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  device_parser_file: "/etc/sbproxy/devices.yaml"
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        // Register the pin BEFORE the capture and keep it alive for the
+        // whole test: with two dispatchers registered, `tracing` computes
+        // this callsite's interest from the dispatcher list (which holds
+        // the capture) instead of from whichever thread happens to hit the
+        // callsite first. See `InterestPin` for the file:line evidence.
+        // Dropping the pin early would re-arm the fast path, so it must
+        // outlive the `with_default` scope below (hence the explicit
+        // `drop` after it, rather than an `_`-bound temporary).
+        let pin = tracing::dispatcher::Dispatch::new(InterestPin);
+
+        let keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = ConfigOnlyWarningCapture { keys: keys.clone() };
+        tracing::subscriber::with_default(subscriber, || {
+            // Repair, don't rely: if some other dispatcher elsewhere in the
+            // process had already cached this callsite as `never` before the
+            // pin existed, this recomputes it. With the pin registered the
+            // rebuild reads the live dispatcher list, so the recomputed
+            // value is honest regardless of which thread runs it.
+            tracing::callsite::rebuild_interest_cache();
+            compile_config(yaml).expect("device_parser_file is config-only, not a compile error");
+        });
+        drop(pin);
+
+        assert_eq!(
+            keys.lock().unwrap().as_slice(),
+            ["proxy.device_parser_file"],
+            "compile_config must warn once for the explicitly-set config-only key"
+        );
+    }
+
     // WOR-1140: unknown-config-key handling.
     #[test]
     fn nested_unknown_key_fails_compile() {
