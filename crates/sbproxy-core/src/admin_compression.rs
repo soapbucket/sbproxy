@@ -1156,11 +1156,13 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("compression-state.redb");
         let local = Arc::new(LocalCompressionStore::open(&path).await.unwrap());
-        let mut pipeline = crate::pipeline::CompiledPipeline::default();
-        pipeline.compression_runtimes =
-            crate::compression_runtime::CompressionRuntimeRegistry::with_local_admin_store_for_test(
-                local,
-            );
+        let pipeline = crate::pipeline::CompiledPipeline {
+            compression_runtimes:
+                crate::compression_runtime::CompressionRuntimeRegistry::with_local_admin_store_for_test(
+                    local,
+                ),
+            ..Default::default()
+        };
 
         let registry = CompressionAdminRegistry::from_pipeline(&pipeline);
         let selected = registry.selected_stores(Some(CompressionBackend::Local));
