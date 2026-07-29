@@ -25,7 +25,8 @@ thiserror = { workspace = true }
 # `spawn_blocking` for the async file-resolver wrapper.
 tokio = { workspace = true, features = ["rt"] }
 
-# Blocking HTTP client for HashiCorp Vault, AWS KMS, and GCP Cloud KMS backends
+# Blocking HTTP client for the HashiCorp Vault, GCP Secret Manager, and
+# Azure Key Vault backends
 ureq = { version = "2", features = ["json"] }
 
 # GCP auth. Pinned to the last 0.12.x release that preserves the

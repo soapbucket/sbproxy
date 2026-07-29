@@ -4214,13 +4214,14 @@ In addition to `${ENV}`, `file:`, and `secret:`, secret-bearing fields accept pr
 | `vault://` | HashiCorp Vault KV | `vault://primary/secret/data/openai-prod?key=api_key` |
 | `awssm://` | AWS Secrets Manager | `awssm://primary/openai-keys?version=3&key=api_key` |
 | `gcpsm://` | GCP Secret Manager | `gcpsm://primary/openai-api-key?version=latest` |
+| `azurekv://` | Azure Key Vault | `azurekv://primary/openai-api-key?version=6a2b45c8f9e14e0d` |
 | `k8ssecret://` | Kubernetes Secret | `k8ssecret://primary/sbproxy-secrets/openai-key` |
 | `secretfile://` | Local YAML or JSON secret file | `secretfile://local/openai-prod?key=api_key` |
 | `secret://` | Local static secret map | `secret://local/openai-prod` |
 
 * `<backend-name>` is the operator-chosen backend instance name declared under `proxy.secrets.backends:`.
 * `<provider-path>` is the backend-specific path. The parser carries it verbatim; each backend validates its own shape at resolve time.
-* `version=<n>` pins a secret version where the backend supports versioning, such as HashiCorp KV v2, AWS Secrets Manager, or GCP Secret Manager. It is ignored by versionless backends.
+* `version=<n>` pins a secret version where the backend supports versioning, such as HashiCorp KV v2, AWS Secrets Manager, GCP Secret Manager, or Azure Key Vault. It is ignored by versionless backends.
 * `key=<json-field>` extracts a sub-field from a JSON secret payload. When omitted the entire payload is returned.
 * Additional query parameters carry through to the backend as opaque hints; the parser does not interpret them.
 
@@ -4233,6 +4234,7 @@ authentication:
     - vault://primary/secret/data/openai-prod?key=api_key
     - awssm://primary/prod/openai-keys?version=3&key=api_key
     - gcpsm://primary/openai-api-key?version=latest
+    - azurekv://primary/openai-api-key?version=6a2b45c8f9e14e0d
     - k8ssecret://primary/sbproxy-secrets/openai-key
     - secretfile://local/openai-prod?key=api_key
     - secret://local/openai-prod
@@ -4284,7 +4286,7 @@ origins:
           api_key: vault://beta-vault/secret/data/openai-prod?key=api_key
 ```
 
-The `vault://acme-vault/...` reference resolves against the `acme-vault` backend at `vault.acme.example`; the `beta-vault` reference resolves against the other instance. Backend types are `local`, `file`, `hashicorp`, `aws`, `gcp`, and `k8s`; see [secrets.md](secrets.md) for each backend's fields and auth methods. An unresolved reference in a secret-bearing field fails startup rather than reaching the wire verbatim.
+The `vault://acme-vault/...` reference resolves against the `acme-vault` backend at `vault.acme.example`; the `beta-vault` reference resolves against the other instance. Backend types are `local`, `file`, `hashicorp`, `aws`, `gcp`, `azure`, and `k8s`; see [secrets.md](secrets.md) for each backend's fields and auth methods. An unresolved reference in a secret-bearing field fails startup rather than reaching the wire verbatim.
 
 ---
 

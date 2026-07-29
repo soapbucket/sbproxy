@@ -1714,6 +1714,53 @@ fn install_secret_resolver(path: &std::path::Path) {
                     }
                 }
             }
+            sbproxy_config::SecretBackendConfig::Azure {
+                name,
+                vault_url,
+                cache_ttl_secs,
+                auth,
+            } => {
+                let auth = match auth {
+                    sbproxy_config::AzureBackendAuth::ManagedIdentity => {
+                        sbproxy_vault::AzureKeyVaultAuth::ManagedIdentity
+                    }
+                    sbproxy_config::AzureBackendAuth::UserAssignedIdentity { client_id } => {
+                        sbproxy_vault::AzureKeyVaultAuth::UserAssignedIdentity {
+                            client_id: client_id.clone(),
+                        }
+                    }
+                    sbproxy_config::AzureBackendAuth::ServicePrincipal {
+                        tenant_id,
+                        client_id,
+                        client_secret,
+                        authority,
+                    } => sbproxy_vault::AzureKeyVaultAuth::ServicePrincipal {
+                        tenant_id: tenant_id.clone(),
+                        client_id: client_id.clone(),
+                        client_secret: env_interp(client_secret),
+                        authority: authority.clone(),
+                    },
+                    sbproxy_config::AzureBackendAuth::AzureCli => {
+                        sbproxy_vault::AzureKeyVaultAuth::AzureCli
+                    }
+                };
+                let cfg = sbproxy_vault::AzureKeyVaultConfig {
+                    vault_url: vault_url.clone(),
+                    auth,
+                    cache_ttl_secs: *cache_ttl_secs,
+                };
+                match sbproxy_vault::AzureKeyVaultBackend::new(cfg) {
+                    Ok(b) => manager.register_backend(
+                        sbproxy_vault::VaultProviderType::AzureKeyVault,
+                        name.clone(),
+                        Box::new(b),
+                    ),
+                    Err(e) => {
+                        eprintln!("Fatal: secret backend '{name}': {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             sbproxy_config::SecretBackendConfig::K8s {
                 name,
                 namespace,

@@ -14,7 +14,8 @@
 //!   `proxy.secrets.map` in the proposed config. This diagnostic
 //!   support does not make the removed colon form runtime-valid.
 //!   Provider-specific references such as `vault://`,
-//!   `awssm://`, `gcpsm://`, `k8ssecret://`, `secretfile://`, and
+//!   `awssm://`, `gcpsm://`, `azurekv://`, `k8ssecret://`,
+//!   `secretfile://`, and
 //!   `secret://<backend>/...` resolve through configured vault
 //!   backends rather than `proxy.secrets.map`, so this rule does not
 //!   treat them as map keys.
@@ -882,6 +883,7 @@ origins:
         - "vault://primary/secret/data/inbound/admin-token?key=token"
         - "awssm://primary/prod/sbproxy-inbound-tokens?version=3&key=admin"
         - "gcpsm://primary/inbound-token?version=latest"
+        - "azurekv://primary/inbound-token?version=abc123def456"
         - "k8ssecret://primary/sbproxy-secrets/inbound-token"
         - "secretfile://local/inbound-admin?key=current"
         - "secret://local/inbound-admin-token"

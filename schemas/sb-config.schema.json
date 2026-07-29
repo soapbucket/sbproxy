@@ -3101,6 +3101,50 @@
           }
         },
         {
+          "description": "Azure Key Vault, referenced as `azurekv://<name>/<secret>`.",
+          "type": "object",
+          "required": [
+            "name",
+            "type",
+            "vault_url"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "azure"
+              ]
+            },
+            "name": {
+              "description": "Backend name used in the `azurekv://<name>/...` reference.",
+              "type": "string"
+            },
+            "vault_url": {
+              "description": "Key Vault URL, e.g. `https://acme-prod.vault.azure.net`.",
+              "type": "string"
+            },
+            "cache_ttl_secs": {
+              "description": "Cache TTL in seconds for resolved reads.",
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "auth": {
+              "description": "Authentication method (defaults to managed identity).",
+              "default": "managed_identity",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/AzureBackendAuth"
+                }
+              ]
+            }
+          }
+        },
+        {
           "description": "Kubernetes Secrets, referenced as `k8ssecret://<name>/<secret>/<key>`.",
           "type": "object",
           "required": [
@@ -3442,6 +3486,87 @@
             }
           },
           "additionalProperties": false
+        }
+      ]
+    },
+    "AzureBackendAuth": {
+      "description": "Authentication for an `azure` secret backend. Externally tagged to match the bare-string `managed_identity` default.",
+      "oneOf": [
+        {
+          "description": "System-assigned managed identity (default).",
+          "type": "string",
+          "enum": [
+            "managed_identity"
+          ]
+        },
+        {
+          "description": "User-assigned managed identity, selected by client id.",
+          "type": "object",
+          "required": [
+            "user_assigned_identity"
+          ],
+          "properties": {
+            "user_assigned_identity": {
+              "type": "object",
+              "required": [
+                "client_id"
+              ],
+              "properties": {
+                "client_id": {
+                  "description": "Client id of the user-assigned identity.",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Service-principal client credentials.",
+          "type": "object",
+          "required": [
+            "service_principal"
+          ],
+          "properties": {
+            "service_principal": {
+              "type": "object",
+              "required": [
+                "client_id",
+                "client_secret",
+                "tenant_id"
+              ],
+              "properties": {
+                "tenant_id": {
+                  "description": "Microsoft Entra tenant id.",
+                  "type": "string"
+                },
+                "client_id": {
+                  "description": "App registration client id.",
+                  "type": "string"
+                },
+                "client_secret": {
+                  "description": "App registration client secret (may be `${ENV}`).",
+                  "type": "string"
+                },
+                "authority": {
+                  "description": "Optional authority host override for sovereign clouds.",
+                  "default": null,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The logged-in Azure CLI (`az account get-access-token`).",
+          "type": "string",
+          "enum": [
+            "azure_cli"
+          ]
         }
       ]
     },
@@ -5350,7 +5475,7 @@
       }
     },
     "CredentialBlock": {
-      "description": "Canonical credentials block. Sits under `proxy.credentials`, `tenants[].credentials`, or `origins[].credentials`. A request resolves matching credentials by walking origin -> tenant -> proxy scopes; the first scope that produces a match for the request's principal serves the credential.\n\nThe credential carries:\n\n* Which provider produces it (`type`, `provider`). * Where the secret material lives (`key`, a provider-specific secret reference such as `vault://`, `awssm://`, `gcpsm://`, `k8ssecret://`, `secretfile://`, or `secret://`, or a legacy `${ENV}` / `file:` reference). * Which inbound principals can use it (`principals` selectors). * Per-credential attribution metadata (`attrs`). * Allow / deny model lists that stack on top of the origin-level allowlist (most-restrictive wins). * Per-credential sub-policies (rate limit, PII redaction, ...).",
+      "description": "Canonical credentials block. Sits under `proxy.credentials`, `tenants[].credentials`, or `origins[].credentials`. A request resolves matching credentials by walking origin -> tenant -> proxy scopes; the first scope that produces a match for the request's principal serves the credential.\n\nThe credential carries:\n\n* Which provider produces it (`type`, `provider`). * Where the secret material lives (`key`, a provider-specific secret reference such as `vault://`, `awssm://`, `gcpsm://`, `azurekv://`, `k8ssecret://`, `secretfile://`, or `secret://`, or a legacy `${ENV}` / `file:` reference). * Which inbound principals can use it (`principals` selectors). * Per-credential attribution metadata (`attrs`). * Allow / deny model lists that stack on top of the origin-level allowlist (most-restrictive wins). * Per-credential sub-policies (rate limit, PII redaction, ...).",
       "type": "object",
       "required": [
         "name",
@@ -5374,7 +5499,7 @@
           ]
         },
         "key": {
-          "description": "Secret material reference. Provider-specific schemes include `vault://`, `awssm://`, `gcpsm://`, `k8ssecret://`, `secretfile://`, and `secret://`; legacy `${ENV}` and `file:` forms also remain valid. The removed `secret:<name>` form is rejected. The resolver dispatches at runtime; the config parser carries the value as a string.",
+          "description": "Secret material reference. Provider-specific schemes include `vault://`, `awssm://`, `gcpsm://`, `azurekv://`, `k8ssecret://`, `secretfile://`, and `secret://`; legacy `${ENV}` and `file:` forms also remain valid. The removed `secret:<name>` form is rejected. The resolver dispatches at runtime; the config parser carries the value as a string.",
           "default": null,
           "type": [
             "string",

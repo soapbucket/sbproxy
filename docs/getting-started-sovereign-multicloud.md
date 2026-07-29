@@ -85,7 +85,7 @@ origins:
     # Inbound auth. The runnable token resolves from the proxy process
     # environment. Production configs can use tenant-scoped provider
     # references such as vault://primary, awssm://primary,
-    # gcpsm://primary, or k8ssecret://primary.
+    # gcpsm://primary, azurekv://primary, or k8ssecret://primary.
     authentication:
       type: bearer
       tokens:

@@ -6,6 +6,7 @@
 #   vault://<backend>/<path>[?version=<n>][&key=<json-field>]      # HashiCorp Vault
 #   awssm://<backend>/<path>[?version=<n>][&key=<json-field>]      # AWS Secrets Manager
 #   gcpsm://<backend>/<path>[?version=<n>][&key=<json-field>]      # GCP Secret Manager
+#   azurekv://<backend>/<secret>[?version=<id>][&key=<json-field>] # Azure Key Vault
 #   k8ssecret://<backend>/<secret>[/<key>]                         # Kubernetes Secrets
 #   secretfile://<backend>/<path>[?key=<json-field>]               # local YAML / JSON file
 #   secret://<backend>/<name>                                      # local static map
@@ -72,6 +73,7 @@ origins:
           #   api_key: vault://primary/secret/data/openai-prod?key=api_key
           #   api_key: awssm://primary/prod/openai-prod?version=3&key=api_key
           #   api_key: gcpsm://primary/openai-api-key?version=latest
+          #   api_key: azurekv://primary/openai-api-key?version=6a2b45c8f9e14e0d
           #   api_key: k8ssecret://primary/sbproxy-secrets/openai-key
           #   api_key: secretfile://local/openai-prod?key=api_key
           default_model: gpt-4o-mini
@@ -89,6 +91,7 @@ origins:
         # - vault://primary/secret/data/inbound/admin-token?key=token
         # - awssm://primary/prod/sbproxy-inbound-tokens?version=3&key=admin
         # - gcpsm://primary/inbound-token?version=latest
+        # - azurekv://primary/inbound-token?version=6a2b45c8f9e14e0d
         # - k8ssecret://primary/sbproxy-secrets/inbound-token
         # - secretfile://local/inbound-admin?key=current
         # - secret://local/inbound-admin-token

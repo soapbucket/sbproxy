@@ -1,6 +1,6 @@
 # Secret Backends
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-28*
 
 SBproxy resolves secret material through provider-specific reference schemes. The scheme names the provider type, the authority names the configured backend instance, and the path is interpreted by that provider:
 
@@ -27,6 +27,7 @@ Everything else in a config still hot-reloads normally. Only the `proxy.secrets`
 | `vault://` | HashiCorp Vault KV | `vault://primary/secret/data/openai-prod?key=api_key` |
 | `awssm://` | AWS Secrets Manager | `awssm://primary/openai-prod?version=3&key=api_key` |
 | `gcpsm://` | GCP Secret Manager | `gcpsm://primary/openai-api-key?version=latest` |
+| `azurekv://` | Azure Key Vault | `azurekv://primary/openai-api-key?version=6a2b45c8f9e14e0d` |
 | `k8ssecret://` | Kubernetes Secret | `k8ssecret://primary/sbproxy-secrets/openai-key` |
 | `secretfile://` | Local YAML or JSON secret file | `secretfile://local/openai-prod?key=api_key` |
 | `secret://` | Local static secret map | `secret://local/openai-prod` |
@@ -210,6 +211,71 @@ gcpsm://primary/projects/<project>/secrets/<secret>/versions/<version>[&key=<jso
 ```
 
 The default version is `latest`. Secret payload bytes must decode as UTF-8. Use `key=<json-field>` when the payload is a JSON object and the config field needs one member.
+
+## Azure Key Vault
+
+The Azure backend reads secrets through the Key Vault `GetSecret` REST API. It supports system-assigned and user-assigned managed identity, service-principal client credentials, and the logged-in Azure CLI for local development.
+
+### Configuration
+
+```yaml
+proxy:
+  secrets:
+    backends:
+      - type: azure
+        name: primary
+        vault_url: https://acme-prod.vault.azure.net
+        cache_ttl_secs: 300
+        auth: managed_identity
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `vault_url` | string | Key Vault URL such as `https://acme-prod.vault.azure.net`. Required. The token audience follows the vault's DNS suffix, so sovereign-cloud vaults (`*.vault.azure.cn`, `*.vault.usgovcloudapi.net`) work without extra settings. |
+| `cache_ttl_secs` | integer | TTL in seconds on cached reads. Default is 300. |
+| `auth` | enum or object | `managed_identity`, `user_assigned_identity`, `service_principal`, or `azure_cli`. |
+
+### Auth Methods
+
+Managed identity is the default and the recommended choice for in-Azure deployments. On VMs and VM scale sets the backend requests tokens from the instance metadata service; on App Service, Functions, and Container Apps it uses the platform identity endpoint advertised through `IDENTITY_ENDPOINT` and `IDENTITY_HEADER`.
+
+```yaml
+auth: managed_identity
+```
+
+A user-assigned identity is selected by client id:
+
+```yaml
+auth:
+  user_assigned_identity:
+    client_id: 11111111-2222-3333-4444-555555555555
+```
+
+Service-principal auth exchanges client credentials at the Microsoft Entra token endpoint. The optional `authority` field overrides the login host for sovereign clouds; it defaults to `https://login.microsoftonline.com`.
+
+```yaml
+auth:
+  service_principal:
+    tenant_id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+    client_id: 11111111-2222-3333-4444-555555555555
+    client_secret: ${AZURE_CLIENT_SECRET}
+```
+
+Azure CLI auth shells out to `az account get-access-token`, reusing the operator's `az login` session. Use it for local development against a real vault, not for production deployments.
+
+```yaml
+auth: azure_cli
+```
+
+### Reference Shape
+
+```text
+azurekv://primary/<secret>[?version=<id>][&key=<json-field>]
+azurekv://primary/<secret>/<version>[?key=<json-field>]
+azurekv://primary/secrets/<secret>[/<version>]
+```
+
+Without a version pin the current secret version is served; `?version=latest` spells the same thing explicitly, matching the other cloud backends. A pin is the Key Vault version id from the secret's URL, such as `?version=6a2b45c8f9e14e0d`. Secret names use letters, digits, and dashes, as Key Vault requires. The backend is read-only; add secret versions through Azure Key Vault APIs or infrastructure automation.
 
 ## Kubernetes Secrets
 

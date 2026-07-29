@@ -585,6 +585,22 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "sbproxy::install_secret_resolver",
     ),
     stable(
+        "proxy.secrets.backends[].auth.service_principal.authority",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.service_principal.client_id",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.service_principal.client_secret",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.service_principal.tenant_id",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
         "proxy.secrets.backends[].auth.session_name",
         "sbproxy::install_secret_resolver",
     ),
@@ -598,6 +614,10 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     ),
     stable(
         "proxy.secrets.backends[].auth.type",
+        "sbproxy::install_secret_resolver",
+    ),
+    stable(
+        "proxy.secrets.backends[].auth.user_assigned_identity.client_id",
         "sbproxy::install_secret_resolver",
     ),
     stable(

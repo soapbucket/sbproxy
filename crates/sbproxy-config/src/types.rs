@@ -4766,8 +4766,8 @@ pub struct TenantObservabilityRedactConfig {
 /// * Which provider produces it (`type`, `provider`).
 /// * Where the secret material lives (`key`, a provider-specific
 ///   secret reference such as `vault://`, `awssm://`, `gcpsm://`,
-///   `k8ssecret://`, `secretfile://`, or `secret://`, or a legacy
-///   `${ENV}` / `file:` reference).
+///   `azurekv://`, `k8ssecret://`, `secretfile://`, or `secret://`,
+///   or a legacy `${ENV}` / `file:` reference).
 /// * Which inbound principals can use it (`principals` selectors).
 /// * Per-credential attribution metadata (`attrs`).
 /// * Allow / deny model lists that stack on top of the origin-level
@@ -4789,9 +4789,9 @@ pub struct CredentialBlock {
     #[serde(default)]
     pub provider: Option<String>,
     /// Secret material reference. Provider-specific schemes include
-    /// `vault://`, `awssm://`, `gcpsm://`, `k8ssecret://`,
-    /// `secretfile://`, and `secret://`; legacy `${ENV}` and `file:`
-    /// forms also remain valid. The removed `secret:<name>` form is
+    /// `vault://`, `awssm://`, `gcpsm://`, `azurekv://`,
+    /// `k8ssecret://`, `secretfile://`, and `secret://`; legacy
+    /// `${ENV}` and `file:` forms also remain valid. The removed `secret:<name>` form is
     /// rejected. The resolver dispatches at runtime; the config parser
     /// carries the value as a string.
     #[serde(default)]
@@ -6008,6 +6008,19 @@ pub enum SecretBackendConfig {
         #[serde(default)]
         auth: GcpBackendAuth,
     },
+    /// Azure Key Vault, referenced as `azurekv://<name>/<secret>`.
+    Azure {
+        /// Backend name used in the `azurekv://<name>/...` reference.
+        name: String,
+        /// Key Vault URL, e.g. `https://acme-prod.vault.azure.net`.
+        vault_url: String,
+        /// Cache TTL in seconds for resolved reads.
+        #[serde(default)]
+        cache_ttl_secs: Option<u64>,
+        /// Authentication method (defaults to managed identity).
+        #[serde(default)]
+        auth: AzureBackendAuth,
+    },
     /// Kubernetes Secrets, referenced as `k8ssecret://<name>/<secret>/<key>`.
     K8s {
         /// Backend name used in the `k8ssecret://<name>/...` reference.
@@ -6132,6 +6145,35 @@ pub enum GcpBackendAuth {
         /// Path to the external-account file.
         path: String,
     },
+}
+
+/// Authentication for an `azure` secret backend. Externally tagged to
+/// match the bare-string `managed_identity` default.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AzureBackendAuth {
+    /// System-assigned managed identity (default).
+    #[default]
+    ManagedIdentity,
+    /// User-assigned managed identity, selected by client id.
+    UserAssignedIdentity {
+        /// Client id of the user-assigned identity.
+        client_id: String,
+    },
+    /// Service-principal client credentials.
+    ServicePrincipal {
+        /// Microsoft Entra tenant id.
+        tenant_id: String,
+        /// App registration client id.
+        client_id: String,
+        /// App registration client secret (may be `${ENV}`).
+        client_secret: String,
+        /// Optional authority host override for sovereign clouds.
+        #[serde(default)]
+        authority: Option<String>,
+    },
+    /// The logged-in Azure CLI (`az account get-access-token`).
+    AzureCli,
 }
 
 /// Authentication for a `k8s` secret backend (WOR-1767).
@@ -7291,6 +7333,18 @@ backends:
     name: gcp1
     project_id: acme-prod
     auth: application_default
+  - type: azure
+    name: azure1
+    vault_url: https://acme-prod.vault.azure.net
+    auth: managed_identity
+  - type: azure
+    name: azure2
+    vault_url: https://acme-ci.vault.azure.net
+    auth:
+      service_principal:
+        tenant_id: my-tenant
+        client_id: my-app
+        client_secret: "${AZURE_CLIENT_SECRET}"
   - type: k8s
     name: k8s1
     namespace: apps
@@ -7298,7 +7352,7 @@ backends:
       type: in_cluster
 "#;
         let cfg: SecretsConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.backends.len(), 4);
+        assert_eq!(cfg.backends.len(), 6);
         match &cfg.backends[0] {
             SecretBackendConfig::Hashicorp {
                 name,
@@ -7329,8 +7383,38 @@ backends:
                 ..
             }
         ));
+        match &cfg.backends[3] {
+            SecretBackendConfig::Azure {
+                name,
+                vault_url,
+                auth,
+                ..
+            } => {
+                assert_eq!(name, "azure1");
+                assert_eq!(vault_url, "https://acme-prod.vault.azure.net");
+                assert!(matches!(auth, AzureBackendAuth::ManagedIdentity));
+            }
+            other => panic!("expected azure backend, got {other:?}"),
+        }
+        match &cfg.backends[4] {
+            SecretBackendConfig::Azure { auth, .. } => match auth {
+                AzureBackendAuth::ServicePrincipal {
+                    tenant_id,
+                    client_id,
+                    client_secret,
+                    authority,
+                } => {
+                    assert_eq!(tenant_id, "my-tenant");
+                    assert_eq!(client_id, "my-app");
+                    assert_eq!(client_secret, "${AZURE_CLIENT_SECRET}");
+                    assert!(authority.is_none());
+                }
+                other => panic!("expected service-principal auth, got {other:?}"),
+            },
+            other => panic!("expected azure backend, got {other:?}"),
+        }
         assert!(matches!(
-            &cfg.backends[3],
+            &cfg.backends[5],
             SecretBackendConfig::K8s {
                 auth: K8sBackendAuth::InCluster,
                 ..

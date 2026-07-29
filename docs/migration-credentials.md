@@ -111,7 +111,7 @@ Resolution at request time walks origin → tenant → proxy. A credential at or
 | `name` | string | Stable operator-supplied name. Unique within the declaring scope. |
 | `type` | enum | One of `ai_provider`, `bearer`, `api_key`, `jwt`, `basic`, `oidc_client`, `outbound_token_exchange`, `outbound_client_credentials`. |
 | `provider` | string | Provider name for `ai_provider` credentials. Matches an entry in the origin's `providers:` list. |
-| `key` | string | Secret reference. Accepts provider-specific schemes such as `vault://`, `awssm://`, `gcpsm://`, `k8ssecret://`, `secretfile://`, and `secret://`, plus `${ENV}`, `file:`, and `secret:`. |
+| `key` | string | Secret reference. Accepts provider-specific schemes such as `vault://`, `awssm://`, `gcpsm://`, `azurekv://`, `k8ssecret://`, `secretfile://`, and `secret://`, plus `${ENV}`, `file:`, and `secret:`. |
 | `principals` | list | Principal selectors. Empty matches every principal. |
 | `attrs` | object | Attribution attributes lowered onto matched principals, except the documented compatibility-only fields. See below. |
 | `models.allow` / `models.deny` | lists | Stack on top of the origin-level allowlist. Most-restrictive wins. |

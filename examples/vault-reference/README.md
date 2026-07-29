@@ -10,7 +10,7 @@ This example shows the provider-specific secret reference schemes alongside the 
 
 | Segment | Meaning |
 |---|---|
-| `<scheme>` | Provider type: `vault`, `awssm`, `gcpsm`, `k8ssecret`, `secretfile`, or `secret`. |
+| `<scheme>` | Provider type: `vault`, `awssm`, `gcpsm`, `azurekv`, `k8ssecret`, `secretfile`, or `secret`. |
 | `<backend>` | Operator-chosen name of a backend block configured per scope. |
 | `<path>` | Provider-specific path. The parser carries it verbatim. |
 | `version=<n>` | Optional version pin for versioned providers. |
@@ -53,7 +53,7 @@ The `vault://primary/secret/data/openai-prod` reference resolves against acme-co
 ## What You'll See In `sb.yml`
 
 * `action.providers[].api_key: ${OPENAI_API_KEY}` keeps the example runnable.
-* Commented production alternatives show `vault://`, `awssm://`, `gcpsm://`, `k8ssecret://`, and `secretfile://` references.
+* Commented production alternatives show `vault://`, `awssm://`, `gcpsm://`, `azurekv://`, `k8ssecret://`, and `secretfile://` references.
 * `authentication.bearer.tokens` uses `${INTERNAL_BEARER_TOKEN}` for the runnable path and comments the provider-backed alternatives.
 * The `proxy.vault` and `tenants[].vault` blocks are shown commented out until the public config schema exposes backend blocks at every scope. The example still documents the resolution model from one file.
 
