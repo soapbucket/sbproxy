@@ -611,7 +611,7 @@ const PATRONUS_ALLOW: &str =
     r#"{"results":[{"status":"success","evaluation_result":{"pass":true}}]}"#;
 
 #[tokio::test]
-async fn patronus_contract_sends_input_output_and_optional_criteria() {
+async fn patronus_contract_disables_capture_for_input_output_and_optional_criteria() {
     let (base_url, received) = fixture_server(200, PATRONUS_ALLOW, Duration::ZERO).await;
     assert!(
         check_external_guardrail(
@@ -625,7 +625,7 @@ async fn patronus_contract_sends_input_output_and_optional_criteria() {
     assert!(wire_request.starts_with("POST /v1/evaluate HTTP/1.1\r\n"));
     assert!(wire_request.contains("x-api-key: fixture-key\r\n"));
     assert!(wire_request.ends_with(
-        r#"{"evaluators":[{"evaluator":"prompt-injection"}],"task_input":"fixture prompt"}"#
+        r#"{"capture":"none","evaluators":[{"evaluator":"prompt-injection"}],"task_input":"fixture prompt"}"#
     ));
 
     let (base_url, received) = fixture_server(200, PATRONUS_ALLOW, Duration::ZERO).await;
@@ -643,7 +643,7 @@ async fn patronus_contract_sends_input_output_and_optional_criteria() {
         .allowed
     );
     assert!(received.await.expect("fixture task").ends_with(
-        r#"{"evaluators":[{"criteria":"block adversarial prompts","evaluator":"prompt-injection"}],"task_output":"fixture prompt"}"#
+        r#"{"capture":"none","evaluators":[{"criteria":"block adversarial prompts","evaluator":"prompt-injection"}],"task_output":"fixture prompt"}"#
     ));
 }
 

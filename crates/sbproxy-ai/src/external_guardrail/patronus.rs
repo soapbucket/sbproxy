@@ -14,7 +14,10 @@ pub(super) fn patronus_request(
     if let Some(criteria) = &config.criteria {
         evaluator["criteria"] = Value::String(criteria.clone());
     }
-    let mut body = json!({"evaluators": [evaluator]});
+    let mut body = json!({
+        "capture": "none",
+        "evaluators": [evaluator],
+    });
     match request.phase {
         GuardrailPhase::Input => {
             body["task_input"] = Value::String(request.content.to_string());
