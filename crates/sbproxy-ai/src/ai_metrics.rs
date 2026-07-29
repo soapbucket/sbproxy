@@ -871,6 +871,17 @@ pub fn record_safety_guardrail_verdict(guardrail: &str, class: &str, backend: &s
 
 /// Record an external guardrail result with a bounded label vocabulary.
 pub fn record_external_guardrail_verdict(provider: &str, phase: &str, outcome: &str) {
+    let (provider, phase, outcome) = normalize_external_guardrail_labels(provider, phase, outcome);
+    AI_EXTERNAL_GUARDRAIL_VERDICTS
+        .with_label_values(&[provider, phase, outcome])
+        .inc();
+}
+
+fn normalize_external_guardrail_labels<'a>(
+    provider: &'a str,
+    phase: &'a str,
+    outcome: &'a str,
+) -> (&'a str, &'a str, &'a str) {
     let provider = match provider {
         "generic"
         | "presidio"
@@ -892,9 +903,19 @@ pub fn record_external_guardrail_verdict(provider: &str, phase: &str, outcome: &
         "allow" | "block" | "fail_open" | "fail_closed" => outcome,
         _ => "unknown",
     };
+    (provider, phase, outcome)
+}
+
+#[cfg(test)]
+pub(crate) fn external_guardrail_verdict_value(
+    provider: &str,
+    phase: &str,
+    outcome: &str,
+) -> f64 {
+    let (provider, phase, outcome) = normalize_external_guardrail_labels(provider, phase, outcome);
     AI_EXTERNAL_GUARDRAIL_VERDICTS
         .with_label_values(&[provider, phase, outcome])
-        .inc();
+        .get()
 }
 
 #[cfg(test)]

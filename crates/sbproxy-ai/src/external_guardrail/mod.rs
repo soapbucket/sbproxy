@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use reqwest::header::{HeaderName, HeaderValue};
 use sbproxy_httpkit::OutboundClientBuilder;
 use serde::Deserialize;
 use serde_json::Value;
@@ -56,7 +57,7 @@ pub struct ExternalGuardrailRequest<'a> {
 pub struct GuardrailVerdict {
     /// Whether content may continue through the pipeline.
     pub allowed: bool,
-    /// A safe provider-supplied reason, if one was available.
+    /// An operator-safe normalized reason. Raw provider text is never exposed.
     pub reason: Option<String>,
     /// Normalized provider categories.
     pub categories: Vec<String>,
@@ -86,7 +87,7 @@ pub enum GuardrailMode {
 
 impl GuardrailMode {
     pub fn is_input(self) -> bool {
-        matches!(self, Self::PreCall | Self::DuringCall)
+        matches!(self, Self::PreCall | Self::DuringCall | Self::LoggingOnly)
     }
 
     pub fn is_output(self) -> bool {
@@ -198,24 +199,95 @@ fn default_auth_prefix() -> Option<String> {
     Some("Bearer".to_string())
 }
 
-macro_rules! provider_config {
-    ($($name:ident),+ $(,)?) => { $(
-        #[derive(Debug, Clone)]
-        pub struct $name { pub url: String }
-    )+ };
+#[derive(Clone)]
+struct GuardrailAuth {
+    header: HeaderName,
+    value: HeaderValue,
 }
-provider_config!(
-    GenericConfig,
-    PresidioConfig,
-    LakeraConfig,
-    AporiaConfig,
-    AzureConfig,
-    BedrockConfig,
-    CrowdStrikeConfig,
-    MistralConfig,
-    PangeaConfig,
-    PatronusConfig
-);
+
+impl std::fmt::Debug for GuardrailAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardrailAuth")
+            .field("header", &self.header)
+            .field("value", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GenericConfig {
+    pub url: String,
+    auth: Option<GuardrailAuth>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PresidioConfig {
+    pub url: String,
+    pub language: String,
+    auth: Option<GuardrailAuth>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LakeraConfig {
+    pub url: String,
+    pub project_id: Option<String>,
+    auth: GuardrailAuth,
+}
+
+#[derive(Debug, Clone)]
+pub struct AporiaConfig {
+    pub url: String,
+    pub project_id: String,
+    auth: GuardrailAuth,
+}
+
+#[derive(Debug, Clone)]
+pub struct AzureConfig {
+    pub url: String,
+    pub severity_threshold: u8,
+    auth: GuardrailAuth,
+}
+
+#[derive(Debug, Clone)]
+pub struct BedrockConfig {
+    pub url: String,
+    pub region: Option<String>,
+    pub guardrail_id: String,
+    pub guardrail_version: String,
+    auth: GuardrailAuth,
+}
+
+#[derive(Debug, Clone)]
+pub struct CrowdStrikeConfig {
+    pub url: String,
+    pub application_id: Option<String>,
+    auth: GuardrailAuth,
+}
+
+#[derive(Debug, Clone)]
+pub struct MistralConfig {
+    pub url: String,
+    pub model: String,
+    pub score_threshold: Option<f64>,
+    auth: GuardrailAuth,
+}
+
+#[derive(Debug, Clone)]
+pub struct PangeaConfig {
+    pub url: String,
+    pub input_recipe: String,
+    pub output_recipe: String,
+    auth: GuardrailAuth,
+}
+
+#[derive(Debug, Clone)]
+pub struct PatronusConfig {
+    pub url: String,
+    pub evaluator: String,
+    pub criteria: Option<String>,
+    auth: GuardrailAuth,
+}
 
 /// A provider contract whose required fields were verified at load time.
 #[derive(Debug, Clone)]
@@ -230,6 +302,54 @@ pub enum CompiledGuardrailProvider {
     Mistral(MistralConfig),
     Pangea(PangeaConfig),
     Patronus(PatronusConfig),
+}
+
+impl CompiledGuardrailProvider {
+    /// Return the provider selected by this validated contract.
+    pub fn provider(&self) -> GuardrailProvider {
+        match self {
+            Self::Generic(_) => GuardrailProvider::Generic,
+            Self::Presidio(_) => GuardrailProvider::Presidio,
+            Self::Lakera(_) => GuardrailProvider::Lakera,
+            Self::Aporia(_) => GuardrailProvider::Aporia,
+            Self::AzureContentSafety(_) => GuardrailProvider::AzureContentSafety,
+            Self::Bedrock(_) => GuardrailProvider::Bedrock,
+            Self::CrowdStrike(_) => GuardrailProvider::CrowdStrike,
+            Self::Mistral(_) => GuardrailProvider::Mistral,
+            Self::Pangea(_) => GuardrailProvider::Pangea,
+            Self::Patronus(_) => GuardrailProvider::Patronus,
+        }
+    }
+
+    fn url(&self) -> &str {
+        match self {
+            Self::Generic(config) => &config.url,
+            Self::Presidio(config) => &config.url,
+            Self::Lakera(config) => &config.url,
+            Self::Aporia(config) => &config.url,
+            Self::AzureContentSafety(config) => &config.url,
+            Self::Bedrock(config) => &config.url,
+            Self::CrowdStrike(config) => &config.url,
+            Self::Mistral(config) => &config.url,
+            Self::Pangea(config) => &config.url,
+            Self::Patronus(config) => &config.url,
+        }
+    }
+
+    fn auth(&self) -> Option<&GuardrailAuth> {
+        match self {
+            Self::Generic(config) => config.auth.as_ref(),
+            Self::Presidio(config) => config.auth.as_ref(),
+            Self::Lakera(config) => Some(&config.auth),
+            Self::Aporia(config) => Some(&config.auth),
+            Self::AzureContentSafety(config) => Some(&config.auth),
+            Self::Bedrock(config) => Some(&config.auth),
+            Self::CrowdStrike(config) => Some(&config.auth),
+            Self::Mistral(config) => Some(&config.auth),
+            Self::Pangea(config) => Some(&config.auth),
+            Self::Patronus(config) => Some(&config.auth),
+        }
+    }
 }
 
 impl ExternalGuardrailConfig {
@@ -251,8 +371,12 @@ impl ExternalGuardrailConfig {
             bail!("score_threshold must be finite and between 0 and 1");
         }
         for value in [
+            Some(self.name.as_str()),
             self.url.as_deref(),
             self.api_key.as_deref(),
+            self.auth_header.as_deref(),
+            self.auth_prefix.as_deref(),
+            self.language.as_deref(),
             self.project_id.as_deref(),
             self.application_id.as_deref(),
             self.region.as_deref(),
@@ -268,74 +392,164 @@ impl ExternalGuardrailConfig {
                 bail!("contains unresolved variable reference");
             }
         }
-        let url = self.effective_url()?;
-        if self.allow_private_url {
-            validate_http_url(&url)?;
-        } else {
-            sbproxy_security::validate_url(&url).map_err(anyhow::Error::msg)?;
-        }
-        self.required_fields()?;
-        Ok(match self.provider {
-            GuardrailProvider::Generic => CompiledGuardrailProvider::Generic(GenericConfig { url }),
+        self.validate_configured_auth()?;
+
+        let compiled = match self.provider {
+            GuardrailProvider::Generic => CompiledGuardrailProvider::Generic(GenericConfig {
+                url: self.required_url()?,
+                auth: self.configured_auth()?,
+            }),
             GuardrailProvider::Presidio => {
-                CompiledGuardrailProvider::Presidio(PresidioConfig { url })
+                CompiledGuardrailProvider::Presidio(PresidioConfig {
+                    url: self.required_url()?,
+                    language: self.language.clone().unwrap_or_else(|| "en".to_string()),
+                    auth: self.configured_auth()?,
+                })
             }
-            GuardrailProvider::Lakera => CompiledGuardrailProvider::Lakera(LakeraConfig { url }),
-            GuardrailProvider::Aporia => CompiledGuardrailProvider::Aporia(AporiaConfig { url }),
-            GuardrailProvider::AzureContentSafety => {
-                CompiledGuardrailProvider::AzureContentSafety(AzureConfig { url })
-            }
-            GuardrailProvider::Bedrock => CompiledGuardrailProvider::Bedrock(BedrockConfig { url }),
-            GuardrailProvider::CrowdStrike => {
-                CompiledGuardrailProvider::CrowdStrike(CrowdStrikeConfig { url })
-            }
-            GuardrailProvider::Mistral => CompiledGuardrailProvider::Mistral(MistralConfig { url }),
-            GuardrailProvider::Pangea => CompiledGuardrailProvider::Pangea(PangeaConfig { url }),
-            GuardrailProvider::Patronus => {
-                CompiledGuardrailProvider::Patronus(PatronusConfig { url })
-            }
-        })
-    }
-
-    fn effective_url(&self) -> Result<String> {
-        if let Some(url) = &self.url {
-            return Ok(url.clone());
-        }
-        let default = match self.provider {
-            GuardrailProvider::Lakera => Some("https://api.lakera.ai/v2/guard"),
-            GuardrailProvider::Mistral => Some("https://api.mistral.ai/v1/moderations"),
-            GuardrailProvider::Pangea => Some("https://api.pangea.cloud/v1/text/guard"),
-            _ => None,
-        };
-        default
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("missing url"))
-    }
-
-    fn required_fields(&self) -> Result<()> {
-        let required = |field: &'static str, value: Option<&String>| -> Result<()> {
-            if value.is_none_or(|item| item.trim().is_empty()) {
-                bail!("missing {field}");
-            }
-            Ok(())
-        };
-        match self.provider {
-            GuardrailProvider::Generic | GuardrailProvider::Presidio => Ok(()),
-            GuardrailProvider::Lakera
-            | GuardrailProvider::AzureContentSafety
-            | GuardrailProvider::CrowdStrike
-            | GuardrailProvider::Mistral
-            | GuardrailProvider::Pangea
-            | GuardrailProvider::Patronus => required("api_key", self.api_key.as_ref()),
+            GuardrailProvider::Lakera => CompiledGuardrailProvider::Lakera(LakeraConfig {
+                url: self
+                    .url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.lakera.ai/v2/guard".to_string()),
+                project_id: self.project_id.clone(),
+                auth: self.required_provider_auth("Authorization", "Bearer")?,
+            }),
             GuardrailProvider::Aporia => {
-                required("api_key", self.api_key.as_ref())?;
-                required("project_id", self.project_id.as_ref())
+                let project_id = self.required_string("project_id", self.project_id.as_ref())?;
+                CompiledGuardrailProvider::Aporia(AporiaConfig {
+                    url: self.url.clone().unwrap_or_else(|| {
+                        format!("https://gr-prd.aporia.com/{project_id}/validate")
+                    }),
+                    project_id,
+                    auth: self.required_provider_auth("X-APORIA-API-KEY", "")?,
+                })
+            }
+            GuardrailProvider::AzureContentSafety => {
+                CompiledGuardrailProvider::AzureContentSafety(AzureConfig {
+                    url: self.required_url()?,
+                    severity_threshold: self.severity_threshold.unwrap_or(4),
+                    auth: self.required_provider_auth("Ocp-Apim-Subscription-Key", "")?,
+                })
             }
             GuardrailProvider::Bedrock => {
-                required("guardrail_id", self.guardrail_id.as_ref())?;
-                required("guardrail_version", self.guardrail_version.as_ref())
+                let region = self.region.clone();
+                let url = match (&self.url, &region) {
+                    (Some(url), _) => url.clone(),
+                    (None, Some(region)) if !region.trim().is_empty() => {
+                        format!("https://bedrock-runtime.{region}.amazonaws.com")
+                    }
+                    (None, _) => bail!("missing region"),
+                };
+                CompiledGuardrailProvider::Bedrock(BedrockConfig {
+                    url,
+                    region,
+                    guardrail_id: self
+                        .required_string("guardrail_id", self.guardrail_id.as_ref())?,
+                    guardrail_version: self
+                        .required_string("guardrail_version", self.guardrail_version.as_ref())?,
+                    auth: self.required_provider_auth("Authorization", "Bearer")?,
+                })
             }
+            GuardrailProvider::CrowdStrike => {
+                CompiledGuardrailProvider::CrowdStrike(CrowdStrikeConfig {
+                    url: self.required_url()?,
+                    application_id: self.application_id.clone(),
+                    auth: self.required_provider_auth("Authorization", "Bearer")?,
+                })
+            }
+            GuardrailProvider::Mistral => {
+                CompiledGuardrailProvider::Mistral(MistralConfig {
+                    url: self
+                        .url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.mistral.ai/v1/moderations".to_string()),
+                    model: self
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| "mistral-moderation-2603".to_string()),
+                    score_threshold: self.score_threshold,
+                    auth: self.required_provider_auth("Authorization", "Bearer")?,
+                })
+            }
+            GuardrailProvider::Pangea => CompiledGuardrailProvider::Pangea(PangeaConfig {
+                url: self
+                    .url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.pangea.cloud/v1/text/guard".to_string()),
+                input_recipe: self
+                    .input_recipe
+                    .clone()
+                    .unwrap_or_else(|| "pangea_prompt_guard".to_string()),
+                output_recipe: self
+                    .output_recipe
+                    .clone()
+                    .unwrap_or_else(|| "pangea_response_guard".to_string()),
+                auth: self.required_provider_auth("Authorization", "Bearer")?,
+            }),
+            GuardrailProvider::Patronus => {
+                CompiledGuardrailProvider::Patronus(PatronusConfig {
+                    url: self
+                        .url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.patronus.ai/v1/evaluate".to_string()),
+                    evaluator: self
+                        .evaluator
+                        .clone()
+                        .unwrap_or_else(|| "prompt-injection".to_string()),
+                    criteria: self.criteria.clone(),
+                    auth: self.required_provider_auth("X-API-KEY", "")?,
+                })
+            }
+        };
+        self.validate_endpoint(compiled.url())?;
+        Ok(compiled)
+    }
+
+    fn required_url(&self) -> Result<String> {
+        self.required_string("url", self.url.as_ref())
+    }
+
+    fn required_string(&self, field: &'static str, value: Option<&String>) -> Result<String> {
+        value
+            .filter(|item| !item.trim().is_empty())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing {field}"))
+    }
+
+    fn validate_endpoint(&self, url: &str) -> Result<()> {
+        if self.allow_private_url {
+            validate_http_url(url)
+        } else {
+            sbproxy_security::validate_url(url).map_err(anyhow::Error::msg)
         }
+    }
+
+    fn validate_configured_auth(&self) -> Result<()> {
+        let header = self.auth_header.as_deref().unwrap_or("Authorization");
+        HeaderName::from_bytes(header.as_bytes()).map_err(|_| anyhow::anyhow!("invalid auth_header"))?;
+        if let Some(key) = &self.api_key {
+            let prefix = self.auth_prefix.as_deref().unwrap_or("");
+            build_auth(header, prefix, key)?;
+        }
+        Ok(())
+    }
+
+    fn configured_auth(&self) -> Result<Option<GuardrailAuth>> {
+        self.api_key
+            .as_ref()
+            .map(|key| {
+                build_auth(
+                    self.auth_header.as_deref().unwrap_or("Authorization"),
+                    self.auth_prefix.as_deref().unwrap_or(""),
+                    key,
+                )
+            })
+            .transpose()
+    }
+
+    fn required_provider_auth(&self, header: &str, prefix: &str) -> Result<GuardrailAuth> {
+        let key = self.required_string("api_key", self.api_key.as_ref())?;
+        build_auth(header, prefix, &key)
     }
 
     /// Return the credential field so the AI configuration resolver can
@@ -347,17 +561,21 @@ impl ExternalGuardrailConfig {
     /// Build and cache the bounded client for this configuration. Public
     /// endpoints are resolved and pinned before the client is built.
     pub fn client(&self) -> Result<&reqwest::Client> {
+        let compiled = self.validate()?;
+        self.client_for(compiled.url())
+    }
+
+    fn client_for(&self, url: &str) -> Result<&reqwest::Client> {
         if let Some(client) = self.client.get() {
             return Ok(client);
         }
-        let url = self.effective_url()?;
         let builder = OutboundClientBuilder::new().no_redirects().into_inner();
         let builder = if self.allow_private_url {
-            validate_http_url(&url)?;
+            validate_http_url(url)?;
             builder
         } else {
             let resolved =
-                sbproxy_security::validate_url_resolved(&url, &[]).map_err(anyhow::Error::msg)?;
+                sbproxy_security::validate_url_resolved(url, &[]).map_err(anyhow::Error::msg)?;
             builder.resolve_to_addrs(&resolved.host, &resolved.addrs)
         };
         let client = builder
@@ -369,6 +587,20 @@ impl ExternalGuardrailConfig {
             .get()
             .expect("external guardrail client was inserted"))
     }
+}
+
+fn build_auth(header: &str, prefix: &str, key: &str) -> Result<GuardrailAuth> {
+    let header = HeaderName::from_bytes(header.as_bytes())
+        .map_err(|_| anyhow::anyhow!("invalid auth_header"))?;
+    let raw_value = if prefix.is_empty() {
+        key.to_string()
+    } else {
+        format!("{prefix} {key}")
+    };
+    let mut value = HeaderValue::from_str(&raw_value)
+        .map_err(|_| anyhow::anyhow!("invalid authentication value"))?;
+    value.set_sensitive(true);
+    Ok(GuardrailAuth { header, value })
 }
 
 fn validate_http_url(value: &str) -> Result<()> {
@@ -430,29 +662,24 @@ async fn dispatch(
     config: &ExternalGuardrailConfig,
     request: ExternalGuardrailRequest<'_>,
 ) -> std::result::Result<GuardrailVerdict, GuardrailCallError> {
-    config.validate().map_err(|_| GuardrailCallError::Request)?;
-    let url = config
-        .effective_url()
-        .map_err(|_| GuardrailCallError::Request)?;
-    let body = match config.provider {
-        GuardrailProvider::Generic | GuardrailProvider::Presidio => {
-            generic::request_body(config, request)
+    let compiled = config.validate().map_err(|_| GuardrailCallError::Request)?;
+    let body = match &compiled {
+        CompiledGuardrailProvider::Generic(provider) => {
+            generic::generic_request(provider, request)
+        }
+        CompiledGuardrailProvider::Presidio(provider) => {
+            generic::presidio_request(provider, request)
         }
         _ => return Err(GuardrailCallError::UnsupportedProvider),
     };
     let mut call = config
-        .client()
+        .client_for(compiled.url())
         .map_err(|_| GuardrailCallError::Request)?
-        .post(url)
+        .post(compiled.url())
         .timeout(Duration::from_millis(config.timeout_ms))
         .json(&body);
-    if let Some(key) = &config.api_key {
-        let header = config.auth_header.as_deref().unwrap_or("Authorization");
-        let value = match config.auth_prefix.as_deref() {
-            Some(prefix) if !prefix.is_empty() => format!("{prefix} {key}"),
-            _ => key.clone(),
-        };
-        call = call.header(header, value);
+    if let Some(auth) = compiled.auth() {
+        call = call.header(auth.header.clone(), auth.value.clone());
     }
     let mut response = call.send().await.map_err(|_| GuardrailCallError::Request)?;
     if !response.status().is_success() {
@@ -471,7 +698,11 @@ async fn dispatch(
     }
     let body =
         serde_json::from_slice::<Value>(&bytes).map_err(|_| GuardrailCallError::InvalidVerdict)?;
-    generic::parse(config.provider, &body)
+    match &compiled {
+        CompiledGuardrailProvider::Generic(_) => generic::parse_generic(&body),
+        CompiledGuardrailProvider::Presidio(_) => generic::parse_presidio(&body),
+        _ => Err(GuardrailCallError::UnsupportedProvider),
+    }
 }
 
 pub fn verdict_blocks(config: &ExternalGuardrailConfig, verdict: &GuardrailVerdict) -> bool {
@@ -558,23 +789,66 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
     #[test]
-    fn generic_response_without_verdict_is_an_error() {
-        assert!(generic::parse(
-            GuardrailProvider::Generic,
-            &serde_json::json!({"analysis":{"risk":"unknown"}})
-        )
-        .is_err());
+    fn compiled_provider_contract_retains_validated_fields() {
+        let aporia: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
+            "name":"aporia", "provider":"aporia", "url":"https://8.8.8.8/validate",
+            "mode":"pre_call", "api_key":"fixture-key", "project_id":"fixture-project"
+        })).unwrap();
+        let CompiledGuardrailProvider::Aporia(aporia) = aporia.validate().unwrap() else {
+            panic!("expected Aporia contract");
+        };
+        assert_eq!(aporia.project_id, "fixture-project");
+
+        let mistral: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
+            "name":"mistral", "provider":"mistral", "url":"https://8.8.8.8/moderations",
+            "mode":"pre_call", "api_key":"fixture-key", "model":"fixture-model",
+            "score_threshold":0.75
+        })).unwrap();
+        let CompiledGuardrailProvider::Mistral(mistral) = mistral.validate().unwrap() else {
+            panic!("expected Mistral contract");
+        };
+        assert_eq!(mistral.model, "fixture-model");
+        assert_eq!(mistral.score_threshold, Some(0.75));
+
+        let pangea: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
+            "name":"pangea", "provider":"pangea", "url":"https://8.8.8.8/guard",
+            "mode":"pre_call", "api_key":"fixture-key", "input_recipe":"input-recipe",
+            "output_recipe":"output-recipe"
+        })).unwrap();
+        let CompiledGuardrailProvider::Pangea(pangea) = pangea.validate().unwrap() else {
+            panic!("expected Pangea contract");
+        };
+        assert_eq!(pangea.input_recipe, "input-recipe");
+        assert_eq!(pangea.output_recipe, "output-recipe");
     }
     #[test]
-    fn logging_only_records_but_never_blocks() {
-        let cfg: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({"name":"custom","url":"https://8.8.8.8/check","mode":"logging_only"})).unwrap();
-        assert!(!verdict_blocks(
-            &cfg,
-            &GuardrailVerdict {
-                allowed: false,
-                ..GuardrailVerdict::default()
-            }
-        ));
+    fn unresolved_and_invalid_auth_fields_fail_during_load() {
+        let unresolved = |name: &str| format!("{}{{{name}}}", "$");
+        for extra in [
+            serde_json::json!({"language":unresolved("GUARD_LANGUAGE")}),
+            serde_json::json!({"auth_header":unresolved("GUARD_HEADER")}),
+            serde_json::json!({"auth_prefix":unresolved("GUARD_PREFIX")}),
+            serde_json::json!({"auth_header":"bad header"}),
+            serde_json::json!({"auth_prefix":"Bearer\nInjected:"}),
+        ] {
+            let mut document = serde_json::json!({
+                "name":"custom", "url":"https://8.8.8.8/check",
+                "mode":"pre_call", "api_key":"fixture-key"
+            });
+            document
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let cfg: ExternalGuardrailConfig = serde_json::from_value(document).unwrap();
+            let error = cfg.validate().expect_err("invalid auth/interpolation must fail");
+            assert!(!error.to_string().contains("fixture-key"));
+        }
+    }
+    #[test]
+    fn generic_response_without_verdict_is_an_error() {
+        assert!(
+            generic::parse_generic(&serde_json::json!({"analysis":{"risk":"unknown"}})).is_err()
+        );
     }
     async fn fixture_server(body: String) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -588,6 +862,89 @@ mod tests {
             stream.write_all(response.as_bytes()).await.unwrap();
         });
         format!("http://{address}/check")
+    }
+    #[tokio::test]
+    async fn logging_only_records_but_never_blocks() {
+        let before = crate::ai_metrics::external_guardrail_verdict_value(
+            "generic", "input", "block",
+        );
+        let url =
+            fixture_server(r#"{"allowed":false,"reason":"do not expose me"}"#.to_string()).await;
+        let cfg: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
+            "name":"audit", "url":url, "mode":"logging_only", "default_on":true,
+            "allow_private_url":true
+        }))
+        .unwrap();
+        assert!(run_input_external_guardrails(&[cfg], "prompt")
+            .await
+            .is_none());
+        let after = crate::ai_metrics::external_guardrail_verdict_value(
+            "generic", "input", "block",
+        );
+        assert!(after > before, "logging_only must record its verdict");
+    }
+    #[test]
+    fn external_guardrail_metric_labels_are_bounded() {
+        let before = crate::ai_metrics::external_guardrail_verdict_value(
+            "unknown", "unknown", "unknown",
+        );
+        crate::ai_metrics::record_external_guardrail_verdict(
+            "attacker-provider",
+            "attacker-phase",
+            "attacker-outcome",
+        );
+        let after = crate::ai_metrics::external_guardrail_verdict_value(
+            "unknown", "unknown", "unknown",
+        );
+        assert!(after > before);
+    }
+    #[test]
+    fn presidio_request_and_verdict_are_strict() {
+        let cfg: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
+            "name":"presidio", "provider":"presidio", "url":"https://8.8.8.8/analyze",
+            "mode":"pre_call", "language":"es"
+        }))
+        .unwrap();
+        let CompiledGuardrailProvider::Presidio(presidio) = cfg.validate().unwrap() else {
+            panic!("expected Presidio contract");
+        };
+        let request = generic::presidio_request(
+            &presidio,
+            ExternalGuardrailRequest {
+                content: "fixture prompt",
+                model: "fixture-model",
+                phase: GuardrailPhase::Input,
+            },
+        );
+        assert_eq!(
+            request,
+            serde_json::json!({"text":"fixture prompt","language":"es"})
+        );
+        assert!(generic::parse_presidio(&serde_json::json!([]))
+            .unwrap()
+            .allowed);
+        assert!(!generic::parse_presidio(
+            &serde_json::json!([{"entity_type":"PERSON"}])
+        )
+        .unwrap()
+        .allowed);
+        assert!(generic::parse_presidio(&serde_json::json!({"allowed":true})).is_err());
+    }
+    #[tokio::test]
+    async fn provider_reason_is_never_exposed() {
+        const SENTINEL: &str = "secret-prompt-SENTINEL-7359";
+        let url =
+            fixture_server(format!(r#"{{"allowed":false,"reason":"{SENTINEL}"}}"#)).await;
+        let cfg: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
+            "name":"custom", "url":url, "mode":"pre_call", "default_on":true,
+            "allow_private_url":true
+        }))
+        .unwrap();
+        let (_, reason) = run_input_external_guardrails(&[cfg], "prompt")
+            .await
+            .expect("guardrail must block");
+        assert!(!reason.contains(SENTINEL));
+        assert_eq!(reason, "external guardrail blocked content");
     }
     #[tokio::test]
     async fn oversized_response_obeys_fail_mode() {
@@ -607,6 +964,26 @@ mod tests {
         )
         .await;
         assert!(!verdict.allowed);
+        let url = fixture_server(format!(
+            r#"{{"allowed":true,"detail":"{}"}}"#,
+            "x".repeat(MAX_GUARDRAIL_RESPONSE_BYTES)
+        ))
+        .await;
+        let cfg: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
+            "name":"custom", "url":url, "mode":"pre_call", "allow_private_url":true,
+            "fail_open":true
+        }))
+        .unwrap();
+        let verdict = check_external_guardrail(
+            &cfg,
+            ExternalGuardrailRequest {
+                content: "prompt",
+                model: "test",
+                phase: GuardrailPhase::Input,
+            },
+        )
+        .await;
+        assert!(verdict.allowed);
     }
     #[tokio::test]
     async fn malformed_response_obeys_fail_mode() {
