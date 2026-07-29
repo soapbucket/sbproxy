@@ -2211,10 +2211,11 @@ pub(super) enum AiIdempotencyEngagement {
     /// origin index missing). The caller proceeds with the upstream
     /// call unchanged.
     NotApplicable,
-    /// Cache hit on a matching body hash. The cached response has
-    /// already been written to the session; the caller short-circuits
-    /// the AI gateway path without contacting the provider.
-    Replayed,
+    /// Cache hit on a matching body hash. The caller owns replay so it
+    /// can enforce the current response policy before writing any bytes.
+    Replayed {
+        response: sbproxy_middleware::idempotency::CachedResponse,
+    },
     /// Cache hit with a different body hash. The 409 conflict body
     /// has already been written to the session. Caller short-circuits.
     Conflict,
@@ -2335,13 +2336,8 @@ pub(super) async fn engage_ai_idempotency(
             // inside the middleware). Treat as a passthrough.
             Ok(AiIdempotencyEngagement::NotApplicable)
         }
-        sbproxy_middleware::idempotency::IdempotencyOutcome::CacheHit(resp) => {
-            // Replay the cached `(status, headers, body)` triple
-            // verbatim. Strip framing headers Pingora will re-derive
-            // for the new client connection so a stale
-            // `transfer-encoding: chunked` does not race the replay.
-            write_ai_cached_response(session, resp.status, &resp.headers, &resp.body).await?;
-            Ok(AiIdempotencyEngagement::Replayed)
+        sbproxy_middleware::idempotency::IdempotencyOutcome::CacheHit(response) => {
+            Ok(AiIdempotencyEngagement::Replayed { response })
         }
         sbproxy_middleware::idempotency::IdempotencyOutcome::Conflict => {
             let (status, content_type, body) = sbproxy_middleware::idempotency::conflict_response();

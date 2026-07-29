@@ -110,6 +110,53 @@ fn request_requires_graphql_replay(
     )
 }
 
+/// AI actions own idempotency and response replay because their current
+/// guardrail policy must run before cached bytes are served.
+fn request_uses_ai_owned_replay_paths(
+    session: &Session,
+    pipeline: &CompiledPipeline,
+    origin_idx: usize,
+) -> bool {
+    let request = session.req_header();
+    let forwarded_action = pipeline
+        .forward_rules
+        .get(origin_idx)
+        .and_then(|rules| {
+            rules.iter().find(|rule| {
+                rule.matchers.iter().any(|matcher| {
+                    matcher
+                        .match_request(request.uri.path(), request.uri.query(), &request.headers)
+                        .is_some()
+                })
+            })
+        })
+        .map(|rule| &rule.action);
+    action_uses_ai_owned_replay_paths(forwarded_action.or_else(|| pipeline.actions.get(origin_idx)))
+}
+
+fn action_uses_ai_owned_replay_paths(action: Option<&Action>) -> bool {
+    matches!(action, Some(Action::AiProxy(_)))
+}
+
+#[cfg(test)]
+mod ai_owned_replay_path_tests {
+    use super::*;
+
+    #[test]
+    fn external_guardrail_ai_action_defers_common_replay_paths() {
+        let ai = sbproxy_modules::action::AiProxyAction {
+            config: sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+                "providers": []
+            }))
+            .expect("AI config"),
+        };
+        let action = Action::AiProxy(Box::new(ai));
+
+        assert!(action_uses_ai_owned_replay_paths(Some(&action)));
+        assert!(!action_uses_ai_owned_replay_paths(Some(&Action::Noop)));
+    }
+}
+
 /// Outcome of the pre-auth inbound-key phase.
 #[derive(Debug)]
 pub(super) enum InboundKeyPhase {
@@ -2194,6 +2241,8 @@ pub(super) async fn request_filter(
 
     // --- Force SSL redirect ---
     let origin = &pipeline.config.origins[origin_idx];
+    let ai_proxy_owns_replay_paths =
+        request_uses_ai_owned_replay_paths(session, &pipeline, origin_idx);
     if origin.force_ssl {
         // Determine whether the inbound request is already on TLS.
         //
@@ -2708,7 +2757,7 @@ pub(super) async fn request_filter(
         .idempotencies
         .get(origin_idx)
         .and_then(|o| o.as_ref())
-        .filter(|_| !ctx.graphql_validation_pending)
+        .filter(|_| !ctx.graphql_validation_pending && !ai_proxy_owns_replay_paths)
     {
         let method_matches = idem.methods.contains(&session.req_header().method);
         let header_present = session
@@ -3230,7 +3279,7 @@ pub(super) async fn request_filter(
         // try to write the answer back. Mutation invalidation
         // also skips because the client is asking for a fresh
         // round-trip and any same-path GET will repopulate.
-        if cache_cfg.enabled && !ctx.flags.no_cache {
+        if cache_cfg.enabled && !ctx.flags.no_cache && !ai_proxy_owns_replay_paths {
             let req_method = session.req_header().method.as_str().to_string();
 
             // --- Mutation invalidation ---

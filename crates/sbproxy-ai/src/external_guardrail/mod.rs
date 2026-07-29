@@ -146,7 +146,7 @@ impl GuardrailProvider {
 /// Deserialized wire configuration. Provider-specific fields remain optional
 /// here so legacy generic configurations stay valid; `compile` makes their
 /// requirements explicit before a handler is published.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, JsonSchema)]
 pub struct ExternalGuardrailConfig {
     /// Stable name used in logs and metrics. It must not be empty.
     pub name: String,
@@ -222,10 +222,45 @@ pub struct ExternalGuardrailConfig {
     /// Optional Patronus evaluator criteria.
     #[serde(default)]
     pub criteria: Option<String>,
-    /// Cached outbound client. It is runtime state and not configuration.
+    /// Compiled provider contract and pinned outbound client. This is runtime
+    /// state, not configuration, and is populated only after credential
+    /// resolution (or lazily by resolver-free validation/test callers).
     #[serde(skip)]
     #[schemars(skip)]
-    client: OnceLock<reqwest::Client>,
+    prepared: OnceLock<std::result::Result<PreparedExternalGuardrail, String>>,
+}
+
+impl std::fmt::Debug for ExternalGuardrailConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalGuardrailConfig")
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("mode", &self.mode)
+            .field("default_on", &self.default_on)
+            .field("fail_open", &self.fail_open)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("provider", &self.provider)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("auth_header", &self.auth_header)
+            .field("auth_prefix", &self.auth_prefix)
+            .field("allow_private_url", &self.allow_private_url)
+            .field("language", &self.language)
+            .field("project_id", &self.project_id)
+            .field("application_id", &self.application_id)
+            .field("region", &self.region)
+            .field("guardrail_id", &self.guardrail_id)
+            .field("guardrail_version", &self.guardrail_version)
+            .field("severity_threshold", &self.severity_threshold)
+            .field("model", &self.model)
+            .field("score_threshold", &self.score_threshold)
+            .field("input_recipe", &self.input_recipe)
+            .field("output_recipe", &self.output_recipe)
+            .field("evaluator", &self.evaluator)
+            .field("criteria", &self.criteria)
+            .field("prepared", &self.prepared.get().is_some())
+            .finish()
+    }
 }
 
 fn default_timeout_ms() -> u64 {
@@ -341,6 +376,12 @@ pub enum CompiledGuardrailProvider {
     Mistral(MistralConfig),
     Pangea(PangeaConfig),
     Patronus(PatronusConfig),
+}
+
+#[derive(Clone)]
+struct PreparedExternalGuardrail {
+    provider: CompiledGuardrailProvider,
+    client: reqwest::Client,
 }
 
 impl CompiledGuardrailProvider {
@@ -593,34 +634,57 @@ impl ExternalGuardrailConfig {
         self.api_key.as_mut()
     }
 
-    /// Build and cache the bounded client for this configuration. Public
-    /// endpoints are resolved and pinned before the client is built.
-    pub fn client(&self) -> Result<&reqwest::Client> {
-        let compiled = self.validate()?;
-        self.client_for(compiled.url())
+    /// Compile the provider contract and build its bounded, DNS-pinned client.
+    ///
+    /// Production configuration calls this after resolving `api_key`, so the
+    /// prepared authorization header can never capture a secret reference.
+    pub fn prepare(&self) -> Result<()> {
+        self.prepared_runtime().map(|_| ())
     }
 
-    fn client_for(&self, url: &str) -> Result<&reqwest::Client> {
-        if let Some(client) = self.client.get() {
-            return Ok(client);
+    /// Whether this configuration already has prepared runtime state.
+    pub fn is_prepared(&self) -> bool {
+        self.prepared.get().is_some_and(|result| result.is_ok())
+    }
+
+    /// Return the prepared bounded client.
+    pub fn client(&self) -> Result<&reqwest::Client> {
+        Ok(&self.prepared_runtime()?.client)
+    }
+
+    fn prepared_runtime(&self) -> Result<&PreparedExternalGuardrail> {
+        match self
+            .prepared
+            .get_or_init(|| self.build_prepared().map_err(|error| error.to_string()))
+        {
+            Ok(prepared) => Ok(prepared),
+            Err(error) => Err(anyhow::anyhow!("{error}")),
         }
+    }
+
+    fn build_prepared(&self) -> Result<PreparedExternalGuardrail> {
+        let provider = self.validate()?;
+        let url = provider.url();
         let builder = OutboundClientBuilder::new().no_redirects().into_inner();
-        let builder = if self.allow_private_url {
+        let resolved = if self.allow_private_url {
             validate_http_url(url)?;
-            builder
+            let parsed = url::Url::parse(url).context("invalid URL")?;
+            let host = parsed
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("URL has no host"))?
+                .to_string();
+            sbproxy_security::validate_url_resolved(url, &[host]).map_err(anyhow::Error::msg)?
         } else {
-            let resolved =
-                sbproxy_security::validate_url_resolved(url, &[]).map_err(anyhow::Error::msg)?;
-            builder.resolve_to_addrs(&resolved.host, &resolved.addrs)
+            sbproxy_security::validate_url_resolved(url, &[]).map_err(anyhow::Error::msg)?
         };
+        if resolved.addrs.is_empty() {
+            bail!("external guardrail endpoint resolved to no addresses");
+        }
+        let builder = builder.resolve_to_addrs(&resolved.host, &resolved.addrs);
         let client = builder
             .build()
             .context("could not build external guardrail client")?;
-        let _ = self.client.set(client);
-        Ok(self
-            .client
-            .get()
-            .expect("external guardrail client was inserted"))
+        Ok(PreparedExternalGuardrail { provider, client })
     }
 }
 
@@ -724,8 +788,11 @@ async fn dispatch(
     config: &ExternalGuardrailConfig,
     request: ExternalGuardrailRequest<'_>,
 ) -> std::result::Result<GuardrailVerdict, GuardrailCallError> {
-    let compiled = config.validate().map_err(|_| GuardrailCallError::Request)?;
-    let body = match &compiled {
+    let prepared = config
+        .prepared_runtime()
+        .map_err(|_| GuardrailCallError::Request)?;
+    let compiled = &prepared.provider;
+    let body = match compiled {
         CompiledGuardrailProvider::Generic(provider) => generic::generic_request(provider, request),
         CompiledGuardrailProvider::Presidio(provider) => {
             generic::presidio_request(provider, request)
@@ -745,9 +812,8 @@ async fn dispatch(
             patronus::patronus_request(provider, request)
         }
     };
-    let mut call = config
-        .client_for(compiled.url())
-        .map_err(|_| GuardrailCallError::Request)?
+    let mut call = prepared
+        .client
         .post(compiled.url())
         .timeout(Duration::from_millis(config.timeout_ms))
         .json(&body);
@@ -771,7 +837,7 @@ async fn dispatch(
     }
     let body =
         serde_json::from_slice::<Value>(&bytes).map_err(|_| GuardrailCallError::InvalidVerdict)?;
-    match &compiled {
+    match compiled {
         CompiledGuardrailProvider::Generic(_) => generic::parse_generic(&body),
         CompiledGuardrailProvider::Presidio(_) => generic::parse_presidio(&body),
         CompiledGuardrailProvider::Lakera(_) => lakera::parse_lakera(&body),
@@ -935,6 +1001,13 @@ pub async fn run_output_external_guardrails(
     run_external_guardrails(configs, content, model, GuardrailPhase::Output).await
 }
 
+/// Apply input guardrail fail modes when request content is unavailable.
+pub fn run_input_external_guardrails_without_content(
+    configs: &[ExternalGuardrailConfig],
+) -> Option<(String, String)> {
+    run_external_guardrails_without_content(configs, GuardrailPhase::Input)
+}
+
 /// Apply output guardrail fail modes when the upstream response cannot be
 /// represented as text. The raw bytes are deliberately not converted or sent
 /// to an external service: logging-only and fail-open entries record a
@@ -943,31 +1016,40 @@ pub async fn run_output_external_guardrails(
 pub fn run_output_external_guardrails_without_content(
     configs: &[ExternalGuardrailConfig],
 ) -> Option<(String, String)> {
-    const CONTENT_UNAVAILABLE_REASON: &str =
-        "external output guardrail could not inspect response content";
+    run_external_guardrails_without_content(configs, GuardrailPhase::Output)
+}
+
+fn run_external_guardrails_without_content(
+    configs: &[ExternalGuardrailConfig],
+    phase: GuardrailPhase,
+) -> Option<(String, String)> {
+    let reason = match phase {
+        GuardrailPhase::Input => "external input guardrail could not inspect request content",
+        GuardrailPhase::Output => "external output guardrail could not inspect response content",
+    };
 
     for config in configs {
-        if !config.default_on || !config.mode.is_output() {
+        let applies = match phase {
+            GuardrailPhase::Input => config.mode.is_input(),
+            GuardrailPhase::Output => config.mode.is_output(),
+        };
+        if !config.default_on || !applies {
             continue;
         }
 
         let blocks = config.mode.blocks() && !config.fail_open;
         let outcome = if blocks { "fail_closed" } else { "fail_open" };
-        record_external_guardrail_verdict(
-            config.provider.as_str(),
-            GuardrailPhase::Output.as_str(),
-            outcome,
-        );
+        record_external_guardrail_verdict(config.provider.as_str(), phase.as_str(), outcome);
         tracing::debug!(
             guardrail = %config.name,
             provider = config.provider.as_str(),
-            phase = GuardrailPhase::Output.as_str(),
+            phase = phase.as_str(),
             outcome,
-            "external guardrail skipped because response content is unavailable"
+            "external guardrail skipped because content is unavailable"
         );
 
         if blocks {
-            return Some((config.name.clone(), CONTENT_UNAVAILABLE_REASON.to_string()));
+            return Some((config.name.clone(), reason.to_string()));
         }
     }
     None
@@ -987,6 +1069,41 @@ mod tests {
             let cfg: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({"name":"custom","url":"https://8.8.8.8/check","mode":"pre_call","timeout_ms":timeout_ms})).unwrap();
             assert!(cfg.validate().is_err());
         }
+    }
+
+    #[test]
+    fn validation_does_not_freeze_credentials_and_prepared_runtime_is_reused() {
+        let mut cfg: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
+            "name": "custom",
+            "url": "https://8.8.8.8/check",
+            "mode": "pre_call",
+            "api_key": "secret://guardrails/customer-policy"
+        }))
+        .unwrap();
+
+        cfg.validate().expect("structural validation");
+        assert!(
+            !cfg.is_prepared(),
+            "validation must not compile an unresolved credential into runtime state"
+        );
+        assert!(
+            !format!("{cfg:?}").contains("secret://guardrails/customer-policy"),
+            "Debug must redact unresolved credential references"
+        );
+        *cfg.credential_reference_mut().unwrap() = "resolved-fixture-key".to_string();
+        cfg.prepare().expect("prepare resolved configuration");
+
+        let first = cfg.prepared_runtime().unwrap();
+        let second = cfg.prepared_runtime().unwrap();
+        assert!(
+            std::ptr::eq(first, second),
+            "request dispatch must reuse one prepared provider/client"
+        );
+        let auth = first.provider.auth().expect("compiled authorization");
+        assert_eq!(auth.value.to_str().unwrap(), "Bearer resolved-fixture-key");
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("resolved-fixture-key"));
+        assert!(!debug.contains("secret://guardrails/customer-policy"));
     }
     #[test]
     fn private_url_requires_explicit_opt_in() {
@@ -1086,6 +1203,34 @@ mod tests {
         });
         format!("http://{address}/check")
     }
+
+    #[tokio::test]
+    async fn dispatch_uses_prepared_runtime_without_request_path_revalidation() {
+        let url = fixture_server(r#"{"allowed":true}"#.to_string()).await;
+        let mut cfg: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
+            "name": "prepared-policy",
+            "url": url,
+            "mode": "pre_call",
+            "allow_private_url": true
+        }))
+        .unwrap();
+        cfg.prepare().expect("prepare runtime before publication");
+
+        // This would make structural validation fail. Dispatch still succeeds
+        // because the published request path only reads prepared state.
+        cfg.name.clear();
+        let verdict = check_external_guardrail(
+            &cfg,
+            ExternalGuardrailRequest {
+                content: "fixture prompt",
+                model: "fixture-model",
+                phase: GuardrailPhase::Input,
+            },
+        )
+        .await;
+        assert!(verdict.allowed);
+    }
+
     #[tokio::test]
     async fn logging_only_records_but_never_blocks() {
         let before =
@@ -1295,5 +1440,24 @@ mod tests {
             crate::ai_metrics::external_guardrail_verdict_value("generic", "output", "fail_closed");
 
         assert_eq!(fail_closed_after, fail_closed_before);
+    }
+
+    #[test]
+    fn unavailable_input_content_honors_fail_modes() {
+        let blocked = run_input_external_guardrails_without_content(&[unavailable_output_config(
+            "pre_call", false,
+        )])
+        .expect("fail-closed input guardrail must block");
+        assert_eq!(blocked.0, "binary-policy");
+        assert_eq!(
+            blocked.1,
+            "external input guardrail could not inspect request content"
+        );
+
+        assert!(run_input_external_guardrails_without_content(&[
+            unavailable_output_config("pre_call", true),
+            unavailable_output_config("logging_only", false),
+        ])
+        .is_none());
     }
 }

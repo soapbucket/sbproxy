@@ -2338,7 +2338,17 @@ pub(super) async fn handle_ai_proxy(
         // fall through unchanged.
         let (idem_skip_reason, idem_capture) =
             match engage_ai_idempotency(session, pipeline, origin_idx, &body_raw, false).await? {
-                AiIdempotencyEngagement::Replayed | AiIdempotencyEngagement::Conflict => {
+                AiIdempotencyEngagement::Replayed { response } => {
+                    write_ai_cached_response(
+                        session,
+                        response.status,
+                        &response.headers,
+                        &response.body,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                AiIdempotencyEngagement::Conflict => {
                     return Ok(());
                 }
                 AiIdempotencyEngagement::NotApplicable => (None, None),
@@ -2549,46 +2559,6 @@ pub(super) async fn handle_ai_proxy(
         .to_ascii_lowercase()
         .starts_with("multipart/");
 
-    // --- Idempotency middleware engagement (POST) ---
-    //
-    // Engage before the upstream call (and before the multipart and
-    // semantic-cache hooks) so a cache hit can serve byte-identical
-    // to the original response without invoking any downstream
-    // logic. Multipart bodies are explicitly skipped for v1
-    // (see `engage_ai_idempotency`); the marker stamps the response
-    // so operators can spot the case in dashboards.
-    let (idem_skip_reason, mut idem_capture) = match engage_ai_idempotency(
-        session,
-        pipeline,
-        origin_idx,
-        body_bytes.as_ref(),
-        is_multipart_request,
-    )
-    .await?
-    {
-        AiIdempotencyEngagement::Replayed | AiIdempotencyEngagement::Conflict => {
-            return Ok(());
-        }
-        AiIdempotencyEngagement::NotApplicable => (None, None),
-        AiIdempotencyEngagement::Skipped { reason } => (Some(reason), None),
-        AiIdempotencyEngagement::Miss {
-            idem,
-            workspace_id,
-            key,
-            body_hash,
-            permit,
-        } => (
-            None,
-            Some(AiIdempotencyCapture {
-                idem,
-                workspace_id,
-                key,
-                body_hash,
-                _permit: permit,
-            }),
-        ),
-    };
-
     if is_multipart_request {
         let maximum = config
             .max_body_size
@@ -2638,6 +2608,62 @@ pub(super) async fn handle_ai_proxy(
                 return Ok(());
             }
         }
+        let multipart_external = config
+            .guardrails
+            .as_ref()
+            .map(|guardrails| guardrails.external.as_slice())
+            .unwrap_or_default();
+        if let Some((name, reason)) =
+            sbproxy_ai::external_guardrail::run_input_external_guardrails_without_content(
+                multipart_external,
+            )
+        {
+            send_guardrail_block_response(
+                session,
+                ctx,
+                &ai_span,
+                400,
+                sbproxy_ai::guardrails::GuardrailBlock { name, reason },
+            )
+            .await?;
+            return Ok(());
+        }
+
+        // Multipart input cannot be represented by the v1 idempotency cache.
+        // Engage only after the current input policy has run so the skip
+        // marker cannot become a policy bypass.
+        let idem_skip_reason =
+            match engage_ai_idempotency(session, pipeline, origin_idx, body_bytes.as_ref(), true)
+                .await?
+            {
+                AiIdempotencyEngagement::Replayed { response } => {
+                    if let Some(block) = ai_output_guardrail_block(
+                        response.status,
+                        None,
+                        multipart_external,
+                        &response.body,
+                        requested_model.as_deref().unwrap_or_default(),
+                    )
+                    .await
+                    {
+                        send_guardrail_block_response(session, ctx, &ai_span, 403, block).await?;
+                    } else {
+                        write_ai_cached_response(
+                            session,
+                            response.status,
+                            &response.headers,
+                            &response.body,
+                        )
+                        .await?;
+                    }
+                    return Ok(());
+                }
+                AiIdempotencyEngagement::Conflict => return Ok(()),
+                AiIdempotencyEngagement::NotApplicable => None,
+                AiIdempotencyEngagement::Skipped { reason } => Some(reason),
+                AiIdempotencyEngagement::Miss { .. } => None,
+            };
+
         let mut provider_order = config
             .providers
             .iter()
@@ -2839,8 +2865,41 @@ pub(super) async fn handle_ai_proxy(
             Error::because(ErrorType::ConnectError, "AI upstream request failed", error)
         })?;
         let provider = &config.providers[provider_idx];
-
         let format = sbproxy_ai::client::provider_format(provider);
+        let selected_model = requested_model
+            .as_deref()
+            .map(|requested| provider.map_model(requested))
+            .unwrap_or_default();
+        ctx.ai_provider = Some(provider.name.to_string());
+        if !selected_model.is_empty() {
+            ctx.ai_model = Some(selected_model.clone());
+        }
+
+        let status = resp.status().as_u16();
+        let resp_ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/json")
+            .to_string();
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let raw_response = read_capped_response_body(resp, config.max_body_size).await?;
+        let response_body =
+            sbproxy_ai::translators::translate_response_bytes(format, raw_response.as_ref());
+        let response_body = bytes::Bytes::from(sbproxy_ai::format::rewrap_response_for_inbound(
+            ctx.ai_inbound_format.as_deref(),
+            &response_body,
+        ));
+        record_ai_provider_response_failure(
+            &ai_span,
+            provider.name.as_str(),
+            status,
+            Some(response_body.as_ref()),
+        );
 
         // For audio_transcription requests, peek at the response body
         // to extract `duration` (present when the operator requests
@@ -2850,31 +2909,12 @@ pub(super) async fn handle_ai_proxy(
         // continue to emit PerCall here; their per-unit usage is
         // captured on the request side and emitted in the chat path.
         if surface_label == "audio_transcription" {
-            let status = resp.status().as_u16();
-            let resp_ct = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/json")
-                .to_string();
-            let retry_after = resp
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            let resp_bytes = read_capped_response_body(resp, config.max_body_size).await?;
-            record_ai_provider_response_failure(
-                &ai_span,
-                provider.name.as_str(),
-                status,
-                Some(resp_bytes.as_ref()),
-            );
             // Whisper is the only OpenAI transcription model today;
             // the inbound body is multipart so the model is not in a
             // JSON field. Default to `whisper-1` for cost lookup; a
             // future commit that parses multipart fields can refine.
             let model = Some("whisper-1".to_string());
-            let duration = serde_json::from_slice::<serde_json::Value>(&resp_bytes)
+            let duration = serde_json::from_slice::<serde_json::Value>(&raw_response)
                 .ok()
                 .and_then(|v| v.get("duration").and_then(|d| d.as_f64()));
             let usage = match duration {
@@ -2899,6 +2939,18 @@ pub(super) async fn handle_ai_proxy(
             if cost_micros > 0 {
                 ctx.ai_cost_usd_micros = Some(cost_micros);
             }
+            if let Some(block) = ai_output_guardrail_block(
+                status,
+                None,
+                multipart_external,
+                response_body.as_ref(),
+                &selected_model,
+            )
+            .await
+            {
+                send_guardrail_block_response(session, ctx, &ai_span, 403, block).await?;
+                return Ok(());
+            }
             let mut extras = public_route_headers(ctx);
             if let Some(reason) = idem_skip_reason {
                 extras.push(("x-sbproxy-idempotency".to_string(), reason.to_string()));
@@ -2906,7 +2958,7 @@ pub(super) async fn handle_ai_proxy(
             if let Some(retry_after) = retry_after {
                 extras.push(("retry-after".to_string(), retry_after));
             }
-            return send_response_with_extras(session, status, &resp_ct, &resp_bytes, &extras)
+            return send_response_with_extras(session, status, &resp_ct, &response_body, &extras)
                 .await;
         }
 
@@ -2924,31 +2976,26 @@ pub(super) async fn handle_ai_proxy(
             &ctx.rollup_properties,
             &ai_span,
         );
-        record_ai_provider_response_failure(
-            &ai_span,
-            provider.name.as_str(),
-            resp.status().as_u16(),
+        if let Some(block) = ai_output_guardrail_block(
+            status,
             None,
-        );
-        // Multipart never captures for idempotency (engagement
-        // skipped with SKIPPED-MULTIPART). Pass the skip reason
-        // through so the marker still lands on the response.
-        //
-        // WOR-1044 PR3: multipart bodies are not JSON-parsed for
-        // reversible PII capture (the redactor walks JSON), so the
-        // capture is empty and the restore call short-circuits.
-        return relay_ai_response_with_idempotency(
-            session,
-            resp,
-            format,
-            config.max_body_size,
-            idem_skip_reason,
-            None,
-            ctx.ai_inbound_format.as_deref(),
-            public_route_headers(ctx),
-            ctx.ai_reversible_redactions.clone(),
+            multipart_external,
+            response_body.as_ref(),
+            &selected_model,
         )
-        .await;
+        .await
+        {
+            send_guardrail_block_response(session, ctx, &ai_span, 403, block).await?;
+            return Ok(());
+        }
+        let mut extras = public_route_headers(ctx);
+        if let Some(reason) = idem_skip_reason {
+            extras.push(("x-sbproxy-idempotency".to_string(), reason.to_string()));
+        }
+        if let Some(retry_after) = retry_after {
+            extras.push(("retry-after".to_string(), retry_after));
+        }
+        return send_response_with_extras(session, status, &resp_ct, &response_body, &extras).await;
     }
 
     let mut body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
@@ -3715,51 +3762,28 @@ pub(super) async fn handle_ai_proxy(
         // verdict; `logging_only` records only, and errors honor each
         // guardrail's `fail_open` flag.
         if !guardrails_config.external.is_empty() {
-            let input_text = {
-                let messages: Vec<sbproxy_ai::Message> = body
-                    .get("messages")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|m| {
-                                serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok()
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if messages.is_empty() {
-                    sbproxy_ai::handler::extract_input_text(&surface, &body).unwrap_or_default()
-                } else {
-                    sbproxy_ai::guardrails::message_text(&messages)
-                }
+            let blocked = if extracted_prompt.is_empty() {
+                sbproxy_ai::external_guardrail::run_input_external_guardrails_without_content(
+                    &guardrails_config.external,
+                )
+            } else {
+                sbproxy_ai::external_guardrail::run_input_external_guardrails(
+                    &guardrails_config.external,
+                    &extracted_prompt,
+                    &model,
+                )
+                .await
             };
-            if !input_text.is_empty() {
-                if let Some((name, reason)) =
-                    sbproxy_ai::external_guardrail::run_input_external_guardrails(
-                        &guardrails_config.external,
-                        &input_text,
-                        &model,
-                    )
-                    .await
-                {
-                    warn!(
-                        guardrail = %name,
-                        reason = %reason,
-                        "AI proxy: external input guardrail blocked request"
-                    );
-                    sbproxy_ai::tracing_spans::record_error(
-                        &ai_span,
-                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                        &reason,
-                    );
-                    mark_guardrail_block(ctx, name.to_string());
-                    let body_bytes = ErrorEnvelope::new("guardrail_violation", &reason)
-                        .code(&name)
-                        .request_id(ctx.request_id.as_str())
-                        .to_bytes();
-                    send_response(session, 400, "application/json", &body_bytes).await?;
-                    return Ok(());
-                }
+            if let Some((name, reason)) = blocked {
+                send_guardrail_block_response(
+                    session,
+                    ctx,
+                    &ai_span,
+                    400,
+                    sbproxy_ai::guardrails::GuardrailBlock { name, reason },
+                )
+                .await?;
+                return Ok(());
             }
         }
         if let Some(pipeline) = guardrail_pipeline.as_ref() {
@@ -4105,6 +4129,86 @@ pub(super) async fn handle_ai_proxy(
         .as_ref()
         .is_some_and(|runtime| runtime.bypasses_semantic_cache(ctx.session_id.is_some()));
 
+    // Streaming responses cannot be buffered for external post-call
+    // inspection. Apply each configured no-content fail mode before any
+    // replay, cache lookup, embedding call, or provider attempt.
+    let is_stream = body
+        .get("stream")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let output_external = config
+        .guardrails
+        .as_ref()
+        .map(|guardrails| guardrails.external.as_slice())
+        .unwrap_or_default();
+    if is_stream {
+        if let Some((name, reason)) =
+            sbproxy_ai::external_guardrail::run_output_external_guardrails_without_content(
+                output_external,
+            )
+        {
+            send_guardrail_block_response(
+                session,
+                ctx,
+                &ai_span,
+                403,
+                sbproxy_ai::guardrails::GuardrailBlock { name, reason },
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    // POST idempotency is owned by the AI path and runs only after canonical
+    // input guardrails and the current request policy. Replayed output is
+    // evaluated against today's output policy before any cached bytes leave.
+    let (idem_skip_reason, mut idem_capture) =
+        match engage_ai_idempotency(session, pipeline, origin_idx, body_bytes.as_ref(), false)
+            .await?
+        {
+            AiIdempotencyEngagement::Replayed { response } => {
+                if let Some(block) = ai_output_guardrail_block(
+                    response.status,
+                    guardrail_pipeline.as_deref(),
+                    output_external,
+                    &response.body,
+                    &model,
+                )
+                .await
+                {
+                    send_guardrail_block_response(session, ctx, &ai_span, 403, block).await?;
+                } else {
+                    write_ai_cached_response(
+                        session,
+                        response.status,
+                        &response.headers,
+                        &response.body,
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
+            AiIdempotencyEngagement::Conflict => return Ok(()),
+            AiIdempotencyEngagement::NotApplicable => (None, None),
+            AiIdempotencyEngagement::Skipped { reason } => (Some(reason), None),
+            AiIdempotencyEngagement::Miss {
+                idem,
+                workspace_id,
+                key,
+                body_hash,
+                permit,
+            } => (
+                None,
+                Some(AiIdempotencyCapture {
+                    idem,
+                    workspace_id,
+                    key,
+                    body_hash,
+                    _permit: permit,
+                }),
+            ),
+        };
+
     // --- Semantic lookup hook (A21/F3+F4, fail-open) ---
     //
     // When the enterprise semantic cache is wired, ask the hook whether
@@ -4155,6 +4259,18 @@ pub(super) async fn handle_ai_proxy(
                         body_len = cached.body.len(),
                         "AI proxy: semantic cache HIT; replaying cached response"
                     );
+                    if let Some(block) = ai_output_guardrail_block(
+                        cached.status,
+                        guardrail_pipeline.as_deref(),
+                        output_external,
+                        cached.body.as_ref(),
+                        &model,
+                    )
+                    .await
+                    {
+                        send_guardrail_block_response(session, ctx, &ai_span, 403, block).await?;
+                        return Ok(());
+                    }
 
                     // Build a Pingora ResponseHeader from the cached entry.
                     // Size hint: cached headers + x-semcache marker.
@@ -4380,6 +4496,22 @@ pub(super) async fn handle_ai_proxy(
                                 status = hit.response.status,
                                 "AI proxy: embedding semantic cache HIT; replaying"
                             );
+                            // Materialize and evaluate the shared response before
+                            // constructing or flushing replay headers.
+                            let body = bytes::Bytes::from(hit.response.body.clone());
+                            if let Some(block) = ai_output_guardrail_block(
+                                hit.response.status,
+                                guardrail_pipeline.as_deref(),
+                                output_external,
+                                body.as_ref(),
+                                &model,
+                            )
+                            .await
+                            {
+                                send_guardrail_block_response(session, ctx, &ai_span, 403, block)
+                                    .await?;
+                                return Ok(());
+                            }
                             let mut header = pingora_http::ResponseHeader::build(
                                 hit.response.status,
                                 Some(hit.response.headers.len() + 1),
@@ -4398,11 +4530,6 @@ pub(super) async fn handle_ai_proxy(
                                 let _ = header.insert_header(name.clone(), value.clone());
                             }
                             let _ = header.insert_header("x-semcache", "HIT");
-                            // `hit.response` is a shared `Arc` (WOR-1703);
-                            // materialize the body for replay off the
-                            // cache lock rather than deep-cloning the
-                            // response inside the critical section.
-                            let body = bytes::Bytes::from(hit.response.body.clone());
                             // WOR-1094: a cache hit is a zero-cost
                             // ledger transaction, not an absent one.
                             // Record the served tokens under the
@@ -4460,12 +4587,6 @@ pub(super) async fn handle_ai_proxy(
             }
         }
     }
-
-    // Check if streaming is requested.
-    let is_stream = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
 
     // Apply the request-pinned ordered pipeline at the legacy mutable-body
     // seam. The runner owns a local working list and this assignment is the
@@ -5964,11 +6085,7 @@ pub(super) async fn handle_ai_proxy(
                 // are configured. They are intentionally not given to the
                 // streaming relay because it can send bytes before a post-call
                 // guardrail has a complete response to inspect.
-                config
-                    .guardrails
-                    .as_ref()
-                    .map(|g| g.external.clone())
-                    .unwrap_or_default(),
+                output_external,
             )
             .await
         }
@@ -6276,6 +6393,47 @@ async fn external_output_guardrail_block(
     blocked.map(|(name, reason)| sbproxy_ai::guardrails::GuardrailBlock { name, reason })
 }
 
+async fn ai_output_guardrail_block(
+    status: u16,
+    builtin: Option<&sbproxy_ai::guardrails::GuardrailPipeline>,
+    external: &[sbproxy_ai::external_guardrail::ExternalGuardrailConfig],
+    body: &[u8],
+    model: &str,
+) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    if let Some(block) = builtin.and_then(|pipeline| pipeline.check_output_bytes(body)) {
+        return Some(block);
+    }
+    external_output_guardrail_block(external, body, model).await
+}
+
+async fn send_guardrail_block_response(
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    ai_span: &tracing::Span,
+    status: u16,
+    block: sbproxy_ai::guardrails::GuardrailBlock,
+) -> Result<()> {
+    warn!(
+        guardrail = %block.name,
+        reason = %block.reason,
+        "AI proxy: guardrail blocked content"
+    );
+    sbproxy_ai::tracing_spans::record_error(
+        ai_span,
+        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+        &block.reason,
+    );
+    mark_guardrail_block(ctx, block.name.clone());
+    let body = ErrorEnvelope::new("guardrail_violation", &block.reason)
+        .code(&block.name)
+        .request_id(ctx.request_id.as_str())
+        .to_bytes();
+    send_response(session, status, "application/json", &body).await
+}
+
 /// Relay a non-streaming AI response and, when `miss_info` is present,
 /// write the response back into the semantic cache on behalf of the hook.
 ///
@@ -6307,7 +6465,7 @@ pub(super) async fn relay_ai_response_with_cache(
     idem_skip_reason: Option<&'static str>,
     idem_capture: Option<AiIdempotencyCapture>,
     output_guardrails: Option<std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
-    output_external: Vec<sbproxy_ai::external_guardrail::ExternalGuardrailConfig>,
+    output_external: &[sbproxy_ai::external_guardrail::ExternalGuardrailConfig],
 ) -> Result<()> {
     let status = resp.status().as_u16();
 
@@ -6460,7 +6618,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 sync_block
             } else {
                 external_output_guardrail_block(
-                    &output_external,
+                    output_external,
                     &resp_body,
                     ctx.as_ref()
                         .and_then(|context| context.ai_model.as_deref())
@@ -9203,12 +9361,14 @@ mod external_guardrail_context_tests {
     struct RecordingSemanticCache {
         lookups: AtomicUsize,
         stores: AtomicUsize,
+        hit: std::sync::Mutex<Option<crate::hooks::CachedResponse>>,
     }
 
     #[derive(Default)]
     struct RecordingIdempotencyCache {
         gets: AtomicUsize,
         puts: AtomicUsize,
+        hit: std::sync::Mutex<Option<sbproxy_middleware::idempotency::CachedResponse>>,
     }
 
     impl sbproxy_middleware::idempotency::IdempotencyCache for RecordingIdempotencyCache {
@@ -9218,7 +9378,7 @@ mod external_guardrail_context_tests {
             _key: &str,
         ) -> Option<sbproxy_middleware::idempotency::CachedResponse> {
             self.gets.fetch_add(1, Ordering::SeqCst);
-            None
+            self.hit.lock().expect("idempotency hit lock").clone()
         }
 
         fn put(
@@ -9235,9 +9395,17 @@ mod external_guardrail_context_tests {
     impl crate::hooks::SemanticLookupHook for RecordingSemanticCache {
         async fn lookup(&self, _req: &crate::hooks::LookupRequest) -> crate::hooks::LookupOutcome {
             self.lookups.fetch_add(1, Ordering::SeqCst);
-            crate::hooks::LookupOutcome {
-                miss_key: Some("recording-miss".to_string()),
-                ..Default::default()
+            let hit = self.hit.lock().expect("semantic hit lock").clone();
+            if hit.is_some() {
+                crate::hooks::LookupOutcome {
+                    hit,
+                    ..Default::default()
+                }
+            } else {
+                crate::hooks::LookupOutcome {
+                    miss_key: Some("recording-miss".to_string()),
+                    ..Default::default()
+                }
             }
         }
 
@@ -9357,17 +9525,31 @@ mod external_guardrail_context_tests {
     async fn downstream_session(
         body: serde_json::Value,
     ) -> (Session, tokio::task::JoinHandle<Vec<u8>>) {
+        downstream_bytes_session(
+            "/v1/chat/completions",
+            "application/json",
+            serde_json::to_vec(&body).expect("request JSON"),
+        )
+        .await
+    }
+
+    async fn downstream_bytes_session(
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (Session, tokio::task::JoinHandle<Vec<u8>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind downstream fixture");
         let address = listener.local_addr().expect("downstream address");
-        let body = serde_json::to_vec(&body).expect("request JSON");
+        let path = path.to_string();
+        let content_type = content_type.to_string();
         let client = tokio::spawn(async move {
             let mut stream = tokio::net::TcpStream::connect(address)
                 .await
                 .expect("connect downstream fixture");
             let request = format!(
-                "POST /v1/chat/completions HTTP/1.1\r\nHost: ai.test\r\ncontent-type: application/json\r\nIdempotency-Key: guardrail-test\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                "POST {path} HTTP/1.1\r\nHost: ai.test\r\ncontent-type: {content_type}\r\nIdempotency-Key: guardrail-test\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()
             );
             stream
@@ -9375,12 +9557,11 @@ mod external_guardrail_context_tests {
                 .await
                 .expect("write request headers");
             stream.write_all(&body).await.expect("write request body");
-            let mut response = vec![0_u8; 8192];
-            let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut response))
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
                 .await
                 .expect("downstream response timed out")
                 .expect("read downstream response");
-            response.truncate(read);
             response
         });
         let (stream, _) = listener.accept().await.expect("accept downstream request");
@@ -9409,7 +9590,8 @@ mod external_guardrail_context_tests {
     ) -> sbproxy_ai::AiHandlerConfig {
         sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
             "providers": [{
-                "name": "fixture",
+                "name": "openai",
+                "provider_type": "openai",
                 "base_url": upstream_url,
                 "allow_private_base_url": true,
                 "api_key": "fixture-key",
@@ -9463,6 +9645,19 @@ mod external_guardrail_context_tests {
                 .expect("write upstream response body");
         });
         (format!("http://{address}/v1"), hits)
+    }
+
+    fn multipart_audio_request() -> (&'static str, Vec<u8>) {
+        const BOUNDARY: &str = "sbproxy-guardrail-boundary";
+        let body = format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nrequested-model\r\n\
+             --{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"fixture.wav\"\r\n\
+             Content-Type: audio/wav\r\n\r\nfixture-audio\r\n--{BOUNDARY}--\r\n"
+        );
+        (
+            "multipart/form-data; boundary=sbproxy-guardrail-boundary",
+            body.into_bytes(),
+        )
     }
 
     fn cascade_proxy_config(
@@ -9596,6 +9791,290 @@ mod external_guardrail_context_tests {
                 "phase": "input"
             })
         );
+    }
+
+    #[tokio::test]
+    async fn external_input_guardrail_receives_text_from_malformed_forwarded_messages() {
+        let (guardrail_url, received) = blocking_guardrail().await;
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = proxy_config(&upstream_url, guardrail_url, "pre_call");
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [
+                {"role": "user", "content": "safe prefix"},
+                {"role": 7, "content": "malformed forwarded sentinel"}
+            ]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("malformed-message guardrail block is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(client.await.expect("downstream client")).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+        let payload = tokio::time::timeout(Duration::from_secs(1), received)
+            .await
+            .expect("guardrail request timed out")
+            .expect("guardrail fixture dropped");
+        assert!(
+            payload["input"]
+                .as_str()
+                .is_some_and(|input| input.contains("malformed forwarded sentinel")),
+            "the canonical extractor must not discard forwarded malformed entries: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_output_guardrail_fails_closed_for_stream_before_any_replay_or_lookup() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = proxy_config(
+            &upstream_url,
+            "https://8.8.8.8/check".to_string(),
+            "post_call",
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("uninspectable stream is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(client.await.expect("downstream client")).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(response.contains("guardrail_violation"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn external_output_guardrail_checks_semantic_hit_before_replay_headers() {
+        let (guardrail_url, received) = blocking_guardrail().await;
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = proxy_config(&upstream_url, guardrail_url, "post_call");
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, _) = pipeline_with_recording_caches();
+        *semantic.hit.lock().expect("semantic hit lock") = Some(crate::hooks::CachedResponse {
+            status: 200,
+            headers: std::collections::HashMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]),
+            body: bytes::Bytes::from_static(b"{\"cached\":\"provider-controlled\"}"),
+            cached_at: std::time::SystemTime::now(),
+        });
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("guarded semantic replay is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(client.await.expect("downstream client")).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(!response.contains("provider-controlled"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 1);
+        let payload = tokio::time::timeout(Duration::from_secs(1), received)
+            .await
+            .expect("guardrail request timed out")
+            .expect("guardrail fixture dropped");
+        assert_eq!(payload["phase"], "output");
+        assert!(payload["input"]
+            .as_str()
+            .is_some_and(|input| input.contains("provider-controlled")));
+    }
+
+    #[tokio::test]
+    async fn external_output_guardrail_checks_idempotency_hit_before_replay() {
+        let request = serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let request_bytes = serde_json::to_vec(&request).expect("request JSON");
+        let (guardrail_url, received) = blocking_guardrail().await;
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = proxy_config(&upstream_url, guardrail_url, "post_call");
+        let (mut session, client) = downstream_session(request).await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        *idempotency.hit.lock().expect("idempotency hit lock") =
+            Some(sbproxy_middleware::idempotency::CachedResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: br#"{"cached":"provider-controlled"}"#.to_vec(),
+                request_body_hash: sbproxy_middleware::idempotency::hash_body(&request_bytes),
+                expires_at_unix: u64::MAX,
+            });
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("guarded idempotency replay is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(client.await.expect("downstream client")).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(!response.contains("provider-controlled"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(idempotency.gets.load(Ordering::SeqCst), 1);
+        let payload = tokio::time::timeout(Duration::from_secs(1), received)
+            .await
+            .expect("guardrail request timed out")
+            .expect("guardrail fixture dropped");
+        assert_eq!(payload["phase"], "output");
+    }
+
+    #[tokio::test]
+    async fn external_input_guardrail_fails_closed_for_multipart_before_upstream() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"text":"ignored"}"#).await;
+        let config = proxy_config(
+            &upstream_url,
+            "https://8.8.8.8/check".to_string(),
+            "pre_call",
+        );
+        let (content_type, body) = multipart_audio_request();
+        let (mut session, client) =
+            downstream_bytes_session("/v1/audio/transcriptions", content_type, body).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("multipart input block is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(client.await.expect("downstream client")).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(response.contains("guardrail_violation"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn external_output_guardrail_checks_materialized_multipart_response() {
+        let (guardrail_url, received) = blocking_guardrail().await;
+        let (upstream_url, upstream_hits) =
+            upstream_fixture(r#"{"text":"provider-controlled","duration":1.5}"#).await;
+        let config = proxy_config(&upstream_url, guardrail_url, "post_call");
+        let (content_type, body) = multipart_audio_request();
+        let (mut session, client) =
+            downstream_bytes_session("/v1/audio/transcriptions", content_type, body).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("multipart output block is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(client.await.expect("downstream client")).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(response.contains("guardrail_violation"), "{response}");
+        assert!(!response.contains("provider-controlled"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        let payload = tokio::time::timeout(Duration::from_secs(1), received)
+            .await
+            .expect("guardrail request timed out")
+            .expect("guardrail fixture dropped");
+        assert_eq!(payload["phase"], "output");
+        assert!(payload["input"]
+            .as_str()
+            .is_some_and(|input| input.contains("provider-controlled")));
+    }
+
+    #[tokio::test]
+    async fn external_output_guardrail_applies_no_content_mode_to_binary_multipart_response() {
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(vec![0xff, 0xfe, 0xfd], "application/octet-stream").await;
+        let config = proxy_config(
+            &upstream_url,
+            "https://8.8.8.8/check".to_string(),
+            "post_call",
+        );
+        let (content_type, body) = multipart_audio_request();
+        let (mut session, client) =
+            downstream_bytes_session("/v1/audio/transcriptions", content_type, body).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("binary multipart output block is handled");
+        drop(session);
+
+        let response = String::from_utf8(client.await.expect("downstream client"))
+            .expect("safe response utf8");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(response.contains("guardrail_violation"), "{response}");
+        assert!(!response.contains('\u{fffd}'), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -46,6 +46,12 @@ impl AiProxyAction {
                         *reference = resolved;
                     }
                 }
+                for guardrail in &guardrails.external {
+                    let name = &guardrail.name;
+                    guardrail.prepare().map_err(|error| {
+                        anyhow::anyhow!("preparing external guardrail '{name}': {}", error)
+                    })?;
+                }
             }
         }
         Ok(Self { config })
@@ -86,11 +92,14 @@ mod tests {
         }))
         .expect("external guardrail credential resolves");
 
+        let guardrail = &action.config.guardrails.unwrap().external[0];
         assert_eq!(
-            action.config.guardrails.unwrap().external[0]
-                .api_key
-                .as_deref(),
+            guardrail.api_key.as_deref(),
             Some("resolved-guardrail-value")
+        );
+        assert!(
+            guardrail.is_prepared(),
+            "runtime must be compiled only after the credential is resolved"
         );
     }
 
