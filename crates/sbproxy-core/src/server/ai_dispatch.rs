@@ -3738,6 +3738,7 @@ pub(super) async fn handle_ai_proxy(
                     sbproxy_ai::external_guardrail::run_input_external_guardrails(
                         &guardrails_config.external,
                         &input_text,
+                        &model,
                     )
                     .await
                 {
@@ -5918,7 +5919,10 @@ pub(super) async fn handle_ai_proxy(
                     .and(guardrail_pipeline.clone())
                     .filter(|p| p.has_output()),
                 // WOR-1529: external output guardrails (post_call) run on the
-                // response after the sync pipeline; empty when none configured.
+                // buffered response after the sync pipeline; empty when none
+                // are configured. They are intentionally not given to the
+                // streaming relay because it can send bytes before a post-call
+                // guardrail has a complete response to inspect.
                 config
                     .guardrails
                     .as_ref()
@@ -6399,6 +6403,9 @@ pub(super) async fn relay_ai_response_with_cache(
                     sbproxy_ai::external_guardrail::run_output_external_guardrails(
                         &output_external,
                         text,
+                        ctx.as_ref()
+                            .and_then(|context| context.ai_model.as_deref())
+                            .unwrap_or(""),
                     )
                     .await
                     .map(|(name, reason)| sbproxy_ai::guardrails::GuardrailBlock { name, reason })
@@ -9124,6 +9131,325 @@ fn model_eligible_providers(
 
 fn shadow_surface_is_eligible(surface: &sbproxy_ai::handler::AiSurface) -> bool {
     surface.supports_shadow_eval()
+}
+
+#[cfg(test)]
+mod external_guardrail_context_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use pingora_core::protocols::l4::stream::Stream;
+    use pingora_proxy::Session;
+    use sbproxy_ai::external_guardrail::{
+        run_input_external_guardrails, run_output_external_guardrails, ExternalGuardrailConfig,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn blocking_guardrail() -> (String, tokio::sync::oneshot::Receiver<serde_json::Value>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind guardrail fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept guardrail request");
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 2048];
+            loop {
+                let read = stream
+                    .read(&mut chunk)
+                    .await
+                    .expect("read guardrail request");
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+                if let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = std::str::from_utf8(&bytes[..header_end]).expect("headers utf8");
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or_default();
+                    if bytes.len() >= header_end + 4 + content_length {
+                        let body = &bytes[header_end + 4..header_end + 4 + content_length];
+                        sender
+                            .send(serde_json::from_slice(body).expect("guardrail JSON"))
+                            .expect("receive guardrail body");
+                        break;
+                    }
+                }
+            }
+            let body = r#"{"allowed":false}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            stream.write_all(response.as_bytes()).await.expect("reply");
+        });
+        (format!("http://{address}/check"), receiver)
+    }
+
+    fn guardrail_config(url: String, mode: &str) -> ExternalGuardrailConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": "customer-policy",
+            "url": url,
+            "mode": mode,
+            "default_on": true,
+            "allow_private_url": true
+        }))
+        .expect("guardrail config")
+    }
+
+    async fn downstream_session(
+        body: serde_json::Value,
+    ) -> (Session, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
+        let body = serde_json::to_vec(&body).expect("request JSON");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture");
+            let request = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: ai.test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .expect("write request headers");
+            stream.write_all(&body).await.expect("write request body");
+            let mut response = vec![0_u8; 8192];
+            let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut response))
+                .await
+                .expect("downstream response timed out")
+                .expect("read downstream response");
+            response.truncate(read);
+            response
+        });
+        let (stream, _) = listener.accept().await.expect("accept downstream request");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse downstream request");
+        (session, client)
+    }
+
+    fn proxy_config(
+        upstream_url: &str,
+        guardrail_url: String,
+        mode: &str,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "fixture",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "guardrails": {"external": [{
+                "name": "customer-policy",
+                "url": guardrail_url,
+                "mode": mode,
+                "default_on": true,
+                "allow_private_url": true
+            }]}
+        }))
+        .expect("proxy config")
+    }
+
+    async fn upstream_fixture(body: &'static str) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream fixture");
+        let address = listener.local_addr().expect("upstream address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept upstream request");
+            observed.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 4096];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("read upstream request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write upstream response");
+        });
+        (format!("http://{address}/v1"), hits)
+    }
+
+    #[tokio::test]
+    async fn external_guardrail_runners_send_model_and_exact_phase() {
+        let (input_url, input_received) = blocking_guardrail().await;
+        let input = run_input_external_guardrails(
+            &[guardrail_config(input_url, "pre_call")],
+            "fixture prompt",
+            "requested-model",
+        )
+        .await;
+        assert!(
+            input.is_some(),
+            "blocking input guardrail must stop dispatch"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), input_received)
+                .await
+                .expect("input guardrail request timed out")
+                .expect("input fixture dropped"),
+            serde_json::json!({
+                "input": "fixture prompt",
+                "model": "requested-model",
+                "phase": "input"
+            })
+        );
+
+        let (output_url, output_received) = blocking_guardrail().await;
+        let output = run_output_external_guardrails(
+            &[guardrail_config(output_url, "post_call")],
+            "provider-controlled text",
+            "selected-model",
+        )
+        .await;
+        let (_, reason) =
+            output.expect("blocking output guardrail must reject the buffered response");
+        assert!(
+            !reason.contains("provider-controlled text"),
+            "provider-controlled output must not become the guardrail response"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), output_received)
+                .await
+                .expect("output guardrail request timed out")
+                .expect("output fixture dropped"),
+            serde_json::json!({
+                "input": "provider-controlled text",
+                "model": "selected-model",
+                "phase": "output"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn external_input_guardrail_blocks_before_the_proxy_contacts_upstream() {
+        let (guardrail_url, received) = blocking_guardrail().await;
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = proxy_config(&upstream_url, guardrail_url, "pre_call");
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("input block is a handled response");
+        drop(session);
+
+        let response = client.await.expect("downstream client");
+        assert!(
+            std::str::from_utf8(&response)
+                .expect("response utf8")
+                .starts_with("HTTP/1.1 400"),
+            "input violation must be returned to the client"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "input violation must not contact the upstream model"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), received)
+                .await
+                .expect("input guardrail request timed out")
+                .expect("input fixture dropped"),
+            serde_json::json!({
+                "input": "fixture prompt",
+                "model": "requested-model",
+                "phase": "input"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn external_output_guardrail_rejects_buffered_provider_text_before_it_can_be_served() {
+        let (guardrail_url, received) = blocking_guardrail().await;
+        let (upstream_url, upstream_hits) = upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"provider-controlled text"}}]}"#,
+        )
+        .await;
+        let config = proxy_config(&upstream_url, guardrail_url, "post_call");
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "selected-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("output block is a handled response");
+        drop(session);
+
+        let response =
+            String::from_utf8(client.await.expect("downstream client")).expect("response utf8");
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "response was {response}"
+        );
+        assert!(
+            response.contains("guardrail_violation"),
+            "response was {response}"
+        );
+        assert!(
+            !response.contains("provider-controlled text"),
+            "provider-controlled text must not be served after a block: {response}"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            1,
+            "buffered output guardrails run after exactly one upstream response"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), received)
+                .await
+                .expect("output guardrail request timed out")
+                .expect("output fixture dropped"),
+            serde_json::json!({
+                "input": r#"{"choices":[{"message":{"role":"assistant","content":"provider-controlled text"}}]}"#,
+                "model": "selected-model",
+                "phase": "output"
+            })
+        );
+    }
 }
 
 #[cfg(test)]

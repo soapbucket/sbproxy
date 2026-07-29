@@ -892,14 +892,16 @@ async fn run_external_guardrails(
 pub async fn run_input_external_guardrails(
     configs: &[ExternalGuardrailConfig],
     content: &str,
+    model: &str,
 ) -> Option<(String, String)> {
-    run_external_guardrails(configs, content, "", GuardrailPhase::Input).await
+    run_external_guardrails(configs, content, model, GuardrailPhase::Input).await
 }
 pub async fn run_output_external_guardrails(
     configs: &[ExternalGuardrailConfig],
     content: &str,
+    model: &str,
 ) -> Option<(String, String)> {
-    run_external_guardrails(configs, content, "", GuardrailPhase::Output).await
+    run_external_guardrails(configs, content, model, GuardrailPhase::Output).await
 }
 
 #[cfg(test)]
@@ -1026,9 +1028,11 @@ mod tests {
             "allow_private_url":true
         }))
         .unwrap();
-        assert!(run_input_external_guardrails(&[cfg], "prompt")
-            .await
-            .is_none());
+        assert!(
+            run_input_external_guardrails(&[cfg], "prompt", "fixture-model")
+                .await
+                .is_none()
+        );
         let after =
             crate::ai_metrics::external_guardrail_verdict_value("generic", "input", "block");
         assert!(after > before, "logging_only must record its verdict");
@@ -1089,7 +1093,7 @@ mod tests {
             "allow_private_url":true
         }))
         .unwrap();
-        let (_, reason) = run_input_external_guardrails(&[cfg], "prompt")
+        let (_, reason) = run_input_external_guardrails(&[cfg], "prompt", "fixture-model")
             .await
             .expect("guardrail must block");
         assert!(!reason.contains(SENTINEL));
