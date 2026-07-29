@@ -8,3 +8,7 @@ publish = false
 [dependencies]
 bytes.workspace = true
 parking_lot.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

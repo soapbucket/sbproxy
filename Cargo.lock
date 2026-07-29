@@ -9028,6 +9028,8 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "parking_lot",
+ "reqwest 0.12.28",
+ "tokio",
 ]
 
 [[package]]
