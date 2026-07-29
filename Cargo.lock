@@ -8700,6 +8700,7 @@ dependencies = [
  "sbproxy-classifier-client",
  "sbproxy-config",
  "sbproxy-extension",
+ "sbproxy-httpkit",
  "sbproxy-model-host",
  "sbproxy-platform",
  "sbproxy-plugin",

@@ -306,6 +306,17 @@ static AI_SAFETY_GUARDRAIL_VERDICTS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+static AI_EXTERNAL_GUARDRAIL_VERDICTS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_external_guardrail_verdicts_total",
+            "External guardrail evaluations by provider, phase, and outcome"
+        ),
+        &["provider", "phase", "outcome"]
+    )
+    .unwrap()
+});
+
 static AI_CACHE_RESULTS: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(
@@ -855,6 +866,34 @@ pub fn record_safety_guardrail_verdict(guardrail: &str, class: &str, backend: &s
     };
     AI_SAFETY_GUARDRAIL_VERDICTS
         .with_label_values(&[guardrail, class, backend, verdict])
+        .inc();
+}
+
+/// Record an external guardrail result with a bounded label vocabulary.
+pub fn record_external_guardrail_verdict(provider: &str, phase: &str, outcome: &str) {
+    let provider = match provider {
+        "generic"
+        | "presidio"
+        | "lakera"
+        | "aporia"
+        | "azure_content_safety"
+        | "bedrock"
+        | "crowdstrike"
+        | "mistral"
+        | "pangea"
+        | "patronus" => provider,
+        _ => "unknown",
+    };
+    let phase = match phase {
+        "input" | "output" => phase,
+        _ => "unknown",
+    };
+    let outcome = match outcome {
+        "allow" | "block" | "fail_open" | "fail_closed" => outcome,
+        _ => "unknown",
+    };
+    AI_EXTERNAL_GUARDRAIL_VERDICTS
+        .with_label_values(&[provider, phase, outcome])
         .inc();
 }
 

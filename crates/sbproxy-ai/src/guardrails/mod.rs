@@ -801,6 +801,11 @@ pub fn validate_pipeline_config(config: &GuardrailsConfig) -> Result<()> {
             }
         }
     }
+    for external in &config.external {
+        external
+            .validate()
+            .map_err(|error| anyhow::anyhow!("external guardrail '{}': {error}", external.name))?;
+    }
     Ok(())
 }
 

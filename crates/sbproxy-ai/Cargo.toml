@@ -11,6 +11,7 @@ sbproxy-util.workspace = true
 sbproxy-config.workspace = true
 sbproxy-cache.workspace = true
 sbproxy-security.workspace = true
+sbproxy-httpkit.workspace = true
 sbproxy-platform.workspace = true
 # WOR-1542: evaluate the AI decision policy plane on the sandboxed CEL
 # engine. sbproxy-extension does not depend on sbproxy-ai, so this is
