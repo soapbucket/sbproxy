@@ -29,12 +29,23 @@ pub(super) fn parse_azure(
 
     let mut normalized_categories = Vec::with_capacity(categories.len().min(32));
     let mut blocked = false;
+    let mut seen_categories = 0_u8;
     for category in categories {
         let category_name = category
             .get("category")
             .and_then(Value::as_str)
-            .filter(|name| matches!(*name, "Hate" | "SelfHarm" | "Sexual" | "Violence"))
             .ok_or(GuardrailCallError::InvalidVerdict)?;
+        let category_flag = match category_name {
+            "Hate" => 0b0001,
+            "SelfHarm" => 0b0010,
+            "Sexual" => 0b0100,
+            "Violence" => 0b1000,
+            _ => return Err(GuardrailCallError::InvalidVerdict),
+        };
+        if seen_categories & category_flag != 0 {
+            return Err(GuardrailCallError::InvalidVerdict);
+        }
+        seen_categories |= category_flag;
         let severity = category
             .get("severity")
             .and_then(Value::as_u64)
@@ -46,6 +57,9 @@ pub(super) fn parse_azure(
             }
         }
         blocked |= severity >= u64::from(config.severity_threshold);
+    }
+    if seen_categories != 0b1111 {
+        return Err(GuardrailCallError::InvalidVerdict);
     }
 
     for item in blocklist_matches {

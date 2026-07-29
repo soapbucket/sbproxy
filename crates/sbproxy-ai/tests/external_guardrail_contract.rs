@@ -337,6 +337,8 @@ fn azure_config(url: String, fail_open: bool, timeout_ms: u64) -> ExternalGuardr
     .expect("Azure fixture config")
 }
 
+const AZURE_ALL_CLEAR: &str = r#"{"categoriesAnalysis":[{"category":"Hate","severity":0},{"category":"SelfHarm","severity":0},{"category":"Sexual","severity":0},{"category":"Violence","severity":0}],"blocklistsMatch":[]}"#;
+
 fn bedrock_config(url: String, fail_open: bool, timeout_ms: u64) -> ExternalGuardrailConfig {
     serde_json::from_value(serde_json::json!({
         "name": "bedrock",
@@ -355,12 +357,7 @@ fn bedrock_config(url: String, fail_open: bool, timeout_ms: u64) -> ExternalGuar
 
 #[tokio::test]
 async fn azure_content_safety_contract_uses_subscription_key_and_eight_level_output() {
-    let (base_url, received) = fixture_server(
-        200,
-        r#"{"categoriesAnalysis":[{"category":"Hate","severity":0}],"blocklistsMatch":[]}"#,
-        Duration::ZERO,
-    )
-    .await;
+    let (base_url, received) = fixture_server(200, AZURE_ALL_CLEAR, Duration::ZERO).await;
 
     let verdict = check_external_guardrail(
         &azure_config(base_url, false, 2_000),
@@ -381,8 +378,8 @@ async fn azure_content_safety_contract_uses_subscription_key_and_eight_level_out
 #[tokio::test]
 async fn azure_content_safety_blocks_severity_or_blocklist_match() {
     for body in [
-        r#"{"categoriesAnalysis":[{"category":"Violence","severity":4}],"blocklistsMatch":[]}"#,
-        r#"{"categoriesAnalysis":[{"category":"Violence","severity":0}],"blocklistsMatch":[{"blocklistName":"fixture","blocklistItemId":"item","blocklistItemText":"prompt"}]}"#,
+        r#"{"categoriesAnalysis":[{"category":"Hate","severity":0},{"category":"SelfHarm","severity":0},{"category":"Sexual","severity":0},{"category":"Violence","severity":4}],"blocklistsMatch":[]}"#,
+        r#"{"categoriesAnalysis":[{"category":"Hate","severity":0},{"category":"SelfHarm","severity":0},{"category":"Sexual","severity":0},{"category":"Violence","severity":0}],"blocklistsMatch":[{"blocklistName":"fixture","blocklistItemId":"item","blocklistItemText":"prompt"}]}"#,
     ] {
         let (base_url, received) = fixture_server(200, body, Duration::ZERO).await;
         let verdict = check_external_guardrail(
@@ -395,6 +392,46 @@ async fn azure_content_safety_blocks_severity_or_blocklist_match() {
             verdict.reason.as_deref(),
             Some("azure content safety blocked content")
         );
+        let _ = received.await;
+    }
+}
+
+#[tokio::test]
+async fn azure_content_safety_rejects_empty_missing_and_duplicate_category_sets() {
+    for (body, fail_open, expected_allowed, expected_reason) in [
+        (
+            r#"{"categoriesAnalysis":[],"blocklistsMatch":[]}"#,
+            false,
+            false,
+            "external guardrail unavailable; fail-closed",
+        ),
+        (
+            r#"{"categoriesAnalysis":[],"blocklistsMatch":[]}"#,
+            true,
+            true,
+            "external guardrail unavailable; fail-open",
+        ),
+        (
+            r#"{"categoriesAnalysis":[{"category":"Hate","severity":0},{"category":"SelfHarm","severity":0},{"category":"Sexual","severity":0}],"blocklistsMatch":[]}"#,
+            false,
+            false,
+            "external guardrail unavailable; fail-closed",
+        ),
+        (
+            r#"{"categoriesAnalysis":[{"category":"Hate","severity":0},{"category":"Hate","severity":0},{"category":"SelfHarm","severity":0},{"category":"Sexual","severity":0}],"blocklistsMatch":[]}"#,
+            true,
+            true,
+            "external guardrail unavailable; fail-open",
+        ),
+    ] {
+        let (base_url, received) = fixture_server(200, body, Duration::ZERO).await;
+        let verdict = check_external_guardrail(
+            &azure_config(base_url, fail_open, 2_000),
+            request(GuardrailPhase::Input),
+        )
+        .await;
+        assert_eq!(verdict.allowed, expected_allowed);
+        assert_eq!(verdict.reason.as_deref(), Some(expected_reason));
         let _ = received.await;
     }
 }
@@ -456,13 +493,7 @@ async fn azure_content_safety_malformed_status_timeout_and_fail_modes_are_safe()
             true,
         ),
         (502, r#"{}"#, Duration::ZERO, false, false),
-        (
-            200,
-            r#"{"categoriesAnalysis":[],"blocklistsMatch":[]}"#,
-            Duration::from_millis(50),
-            true,
-            true,
-        ),
+        (200, AZURE_ALL_CLEAR, Duration::from_millis(50), true, true),
     ] {
         let (base_url, received) = fixture_server(status, body, delay).await;
         let timeout_ms = if delay.is_zero() { 2_000 } else { 1 };
