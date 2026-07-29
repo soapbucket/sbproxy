@@ -12,7 +12,9 @@ mod bedrock;
 mod crowdstrike;
 mod generic;
 mod lakera;
+mod mistral;
 mod pangea;
+mod patronus;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -652,8 +654,6 @@ pub enum GuardrailCallError {
     ResponseTooLarge,
     #[error("guardrail returned an invalid verdict")]
     InvalidVerdict,
-    #[error("provider contract is not connected")]
-    UnsupportedProvider,
 }
 
 /// Call an external guardrail. A transport or parse error is mapped through
@@ -708,8 +708,11 @@ async fn dispatch(
         CompiledGuardrailProvider::CrowdStrike(provider) => {
             crowdstrike::crowdstrike_request(provider, request)
         }
+        CompiledGuardrailProvider::Mistral(provider) => mistral::mistral_request(provider, request),
         CompiledGuardrailProvider::Pangea(provider) => pangea::pangea_request(provider, request),
-        _ => return Err(GuardrailCallError::UnsupportedProvider),
+        CompiledGuardrailProvider::Patronus(provider) => {
+            patronus::patronus_request(provider, request)
+        }
     };
     let mut call = config
         .client_for(compiled.url())
@@ -747,8 +750,9 @@ async fn dispatch(
         }
         CompiledGuardrailProvider::Bedrock(_) => bedrock::parse_bedrock(&body),
         CompiledGuardrailProvider::CrowdStrike(_) => crowdstrike::parse_crowdstrike(&body),
+        CompiledGuardrailProvider::Mistral(provider) => mistral::parse_mistral(&body, provider),
         CompiledGuardrailProvider::Pangea(_) => pangea::parse_pangea(&body),
-        _ => Err(GuardrailCallError::UnsupportedProvider),
+        CompiledGuardrailProvider::Patronus(_) => patronus::parse_patronus(&body),
     }
 }
 

@@ -391,6 +391,336 @@ fn pangea_config(url: String, fail_open: bool, timeout_ms: u64) -> ExternalGuard
     .expect("Pangea fixture config")
 }
 
+fn mistral_config(
+    url: String,
+    fail_open: bool,
+    timeout_ms: u64,
+    model: Option<&str>,
+    score_threshold: Option<f64>,
+) -> ExternalGuardrailConfig {
+    serde_json::from_value(serde_json::json!({
+        "name": "mistral",
+        "provider": "mistral",
+        "url": url,
+        "mode": "during_call",
+        "api_key": "fixture-key",
+        "model": model,
+        "score_threshold": score_threshold,
+        "allow_private_url": true,
+        "fail_open": fail_open,
+        "timeout_ms": timeout_ms
+    }))
+    .expect("Mistral fixture config")
+}
+
+fn patronus_config(
+    url: String,
+    fail_open: bool,
+    timeout_ms: u64,
+    criteria: Option<&str>,
+) -> ExternalGuardrailConfig {
+    serde_json::from_value(serde_json::json!({
+        "name": "patronus",
+        "provider": "patronus",
+        "url": url,
+        "mode": "during_call",
+        "api_key": "fixture-key",
+        "evaluator": "prompt-injection",
+        "criteria": criteria,
+        "allow_private_url": true,
+        "fail_open": fail_open,
+        "timeout_ms": timeout_ms
+    }))
+    .expect("Patronus fixture config")
+}
+
+const MISTRAL_ALLOW: &str = r#"{"results":[{"categories":{"hate":false,"pii":false},"category_scores":{"hate":0.01,"pii":0.02}}]}"#;
+
+#[tokio::test]
+async fn mistral_contract_uses_documented_path_bearer_default_and_override_models() {
+    let (base_url, received) = fixture_server(200, MISTRAL_ALLOW, Duration::ZERO).await;
+    let verdict = check_external_guardrail(
+        &mistral_config(
+            format!("{base_url}/v1/moderations"),
+            false,
+            2_000,
+            None,
+            None,
+        ),
+        request(GuardrailPhase::Input),
+    )
+    .await;
+    assert!(verdict.allowed);
+    let wire_request = received.await.expect("fixture task");
+    assert!(wire_request.starts_with("POST /v1/moderations HTTP/1.1\r\n"));
+    assert!(wire_request.contains("authorization: Bearer fixture-key\r\n"));
+    assert!(
+        wire_request.ends_with(r#"{"input":["fixture prompt"],"model":"mistral-moderation-2603"}"#)
+    );
+
+    let (base_url, received) = fixture_server(200, MISTRAL_ALLOW, Duration::ZERO).await;
+    assert!(
+        check_external_guardrail(
+            &mistral_config(
+                format!("{base_url}/v1/moderations"),
+                false,
+                2_000,
+                Some("fixture-moderation-model"),
+                None,
+            ),
+            request(GuardrailPhase::Output),
+        )
+        .await
+        .allowed
+    );
+    assert!(received
+        .await
+        .expect("fixture task")
+        .ends_with(r#"{"input":["fixture prompt"],"model":"fixture-moderation-model"}"#));
+}
+
+#[tokio::test]
+async fn mistral_blocks_true_categories_and_configured_score_thresholds() {
+    let (base_url, received) = fixture_server(
+        200,
+        r#"{"results":[{"categories":{"hate":true,"pii":false},"category_scores":{"hate":0.01,"pii":0.02}}]}"#,
+        Duration::ZERO,
+    )
+    .await;
+    let verdict = check_external_guardrail(
+        &mistral_config(
+            format!("{base_url}/v1/moderations"),
+            false,
+            2_000,
+            None,
+            None,
+        ),
+        request(GuardrailPhase::Input),
+    )
+    .await;
+    assert!(!verdict.allowed);
+    assert_eq!(verdict.reason.as_deref(), Some("mistral blocked content"));
+    assert_eq!(verdict.categories, ["hate", "pii"]);
+    assert_eq!(verdict.scores.get("hate"), Some(&0.01));
+    let _ = received.await;
+
+    let (base_url, received) = fixture_server(
+        200,
+        r#"{"results":[{"categories":{"hate":false,"pii":false},"category_scores":{"hate":0.8,"pii":0.02}}]}"#,
+        Duration::ZERO,
+    )
+    .await;
+    let verdict = check_external_guardrail(
+        &mistral_config(
+            format!("{base_url}/v1/moderations"),
+            false,
+            2_000,
+            None,
+            Some(0.8),
+        ),
+        request(GuardrailPhase::Output),
+    )
+    .await;
+    assert!(!verdict.allowed, "threshold equality must block");
+    assert_eq!(verdict.reason.as_deref(), Some("mistral blocked content"));
+    let _ = received.await;
+}
+
+#[tokio::test]
+async fn mistral_rejects_invalid_verdicts_and_obeys_both_fail_modes() {
+    for (body, fail_open, expected_allowed) in [
+        ("{not json", false, false),
+        (r#"{"results":[]}"#, true, true),
+        (
+            r#"{"results":[{"categories":{},"category_scores":{}}]}"#,
+            false,
+            false,
+        ),
+        (r#"{"results":[{"categories":{"hate":false}}]}"#, true, true),
+        (
+            r#"{"results":[{"categories":{"hate":false},"category_scores":{"pii":0.01}}]}"#,
+            false,
+            false,
+        ),
+        (
+            r#"{"results":[{"categories":{"hate":false},"category_scores":{"hate":0.01}},{"categories":{"hate":false},"category_scores":{"hate":0.01}}]}"#,
+            true,
+            true,
+        ),
+        (
+            r#"{"results":[{"categories":{"hate":"false"},"category_scores":{"hate":0.01}}]}"#,
+            true,
+            true,
+        ),
+        (
+            r#"{"results":[{"categories":{"hate":false},"category_scores":{"hate":1.1}}]}"#,
+            false,
+            false,
+        ),
+        (
+            r#"{"results":[{"categories":{"hate":false},"category_scores":{"hate":1e999}}]}"#,
+            true,
+            true,
+        ),
+    ] {
+        let (base_url, received) = fixture_server(200, body, Duration::ZERO).await;
+        assert_eq!(
+            check_external_guardrail(
+                &mistral_config(
+                    format!("{base_url}/v1/moderations"),
+                    fail_open,
+                    2_000,
+                    None,
+                    None,
+                ),
+                request(GuardrailPhase::Input),
+            )
+            .await
+            .allowed,
+            expected_allowed
+        );
+        let _ = received.await;
+    }
+
+    for (status, body, delay, fail_open, expected_allowed) in [
+        (502, r#"{}"#, Duration::ZERO, false, false),
+        (200, MISTRAL_ALLOW, Duration::from_millis(50), true, true),
+    ] {
+        let (base_url, received) = fixture_server(status, body, delay).await;
+        let timeout_ms = if delay.is_zero() { 2_000 } else { 1 };
+        assert_eq!(
+            check_external_guardrail(
+                &mistral_config(
+                    format!("{base_url}/v1/moderations"),
+                    fail_open,
+                    timeout_ms,
+                    None,
+                    None,
+                ),
+                request(GuardrailPhase::Input),
+            )
+            .await
+            .allowed,
+            expected_allowed
+        );
+        let _ = received.await;
+    }
+}
+
+const PATRONUS_ALLOW: &str =
+    r#"{"results":[{"status":"success","evaluation_result":{"pass":true}}]}"#;
+
+#[tokio::test]
+async fn patronus_contract_sends_input_output_and_optional_criteria() {
+    let (base_url, received) = fixture_server(200, PATRONUS_ALLOW, Duration::ZERO).await;
+    assert!(
+        check_external_guardrail(
+            &patronus_config(format!("{base_url}/v1/evaluate"), false, 2_000, None),
+            request(GuardrailPhase::Input),
+        )
+        .await
+        .allowed
+    );
+    let wire_request = received.await.expect("fixture task");
+    assert!(wire_request.starts_with("POST /v1/evaluate HTTP/1.1\r\n"));
+    assert!(wire_request.contains("x-api-key: fixture-key\r\n"));
+    assert!(wire_request.ends_with(
+        r#"{"evaluators":[{"evaluator":"prompt-injection"}],"task_input":"fixture prompt"}"#
+    ));
+
+    let (base_url, received) = fixture_server(200, PATRONUS_ALLOW, Duration::ZERO).await;
+    assert!(
+        check_external_guardrail(
+            &patronus_config(
+                format!("{base_url}/v1/evaluate"),
+                false,
+                2_000,
+                Some("block adversarial prompts"),
+            ),
+            request(GuardrailPhase::Output),
+        )
+        .await
+        .allowed
+    );
+    assert!(received.await.expect("fixture task").ends_with(
+        r#"{"evaluators":[{"criteria":"block adversarial prompts","evaluator":"prompt-injection"}],"task_output":"fixture prompt"}"#
+    ));
+}
+
+#[tokio::test]
+async fn patronus_blocks_failed_evaluations_and_rejects_invalid_result_sets() {
+    let (base_url, received) = fixture_server(
+        200,
+        r#"{"results":[{"status":"success","evaluation_result":{"pass":false}}]}"#,
+        Duration::ZERO,
+    )
+    .await;
+    let verdict = check_external_guardrail(
+        &patronus_config(format!("{base_url}/v1/evaluate"), false, 2_000, None),
+        request(GuardrailPhase::Input),
+    )
+    .await;
+    assert!(!verdict.allowed);
+    assert_eq!(verdict.reason.as_deref(), Some("patronus blocked content"));
+    let _ = received.await;
+
+    for (body, fail_open, expected_allowed) in [
+        ("{not json", false, false),
+        (r#"{"results":[]}"#, true, true),
+        (
+            r#"{"results":[{"status":"success","evaluation_result":{"pass":true}},{"status":"success","evaluation_result":{"pass":true}}]}"#,
+            false,
+            false,
+        ),
+        (
+            r#"{"results":[{"status":"failed","evaluation_result":{"pass":true}}]}"#,
+            false,
+            false,
+        ),
+        (r#"{"results":[{"status":"success"}]}"#, true, true),
+        (
+            r#"{"results":[{"status":"success","evaluation_result":{"pass":"true"}}]}"#,
+            false,
+            false,
+        ),
+    ] {
+        let (base_url, received) = fixture_server(200, body, Duration::ZERO).await;
+        assert_eq!(
+            check_external_guardrail(
+                &patronus_config(format!("{base_url}/v1/evaluate"), fail_open, 2_000, None),
+                request(GuardrailPhase::Output),
+            )
+            .await
+            .allowed,
+            expected_allowed
+        );
+        let _ = received.await;
+    }
+
+    for (status, body, delay, fail_open, expected_allowed) in [
+        (502, r#"{}"#, Duration::ZERO, true, true),
+        (200, PATRONUS_ALLOW, Duration::from_millis(50), false, false),
+    ] {
+        let (base_url, received) = fixture_server(status, body, delay).await;
+        let timeout_ms = if delay.is_zero() { 2_000 } else { 1 };
+        assert_eq!(
+            check_external_guardrail(
+                &patronus_config(
+                    format!("{base_url}/v1/evaluate"),
+                    fail_open,
+                    timeout_ms,
+                    None,
+                ),
+                request(GuardrailPhase::Input),
+            )
+            .await
+            .allowed,
+            expected_allowed
+        );
+        let _ = received.await;
+    }
+}
+
 #[test]
 fn pangea_defaults_compile_to_documented_endpoint_and_recipes() {
     let config: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
