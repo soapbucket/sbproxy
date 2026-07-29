@@ -1538,7 +1538,7 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         server: config_file.proxy,
         l2_store,
         messenger,
-        // The mesh node is built by the enterprise startup hook (not OSS),
+        // A pipeline lifecycle extension builds the mesh node when configured,
         // so compilation always yields `None` here.
         mesh: None,
         // Access-log emission settings ride through unchanged. `None`

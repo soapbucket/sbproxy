@@ -281,7 +281,7 @@ pub const PLUGIN_TRANSFORM_TIMEOUT: std::time::Duration = std::time::Duration::f
 ///    `block_in_place` call moves this thread off the runtime's
 ///    pollable-worker pool while the future runs, so other tasks
 ///    on the runtime keep making progress. This pattern is the same
-///    one the proxy already uses for its enterprise reload hook
+///    one the proxy already uses for its pipeline lifecycle hook
 ///    (see `crates/sbproxy-core/src/server.rs::reload`).
 /// 2. **Outside a tokio runtime** (the test case from `#[test]`): a
 ///    fresh current-thread runtime is built per call to drive the

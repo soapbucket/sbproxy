@@ -1406,7 +1406,7 @@ pub fn fold_boot_bundle(
 ///
 /// Two deliberate choices about that runtime. It is multi-threaded with
 /// one worker rather than current-thread, because the reload transaction
-/// reaches `tokio::task::block_in_place` when an enterprise reload hook is
+/// reaches `tokio::task::block_in_place` when a pipeline lifecycle hook is
 /// registered, and that call panics on a current-thread runtime. And the
 /// apply step blocks its worker for the length of a pipeline rebuild,
 /// which is fine precisely because this runtime exists for one task: no

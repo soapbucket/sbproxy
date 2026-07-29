@@ -4,8 +4,7 @@
 
 The wire format the proxy uses when it returns `402 Payment Required`
 to an AI crawler. This document is the canonical reference for the
-challenge body shape and for the line that splits OSS-advertises from
-enterprise-settles.
+challenge body shape.
 
 The behavioural policy that emits these bodies is `ai_crawl_control`;
 see [`ai-crawl-control.md`](ai-crawl-control.md) for configuration,
@@ -29,58 +28,8 @@ The OSS proxy emits one of two 402 shapes, picked per request:
    one entry per advertised rail, each with its own per-rail
    quote-token JWS.
 
-The multi-rail body is the negotiation contract. It is fully defined
-in OSS so the same proxy binary can advertise rails whether or not the
-operator is running an enterprise build that can settle them.
-
-## OSS advertises, enterprise settles
-
-The split between what OSS does and what the enterprise build does is
-deliberate. The runnable framing is in
-`examples/rail-lightning/README.md`.
-
-What the OSS proxy does today:
-
-- Parses the `Accept-Payment` header (RFC-style q-values) and the
-  multi-rail `Accept` MIME types.
-- Filters the agent's preference set against the operator's per-tier
-  `rails:` override and the top-level `rails:` block.
-- Emits the multi-rail 402 body with one entry per surviving rail,
-  each carrying its own quote-token JWS (separate nonce per rail).
-- Responds 406 `no_acceptable_rail` when the preference set has no
-  overlap with the offered rails, listing the operator's offered set
-  on the response.
-- Falls back to the single-rail format for legacy crawlers that did
-  not opt in.
-- Honours the in-memory ledger (`valid_tokens:`) and the HTTPS-only
-  HTTP ledger client for accept-payment redemption.
-
-What the OSS proxy cannot do today:
-
-- Settle a real-money payment on a stablecoin or fiat rail.
-- Verify an x402 redemption token against a facilitator.
-- Capture a Stripe `payment_intent`.
-- Open or close a Lightning invoice.
-
-Settlement on those rails requires the enterprise build, gated behind
-cargo features:
-
-| Feature              | Settles                                        |
-|----------------------|------------------------------------------------|
-| `stripe`             | Stripe fiat (cards, ACH).                      |
-| `x402`               | x402 v2 stablecoin-on-chain via a facilitator. |
-| `mpp`                | Stripe Multi-Party Payments.                   |
-| `lightning-cln`      | Core Lightning node.                           |
-| `lightning-lnd`      | LND node.                                      |
-| `lightning-phoenixd` | Phoenix self-custodial daemon.                 |
-
-Each enterprise feature registers a `BillingRail` impl into the OSS
-plugin trait registry under the canonical rail name the OSS schema
-already understands (`x402`, `mpp`, `lightning`). The OSS YAML schema
-in `sb.yml` does not change across enterprise backends; only the
-settlement code does. That is the property this contract pins:
-operators write the same `sb.yml` whether they run OSS or an
-enterprise build.
+The multi-rail body is a negotiation contract. It defines the response
+shape and quote-token binding; it does not perform payment settlement.
 
 ## Single-rail body
 
@@ -146,8 +95,8 @@ Notes:
   `examples/quote-token-replay-jwks/` example.
 - `rails[]` order is the operator's declared preference. Agents break
   ties on this order after q-value sorting their own preference set.
-- Lightning entries appear in the body only when an enterprise
-  `lightning-*` feature has registered a `BillingRail` named
+- Lightning entries appear in the body only when a configured
+  `lightning-*` integration has registered a `BillingRail` named
   `lightning` into the trait registry. With the OSS-default build, a
   per-tier `rails: [lightning, x402]` declaration parses cleanly (the
   `Rail::Lightning` enum variant ships in OSS) and the proxy still
@@ -282,22 +231,18 @@ before consulting the ledger. A token whose claims do not match the
 retry context (different rail, different route, expired) is rejected
 without a ledger round-trip.
 
-The token schema is OSS. The settlement that the token underwrites is
-enterprise.
+The token schema binds a challenge retry. Payment settlement is not part of
+this repository's current feature set.
 
 ## Related
 
 - [`ai-crawl-control.md`](ai-crawl-control.md) - policy configuration,
   agent classes, ledger, tiered pricing.
-- [`enterprise.md`](enterprise.md) - the OSS / enterprise split,
-  including the rail settlement features.
 - `examples/rail-x402-base-sepolia/` - x402 rail with a hermetic
   mock facilitator.
 - `examples/rail-mpp-stripe-test/` - MPP rail with Stripe test
   mode and a wiremock fallback.
 - `examples/multi-rail-accept-payment/` - x402 + MPP wired
   together with q-value negotiation.
-- `examples/rail-lightning/` - Lightning rail negotiation contract
-  (settlement is enterprise-only).
 - `examples/quote-token-replay-jwks/` - JWKS endpoint and
   single-use quote-token enforcement.

@@ -3,7 +3,7 @@
 
 Cache Reserve is a long-tail cold tier sitting under the per-origin response cache. Items evicted from the hot cache are admitted into the reserve subject to a sample rate and size threshold; on a hot miss the proxy consults the reserve before falling through to origin and promotes the entry back into the hot tier on hit.
 
-The OSS package ships three reserve backends out of the box (memory, filesystem, redis) plus the [`CacheReserveBackend`](#backend-trait) trait that enterprise builds extend with an S3 + KMS implementation.
+SBproxy ships three reserve backends out of the box: memory, filesystem, and redis.
 
 ## Configuration
 
@@ -38,7 +38,7 @@ origins:
 | `filesystem` | `path` | One body file plus a sidecar metadata JSON per key, fanned out by SHA-256 hash. Survives restarts. |
 | `redis` | `redis_url`, optional `key_prefix` | Connection pooling via `ConnectionManager`. Entries self-evict on the server side via `PEXPIREAT`. |
 
-Enterprise builds register additional types (e.g. `s3`) through the `CacheReserveBackend` trait. The OSS pipeline ignores unknown types with a warning so the enterprise startup hook can swap in its own implementation.
+The pipeline ignores unknown backend types with a warning.
 
 ### Admission filter
 
@@ -61,7 +61,7 @@ The filter runs before any reserve I/O happens so a misconfigured admission wind
 
 ## Backend trait
 
-The integration point for cold-tier backends is the async [`CacheReserveBackend`](../crates/sbproxy-cache/src/reserve/mod.rs) trait. Enterprise builds ship their own `impl CacheReserveBackend` (S3 + KMS, GCS, Azure Blob) without re-vendoring the OSS data plane.
+The integration point for cold-tier backends is the async [`CacheReserveBackend`](../crates/sbproxy-cache/src/reserve/mod.rs) trait.
 
 ```rust,no_run
 use async_trait::async_trait;

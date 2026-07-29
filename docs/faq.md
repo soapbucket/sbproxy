@@ -2,7 +2,7 @@
 
 *Last modified: 2026-07-29*
 
-Quick answers to the questions operators hit most often when standing up SBproxy, picking between OSS and enterprise, debugging a config that will not load, or wiring observability. For the full reference of any feature, follow the link to the matching doc.
+Quick answers to the questions operators hit most often when standing up SBproxy, debugging a config that will not load, or wiring observability. For the full reference of any feature, follow the link to the matching doc.
 
 ## Install + first run
 
@@ -45,11 +45,11 @@ The validator runs the same schema check the server uses at boot, prints the off
 
 See [troubleshooting.md](./troubleshooting.md) for the most common validation errors.
 
-## OSS vs enterprise
+## Distribution
 
-### What is in the OSS distribution?
+### What is included?
 
-Everything in this repo:
+Everything in this repository ships under Apache-2.0:
 
 * The full proxy: HTTP/1.1, HTTP/2, websockets, gRPC, GraphQL, MCP.
 * The AI gateway: 72 native providers, routing strategies, guardrails, budgets, streaming, semantic cache, virtual keys.
@@ -59,17 +59,6 @@ Everything in this repo:
 * Scripting via CEL, Lua, JavaScript, and WebAssembly.
 * The embedded admin server, the access log, the metrics and tracing wiring, the audit log.
 * All examples and dashboards.
-
-### What is enterprise-only?
-
-Three categories: hosted infrastructure, multi-tenant orchestration, and analytics. Concretely:
-
-* The hosted control plane (a managed cluster you point your OSS proxies at).
-* The portal: per-workspace dashboards, billing, virtual-key issuance, audit search.
-* Long-haul event ingestion (Kafka / NATS, S3 archives, Datadog / Splunk forwarders).
-* HSM-backed key custody, SPIFFE workload identity, multi-source entitlements.
-
-See [enterprise.md](./enterprise.md) for the buyer-facing overview.
 
 ### Can I run SBproxy in production?
 
@@ -152,7 +141,7 @@ The canonical metric catalog with stability promises is [metrics-stability.md](.
 
 ### Where does the access log go?
 
-`stderr` by default, structured JSON, one line per request. Enable via the top-level `access_log:` block; route to a file via stdout/stderr redirection, or to a sink (S3, Kafka, Datadog) via the enterprise build. The full schema is in [access-log.md](./access-log.md).
+`stderr` by default, structured JSON, one line per request. Enable via the top-level `access_log:` block; route to a file via stdout/stderr redirection. The full schema is in [access-log.md](./access-log.md).
 
 The log carries phase timings (`auth_ms`, `upstream_ttfb_ms`, `response_filter_ms`) so a slow request reveals which part of the pipeline produced the latency without cross-referencing histograms.
 
@@ -208,4 +197,3 @@ Accepted levels: `trace`, `debug`, `info`, `warn`, `error`. Default is `info`. `
 * [manual.md](./manual.md) - install, CLI, runtime, TLS, deployment patterns.
 * [configuration.md](./configuration.md) - every `sb.yml` field with examples.
 * [troubleshooting.md](./troubleshooting.md) - common failure modes and fixes.
-* [enterprise.md](./enterprise.md) - the OSS / enterprise split.

@@ -2,7 +2,7 @@
 
 *Last modified: 2026-07-28*
 
-SBproxy is an open source Enterprise AI Gateway for API, MCP, and AI model traffic. This index covers the Apache-2.0 OSS binary. The [enterprise overview](enterprise.md) describes optional capabilities and the extension boundary.
+SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
 ## Start and learn
 
@@ -66,7 +66,7 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [a2a-gateway.md](a2a-gateway.md) - the `a2a` action: typed AgentCard, capability discovery, and modality negotiation helpers.
 - [agent-skills.md](agent-skills.md) - Agent Skills v0.2.0 well-known projection: schema, integrity, archive safety, no-script-execution contract.
 - [cloudflare-code-mode.md](cloudflare-code-mode.md) - typed TypeScript module emission for Cloudflare Code Mode agents over the MCP federation registry.
-- [ai-crawl-control.md](ai-crawl-control.md) - the `ai_crawl_control` policy: Pay Per Crawl token challenge, ledger trait, OSS-advertises / enterprise-settles split.
+- [ai-crawl-control.md](ai-crawl-control.md) - the `ai_crawl_control` policy: Pay Per Crawl token challenge and ledger trait.
 - [content-for-agents.md](content-for-agents.md) - operator guide to agent-aware content delivery: shape negotiation, body transforms, well-known license posture.
 - [rsl.md](rsl.md) - RSL 1.0 licensing cookbook: expressing license stance via YAML and the resulting `/licenses.xml` projection.
 - [web-bot-auth.md](web-bot-auth.md) - the `bot_auth` provider: verifying RFC 9421-signed AI crawlers against a published key directory.
@@ -114,7 +114,7 @@ Point a framework you already run at the gateway: chat completions through the O
 
 ## Reference
 
-- [402-challenge.md](402-challenge.md) - wire-format contract for the `402 Payment Required` body, including the OSS-advertises / enterprise-settles split.
+- [402-challenge.md](402-challenge.md) - wire-format contract for the `402 Payment Required` body.
 - [l402.md](l402.md) - L402 (Lightning HTTP 402) macaroon bearer credential surface: issuer, verifier, attenuation, payment-hash binding.
 - [admin-api-reference.md](admin-api-reference.md) - per-route schema for the embedded admin server (`/api/*`, `/admin/*`, and the unauthenticated probe routes).
 - [config-stability.md](config-stability.md) - field stability guarantees and versioning.
@@ -126,7 +126,6 @@ Point a framework you already run at the gateway: chat completions through the O
 - [feature-flags.md](feature-flags.md) - the sticky-bucketing flag store plus the `flag_enabled(name, key)` CEL helper.
 - [routing-strategies.md](routing-strategies.md) - the `RoutingStrategy` trait: opt-in extension point for custom upstream selection inside `load_balancer`.
 - [openapi-validation.md](openapi-validation.md) - the `openapi_validation` policy: validating request bodies against an OpenAPI 3.0 document at startup.
-- [enterprise.md](enterprise.md) - what the enterprise tier adds on top of the OSS data plane and how to request access.
 - [glossary.md](glossary.md) - vocabulary used in this documentation set.
 - [headers-reference.md](headers-reference.md) - every response header the proxy can emit, with the config that triggers it.
 - [metrics-stability.md](metrics-stability.md) - Prometheus metric naming and stability.

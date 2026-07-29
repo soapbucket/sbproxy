@@ -15,7 +15,7 @@ The `exposed_credentials` policy detects requests carrying a known-leaked passwo
    - stamps `exposed-credential-check: leaked-password` on the upstream request (`action: tag`, the default), or
    - rejects the request with `403 Forbidden` (`action: block`).
 
-Only `Authorization: Basic` is inspected today. Bearer tokens and JSON form bodies are out of scope for the OSS provider; the enterprise build extends to JSON form lookups via the HIBP k-anonymity adapter.
+Only `Authorization: Basic` is inspected today. Bearer tokens and JSON form bodies are out of scope.
 
 ## Configuration
 
@@ -36,7 +36,7 @@ policies:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `provider` | `static` | Source of the exposure list. OSS only ships `static`; HIBP lives in the enterprise build. |
+| `provider` | `static` | Source of the exposure list. The current provider is `static`. |
 | `action` | `tag` | `tag` stamps the configured header on the upstream. `block` returns 403. |
 | `header` | `exposed-credential-check` | Header name when `action: tag`. |
 | `passwords` | `[]` | Plaintext passwords. Hashed at compile time; the source strings are not retained on the policy. |
@@ -75,7 +75,7 @@ Switch `action: block` once those response loops are wired up and the false-posi
 
 ## Limitations
 
-- Static lists scale to a few million entries before memory becomes a concern. For the full HIBP corpus (1B+ rows), use the enterprise build with the HIBP adapter.
+- Static lists scale to a few million entries before memory becomes a concern.
 - SHA-1 is the choice for compatibility with public exposure datasets. It is not a security boundary; the policy assumes the configured list is itself non-sensitive (or stored as hashes).
 - The match is exact. We do not normalise (lowercase, NFC, trim) the password before hashing.
 

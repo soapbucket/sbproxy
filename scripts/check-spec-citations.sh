@@ -19,43 +19,16 @@
 # only walks the docs/ trees, not the source tree.
 #
 # Usage:
-#   bash scripts/check-spec-citations.sh                   # both trees
-#   bash scripts/check-spec-citations.sh --tree sbproxy    # one tree
-#
-# Env:
-#   ENTERPRISE_ROOT   optional path to a sibling sbproxy-enterprise
-#                     checkout. When set, its docs/ tree is also walked.
+#   bash scripts/check-spec-citations.sh
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUST_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-ENTERPRISE_ROOT="${ENTERPRISE_ROOT:-}"
-
-DO_RUST=1
-DO_ENT=1
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --tree)
-      shift
-      case "$1" in
-        sbproxy|rust)         DO_ENT=0 ;;
-        sbproxy-enterprise|enterprise) DO_RUST=0 ;;
-        *) echo "unknown tree: $1" >&2; exit 2 ;;
-      esac
-      shift
-      ;;
-    -h|--help)
-      sed -n '1,30p' "$0"
-      exit 0
-      ;;
-    *)
-      echo "unknown arg: $1" >&2
-      exit 2
-      ;;
-  esac
-done
+if [ $# -ne 0 ]; then
+  echo "usage: bash scripts/check-spec-citations.sh" >&2
+  exit 2
+fi
 
 # Patterns to ban. Each entry is `regex|explanation`. The regex is fed
 # to `grep -E` so escape accordingly.
@@ -103,13 +76,7 @@ check_tree() {
   fi
 }
 
-if [ "$DO_RUST" = 1 ]; then
-  check_tree "$RUST_ROOT" "sbproxy"
-fi
-
-if [ "$DO_ENT" = 1 ] && [ -n "$ENTERPRISE_ROOT" ]; then
-  check_tree "$ENTERPRISE_ROOT" "sbproxy-enterprise"
-fi
+check_tree "$RUST_ROOT" "sbproxy"
 
 if [ "$fail" -eq 0 ]; then
   echo "ok: no banned spec citations found"

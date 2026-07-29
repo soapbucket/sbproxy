@@ -219,7 +219,7 @@ The Rust gateway depends on a vetted set of crates. The Cargo.lock file is commi
 - Serialization: `serde`, `serde_yaml`, `serde_json`
 - Tracing and metrics: `tracing`, `prometheus`
 - Scripting bridges: `mlua`, `rquickjs` (sandboxed)
-- ML/embedding (enterprise classifier sidecar): handled in a separate process with its own dependency surface
+- ML/embedding sidecars: handled in a separate process with their own dependency surface
 
 There are **no Python or Node runtime dependencies** in the gateway hot path. The Lua and JavaScript scripting modules execute user-provided code in sandboxes; they do not pull external module ecosystems at runtime.
 
@@ -292,7 +292,7 @@ The supply-chain story exists because incidents happen. Here is how we respond.
 2. **Yank the affected version from package indices** (Homebrew, Docker `:latest`, Cargo if applicable). Existing pulls of the affected artifact remain available because deletion makes forensics harder; the advisory directs users to the safe replacement.
 3. **Cut a fixed release** with a higher patch number. We do not re-tag a known-compromised version.
 4. **Publish a post-mortem** within 7 days of the advisory, naming the root cause and the changes to the pipeline. This includes an updated entry in `SUPPLY-CHAIN.md` itself if the threat model gained a new scenario.
-5. **Notify enterprise customers directly** via the support contact on file.
+5. **Notify affected customers directly** via the support contact on file.
 
 We do **not** silently rebuild and re-push under the same version. Every signing event is in the Rekor transparency log; pretending it didn't happen is impossible and dishonest.
 
@@ -315,7 +315,6 @@ This is a category of risk we cannot fully mitigate but can constrain:
 
 - The Rekor transparency log has multiple monitors, including the open-source Sigstore community and several auditing services. A backdated or forged log entry would be detected.
 - GitHub OIDC tokens are short-lived and bound to the workflow run. A long-running compromise of the GitHub OIDC issuer would invalidate the entire ecosystem, not just SBproxy; it is a public infrastructure incident.
-- For customers who require independence from the Sigstore ecosystem, the enterprise tier offers an additional **GPG-signed release option** with maintainer-held keys. This is opt-in because the operational complexity is real (key management, revocation, rotation) and most customers do not need it. Talk to us.
 
 ---
 

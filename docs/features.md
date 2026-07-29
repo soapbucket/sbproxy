@@ -569,7 +569,8 @@ curl -H "Host: api.test.sbproxy.dev" \
 
 The OSS WAF can subscribe to a remote feed that publishes signed rule bundles. The proxy downloads, verifies, and hot-loads bundles in the background; in-flight requests see a stable snapshot. This lets operators ship updated detection signatures without redeploying.
 
-The publisher side (the service that signs and serves bundles) is shipped as part of the enterprise build. The subscriber documented below is in the OSS proxy.
+The subscriber documented below is in the proxy. Operators provide the service that
+signs and serves rule bundles.
 
 ```yaml
 policies:
@@ -1573,7 +1574,8 @@ and [admin-api-reference.md](admin-api-reference.md#get-apialerts).
 
 ### Request envelope: properties, sessions, users
 
-SBproxy stamps every request with a typed observability envelope so downstream tools (in-process subscribers today; the enterprise ingest pipeline and portal next) can slice traffic without re-deriving fields.
+SBproxy stamps every request with a typed observability envelope so downstream tools can
+slice traffic without re-deriving fields.
 
 Three caller-supplied dimensions land at request entry:
 
@@ -1584,7 +1586,7 @@ Tag any request with metadata for slicing. The proxy strips the prefix, lowercas
 ```text
 X-Sb-Property-Environment: prod
 X-Sb-Property-Feature-Flag: agent-v2
-X-Sb-Property-Customer-Tier: enterprise
+X-Sb-Property-Customer-Tier: premium
 ```
 
 Caps per request, all defaults:

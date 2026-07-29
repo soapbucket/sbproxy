@@ -41,10 +41,10 @@ pub enum DegradedSubsystem {
     /// One or more `listings/*.yaml` entries failed to load; the
     /// pipeline went live without them.
     Listings,
-    /// The enterprise reload hook returned an error, or its runtime
-    /// could not be built. Enterprise slots on the new pipeline may
+    /// The pipeline lifecycle hook returned an error, or its runtime
+    /// could not be built. Optional slots on the new pipeline may
     /// carry prior state.
-    EnterpriseHook,
+    PipelineLifecycleHook,
     /// The telemetry sink dispatcher could not be installed; log and
     /// event export falls back to the legacy tracing subscriber.
     SinkDispatcher,
@@ -58,7 +58,7 @@ impl DegradedSubsystem {
             Self::AiProviderRegistry => "ai_provider_registry",
             Self::KeyPlane => "key_plane",
             Self::Listings => "listings",
-            Self::EnterpriseHook => "enterprise_hook",
+            Self::PipelineLifecycleHook => "pipeline_lifecycle_hook",
             Self::SinkDispatcher => "sink_dispatcher",
         }
     }
@@ -70,7 +70,7 @@ impl std::fmt::Display for DegradedSubsystem {
             Self::AiProviderRegistry => "AI provider registry",
             Self::KeyPlane => "key plane",
             Self::Listings => "listings",
-            Self::EnterpriseHook => "enterprise reload hook",
+            Self::PipelineLifecycleHook => "pipeline lifecycle hook",
             Self::SinkDispatcher => "sink dispatcher",
         };
         formatter.write_str(text)
@@ -237,7 +237,7 @@ impl Drop for ProviderRegistryRollback {
 ///
 /// Reads the file, runs `compile_config` (which also drives the
 /// features.* migration), constructs a fresh
-/// [`CompiledPipeline`], invokes the enterprise reload hook
+/// [`CompiledPipeline`], invokes the pipeline lifecycle hook
 /// (best-effort), and atomically swaps the live pipeline. Returns a
 /// [`ReloadOutcome`] on success; logs and returns `Err` on any step's
 /// failure so the caller can decide whether to retry.
@@ -669,9 +669,9 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
         }
     }
 
-    // Invoke the enterprise reload hook (best-effort): the OSS reload
+    // Invoke the pipeline lifecycle hook (best-effort): the reload
     // path must continue to swap the pipeline even if a downstream
-    // hook errors, otherwise a failing enterprise extension would
+    // hook errors, otherwise a failing lifecycle extension would
     // permanently pin the operator on the old config. The failure is
     // reported through `ReloadOutcome` instead. We spin up a
     // current-thread runtime when no ambient tokio runtime exists so
@@ -683,7 +683,7 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
                     if let Err(e) = startup.on_reload(&mut new_pipeline).await {
                         tracing::warn!(
                             error = %e,
-                            "enterprise reload hook failed; serving with prior hook state",
+                            "pipeline lifecycle hook failed; serving with prior hook state",
                         );
                         return true;
                     }
@@ -699,7 +699,7 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
                     if let Err(e) = hook_rt.block_on(startup.on_reload(&mut new_pipeline)) {
                         tracing::warn!(
                             error = %e,
-                            "enterprise reload hook failed; serving with prior hook state",
+                            "pipeline lifecycle hook failed; serving with prior hook state",
                         );
                         true
                     } else {
@@ -716,7 +716,7 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
             }
         };
         if hook_failed {
-            outcome.degrade(DegradedSubsystem::EnterpriseHook);
+            outcome.degrade(DegradedSubsystem::PipelineLifecycleHook);
         }
     }
     let config_dir = std::path::Path::new(config_path)
@@ -1419,7 +1419,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         }
     }
 
-    // Give enterprise code a chance to wire its hooks, construct clients,
+    // Give the lifecycle extension a chance to wire its hooks, construct clients,
     // and register origins. Failures here do NOT block serving: they log
     // and return None-hooks, so request paths fall through to OSS behavior.
     //
@@ -1438,7 +1438,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         if let Err(e) = hook_rt.block_on(startup.on_startup(&mut pipeline)) {
             tracing::warn!(
                 error = %e,
-                "enterprise startup hook failed; continuing without enterprise features"
+                "pipeline lifecycle hook failed; continuing without optional features"
             );
         }
     }
@@ -1510,7 +1510,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // background std thread so an operator-driven `kill -HUP $(pgrep
     // sbproxy)` re-runs `reload_from_config_path` (which threads
     // through compile_config + the day-6 features.* migration + the
-    // enterprise reload hook). Idempotent: each delivery atomically
+    // pipeline lifecycle hook). Idempotent: each delivery atomically
     // swaps the live pipeline; multiple back-to-back SIGHUPs coalesce.
     {
         let cfg_path = config_path.to_string();

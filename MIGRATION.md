@@ -65,4 +65,4 @@ These are additive and do not require config changes:
 
 - File migration questions as an issue tagged `migration` on `github.com/soapbucket/sbproxy`.
 - Security-sensitive issues go through `SECURITY.md`.
-- For paid migration support (e.g., enterprise customers with non-trivial v0.1.x customizations), contact support@soapbucket.dev.
+- For migration support with non-trivial v0.1.x customizations, contact support@soapbucket.dev.

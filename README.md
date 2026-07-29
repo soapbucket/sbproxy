@@ -6,7 +6,7 @@
 
 *Last modified: 2026-07-28*
 
-SBproxy is an open source Enterprise AI Gateway for API, MCP, and AI model traffic. The Apache-2.0 binary in this repository is the OSS data plane. Optional enterprise capabilities extend it through the public plugin boundary; the [enterprise overview](docs/enterprise.md) documents that split.
+SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
 ## Start here
 

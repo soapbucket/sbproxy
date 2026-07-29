@@ -1,4 +1,4 @@
-//! Compiled pipeline: config + instantiated module enums + enterprise hooks.
+//! Compiled pipeline: config + instantiated module enums + optional hooks.
 //!
 //! [`CompiledPipeline`] bridges the gap between `sbproxy-config` (which stores
 //! JSON `serde_json::Value` blobs) and `sbproxy-modules` (which defines typed
@@ -11,9 +11,8 @@
 //!   response cache: whichever backend `proxy.response_cache_store`
 //!   selects, or, when that block is absent, Redis if `config.l2_store`
 //!   is set and an in-memory LRU otherwise,
-//! * an enterprise [`Hooks`](crate::hooks::Hooks) bundle of optional traits
-//!   that OSS leaves as `None` and enterprise populates via the
-//!   [`EnterpriseStartupHook`](crate::hooks::EnterpriseStartupHook) pattern.
+//! * an optional [`Hooks`](crate::hooks::Hooks) bundle of traits populated by a
+//!   [`PipelineLifecycleHook`](crate::hooks::PipelineLifecycleHook) when registered.
 //!
 //! This struct lives in `sbproxy-core` to avoid a circular dependency:
 //! config -> modules -> config would be circular, but core depends on both.
@@ -1036,11 +1035,11 @@ pub struct CompiledPipeline {
     /// path doesn't have to re-walk `config.server.cache_reserve` on
     /// every put.
     pub cache_reserve_admission: Option<ReserveAdmission>,
-    /// Enterprise hooks bundle.
+    /// Optional pipeline hooks bundle.
     ///
-    /// All fields default to `None` in OSS builds. Enterprise registers
+    /// All fields default to `None`. A lifecycle extension registers
     /// implementations (classifier, semantic cache, etc.) via the
-    /// `EnterpriseStartupHook` pattern. Request-path code invokes these
+    /// `PipelineLifecycleHook` pattern. Request-path code invokes these
     /// optionally and no-ops when they are `None`.
     pub hooks: crate::hooks::Hooks,
     /// Pre-parsed CIDRs from `proxy.trusted_proxies`. When the immediate
@@ -1403,7 +1402,7 @@ impl CompiledPipeline {
         // Built from the top-level `cache_reserve:` block. The OSS
         // backends (memory / filesystem / redis) are instantiated here;
         // unknown / enterprise backends drop through to `None` with a
-        // warning so the enterprise startup hook can swap in its own
+        // warning so a pipeline lifecycle hook can swap in its own
         // implementation post-compile.
         let (cache_reserve, cache_reserve_admission) =
             build_cache_reserve(&config.server.cache_reserve);

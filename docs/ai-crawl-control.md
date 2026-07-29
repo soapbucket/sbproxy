@@ -7,24 +7,20 @@ Each token redeems exactly once ([config](../examples/ai-crawl-control/)).
 
 The `ai_crawl_control` policy implements the "Pay Per Crawl" pattern: AI crawlers that arrive without a valid `Crawler-Payment` token receive `402 Payment Required` along with a JSON challenge body. A crawler that wants the content reads the challenge, posts a payment to your billing system, and retries with the issued token in the `Crawler-Payment` header. Each token redeems exactly once.
 
-The OSS implementation ships an in-memory ledger seeded from config and an HTTPS-only HTTP ledger client for production. The enterprise build extends the same `Ledger` trait with managed adapters so the proxy can authorise tokens against Stripe, x402, MPP, and Lightning rails.
+The implementation ships an in-memory ledger seeded from config and an HTTPS-only HTTP ledger client for production.
 
-## OSS scope: challenge body only
+## Challenge body
 
 The OSS proxy emits two challenge shapes:
 
 1. **Single-rail (default).** A 402 with the `Crawler-Payment` header and a flat JSON body describing the price. This is the path legacy crawlers see.
 2. **Multi-rail (opt-in).** When the agent sends `Accept-Payment:` or one of the multi-rail `Accept` MIME types (`application/sbproxy-multi-rail+json`, `application/x402+json`, `application/mpp+json`), the OSS proxy emits a 402 with `Content-Type: application/sbproxy-multi-rail+json` and a body that lists one entry per rail the operator declared (x402, MPP, Lightning), each with its own quote-token JWS.
 
-The multi-rail body is the wire-format contract. The OSS build can negotiate it, advertise rails, mint per-rail quote tokens, and respond 406 when the agent's preference set has no overlap with the operator's offered rails.
-
-What the OSS build cannot do is settle a payment on x402, MPP, Stripe, or Lightning. Settlement code lives in the enterprise build behind the `stripe`, `x402`, `mpp`, `lightning-cln`, `lightning-lnd`, and `lightning-phoenixd` cargo features. With an OSS-only build, the rails advertised in the multi-rail body are honoured by the in-memory or HTTP ledger; the enterprise BillingRail registrations are what actually authorise a real-money settlement.
-
-### Stripe rail: partially implemented
-
-The Stripe rail is experimental and not advertised as a supported rail yet. On the `stripe_fiat` rail the build emits a placeholder payment intent (`pi_pending_<quote_id>`), not a real Stripe `pi_*`, so no charge is created; the issued token is honoured only by the local in-memory or HTTP ledger. Real Stripe capture is an enterprise concern behind the `stripe` cargo feature and is still being finished. Treat Stripe support as a work in progress until this note is removed, and do not rely on it for production billing.
-
-This is the same framing the rail-Lightning example uses: see `examples/rail-lightning/README.md`. For the wire-shape contract on its own, see [`402-challenge.md`](402-challenge.md).
+The multi-rail body is the wire-format contract. The proxy can negotiate it,
+advertise rails, mint per-rail quote tokens, and respond 406 when the agent's
+preference set has no overlap with the operator's offered rails. Payment
+settlement is not currently part of this repository. For the wire-shape
+contract, see [`402-challenge.md`](402-challenge.md).
 
 ## Request flow
 

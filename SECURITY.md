@@ -153,7 +153,7 @@ Specifics, including cipher suites and curve preferences, are documented in the 
 
 Sensitive configuration values (API keys, OAuth secrets) referenced from `sb.yml` should be sourced from environment variables, files mounted with restricted permissions, or a secrets manager. The gateway does not encrypt values it loads from disk; it relies on filesystem permissions and the surrounding deployment environment to protect them.
 
-The enterprise build's billing and audit-log surfaces persist data at rest; the storage backend you configure (Postgres, ClickHouse, etc.) is responsible for at-rest encryption per your standards.
+Storage backends you configure (Postgres, ClickHouse, and similar systems) are responsible for at-rest encryption per your standards.
 
 ---
 
@@ -162,7 +162,7 @@ The enterprise build's billing and audit-log surfaces persist data at rest; the 
 We track open hardening items publicly. As of the latest release:
 
 - **Streaming SSE response capture in the semantic cache** is intentionally bypassed. See `SUPPLY-CHAIN.md` for the rationale and the framing-aware capture roadmap (Q3 2026).
-- **First-party prompt-injection detection** is heuristic. For strict use cases, integrate one of the supported guardrail vendors (Aporia, Lakera, Model Armor, Patronus, Pangea, CrowdStrike) via the enterprise tier.
+- **First-party prompt-injection detection** is heuristic. For strict use cases, integrate a supported guardrail vendor (Aporia, Lakera, Model Armor, Patronus, Pangea, or CrowdStrike).
 - **Reproducible builds** are deterministic at the dependency-graph level: the committed `Cargo.lock` pins every dependency version and CI builds with `--locked`. The toolchain is a fixed Rust release channel installed in CI, and the workspace minimum is declared in `Cargo.toml` (`rust-version`). Bit-for-bit reproducibility across builders, including an exact pinned toolchain version, is on the roadmap; we publish CI verification status as it lands.
 
 ---

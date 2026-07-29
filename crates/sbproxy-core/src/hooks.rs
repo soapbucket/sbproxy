@@ -1,9 +1,9 @@
-//! Enterprise hook traits exposed by the OSS pipeline.
+//! Optional hook traits exposed by the pipeline.
 //!
 //! `CompiledPipeline` owns an [`Hooks`] bundle of `Option<Arc<dyn TraitName>>`
-//! slots. OSS builds leave every slot `None` and the request path falls
-//! through without annotation. Enterprise crates register a single
-//! [`EnterpriseStartupHook`] via the `register_startup_hook!` macro; the
+//! slots. Builds that do not register an extension leave every slot `None` and
+//! the request path falls through without annotation. Extensions register a single
+//! [`PipelineLifecycleHook`] via the `register_startup_hook!` macro; the
 //! startup hook populates the remaining slots with concrete implementations
 //! (gRPC classifier client, semantic cache, etc.).
 //!
@@ -41,33 +41,33 @@ pub const REDACTED_REQUEST_HEADERS: &[&str] = &["authorization", "cookie", "prox
 // Startup hook
 // ============================================================================
 
-/// One-shot lifecycle hook that wires enterprise implementations into a
+/// One-shot lifecycle hook that wires optional implementations into a
 /// freshly compiled pipeline.
 ///
 /// Exactly one implementation is registered per binary using the
-/// `register_startup_hook!` macro and collected through `inventory`. OSS
-/// binaries register none and all other hook slots remain `None`.
+/// `register_startup_hook!` macro and collected through `inventory`. Binaries
+/// that register none leave all other hook slots as `None`.
 ///
 /// `on_startup` runs once at process boot; `on_reload` runs on every
 /// hot-reload after the new pipeline is compiled but before it is swapped
 /// in as the live pipeline.
 #[async_trait]
-pub trait EnterpriseStartupHook: Send + Sync {
-    /// Populate enterprise slots on the freshly compiled pipeline at
+pub trait PipelineLifecycleHook: Send + Sync {
+    /// Populate optional slots on the freshly compiled pipeline at
     /// process boot. Returning an error aborts startup.
     async fn on_startup(
         &self,
         pipeline: &mut crate::pipeline::CompiledPipeline,
     ) -> anyhow::Result<()>;
 
-    /// Re-populate enterprise slots on a reloaded pipeline. Called after
+    /// Re-populate optional slots on a reloaded pipeline. Called after
     /// the new `CompiledPipeline` is built from reloaded config, before
     /// it goes live.
     ///
     /// Returning an error does **not** abort the reload. The call site
     /// logs the error, records the hook in the returned
     /// `server::ReloadOutcome` as a degraded subsystem, and swaps the
-    /// new pipeline in anyway. That is deliberate: a failing enterprise
+    /// new pipeline in anyway. That is deliberate: a failing lifecycle
     /// extension must not be able to permanently pin an operator on an
     /// old config, which is exactly what aborting would do for every
     /// subsequent reload until the extension was fixed. Operators see
@@ -621,7 +621,7 @@ impl StreamCacheGuard {
     /// underlying channel is bounded at [`STREAM_CACHE_CHANNEL_CAPACITY`]
     /// and a full buffer or closed receiver causes the chunk to be
     /// dropped with a `sbproxy_hooks_channel_dropped_total{reason}`
-    /// increment. The recorder is enterprise-only and explicitly
+    /// increment. The recorder is optional and explicitly
     /// fail-open: dropping chunks is preferable to stalling the
     /// proxy hot path.
     pub fn chunk(&self, bytes: Bytes) {
@@ -706,17 +706,16 @@ pub trait StreamCacheRecorderHook: Send + Sync {
 // Aggregate: Hooks bundle owned by CompiledPipeline
 // ============================================================================
 
-/// Bundle of all enterprise hook slots owned by [`crate::pipeline::CompiledPipeline`].
+/// Bundle of all optional hook slots owned by [`crate::pipeline::CompiledPipeline`].
 ///
-/// Every slot defaults to `None`. OSS binaries leave all slots empty;
-/// enterprise binaries populate them from their
-/// [`EnterpriseStartupHook::on_startup`] implementation. Request-path
+/// Every slot defaults to `None`. A registered lifecycle extension populates
+/// slots from its [`PipelineLifecycleHook::on_startup`] implementation. Request-path
 /// code checks each slot before dispatching and no-ops when `None`.
 #[derive(Default, Clone)]
 pub struct Hooks {
     /// Lifecycle hook that populates the other slots. Registered via
     /// `inventory` and collected by [`crate::hook_registry::collect_startup_hook`].
-    pub startup: Option<Arc<dyn EnterpriseStartupHook>>,
+    pub startup: Option<Arc<dyn PipelineLifecycleHook>>,
     /// Prompt classification (labels + confidence).
     pub prompt_classifier: Option<Arc<dyn PromptClassifierHook>>,
     /// Coarse intent detection used by model routers.

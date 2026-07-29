@@ -324,7 +324,7 @@ fn build_responses(origin: &sbproxy_config::CompiledOrigin) -> Value {
 /// OSS ships baseline mappers for the auth types the open-source proxy
 /// implements (api_keys, basic_auth, oauth_client_creds). Enterprise
 /// crates register richer mappers via [`inventory::submit!`] for
-/// enterprise-only auth types (SAML, biscuit, oauth_introspection,
+/// extension-provided auth types (SAML, biscuit, oauth_introspection,
 /// ext_authz) and may override OSS mappers when they want to publish
 /// fuller metadata.
 ///

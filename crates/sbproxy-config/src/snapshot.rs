@@ -268,7 +268,7 @@ mod tests {
     use super::*;
 
     // Default-constructed snapshots must have no mesh node attached; the
-    // enterprise startup hook is responsible for populating the field when
+    // pipeline lifecycle extension is responsible for populating the field when
     // the `mesh:` extension is configured.
     #[test]
     fn compiled_config_default_has_no_mesh() {

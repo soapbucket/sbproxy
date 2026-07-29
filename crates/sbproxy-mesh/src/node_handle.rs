@@ -248,7 +248,7 @@ impl MeshNode {
     }
 
     /// Attach a periodic Redis-backed snapshot task. Called by the
-    /// enterprise startup hook after bootstrap when `MeshConfig.persistence`
+    /// pipeline lifecycle hook after bootstrap when `MeshConfig.persistence`
     /// is enabled. The task is shut down and flushed when the `MeshNode`
     /// is dropped.
     ///
@@ -265,7 +265,7 @@ impl MeshNode {
         self.persistence_task.is_some()
     }
 
-    /// Attach a running federation loop. Called by the enterprise startup
+    /// Attach a running federation loop. Called by the pipeline lifecycle
     /// hook after persistence is wired when `MeshConfig.federation` is
     /// enabled. Task is shut down when the `MeshNode` is dropped.
     pub fn with_federation(mut self, handle: crate::federation::FederationTaskHandle) -> Self {

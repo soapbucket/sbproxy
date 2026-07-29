@@ -85,8 +85,8 @@ pub fn global_bus() -> Option<PolicyBus> {
 /// The OSS [`PolicyVerdictEvent`] is already bounded by construction (the
 /// inbound request id is capped upstream at 256 bytes and the OSS payload
 /// carries no request-header or response-body context, which are
-/// enterprise-only fields), so an oversized line is not reachable today. This
-/// cap is defense-in-depth for the `#[non_exhaustive]` struct as the enterprise
+/// optional fields), so an oversized line is not reachable today. This
+/// cap is defense-in-depth for the `#[non_exhaustive]` struct as the optional
 /// audit envelope grows it, and it keeps a single event from flooding the audit
 /// sink and the disk behind it.
 const MAX_AUDIT_LINE_BYTES: usize = 64 * 1024;

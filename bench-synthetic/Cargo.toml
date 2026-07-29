@@ -14,7 +14,7 @@ publish = false
 # log sink.
 #
 # This crate is self-contained: it does NOT depend on the main
-# sbproxy-rust workspace, which keeps the builder CI lane independent
+# sbproxy workspace, which keeps the builder CI lane independent
 # of the proxy's release build. Once the harness moves to
 # `sbproxy-bench/harness/synthetic/` it inherits the same shape.
 

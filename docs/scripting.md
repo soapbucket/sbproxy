@@ -89,7 +89,9 @@ The CEL context is built per request. Every namespace below is available to `exp
 
 > Header normalization: header keys are lowercased only; hyphens are preserved. Always use bracket notation: `request.headers["content-type"]`, not `request.headers["Content-Type"]` or `request.headers.content_type`.
 
-Enterprise builds additionally populate `request.kya.*` (Know-Your-Agent verifier verdict) and `request.ml_classification.*` (ML agent classifier verdict) when those subsystems run.
+`request.kya.*` (Know-Your-Agent verifier verdict) and
+`request.ml_classification.*` (ML agent classifier verdict) are available when their
+respective subsystems run.
 
 The trust tier is computed once after identity enrichment and authentication.
 An observed denial wins over positive evidence; verified Web Bot Auth, CAP,

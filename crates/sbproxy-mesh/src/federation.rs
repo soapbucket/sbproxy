@@ -22,7 +22,7 @@
 //! This module is an integration seam, not OSS runtime surface: the OSS
 //! bootstrap never constructs a federation loop. It attaches only through
 //! [`MeshNode::with_federation`](crate::node_handle::MeshNode::with_federation),
-//! which the enterprise startup path calls after boot.
+//! which a pipeline lifecycle extension calls after boot.
 
 use crate::backend::redis::{RedisBackend, RedisBackendConfig};
 use crate::persistence::{PersistedState, SharedState};

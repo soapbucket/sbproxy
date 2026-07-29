@@ -516,7 +516,7 @@ where
 ///
 /// The task runs on a **dedicated OS thread** that hosts its own
 /// single-threaded tokio runtime. This is deliberate: when the
-/// enterprise startup hook's async `apply()` returns, the calling
+/// pipeline lifecycle hook's async `apply()` returns, the calling
 /// runtime may drop, which would cancel any task spawned via
 /// `tokio::spawn` on it. A dedicated thread with its own runtime is
 /// independent of who called `spawn_snapshot_loop`.

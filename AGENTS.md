@@ -104,7 +104,7 @@ Two consequences worth remembering:
 ## Workspace layout
 
 ```
-sbproxy-rust/
+sbproxy/
   crates/
     sbproxy/            - binary entry point (cmd line, signal handling, server boot)
     sbproxy-core/       - request pipeline (request_filter, response_filter,
@@ -211,12 +211,9 @@ chain-construction path.
 - The marketing site at `www.sbproxy.dev` is language-agnostic; do
   not lead with "Rust" there. The README and technical docs in this
   repo can.
-- This repo is OSS-only. Closed-source features extend the runtime
-  via the `sbproxy-plugin` trait registry; never add a direct
-  dependency on a closed-source crate, and do not name closed-source
-  crate paths in this repo's docs or rustdoc. The single exception is
-  `docs/enterprise.md`, which is the buyer-facing landing page that
-  describes the OSS / enterprise split.
+- Every feature in this repository ships under Apache-2.0. Do not add a
+  direct dependency on a closed-source crate or name closed-source crate paths
+  in this repository's docs or rustdoc.
 
 ## Docs convention
 

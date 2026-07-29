@@ -464,15 +464,15 @@ The per-guardrail streaming policy table is in
 
 ### Streaming cache recorder hook
 
-`StreamCacheRecorderHook` (in `sbproxy-core/src/hooks.rs`) is the OSS-side seam that lets
-an enterprise build record streaming AI responses for later replay. It mirrors the shape
+`StreamCacheRecorderHook` (in `sbproxy-core/src/hooks.rs`) is an optional seam for
+recording streaming AI responses. It mirrors the shape
 of `SemanticLookupHook` and `StreamSafetyHook`: a trait, a per-session context type
 (`StreamCacheCtx`), and a unit slot on the `Hooks` bundle that defaults to `None`.
 
-The hook lives in OSS because the emit point is on the SSE forwarding hot path. Threading
-chunks across a crate boundary at runtime would be expensive; landing the trait in
-`sbproxy-core` keeps the per-chunk fan-out cheap and lets the enterprise impl plug in
-through `EnterpriseStartupHook::on_startup` exactly like every other slot.
+The hook lives in the core crate because the emit point is on the SSE forwarding hot path.
+Threading chunks across a crate boundary at runtime would be expensive; landing the trait
+in `sbproxy-core` keeps the per-chunk fan-out cheap and lets an implementation plug in
+through `PipelineLifecycleHook::on_startup` exactly like every other slot.
 
 When the slot is wired, `relay_ai_stream` calls `start_session` once at stream start,
 forwards a copy of every chunk into the returned channel, and emits exactly one terminal
@@ -482,12 +482,12 @@ error, mid-stream abort). A `StreamCacheGuard` RAII wrapper owns this terminal-e
 invariant: `guard.finish()` sends `complete: true`, and the guard's `Drop` impl sends
 `complete: false` if `finish` was never called.
 
-What stays out of OSS: caching policy decisions (deterministic tool calls only, image
-data by reference only), replay pacing (`as_fast_as_possible` vs `natural`), eviction,
-and persistence. The OSS proxy passes the AI handler's `semantic_cache.streaming` config
-block through verbatim as a `serde_json::Value` so the enterprise recorder reads
-whatever shape it expects without OSS validating those fields. The enterprise crate
-fills the slot from its `EnterpriseStartupHook::on_startup` implementation.
+Caching policy decisions (deterministic tool calls only, image data by reference only),
+replay pacing (`as_fast_as_possible` vs `natural`), eviction, and persistence are chosen
+by the recorder implementation. The proxy passes the AI handler's
+`semantic_cache.streaming` config block through verbatim as a `serde_json::Value` so a
+recorder can read the shape it expects without core validation. A pipeline lifecycle
+extension fills the slot from `PipelineLifecycleHook::on_startup`.
 
 ### MCP federation
 
@@ -507,9 +507,8 @@ narrow, purpose-built channels:
 Every policy decision emits a `PolicyVerdictEvent` (type defined in
 `sbproxy-observe::events`) onto a bounded `tokio::sync::mpsc` channel in
 `sbproxy-core::policy_bus` (capacity 10,000). The hot path finishes as soon as the event
-is enqueued; a downstream consumer drains it asynchronously. In OSS the consumer writes
-JSON lines to stderr; the enterprise build replaces it with a NATS-backed audit-chain
-consumer. On overflow the dispatcher drops the event, increments
+is enqueued; a downstream consumer drains it asynchronously. The default consumer writes
+JSON lines to stderr. On overflow the dispatcher drops the event, increments
 `sbproxy_policy_audit_events_dropped_total{tenant}`, and continues; the hot path never
 blocks on the bus.
 
