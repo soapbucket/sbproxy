@@ -12,6 +12,15 @@ the next version cut.
 
 ### Added
 
+- **External AI guardrails now use hardened vendor contracts.** Generic
+  webhooks and Presidio remain compatible, while Lakera, Aporia, Azure AI
+  Content Safety, Amazon Bedrock Guardrails, CrowdStrike AIDR, Mistral
+  moderation, Pangea AI Guard, and Patronus have typed adapters. Credentials
+  resolve through the existing secret providers; outbound URLs are validated
+  and DNS-pinned; redirects are disabled; and responses have a timeout and a
+  64 KiB limit. Fail policy now covers malformed responses, replayed output,
+  streaming, and uninspectable multipart content before bytes can leave the
+  gateway. See [`docs/guardrails.md`](docs/guardrails.md).
 - **AI routing learns live locality and shares caller quota across the
   fleet.** Prefix affinity records bounded, expiring provider holders and
   falls back by recent token load; outcome-aware routing blends learned
