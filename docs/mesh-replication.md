@@ -29,7 +29,7 @@ place managed-model requests using the same gossip cluster's typed-state
 cache, and approximate-tier key budgets disseminate per-node counters
 over it too (see [key-management.md](key-management.md)). Neither
 consumer uses the durable, quorum-checked `replication` block described
-below — they read the best-effort single-owner cache this substrate
+below. They read the best-effort single-owner cache this substrate
 sits underneath. Read this page when you are standing up or operating
 the cluster substrate itself; read [model-cluster-symmetric](../examples/model-cluster-symmetric)
 or [model-cluster-split](../examples/model-cluster-split) for the

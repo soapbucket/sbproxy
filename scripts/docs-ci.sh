@@ -2,10 +2,13 @@
 # Wave 1 / Q1.10 - Doc CI runner.
 #
 # Runs two checks over the documentation tree:
-#   1. lychee link checker (offline; external links live in .lycheeignore).
-#   2. Code-block syntax check: `rust` blocks go through `rust-script`,
-#      `bash` blocks go through `bash -n`. Blocks tagged `no_run` (rust)
-#      or `skip` (bash) are skipped.
+#   1. lychee link checker over the complete tree (offline; external links
+#      live in .lycheeignore).
+#   2. Code-block syntax check over the public, flat `docs/*.md` corpus:
+#      `rust` blocks go through rustc and `bash` blocks go through `bash -n`.
+#      Blocks tagged `no_run` (rust) or `skip` (bash) are skipped. Internal
+#      implementation artifacts under `docs/superpowers/` remain link-checked
+#      but their pseudocode fences are not executable documentation.
 #
 # Exits non-zero on the first failure. The companion workflow at
 # `.github/workflows/docs-ci.yml` (B1.10) wraps this script.
@@ -291,11 +294,17 @@ run_code() {
   local skipped=0
 
   for tree in "${TREES[@]}"; do
-    while IFS= read -r -d '' md; do
+    # Public documentation is flat at docs/*.md, which is also the source
+    # boundary used by regen-llms-full.sh. Nested docs/superpowers files are
+    # internal plans and specs: lychee checks their links above, but the Rust
+    # and Bash snippets they use to describe future work are not executable
+    # user documentation.
+    for md in "$tree"/*.md; do
+      [ -f "$md" ] || continue
       [ "${DOCS_CI_QUIET:-0}" = "1" ] || echo "[docs-ci] code blocks: $md"
       run_lang_pass "$md" rust check_rust_block rc checked skipped
       run_lang_pass "$md" bash check_bash_block rc checked skipped
-    done < <(find "$tree" -type f -name '*.md' -print0)
+    done
   done
 
   echo "[docs-ci] code-block check: checked=$checked skipped=$skipped rc=$rc"

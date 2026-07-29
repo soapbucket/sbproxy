@@ -61,7 +61,7 @@ blocks are evaluated by a secondary LLM judge (`ToolOutputJudge`)
 before any served session-ledger outcome, compaction, or client
 response. The judge call is no-tools, fail-closed (timeout, malformed
 response, and egress denial all quarantine), and emits only a digest
-or closed reason code — never matched text or raw tool output.
+or closed reason code, never matched text or raw tool output.
 
 ```yaml
 action:

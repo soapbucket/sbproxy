@@ -445,7 +445,7 @@ walks through that same fixture end to end, including a real
 ## See also
 
 - [`use-case-mcp-federation.md`](use-case-mcp-federation.md): the
-  solution guide — problem, RBAC allowlist, and next steps.
+  solution guide: problem, RBAC allowlist, and next steps.
 - [`migration-mcp-rbac.md`](migration-mcp-rbac.md): upgrade
   walk-through for the principal-aware ACL and default-deny
   flip.
