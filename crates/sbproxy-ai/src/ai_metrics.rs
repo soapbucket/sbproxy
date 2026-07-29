@@ -907,11 +907,7 @@ fn normalize_external_guardrail_labels<'a>(
 }
 
 #[cfg(test)]
-pub(crate) fn external_guardrail_verdict_value(
-    provider: &str,
-    phase: &str,
-    outcome: &str,
-) -> f64 {
+pub(crate) fn external_guardrail_verdict_value(provider: &str, phase: &str, outcome: &str) -> f64 {
     let (provider, phase, outcome) = normalize_external_guardrail_labels(provider, phase, outcome);
     AI_EXTERNAL_GUARDRAIL_VERDICTS
         .with_label_values(&[provider, phase, outcome])

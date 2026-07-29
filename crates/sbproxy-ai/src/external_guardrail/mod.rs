@@ -6,7 +6,9 @@
 
 #![allow(missing_docs)]
 
+mod aporia;
 mod generic;
+mod lakera;
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -399,13 +401,11 @@ impl ExternalGuardrailConfig {
                 url: self.required_url()?,
                 auth: self.configured_auth()?,
             }),
-            GuardrailProvider::Presidio => {
-                CompiledGuardrailProvider::Presidio(PresidioConfig {
-                    url: self.required_url()?,
-                    language: self.language.clone().unwrap_or_else(|| "en".to_string()),
-                    auth: self.configured_auth()?,
-                })
-            }
+            GuardrailProvider::Presidio => CompiledGuardrailProvider::Presidio(PresidioConfig {
+                url: self.required_url()?,
+                language: self.language.clone().unwrap_or_else(|| "en".to_string()),
+                auth: self.configured_auth()?,
+            }),
             GuardrailProvider::Lakera => CompiledGuardrailProvider::Lakera(LakeraConfig {
                 url: self
                     .url
@@ -457,20 +457,18 @@ impl ExternalGuardrailConfig {
                     auth: self.required_provider_auth("Authorization", "Bearer")?,
                 })
             }
-            GuardrailProvider::Mistral => {
-                CompiledGuardrailProvider::Mistral(MistralConfig {
-                    url: self
-                        .url
-                        .clone()
-                        .unwrap_or_else(|| "https://api.mistral.ai/v1/moderations".to_string()),
-                    model: self
-                        .model
-                        .clone()
-                        .unwrap_or_else(|| "mistral-moderation-2603".to_string()),
-                    score_threshold: self.score_threshold,
-                    auth: self.required_provider_auth("Authorization", "Bearer")?,
-                })
-            }
+            GuardrailProvider::Mistral => CompiledGuardrailProvider::Mistral(MistralConfig {
+                url: self
+                    .url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.mistral.ai/v1/moderations".to_string()),
+                model: self
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "mistral-moderation-2603".to_string()),
+                score_threshold: self.score_threshold,
+                auth: self.required_provider_auth("Authorization", "Bearer")?,
+            }),
             GuardrailProvider::Pangea => CompiledGuardrailProvider::Pangea(PangeaConfig {
                 url: self
                     .url
@@ -486,20 +484,18 @@ impl ExternalGuardrailConfig {
                     .unwrap_or_else(|| "pangea_response_guard".to_string()),
                 auth: self.required_provider_auth("Authorization", "Bearer")?,
             }),
-            GuardrailProvider::Patronus => {
-                CompiledGuardrailProvider::Patronus(PatronusConfig {
-                    url: self
-                        .url
-                        .clone()
-                        .unwrap_or_else(|| "https://api.patronus.ai/v1/evaluate".to_string()),
-                    evaluator: self
-                        .evaluator
-                        .clone()
-                        .unwrap_or_else(|| "prompt-injection".to_string()),
-                    criteria: self.criteria.clone(),
-                    auth: self.required_provider_auth("X-API-KEY", "")?,
-                })
-            }
+            GuardrailProvider::Patronus => CompiledGuardrailProvider::Patronus(PatronusConfig {
+                url: self
+                    .url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.patronus.ai/v1/evaluate".to_string()),
+                evaluator: self
+                    .evaluator
+                    .clone()
+                    .unwrap_or_else(|| "prompt-injection".to_string()),
+                criteria: self.criteria.clone(),
+                auth: self.required_provider_auth("X-API-KEY", "")?,
+            }),
         };
         self.validate_endpoint(compiled.url())?;
         Ok(compiled)
@@ -526,7 +522,8 @@ impl ExternalGuardrailConfig {
 
     fn validate_configured_auth(&self) -> Result<()> {
         let header = self.auth_header.as_deref().unwrap_or("Authorization");
-        HeaderName::from_bytes(header.as_bytes()).map_err(|_| anyhow::anyhow!("invalid auth_header"))?;
+        HeaderName::from_bytes(header.as_bytes())
+            .map_err(|_| anyhow::anyhow!("invalid auth_header"))?;
         if let Some(key) = &self.api_key {
             let prefix = self.auth_prefix.as_deref().unwrap_or("");
             build_auth(header, prefix, key)?;
@@ -664,12 +661,12 @@ async fn dispatch(
 ) -> std::result::Result<GuardrailVerdict, GuardrailCallError> {
     let compiled = config.validate().map_err(|_| GuardrailCallError::Request)?;
     let body = match &compiled {
-        CompiledGuardrailProvider::Generic(provider) => {
-            generic::generic_request(provider, request)
-        }
+        CompiledGuardrailProvider::Generic(provider) => generic::generic_request(provider, request),
         CompiledGuardrailProvider::Presidio(provider) => {
             generic::presidio_request(provider, request)
         }
+        CompiledGuardrailProvider::Lakera(provider) => lakera::lakera_request(provider, request),
+        CompiledGuardrailProvider::Aporia(provider) => aporia::aporia_request(provider, request),
         _ => return Err(GuardrailCallError::UnsupportedProvider),
     };
     let mut call = config
@@ -701,6 +698,8 @@ async fn dispatch(
     match &compiled {
         CompiledGuardrailProvider::Generic(_) => generic::parse_generic(&body),
         CompiledGuardrailProvider::Presidio(_) => generic::parse_presidio(&body),
+        CompiledGuardrailProvider::Lakera(_) => lakera::parse_lakera(&body),
+        CompiledGuardrailProvider::Aporia(_) => aporia::parse_aporia(&body),
         _ => Err(GuardrailCallError::UnsupportedProvider),
     }
 }
@@ -793,7 +792,8 @@ mod tests {
         let aporia: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
             "name":"aporia", "provider":"aporia", "url":"https://8.8.8.8/validate",
             "mode":"pre_call", "api_key":"fixture-key", "project_id":"fixture-project"
-        })).unwrap();
+        }))
+        .unwrap();
         let CompiledGuardrailProvider::Aporia(aporia) = aporia.validate().unwrap() else {
             panic!("expected Aporia contract");
         };
@@ -803,7 +803,8 @@ mod tests {
             "name":"mistral", "provider":"mistral", "url":"https://8.8.8.8/moderations",
             "mode":"pre_call", "api_key":"fixture-key", "model":"fixture-model",
             "score_threshold":0.75
-        })).unwrap();
+        }))
+        .unwrap();
         let CompiledGuardrailProvider::Mistral(mistral) = mistral.validate().unwrap() else {
             panic!("expected Mistral contract");
         };
@@ -814,7 +815,8 @@ mod tests {
             "name":"pangea", "provider":"pangea", "url":"https://8.8.8.8/guard",
             "mode":"pre_call", "api_key":"fixture-key", "input_recipe":"input-recipe",
             "output_recipe":"output-recipe"
-        })).unwrap();
+        }))
+        .unwrap();
         let CompiledGuardrailProvider::Pangea(pangea) = pangea.validate().unwrap() else {
             panic!("expected Pangea contract");
         };
@@ -840,7 +842,9 @@ mod tests {
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
             let cfg: ExternalGuardrailConfig = serde_json::from_value(document).unwrap();
-            let error = cfg.validate().expect_err("invalid auth/interpolation must fail");
+            let error = cfg
+                .validate()
+                .expect_err("invalid auth/interpolation must fail");
             assert!(!error.to_string().contains("fixture-key"));
         }
     }
@@ -865,9 +869,8 @@ mod tests {
     }
     #[tokio::test]
     async fn logging_only_records_but_never_blocks() {
-        let before = crate::ai_metrics::external_guardrail_verdict_value(
-            "generic", "input", "block",
-        );
+        let before =
+            crate::ai_metrics::external_guardrail_verdict_value("generic", "input", "block");
         let url =
             fixture_server(r#"{"allowed":false,"reason":"do not expose me"}"#.to_string()).await;
         let cfg: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
@@ -878,24 +881,21 @@ mod tests {
         assert!(run_input_external_guardrails(&[cfg], "prompt")
             .await
             .is_none());
-        let after = crate::ai_metrics::external_guardrail_verdict_value(
-            "generic", "input", "block",
-        );
+        let after =
+            crate::ai_metrics::external_guardrail_verdict_value("generic", "input", "block");
         assert!(after > before, "logging_only must record its verdict");
     }
     #[test]
     fn external_guardrail_metric_labels_are_bounded() {
-        let before = crate::ai_metrics::external_guardrail_verdict_value(
-            "unknown", "unknown", "unknown",
-        );
+        let before =
+            crate::ai_metrics::external_guardrail_verdict_value("unknown", "unknown", "unknown");
         crate::ai_metrics::record_external_guardrail_verdict(
             "attacker-provider",
             "attacker-phase",
             "attacker-outcome",
         );
-        let after = crate::ai_metrics::external_guardrail_verdict_value(
-            "unknown", "unknown", "unknown",
-        );
+        let after =
+            crate::ai_metrics::external_guardrail_verdict_value("unknown", "unknown", "unknown");
         assert!(after > before);
     }
     #[test]
@@ -920,21 +920,22 @@ mod tests {
             request,
             serde_json::json!({"text":"fixture prompt","language":"es"})
         );
-        assert!(generic::parse_presidio(&serde_json::json!([]))
-            .unwrap()
-            .allowed);
-        assert!(!generic::parse_presidio(
-            &serde_json::json!([{"entity_type":"PERSON"}])
-        )
-        .unwrap()
-        .allowed);
+        assert!(
+            generic::parse_presidio(&serde_json::json!([]))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !generic::parse_presidio(&serde_json::json!([{"entity_type":"PERSON"}]))
+                .unwrap()
+                .allowed
+        );
         assert!(generic::parse_presidio(&serde_json::json!({"allowed":true})).is_err());
     }
     #[tokio::test]
     async fn provider_reason_is_never_exposed() {
         const SENTINEL: &str = "secret-prompt-SENTINEL-7359";
-        let url =
-            fixture_server(format!(r#"{{"allowed":false,"reason":"{SENTINEL}"}}"#)).await;
+        let url = fixture_server(format!(r#"{{"allowed":false,"reason":"{SENTINEL}"}}"#)).await;
         let cfg: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
             "name":"custom", "url":url, "mode":"pre_call", "default_on":true,
             "allow_private_url":true

@@ -91,7 +91,7 @@ pub(super) fn parse_presidio(body: &Value) -> Result<GuardrailVerdict, Guardrail
     })
 }
 
-fn normalize_category(value: &str) -> Option<String> {
+pub(super) fn normalize_category(value: &str) -> Option<String> {
     let normalized = value
         .chars()
         .take(64)
