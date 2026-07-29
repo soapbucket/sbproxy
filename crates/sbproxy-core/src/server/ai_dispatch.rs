@@ -2876,12 +2876,14 @@ pub(super) async fn handle_ai_proxy(
         }
 
         let status = resp.status().as_u16();
-        let resp_ct = resp
+        let upstream_content_type = resp
             .headers()
             .get("content-type")
             .and_then(|value| value.to_str().ok())
-            .unwrap_or("application/json")
-            .to_string();
+            .map(str::to_string);
+        let resp_ct = upstream_content_type
+            .clone()
+            .unwrap_or_else(|| "application/json".to_string());
         let retry_after = resp
             .headers()
             .get(reqwest::header::RETRY_AFTER)
@@ -2939,12 +2941,12 @@ pub(super) async fn handle_ai_proxy(
             if cost_micros > 0 {
                 ctx.ai_cost_usd_micros = Some(cost_micros);
             }
-            if let Some(block) = ai_output_guardrail_block(
+            if let Some(block) = multipart_external_output_guardrail_block(
                 status,
-                None,
                 multipart_external,
                 response_body.as_ref(),
                 &selected_model,
+                upstream_content_type.as_deref(),
             )
             .await
             {
@@ -2976,12 +2978,12 @@ pub(super) async fn handle_ai_proxy(
             &ctx.rollup_properties,
             &ai_span,
         );
-        if let Some(block) = ai_output_guardrail_block(
+        if let Some(block) = multipart_external_output_guardrail_block(
             status,
-            None,
             multipart_external,
             response_body.as_ref(),
             &selected_model,
+            upstream_content_type.as_deref(),
         )
         .await
         {
@@ -6409,6 +6411,46 @@ async fn ai_output_guardrail_block(
     external_output_guardrail_block(external, body, model).await
 }
 
+fn external_guardrail_text_media_type(content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    media_type.starts_with("text/")
+        || matches!(
+            media_type.as_str(),
+            "application/json"
+                | "application/json-seq"
+                | "application/x-ndjson"
+                | "application/xml"
+                | "application/javascript"
+                | "application/x-javascript"
+        )
+        || media_type.ends_with("+json")
+        || media_type.ends_with("+xml")
+}
+
+async fn multipart_external_output_guardrail_block(
+    status: u16,
+    configs: &[sbproxy_ai::external_guardrail::ExternalGuardrailConfig],
+    body: &[u8],
+    model: &str,
+    content_type: Option<&str>,
+) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    if !content_type.is_some_and(external_guardrail_text_media_type) {
+        return sbproxy_ai::external_guardrail::run_output_external_guardrails_without_content(
+            configs,
+        )
+        .map(|(name, reason)| sbproxy_ai::guardrails::GuardrailBlock { name, reason });
+    }
+    external_output_guardrail_block(configs, body, model).await
+}
+
 async fn send_guardrail_block_response(
     session: &mut Session,
     ctx: &mut RequestContext,
@@ -9617,6 +9659,13 @@ mod external_guardrail_context_tests {
         body: Vec<u8>,
         content_type: &'static str,
     ) -> (String, Arc<AtomicUsize>) {
+        upstream_bytes_fixture_with_optional_content_type(body, Some(content_type)).await
+    }
+
+    async fn upstream_bytes_fixture_with_optional_content_type(
+        body: Vec<u8>,
+        content_type: Option<&'static str>,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind upstream fixture");
@@ -9631,8 +9680,11 @@ mod external_guardrail_context_tests {
                 .read(&mut request)
                 .await
                 .expect("read upstream request");
+            let content_type_header = content_type
+                .map(|content_type| format!("content-type: {content_type}\r\n"))
+                .unwrap_or_default();
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\n{content_type_header}content-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()
             );
             stream
@@ -10044,37 +10096,51 @@ mod external_guardrail_context_tests {
     }
 
     #[tokio::test]
-    async fn external_output_guardrail_applies_no_content_mode_to_binary_multipart_response() {
-        let (upstream_url, upstream_hits) =
-            upstream_bytes_fixture(vec![0xff, 0xfe, 0xfd], "application/octet-stream").await;
-        let config = proxy_config(
-            &upstream_url,
-            "https://8.8.8.8/check".to_string(),
-            "post_call",
-        );
-        let (content_type, body) = multipart_audio_request();
-        let (mut session, client) =
-            downstream_bytes_session("/v1/audio/transcriptions", content_type, body).await;
-        let mut context = crate::context::RequestContext::new();
+    async fn external_output_guardrail_uses_no_content_mode_for_uninspectable_multipart() {
+        for (upstream_body, upstream_content_type) in [
+            (
+                b"valid UTF-8 bytes with a binary media type".to_vec(),
+                Some("application/octet-stream"),
+            ),
+            (vec![0xff, 0xfe, 0xfd], Some("application/json")),
+            (b"valid UTF-8 bytes without a media type".to_vec(), None),
+        ] {
+            let (guardrail_url, guardrail_hits) = upstream_fixture(r#"{"allowed":true}"#).await;
+            let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_optional_content_type(
+                upstream_body,
+                upstream_content_type,
+            )
+            .await;
+            let config = proxy_config(&upstream_url, guardrail_url, "post_call");
+            let (content_type, body) = multipart_audio_request();
+            let (mut session, client) =
+                downstream_bytes_session("/v1/audio/transcriptions", content_type, body).await;
+            let mut context = crate::context::RequestContext::new();
 
-        super::handle_ai_proxy(
-            &mut session,
-            &config,
-            &crate::pipeline::CompiledPipeline::default(),
-            "ai.test",
-            &mut context,
-            None,
-        )
-        .await
-        .expect("binary multipart output block is handled");
-        drop(session);
+            super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &crate::pipeline::CompiledPipeline::default(),
+                "ai.test",
+                &mut context,
+                None,
+            )
+            .await
+            .expect("uninspectable multipart output block is handled");
+            drop(session);
 
-        let response = String::from_utf8(client.await.expect("downstream client"))
-            .expect("safe response utf8");
-        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
-        assert!(response.contains("guardrail_violation"), "{response}");
-        assert!(!response.contains('\u{fffd}'), "{response}");
-        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+            let response = String::from_utf8(client.await.expect("downstream client"))
+                .expect("safe response utf8");
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+            assert!(response.contains("guardrail_violation"), "{response}");
+            assert!(!response.contains('\u{fffd}'), "{response}");
+            assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                guardrail_hits.load(Ordering::SeqCst),
+                0,
+                "uninspectable multipart bytes must not leave the gateway"
+            );
+        }
     }
 
     #[tokio::test]

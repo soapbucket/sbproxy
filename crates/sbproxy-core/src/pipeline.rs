@@ -29,7 +29,8 @@ use sbproxy_cache::{
 };
 use sbproxy_config::{CompiledConfig, Parameter, RequestModifierConfig};
 use sbproxy_modules::compile::{
-    compile_action, compile_action_for_origin, compile_auth, compile_policy, compile_transform,
+    compile_action_for_origin, compile_action_for_origin_for_validation, compile_auth,
+    compile_policy, compile_transform,
 };
 use sbproxy_modules::transform::{CompiledTransform, TransformConfig};
 use sbproxy_modules::{Action, Auth, BotDetection, Policy, ThreatProtection};
@@ -1206,7 +1207,15 @@ impl CompiledPipeline {
                 origin.origin_id.as_str(),
                 None,
             );
-            let action = compile_action_for_origin(&origin.action_config, &action_identity)?;
+            let action = match mode {
+                PipelineConstructionMode::Runtime => {
+                    compile_action_for_origin(&origin.action_config, &action_identity)?
+                }
+                PipelineConstructionMode::Validation => compile_action_for_origin_for_validation(
+                    &origin.action_config,
+                    &action_identity,
+                )?,
+            };
             actions.push(action);
 
             // Compile auth (optional per origin).
@@ -1273,11 +1282,12 @@ impl CompiledPipeline {
                 &origin.forward_rules,
                 origin.workspace_id.as_str(),
                 origin.origin_id.as_str(),
+                mode,
             )?;
             forward_rules.push(origin_fwd_rules);
 
             // Compile fallback origin (optional per origin).
-            let fallback = compile_fallback(&origin.fallback_origin)?;
+            let fallback = compile_fallback(&origin.fallback_origin, mode)?;
             fallbacks.push(fallback);
 
             // Compile bot detection (optional per origin).
@@ -1759,11 +1769,12 @@ fn compile_forward_rules(
     raw_rules: &[serde_json::Value],
     workspace_id: &str,
     origin_id: &str,
+    mode: PipelineConstructionMode,
 ) -> anyhow::Result<Vec<CompiledForwardRule>> {
     let mut compiled = Vec::with_capacity(raw_rules.len());
     for (rule_index, rule_val) in raw_rules.iter().enumerate() {
         let rule_id = routing_action_identity(workspace_id, origin_id, Some(rule_index));
-        let fwd = compile_single_forward_rule(rule_val, &rule_id)?;
+        let fwd = compile_single_forward_rule(rule_val, &rule_id, mode)?;
         compiled.push(fwd);
     }
     Ok(compiled)
@@ -1801,6 +1812,7 @@ fn compile_forward_rules(
 fn compile_single_forward_rule(
     val: &serde_json::Value,
     rule_id: &str,
+    mode: PipelineConstructionMode,
 ) -> anyhow::Result<CompiledForwardRule> {
     let rules_arr = val
         .get("rules")
@@ -1834,7 +1846,12 @@ fn compile_single_forward_rule(
     let action_config = origin_obj
         .get("action")
         .ok_or_else(|| anyhow::anyhow!("forward rule origin missing 'action'"))?;
-    let action = compile_action_for_origin(action_config, rule_id)?;
+    let action = match mode {
+        PipelineConstructionMode::Runtime => compile_action_for_origin(action_config, rule_id)?,
+        PipelineConstructionMode::Validation => {
+            compile_action_for_origin_for_validation(action_config, rule_id)?
+        }
+    };
 
     // Parse request modifiers (optional).
     // Supports both Rust format ({ headers: { set: ... } }) and Go format
@@ -1970,7 +1987,10 @@ fn compile_query_matcher(val: Option<&serde_json::Value>) -> anyhow::Result<Opti
 ///       status_code: 200
 ///       json_body: { ... }
 /// ```
-fn compile_fallback(raw: &Option<serde_json::Value>) -> anyhow::Result<Option<CompiledFallback>> {
+fn compile_fallback(
+    raw: &Option<serde_json::Value>,
+    mode: PipelineConstructionMode,
+) -> anyhow::Result<Option<CompiledFallback>> {
     let val = match raw {
         Some(v) => v,
         None => return Ok(None),
@@ -2003,7 +2023,12 @@ fn compile_fallback(raw: &Option<serde_json::Value>) -> anyhow::Result<Option<Co
     let action_config = origin_obj
         .get("action")
         .ok_or_else(|| anyhow::anyhow!("fallback origin missing 'action'"))?;
-    let action = compile_action(action_config)?;
+    let action = match mode {
+        PipelineConstructionMode::Runtime => compile_action_for_origin(action_config, "")?,
+        PipelineConstructionMode::Validation => {
+            compile_action_for_origin_for_validation(action_config, "")?
+        }
+    };
 
     Ok(Some(CompiledFallback {
         on_error,

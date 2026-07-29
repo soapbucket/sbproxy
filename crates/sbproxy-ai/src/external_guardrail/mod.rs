@@ -232,10 +232,11 @@ pub struct ExternalGuardrailConfig {
 
 impl std::fmt::Debug for ExternalGuardrailConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let url = self.url.as_deref().map(sanitized_debug_url);
         formatter
             .debug_struct("ExternalGuardrailConfig")
             .field("name", &self.name)
-            .field("url", &self.url)
+            .field("url", &url)
             .field("mode", &self.mode)
             .field("default_on", &self.default_on)
             .field("fail_open", &self.fail_open)
@@ -261,6 +262,18 @@ impl std::fmt::Debug for ExternalGuardrailConfig {
             .field("prepared", &self.prepared.get().is_some())
             .finish()
     }
+}
+
+fn sanitized_debug_url(value: &str) -> String {
+    let Ok(mut url) = url::Url::parse(value) else {
+        return "[INVALID URL]".to_string();
+    };
+    let _ = url.set_password(None);
+    let _ = url.set_username("");
+    url.set_path("/");
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
 }
 
 fn default_timeout_ms() -> u64 {
@@ -592,11 +605,32 @@ impl ExternalGuardrailConfig {
     }
 
     fn validate_endpoint(&self, url: &str) -> Result<()> {
+        validate_http_url(url)?;
         if self.allow_private_url {
-            validate_http_url(url)
-        } else {
-            sbproxy_security::validate_url(url).map_err(anyhow::Error::msg)
+            return Ok(());
         }
+
+        // Structural validation must not perform DNS. Runtime preparation
+        // resolves and pins the endpoint before publication; here we reject
+        // the private targets that are knowable from the URL alone.
+        let parsed = url::Url::parse(url).context("invalid URL")?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("URL has no host"))?;
+        if host.eq_ignore_ascii_case("localhost")
+            || host
+                .to_ascii_lowercase()
+                .strip_suffix(".localhost")
+                .is_some()
+        {
+            bail!("blocked: hostname '{host}' is private/internal");
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if sbproxy_security::is_private_ip(&ip) {
+                bail!("blocked: IP address {ip} is private/internal");
+            }
+        }
+        Ok(())
     }
 
     fn validate_configured_auth(&self) -> Result<()> {
@@ -1105,6 +1139,43 @@ mod tests {
         assert!(!debug.contains("resolved-fixture-key"));
         assert!(!debug.contains("secret://guardrails/customer-policy"));
     }
+
+    #[test]
+    fn structural_validation_does_not_resolve_dns() {
+        let cfg: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
+            "name": "custom",
+            "url": "https://guardrail-does-not-exist.invalid/check",
+            "mode": "pre_call"
+        }))
+        .unwrap();
+
+        cfg.validate()
+            .expect("structural validation must not depend on DNS");
+        assert!(!cfg.is_prepared());
+    }
+
+    #[test]
+    fn debug_redacts_url_credentials_query_and_fragment() {
+        let cfg: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
+            "name": "custom",
+            "url": "https://webhook-user:webhook-password@guard.example.test/hooks/path-secret?token=query-secret#fragment-secret",
+            "mode": "pre_call"
+        }))
+        .unwrap();
+
+        let debug = format!("{cfg:?}");
+        assert!(debug.contains("https://guard.example.test/"));
+        for secret in [
+            "webhook-user",
+            "webhook-password",
+            "path-secret",
+            "query-secret",
+            "fragment-secret",
+        ] {
+            assert!(!debug.contains(secret), "{secret} leaked through Debug");
+        }
+    }
+
     #[test]
     fn private_url_requires_explicit_opt_in() {
         let cfg: ExternalGuardrailConfig = serde_json::from_value(

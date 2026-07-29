@@ -33,11 +33,32 @@ use crate::transform::{
 
 /// Compile a JSON action config into an Action enum variant.
 pub fn compile_action(config: &serde_json::Value) -> Result<Action> {
-    compile_action_for_origin(config, "")
+    compile_action_for_origin_with_runtime(config, "", true)
+}
+
+/// Compile a JSON action for validation without constructing runtime clients.
+pub fn compile_action_for_validation(config: &serde_json::Value) -> Result<Action> {
+    compile_action_for_origin_with_runtime(config, "", false)
 }
 
 /// Compile an action with the stable identity of its owning origin.
 pub fn compile_action_for_origin(config: &serde_json::Value, origin_id: &str) -> Result<Action> {
+    compile_action_for_origin_with_runtime(config, origin_id, true)
+}
+
+/// Compile an origin action for validation without constructing runtime clients.
+pub fn compile_action_for_origin_for_validation(
+    config: &serde_json::Value,
+    origin_id: &str,
+) -> Result<Action> {
+    compile_action_for_origin_with_runtime(config, origin_id, false)
+}
+
+fn compile_action_for_origin_with_runtime(
+    config: &serde_json::Value,
+    origin_id: &str,
+    prepare_runtime: bool,
+) -> Result<Action> {
     let type_name = extract_type(config)?;
     match type_name.as_str() {
         "proxy" => Ok(Action::Proxy(ProxyAction::from_config(config.clone())?)),
@@ -51,9 +72,14 @@ pub fn compile_action_for_origin(config: &serde_json::Value, origin_id: &str) ->
         "load_balancer" => Ok(Action::LoadBalancer(std::sync::Arc::new(
             LoadBalancerAction::from_config_for_origin(config.clone(), origin_id)?,
         ))),
-        "ai_proxy" => Ok(Action::AiProxy(Box::new(AiProxyAction::from_config(
-            config.clone(),
-        )?))),
+        "ai_proxy" => {
+            let action = if prepare_runtime {
+                AiProxyAction::from_config(config.clone())?
+            } else {
+                AiProxyAction::from_config_for_validation(config.clone())?
+            };
+            Ok(Action::AiProxy(Box::new(action)))
+        }
         "websocket" => Ok(Action::WebSocket(WebSocketAction::from_config(
             config.clone(),
         )?)),
