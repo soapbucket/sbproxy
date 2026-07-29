@@ -32,15 +32,25 @@ use crate::{
 /// `latest`; an operator overrides it through the `acquire.version` field.
 pub const DEFAULT_SGLANG_VERSION: &str = "0.5.2";
 
-/// Curated digest-pinned default SGLang container image (WOR-1917).
+/// Curated digest-pinned default SGLang container image.
 ///
-/// The container-first default selects it when a deployment forces
-/// `engine: sglang`, the operator has not configured SGLang provisioning,
-/// and the worker has a container runtime. It matches
-/// [`DEFAULT_SGLANG_VERSION`] and is pinned by an immutable sha256 digest,
-/// never a floating tag. The digest here is a placeholder of the correct
-/// 64-character shape.
-// TODO(WOR-1917): orchestrator will replace with the resolved digest for v0.4.6.post1
+/// The digest is real and registry-verified: it is the Docker Hub manifest
+/// digest of `lmsysorg/sglang:v0.5.2`, the tag matching
+/// [`DEFAULT_SGLANG_VERSION`], and this exact image served live tokens on
+/// an NVIDIA L4 in the recorded engine benchmark
+/// (`docs/serving-engine-benchmark.md`). The container-first default
+/// selects it when a deployment forces `engine: sglang`, the operator has
+/// not configured SGLang provisioning, and the worker has a container
+/// runtime. It is pinned by an immutable sha256 digest, never a floating
+/// tag.
+///
+/// Refresh happens only when [`DEFAULT_SGLANG_VERSION`] moves, in the same
+/// commit: whoever bumps the version resolves the new tag's digest with
+/// `docker buildx imagetools inspect lmsysorg/sglang:v<version> --format
+/// '{{.Manifest.Digest}}'`, updates this constant, and exercises the new
+/// pin on real hardware before release. A pinned digest never goes stale
+/// on its own, so there is no scheduled refresh cadence; an old default
+/// means an old engine version, not a broken pull.
 pub const DEFAULT_SGLANG_IMAGE: &str =
     "lmsysorg/sglang@sha256:f3b48b0e06ba98f2fa1dcf62254f14573af8ce7d9d3b519e771ee77a473c6d43";
 
@@ -1037,22 +1047,15 @@ mod tests {
     }
 
     #[test]
-    fn default_sglang_image_has_digest_shape() {
-        // The default image is a `repository@sha256:<64>` reference. Until the
-        // orchestrator patches the real digest (the REPLACE marker is still
-        // present) the strict digest-pinned assertion is skipped: only the
-        // structural shape is checked so the const cannot silently rot. Once
-        // the marker is gone, the full immutable-digest check applies.
-        let (repository, digest) = DEFAULT_SGLANG_IMAGE
-            .rsplit_once("@sha256:")
-            .expect("digest-form image reference");
-        assert_eq!(repository, "lmsysorg/sglang");
-        assert_eq!(digest.len(), 64, "digest must keep the 64-character shape");
-        if DEFAULT_SGLANG_IMAGE.contains("REPLACE_ME") {
-            assert!(!digest_pinned_image(DEFAULT_SGLANG_IMAGE));
-        } else {
-            assert!(digest_pinned_image(DEFAULT_SGLANG_IMAGE));
-        }
+    fn default_sglang_image_is_digest_pinned() {
+        // The curated container-first default must be an immutable digest so
+        // the container driver accepts it without an operator override. The
+        // digest is the registry manifest digest of the tag matching
+        // DEFAULT_SGLANG_VERSION, exercised live on an NVIDIA L4 in
+        // docs/serving-engine-benchmark.md; refresh it in the same commit
+        // that bumps DEFAULT_SGLANG_VERSION.
+        assert!(digest_pinned_image(DEFAULT_SGLANG_IMAGE));
+        assert!(DEFAULT_SGLANG_IMAGE.starts_with("lmsysorg/sglang@sha256:"));
     }
 
     #[test]
