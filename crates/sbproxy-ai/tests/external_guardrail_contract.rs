@@ -181,7 +181,8 @@ async fn lakera_block_malformed_status_timeout_and_fail_modes_are_safe() {
 
 #[tokio::test]
 async fn aporia_input_and_output_contracts_allow_and_send_exact_wire_format() {
-    let (base_url, received) = fixture_server(200, r#"{"result":"allow"}"#, Duration::ZERO).await;
+    let (base_url, received) =
+        fixture_server(200, r#"{"action":"passthrough"}"#, Duration::ZERO).await;
     let config = provider_config(
         "aporia",
         format!("{base_url}/fixture-project/validate"),
@@ -200,7 +201,8 @@ async fn aporia_input_and_output_contracts_allow_and_send_exact_wire_format() {
         r#"{"explain":true,"messages":[{"content":"fixture prompt","role":"user"}],"validation_target":"prompt"}"#
     ));
 
-    let (base_url, received) = fixture_server(200, r#"{"result":"allow"}"#, Duration::ZERO).await;
+    let (base_url, received) =
+        fixture_server(200, r#"{"action":"passthrough"}"#, Duration::ZERO).await;
     let config = provider_config(
         "aporia",
         format!("{base_url}/fixture-project/validate"),
@@ -220,7 +222,7 @@ async fn aporia_input_and_output_contracts_allow_and_send_exact_wire_format() {
 
 #[tokio::test]
 async fn aporia_block_malformed_status_timeout_and_fail_modes_are_safe() {
-    let (base_url, received) = fixture_server(200, r#"{"result":"block"}"#, Duration::ZERO).await;
+    let (base_url, received) = fixture_server(200, r#"{"action":"block"}"#, Duration::ZERO).await;
     let config = provider_config(
         "aporia",
         format!("{base_url}/fixture-project/validate"),
@@ -234,11 +236,13 @@ async fn aporia_block_malformed_status_timeout_and_fail_modes_are_safe() {
 
     for (status, body, delay, fail_open, expected_allowed) in [
         (200, "{not json", Duration::ZERO, true, true),
-        (200, r#"{"result":"unknown"}"#, Duration::ZERO, true, true),
+        (200, r#"{}"#, Duration::ZERO, false, false),
+        (200, r#"{"action":true}"#, Duration::ZERO, false, false),
+        (200, r#"{"action":"unknown"}"#, Duration::ZERO, true, true),
         (502, r#"{}"#, Duration::ZERO, false, false),
         (
             200,
-            r#"{"result":"allow"}"#,
+            r#"{"action":"passthrough"}"#,
             Duration::from_millis(50),
             false,
             false,
@@ -257,6 +261,63 @@ async fn aporia_block_malformed_status_timeout_and_fail_modes_are_safe() {
                 .await
                 .allowed,
             expected_allowed
+        );
+        let _ = received.await;
+    }
+}
+
+#[tokio::test]
+async fn aporia_modify_and_rephrase_obey_both_fail_modes() {
+    for (action, fail_open, expected_allowed, expected_reason) in [
+        (
+            "modify",
+            false,
+            false,
+            "external guardrail unavailable; fail-closed",
+        ),
+        (
+            "modify",
+            true,
+            true,
+            "external guardrail unavailable; fail-open",
+        ),
+        (
+            "rephrase",
+            false,
+            false,
+            "external guardrail unavailable; fail-closed",
+        ),
+        (
+            "rephrase",
+            true,
+            true,
+            "external guardrail unavailable; fail-open",
+        ),
+    ] {
+        let response = match action {
+            "modify" => r#"{"action":"modify","revised_response":"vendor controlled"}"#,
+            "rephrase" => r#"{"action":"rephrase","revised_response":"vendor controlled"}"#,
+            _ => unreachable!("fixture action is fixed"),
+        };
+        let (base_url, received) = fixture_server(200, response, Duration::ZERO).await;
+        let config = provider_config(
+            "aporia",
+            format!("{base_url}/fixture-project/validate"),
+            fail_open,
+            2_000,
+        );
+
+        let verdict = check_external_guardrail(&config, request(GuardrailPhase::Output)).await;
+
+        assert_eq!(verdict.allowed, expected_allowed);
+        assert_eq!(verdict.reason.as_deref(), Some(expected_reason));
+        assert!(
+            !verdict
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("vendor controlled"),
+            "vendor response text must not become an operator reason"
         );
         let _ = received.await;
     }

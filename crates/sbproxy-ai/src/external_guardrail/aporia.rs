@@ -25,13 +25,14 @@ pub(super) fn aporia_request(
 }
 
 pub(super) fn parse_aporia(body: &Value) -> Result<GuardrailVerdict, GuardrailCallError> {
-    let result = body
-        .get("result")
+    let action = body
+        .get("action")
         .and_then(Value::as_str)
         .ok_or(GuardrailCallError::InvalidVerdict)?;
-    let allowed = match result {
-        "allow" => true,
+    let allowed = match action {
+        "passthrough" => true,
         "block" => false,
+        "modify" | "rephrase" => return Err(GuardrailCallError::InvalidVerdict),
         _ => return Err(GuardrailCallError::InvalidVerdict),
     };
     Ok(GuardrailVerdict {
