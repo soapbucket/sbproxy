@@ -132,8 +132,14 @@ The target adapter set is:
 - Mistral moderation;
 - Pangea;
 - Patronus;
-- Prompt Security;
 - a documented generic webhook contract.
+
+Prompt Security is not a named adapter in this release. Its current public API
+endpoint and response contract could not be verified from authoritative vendor
+documentation, and the previously referenced hostname does not pass normal TLS
+hostname validation. Operators can use the generic webhook for a verified
+custom endpoint. A named adapter can be added after its request, authentication,
+response, timeout, and malformed-response behavior can be tested.
 
 Each adapter owns only request shaping, authentication, and response parsing.
 The shared pipeline owns URL validation, body limits, timeout behavior,
