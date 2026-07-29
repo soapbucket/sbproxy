@@ -21,7 +21,7 @@ guardrails:
       timeout_ms: 500
 ```
 
-`name` is a safe identifier for logs and client error codes. Metrics use bounded provider, phase, and outcome labels instead. `provider: generic` selects the small JSON contract below. A loopback URL needs `allow_private_url: true`; public URLs are resolved and pinned before use, while private targets are rejected by default. `mode: pre_call` evaluates the request before provider dispatch. `default_on: true` automatically enables the configured phases on this route. `fail_open: false` makes a timeout, a non-success response, malformed JSON, or a response larger than 64 KiB block the request. `timeout_ms` accepts 1 through 30000 and defaults to 2000.
+`name` is an operator-defined identifier used in logs and client error codes. Metrics use bounded provider, phase, and outcome labels instead. `provider: generic` selects the small JSON contract below. A loopback URL needs `allow_private_url: true`; public URLs are resolved and pinned before use, while private targets are rejected by default. `mode: pre_call` evaluates the request before provider dispatch. `default_on: true` automatically enables the configured phases on this route. `fail_open: false` makes a timeout, a non-success response, malformed JSON, or a response larger than 64 KiB block the request. `timeout_ms` accepts 1 through 30000 and defaults to 2000.
 
 Modes decide which content is sent to the adapter. `pre_call` checks input. `post_call` checks a buffered, non-streaming model response. `during_call` checks both. `logging_only` checks both input and output but never blocks.
 
@@ -64,7 +64,7 @@ The schema describes every wire field, but a provider choice makes some fields r
 | `pangea` | `api_key` | URL and input/output recipes have documented defaults. |
 | `patronus` | `api_key` | URL and evaluator default; `criteria` is optional. |
 
-Use the provider's own documentation for account setup and policy semantics: [Lakera Guard](https://docs.lakera.ai/docs/api/guard), [Aporia Guardrails](https://docs.aporia.com/guardrails/quickstart), [Azure Content Safety](https://learn.microsoft.com/rest/api/cognitiveservices/contentsafety/text-analyze/analyze-text), [Amazon Bedrock API keys](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html) and [ApplyGuardrail](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ApplyGuardrail.html), [CrowdStrike AIDR](https://falcon.crowdstrike.com/documentation/page/aef99b7e/ai-detection-and-response-api), [Mistral classifiers](https://docs.mistral.ai/api/endpoint/classifiers), [Pangea AI Guard](https://pangea.cloud/docs/api/ai-guard), and [Patronus Evaluate](https://docs.patronus.ai/docs/api-reference/evaluate).
+Use the provider's own documentation for account setup and policy semantics: [Lakera Guard](https://docs.lakera.ai/docs/api/guard), [Aporia Guardrails](https://docs.aporia.com/guardrails/quickstart), [Azure Content Safety](https://learn.microsoft.com/rest/api/cognitiveservices/contentsafety/text-analyze/analyze-text), [Amazon Bedrock API keys](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html) and [ApplyGuardrail](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ApplyGuardrail.html), [CrowdStrike AIDR](https://aidr-docs.crowdstrike.com/docs/api/aidr), [Mistral classifiers](https://docs.mistral.ai/api/endpoint/classifiers), [Pangea AI Guard](https://pangea.cloud/docs/api/ai-guard), and [Patronus Evaluate](https://docs.patronus.ai/docs/api-reference/evaluate).
 
 ## Troubleshooting
 

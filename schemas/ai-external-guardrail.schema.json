@@ -9,7 +9,7 @@
   ],
   "properties": {
     "name": {
-      "description": "Stable identifier used in safe logs and client error codes. It must contain at least one non-whitespace character.",
+      "description": "Operator-defined identifier used in logs and client error codes. It must contain at least one non-whitespace character.",
       "type": "string",
       "pattern": "\\S"
     },

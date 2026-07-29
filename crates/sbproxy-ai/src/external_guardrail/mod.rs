@@ -148,7 +148,7 @@ impl GuardrailProvider {
 /// requirements explicit before a handler is published.
 #[derive(Clone, Deserialize, JsonSchema)]
 pub struct ExternalGuardrailConfig {
-    /// Stable identifier used in safe logs and client error codes.
+    /// Operator-defined identifier used in logs and client error codes.
     /// It must contain at least one non-whitespace character.
     #[schemars(regex(pattern = "\\S"))]
     pub name: String,
@@ -1491,8 +1491,14 @@ mod tests {
         .unwrap()
     }
 
+    fn unavailable_content_metric_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn unavailable_output_content_fails_closed_without_exposing_bytes() {
+        let _metric_lock = unavailable_content_metric_lock();
         let blocked = run_output_external_guardrails_without_content(&[unavailable_output_config(
             "post_call",
             false,
@@ -1508,6 +1514,7 @@ mod tests {
 
     #[test]
     fn unavailable_output_content_honors_fail_open_and_logging_only_once() {
+        let _metric_lock = unavailable_content_metric_lock();
         let fail_open_before =
             crate::ai_metrics::external_guardrail_verdict_value("generic", "output", "fail_open");
         assert!(run_output_external_guardrails_without_content(&[
@@ -1523,6 +1530,7 @@ mod tests {
 
     #[test]
     fn unavailable_output_content_ignores_disabled_and_input_only_guardrails() {
+        let _metric_lock = unavailable_content_metric_lock();
         let fail_closed_before =
             crate::ai_metrics::external_guardrail_verdict_value("generic", "output", "fail_closed");
         let mut disabled = unavailable_output_config("post_call", false);
@@ -1540,6 +1548,7 @@ mod tests {
 
     #[test]
     fn unavailable_input_content_honors_fail_modes() {
+        let _metric_lock = unavailable_content_metric_lock();
         let blocked = run_input_external_guardrails_without_content(&[unavailable_output_config(
             "pre_call", false,
         )])
