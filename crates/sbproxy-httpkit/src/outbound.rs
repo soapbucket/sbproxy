@@ -101,7 +101,6 @@ impl OutboundClientBuilder {
     /// This transfers responsibility to the caller for preserving TLS verification
     /// and the outbound security defaults while applying further customization.
     /// Normal callers should prefer [`Self::build`].
-    #[must_use]
     pub fn into_inner(self) -> reqwest::ClientBuilder {
         self.inner
     }

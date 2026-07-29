@@ -21,8 +21,17 @@ async fn response_server(
 
     tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = [0; 1024];
-        stream.read(&mut request).await.unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0; 1024];
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "client closed before sending complete headers");
+            request.extend_from_slice(&chunk[..count]);
+            assert!(request.len() <= 16 * 1024, "fixture request is too large");
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
         request_was_received.store(true, Ordering::SeqCst);
 
         let location_header = location

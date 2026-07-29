@@ -31,7 +31,7 @@ pub(super) fn parse_lakera(body: &Value) -> Result<GuardrailVerdict, GuardrailCa
         None => &[],
     };
     let categories = breakdown
-        .into_iter()
+        .iter()
         .filter(|item| item.get("detected").and_then(Value::as_bool) == Some(true))
         .filter_map(|item| item.get("detector_type").and_then(Value::as_str))
         .filter_map(normalize_category)
