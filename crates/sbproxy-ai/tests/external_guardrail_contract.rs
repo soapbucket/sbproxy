@@ -391,6 +391,30 @@ fn pangea_config(url: String, fail_open: bool, timeout_ms: u64) -> ExternalGuard
     .expect("Pangea fixture config")
 }
 
+#[test]
+fn pangea_defaults_compile_to_documented_endpoint_and_recipes() {
+    let config: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
+        "name": "pangea",
+        "provider": "pangea",
+        "mode": "during_call",
+        "api_key": "fixture-key"
+    }))
+    .expect("Pangea default config");
+
+    let CompiledGuardrailProvider::Pangea(config) =
+        config.validate().expect("Pangea defaults compile")
+    else {
+        panic!("expected Pangea provider");
+    };
+
+    assert_eq!(
+        config.url,
+        "https://ai-guard.aws.us.pangea.cloud/v1/text/guard"
+    );
+    assert_eq!(config.input_recipe, "pangea_prompt_guard");
+    assert_eq!(config.output_recipe, "pangea_llm_response_guard");
+}
+
 const GUARDRAIL_DETECTORS: &str = r#"{"prompt_injection":{"detected":true,"data":{"analyzer_responses":[{"analyzer":"PA4002","confidence":0.99}]}},"pii_entity":{"detected":false,"data":null}}"#;
 
 #[tokio::test]

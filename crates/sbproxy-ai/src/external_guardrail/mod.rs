@@ -476,10 +476,9 @@ impl ExternalGuardrailConfig {
                 auth: self.required_provider_auth("Authorization", "Bearer")?,
             }),
             GuardrailProvider::Pangea => CompiledGuardrailProvider::Pangea(PangeaConfig {
-                url: self
-                    .url
-                    .clone()
-                    .unwrap_or_else(|| "https://api.pangea.cloud/v1/text/guard".to_string()),
+                url: self.url.clone().unwrap_or_else(|| {
+                    "https://ai-guard.aws.us.pangea.cloud/v1/text/guard".to_string()
+                }),
                 input_recipe: self
                     .input_recipe
                     .clone()
@@ -487,7 +486,7 @@ impl ExternalGuardrailConfig {
                 output_recipe: self
                     .output_recipe
                     .clone()
-                    .unwrap_or_else(|| "pangea_response_guard".to_string()),
+                    .unwrap_or_else(|| "pangea_llm_response_guard".to_string()),
                 auth: self.required_provider_auth("Authorization", "Bearer")?,
             }),
             GuardrailProvider::Patronus => CompiledGuardrailProvider::Patronus(PatronusConfig {
