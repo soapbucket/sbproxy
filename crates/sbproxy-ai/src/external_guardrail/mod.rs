@@ -9,10 +9,12 @@
 mod aporia;
 mod azure;
 mod bedrock;
+mod crowdstrike;
 mod generic;
 mod lakera;
+mod pangea;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -704,6 +706,10 @@ async fn dispatch(
             azure::azure_request(provider, request)
         }
         CompiledGuardrailProvider::Bedrock(provider) => bedrock::bedrock_request(provider, request),
+        CompiledGuardrailProvider::CrowdStrike(provider) => {
+            crowdstrike::crowdstrike_request(provider, request)
+        }
+        CompiledGuardrailProvider::Pangea(provider) => pangea::pangea_request(provider, request),
         _ => return Err(GuardrailCallError::UnsupportedProvider),
     };
     let mut call = config
@@ -741,8 +747,106 @@ async fn dispatch(
             azure::parse_azure(&body, provider)
         }
         CompiledGuardrailProvider::Bedrock(_) => bedrock::parse_bedrock(&body),
+        CompiledGuardrailProvider::CrowdStrike(_) => crowdstrike::parse_crowdstrike(&body),
+        CompiledGuardrailProvider::Pangea(_) => pangea::parse_pangea(&body),
         _ => Err(GuardrailCallError::UnsupportedProvider),
     }
+}
+
+/// Parse the shared AIDR and AI Guard `result.blocked` and detector shape.
+/// Provider output can contain transformed content, which is intentionally not
+/// read or surfaced by this safety boundary.
+pub(super) fn parse_blocked_detector_result(
+    body: &Value,
+    blocked_reason: &'static str,
+) -> Result<GuardrailVerdict, GuardrailCallError> {
+    let result = body
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or(GuardrailCallError::InvalidVerdict)?;
+    let blocked = result
+        .get("blocked")
+        .and_then(Value::as_bool)
+        .ok_or(GuardrailCallError::InvalidVerdict)?;
+    let detectors = result
+        .get("detectors")
+        .and_then(Value::as_object)
+        .filter(|detectors| !detectors.is_empty())
+        .ok_or(GuardrailCallError::InvalidVerdict)?;
+    if detectors.len() > 32 {
+        return Err(GuardrailCallError::InvalidVerdict);
+    }
+
+    let mut categories = Vec::new();
+    let mut scores = BTreeMap::new();
+    let mut seen_categories = BTreeSet::new();
+    for (name, detector) in detectors {
+        let category =
+            generic::normalize_category(name).ok_or(GuardrailCallError::InvalidVerdict)?;
+        if !seen_categories.insert(category.clone()) {
+            return Err(GuardrailCallError::InvalidVerdict);
+        }
+        let Some(detector) = detector.as_object() else {
+            if detector.is_null() {
+                continue;
+            }
+            return Err(GuardrailCallError::InvalidVerdict);
+        };
+        let detected = detector
+            .get("detected")
+            .and_then(Value::as_bool)
+            .ok_or(GuardrailCallError::InvalidVerdict)?;
+        let data = detector
+            .get("data")
+            .ok_or(GuardrailCallError::InvalidVerdict)?;
+        let data = if data.is_null() {
+            None
+        } else {
+            Some(data.as_object().ok_or(GuardrailCallError::InvalidVerdict)?)
+        };
+        if detected {
+            if data.is_none() || categories.len() == 32 {
+                return Err(GuardrailCallError::InvalidVerdict);
+            }
+            categories.push(category.clone());
+        }
+        let Some(analyzers) = data.and_then(|data| data.get("analyzer_responses")) else {
+            continue;
+        };
+        let analyzers = analyzers
+            .as_array()
+            .filter(|analyzers| !analyzers.is_empty())
+            .ok_or(GuardrailCallError::InvalidVerdict)?;
+        for analyzer in analyzers {
+            let analyzer = analyzer
+                .as_object()
+                .ok_or(GuardrailCallError::InvalidVerdict)?;
+            let name = analyzer
+                .get("analyzer")
+                .and_then(Value::as_str)
+                .and_then(generic::normalize_category)
+                .ok_or(GuardrailCallError::InvalidVerdict)?;
+            let confidence = analyzer
+                .get("confidence")
+                .and_then(Value::as_f64)
+                .filter(|score| score.is_finite() && (0.0..=1.0).contains(score))
+                .ok_or(GuardrailCallError::InvalidVerdict)?;
+            if scores.len() == 32
+                || scores
+                    .insert(format!("{category}.{name}"), confidence)
+                    .is_some()
+            {
+                return Err(GuardrailCallError::InvalidVerdict);
+            }
+        }
+    }
+
+    Ok(GuardrailVerdict {
+        allowed: !blocked,
+        reason: blocked.then(|| blocked_reason.to_string()),
+        categories,
+        scores,
+    })
 }
 
 pub fn verdict_blocks(config: &ExternalGuardrailConfig, verdict: &GuardrailVerdict) -> bool {

@@ -355,6 +355,232 @@ fn bedrock_config(url: String, fail_open: bool, timeout_ms: u64) -> ExternalGuar
     .expect("Bedrock fixture config")
 }
 
+fn crowdstrike_config(
+    url: String,
+    fail_open: bool,
+    timeout_ms: u64,
+    application_id: Option<&str>,
+) -> ExternalGuardrailConfig {
+    serde_json::from_value(serde_json::json!({
+        "name": "crowdstrike",
+        "provider": "crowd_strike",
+        "url": url,
+        "mode": "during_call",
+        "api_key": "fixture-key",
+        "application_id": application_id,
+        "allow_private_url": true,
+        "fail_open": fail_open,
+        "timeout_ms": timeout_ms
+    }))
+    .expect("CrowdStrike fixture config")
+}
+
+fn pangea_config(url: String, fail_open: bool, timeout_ms: u64) -> ExternalGuardrailConfig {
+    serde_json::from_value(serde_json::json!({
+        "name": "pangea",
+        "provider": "pangea",
+        "url": url,
+        "mode": "during_call",
+        "api_key": "fixture-key",
+        "input_recipe": "fixture-input-recipe",
+        "output_recipe": "fixture-output-recipe",
+        "allow_private_url": true,
+        "fail_open": fail_open,
+        "timeout_ms": timeout_ms
+    }))
+    .expect("Pangea fixture config")
+}
+
+const GUARDRAIL_DETECTORS: &str = r#"{"prompt_injection":{"detected":true,"data":{"analyzer_responses":[{"analyzer":"PA4002","confidence":0.99}]}},"pii_entity":{"detected":false,"data":null}}"#;
+
+#[tokio::test]
+async fn crowdstrike_input_contract_sends_documented_shape_and_normalizes_verdict_data() {
+    let response = format!(r#"{{"result":{{"blocked":false,"detectors":{GUARDRAIL_DETECTORS}}}}}"#);
+    let (base_url, received) =
+        fixture_server(200, Box::leak(response.into_boxed_str()), Duration::ZERO).await;
+    let verdict = check_external_guardrail(
+        &crowdstrike_config(
+            format!("{base_url}/aidr/aiguard/v1/guard_chat_completions"),
+            false,
+            2_000,
+            Some("fixture-app"),
+        ),
+        request(GuardrailPhase::Input),
+    )
+    .await;
+
+    assert!(verdict.allowed);
+    assert_eq!(verdict.categories, ["prompt_injection"]);
+    assert_eq!(verdict.scores.get("prompt_injection.pa4002"), Some(&0.99));
+    let wire_request = received.await.expect("fixture task");
+    assert!(wire_request.starts_with("POST /aidr/aiguard/v1/guard_chat_completions HTTP/1.1\r\n"));
+    assert!(wire_request.contains("authorization: Bearer fixture-key\r\n"));
+    assert!(wire_request.ends_with(
+        r#"{"app_id":"fixture-app","guard_input":{"messages":[{"content":"fixture prompt","role":"user"}]}}"#
+    ));
+}
+
+#[tokio::test]
+async fn crowdstrike_block_malformed_unknown_status_timeout_and_fail_modes_are_safe() {
+    let blocked = format!(r#"{{"result":{{"blocked":true,"detectors":{GUARDRAIL_DETECTORS}}}}}"#);
+    let (base_url, received) =
+        fixture_server(200, Box::leak(blocked.into_boxed_str()), Duration::ZERO).await;
+    let verdict = check_external_guardrail(
+        &crowdstrike_config(
+            format!("{base_url}/aidr/aiguard/v1/guard_chat_completions"),
+            false,
+            2_000,
+            None,
+        ),
+        request(GuardrailPhase::Output),
+    )
+    .await;
+    assert!(!verdict.allowed);
+    assert_eq!(
+        verdict.reason.as_deref(),
+        Some("crowdstrike blocked content")
+    );
+    let wire_request = received.await.expect("fixture task");
+    assert!(wire_request.ends_with(
+        r#"{"event_type":"output","guard_input":{"messages":[{"content":"fixture prompt","role":"user"}]}}"#
+    ));
+
+    for (status, body, delay, fail_open, expected_allowed) in [
+        (200, r#"{}"#, Duration::ZERO, false, false),
+        (
+            200,
+            r#"{"result":{"blocked":false}}"#,
+            Duration::ZERO,
+            true,
+            true,
+        ),
+        (
+            200,
+            r#"{"result":{"blocked":"false","detectors":{}}}"#,
+            Duration::ZERO,
+            false,
+            false,
+        ),
+        (
+            200,
+            r#"{"result":{"blocked":false,"detectors":{"unknown":true}}}"#,
+            Duration::ZERO,
+            true,
+            true,
+        ),
+        (502, r#"{}"#, Duration::ZERO, false, false),
+        (
+            200,
+            r#"{"result":{"blocked":false,"detectors":{}}}"#,
+            Duration::from_millis(50),
+            true,
+            true,
+        ),
+    ] {
+        let (base_url, received) = fixture_server(status, body, delay).await;
+        let timeout_ms = if delay.is_zero() { 2_000 } else { 1 };
+        let verdict = check_external_guardrail(
+            &crowdstrike_config(
+                format!("{base_url}/aidr/aiguard/v1/guard_chat_completions"),
+                fail_open,
+                timeout_ms,
+                None,
+            ),
+            request(GuardrailPhase::Input),
+        )
+        .await;
+        assert_eq!(verdict.allowed, expected_allowed);
+        let _ = received.await;
+    }
+}
+
+#[tokio::test]
+async fn pangea_input_and_output_contracts_select_recipes_and_normalize_scores() {
+    for (phase, recipe) in [
+        (GuardrailPhase::Input, "fixture-input-recipe"),
+        (GuardrailPhase::Output, "fixture-output-recipe"),
+    ] {
+        let response = format!(
+            r#"{{"status":"Success","result":{{"blocked":false,"detectors":{GUARDRAIL_DETECTORS}}}}}"#
+        );
+        let (base_url, received) =
+            fixture_server(200, Box::leak(response.into_boxed_str()), Duration::ZERO).await;
+        let verdict = check_external_guardrail(
+            &pangea_config(format!("{base_url}/v1/text/guard"), false, 2_000),
+            request(phase),
+        )
+        .await;
+
+        assert!(verdict.allowed);
+        assert_eq!(verdict.categories, ["prompt_injection"]);
+        assert_eq!(verdict.scores.get("prompt_injection.pa4002"), Some(&0.99));
+        let wire_request = received.await.expect("fixture task");
+        assert!(wire_request.starts_with("POST /v1/text/guard HTTP/1.1\r\n"));
+        assert!(wire_request.contains("authorization: Bearer fixture-key\r\n"));
+        assert!(wire_request.ends_with(&format!(
+            r#"{{"debug":true,"recipe":"{recipe}","text":"fixture prompt"}}"#
+        )));
+    }
+}
+
+#[tokio::test]
+async fn pangea_block_malformed_unknown_non_finite_status_timeout_and_fail_modes_are_safe() {
+    let blocked = format!(r#"{{"result":{{"blocked":true,"detectors":{GUARDRAIL_DETECTORS}}}}}"#);
+    let (base_url, received) =
+        fixture_server(200, Box::leak(blocked.into_boxed_str()), Duration::ZERO).await;
+    let verdict = check_external_guardrail(
+        &pangea_config(format!("{base_url}/v1/text/guard"), false, 2_000),
+        request(GuardrailPhase::Input),
+    )
+    .await;
+    assert!(!verdict.allowed);
+    assert_eq!(verdict.reason.as_deref(), Some("pangea blocked content"));
+    let _ = received.await;
+
+    for (status, body, delay, fail_open, expected_allowed) in [
+        (200, r#"{}"#, Duration::ZERO, false, false),
+        (
+            200,
+            r#"{"result":{"blocked":false,"detectors":{}}}"#,
+            Duration::ZERO,
+            true,
+            true,
+        ),
+        (
+            200,
+            r#"{"result":{"blocked":false,"detectors":{"prompt_injection":{"detected":true,"data":{"analyzer_responses":[{"analyzer":"PA","confidence":"bad"}]}}}}}"#,
+            Duration::ZERO,
+            false,
+            false,
+        ),
+        (
+            200,
+            r#"{"result":{"blocked":false,"detectors":{"prompt_injection":{"detected":true,"data":{"analyzer_responses":[{"analyzer":"PA","confidence":2.0}]}}}}}"#,
+            Duration::ZERO,
+            true,
+            true,
+        ),
+        (502, r#"{}"#, Duration::ZERO, false, false),
+        (
+            200,
+            r#"{"result":{"blocked":false,"detectors":{}}}"#,
+            Duration::from_millis(50),
+            true,
+            true,
+        ),
+    ] {
+        let (base_url, received) = fixture_server(status, body, delay).await;
+        let timeout_ms = if delay.is_zero() { 2_000 } else { 1 };
+        let verdict = check_external_guardrail(
+            &pangea_config(format!("{base_url}/v1/text/guard"), fail_open, timeout_ms),
+            request(GuardrailPhase::Output),
+        )
+        .await;
+        assert_eq!(verdict.allowed, expected_allowed);
+        let _ = received.await;
+    }
+}
+
 #[tokio::test]
 async fn azure_content_safety_contract_uses_subscription_key_and_eight_level_output() {
     let (base_url, received) = fixture_server(200, AZURE_ALL_CLEAR, Duration::ZERO).await;
