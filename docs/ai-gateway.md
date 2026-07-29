@@ -1406,7 +1406,7 @@ Per-surface knobs live under `per_surface_rate_limits` (see [Per-surface rate li
 
 ### Reranking
 
-`reranking` is not enterprise-gated. The OSS build classifies the surface, dispatches it when a configured provider supports it (Cohere today), and captures the request's document count for per-unit billing. The only gate is the capability check above: when no configured provider supports reranking, the proxy returns 501 before any upstream call, same as every other surface.
+`reranking` ships in the OSS build. It classifies the surface, dispatches it when a configured provider supports it (Cohere today), and captures the request's document count for per-unit billing. When no configured provider supports reranking, the proxy returns 501 before any upstream call, the same as every other surface.
 
 ## Context handling
 
@@ -1578,7 +1578,7 @@ The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpo
 | `sbproxy_ai_realtime_sessions_active` | Gauge | | Currently open OpenAI Realtime API WebSocket sessions |
 | `sbproxy_ai_realtime_session_duration_seconds` | Histogram | `provider`, `close_reason` | Wall-clock duration of a Realtime WebSocket session, observed at close. `close_reason` is `client_closed` or `error` |
 | `sbproxy_ai_realtime_audio_seconds_total` | Counter | `provider`, `direction` | Cumulative audio seconds forwarded over Realtime sessions. Frame-exact accounting requires terminate-and-relay (not on the OSS path); the OSS dispatcher uses session wall-clock as a duration proxy on close |
-| `sbproxy_ai_realtime_frames_forwarded_total` | Counter | `provider`, `direction`, `kind` | Cumulative frames forwarded over Realtime sessions (`kind` is `text` or `audio`). Reserved for a future enterprise terminate-and-relay path |
+| `sbproxy_ai_realtime_frames_forwarded_total` | Counter | `provider`, `direction`, `kind` | Cumulative frames forwarded over Realtime sessions (`kind` is `text` or `audio`). A future terminate-and-relay implementation would add per-frame inspection. |
 
 Use these to build spending dashboards, set budget alerts, and track provider reliability without any application-level instrumentation.
 
@@ -1722,7 +1722,7 @@ non-`101` provider response does not change that gauge and does not emit
 session-duration or realtime billing events.
 
 What runs during the session:
-- Pingora forwards WebSocket frames byte-transparently. The proxy does not inspect individual frames (per-frame guardrails are not on the OSS path; they would require terminate-and-relay, which is reserved for an enterprise build).
+- Pingora forwards WebSocket frames byte-transparently. The proxy does not inspect individual frames. Per-frame guardrails require a future terminate-and-relay implementation.
 - Admission is evaluated once. A hot policy/config update applies to new
   upgrades; a socket that already received 101 continues relaying frames and
   can complete its close handshake.
@@ -1763,7 +1763,7 @@ ws = websocket.create_connection(
 )
 ```
 
-The proxy enforces gating before the upgrade and emits a session-end billing event after close; per-frame inspection is reserved for an enterprise terminate-and-relay path that would land alongside a dedicated Pingora `Service` impl.
+The proxy enforces gating before the upgrade and emits a session-end billing event after close. Per-frame inspection requires a future terminate-and-relay implementation alongside a dedicated Pingora `Service` implementation.
 
 ## Full example
 

@@ -1,0 +1,51 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "cases": [
+    {
+      "name": "allowed prompt reaches the local model",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Host": "ai.local",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "model": "fixture-model",
+          "messages": [{"role": "user", "content": "allowed prompt"}]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"model": "fixture-model", "choices": [{"message": {"content": "fixture response"}}]}
+        }
+      }
+    },
+    {
+      "name": "blocked prompt stops before the local model",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Host": "ai.local",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "model": "fixture-model",
+          "messages": [{"role": "user", "content": "blocked prompt"}]
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"error": {"type": "guardrail_violation", "code": "local-policy"}}
+        }
+      }
+    }
+  ]
+}

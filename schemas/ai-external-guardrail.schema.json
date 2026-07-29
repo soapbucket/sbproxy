@@ -1,0 +1,225 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SBproxy AI external guardrail configuration",
+  "description": "Deserialized wire configuration. Provider-specific fields remain optional here so legacy generic configurations stay valid; `compile` makes their requirements explicit before a handler is published.",
+  "type": "object",
+  "required": [
+    "mode",
+    "name"
+  ],
+  "properties": {
+    "name": {
+      "description": "Stable name used in logs and metrics. It must not be empty.",
+      "type": "string"
+    },
+    "url": {
+      "description": "Provider endpoint. Generic, Presidio, Azure, and CrowdStrike require it. Other providers supply a documented default or derive it from their fields.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mode": {
+      "description": "When to evaluate this provider: before a call, after a call, both, or logging only.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/GuardrailMode"
+        }
+      ]
+    },
+    "default_on": {
+      "description": "Run this guardrail when a request does not explicitly select a guardrail set.",
+      "default": false,
+      "type": "boolean"
+    },
+    "fail_open": {
+      "description": "Allow traffic when this provider cannot be reached or returns an invalid response.",
+      "default": false,
+      "type": "boolean"
+    },
+    "timeout_ms": {
+      "description": "Per-request provider deadline in milliseconds, from 1 through 30000.",
+      "default": 2000,
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 30000.0,
+      "minimum": 1.0
+    },
+    "provider": {
+      "description": "Provider wire contract. Omit for the backward-compatible generic contract.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/GuardrailProvider"
+        }
+      ]
+    },
+    "api_key": {
+      "description": "Credential value or a resolved secret reference. Required by named hosted providers.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "auth_header": {
+      "description": "Header used with `api_key` for generic and Presidio requests.",
+      "default": "Authorization",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "auth_prefix": {
+      "description": "Prefix inserted before `api_key` for generic and Presidio requests.",
+      "default": "Bearer",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "allow_private_url": {
+      "description": "Permit a loopback or private endpoint after URL syntax validation.",
+      "default": false,
+      "type": "boolean"
+    },
+    "language": {
+      "description": "Presidio language code. Defaults to `en` for the Presidio provider.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "project_id": {
+      "description": "Aporia project identifier. Required for the Aporia provider.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "application_id": {
+      "description": "Optional CrowdStrike application identifier.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "region": {
+      "description": "AWS region used to derive the Bedrock runtime endpoint when `url` is absent.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "guardrail_id": {
+      "description": "Bedrock guardrail identifier. Required for the Bedrock provider.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "guardrail_version": {
+      "description": "Bedrock guardrail version. Required for the Bedrock provider.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "severity_threshold": {
+      "description": "Azure Content Safety block threshold from 0 through 7. Defaults to 4.",
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint8",
+      "maximum": 7.0,
+      "minimum": 0.0
+    },
+    "model": {
+      "description": "Mistral moderation model. Defaults to `mistral-moderation-2603`.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "score_threshold": {
+      "description": "Mistral category score threshold from 0 through 1.",
+      "default": null,
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double",
+      "maximum": 1.0,
+      "minimum": 0.0
+    },
+    "input_recipe": {
+      "description": "Pangea recipe used for request content. Defaults to `pangea_prompt_guard`.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "output_recipe": {
+      "description": "Pangea recipe used for response content. Defaults to `pangea_llm_response_guard`.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "evaluator": {
+      "description": "Patronus evaluator name. Defaults to `prompt-injection`.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "criteria": {
+      "description": "Optional Patronus evaluator criteria.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "GuardrailMode": {
+      "description": "When an external guardrail runs, mapped from LiteLLM's `mode`.",
+      "type": "string",
+      "enum": [
+        "pre_call",
+        "post_call",
+        "during_call",
+        "logging_only"
+      ]
+    },
+    "GuardrailProvider": {
+      "description": "Provider contracts supported by the external guardrail configuration.",
+      "type": "string",
+      "enum": [
+        "generic",
+        "presidio",
+        "lakera",
+        "aporia",
+        "azure_content_safety",
+        "bedrock",
+        "crowd_strike",
+        "mistral",
+        "pangea",
+        "patronus"
+      ]
+    }
+  }
+}

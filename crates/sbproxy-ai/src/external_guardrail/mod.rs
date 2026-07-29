@@ -23,6 +23,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use reqwest::header::{HeaderName, HeaderValue};
 use sbproxy_httpkit::OutboundClientBuilder;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -84,7 +85,7 @@ impl GuardrailVerdict {
 }
 
 /// When an external guardrail runs, mapped from LiteLLM's `mode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailMode {
     PreCall,
@@ -108,7 +109,7 @@ impl GuardrailMode {
 }
 
 /// Provider contracts supported by the external guardrail configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailProvider {
     #[default]
@@ -145,55 +146,85 @@ impl GuardrailProvider {
 /// Deserialized wire configuration. Provider-specific fields remain optional
 /// here so legacy generic configurations stay valid; `compile` makes their
 /// requirements explicit before a handler is published.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ExternalGuardrailConfig {
+    /// Stable name used in logs and metrics. It must not be empty.
     pub name: String,
+    /// Provider endpoint. Generic, Presidio, Azure, and CrowdStrike require it.
+    /// Other providers supply a documented default or derive it from their fields.
     #[serde(default)]
     pub url: Option<String>,
+    /// When to evaluate this provider: before a call, after a call, both, or logging only.
     pub mode: GuardrailMode,
+    /// Run this guardrail when a request does not explicitly select a guardrail set.
     #[serde(default)]
     pub default_on: bool,
+    /// Allow traffic when this provider cannot be reached or returns an invalid response.
     #[serde(default)]
     pub fail_open: bool,
+    /// Per-request provider deadline in milliseconds, from 1 through 30000.
     #[serde(default = "default_timeout_ms")]
+    #[schemars(range(min = 1, max = 30_000))]
     pub timeout_ms: u64,
+    /// Provider wire contract. Omit for the backward-compatible generic contract.
     #[serde(default)]
     pub provider: GuardrailProvider,
+    /// Credential value or a resolved secret reference. Required by named hosted providers.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Header used with `api_key` for generic and Presidio requests.
     #[serde(default = "default_auth_header")]
     pub auth_header: Option<String>,
+    /// Prefix inserted before `api_key` for generic and Presidio requests.
     #[serde(default = "default_auth_prefix")]
     pub auth_prefix: Option<String>,
+    /// Permit a loopback or private endpoint after URL syntax validation.
     #[serde(default)]
     pub allow_private_url: bool,
+    /// Presidio language code. Defaults to `en` for the Presidio provider.
     #[serde(default)]
     pub language: Option<String>,
+    /// Aporia project identifier. Required for the Aporia provider.
     #[serde(default)]
     pub project_id: Option<String>,
+    /// Optional CrowdStrike application identifier.
     #[serde(default)]
     pub application_id: Option<String>,
+    /// AWS region used to derive the Bedrock runtime endpoint when `url` is absent.
     #[serde(default)]
     pub region: Option<String>,
+    /// Bedrock guardrail identifier. Required for the Bedrock provider.
     #[serde(default)]
     pub guardrail_id: Option<String>,
+    /// Bedrock guardrail version. Required for the Bedrock provider.
     #[serde(default)]
     pub guardrail_version: Option<String>,
+    /// Azure Content Safety block threshold from 0 through 7. Defaults to 4.
     #[serde(default)]
+    #[schemars(range(max = 7))]
     pub severity_threshold: Option<u8>,
+    /// Mistral moderation model. Defaults to `mistral-moderation-2603`.
     #[serde(default)]
     pub model: Option<String>,
+    /// Mistral category score threshold from 0 through 1.
     #[serde(default)]
+    #[schemars(range(min = 0.0, max = 1.0))]
     pub score_threshold: Option<f64>,
+    /// Pangea recipe used for request content. Defaults to `pangea_prompt_guard`.
     #[serde(default)]
     pub input_recipe: Option<String>,
+    /// Pangea recipe used for response content. Defaults to `pangea_llm_response_guard`.
     #[serde(default)]
     pub output_recipe: Option<String>,
+    /// Patronus evaluator name. Defaults to `prompt-injection`.
     #[serde(default)]
     pub evaluator: Option<String>,
+    /// Optional Patronus evaluator criteria.
     #[serde(default)]
     pub criteria: Option<String>,
+    /// Cached outbound client. It is runtime state and not configuration.
     #[serde(skip)]
+    #[schemars(skip)]
     client: OnceLock<reqwest::Client>,
 }
 

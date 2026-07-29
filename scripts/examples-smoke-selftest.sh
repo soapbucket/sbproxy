@@ -35,6 +35,10 @@ case "$url" in
     exit 0
     ;;
   */json)
+    case " $* " in
+      *' --data-binary '{"message":"hello"}' '*) ;;
+      *) echo "missing serialized request body" >&2; exit 1 ;;
+    esac
     printf 'HTTP/1.1 201 Created\r\nx-smoke-token: abc-123\r\ncontent-type: application/json\r\n\r\n{"ok":true,"nested":{"count":3},"extra":"kept"}'
     exit 0
     ;;
@@ -100,7 +104,8 @@ YAML
         "path": "/json",
         "headers": {
           "Host": "example.localhost"
-        }
+        },
+        "body": {"message": "hello"}
       },
       "expect": {
         "status": 201,

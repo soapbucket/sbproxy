@@ -1,0 +1,23 @@
+services:
+  fixture:
+    image: python:3.12-alpine
+    command: ["python3", "/fixture.py"]
+    volumes:
+      - ./fixture.py:/fixture.py:ro
+    ports:
+      # SBproxy shares this service's network namespace, so this publishes it.
+      - "8080:8080"
+
+  sbproxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cloudbuild
+    image: sbproxy-ai-external-guardrails:local
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    network_mode: service:fixture
+    environment:
+      FIXTURE_API_KEY: fixture-local-token
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    depends_on:
+      - fixture

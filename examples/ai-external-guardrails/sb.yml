@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# A local OpenAI-compatible model and a local generic guardrail webhook.
+# Both endpoints share the fixture container's loopback namespace with SBproxy.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+      providers:
+        - name: fixture-model
+          provider_type: openai
+          # Compose supplies a throwaway value. This is only a local fixture.
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18080/v1
+          allow_private_base_url: true
+          default_model: fixture-model
+          models: [fixture-model]
+
+      guardrails:
+        external:
+          - name: local-policy
+            provider: generic
+            url: http://127.0.0.1:18081/check
+            allow_private_url: true
+            mode: pre_call
+            default_on: true
+            fail_open: false
+            timeout_ms: 500

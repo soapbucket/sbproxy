@@ -58,6 +58,7 @@ For human-facing documentation, see `docs/architecture.md`, `docs/configuration.
 
 ## CI and release
 
-- doc_ci: lychee link checking and code-block syntax validation across `sbproxy-rust/docs/`; runs on every PR touching docs.
-- examples_smoke: every directory under `examples/` boots via `docker compose`, hits `/healthz`, and exercises one feature endpoint with an audit-log assertion.
+- doc_ci: lychee link checking and code-block syntax validation across `docs/`; runs on every PR touching docs.
+- examples_smoke: each Compose example with `smoke.json` boots via `docker compose`, waits for its declared health path, then evaluates its declared request cases and optional feature endpoints; audit assertions run only when `audit_check` is true.
+- ai_external_guardrails: typed external adapters for generic webhooks, Presidio, Lakera, Aporia, Azure Content Safety, Bedrock, CrowdStrike, Mistral, Pangea, and Patronus; response reads are capped and malformed responses obey the configured fail mode.
 - observability_budgets_ci: SLO burn-rate regression and cardinality budget regression run on PRs touching `sbproxy-observe/` or metric labels.

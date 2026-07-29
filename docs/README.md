@@ -37,6 +37,7 @@ SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI m
 Govern the AI you call, the AI that calls you, and the AI you run.
 
 - [ai-gateway.md](ai-gateway.md) - providers, routing strategies, guardrails, budgets, streaming.
+- [guardrails.md](guardrails.md) - external guardrail adapters, response contract, failure policy, and a local tested walkthrough.
 - [quickstart-serve.md](quickstart-serve.md) - run your first model in 60 seconds: `curl | sh`, then `sbproxy run <model>`, on a Linux GPU, a Mac, or a CPU box.
 - [self-hosting.md](self-hosting.md) - single binary to self-host: install, the serve-only quickstart, the model manifest, aliases, spill-to-cloud, and the OpenRouter parity map.
 - [model-host.md](model-host.md) - canonical `proxy.model_host` deployments, verified artifacts, managed engines, admission, reload, and lifecycle CLI for one node.

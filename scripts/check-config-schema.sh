@@ -12,6 +12,7 @@
 #       level because origins[].action is a deliberately opaque
 #       polymorphic node (see the generator's module docs).
 #   schemas/ai-compression.schema.json <- sbproxy-ai CompressionPolicy
+#   schemas/ai-external-guardrail.schema.json <- sbproxy-ai ExternalGuardrailConfig
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -21,6 +22,7 @@ schemas=(
     "schemas/sb-config.schema.json|-p sbproxy-config --bin generate-schema"
     "schemas/ai-proxy-provider.schema.json|-p sbproxy-ai --bin generate-ai-provider-schema"
     "schemas/ai-compression.schema.json|-p sbproxy-ai --bin generate-ai-compression-schema"
+    "schemas/ai-external-guardrail.schema.json|-p sbproxy-ai --bin generate-ai-external-guardrail-schema"
 )
 
 GENERATED=$(mktemp)
