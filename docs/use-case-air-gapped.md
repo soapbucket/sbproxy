@@ -1,8 +1,8 @@
 # Air-gapped AI: weights, prompts, and verdicts that never leave your network
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-07-28*
 
-> **Compatibility form** — this walkthrough still uses provider `serve:`. Prefer `proxy.model_host` + `provider_type: managed_model` for new deployments; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/).
+> **Compatibility form:** This walkthrough still uses provider `serve:`. Prefer `proxy.model_host` + `provider_type: managed_model` for new deployments; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/).
 
 ![Terminal recording: sbproxy doctor reports the host, the manifest shows a file: source with pinned sha256 digests, validate and plan pass with no network access, and a prompt injection attempt is blocked on the box](assets/use-case-air-gapped.gif)
 
@@ -26,7 +26,8 @@ Two honesty notes before you start, both from [model-host.md](model-host.md). Ca
 On a connected machine, any of the usual three:
 
 ```bash
-# Linux / macOS, single static binary:
+# Prebuilt release executable for Linux amd64/arm64 (glibc) or Apple Silicon macOS.
+# No Rust, Python, JVM, or Node toolchain/runtime is required.
 curl -fsSL https://download.sbproxy.dev | sh
 
 # Homebrew:
@@ -36,7 +37,7 @@ brew install soapbucket/tap/sbproxy
 docker pull soapbucket/sbproxy:latest
 ```
 
-For the enclave itself you carry the artifact across the wall the same way you carry the weights: verify it on the connected side, then transfer. The binary is static and needs no toolchain on the target. The full install matrix is in the [manual](manual.md).
+For the enclave itself you carry the artifact across the wall the same way you carry the weights: verify it on the connected side, then transfer. Public release archives contain a prebuilt executable, and Linux artifacts are glibc-linked. The target needs a compatible glibc, but no Rust, Python, JVM, or Node toolchain/runtime. The full install matrix is in the [manual](manual.md).
 
 ## Minimal config
 
@@ -193,7 +194,7 @@ local model serving (serve:): not available
 On a host that cannot admit the model, that verdict is correct: the report ends with `not available` and names each blocker. The gateway is honest about it at boot too; with no GPU visible it logs:
 
 ```console
-$ sbproxy examples/use-case-air-gapped/sb.yml
+$ sbproxy serve -f examples/use-case-air-gapped/sb.yml
 WARN sbproxy_core::server::model_host: serve: is configured but no GPU is visible to this process; local model serving will reject admission and requests will fail over to the next provider (or 502 with no fallback). Run `sbproxy doctor` for the full host report
 ```
 

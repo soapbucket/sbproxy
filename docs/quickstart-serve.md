@@ -1,100 +1,58 @@
-# Run your first managed model
+# Run a local model
 
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-28*
 
-Install SBproxy, then run the pinned bootstrap model from the built-in catalog:
+`sbproxy run` is the first local-model command to try. It chooses a catalogued artifact, verifies it, starts a managed local deployment, and prints an OpenAI-compatible endpoint. It is meant for one model on one machine. The completion command below uses `curl` and `jq`.
+
+Check the host before downloading a model:
+
+```bash
+sbproxy doctor
+sbproxy models list
+```
+
+`doctor` reports visible devices, available engines, cache location, and blockers. `models list` shows the catalog IDs that `run` accepts.
+
+## Start a model
+
+Install SBproxy if necessary, then start the small bootstrap model:
 
 ```bash
 curl -fsSL https://download.sbproxy.dev | sh
 sbproxy run qwen2.5-0.5b-instruct --variant q4_k_m
 ```
 
-`sbproxy run` detects the worker, resolves the exact GGUF artifact, verifies its
-size and SHA-256, provisions the matching llama.cpp engine, and warms the model.
-It does not print a success banner while an engine is still downloading or
-starting.
+The first run downloads the selected artifact and the engine it needs. Keep this terminal open. SBproxy does not announce readiness until the model can answer requests.
 
-When the deployment reports `ready`, the output includes lines like these:
+The ready output names a loopback endpoint, usually `http://127.0.0.1:8080`, and prints `OPENAI_BASE_URL` plus an API-key placeholder for SDKs that require one. It also prints a generated loopback admin credential. Treat that password as a secret.
 
-```text
-qwen2.5-0.5b-instruct is ready on http://127.0.0.1:8080
-Admin: http://127.0.0.1:<generated-port>
-Admin username: admin
-Admin password: <generated-password>
+## Send a completion
+
+In another terminal, call the endpoint:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen2.5-0.5b-instruct","messages":[{"role":"user","content":"Say hello."}]}' \
+  | jq '{model, content: .choices[0].message.content}'
+```
+
+The response contains the model name and nonempty assistant content. An OpenAI-compatible SDK can use the values printed in the ready output:
+
+```bash
 export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
 export OPENAI_API_KEY=local
 ```
 
-The generated admin password is high entropy and the admin listener binds to
-loopback. Keep that terminal output if you want to use lifecycle commands during
-the run.
+`OPENAI_API_KEY=local` satisfies client libraries that require a nonempty value. It is separate from the generated admin credential.
 
-## Send a completion
+## Stop or inspect it
 
-```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"qwen2.5-0.5b-instruct","messages":[{"role":"user","content":"hello"}]}'
-```
-
-An OpenAI-compatible SDK can use the two exported variables from the ready
-banner. `OPENAI_API_KEY=local` satisfies SDKs that require a nonempty value; it
-is separate from the generated admin credential.
-
-## Inspect and stop the deployment
-
-Copy the generated admin URL and password into environment variables:
+Press `Ctrl-C` in the `sbproxy run` terminal to stop the local deployment. The verified artifact remains in the cache for a later run. To inspect catalog entries without starting a model:
 
 ```bash
-export SB_ADMIN_URL=http://127.0.0.1:49123
-export SB_ADMIN_USERNAME=admin
-export SB_ADMIN_PASSWORD='paste-generated-password'
-
-sbproxy models ps --format json
-sbproxy models stop local --format json
-```
-
-`models stop` drains active requests, stops the engine process, and leaves the
-verified artifact in cache. A later start reuses it.
-
-## Inspect without starting
-
-`--dry-run` prints the generated canonical configuration and exits. It still
-resolves the model against the actual worker, and it embeds a newly generated
-admin credential in the printed file.
-
-```bash
-sbproxy run qwen2.5-0.5b-instruct \
-  --variant q4_k_m \
-  --port 8080 \
-  --admin-port 9090 \
-  --dry-run
-```
-
-Use `sbproxy doctor` and `sbproxy models list` for read-only host and catalog
-inspection:
-
-```bash
-sbproxy doctor --format json
-sbproxy models list --format json
 sbproxy models show qwen2.5-0.5b-instruct --format json
+sbproxy doctor --format json
 ```
 
-## Hardware status
-
-The bootstrap GGUF runs on CPU and Apple Metal catalog workers. This PR
-runs a real Apple Silicon request before publication. NVIDIA discovery and the
-managed vLLM and SGLang container engines have deterministic coverage, while the
-live GCP NVIDIA and multi-node gate remains in the final integration PR.
-
-If the selected artifact does not fit, the command exits before claiming the
-endpoint is ready. Use a smaller variant, free device memory, or configure a
-different worker.
-
-## Move to a managed config
-
-`sbproxy run` is a single-deployment convenience command. Use
-[`examples/model-host-managed`](../examples/model-host-managed) when you need a
-stable cache path, fixed admin port, queue limits, reload, or more than one
-origin. [model-host.md](model-host.md) explains every field and the migration
-from provider `serve:` blocks.
+Use a managed `proxy.model_host` configuration when you need fixed ports, an explicit cache location, several origins, or a deployment that survives the convenience command. [model-host.md](model-host.md) describes that shape. [self-hosting.md](self-hosting.md) covers local models with gateway policy and hosted fallback.

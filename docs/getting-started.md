@@ -1,94 +1,172 @@
 # Getting started
 
-*Last modified: 2026-07-14*
+*Last modified: 2026-07-28*
 
-This page takes you from nothing installed to a working SBproxy in a few minutes: install the binary, run a config, confirm it's doing what you expect, then branch into whichever feature brought you here. For the pitch and feature tour, see the [README](../README.md); for every `sb.yml` field, see [configuration.md](configuration.md).
+This walkthrough runs one local upstream through three gateway configurations. It needs SBproxy, `curl`, and `jq`. It makes no network request to an AI provider and needs no API key.
 
-## 1. Install
+SBproxy currently binds its data listener to all host interfaces. Run this
+walkthrough on a trusted development machine or behind a host firewall. The
+commands connect through `127.0.0.1`, and the cleanup section stops both
+listeners when you finish.
 
-Pick whichever fits your platform:
+Install SBproxy first if `sbproxy --version` does not print a version:
 
 ```bash
-# curl (macOS / Linux)
 curl -fsSL https://download.sbproxy.dev | sh
-
-# Homebrew (macOS / Linux)
-brew tap soapbucket/tap
-brew install sbproxy
-
-# Docker
-docker pull soapbucket/sbproxy:latest
+export PATH="$HOME/.local/bin:$PATH"
+sbproxy --version
 ```
 
-Building from source needs Rust 1.82+:
+Add the `export` to your shell profile if `~/.local/bin` was not already on
+`PATH`.
+
+Clone the repository so the example files are available:
 
 ```bash
 git clone https://github.com/soapbucket/sbproxy
 cd sbproxy
-make build-release
 ```
 
-Verify the binary is on your `PATH`:
+The example has four configurations. `upstream.yml` starts a fixed local service on port 8091. The other files use port 8080 and add one traffic type at a time: HTTP API, MCP, then AI.
 
 ```bash
-sbproxy --version
+for config in upstream.yml api.yml mcp.yml sb.yml; do
+  sbproxy validate "examples/enterprise-ai-gateway/$config"
+done
 ```
 
-Windows binaries, the distroless Docker image layout, and installing to a specific system path are covered in the [runtime manual's install section](manual.md#1-installation).
+`sbproxy validate` parses and compiles the configuration without opening a listener. Fix a validation error before starting the process.
 
-## 2. Write a config and run it
+## Start the local upstream
 
-Every `sb.yml` has two top-level keys: `proxy:` for global listener settings, and `origins:` mapping a hostname to what happens when a request arrives for it. Here's the smallest useful one, reverse-proxying to SBproxy's public HTTP echo service (`test.sbproxy.dev`, similar to httpbin) so there's nothing else to stand up:
-
-```yaml
-proxy:
-  http_bind_port: 8080
-
-origins:
-  "myapp.example.com":
-    action:
-      type: proxy
-      url: https://test.sbproxy.dev
-```
-
-Save that as `sb.yml`. `myapp.example.com` is the hostname your client sends in its `Host` header; SBproxy matches it against `origins:` and forwards to the upstream. Use whatever hostname you want here, `example.com` is reserved (RFC 2606), so it never collides with a real domain.
-
-Validate it before starting anything:
+In the first terminal, run the fixture and leave it running:
 
 ```bash
-sbproxy validate sb.yml
+sbproxy serve -f examples/enterprise-ai-gateway/upstream.yml
 ```
 
-This runs the same schema check the server uses at boot and exits non-zero with the offending field if something's wrong, useful to wire into CI later. Then run it:
+`upstream.yml` sets `proxy.http_bind_port` to `8091`. Its `127.0.0.1` origin uses a mock action that returns a fixed OpenAI-compatible JSON response on every path. The fields used later are `gateway`, `object`, `model`, and `choices[0].message.content`.
+
+## Stage 1: proxy an HTTP API
+
+In a second terminal, start the API configuration:
 
 ```bash
-sbproxy sb.yml
+sbproxy serve -f examples/enterprise-ai-gateway/api.yml
 ```
 
-And in another terminal:
+`api.yml` binds the gateway to port `8080`. Its `api.example.com` origin has a `proxy` action whose upstream URL is `http://127.0.0.1:8091`. The `Host` header selects that origin, so the client can reach a local listener while still exercising hostname routing.
+
+SBproxy blocks proxy upstreams that resolve to private IP addresses by
+default. This local example opts into only the IPv4 loopback range with
+`proxy.extensions.upstream.allow_private_cidrs: [127.0.0.0/8]`. Keep that
+allowlist as narrow as possible; a production service on a public address
+does not need it. The AI provider in stage 3 has a separate
+`allow_private_base_url: true` switch because model-provider egress is
+configured independently from a conventional proxy action.
+
+Send a request from a third terminal:
 
 ```bash
-curl -H "Host: myapp.example.com" http://127.0.0.1:8080/get
+curl -sS \
+  -H 'Host: api.example.com' \
+  http://127.0.0.1:8080/status | jq '{gateway, object, model}'
 ```
 
-You should get back the request SBproxy forwarded, echoed as JSON. That's a working reverse proxy.
+The response includes `"gateway": "sbproxy"`. That value comes from the local upstream and proves the request passed through the gateway.
 
-## 3. If something didn't work
+Stop the stage-1 gateway with `Ctrl-C` in the second terminal. Keep the upstream terminal running.
 
-- `sbproxy validate sb.yml` catches most config mistakes before you even start the proxy.
-- Wrong status code or no response? Check the [troubleshooting guide](troubleshooting.md), it's organized by symptom (404s, 502s, config edits not taking effect, and more).
-- Quick answers to common install and first-run questions are in the [FAQ](faq.md#install--first-run).
+## Stage 2: add an MCP tool
 
-## 4. Where to go next
+Start the next configuration in the second terminal:
 
-The config above is a bare reverse proxy. Everything else, AI routing, auth, rate limiting, caching, is more `origins:` fields in the same file:
+```bash
+sbproxy serve -f examples/enterprise-ai-gateway/mcp.yml
+```
 
-- **Route to an AI model instead of an HTTP backend**: see [Serve your own model](../README.md#serve-your-own-model) in the README for the shortest path, or [ai-gateway.md](ai-gateway.md) for the full provider and routing reference.
-- **Solve a specific problem** (auth in front of existing APIs, guardrails, metering AI crawlers, migrating off LiteLLM, ...): the [problem-to-walkthrough table](README.md#solve-a-problem) has a runnable example for each.
-- **See every available field**: [configuration.md](configuration.md) is the full `sb.yml` reference; [json-schema.md](json-schema.md) gets you editor autocomplete and inline validation.
-- **Tour every feature with copy-paste configs**: [features.md](features.md).
-- **Browse runnable examples**: the [`examples/`](../examples/) directory has one directory per feature, each with its own config and README.
-- **Deploy to production**: [self-hosting.md](self-hosting.md) for the single-binary shape, [kubernetes.md](kubernetes.md) and [quickstart-operator.md](quickstart-operator.md) for the OSS operator, [sidecar-deployment.md](sidecar-deployment.md) for per-pod sidecars.
-- **Contribute or build from source**: [CONTRIBUTING.md](../CONTRIBUTING.md).
+`mcp.yml` keeps the API origin and adds `mcp.example.com`. Its `mcp` action derives a tool from the local upstream's OpenAPI description. The server is given the `local` prefix and uses an always-on namespace, so its `GET /status` operation appears as `local.gateway_status`.
 
-For the complete documentation set, start at the [docs index](README.md).
+An MCP client initializes the connection before it lists or calls tools. This
+example leaves sessions disabled, so the gateway does not return a session ID
+that you need to save.
+
+Initialize the client:
+
+```bash
+curl -sS \
+  -H 'Host: mcp.example.com' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-demo","version":"1.0.0"}}}' \
+  http://127.0.0.1:8080/ | jq .
+```
+
+Then tell the gateway initialization is complete:
+
+```bash
+curl -sS -o /dev/null -w 'initialized: HTTP %{http_code}\n' \
+  -H 'Host: mcp.example.com' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2025-06-18' \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  http://127.0.0.1:8080/
+```
+
+List the tool catalogue:
+
+```bash
+curl -sS \
+  -H 'Host: mcp.example.com' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2025-06-18' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+  http://127.0.0.1:8080/ | jq '.result.tools[] | select(.name == "local.gateway_status")'
+```
+
+The command prints the `local.gateway_status` tool. Call it with another JSON-RPC request:
+
+```bash
+curl -sS \
+  -H 'Host: mcp.example.com' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2025-06-18' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"local.gateway_status","arguments":{}}}' \
+  http://127.0.0.1:8080/ | jq '.result.content'
+```
+
+The returned content contains `sbproxy`. Stop this gateway with `Ctrl-C` before the next stage.
+
+## Stage 3: add an AI endpoint
+
+Start the complete configuration:
+
+```bash
+sbproxy serve -f examples/enterprise-ai-gateway/sb.yml
+```
+
+`sb.yml` keeps the API and MCP origins, then adds `ai.example.com`. Its `ai_proxy` action uses `local-demo` as the default model. The `local-openai` provider speaks the OpenAI protocol at `http://127.0.0.1:8091/v1`; `allow_private_base_url: true` permits this loopback provider. The fixture answers the request, so no model weights or provider credentials are involved.
+
+Send a chat completion:
+
+```bash
+curl -sS \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"local-demo","messages":[{"role":"user","content":"Say hello."}]}' \
+  http://127.0.0.1:8080/v1/chat/completions \
+  | jq '{object, model, content: .choices[0].message.content}'
+```
+
+The response has `"object": "chat.completion"` and a nonempty `content` value.
+
+## Stop and clean up
+
+Press `Ctrl-C` in the gateway terminal, then press `Ctrl-C` in the upstream terminal. The walkthrough starts no background process, writes no credentials, and leaves no model cache. Keep the checked-out example files for later runs.
+
+## Continue
+
+Read [core concepts](core-concepts.md) for the shared request pipeline, then use [configuration.md](configuration.md) to change the example. [MCP](mcp.md) and [AI gateway](ai-gateway.md) explain the two actions in depth. To run actual local model weights, use [Run your first managed model](quickstart-serve.md).

@@ -1,5 +1,6 @@
 # Troubleshooting
-*Last modified: 2026-07-22*
+
+*Last modified: 2026-07-29*
 
 When something breaks, this is the first place to look. Each section is one failure: the symptom, the likely cause, and the fix. For *why* these things happen, see [architecture.md](architecture.md); for what the proxy does on its own while a dependency is down, see [degradation.md](degradation.md); for the dashboard-to-action triage flow, see [operator-runbook.md](operator-runbook.md).
 
@@ -50,7 +51,7 @@ Check:
 The `Host` header on the request does not match any configured origin.
 
 Check:
-- Run `sbproxy validate --config sb.yml` to confirm the config parses.
+- Run `sbproxy validate sb.yml` to confirm the config parses.
 - Confirm the request's `Host` header matches the origin name exactly, including any port suffix.
 - SBproxy uses a bloom filter for fast hostname lookup. If you just added an origin via hot reload, wait a second and retry.
 - These 404s land in `sbproxy_requests_total` under the client-supplied hostname (the cardinality limiter collapses excess values into `__other__`) and in the access log with `error_class: "not_found"`, so a flood of them is visible: it is usually a DNS record pointing at the proxy for a hostname you never configured, or scanning traffic.
@@ -80,7 +81,7 @@ Check:
 Usually one of: file watcher debounce, ConfigMap symlink swap, or a validation failure.
 
 Check:
-- A config with a validation error gets logged and rejected. The old config keeps running. Run `sbproxy validate --config sb.yml` to see the error.
+- A config with a validation error gets logged and rejected. The old config keeps running. Run `sbproxy validate sb.yml` to see the error.
 - The file watcher reacts to in-place writes. Saves that replace the file by atomic rename (many editors, `sed -i`, and Kubernetes ConfigMap symlink swaps) may not be detected. After a ConfigMap update, send `SIGHUP` or restart the pod to force the reload.
 - The `agent_classes`, `agent_detect`, and `tls_fingerprint` installers are applied at startup and re-applied on every hot reload; each swaps its live state atomically, so changes to those blocks take effect without a restart.
 - Watch `sbproxy_config_reload_total{result}`: a rising `failure` count or a stalled `success` cadence is the reload path telling you it is stuck.
@@ -99,7 +100,7 @@ Check:
 
 Check in order:
 1. Confirm the provider API key is set correctly. Check the `api_key` field or the environment variable it references.
-2. Run `sbproxy validate --config sb.yml` to confirm the provider block parses correctly.
+2. Run `sbproxy validate sb.yml` to confirm the provider block parses correctly.
 3. Check the structured log for `provider` and `status_code` fields on the failed request.
 4. If using a fallback chain, check that at least one provider in the chain has available capacity. The log will show which provider was attempted last.
 5. If the error is "context window exceeded," the requested model does not support the token count in the prompt. Add a model with a larger context window to the provider list.
@@ -188,7 +189,7 @@ their feature-specific failure posture.
 
 Check:
 
-- Run `sbproxy validate --config sb.yml` with the required secret environment
+- Run `sbproxy validate sb.yml` with the required secret environment
   already set. Do not print the expanded DSN. Validation catches malformed or
   unsupported schemes, query strings, fragments, bad database syntax, missing
   certificate/key partners, unreadable PEM files, and a mismatched client key.
@@ -324,7 +325,7 @@ Check:
 
 Provider-level `serve:` blocks use the same runtime through compatibility
 lowering. New configurations should use `proxy.model_host`. Live NVIDIA
-remediation is verified in the final GCP integration PR; see
+certification has not been recorded; see
 [model-host-certification.md](model-host-certification.md) before treating a
 simulated device test as hardware evidence.
 
@@ -470,7 +471,7 @@ make build                          # -> target/debug/sbproxy
 # Release build (required by the e2e harness)
 cargo build --release -p sbproxy    # -> target/release/sbproxy
 # Validate a config offline before serving
-sbproxy validate --config ./sb.yml
+sbproxy validate ./sb.yml
 # Diff a proposed config against a baseline (exit 0 no-op / 2 changes / 3 errors)
 sbproxy plan -f ./sb.yml --against ./last-good.yml
 # Run

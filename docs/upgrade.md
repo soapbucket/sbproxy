@@ -1,79 +1,81 @@
-# Upgrade Guide
-*Last modified: 2026-07-22*
+# Upgrade SBproxy
 
-## Upgrading between versions
+*Last modified: 2026-07-28*
 
-### From v0.x to v1.0
+Use this procedure for the Rust v1 release line. Upgrade a test or canary instance before the rest of a fleet, and keep the previous binary or image available until the new process has served traffic.
 
-#### Breaking changes
+If you are moving from the archived Go `v0.1.x` implementation, read [MIGRATION.md](../MIGRATION.md) before this page. The config schema is called `schema-v1`; it is separate from the Rust binary version. Release-specific changes are in [CHANGELOG.md](../CHANGELOG.md).
 
-- Security headers policy now uses `headers: [{name, value}]` array format instead of flat `x_frame_options` fields.
-- `session_config` renamed to `session`. The old name still works for now.
-- `serde_yaml` replaced with `yaml_serde` internally. No user-facing impact.
+## Before replacing anything
 
-#### New features
+Choose a target release from the [GitHub releases page](https://github.com/soapbucket/sbproxy/releases), read its changelog entry, and record the version now running:
 
-- JavaScript engine (QuickJS) for transforms and WAF rules via `js_script` fields in request/response modifiers.
-- ACME auto-cert (Let's Encrypt) via `proxy.acme` config block.
-- Reserved HTTP/3 (QUIC) config shape via `proxy.http3`. `enabled: true` is rejected until native HTTP/3 support lands.
-- Per-origin metrics with 21 metric families and configurable cardinality limiting.
-- W3C and B3 distributed tracing header propagation.
-- Webhook alerting with configurable channels via `proxy.alerting`.
-- Admin stats SPA via `proxy.admin`.
-- The legacy per-origin `connection_pool` shape remains parseable but is
-  config-only; Pingora's built-in pool settings apply.
+```bash
+sbproxy --version
+sbproxy validate /etc/sbproxy/sb.yml
+cp /etc/sbproxy/sb.yml /etc/sbproxy/sb.yml.before-upgrade
+```
 
-#### Config additions
+`validate` compiles the configuration without binding a listener. Resolve errors here, not during a rollout. Keep secrets out of shell history and copy any referenced secret material with the backup method your platform already uses.
 
-The following top-level `proxy:` sub-keys are new in v1.0:
+For a configuration change that accompanies the binary upgrade, preview it first:
 
-| Key | Description |
-|-----|-------------|
-| `proxy.acme` | ACME auto-cert configuration (Let's Encrypt). |
-| `proxy.http3` | Reserved HTTP/3 QUIC configuration. `enabled: true` fails config compilation. |
-| `proxy.metrics` | Metrics cardinality limits. |
-| `proxy.alerting` | Alert notification channels (webhook, log). |
-| `proxy.admin` | Embedded stats/logs SPA. |
+```bash
+sbproxy plan -f proposed-sb.yml --against /etc/sbproxy/sb.yml
+sbproxy validate proposed-sb.yml
+```
 
-The following per-origin keys are new in v1.0:
+`plan` exits 2 when it finds changes. That is an informational result. It exits 3 for semantic validation errors.
 
-| Key | Description |
-|-----|-------------|
-| `connection_pool` | Config-only compatibility shape; does not tune Pingora. |
-| `on_request` | Event hook plugins (alpha). |
-| `on_response` | Event hook plugins (alpha). |
-| `bot_detection` | Bot traffic detection (alpha). |
-| `threat_protection` | Dynamic blocklist integration (alpha). |
-| `rate_limit_headers` | Config-only compatibility shape; configure response headers on the live rate-limit policy. |
-| `traffic_capture` | Config-only compatibility shape; use `mirror` for live request mirroring. |
-| `message_signatures` | HTTP message signature verification (alpha). |
+## Install the target release
 
-#### Migration steps
+For an installer-managed node, pin the target tag instead of taking whatever release is latest:
 
-1. If you use `session_config:`, rename it to `session:`. The alias still works but will be removed in a future release.
-2. If you use security headers via flat fields (e.g. `x_frame_options`), move to the `response_modifiers` headers format:
+```bash
+export TARGET_VERSION=v1.9.0
+curl -fsSL https://download.sbproxy.dev | SBPROXY_VERSION="$TARGET_VERSION" sh
+sbproxy --version
+```
 
-   Before:
-   ```yaml
-   x_frame_options: DENY
-   x_content_type_options: nosniff
-   ```
+Replace `v1.9.0` with the release tag you approved. The installer verifies the published SHA-256 checksum and verifies the Sigstore bundle when `cosign` is installed. See [SUPPLY-CHAIN.md](../SUPPLY-CHAIN.md) for the verification model.
 
-   After:
-   ```yaml
-   response_modifiers:
-     - headers:
-         set:
-           X-Frame-Options: DENY
-           X-Content-Type-Options: nosniff
-   ```
+For Docker, pull the same release tag, update the pinned image reference in your deployment manifest, and keep the explicit configuration command:
 
-3. Validate the config before deploying:
+```bash
+docker pull soapbucket/sbproxy:1.9.0
+docker run --rm -p 8080:8080 \
+  -v "$PWD/sb.yml:/etc/sbproxy/sb.yml:ro" \
+  soapbucket/sbproxy:1.9.0 serve -f /etc/sbproxy/sb.yml
+```
 
-   ```bash
-   sbproxy validate sb.yml
-   ```
+The published image has no default configuration command. In Kubernetes, update the `SBProxy.spec.image` tag and use the rollout procedure in [kubernetes.md](kubernetes.md).
 
-   The flag form `sbproxy --check -f sb.yml` dispatches to the same handler, which is handy in CI pipelines that only pass flags.
+## Roll out and verify
 
-4. Deploy with zero downtime via config hot reload. Send `SIGHUP` to the running process, or use the admin API.
+Restart one supervised instance, wait for it to become healthy, then continue with the next instance. For a systemd-managed node, that normally looks like this:
+
+```bash
+sudo systemctl restart sbproxy
+sudo systemctl status sbproxy --no-pager
+```
+
+Make a representative request through the data plane. The `Host` header selects the origin you are testing:
+
+```bash
+curl -i -H 'Host: api.example.com' http://127.0.0.1:8080/status
+```
+
+For a running proxy with the admin server enabled, check the authenticated
+`GET /api/health` endpoint on its configured bind address and port. The
+default admin address is `127.0.0.1:9090`; see [admin.md](admin.md) for
+authentication and reload checks. Watch access logs, error rate, latency,
+provider failures, and budget behavior through the normal observation
+window before expanding the rollout.
+
+## Roll back
+
+If the new binary fails validation, startup, or the canary traffic check, restore the prior binary or image and restart that instance. Restore the saved configuration only when the configuration changed as part of the rollout. Do not mix binary rollback with an unrelated configuration edit; validate the restored file before restarting.
+
+For Kubernetes, restore the previous approved image tag and wait for the Deployment or StatefulSet rollout to complete. For Helm-managed operator changes, use `helm history` followed by `helm rollback`. The [operator quickstart](quickstart-operator.md) has the small-cluster commands.
+
+After the fleet is stable on the intended version, remove the temporary `sb.yml.before-upgrade` copy according to your secret-retention policy.

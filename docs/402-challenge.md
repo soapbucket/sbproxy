@@ -1,5 +1,6 @@
 # 402 Challenge contract
-*Last modified: 2026-07-26*
+
+*Last modified: 2026-07-28*
 
 The wire format the proxy uses when it returns `402 Payment Required`
 to an AI crawler. This document is the canonical reference for the
@@ -35,8 +36,8 @@ operator is running an enterprise build that can settle them.
 ## OSS advertises, enterprise settles
 
 The split between what OSS does and what the enterprise build does is
-deliberate, and matches the framing the rail-Lightning example PR
-uses (see `examples/rail-lightning/README.md`).
+deliberate. The runnable framing is in
+`examples/rail-lightning/README.md`.
 
 What the OSS proxy does today:
 

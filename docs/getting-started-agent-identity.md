@@ -1,20 +1,28 @@
-# Getting started: Agent identity issuance and enforcement
+# Getting started: agent identity verification and discovery
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-28*
 
 ## What you will build
 
-A gateway that gives AI agents a verifiable identity and enforces it at the edge. Inbound agents sign each request with an Ed25519 key under RFC 9421 HTTP Message Signatures, and SBproxy verifies the signature against a directory of known agent keys before the request reaches the upstream. You will also publish SBproxy's own signing-key directory so other verifiers can confirm the requests SBproxy signs on the way out.
+A gateway that verifies AI-agent identities at the edge. Inbound agents sign each request with an Ed25519 key under RFC 9421 HTTP Message Signatures, and SBproxy checks the signature against a directory of known agent keys before the request reaches the upstream. You will also publish a key directory and agent card for an SBproxy signing identity.
+
+The two jobs are separate. `bot_auth` verifies callers. `web_bot_auth_publish`
+serves discovery documents for a public key whose private half is held by a
+signer. Publishing the key does not create or distribute that private key.
 
 ## Prerequisites
 
 - A shell with `curl`.
 - `openssl` (used below to generate an Ed25519 keypair for a test agent).
+- A checkout of this repository for the signing helper at
+  `examples/web-bot-auth/bin/sign-request.sh`.
 - An upstream to proxy to. This guide uses `test.sbproxy.dev` as the placeholder upstream, following the repo convention.
 
 ## Install
 
-You do not have to compile anything to run SBproxy. One line installs the prebuilt binary on macOS or Linux (the script detects OS and architecture and drops the binary in `~/.local/bin`):
+You do not have to compile anything to run SBproxy. One line installs the
+prebuilt binary on Linux amd64/arm64 or Apple Silicon macOS and places it in
+`~/.local/bin`:
 
 ```bash
 curl -fsSL https://download.sbproxy.dev | sh
@@ -30,7 +38,10 @@ The same `serve -f <config>` form works for the Docker image (`soapbucket/sbprox
 
 ## Minimal config
 
-Save this as `sb.yml`. The `bot_auth` provider is the enforcement side: it verifies signed agents against the inline `agents` directory. The `web_bot_auth_publish` block is the issuance side: it serves SBproxy's own signing-key directory so verifiers can discover the key SBproxy signs outbound requests with.
+Save this as `sb.yml`. The `bot_auth` provider verifies signed agents against
+the inline `agents` directory. The `web_bot_auth_publish` block serves a
+separate public-key directory and agent card. A signer can advertise that
+directory so verifiers know which public key to use.
 
 ```yaml
 # yaml-language-server: $schema=https://raw.githubusercontent.com/soapbucket/sbproxy/main/schemas/sb-config.schema.json
@@ -61,8 +72,8 @@ origins:
             - "@target-uri"
             - "@authority"
 
-    # Issuance: publish SBproxy's own signing-key directory + agent card.
-    # Only the PUBLIC half lives in YAML; keep the private key in a vault.
+    # Discovery: publish a signing-key directory and agent card.
+    # Only the PUBLIC half lives here. Keep its private half in a vault.
     web_bot_auth_publish:
       enabled: true
       key_id: "sbproxy-key-2026-05-31"
@@ -73,7 +84,10 @@ origins:
       contact_url: "mailto:abuse@example.com"
 ```
 
-Every key above appears in `schemas/sb-config.schema.json` and in the `examples/web-bot-auth` and `examples/web-bot-auth-publish` configs. To generate a real key for the test agent, create an Ed25519 keypair and paste its public half (hex) into the `public_key` field:
+Every field above appears in `schemas/sb-config.schema.json` and in the
+`examples/web-bot-auth` and `examples/web-bot-auth-publish` configs. To
+generate a real key for the test agent, create an Ed25519 keypair and paste
+its public half, as hex, into the first `agents[].public_key` field:
 
 ```bash
 openssl genpkey -algorithm ed25519 -out openai-bot.pem
@@ -107,9 +121,19 @@ curl -i -H 'Host: blog.local' \
 # HTTP/1.1 401 Unauthorized
 ```
 
-A request signed by the key in the directory passes and is forwarded to the upstream with `200`. Production clients generate the `Signature-Input` and `Signature` headers with an RFC 9421 signer keyed to the private half of the keypair above.
+A request signed by the key in the directory passes and is forwarded to the
+upstream with `200`. Run the bundled helper from the repository checkout to
+create the two RFC 9421 headers. The `keyid` must match the directory entry,
+and the private key must match the public key you pasted into `sb.yml`.
 
 ```bash
+eval "$(examples/web-bot-auth/bin/sign-request.sh \
+  --key openai-bot.pem \
+  --keyid openai-2026-01 \
+  --method GET \
+  --target-uri /article \
+  --authority blog.local)"
+
 curl -i -H 'Host: blog.local' \
      -H "Signature-Input: $SIG_INPUT" \
      -H "Signature: $SIG" \
@@ -117,7 +141,8 @@ curl -i -H 'Host: blog.local' \
 # HTTP/1.1 200 OK
 ```
 
-Issuance: fetch the signing-key directory SBproxy publishes. Other verifiers fetch this to discover the key SBproxy signs outbound requests with.
+Discovery: fetch the signing-key directory SBproxy publishes. A signer using
+the matching private key can point verifiers at this URL.
 
 ```bash
 curl -i -H 'Host: blog.local' \

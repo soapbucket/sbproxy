@@ -1,6 +1,6 @@
 # OIDC Relying-Party login
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-28*
 
 The `oidc` auth provider turns SBproxy into an OpenID Connect
 Relying Party. Unlike the `jwt` provider, which only validates a
@@ -139,15 +139,12 @@ endpoint to honour arbitrary query parameters is unsafe.
 
 ## Discovery
 
-Today the IdP endpoints are explicit config fields. The OIDC
-discovery document at `<issuer>/.well-known/openid-configuration`
-is supported as an optional discovery-time fetch: when an
-operator points the provider at a discovery URL (a follow-up
-PR2), the proxy can populate `authorization_endpoint`,
-`token_endpoint`, `jwks_uri`, and `end_session_endpoint` from the
-fetched document instead of from explicit config. Until that
-lands, populate the endpoints by hand from the IdP's discovery
-document.
+Today the IdP endpoints are explicit config fields. The runtime contains the
+validated discovery-document parser and TTL cache, but configuration does not
+yet wire them into the auth provider. Read
+`<issuer>/.well-known/openid-configuration` and populate
+`authorization_endpoint`, `token_endpoint`, `jwks_uri`, and the optional
+`end_session_endpoint` explicitly.
 
 ## Session storage
 

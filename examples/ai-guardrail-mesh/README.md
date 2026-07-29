@@ -1,5 +1,7 @@
 # AI guardrail mesh
 
+![AI guardrail mesh](../../docs/assets/ai-guardrail-mesh.gif)
+
 Run the input guardrails as a cascade, collect the full verdict set, and
 fuse it under a configurable rule, instead of blocking on the first
 detector that flags.

@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-07-28*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -9,10 +9,10 @@ system, the AI gateway, caching, events, and common deployment topologies.
 
 ## 1. Overview
 
-SBproxy is a single static binary with no required external runtime dependencies. It is
-written in Rust and ships as a self-contained executable. There is no JVM, no Python
-interpreter, no Node.js runtime, and no shared library requirement beyond libc (or none at
-all when built with `musl` or `--target *-unknown-linux-musl`).
+Public release archives contain a prebuilt SBproxy executable. Linux release artifacts
+are linked against glibc. Running them does not require a Rust or C toolchain, a JVM, a
+Python interpreter, or a Node.js runtime. Source builds can target `musl` with
+`--target *-unknown-linux-musl` when a musl-linked executable is required.
 
 The proxy is built on Cloudflare's [Pingora](https://github.com/cloudflare/pingora)
 framework. Pingora supplies the tokio runtime, listener management, HTTP/1.1, HTTP/2

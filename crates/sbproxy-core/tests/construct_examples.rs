@@ -98,7 +98,13 @@ fn collect_yml_files(root: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    out.extend(
+        ["upstream.yml", "api.yml", "mcp.yml", "sb.yml"]
+            .into_iter()
+            .map(|name| root.join("enterprise-ai-gateway").join(name)),
+    );
     out.sort();
+    out.dedup();
     out
 }
 

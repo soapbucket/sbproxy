@@ -1,6 +1,6 @@
 # Taking SBproxy on-call: metrics, logs, and your first incident
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-07-28*
 
 ![Terminal recording: traffic flows through three origins, a dead upstream returns 502, the fallback origin serves a degraded 200, and the failure shows up in /metrics and the JSON access log](assets/use-case-production-ops.gif)
 
@@ -21,7 +21,8 @@ A three-origin config that stages a small incident on your desk. `app.local` is 
 Pick the option that fits your platform:
 
 ```bash
-# Linux / macOS, single static binary:
+# Prebuilt release executable for Linux amd64/arm64 (glibc) or Apple Silicon macOS.
+# No Rust, Python, JVM, or Node toolchain/runtime is required.
 curl -fsSL https://download.sbproxy.dev | sh
 
 # macOS via Homebrew:

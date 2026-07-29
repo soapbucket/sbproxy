@@ -184,8 +184,8 @@ jobs:
           cp LICENSE NOTICE README.md SECURITY.md SUPPLY-CHAIN.md "${STAGE}/" 2>/dev/null || true
           # Pack the CONTENTS of the staging dir (binary, license, readme)
           # so the tarball extracts to a flat layout: sbproxy + LICENSE etc.
-          # at root. Matches the Go v0.1.x convention so install.sh and
-          # the Homebrew formula find the binary at the expected path.
+          # at root so install.sh and the Homebrew formula find the binary
+          # at the expected path.
           tar -czf "dist/sbproxy_${{ matrix.platform }}.tar.gz" -C "${STAGE}" .
           # sha256sum on Linux (present in the rust:bookworm container),
           # shasum on macOS; both emit the same "HASH  filename" shape.

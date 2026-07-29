@@ -2,6 +2,8 @@
 
 *Last modified: 2026-07-06*
 
+![Point your coding assistant at your own GPU](../../docs/assets/use-case-coding-assistant.gif)
+
 The gateway hosts Qwen3 14B on the local GPU and serves it under the
 alias `claude-sonnet-4-5`. Because SBproxy exposes an Anthropic-format
 `/v1/messages` bridge alongside the OpenAI wire, Claude Code reaches the

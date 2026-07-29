@@ -1,8 +1,14 @@
 # Config stability tiers
 
-*Last modified: 2026-07-23*
+*Last modified: 2026-07-28*
 
-Stability guarantees for every field in `sb.yml`. Check a field's tier before relying on it in production.
+This page defines the stability tiers and applies them to representative or
+high-impact configuration leaves. It also lists the current reviewed
+`config-only` registry. It is not an exhaustive field matrix:
+[`configuration.md`](configuration.md) is the complete field inventory.
+
+An unlisted field has no implicit stability promise. Before depending on one,
+review its Rust source and the changelog for the release you plan to run.
 
 ---
 
@@ -103,7 +109,11 @@ and stale entries fail when their schema path is removed or renamed.
 
 ---
 
-## Field stability reference
+## Selected field stability reference
+
+The tables below cover representative and high-impact leaves. They do not
+assign a tier to every property accepted by the configuration parser. Use the
+tier definitions above only where a field is listed explicitly.
 
 ### Top-level fields
 
@@ -170,7 +180,7 @@ HTTP/3 is not served by this build. The block is retained for forward compatibil
 | `bot_detection` | - | object | - | **alpha** | Bot detection config. |
 | `threat_protection` | - | object | - | **alpha** | Dynamic threat blocklist config. |
 | `rate_limit_headers` | - | object | - | **config-only** | Use the live rate-limit policy's `headers` block. |
-| `error_pages` | - | object | - | **beta** | Custom error page config. |
+| `error_pages` | - | array | - | **beta** | Custom error page entries, each matching one status or a list of statuses. |
 | `traffic_capture` | - | object | - | **config-only** | No OSS consumer; use `mirror` for request mirroring. |
 | `connection_pool` | - | object | - | **config-only** | Retained for compatibility; Pingora's built-in pool settings apply. |
 | `message_signatures` | - | object | - | **alpha** | HTTP message signing config. |
@@ -202,7 +212,7 @@ HTTP/3 is not served by this build. The block is retained for forward compatibil
 | `enabled` | `enable` | boolean | true | **stable** |
 | `algorithms` | - | array | `[]` | **stable** |
 | `min_size` | - | integer | 0 | **stable** |
-| `level` | - | integer | - | **beta** |
+| `level` | - | integer | - | **config-only** |
 
 `level` is parsed but not applied: the encoders use their library
 default levels (gzip and zstd defaults, brotli quality 4).
@@ -280,4 +290,7 @@ default levels (gzip and zstd defaults, brotli quality 4).
 | Field | Type | Stability |
 |---|---|---|
 | `code` | integer | **stable** |
-| `text` | string | **stable** |
+| `text` | string | **config-only** |
+
+`text` is retained for schema-v1 compatibility. The response modifier applies
+`code`; the runtime does not emit or preserve a custom reason phrase.

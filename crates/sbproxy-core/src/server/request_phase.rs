@@ -2308,70 +2308,11 @@ pub(super) async fn request_filter(
     // --- Threat protection (before auth, per handler chain) ---
     if let Some(threat) = &pipeline.threat_protections[origin_idx] {
         if threat.enabled {
-            let content_type = session
-                .req_header()
-                .headers
-                .get(http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            let declared_json = content_type.contains("application/json");
-            // WOR-1150: scan when the Content-Type declares JSON OR the
-            // body is actually JSON-shaped, so a client cannot bypass the
-            // JSON-bomb / depth limits by mislabeling the Content-Type
-            // (e.g. sending a deep JSON body as text/plain). A JSON body's
-            // first non-whitespace byte is `{`/`[` and lands in the first
-            // transport chunk, so the shape check reads only that chunk.
-            if let Some(first_chunk) = session.read_request_body().await? {
-                let looks_json = first_chunk
-                    .iter()
-                    .find(|b| !b.is_ascii_whitespace())
-                    .map(|b| *b == b'{' || *b == b'[')
-                    .unwrap_or(false);
-                if declared_json || looks_json {
-                    // WOR-1739: accumulate the FULL body, not just the
-                    // first chunk. Pingora delivers the body chunk by
-                    // chunk and mirrors every consumed chunk into its
-                    // retry buffer for upstream replay, so scanning a
-                    // single read left a JSON bomb whose depth / key
-                    // explosion straddled a later chunk unscanned while
-                    // the whole body still reached the origin. Bound the
-                    // buffer by the configured `max_total_size` (or a
-                    // hard ceiling when unset) so a threat-protected
-                    // origin cannot be driven to buffer without limit;
-                    // an over-cap body is rejected exactly as
-                    // `check_json_body` rejects an oversized one.
-                    const THREAT_SCAN_HARD_CAP: usize = 8 * 1024 * 1024;
-                    let size_cap = threat
-                        .json
-                        .as_ref()
-                        .and_then(|j| j.max_total_size)
-                        .unwrap_or(THREAT_SCAN_HARD_CAP);
-                    let mut body_buf: Vec<u8> = first_chunk.to_vec();
-                    let mut over_cap = body_buf.len() > size_cap;
-                    while !over_cap {
-                        match session.read_request_body().await? {
-                            Some(chunk) => {
-                                if body_buf.len().saturating_add(chunk.len()) > size_cap {
-                                    over_cap = true;
-                                } else {
-                                    body_buf.extend_from_slice(&chunk);
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                    if over_cap {
-                        debug!("threat protection blocked request: body exceeds size cap");
-                        send_error(session, 413, "request entity too large").await?;
-                        return Ok(true);
-                    }
-                    if let Err(msg) = threat.check_json_body(&body_buf) {
-                        debug!(detail = %msg, "threat protection blocked request");
-                        send_error(session, 413, "request entity too large").await?;
-                        return Ok(true);
-                    }
-                }
-            }
+            // Body reads in request_filter drain the downstream stream
+            // before Pingora can forward it. Defer the bounded scan to
+            // request_body_filter, which releases the exact buffered bytes
+            // only after validation succeeds.
+            ctx.threat_scan_pending = true;
         }
     }
 

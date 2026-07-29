@@ -19,24 +19,31 @@
 #   sbproxy serve -f examples/mcp-federation/upstream.yml &
 #   sbproxy serve -f examples/mcp-federation/sb.yml
 #
-# Initialize the MCP session (answered locally; no upstream needed):
 # Test:
+# Start the MCP lifecycle (answered locally; no upstream needed):
 #   curl -s -X POST http://127.0.0.1:8080 \
 #     -H 'Host: mcp.example.com' \
 #     -H 'Content-Type: application/json' \
-#     -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+#     -H 'Accept: application/json, text/event-stream' \
+#     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-demo","version":"1.0.0"}}}' | jq .
 #
-# Initialize the MCP session (answered locally; no upstream needed):
-#   curl -s -X POST http://127.0.0.1:8080 \
+# Complete initialization. Sessions are disabled, so no
+# Mcp-Session-Id header is needed. Returns HTTP 202:
+#   curl -sS -o /dev/null -w '%{http_code}\n' \
+#     -X POST http://127.0.0.1:8080 \
 #     -H 'Host: mcp.example.com' \
 #     -H 'Content-Type: application/json' \
-#     -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | jq .
+#     -H 'Accept: application/json, text/event-stream' \
+#     -H 'MCP-Protocol-Version: 2025-06-18' \
+#     -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 #
 # List the federated tool catalogue (real: only gh.search_repos shows
 # up, because the db upstream is the unreachable placeholder):
 #   curl -s -X POST http://127.0.0.1:8080 \
 #     -H 'Host: mcp.example.com' \
 #     -H 'Content-Type: application/json' \
+#     -H 'Accept: application/json, text/event-stream' \
+#     -H 'MCP-Protocol-Version: 2025-06-18' \
 #     -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | jq .
 #
 # Call the real federated tool (dispatches an actual REST request to
@@ -45,6 +52,8 @@
 #   curl -s -X POST http://127.0.0.1:8080 \
 #     -H 'Host: mcp.example.com' \
 #     -H 'Content-Type: application/json' \
+#     -H 'Accept: application/json, text/event-stream' \
+#     -H 'MCP-Protocol-Version: 2025-06-18' \
 #     -d '{
 #       "jsonrpc":"2.0",
 #       "id":3,
@@ -61,6 +70,8 @@
 #   curl -s -X POST http://127.0.0.1:8080 \
 #     -H 'Host: mcp.example.com' \
 #     -H 'Content-Type: application/json' \
+#     -H 'Accept: application/json, text/event-stream' \
+#     -H 'MCP-Protocol-Version: 2025-06-18' \
 #     -d '{
 #       "jsonrpc":"2.0",
 #       "id":4,

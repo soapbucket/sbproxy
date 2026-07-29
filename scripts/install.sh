@@ -91,7 +91,7 @@ resolve_version() {
 
     if [ -z "$VERSION" ]; then
         echo "Error: could not determine latest version"
-        echo "Set SBPROXY_VERSION manually, e.g.: SBPROXY_VERSION=v0.1.0 sh install.sh"
+        echo "Set SBPROXY_VERSION manually, e.g.: SBPROXY_VERSION=v1.0.0 sh install.sh"
         exit 1
     fi
 

@@ -1,11 +1,11 @@
-//! Schema-compat regression test for v1 (Go) sb.yml configs.
+//! Schema-compat regression test for v0.1.x Go `sb.yml` configs.
 //!
-//! MIGRATION.md and the v2 launch story both promise that an existing
-//! `sb.yml` written for the Go implementation continues to load and
-//! compile on the Rust v2 binary unmodified. This test pins that
-//! promise: every fixture in `tests/v1-compat-fixtures/` is a real
-//! v1-shape config (lifted from the Go repo's `tests/config-compat/`
-//! suite) and must compile against the current schema.
+//! MIGRATION.md promises that an existing `sb.yml` written for the
+//! archived Go implementation continues to load on the Rust v1 line.
+//! The source fixtures came from
+//! <https://github.com/soapbucket/sbproxy-go/tree/v0.1.2/tests/config-compat>.
+//! Every fixture in `tests/v1-compat-fixtures/` must compile against the
+//! current schema.
 //!
 //! When a v1-style field is intentionally removed, this test fails
 //! and the breaking change has to be called out in MIGRATION.md

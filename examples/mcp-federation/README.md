@@ -2,6 +2,8 @@
 
 *Last modified: 2026-07-19*
 
+![MCP gateway with federated upstreams](../../docs/assets/mcp-federation.gif)
+
 The `mcp` action turns SBproxy into a Model Context Protocol gateway. It speaks JSON-RPC 2.0 on a configured origin, aggregates the tool catalogues of one or more upstream servers, and routes `tools/call` requests back to the upstream that owns each tool. Per-server `prefix:`, `rbac:`, and `timeout:` options live alongside the `origin:` entries; an inline `tool_allowlist` guardrail short-circuits any call to a tool not on the allowlist before it leaves the proxy.
 
 The wire format matches the schema published on `www.sbproxy.dev`. The action is a thin adapter on top of the federation library in `crates/sbproxy-extension/src/mcp/`; tool aggregation, name-collision handling, and the underlying transports live there.
@@ -10,7 +12,7 @@ The wire format matches the schema published on `www.sbproxy.dev`. The action is
 
 This package federates **two** upstreams so you can see both stories side by side:
 
-- **`gh`** is a `type: openapi` server (see [docs/mcp.md](../../docs/mcp.md#openapi-backed-servers)) pointed at the tiny REST mock in `upstream.yml`. The gateway derives the `gh.search_repos` tool from the inline OpenAPI spec with no code, and dispatches `tools/call` as a real HTTP request to that mock. `tools/list` and `tools/call gh.search_repos` below are genuine round-trips — run the two processes and you get real responses, not a transcript.
+- **`gh`** is a `type: openapi` server (see [docs/mcp.md](../../docs/mcp.md#openapi-backed-servers)) pointed at the tiny REST mock in `upstream.yml`. The gateway derives the `gh.search_repos` tool from the inline OpenAPI spec with no code, and dispatches `tools/call` as a real HTTP request to that mock. `tools/list` and `tools/call gh.search_repos` below are genuine round-trips. Run the two processes and you get real responses, not a transcript.
 - **`db`** is a plain `type: mcp` server pointed at `postgres.example.com`, an RFC 2606 reserved placeholder, not a running server. It exists to show the honest failure mode next to the real one: it is silently absent from `tools/list` (federation degrades per-server, logging and skipping a dead upstream rather than failing the whole catalogue) and `tools/call db.query` returns `"unknown tool: db.query"`. Point `db`'s `origin` at your own MCP server, or convert it to `type: openapi` the same way `gh` is done, to make it real too.
 
 For the full end-to-end product story (problem, RBAC, next steps), see [docs/use-case-mcp-federation.md](../../docs/use-case-mcp-federation.md).
@@ -27,19 +29,32 @@ sbproxy serve -f examples/mcp-federation/sb.yml
 ## Try it
 
 ```bash
-# Initialize an MCP session. Answered locally by the gateway — no
-# upstream is contacted, so this works even before you start
-# upstream.yml.
+# Start the MCP lifecycle. The gateway answers initialize locally,
+# so this works even before you start upstream.yml.
 curl -s -X POST http://127.0.0.1:8080 \
   -H 'Host: mcp.example.com' \
   -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | jq .
-# Returns the configured server_info.name / .version.
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-demo","version":"1.0.0"}}}' | jq .
+# Returns the negotiated protocol version and configured
+# server_info.name / .version.
+
+# Complete initialization. Sessions are disabled in this example, so
+# no Mcp-Session-Id header is needed. Returns HTTP 202.
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -X POST http://127.0.0.1:8080 \
+  -H 'Host: mcp.example.com' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2025-06-18' \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 
 # List the federated tool catalogue.
 curl -s -X POST http://127.0.0.1:8080 \
   -H 'Host: mcp.example.com' \
   -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2025-06-18' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | jq .
 # Real output with both processes running:
 # {"jsonrpc":"2.0","id":2,"result":{"tools":[
@@ -54,6 +69,8 @@ curl -s -X POST http://127.0.0.1:8080 \
 curl -s -X POST http://127.0.0.1:8080 \
   -H 'Host: mcp.example.com' \
   -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2025-06-18' \
   -d '{
     "jsonrpc":"2.0",
     "id":3,
@@ -70,6 +87,8 @@ curl -s -X POST http://127.0.0.1:8080 \
 curl -s -X POST http://127.0.0.1:8080 \
   -H 'Host: mcp.example.com' \
   -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2025-06-18' \
   -d '{
     "jsonrpc":"2.0",
     "id":4,
@@ -86,6 +105,8 @@ curl -s -X POST http://127.0.0.1:8080 \
 curl -s -X POST http://127.0.0.1:8080 \
   -H 'Host: mcp.example.com' \
   -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2025-06-18' \
   -d '{
     "jsonrpc":"2.0",
     "id":5,
@@ -116,7 +137,7 @@ example under [`examples/mcp-rbac-quotas`](../mcp-rbac-quotas).
 
 ## Make `db` real too
 
-Swap `db`'s `origin: postgres.example.com` for a running MCP server (bare hostname normalises to `https://<host>/mcp`, or give a full URL including `http://127.0.0.1:<port>/mcp` for local testing), or convert it to a second `type: openapi` server the way `gh` is done here — point `origin` at any REST API you own and give it an inline `spec` or `spec_path`. Either way `db`'s `rbac: db_writer` and the `tool_allowlist` guardrail keep applying with no other config change.
+Swap `db`'s `origin: postgres.example.com` for a running MCP server (bare hostname normalises to `https://<host>/mcp`, or give a full URL including `http://127.0.0.1:<port>/mcp` for local testing), or convert it to a second `type: openapi` server the way `gh` is done here: point `origin` at any REST API you own and give it an inline `spec` or `spec_path`. Either way `db`'s `rbac: db_writer` and the `tool_allowlist` guardrail keep applying with no other config change.
 
 ## See also
 

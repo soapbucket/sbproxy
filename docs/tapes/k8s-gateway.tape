@@ -20,7 +20,7 @@ Type `export PS1='$ '; clear`
 Enter
 Show
 
-Type `curl -H 'Host: api.example.com' -H 'X-Forwarded-For: 203.0.113.7' http://127.0.0.1:8080/headers`
+Type `curl -i -H 'Host: api.example.com' -H 'X-Forwarded-For: 203.0.113.7' http://127.0.0.1:8080/headers`
 Enter
 Sleep 1.6s
 

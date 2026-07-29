@@ -1,6 +1,6 @@
 # Internal MCP servers multiplying without an owner: federate them behind one gateway
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-07-28*
 
 Every team that wires an agent up to a tool ends up standing up its own MCP server: one for the GitHub org, one for the internal database, one for the ticket tracker. Six months later there are a dozen of them, each with its own auth story, its own idea of who is allowed to call `delete_repo`, and no shared record of what any agent actually did. SBproxy's MCP gateway collapses that sprawl into one endpoint: it aggregates the tool catalogues of every upstream server behind a single virtual MCP server, gates every `tools/call` with default-deny RBAC keyed on the caller's identity, and can turn a REST API with no MCP support at all into governed tools with nothing but an OpenAPI spec. This guide builds that gateway end to end, with real curls against a real (if intentionally tiny) upstream.
 
@@ -16,7 +16,8 @@ One MCP endpoint on port 8080 that speaks JSON-RPC 2.0 and aggregates two upstre
 ## Install
 
 ```bash
-# Linux / macOS, single static binary:
+# Prebuilt release executable for Linux amd64/arm64 (glibc) or Apple Silicon macOS.
+# No Rust, Python, JVM, or Node toolchain/runtime is required.
 curl -fsSL https://download.sbproxy.dev | sh
 
 # macOS via Homebrew:
@@ -73,7 +74,7 @@ rbac_policies:
         allowed: ["db.query"]
 ```
 
-Third, the honest placeholder and the allowlist guardrail. `db` is a plain `type: mcp` server pointed at `postgres.example.com`, an RFC 2606 reserved hostname that resolves nowhere — this is what an unfinished federation entry looks like before you point it at a real server. The `tool_allowlist` guardrail is a second, coarser gate on top of RBAC: even an RBAC-allowed tool must also appear here to be forwarded, which is useful as a single audited list independent of the per-caller policy detail above.
+Third, the honest placeholder and the allowlist guardrail. `db` is a plain `type: mcp` server pointed at `postgres.example.com`, an RFC 2606 reserved hostname that resolves nowhere. This is what an unfinished federation entry looks like before you point it at a real server. The `tool_allowlist` guardrail is a second, coarser gate on top of RBAC: even an RBAC-allowed tool must also appear here to be forwarded, which is useful as a single audited list independent of the per-caller policy detail above.
 
 ```yaml
   - origin: postgres.example.com
@@ -98,29 +99,52 @@ sbproxy serve -f examples/mcp-federation/upstream.yml &
 sbproxy serve -f examples/mcp-federation/sb.yml
 ```
 
-Initialize an MCP session. This is answered locally by the gateway — no upstream is contacted, so it works even before the mock is up:
+Start the MCP lifecycle. `initialize` is answered locally by the gateway, so
+it works even before the mock is up:
 
 ```console
 $ curl -s -X POST http://127.0.0.1:8080 \
-    -H 'Host: mcp.example.com' -H 'Content-Type: application/json' \
-    -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | jq -c '.result.serverInfo'
-{"name":"my-mcp","version":"1.0.0"}
+    -H 'Host: mcp.example.com' \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-demo","version":"1.0.0"}}}' \
+  | jq -c '{protocolVersion: .result.protocolVersion, serverInfo: .result.serverInfo}'
+{"protocolVersion":"2025-06-18","serverInfo":{"name":"my-mcp","version":"1.0.0"}}
+```
+
+Tell the gateway initialization is complete. This example leaves MCP
+sessions disabled, so there is no `Mcp-Session-Id` header to preserve:
+
+```console
+$ curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8080 \
+    -H 'Host: mcp.example.com' \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H 'MCP-Protocol-Version: 2025-06-18' \
+    -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+202
 ```
 
 List the federated catalogue. Only `gh.search_repos` shows up: the `db` upstream's `tools/list` fetch fails against the unreachable placeholder, and federation drops the failed server rather than failing the whole call.
 
 ```console
 $ curl -s -X POST http://127.0.0.1:8080 \
-    -H 'Host: mcp.example.com' -H 'Content-Type: application/json' \
+    -H 'Host: mcp.example.com' \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H 'MCP-Protocol-Version: 2025-06-18' \
     -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | jq -c '.result.tools[].name'
 "gh.search_repos"
 ```
 
-Call the real tool. The gateway resolves the OpenAPI route for `search_repos`, puts `q` on the query string, and sends an actual GET to the mock upstream — the response below is that upstream's real body, wrapped as MCP tool-result content:
+Call the real tool. The gateway resolves the OpenAPI route for `search_repos`, puts `q` on the query string, and sends an actual GET to the mock upstream. The response below is that upstream's real body, wrapped as MCP tool-result content:
 
 ```console
 $ curl -s -X POST http://127.0.0.1:8080 \
-    -H 'Host: mcp.example.com' -H 'Content-Type: application/json' \
+    -H 'Host: mcp.example.com' \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H 'MCP-Protocol-Version: 2025-06-18' \
     -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"gh.search_repos","arguments":{"q":"sbproxy"}}}' \
   | jq -r '.result.content[0].text'
 [{"full_name":"soapbucket/sbproxy","name":"sbproxy","stars":4200},{"full_name":"soapbucket/docs","name":"docs","stars":12}]
@@ -130,7 +154,10 @@ Call a tool that is not on the allowlist. The `tool_allowlist` guardrail refuses
 
 ```console
 $ curl -s -X POST http://127.0.0.1:8080 \
-    -H 'Host: mcp.example.com' -H 'Content-Type: application/json' \
+    -H 'Host: mcp.example.com' \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H 'MCP-Protocol-Version: 2025-06-18' \
     -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"gh.delete_repo","arguments":{"owner":"foo","repo":"bar"}}}' \
   | jq -c '.error'
 {"code":-32602,"message":"tool 'gh.delete_repo' is blocked by tool_allowlist guardrail"}
@@ -140,20 +167,23 @@ Now call `db.query`, the tool behind the placeholder upstream. This is the hones
 
 ```console
 $ curl -s -X POST http://127.0.0.1:8080 \
-    -H 'Host: mcp.example.com' -H 'Content-Type: application/json' \
+    -H 'Host: mcp.example.com' \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H 'MCP-Protocol-Version: 2025-06-18' \
     -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"db.query","arguments":{"sql":"select 1"}}}' \
   | jq -c '.error'
 {"code":-32603,"message":"tool call failed: unknown tool: db.query"}
 ```
 
-To make `db` real, point its `origin` at a running MCP server — a bare hostname normalises to `https://<host>/mcp`, or give a full URL (including `http://127.0.0.1:<port>/mcp` for something running locally) — or convert it to a second `type: openapi` server the way `gh` is done here, pointed at any REST API you own with a `spec` or `spec_path`. Neither change touches `rbac_policies` or the `tool_allowlist` guardrail; both keep applying.
+To make `db` real, point its `origin` at a running MCP server. A bare hostname normalises to `https://<host>/mcp`, or you can give a full URL, including `http://127.0.0.1:<port>/mcp` for something running locally. You can also convert it to a second `type: openapi` server the way `gh` is done here, pointed at any REST API you own with a `spec` or `spec_path`. Neither change touches `rbac_policies` or the `tool_allowlist` guardrail; both keep applying.
 
 ## You are done when
 
 - `tools/list` returns exactly one tool, `gh.search_repos`, and does not error even though `db`'s upstream is unreachable.
 - `tools/call gh.search_repos` returns `"isError":false` with the mock upstream's repository list in `.result.content[0].text`.
 - `tools/call gh.delete_repo` (not on the allowlist) returns a JSON-RPC error naming the blocked tool, code `-32602`.
-- `tools/call db.query` returns a JSON-RPC error naming it an unknown tool, code `-32603` — proof that a federated server failing does not silently forward calls to a tool that was never really there.
+- `tools/call db.query` returns a JSON-RPC error naming it an unknown tool, code `-32603`. This proves that a federated server failing does not silently forward calls to a tool that was never really there.
 
 ## Next steps
 

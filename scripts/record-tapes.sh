@@ -4,7 +4,7 @@
 # Each tape under docs/tapes/ declares the config it should run against with a
 # `# CONFIG: <path>` directive near the top. This script starts the release
 # binary with that config (provider keys sourced from the environment), waits
-# for the admin readiness probe, records the tape against the live proxy, then
+# for the data listener, records the tape against the live proxy, then
 # stops it. Provider keys stay in the environment and are never typed on screen.
 #
 # Usage:
@@ -23,28 +23,105 @@ cd "$(dirname "$0")/.."
 
 BIN="${SBPROXY_BIN:-./target/release/sbproxy}"
 ENV_FILE="${SBPROXY_DEMO_ENV:-../test/.env}"
-REC_LOG="/tmp/sbproxy-rec.log"
-export SBPROXY_REC_LOG="$REC_LOG"
+ACTIVE_PIDS=()
+ACTIVE_WORKSPACES=()
 
 if [ ! -x "$BIN" ]; then
   echo "error: $BIN not found. Build it first: make build-release" >&2
   exit 1
 fi
 if [ -f "$ENV_FILE" ]; then
+  set -a
   # shellcheck disable=SC1090
-  set -a; . "$ENV_FILE"; set +a
+  . "$ENV_FILE"
+  set +a
   echo "loaded provider keys from $ENV_FILE"
 else
   echo "note: $ENV_FILE not found; relying on keys already in the environment"
 fi
 
-free_ports() {
-  local p pids
-  for p in 8080 9090; do
-    pids="$(lsof -ti "tcp:$p" 2>/dev/null || true)"
-    [ -n "$pids" ] && kill -9 $pids 2>/dev/null || true
+stop_pid() {
+  local pid="$1" _
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
+stop_active_from() {
+  local start="$1" i
+  for ((i=${#ACTIVE_PIDS[@]} - 1; i >= start; i--)); do
+    stop_pid "${ACTIVE_PIDS[$i]}"
   done
-  sleep 0.3
+  ACTIVE_PIDS=("${ACTIVE_PIDS[@]:0:start}")
+}
+
+remove_workspace() {
+  local workspace="$1"
+  [ -n "$workspace" ] || return
+  rm -f -- "$workspace/main.log" "$workspace/aux.log" 2>/dev/null || true
+  rmdir -- "$workspace" 2>/dev/null || true
+}
+
+remove_workspaces_from() {
+  local start="$1" i
+  for ((i=${#ACTIVE_WORKSPACES[@]} - 1; i >= start; i--)); do
+    remove_workspace "${ACTIVE_WORKSPACES[$i]}"
+  done
+  ACTIVE_WORKSPACES=("${ACTIVE_WORKSPACES[@]:0:start}")
+}
+
+cleanup() {
+  stop_active_from 0
+  remove_workspaces_from 0
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+config_port() {
+  local cfg="$1" port
+  port="$(sed -n 's/^[[:space:]]*http_bind_port:[[:space:]]*//p' "$cfg" | head -n1)"
+  printf '%s\n' "${port:-8080}"
+}
+
+reject_occupied_port() {
+  local port="$1" owners
+  owners="$(lsof -ti "tcp:$port" 2>/dev/null || true)"
+  if [ -n "$owners" ]; then
+    echo "error: required port $port is already occupied (PID(s): $(echo "$owners" | tr '\n' ' '))" >&2
+    return 1
+  fi
+}
+
+start_proxy() {
+  local cfg="$1" log="$2" loglevel="$3"
+  # The child receives its own stdout path for tape commands that inspect logs.
+  # shellcheck disable=SC2094
+  RUST_LOG="$loglevel" NO_COLOR=1 SBPROXY_REC_LOG="$log" \
+    "$BIN" serve -f "$cfg" >"$log" 2>&1 &
+  ACTIVE_PIDS+=("$!")
+}
+
+wait_ready() {
+  local pid="$1" port="$2"
+  for _ in $(seq 1 80); do
+    if curl -s -o /dev/null --max-time 2 "localhost:$port" >/dev/null 2>&1; then
+      return 0
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.25
+  done
+  return 1
 }
 
 record() {
@@ -52,17 +129,24 @@ record() {
   [ -f "$tape" ] || tape="docs/tapes/${tape%.tape}.tape"
   if [ ! -f "$tape" ]; then echo "skip: no such tape $tape" >&2; return 1; fi
 
-  local cfg
+  local cfg aux_cfg
   cfg="$(sed -n 's/^# CONFIG:[[:space:]]*//p' "$tape" | head -n1)"
   if [ -z "$cfg" ]; then echo "skip: $tape has no '# CONFIG:' directive" >&2; return 1; fi
   if [ ! -f "$cfg" ]; then echo "skip: config $cfg (from $tape) missing" >&2; return 1; fi
+  aux_cfg="$(sed -n 's/^# AUX_CONFIG:[[:space:]]*//p' "$tape" | head -n1)"
+  if [ -n "$aux_cfg" ] && [ ! -f "$aux_cfg" ]; then
+    echo "skip: auxiliary config $aux_cfg (from $tape) missing" >&2
+    return 1
+  fi
 
   # Examples bind the data listener on http_bind_port (default 8080) and do
   # not start the optional admin server, so readiness is probed on the data
   # port: any HTTP response (even a 404) means the listener is accepting.
-  local port
-  port="$(sed -n 's/^[[:space:]]*http_bind_port:[[:space:]]*//p' "$cfg" | head -n1)"
-  port="${port:-8080}"
+  local port aux_port=""
+  port="$(config_port "$cfg")"
+  if [ -n "$aux_cfg" ]; then
+    aux_port="$(config_port "$aux_cfg")"
+  fi
 
   # A tape may raise the proxy log level (e.g. the fallback demo greps the
   # log for a failover WARN). Default to error so the log stays quiet.
@@ -70,29 +154,53 @@ record() {
   loglevel="$(sed -n 's/^# LOGLEVEL:[[:space:]]*//p' "$tape" | head -n1)"
   loglevel="${loglevel:-error}"
 
-  echo "==> $tape   (config: $cfg, port: $port, log: $loglevel)"
-  free_ports
-  RUST_LOG="$loglevel" NO_COLOR=1 "$BIN" "$cfg" >"$REC_LOG" 2>&1 &
-  local pid=$!
+  reject_occupied_port "$port" || return 1
+  if [ -n "$aux_port" ]; then
+    if [ "$aux_port" = "$port" ]; then
+      echo "error: main and auxiliary configs both require port $port" >&2
+      return 1
+    fi
+    reject_occupied_port "$aux_port" || return 1
+  fi
 
-  local ready=""
-  for _ in $(seq 1 80); do
-    if curl -s -o /dev/null --max-time 2 "localhost:$port" >/dev/null 2>&1; then ready=1; break; fi
-    if ! kill -0 "$pid" 2>/dev/null; then break; fi
-    sleep 0.25
-  done
-  if [ -z "$ready" ]; then
-    echo "error: proxy never became ready for $cfg; see $REC_LOG" >&2
-    tail -n 5 "$REC_LOG" >&2 || true
-    kill "$pid" 2>/dev/null || true
+  local workspace main_log aux_log start_index workspace_start main_pid aux_pid
+  workspace="$(mktemp -d "${TMPDIR:-/tmp}/sbproxy-record.XXXXXX")"
+  workspace_start=${#ACTIVE_WORKSPACES[@]}
+  ACTIVE_WORKSPACES+=("$workspace")
+  main_log="$workspace/main.log"
+  aux_log="$workspace/aux.log"
+  start_index=${#ACTIVE_PIDS[@]}
+
+  echo "==> $tape   (config: $cfg, port: $port, log: $loglevel)"
+  if [ -n "$aux_cfg" ]; then
+    start_proxy "$aux_cfg" "$aux_log" "$loglevel"
+    aux_pid="${ACTIVE_PIDS[${#ACTIVE_PIDS[@]} - 1]}"
+    if ! wait_ready "$aux_pid" "$aux_port"; then
+      echo "error: auxiliary proxy never became ready on port $aux_port for $aux_cfg" >&2
+      stop_active_from "$start_index"
+      remove_workspaces_from "$workspace_start"
+      return 1
+    fi
+  fi
+
+  start_proxy "$cfg" "$main_log" "$loglevel"
+  main_pid="${ACTIVE_PIDS[${#ACTIVE_PIDS[@]} - 1]}"
+  if ! wait_ready "$main_pid" "$port"; then
+    echo "error: proxy never became ready on port $port for $cfg" >&2
+    stop_active_from "$start_index"
+    remove_workspaces_from "$workspace_start"
     return 1
   fi
 
+  export SBPROXY_REC_LOG="$main_log"
+  set +e
   vhs "$tape"
   local rc=$?
+  set -e
 
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  stop_active_from "$start_index"
+  remove_workspaces_from "$workspace_start"
+  unset SBPROXY_REC_LOG
   return $rc
 }
 
@@ -110,7 +218,6 @@ for t in "${tapes[@]}"; do
   record "$t" || failed=$((failed + 1))
 done
 
-free_ports
 if [ "$failed" -gt 0 ]; then
   echo "done with $failed failure(s)" >&2
   exit 1

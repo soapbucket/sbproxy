@@ -1,6 +1,6 @@
 # Self-hosting SBproxy
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-07-28*
 
 One binary to self-host your AI gateway, and the same binary runs the
 models. OpenRouter proved that teams want unified routing, fallbacks,
@@ -27,8 +27,9 @@ curl -fsSL https://download.sbproxy.dev | sh
 brew install soapbucket/tap/sbproxy
 
 # Docker
-docker run --rm -p 8080:8080 -v "$PWD/sb.yml:/etc/sbproxy/sb.yml" \
-  soapbucket/sbproxy:latest
+docker run --rm -p 8080:8080 \
+  -v "$PWD/sb.yml:/etc/sbproxy/sb.yml:ro" \
+  soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
 ```
 
 Binary downloads and the rest of the install matrix are in the
@@ -73,8 +74,8 @@ acquisition, and the current hardware evidence boundary.
 ## The model manifest
 
 Catalog v2 is the reviewable file that says which models exist, where their
-weights come from, and which digests must match. Canonical deployments in this
-PR use the built-in catalog. An operator catalog is available through the
+weights come from, and which digests must match. Canonical deployments use the
+built-in catalog. An operator catalog is available through the
 compatibility `serve.catalog_file` path; moving custom catalog selection into
 the managed admin plane is later work. See
 [`examples/model-manifest`](../examples/model-manifest). A manifest
@@ -148,8 +149,8 @@ origins:
 ```
 
 Check the [model host boundary](model-host.md#current-boundary) before choosing
-hardware. Apple Metal is the live gate for this PR; NVIDIA remains pending the
-final GCP integration run.
+hardware. Apple Silicon Metal passed on 2026-07-11. NVIDIA CUDA and live GCP
+certification remain pending, with deterministic and local test evidence only.
 
 ## Spill to cloud, with policy attached
 
@@ -208,7 +209,7 @@ charged. A local completion costs nothing at the API, so the whole
 displaced price is the saving:
 
 ```yaml
-# Fragment — nest under origins."<host>".action (compatibility serve: path).
+# Fragment: nest under origins."<host>".action (compatibility serve: path).
 # Full file: examples/self-hosting/sb.yml
 providers:
   - name: local
@@ -289,12 +290,12 @@ your own GPUs.
 
 ## Runnable examples
 
-- [`examples/self-hosting/`](../examples/self-hosting/) — local model plus
+- [`examples/self-hosting/`](../examples/self-hosting/) - local model plus
   cloud spill in one fallback array (the serve-only quickstart this page
   describes).
-- [`examples/self-hosting-macos/`](../examples/self-hosting-macos/) — same
+- [`examples/self-hosting-macos/`](../examples/self-hosting-macos/) - same
   idea with the admin UI enabled on Apple Silicon / Metal.
-- [`examples/model-host-managed/`](../examples/model-host-managed/) —
+- [`examples/model-host-managed/`](../examples/model-host-managed/) -
   canonical `proxy.model_host` + `provider_type: managed_model`.
 
 ## Related
@@ -302,7 +303,7 @@ your own GPUs.
 - [model-host.md](model-host.md) - the reference: catalog, fit planner,
   supervisor, engine matrix.
 - [model-host-certification.md](model-host-certification.md) -
-  the hardware evidence ledger and final GCP procedure.
+  the hardware evidence ledger and GCP certification procedure.
 - [ai-gateway.md](ai-gateway.md) - the routing, guardrail, budget, and
   ledger planes local models plug into.
 - [quickstart-serve.md](quickstart-serve.md) - `sbproxy run <model>` on-ramp.

@@ -6,8 +6,9 @@ origins:
   "conhash.test":
     action:
       type: load_balancer
-      algorithm: consistent_hash
-      hash_key: X-Hash-Key
+      algorithm:
+        header_hash:
+          header: X-Hash-Key
       targets:
         - url: http://127.0.0.1:18888/echo
           weight: 1

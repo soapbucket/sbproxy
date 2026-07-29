@@ -11,7 +11,9 @@ on:
       - 'docs/**'
       - 'llms.txt'
       - 'README.md'
+      - 'schemas/sb-config.schema.json'
       - 'scripts/check-doc-drift.sh'
+      - '.github/workflows/release.yml'
       - '.github/workflows/doc-drift.yml'
 
 permissions:

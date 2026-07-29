@@ -1,6 +1,6 @@
 # Model host hardware certification
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-07-28*
 
 This page separates evidence already produced by deterministic tests from work
 that requires a real accelerator. It is an evidence ledger and a repeatable
@@ -13,11 +13,11 @@ certification.
 |---|---|---|
 | CPU contracts | covered in CI | Artifact, driver, fit, admission, reconcile, reload, and CLI suites. |
 | Apple Silicon Metal | passed 2026-07-11 | Real managed GGUF completion, status and stop truth, cache reuse, maintenance health, and ready-engine Ctrl-C shutdown on Apple M4 Max. |
-| NVIDIA CUDA single node | pending final GCP PR | Deterministic T4/L4 descriptors, vLLM plans, and container isolation tests exist. No live claim is made in this PR. |
-| NVIDIA multi-GPU | pending final GCP PR | Placement and device-scoping tests only. |
+| NVIDIA CUDA single node | pending live certification | Deterministic T4/L4 descriptors, vLLM plans, and container isolation tests exist. No live CUDA evidence is recorded. |
+| NVIDIA multi-GPU | pending live certification | Deterministic placement and device-scoping tests only. |
 | Local multi-process cluster control | passed 2026-07-11 | Four real processes, enrolled identities, signed gossip and state, node-specific mTLS, controller restart fencing, rolling and recreate transitions, worker loss, post-GC tombstone, partition callout, digest mismatch and recovery, and child cleanup. |
 | Local three-process data plane | passed 2026-07-13 | A gateway and two workers prove authenticated HTTP/2 dispatch, logical discovery, unary and SSE responses, coordinated cold start, pre-output failover, no mid-stream replay, cancellation, permit release, and absence of the bearer sentinel from worker logs. |
-| Three-node GCP runtime | pending final GCP PR | Local control and data planes are complete. Live GCP networking, NVIDIA engines, and hardware evidence remain pending. |
+| Three-node GCP runtime | pending live certification | Local control and data-plane tests exist. Live GCP networking, NVIDIA engines, and hardware evidence remain pending. |
 
 The generated [capability matrix](model-host-capabilities.md) records Apple
 Metal and the deterministic cluster control plane as stable. Remote dispatch,
@@ -106,9 +106,8 @@ not GCP or remote inference certification.
 
 ### Apple Metal evidence from 2026-07-11
 
-The PR gate ran on arm64 macOS 26.5.1 build 25F80, Apple M4 Max, with 36 GiB
-of memory. The branch worktree was based on `36d95ddd`; the PR description
-records the final review-fix commit that contains the same runtime code.
+The recorded gate ran on arm64 macOS 26.5.1 build 25F80, Apple M4 Max,
+with 36 GiB of memory.
 
 - Model: `qwen2.5-0.5b-instruct:q4_k_m`
 - Managed engine: llama.cpp b9905 on Metal
@@ -146,7 +145,7 @@ source-build publication, per-device capacity, bounded queue behavior, atomic
 rollback, status shape, and CLI contracts. They cannot prove a driver loads a
 model or returns tokens on real hardware.
 
-## Apple Metal gate for this PR
+## Apple Metal verification procedure
 
 Use an isolated cache and ports on Apple Silicon:
 
@@ -179,15 +178,15 @@ and the verified artifact digest. Stop must reach `stopped` without deleting the
 snapshot. A second run against the same cache must verify a cache hit without
 another weight download.
 
-Record the final binary revision and retained command output in the PR
-description. The evidence above promotes the Apple capability from `preview`
-to `stable`; regenerate the matrix whenever this record changes.
+Record the tested binary revision and retain the command output with the
+certification evidence. The evidence above supports the Apple capability at
+`stable`; regenerate the matrix whenever this record changes.
 
-## Final GCP NVIDIA gate
+## GCP NVIDIA certification procedure
 
-The user explicitly reserved NVIDIA and live GCP multi-node validation for the
-final PR group. Run this procedure only after the distributed data plane,
-governance, and operator-product slices have landed.
+NVIDIA CUDA and live GCP multi-node certification remain pending. The
+deterministic and local tests above do not supply live hardware evidence. Run
+this procedure when recording that evidence.
 
 ### Provision an L4 worker
 
@@ -286,6 +285,6 @@ For every live run, retain:
 - failure logs for every expected refusal;
 - GCP machine type, accelerator type, zone, and teardown confirmation.
 
-Do not promote a capability from this checklist alone. Promotion requires the
-recorded output attached to the PR and a deterministic regression test for any
-bug found during the hardware run.
+Do not promote a capability from this checklist alone. Promotion requires
+retained output tied to the tested revision and a deterministic regression test
+for any bug found during the hardware run.

@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-07-21*
+*Last modified: 2026-07-28*
 
 SBproxy can own model processes on one worker or place them across a managed
 cluster. Model-host control lives under `proxy.model_host`. Depending on its
@@ -955,19 +955,20 @@ points at the alternatives: install llama.cpp on `PATH`, set a trusted
 explicit `version:` always wins over this selection, so only pin one on macOS
 if you know the build loads on the hosts you deploy to.
 
-llama.cpp is the engine for GGUF models on CPU and Apple Metal. NVIDIA GPU
-serving is handled by the vLLM and SGLang container engines, not llama.cpp, so
-point a GPU deployment at one of those.
+llama.cpp is the engine for GGUF models on CPU and Apple Metal. On a compatible
+NVIDIA Linux host, SBproxy can also build llama.cpp from digest-pinned source
+with CUDA. The pending NVIDIA certification target uses vLLM or SGLang, so use
+one of those when following the certification procedure.
 
 ```yaml
 engines:
   llama_cpp:
     launch: binary
     version: b9905
-    acceleration: auto   # Metal on Apple Silicon, otherwise CPU
+    acceleration: auto   # Metal on Apple Silicon, CUDA when build prerequisites pass, otherwise CPU
 ```
 
-Live CUDA validation is part of the final GCP PR, so this path remains preview
+Live CUDA certification has not been recorded, so this path remains preview
 despite deterministic source-build coverage in CI.
 
 ### vLLM in a container (default)
@@ -998,8 +999,8 @@ engines:
 ```
 
 Tagged images, `latest`, writable artifact mounts, arbitrary container argv, and
-unscoped devices are rejected. Live container certification is deferred to the
-final GCP PR.
+unscoped devices are rejected. Live NVIDIA container certification remains
+pending.
 
 ### vLLM with uv (no-docker fallback)
 

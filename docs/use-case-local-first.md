@@ -1,8 +1,8 @@
 # You bought a GPU. Prove it pays for itself.
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-07-28*
 
-> **Compatibility form** — this walkthrough still uses provider `serve:`. Prefer `proxy.model_host` + `provider_type: managed_model` for new deployments; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/).
+> **Compatibility form:** This walkthrough still uses provider `serve:`. Prefer `proxy.model_host` + `provider_type: managed_model` for new deployments; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/).
 
 ![A local Qwen3 answer from the GPU, a training-sensitive prompt pinned to the local lane, then the ledger split across both lanes and the dollars the GPU displaced](assets/use-case-local-first.gif)
 
@@ -21,12 +21,13 @@ An OpenAI-compatible endpoint backed by a single provider array. Provider zero i
 - An OpenAI API key (`OPENAI_API_KEY`) for the spill lane.
 - `curl` for sending requests, `jq` for reading responses and the ledger.
 
-One caveat. This page still shows the provider-level `serve:` compatibility form. New deployments should use `proxy.model_host` and `provider_type: managed_model`. Apple Metal runs the live gate before this PR is published; NVIDIA vLLM and CUDA validation remains in the final GCP PR. Run `sbproxy doctor` before trusting a box, and use [model-host.md](model-host.md) for the current contract.
+One caveat. This page still shows the provider-level `serve:` compatibility form. New deployments should use `proxy.model_host` and `provider_type: managed_model`. Apple Silicon Metal passed on 2026-07-11. NVIDIA vLLM, CUDA, and live GCP certification remain pending, with deterministic and local test evidence only. Run `sbproxy doctor` before trusting a box, and use [model-host.md](model-host.md) for the current contract.
 
 ## Install
 
 ```bash
-# Linux / macOS, single static binary:
+# Prebuilt release executable for Linux amd64/arm64 (glibc) or Apple Silicon macOS.
+# No Rust, Python, JVM, or Node toolchain/runtime is required.
 curl -fsSL https://download.sbproxy.dev | sh
 
 # macOS via Homebrew:

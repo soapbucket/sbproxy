@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
-# Provider-specific secret references with tenant-scoped backends.
+# Provider-specific secret references with proxy-scoped backends.
 #
 # Secret-bearing fields accept provider-specific URI schemes:
 #
@@ -13,9 +13,9 @@
 #
 # Environment variables keep the existing ${ENV_VAR} form.
 #
-# Resolution at request time: origin scope -> tenant scope -> proxy
-# scope. First scope that declares a backend with the matching scheme
-# provider type and backend name serves the reference.
+# Backends are declared once under proxy.secrets.backends. A reference
+# names the exact backend to use. Use distinct backend names and native
+# Vault, cloud IAM, or Kubernetes policies for tenant isolation.
 #
 # Setup:
 #
@@ -35,30 +35,22 @@
 proxy:
   http_bind_port: 8080
 
-  # Proxy-scope vault backends are the fallback for any tenant that
-  # does not redeclare the named backend below.
-  #
-  # NOTE: this block is illustrative until the public config schema
-  # exposes vault backend blocks at every scope. It is shown here so
-  # the multi-tenant resolution model is clear from a single file.
-  #
-  # vault:
-  #   - name: primary
-  #     type: hashicorp
-  #     addr: https://vault.shared.example/v1
-  #     token: ${VAULT_TOKEN_SHARED}
+  # Valid production backend shape. It stays commented so the default
+  # example runs without a Vault server.
+  # secrets:
+  #   backends:
+  #     - type: hashicorp
+  #       name: acme
+  #       addr: https://vault.acme.example/v1
+  #       mount: secret/tenants/acme-corp
+  #       auth:
+  #         type: token
+  #         token: ${VAULT_TOKEN_ACME}
 
-  # Tenant scope. Each tenant can carry its own vault backends. The
-  # acme-corp `primary` block redeclares the proxy default with a
-  # tenant-specific endpoint, so references resolved in an acme-corp
-  # context hit acme's Vault, not the shared one.
+  # Tenant scope carries credentials and observability overrides.
+  # Secret backend definitions remain at proxy scope.
   tenants:
     - id: acme-corp
-      # vault:
-      #   - name: primary   # same name as proxy default, different instance
-      #     type: hashicorp
-      #     addr: https://vault.acme.example/v1
-      #     token: ${VAULT_TOKEN_ACME}
 
 origins:
   "api.acme.example.com":
@@ -70,7 +62,7 @@ origins:
           # Runnable path:
           api_key: ${OPENAI_API_KEY}
           # Production alternatives:
-          #   api_key: vault://primary/secret/data/openai-prod?key=api_key
+          #   api_key: vault://acme/openai-prod?key=api_key
           #   api_key: awssm://primary/prod/openai-prod?version=3&key=api_key
           #   api_key: gcpsm://primary/openai-api-key?version=latest
           #   api_key: azurekv://primary/openai-api-key?version=6a2b45c8f9e14e0d
@@ -88,7 +80,7 @@ origins:
         # Runnable path:
         - ${INTERNAL_BEARER_TOKEN}
         # Production alternatives:
-        # - vault://primary/secret/data/inbound/admin-token?key=token
+        # - vault://acme/inbound/admin-token?key=token
         # - awssm://primary/prod/sbproxy-inbound-tokens?version=3&key=admin
         # - gcpsm://primary/inbound-token?version=latest
         # - azurekv://primary/inbound-token?version=6a2b45c8f9e14e0d

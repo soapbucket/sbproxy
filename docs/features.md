@@ -1,6 +1,6 @@
 # SBproxy features manual
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-07-29*
 
 The capability tour: each section covers what a feature does, a minimal config to turn it on, and a working example against `test.sbproxy.dev`, with a link to the doc that owns the full reference. Installation and runtime operations live in [manual.md](manual.md); the complete field schema lives in [configuration.md](configuration.md).
 
@@ -30,7 +30,7 @@ Homebrew, Docker, binary downloads, and source builds are covered in the [runtim
 
 ```bash
 sbproxy serve -f sb.yml          # Start from config file
-sbproxy validate --config sb.yml # Validate config without starting
+sbproxy validate sb.yml          # Validate config without starting
 ```
 
 The full CLI (plan, apply, doctor, projections, flags) is in the [runtime manual](manual.md#2-cli-reference).

@@ -13,8 +13,8 @@ script's header says otherwise.
 |---|---|---|
 | `check.sh` | Local CLAUDE.md gate; prefers cargo-nextest for CI-equivalent non-e2e tests, runs doctests, and cleans high-churn build artifacts on exit. | local |
 | `cleanup-build-artifacts.sh` | Prune generated docs, nextest output, incremental dirs, and transient logs without deleting dependency build outputs. | local + CI |
-| `run-e2e.sh` | Build the Rust proxy and drive the vendored Go conformance suite. | local + CI |
-| `run-all-e2e.sh` | Build the proxy and run every Rust e2e test. | local + CI |
+| `run-e2e.sh` | Build the Rust proxy and run the maintained HTTP conformance smoke set. | local + CI |
+| `run-all-e2e.sh` | Build the Rust proxy and audit all 93 cases in the historical HTTP catalog. | local + CI |
 | `build-e2e.sh` | Just the proxy build step (release profile). | shared by other runners |
 | `perf-compare.sh` | Two-bench delta comparison between branches. | nightly bench |
 | `generate-certs.sh` | Mint a local CA + leaf cert for TLS tests. | local only |

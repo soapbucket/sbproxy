@@ -228,8 +228,9 @@ of doc slugs lives in `docs/README.md` and in the marketing site's
 
 Buyer-facing reference docs live here: `architecture.md`,
 `ai-gateway.md`, `configuration.md`, `scripting.md`,
-`openapi-emission.md`, `glossary.md`. The `upgrade.md` file is the
-only place archived-Go references are allowed.
+`openapi-emission.md`, `glossary.md`. Keep archived-Go references to
+useful migration or compatibility history only, and link each one to
+[`https://github.com/soapbucket/sbproxy-go`](https://github.com/soapbucket/sbproxy-go).
 
 Public install + extension story is configuration, not Rust traits.
 Surface curl, Homebrew, and Docker for install; surface CEL, Lua,
@@ -266,8 +267,8 @@ commit:
 
 The active git history of this Rust implementation starts at `v1.0.0`.
 The Go implementation shipped publicly as `v0.1.0` through `v0.1.2`
-and is archived at `github.com/soapbucket/sbproxy-go`. See
-`MIGRATION.md` for upgrade guidance.
+and is archived at [`soapbucket/sbproxy-go`](https://github.com/soapbucket/sbproxy-go).
+See `MIGRATION.md` for upgrade guidance.
 
 The internal config schema is independently versioned and is referred
 to as `schema-v1`; the same schema is supported by both the Go

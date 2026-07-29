@@ -1,16 +1,16 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # CPU / Apple Metal stand-in for the "serve an open-weight model on one
 # NVIDIA L4" story in docs/use-case-serve-on-l4.md. This config names
-# llama.cpp and a GGUF file, which is the CPU/Metal engine path, not
-# the NVIDIA GPU path. It exercises the config shape and the preflight
-# tooling (validate/plan/doctor), and answers a real completion on any
-# box that has llama-server available. It does NOT exercise or certify
-# the NVIDIA L4 engine path: that is vLLM/SGLang, still pending live
-# GCP evidence — see docs/model-host.md#managed-engines and
+# llama.cpp and a GGUF file. This walkthrough exercises its CPU/Metal
+# path, the config shape, and the preflight tooling
+# (validate/plan/doctor). A host with the CUDA build prerequisites can
+# also run llama.cpp with GPU offload, but that does not exercise or
+# certify the planned NVIDIA L4 path through vLLM/SGLang. Live GCP
+# evidence is still pending; see docs/model-host.md#managed-engines and
 # docs/model-host-certification.md.
 #
 # Run (on any machine; a real completion needs llama-server available):
-#   sbproxy examples/use-case-serve-on-l4/sb.yml
+#   sbproxy serve -f examples/use-case-serve-on-l4/sb.yml
 proxy:
   http_bind_port: 8080
 
@@ -32,9 +32,9 @@ origins:
             models:
               # Explicit weights source: repo, quant, file. This GGUF +
               # llama-server path is the CPU/Metal stand-in used for
-              # preflight and config-shape validation on any box; it is
-              # not the NVIDIA engine path (that's vLLM/SGLang, pending
-              # live GCP certification). Bare catalog ids
+              # preflight and config-shape validation on this page. A
+              # CUDA build is supported, but the pending NVIDIA
+              # certification target uses vLLM/SGLang. Bare catalog ids
               # (`model: qwen3-14b`) and the fit planner's automatic
               # quant choice (FP8 on an Ada-class NVIDIA GPU via vLLM,
               # Q4 GGUF on CPU/Metal via llama.cpp) take over once
@@ -43,8 +43,8 @@ origins:
               - model: "hf:Qwen/Qwen3-14B-GGUF:Q4_K_M"
                 gguf_file: Qwen3-14B-Q4_K_M.gguf
                 name: qwen3-14b
-                # Pinned explicitly (not "auto") so this is unambiguously
-                # the CPU/Metal engine, never the NVIDIA vLLM/SGLang path.
+                # Selected explicitly (not "auto") so this uses
+                # llama.cpp rather than the vLLM/SGLang certification path.
                 engine: llama_cpp
                 # No extra_args: llama.cpp's stable argument allowlist
                 # does not include --jinja today, so the chat template

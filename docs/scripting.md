@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Lua, JavaScript, and WASM
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-28*
 
 SBproxy includes four scripting engines for custom logic: CEL (Common Expression Language), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -418,7 +418,7 @@ end
 
 On both paths, the only field the proxy applies from the returned table is `set_headers`: a map of header name to string value, inserted onto the upstream request or the client response. Lua modifiers cannot change the path, method, query, status, or body; use the typed modifier fields for those (section 7).
 
-A legacy Go-style request script that defines `match_request(req, ctx)` and calls `req:set_header(name, value)` also works: the proxy falls back to it when `modify_request` is not defined.
+A legacy request script that defines `match_request(req, ctx)` and calls `req:set_header(name, value)` also works: the proxy falls back to it when `modify_request` is not defined.
 
 ### 4.2 Context tables
 

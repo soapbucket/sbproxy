@@ -7,7 +7,7 @@
 # Regenerate with:  scripts/record-tapes.sh use-case-serve-on-l4
 # The record script starts `sbproxy examples/use-case-serve-on-l4/sb.yml`,
 # waits for readiness, runs this tape, then stops it. LOGLEVEL is warn so the
-# serve: preflight warning lands in /tmp/sbproxy-rec.log for the grep below.
+# serve: preflight warning lands in the per-recording log at $SBPROXY_REC_LOG.
 # Requires vhs, ttyd, ffmpeg, curl (brew install vhs).
 #
 # CONFIG: examples/use-case-serve-on-l4/sb.yml
@@ -60,7 +60,7 @@ Sleep 1.4s
 Enter
 Sleep 400ms
 
-Type `grep -o 'serve: is configured but no GPU is visible.*' /tmp/sbproxy-rec.log | head -1`
+Type `grep -o 'serve: is configured but no GPU is visible.*' "$SBPROXY_REC_LOG" | head -1`
 Enter
 Sleep 4s
 

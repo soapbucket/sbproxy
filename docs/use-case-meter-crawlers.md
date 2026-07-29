@@ -1,6 +1,6 @@
 # AI crawlers are reading your site for free
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-07-28*
 
 ![An unsigned crawler gets 401, a signed crawler gets a 402 price challenge, a payment token redeems once for a 200, and the replay is charged again](assets/use-case-meter-crawlers.gif)
 
@@ -25,7 +25,8 @@ One boundary to be clear about before you start, because vendors in this space t
 ## Install
 
 ```bash
-# Linux / macOS, single static binary:
+# Prebuilt release executable for Linux amd64/arm64 (glibc) or Apple Silicon macOS.
+# No Rust, Python, JVM, or Node toolchain/runtime is required.
 curl -fsSL https://download.sbproxy.dev | sh
 
 # macOS via Homebrew:

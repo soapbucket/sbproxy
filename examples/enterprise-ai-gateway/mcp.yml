@@ -1,0 +1,38 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Stage 2: keep the API and expose it as an OpenAPI-backed MCP tool.
+
+proxy:
+  http_bind_port: 8080
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - 127.0.0.0/8
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: http://127.0.0.1:8091
+
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: enterprise-ai-gateway
+        version: "1.0.0"
+      federated_servers:
+        - type: openapi
+          origin: http://127.0.0.1:8091
+          prefix: local
+          namespace: always
+          spec:
+            openapi: "3.0.0"
+            info:
+              title: Local gateway status
+              version: "1.0.0"
+            paths:
+              /status:
+                get:
+                  operationId: gateway_status
+                  summary: Return the local gateway status.

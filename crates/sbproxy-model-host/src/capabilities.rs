@@ -1189,7 +1189,7 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         id: "engine.llama_cpp_managed",
         domain: CapabilityDomain::Engine,
         status: SupportLevel::Preview,
-        summary: "Managed llama.cpp acquires a digest-verified prebuilt binary to serve GGUF models on CPU and Apple Metal. NVIDIA GPU serving is handled by vLLM and SGLang, not llama.cpp.",
+        summary: "Managed llama.cpp resolves an operator binary, fetches a digest-verified CPU or Metal release, or builds digest-pinned source with CUDA. Live NVIDIA certification remains deferred.",
         evidence: &[
             "test.engine_drivers",
             "test.cuda_build",

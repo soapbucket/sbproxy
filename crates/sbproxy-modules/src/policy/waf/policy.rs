@@ -22,8 +22,9 @@ const MAX_PARANOIA: u8 = 4;
 /// Web Application Firewall policy.
 ///
 /// Provides OWASP CRS-based request filtering, custom rules, and
-/// configurable actions on match. Fields are stored as generic values
-/// for forward compatibility with the Go implementation.
+/// configurable actions on match. The OWASP and custom-rule payloads
+/// remain generic so they can accept additional rule attributes without
+/// changing this envelope.
 ///
 /// The `paranoia` field follows the OWASP CRS convention. Level 1 is the
 /// default and runs only the lowest-false-positive rules. Levels 2-4

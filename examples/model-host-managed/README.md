@@ -1,6 +1,6 @@
 # Managed local model
 
-*Last modified: 2026-07-11*
+*Last modified: 2026-07-28*
 
 This example runs the built-in pinned Qwen bootstrap artifact through the
 canonical single-node model host. `proxy.model_host` owns the deployment;
@@ -66,9 +66,11 @@ generation and keeps the prior revision active.
 
 ## Hardware note
 
-The GGUF variant supports CPU, Apple Metal, and CUDA workers. Apple Metal is the
-real hardware gate for this PR. Live NVIDIA and multi-node GCP validation is
-reserved for the final integration PR.
+With `acceleration: auto`, llama.cpp selects CPU, Apple Metal, or a
+source-built CUDA path when the host passes its prerequisites. Metal passed on
+2026-07-11. The CUDA path has deterministic source-build coverage but no live
+NVIDIA certification. The pending NVIDIA certification procedure uses vLLM or
+SGLang with a compatible artifact.
 
 See [`docs/model-host.md`](../../docs/model-host.md) for the full field reference
 and [`docs/security-model-host.md`](../../docs/security-model-host.md) for the

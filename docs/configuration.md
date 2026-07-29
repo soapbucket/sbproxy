@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-07-28*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -87,7 +87,10 @@ The config has two main sections: `proxy` (server-level settings) and `origins`
 
 ## JSON Schema (editor autocomplete + validation)
 
-SBproxy ships a JSON Schema at `schemas/sb-config.schema.json`. Editor tooling that understands the `yaml-language-server` directive (VS Code with the YAML extension, IntelliJ / JetBrains, Helix) reads this schema and validates `sb.yml` field names + types in real time. A typo in a key surfaces as an editor error rather than as a runtime parse failure.
+SBproxy ships a generated JSON Schema at `schemas/sb-config.schema.json`.
+Editor tooling that understands the `yaml-language-server` directive (VS Code
+with the YAML extension, IntelliJ / JetBrains, Helix) uses it for autocomplete,
+typed fields, and closed-enum hints.
 
 Opt in by adding a comment header at the top of your `sb.yml`:
 
@@ -102,7 +105,18 @@ origins:
 
 Every `examples/*/sb.yml` in this repo carries the header pointing at the local `schemas/` path so the examples are self-validating against the same schema operators consume.
 
-The schema is **generated** from the Rust types in `crates/sbproxy-config/src/types.rs` so it cannot drift from the runtime. Regenerate locally with:
+The schema describes the typed configuration envelope generated from
+`crates/sbproxy-config/src/types.rs`. Module payloads stay opaque at this
+layer: `action`, `authentication`, each `policies[]` entry, and each
+`transforms[]` entry are parsed by their runtime constructors after the
+envelope loads. Most envelope objects are also open, and serde aliases such as
+`auth` and `session_config` do not appear as separate schema properties.
+Those boundaries mean an editor cannot catch every misspelled key.
+
+Run `sbproxy validate <path>` for the authoritative check. It loads the same
+configuration and constructs the same runtime modules as `serve`.
+
+Regenerate the schema locally with:
 
 ```bash
 cargo run -p sbproxy-config --bin generate-schema > schemas/sb-config.schema.json
@@ -117,6 +131,9 @@ The CI gate `scripts/check-config-schema.sh` runs the generator and `diff`s agai
 **Map, not a config.** Every `{ ... }` and `[ ... ]` below is a placeholder for a real block documented in its own section, not literal YAML. This shows which keys nest where; it does not validate or run. For a complete file, see [`examples/basic-proxy/sb.yml`](../examples/basic-proxy/sb.yml) for the smallest real one, or any [`examples/<name>/sb.yml`](../examples/) for a feature-specific full config.
 
 ```yaml
+# Optional external source descriptor
+source: { ... }
+
 # Server settings (ports, TLS, ACME, admin, secrets, shared state)
 proxy:
   http_bind_port: 8080
@@ -132,6 +149,12 @@ proxy:
   cluster: { ... }
   model_host: { ... }
   config_authority: { ... }
+  observability: { ... }
+  scripting: { ... }
+  key_management: { ... }
+  cache_reserve: { ... }
+  tenants: [ ... ]
+  credentials: [ ... ]
 
   # L2 cache (Redis) for distributed rate limiting and caching
   l2_cache_settings:
@@ -156,6 +179,14 @@ agent_classes:
     bot_auth_keyid_enabled: true
     cache_size: 10000
 
+# Optional process-wide blocks
+access_log: { ... }
+rate_limits: { ... }
+audit: { ... }
+session_ledger: { ... }
+flags: [ ... ]
+update: { ... }
+
 # Per-hostname origin configurations
 origins:
   "api.example.com":
@@ -176,6 +207,21 @@ origins:
 ```
 
 `l2_cache_settings` and `messenger_settings` are nested under `proxy:` (the deserializer also accepts `l2_cache` as a canonical alias).
+
+### Top-level fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `source` | object | unset | Optional local or Git configuration source descriptor. |
+| `proxy` | object | defaults | Server-wide listener, security, state, and operations settings. |
+| `origins` | map | `{}` | Hostname-keyed request pipelines. |
+| `access_log` | object | unset | Structured JSON access-log configuration. |
+| `agent_classes` | object | unset | Agent catalog selection and resolver tuning. |
+| `rate_limits` | object | unset | Workspace-wide budget and auto-suspend state. Separate from per-origin policies. |
+| `audit` | object | unset | Compatibility audit configuration. `audit.sink` is config-only; OSS audit rows remain in memory and tracing. |
+| `session_ledger` | object | unset | MCP tool-call session-ledger emission. |
+| `flags` | list | `[]` | Process-wide feature flags exposed to CEL. |
+| `update` | object | stable channel, automatic checks off | Binary and managed-engine update policy. |
 
 ### Agent classes
 
@@ -241,25 +287,37 @@ proxy:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `http_bind_port` | int | 8080 | HTTP listen port |
+| `http2_cleartext` | bool | false | Enable h2c on the plain HTTP listener for plaintext HTTP/2 and gRPC clients. |
 | `https_bind_port` | int | unset | Optional HTTPS listen port. Requires `tls_cert_file` + `tls_key_file` or an `acme` block. |
 | `tls_cert_file` | string | | Path to PEM-encoded TLS certificate. Ignored when `acme` is configured. |
 | `tls_key_file` | string | | Path to PEM-encoded TLS private key. |
 | `acme` | object | | ACME (auto-TLS) block. Overrides manual cert/key when set. See [ACME / auto TLS](#acme--auto-tls). |
 | `http3` | object | | Reserved HTTP/3 (QUIC) listener config. Enabling it is rejected; see [HTTP/3 fields](#http3-fields). |
 | `metrics` | object | | Metrics tuning, including label cardinality limits. |
+| `observability` | object | | Log sinks, redaction, custom fields, OTLP export, and usage rollups. Parent log level, format, and sampling fields are config-only; the process uses CLI/environment logging selection. |
 | `alerting` | object | | Alert notification channels. |
-| `admin` | object | | Embedded read-only admin / stats API server. |
+| `admin` | object | | Embedded authenticated admin API and UI. |
 | `secrets` | object | | Secrets management backend. See [Secrets](#secrets). |
 | `cluster` | object | unset | Canonical local or distributed cluster identity, membership, mTLS, enrollment, snapshot, and signed deployment-authority settings. |
 | `model_host` | object | unset | Canonical managed-model authority, cache, engines, deployments, placement, and rollout policy. |
+| `config_authority` | object | unset | Subscribe to or publish signed configuration bundles. |
+| `key_management` | object | unset | Mutable key store, policy cache, encryption, claim mapping, and declarative seed. |
 | `l2_cache_settings` | object | | Optional shared-state backend. Alias: `l2_cache`. |
+| `cache_reserve` | object | unset | Optional cold-tier response cache backed by memory, filesystem, or Redis. |
 | `compression_state` | object | unset | Process-owned Local AI summary-state path. See [compression_state](#compression_state). |
 | `response_cache_store` | object | unset | Picks the backing store for the shared response cache and optionally encrypts entries at rest. See [Choosing the backing store](#choosing-the-backing-store). When unset, the store is Redis if `l2_cache_settings` is configured and an in-process map otherwise. |
 | `messenger_settings` | object | | Optional shared message bus for inter-component eventing. |
 | `trusted_proxies` | array of CIDR strings | `[]` | Source ranges whose inbound `X-Forwarded-For` / `X-Real-IP` / `Forwarded` headers are honoured. Connections from outside the list have those headers stripped on ingress so they cannot spoof identity. IPv6 CIDRs work. See [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers). |
 | `correlation_id` | object | enabled, `X-Request-Id`, echo on | Correlation-ID propagation policy. See [Correlation ID](#correlation-id). |
 | `mtls` | object | unset | mTLS client-certificate verification on the HTTPS listener. See [mTLS client authentication](#mtls-client-authentication). |
+| `ai_providers_file` | string | unset | Override the embedded AI provider catalog at startup. |
+| `device_parser_file` | string | unset | Config-only. The current pure-Rust device parser does not load this override. |
+| `synthetic_probe` | object | unset | Optional in-process transaction probe reported through readiness. |
+| `scripting` | object | defaults | Scripting runtime limits, including the live Lua sandbox controls. |
 | `http_client_timeouts` | object | (see below) | Tunable timeouts for the proxy's outbound HTTP helpers (forward-auth, callbacks, mirrors, SWR refreshes, bot-auth directory). See [HTTP client timeouts](#http-client-timeouts). |
+| `web_bot_auth` | object | unset | Process-wide Ed25519 identity for outbound Web Bot Auth signing and public-key discovery. |
+| `tenants` | list | `[]` | Declared tenants referenced by `origins.*.tenant_id`. |
+| `credentials` | list | `[]` | Proxy-scope credentials inherited by tenant and origin scopes. |
 | `extensions` | object | | Opaque map for enterprise / third-party top-level config blocks. OSS never parses these. |
 
 ### HTTP client timeouts
@@ -814,6 +872,7 @@ origins:
 |-------|------|---------|-------------|
 | `action` | object | required | What to do with the request (proxy, redirect, static, etc.). |
 | `tenant_id` | string | `__default__` | Tenant this origin resolves to. Must match a `proxy.tenants[].id`; absent uses the synthetic `__default__` tenant. Stamped on the request context for auth / policy / vault resolution. See [Tenants](#tenants). |
+| `credentials` | list | `[]` | Origin-scope credentials. These override or extend credentials inherited from tenant and proxy scopes. |
 | `authentication` | object | | Auth provider. Alias: `auth`. |
 | `policies` | list | | Policy enforcers (rate limit, IP filter, WAF, etc.). |
 | `transforms` | list | | Body transforms applied in order. |
@@ -826,6 +885,7 @@ origins:
 | `properties` | object | | Custom request-property capture, redaction, response echo, and bounded durable-rollup promotion. |
 | `sessions` | object | | Observability session-ID capture and auto-generation. This is separate from the `session` cookie block. |
 | `user` | object | | Observability user-ID capture. |
+| `observability` | object | | Per-origin `log.redact.pii` override, composed with tenant or proxy scope. |
 | `force_ssl` | bool | false | Redirect plain HTTP requests to HTTPS. |
 | `allowed_methods` | list | empty (allow all) | Whitelist of HTTP methods. |
 | `forward_rules` | list | | Path / header / IP rules that route to inline child origins. |
@@ -837,14 +897,28 @@ origins:
 | `mirror` | object | | Shadow traffic configuration. See [Request mirror](#request-mirror). |
 | `bot_detection` | object | | Bot detection config. |
 | `threat_protection` | object | | IP reputation / blocklist config. |
-| `rate_limit_headers` | object | | Compatibility-only; ignored by the OSS runtime. Configure headers on the live rate-limit policy. |
-| `error_pages` | list | | Custom error pages keyed by status code or class. |
+| `rate_limit_headers` | object | | Config-only. Configure headers on the live rate-limit policy. |
+| `error_pages` | list | | Custom error pages matching one status code or an explicit list of status codes. |
 | `problem_details` | object | | RFC 9457 `application/problem+json` default renderer. Composes with `error_pages`. |
-| `traffic_capture` | object | | Compatibility-only; no OSS consumer. Use `mirror` for live request mirroring. |
+| `proxy_status` | object | | RFC 9209 `Proxy-Status` response-header configuration. |
+| `traffic_capture` | object | | Config-only. Use `mirror` for live request mirroring. |
 | `message_signatures` | object | | RFC 9421 HTTP message signatures. |
+| `olp` | object | | RSL Open License Protocol token issuer and public-key endpoints. |
+| `web_bot_auth_publish` | object | | Publish a Web Bot Auth key directory and Signature Agent Card on this origin. |
 | `idempotency` | object | | RFC 8594 idempotency middleware. See [Idempotency](#idempotency). |
-| `connection_pool` | object | | Compatibility-only; Pingora's built-in upstream pool settings apply. |
+| `connection_pool` | object | | Config-only. Pingora's built-in upstream pool settings apply. |
 | `extensions` | object | | Opaque map for enterprise / third-party origin-level blocks. |
+| `expose_openapi` | bool | false | Publish this origin's generated OpenAPI document at its well-known paths. |
+| `stream_safety` | list | `[]` | Per-origin streaming-safety rule identifiers. |
+| `default_content_shape` | string | `html` | Default projection shape when the request has no concrete `Accept` preference. |
+| `content_signal` | string | unset | `Content-Signal` value: `ai-train`, `search`, or `ai-input`. |
+| `token_bytes_ratio` | number | `0.25` | Markdown token-estimation ratio override. |
+| `agent_skills` | list | `[]` | Agent Skills advertisements served from well-known paths. |
+| `agents_md` | string | unset | Body served at `/AGENTS.md`. |
+| `ai_txt` | string | unset | Body served at `/ai.txt`. |
+| `agents_json` | object | unset | Manifest served at `/.well-known/agents.json`. |
+| `outbound_credential` | object | unset | Outbound credential exchange, client-credentials, or vault-secret resolver. |
+| `outbound_web_bot_auth` | bool | false | Sign upstream requests with `proxy.web_bot_auth`. |
 
 ### Origin architecture
 
@@ -1769,6 +1843,63 @@ origins:
 | `url` | string | required | Upstream agent URL. |
 | `agent_card` | object | | Cached A2A agent card (free-form JSON). |
 
+### mcp
+
+Expose one MCP gateway that federates tools and resources from upstream MCP
+servers. Only `mode: gateway` is implemented, and `federated_servers` must
+contain at least one entry.
+
+```yaml
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: enterprise-tools
+        version: "1.0.0"
+      federated_servers:
+        - origin: https://tools.internal/mcp
+          prefix: tools
+          namespace: always
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `mode` | string | `gateway` | MCP operating mode. Other values fail configuration. |
+| `server_info` | object | generated defaults | Name and version returned by MCP `initialize`. |
+| `federated_servers` | list | required, non-empty | Upstream MCP or OpenAPI-backed servers. Each entry requires `origin`; optional fields include `prefix`, `namespace`, `transport`, `timeout`, `rbac`, and OpenAPI `spec` or `spec_path`. |
+| `rbac_policies` | map | `{}` | Named tool-access policies referenced by `federated_servers[].rbac`. |
+| `egress` | object | allow all | Default egress policy for OpenAPI-backed REST tools. A server-level `egress` block overrides it. |
+| `guardrails` | list | `[]` | Tool allowlist and lethal-trifecta checks applied before `tools/call`. |
+| `progressive_discovery` | bool | false | Advertise `search` and `execute` meta-tools instead of the full catalog. |
+| `oauth` | object | unset | RFC 9728 protected-resource discovery metadata. |
+| `refresh_interval` | duration | `60s` | Upstream tool and resource catalog refresh cadence. |
+| `upstream_connect_timeout` | duration | `5s` | TCP connection deadline for upstream exchanges. |
+| `upstream_timeout` | duration | `30s` | Whole-request deadline for upstream exchanges. |
+| `max_upstream_response_bytes` | int | 8 MiB | Maximum response body buffered from one upstream exchange. |
+| `tool_versioning` | object | unset | Optional lockfile, version-bump checks, judges, and rollout controls. |
+| `sessions` | object | unset | Optional `Mcp-Session-Id` lifecycle management. |
+| `token_compaction` | object | unset | Optional compaction for verbose tool-result text blocks. |
+| `dual_llm_quarantine` | object | unset | Optional LLM review gate for suspicious tool output. |
+| `tool_pricing` | map | `{}` | USD price per advertised tool name for cost attribution. |
+| `usage_sinks` | list | `[]` | JSONL, webhook, ledger, Langfuse, or Datadog tool-usage destinations. |
+
+See [mcp.md](mcp.md) for federation, RBAC, OpenAPI-backed tools, sessions,
+versioning, and cost attribution.
+
+### noop
+
+Return `200 OK` with an empty body. The action accepts no fields beyond
+`type` and is useful for health fixtures and policy-only origins.
+
+```yaml
+origins:
+  "noop.example.com":
+    action:
+      type: noop
+```
+
 ---
 
 ## Authentication
@@ -1999,6 +2130,78 @@ origins:
 | `headers_to_forward` | list | | Headers to copy from the original request. Alias: `forward_headers`. |
 | `trust_headers` | list | | Headers from the auth response to inject into the upstream request |
 | `success_status` | int \| list | 200 | Status code(s) that mean "authenticated". A list is accepted, but only the first element is used. |
+
+### bot_auth
+
+Verify RFC 9421 HTTP Message Signatures from known agents. Configure an inline
+`agents` directory, a hosted `directory`, or both.
+
+```yaml
+authentication:
+  type: bot_auth
+  clock_skew_seconds: 30
+  agents:
+    - name: openai-gptbot
+      key_id: openai-2026-01
+      algorithm: ed25519
+      public_key: ${OPENAI_BOT_PUBKEY}
+      required_components: ["@method", "@target-uri", "@authority"]
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `agents` | list | `[]` | Inline agent keys. Each `key_id` must be unique. |
+| `directory` | object | unset | HTTPS hosted-directory lookup and refresh settings. |
+| `clock_skew_seconds` | int | 30 | Tolerance for signature `created` and `expires` values. |
+| `nonce_policy` | string | `strict` | Replay behavior when a nonce store is installed: `strict` or `permissive`. |
+
+See [web-bot-auth.md](web-bot-auth.md) for directory validation, required
+signature components, and replay behavior.
+
+### cap
+
+Validate Crawler Authorization Protocol tokens from `CAP-Token` or the
+`Authorization: CAP` scheme. Configure a JWKS URL or an inline JWKS document;
+`jwks_url` wins when both are present.
+
+```yaml
+authentication:
+  type: cap
+  jwks_url: https://issuer.example.com/.well-known/cap/keys.json
+  audience: api.example.com
+  require_agent_binding: true
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `jwks_url` | string | unset | Remote JWKS endpoint. One of `jwks_url` or `jwks_static` is required. |
+| `jwks_static` | object | unset | Inline JWKS for offline or pre-issued-token deployments. |
+| `jwks_refresh_secs` | int | 3600 | Remote JWKS cache interval, clamped to at least 30 seconds. |
+| `audience` | string | request `Host` | Explicit token audience. |
+| `require_agent_binding` | bool | false | Require the token subject to match a resolved agent identity. |
+
+### oidc
+
+Run an OpenID Connect authorization-code and PKCE login flow, then authenticate
+later requests from a sealed session cookie.
+
+```yaml
+authentication:
+  type: oidc
+  authorization_endpoint: https://idp.example.com/authorize
+  token_endpoint: https://idp.example.com/oauth/token
+  jwks_uri: https://idp.example.com/.well-known/jwks.json
+  issuer: https://idp.example.com
+  client_id: sbproxy
+  client_secret: ${OIDC_CLIENT_SECRET}
+  cookie_secret: ${OIDC_COOKIE_SECRET}
+```
+
+The seven fields shown above are required. `cookie_secret` must contain at
+least 32 bytes after secret resolution. Optional fields include `scope`,
+`redirect_path`, session and transaction TTLs, userinfo, and RP-initiated
+logout settings. See [auth-oidc.md](auth-oidc.md) for the full field table and
+browser flow.
 
 ### noop
 
@@ -3967,7 +4170,7 @@ The breaker is **complementary to** [outlier detection](#outlier-detection):
 | Circuit breaker | `N` failures in a row, immediate isolation |
 | Outlier detection | Failure *rate* over a sliding window |
 
-Either signal independently ejects a target from `select_target`. Configure both for robust resilience: outlier detection catches "this target is bad in aggregate," the breaker catches "this target is hard down right now." When every target is tripped, the LB falls back to the unfiltered list rather than 502'ing the client.
+Either signal independently ejects a target from `select_target`. Configure both: outlier detection catches "this target is bad in aggregate," and the breaker catches "this target is hard down right now." When every target is tripped, the LB falls back to the unfiltered list rather than 502'ing the client.
 
 See [example 84](../examples/circuit-breaker/sb.yml).
 
@@ -5067,13 +5270,19 @@ action:
 
 ## Environment variable templating in header modifiers
 
-Request and response header modifiers may reference environment variables using the `{{env.NAME}}` template form. To prevent multi-tenant exfiltration of process secrets, env expansion is gated by an explicit allowlist on `TemplateContext::allowed_env_vars`. This change is tracked under OPENSOURCE.md H4.
+Request and response header modifiers may reference environment variables with
+`{{env.NAME}}`. Resolution has two stages:
 
-- The default allowlist is empty. With the default, every `{{env.X}}` template resolves to the empty string and a `tracing::warn!` is logged. This includes well-known secret names like `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, and any custom `_TOKEN` / `_KEY` env vars set on the proxy process.
-- Operators opt in per-installation by adding env var names to `TemplateContext::allowed_env_vars` when populating the per-request template context. Names are matched literally; case matters.
-- Allowlisted env vars that are unset at the OS level resolve to the literal `{{env.X}}` string so misconfiguration shows up as obviously broken header values rather than silently empty ones.
+1. While compiling the origin, the stock binary replaces the template when
+   `NAME` is set in the process environment.
+2. If `NAME` is unset, the literal template reaches the request-time header
+   modifier. Its `TemplateContext` has an empty environment allowlist in the
+   stock runtime, so the unresolved `{{env.NAME}}` becomes an empty string and
+   emits a warning.
 
-Example header modifier and the matching allowlist a deployment would use:
+There is no configuration field or command-line option for populating that
+runtime allowlist. A missing environment variable can therefore produce an
+empty request or response header.
 
 ```yaml
 request_modifiers:
@@ -5083,11 +5292,7 @@ request_modifiers:
         X-Region:   "{{env.SBPROXY_REGION}}"
 ```
 
-```rust,no_run
-// Inside the proxy runtime that builds TemplateContext per request.
-let mut tmpl = sbproxy_middleware::modifiers::TemplateContext::new();
-tmpl.allowed_env_vars.push("SBPROXY_BUILD_ID".to_string());
-tmpl.allowed_env_vars.push("SBPROXY_REGION".to_string());
-```
-
-A header value of `{{env.AWS_SECRET_ACCESS_KEY}}` will not resolve unless `AWS_SECRET_ACCESS_KEY` is added to that allowlist. There is no global "allow all env vars" switch.
+Only trusted operators should be able to edit configuration that uses this
+form because a value resolved during compilation can be sent to an upstream.
+Use the secret reference backends for credentials instead of copying secrets
+into headers.

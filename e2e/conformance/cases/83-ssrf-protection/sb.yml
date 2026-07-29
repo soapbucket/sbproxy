@@ -17,11 +17,11 @@ origins:
           max_header_size: 8KB
           max_request_size: 1MB
 
-      - type: threat_protection
-        enabled: true
-        json:
-          max_depth: 10
-          max_keys: 100
-          max_string_length: 10000
-          max_array_size: 100
-          max_total_size: 1048576
+    threat_protection:
+      enabled: true
+      json:
+        max_depth: 10
+        max_keys: 100
+        max_string_length: 10000
+        max_array_size: 100
+        max_total_size: 1048576

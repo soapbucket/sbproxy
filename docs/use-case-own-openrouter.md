@@ -1,6 +1,6 @@
 # API keys everywhere, accounting nowhere: stand up your own OpenRouter
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-07-28*
 
 ![Minting a virtual key, calling OpenAI and Anthropic through one governed endpoint, reading the spend ledger, and tripping a budget cap](assets/use-case-own-openrouter.gif)
 
@@ -19,7 +19,8 @@ One endpoint on port 8080 that speaks the OpenAI API in front of OpenAI and Anth
 ## Install
 
 ```bash
-# Linux / macOS, single static binary:
+# Prebuilt release executable for Linux amd64/arm64 (glibc) or Apple Silicon macOS.
+# No Rust, Python, JVM, or Node toolchain/runtime is required.
 curl -fsSL https://download.sbproxy.dev | sh
 
 # macOS via Homebrew:
@@ -106,7 +107,7 @@ Export your provider keys and start the gateway (or run `docker compose up` from
 ```bash
 export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=sk-ant-...
-sbproxy sb.yml
+sbproxy serve -f sb.yml
 ```
 
 Mint a key for your first team. The plaintext token comes back exactly once; after this response the gateway holds only the hash.

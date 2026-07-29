@@ -134,11 +134,13 @@ pub const KNOWN_AUTH_TYPES: &[&str] = &[
     "bot_auth",
     "web_bot_auth",
     "cap",
+    "oidc",
     "noop",
 ];
 
 /// Built-in OSS policy `type:` names. Mirrors `sbproxy_modules::compile_policy`.
 pub const KNOWN_POLICY_TYPES: &[&str] = &[
+    "rate_limit_budget",
     "rate_limiting",
     "ip_filter",
     "ip_filtering",
@@ -154,6 +156,7 @@ pub const KNOWN_POLICY_TYPES: &[&str] = &[
     "assertion",
     "response_assertion",
     "request_validator",
+    "content_digest",
     "concurrent_limit",
     "concurrent_limiting",
     "ai_crawl_control",
@@ -172,6 +175,7 @@ pub const KNOWN_POLICY_TYPES: &[&str] = &[
     // WOR-203 PR 3b: NL-as-a-policy via the LLM-as-judge backend.
     // See `crates/sbproxy-modules/src/policy/semantic_constraint.rs`.
     "semantic_constraint",
+    "agent_budget",
 ];
 
 /// Built-in OSS transform `type:` names. Mirrors `sbproxy_modules::compile_transform`.
@@ -200,6 +204,7 @@ pub const KNOWN_TRANSFORM_TYPES: &[&str] = &[
     "citation_block",
     "json_envelope",
     "cel",
+    "a2a_agent_card_rewrite",
     "noop",
 ];
 
@@ -1000,6 +1005,104 @@ origins:
         assert!(
             findings.iter().all(|f| f.rule_id != "unknown-action-type"),
             "got findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_builtins_are_known_to_plan_validation() {
+        let cases = [
+            (
+                "oidc",
+                "unknown-auth-type",
+                r#"
+origins:
+  app.example.com:
+    action:
+      type: static
+      body: ok
+    authentication:
+      type: oidc
+      authorization_endpoint: https://idp.example.com/authorize
+      token_endpoint: https://idp.example.com/oauth/token
+      jwks_uri: https://idp.example.com/.well-known/jwks.json
+      issuer: https://idp.example.com
+      client_id: sbproxy
+      client_secret: super-secret-client-secret-of-arbitrary-length
+      cookie_secret: operator-supplied-32-plus-byte-cookie-secret
+"#,
+            ),
+            (
+                "rate_limit_budget",
+                "unknown-policy-type",
+                r#"
+origins:
+  api.example.com:
+    action:
+      type: static
+      body: ok
+    policies:
+      - type: rate_limit_budget
+"#,
+            ),
+            (
+                "content_digest",
+                "unknown-policy-type",
+                r#"
+origins:
+  webhook.example.com:
+    action:
+      type: static
+      body: ok
+    policies:
+      - type: content_digest
+"#,
+            ),
+            (
+                "agent_budget",
+                "unknown-policy-type",
+                r#"
+origins:
+  ai.example.com:
+    action:
+      type: static
+      body: ok
+    policies:
+      - type: agent_budget
+        requests_per_minute: 60
+        tokens_per_hour: 100000
+        burst: 10
+        on_exceed: deny
+"#,
+            ),
+            (
+                "a2a_agent_card_rewrite",
+                "unknown-transform-type",
+                r#"
+origins:
+  agent.example.com:
+    action:
+      type: static
+      body: ok
+    transforms:
+      - type: a2a_agent_card_rewrite
+"#,
+            ),
+        ];
+
+        let mut rejected_builtins = Vec::new();
+        for (type_name, unknown_rule, yaml) in cases {
+            let cfg = parse(yaml);
+            let findings = validate(&cfg, &ValidationOptions::default());
+            if findings
+                .iter()
+                .any(|finding| finding.rule_id == unknown_rule)
+            {
+                rejected_builtins.push(type_name);
+            }
+        }
+        assert!(
+            rejected_builtins.is_empty(),
+            "runtime built-ins rejected by plan validation: {rejected_builtins:?}"
         );
     }
 

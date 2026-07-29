@@ -1,15 +1,20 @@
-# Conformance e2e suite (curl + bash)
+# HTTP compatibility catalog (curl + bash)
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-07-28*
 
-The blackbox conformance suite for sbproxy. 93 cases driven by raw
-curl through `run-tests.sh`. Originally authored against the Go
-implementation; vendored here so it survives the archival of
-`soapbucket/sbproxy-go`.
+This directory contains 93 black-box HTTP cases driven by raw curl
+through `run-tests.sh`. The catalog was originally written for the Go
+implementation. The proxy implementation now lives entirely in this
+Rust repository; the retired implementation is preserved at
+[`soapbucket/sbproxy-go`](https://github.com/soapbucket/sbproxy-go).
 
-This is **not** a deprecated suite. It is the strictest HTTP
-conformance harness we ship, and it catches things the Rust-native
-suite at `e2e/tests/*.rs` does not.
+The default command runs a maintained smoke set. It covers basic
+proxying, API and AI paths, callbacks, failure modes, threat protection,
+metrics, secrets, error responses, load balancing, and gRPC-Web. Use
+`--all` when migrating or auditing the complete historical catalog.
+The full-catalog command is diagnostic: a failure may mean an old
+fixture needs to be translated to the current schema, so review its
+configuration before treating it as a product regression.
 
 ## Why both suites exist
 
@@ -17,33 +22,41 @@ suite at `e2e/tests/*.rs` does not.
 |---|---|---|
 | Runner | `cargo test` | `bash run-tests.sh` |
 | Author style | Rust assertions, typed harness | curl + grep + bash |
-| Deps | cargo only | node + jq + python3 + curl |
-| What it covers | Targeted feature tests | Full HTTP-stack conformance |
-| Speed | Fast (~50 tests in seconds) | Slower (93 cases, real curl) |
-| Catches | Logic bugs in feature code | Wire-protocol bugs |
+| Deps | cargo only | node + jq + python3 + curl + lsof + openssl |
+| What it covers | Current targeted feature contracts | HTTP smoke tests and historical compatibility cases |
+| Default scope | Test selected by the cargo command | 16 maintained smoke cases |
+| Full scope | Workspace or package suite | 93-case migration audit |
+| Catches | Logic bugs in feature code | HTTP framing, routing, and wire-level regressions |
 
-The proof point: the v2 Content-Length bug on 429 responses passed
-the Rust suite (its HTTP client tolerated the missing header) but
-hung the curl suite. Both suites catch different things; we run
-both.
+The suites are complementary. For example, curl exposes response
+framing problems that an in-process HTTP client may tolerate, while
+the Rust suite can assert internal state and typed errors directly.
 
 ## Running it
 
 From the workspace root:
 
 ```bash
-# All cases against the release binary
+# Maintained smoke set against a release binary
 ./scripts/run-e2e.sh
 
-# A subset
+# Selected cases
 ./scripts/run-e2e.sh 01 03 18
 
-# Against an externally-cloned suite (e.g. soapbucket/sbproxy-go)
-GO_E2E_DIR=/path/to/sbproxy-go/e2e ./scripts/run-e2e.sh
+# Full historical catalog audit
+./scripts/run-e2e.sh --all
+# Equivalent explicit entry point:
+./scripts/run-all-e2e.sh
 ```
 
-The script builds the release binary, symlinks it where the runner
-expects, and invokes `run-tests.sh`.
+The script builds the release binary and invokes the in-tree
+`run-tests.sh`. To use a different already-built Rust binary directly,
+set `SBPROXY_BIN` when running the conformance script:
+
+```bash
+SBPROXY_BIN="$PWD/target/debug/sbproxy" \
+  ./e2e/conformance/run-tests.sh 83
+```
 
 ## Prerequisites
 
@@ -51,6 +64,8 @@ expects, and invokes `run-tests.sh`.
 - `jq` (assertion helpers)
 - `python3` (JWT helper for case 20)
 - `curl`
+- `lsof` (verifies that the runner owns each test listener)
+- `openssl` (generates local test certificates on the first run)
 
 ## What is in here
 
@@ -59,8 +74,9 @@ expects, and invokes `run-tests.sh`.
 - `servers/` - the test backend harness:
   - `test-server.js` - generic echo + callback recorder.
   - `mock-ai.js` - OpenAI-shape mock provider.
-  - `echo-server.go` - pure-Go echo server (the compiled binary is
-    gitignored; rebuild with `go build -o echo-server echo-server.go`).
+  - `echo-server.go` - intentional pure-Go echo-server fixture. Its compiled
+    binary is gitignored; rebuild it with `go build -o echo-server echo-server.go`
+    only when working on that fixture. It is not a proxy implementation.
 - `run-tests.sh` - the bash runner with per-case assertions.
 - `generate-certs.sh` - produces self-signed mTLS material for cases
   that need it. Output is gitignored.

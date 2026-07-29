@@ -1,6 +1,6 @@
 # Guardrails on every prompt, local or hosted
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-07-28*
 
 ![One guardrail mesh blocking an injection aimed at a local model and redacting PII bound for a hosted one](assets/use-case-guardrails-everywhere.gif)
 
@@ -21,7 +21,8 @@ The frame worth keeping in your head is: govern the AI you call, the AI that cal
 ## Install
 
 ```bash
-# Linux / macOS, single static binary:
+# Prebuilt release executable for Linux amd64/arm64 (glibc) or Apple Silicon macOS.
+# No Rust, Python, JVM, or Node toolchain/runtime is required.
 curl -fsSL https://download.sbproxy.dev | sh
 
 # macOS via Homebrew:
@@ -111,7 +112,7 @@ Start the gateway:
 
 ```bash
 export OPENAI_API_KEY=sk-...
-sbproxy sb.yml
+sbproxy serve -f sb.yml
 ```
 
 Send an injection attempt aimed at the local model. It trips the injection detector ("ignore all previous") and the jailbreak detector ("ignore your safety"), two flags meet the quorum, and the request dies at the edge. Ollama does not need to be running for this to work; nothing is ever sent to it:

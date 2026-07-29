@@ -1,21 +1,32 @@
 # Serve Qwen, GLM, or Gemma on one cloud L4
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-07-28*
 
 ![sbproxy validate, plan, and doctor running the serve preflight for this page's config on a machine with no GPU](assets/use-case-serve-on-l4.gif)
 
-*The recording is the CPU/Metal stand-in this page actually runs today: `sbproxy validate`, `plan`, and `doctor` walking this page's llama.cpp + GGUF config on a machine with no GPU, refusing to start an engine it cannot serve. It is not NVIDIA L4 evidence — see [NVIDIA L4 (planned)](#nvidia-l4-planned) below for why, and for what the certified path looks like.*
+*The recording runs `sbproxy validate`, `plan`, and `doctor` for the
+llama.cpp + GGUF config on a machine without a GPU. The NVIDIA L4 procedure
+is still [planned](#nvidia-l4-planned).*
 
-You have GCP credits and a model you want to run on your own terms. The open-weight releases from Qwen, GLM, and Gemma are good enough for real work now, but most serving guides stop at a bare `vllm serve` with nothing in front of it and no plan for the day you need a hosted fallback. SBproxy is built for exactly this gap: "Call any model. Serve your own. Govern both." One Apache-2.0 binary routes to 72 providers or serves the weights on your own GPUs. This page has two halves: a `serve:` config plus preflight tooling you can run right now, on whatever CPU or Apple Silicon box you have open, and the planned procedure for the certified NVIDIA L4 path — from `gcloud compute instances create` to a first vLLM/SGLang completion — which is not yet backed by live hardware evidence.
+Use this guide when you want to serve open weights behind the same gateway
+that routes to hosted providers. The runnable section uses llama.cpp and a
+GGUF model on CPU or Apple Silicon. A later section gives the procedure for
+certifying vLLM or SGLang on an NVIDIA L4.
 
-A status note before you read further, and definitely before you spend money. Nothing below [NVIDIA L4 (planned)](#nvidia-l4-planned) has run on an L4. NVIDIA vLLM and SGLang container, multi-GPU, and multi-node GCP validation is reserved for the final integration PR; the deterministic driver and capacity suites run in CI today. Use [model-host-certification.md](model-host-certification.md) for the evidence ledger, and do not read the GGUF walkthrough below as proof of anything about NVIDIA GPUs — llama.cpp does not serve them. See [model-host.md](model-host.md#managed-engines) for the exact engine policy.
+Apple Silicon Metal passed on 2026-07-11. NVIDIA CUDA, multi-GPU, and live
+GCP certification remain pending. The current NVIDIA evidence covers
+deterministic driver, capacity, plan, and container-isolation tests. See
+[model-host-certification.md](model-host-certification.md) for the evidence
+ledger and [model-host.md](model-host.md#managed-engines) for engine policy.
 
 ## What you will build
 
-Two things, and only one of them is real yet:
-
-- **Runnable today:** the `serve:` config below, checked with `sbproxy validate`, `plan`, and `doctor` on any machine, plus a real completion if that machine happens to have `llama-server` available (CPU or Apple Metal). This proves the config shape and the preflight tooling. It does not touch a GPU.
-- **Planned:** a `g2-standard-8` VM with one 24 GB L4, running an OpenAI-compatible gateway on port 8080 through the certified vLLM or SGLang engine, using canonical managed deployments and exact catalog v2 artifacts, with completion, status, stop, and cache reuse recorded against real hardware. See [NVIDIA L4 (planned)](#nvidia-l4-planned).
+- **Runnable today:** Check the `serve:` config with `sbproxy validate`,
+  `plan`, and `doctor`. If `llama-server` is available, send a real
+  completion on CPU or Apple Metal.
+- **Pending certification:** Create a `g2-standard-8` VM with one 24 GB L4
+  and record completion, status, stop, and cache-reuse evidence through
+  vLLM or SGLang.
 
 The same routing, guardrail, budget, and ledger planes that govern hosted providers apply to a local deployment either way.
 
@@ -27,12 +38,13 @@ For the stand-in you can run today:
 - `sbproxy` installed (below). `sbproxy doctor` tells you whether `llama-server` is already on this box or needs fetching before a real completion works.
 - Optional: a Hugging Face token. The Qwen weights in this walkthrough are ungated, but Gemma and Llama sit behind click-through licenses, and a gated repo needs `hf_token` in a model manifest (more on that below).
 
-The GCP project, L4 quota, and cost prerequisites for the planned path live in [NVIDIA L4 (planned)](#nvidia-l4-planned) — you do not need any of that for the rest of this page.
+The GCP project, L4 quota, and cost prerequisites for the planned path live in [NVIDIA L4 (planned)](#nvidia-l4-planned). You do not need any of that for the rest of this page.
 
 ## Install
 
 ```bash
-# Linux / macOS, single static binary:
+# Prebuilt release executable for Linux amd64/arm64 (glibc) or Apple Silicon macOS.
+# No Rust, Python, JVM, or Node toolchain/runtime is required.
 curl -fsSL https://download.sbproxy.dev | sh
 
 # macOS via Homebrew:
@@ -46,7 +58,7 @@ The [manual](manual.md) covers checksums, packages, and the rest of the install 
 
 ## Minimal config (stand-in)
 
-Save this as `sb.yml`. It is [`examples/use-case-serve-on-l4/sb.yml`](../examples/use-case-serve-on-l4/sb.yml), and its shape comes from [`examples/ai-local-serving`](../examples/ai-local-serving). This config names llama.cpp and a GGUF file, which is the CPU / Apple Metal engine path. Treat it as a stand-in for exercising the config shape and the preflight tooling — not as the NVIDIA GPU path. See [NVIDIA L4 (planned)](#nvidia-l4-planned) for what actually runs on the L4 itself.
+Save this as `sb.yml`. It is [`examples/use-case-serve-on-l4/sb.yml`](../examples/use-case-serve-on-l4/sb.yml), and its shape comes from [`examples/ai-local-serving`](../examples/ai-local-serving). This config names llama.cpp and a GGUF file. This walkthrough tests that configuration on CPU and Apple Metal. SBproxy also supports digest-pinned CUDA llama.cpp source builds, but they are not the certified NVIDIA path for this guide. See [NVIDIA L4 (planned)](#nvidia-l4-planned) for that path.
 
 ```yaml
 proxy:
@@ -74,15 +86,29 @@ The `proxy` block binds the data plane to 8080. The origin key `ai.local` is the
 
 The provider is the interesting part. It has no `base_url`, and that is deliberate: a served provider is hosted on this box, the gateway resolves the engine's loopback port itself, and writing `base_url` next to `serve:` is rejected as a config error. The `default_model` and `models` list name the serve entry, and that name is the model id every plane sees: routing, budgets, virtual keys, the usage ledger.
 
-Inside `serve:`, the model line names the weights explicitly: the Hugging Face repo, the quant, and the exact file. GGUF weights pick llama.cpp as the engine; `engine: llama_cpp` pins that explicitly rather than leaving it to `auto`, which matters once vLLM/SGLang exist alongside it. `name:` is the model id every plane sees, and `keep_alive: 30m` unloads an idle engine after thirty minutes so memory comes back. There is no `extra_args: ["--jinja"]` here: llama.cpp's stable argument allowlist does not include `--jinja` today, so the GGUF's embedded chat template goes through llama-server's own default handling rather than an operator override — worth knowing if Qwen3's turns render oddly, since forcing the Jinja template isn't a config knob yet. The shorter form is a bare catalog id (`model: qwen3-14b`): the catalog resolves it, the model metadata is prefetched at admission, and the fit planner walks the quant list `[FP8, Q4_K_M]`, taking the first one the card can run: FP8 on an NVIDIA GPU with FP8 kernels via vLLM, the Q4 GGUF on CPU or Metal via llama.cpp. The explicit form pins the exact weights file, which is why this walkthrough uses it.
+Inside `serve:`, the model line names the Hugging Face repository, quant,
+and file. GGUF weights select llama.cpp. Setting `engine: llama_cpp` makes
+that choice explicit instead of leaving it to `auto`. The `name` becomes
+the model id used by routing, budgets, virtual keys, and the usage ledger.
+`keep_alive: 30m` unloads the engine after thirty idle minutes.
+
+The stable llama.cpp argument allowlist does not include
+`extra_args: ["--jinja"]`. The engine therefore uses the GGUF's embedded
+chat template. If Qwen3 turns render incorrectly, an operator cannot force
+the Jinja template through this config today.
+
+A bare catalog id such as `model: qwen3-14b` lets the fit planner select the
+first compatible quant from `[FP8, Q4_K_M]`. FP8 requires a supported
+NVIDIA GPU and vLLM; Q4 GGUF runs through llama.cpp on CPU or Metal. This
+guide uses the explicit form to pin the weights file.
 
 To serve GLM instead, point the model line at a GLM GGUF repo and file the same way. Gemma is not in the built-in catalog and its repos are gated, so give it a model manifest entry instead: one reviewable file that names the source repo, a pinned revision, per-file sha256 digests, a pull policy, and, for a gated repo, your Hugging Face token as an `hf_token` secret reference rather than a literal in config. Point `serve.catalog_file` at the manifest and name its entry in `serve.models`. A curated manifest with digests doubles as a supply-chain allowlist. See [`examples/model-manifest`](../examples/model-manifest) and the manifest section of [model-host.md](model-host.md).
 
-One paragraph on why this config surface is shaped the way it is. Letting configuration start subprocesses inside a gateway that holds provider keys is a real attack surface, so it is constrained: `engine` is an allowlisted enum (`vllm`, `llama_cpp`), never a command string, the runtime owns the argument templates, engine binaries resolve from `PATH` or pinned releases only, and downloaded weights verify against manifest sha256 digests before an engine reads them. The full posture, including what is enforced today and what hardening remains, is in [security-model-host.md](security-model-host.md).
+One paragraph on why this config surface is shaped the way it is. Letting configuration start subprocesses inside a gateway that holds provider keys is a real attack surface, so it is constrained. `engine` is an allowlisted enum (`auto`, `vllm`, `sglang`, `llama_cpp`, or `embedded`), never a command string. The runtime owns typed argument templates and provisions each engine through its supported path: an operator binary, a verified release or source build, a pinned uv environment, or a digest-pinned container. Downloaded weights verify against manifest sha256 digests before an engine reads them. The full posture, including what is enforced today and what hardening remains, is in [security-model-host.md](security-model-host.md).
 
 ## Run it (stand-in)
 
-Ask the box whether it qualifies before starting anything — this is exactly what the recording above shows. Here is the real, abbreviated report from an Apple Silicon Mac with no `llama-server` installed yet; run `sbproxy doctor` on your own box for its live report:
+Ask the box whether it qualifies before starting anything. This is exactly what the recording above shows. Here is the real, abbreviated report from an Apple Silicon Mac with no `llama-server` installed yet; run `sbproxy doctor` on your own box for its live report:
 
 ```console
 $ sbproxy doctor
@@ -105,7 +131,7 @@ local model serving (serve:): not available
   recommended: llama_cpp: sbproxy can fetch the pinned ggml-org llama.cpp macos-arm64 release binary
 ```
 
-A `not available` verdict names every blocker with a recommended fix, which is a better way to find out than a spawn failure at 2am. Once `llama-server` is present, either already on `PATH` or fetched from the pinned release, the verdict for `serve:` flips to `ready` and the completion below actually answers. `vllm`'s line is honest too: it names why it cannot be acquired here rather than pretending it could serve this GGUF — it never does, on any host.
+A `not available` verdict names every blocker with a recommended fix, which is a better way to find out than a spawn failure at 2am. Once `llama-server` is present, either already on `PATH` or fetched from the pinned release, the verdict for `serve:` flips to `ready` and the completion below actually answers. `vllm`'s line is honest too: it names why it cannot be acquired on this host. This walkthrough keeps its GGUF on llama.cpp.
 
 Check the config itself with the plan differ. With no `--against` baseline, everything surfaces as added:
 
@@ -116,12 +142,12 @@ $ sbproxy plan -f sb.yml
 Plan: 1 added, 0 changed, 0 removed. max-blast-radius: reload
 ```
 
-Exit code 2 means valid with changes present; a config that fails validation exits 3 with the findings printed. The serve-specific rejections are enforced at gateway start, before the listener takes traffic: an engine outside the allowlist (`unknown variant 'sglang', expected one of 'auto', 'vllm', 'llama_cpp', 'embedded'`) or a `base_url` on a served provider is a fatal boot error with a message naming the fix. `validate` and `plan` going green is the part of this page that is true on every machine, GPU or none.
+Exit code 2 means valid with changes present; a config that fails validation exits 3 with the findings printed. The serve-specific rejections are enforced at gateway start, before the listener takes traffic. An engine outside the allowlist (`unknown variant 'shell', expected one of 'auto', 'vllm', 'sglang', 'llama_cpp', 'embedded'`) or a `base_url` on a served provider is a fatal boot error with a message naming the fix. `validate` and `plan` going green is the part of this page that is true on every machine, GPU or none.
 
 If `llama-server` is available on this box, go further and start the gateway:
 
 ```bash
-sbproxy sb.yml
+sbproxy serve -f sb.yml
 ```
 
 Send a completion. Be patient with this one on a cold cache: it pays a managed download of the 9 GB GGUF into `/var/lib/sbproxy/models` plus the llama-server bring-up, which can run several minutes on a laptop. The gateway log shows progress.
@@ -157,17 +183,16 @@ Send the same request a second time. It answers in normal API time, because the 
 
 ## You are done when
 
-- `sbproxy validate sb.yml` exits 0 and `sbproxy plan -f sb.yml` reports the origin added — true on any machine, with or without a GPU.
+- `sbproxy validate sb.yml` exits 0 and `sbproxy plan -f sb.yml` reports the origin added. This is true on any machine, with or without a GPU.
 - `sbproxy doctor` gives a clear, actionable verdict for this host: `ready` with `llama_cpp` resolved, or `not available` with the exact blocker and a suggested fix. Either outcome is a legitimate result for this stand-in.
 - Optional, only if `llama-server` was actually available on this box: the completion above returns `HTTP 200` with an OpenAI-shaped body whose `model` field names the served GGUF file, and a second identical request completes in a small fraction of the first call's time because the model stayed resident.
 
-None of the above is NVIDIA L4 evidence. That gate is separate and is not closed yet — see below.
-
 ## NVIDIA L4 (planned)
 
-This is the procedure for the certified path, and the status is exactly what [model-host-certification.md](model-host-certification.md) records: NVIDIA CUDA single node is *pending final GCP PR*. Deterministic T4/L4 descriptors, vLLM plans, and container isolation tests exist and run in CI; no live completion, status, or cache-reuse evidence from a real L4 has been recorded. Live GCP validation is reserved for the final integration PR.
-
-The certified NVIDIA GPU engines are vLLM and SGLang, both launched as digest-pinned containers (vLLM can also use a pinned uv environment). **llama.cpp is not part of this path** — it serves GGUF models on CPU and Apple Metal, not on NVIDIA GPUs. See [model-host.md](model-host.md#managed-engines) for the exact policy. Concretely: the stand-in above, and a `pgrep -af llama-server` showing an engine running on an L4 box, are not NVIDIA L4 evidence, no matter what GPU happens to be attached to that box.
+This is a certification procedure, not a completed result. No live
+completion, status, or cache-reuse evidence from an L4 has been recorded.
+The target engine is vLLM or SGLang, using a digest-pinned container or
+pinned uv environment.
 
 When you want to work through the planned procedure yourself:
 
@@ -178,7 +203,11 @@ When you want to work through the planned procedure yourself:
     --format="value(quotas)" | tr ',' '\n' | grep -i l4
   ```
 
-- A cost expectation. L4 boxes bill while they exist: the smaller `g2-standard-4` runs about $0.71/hr on demand, roughly $516 a month if you forget it. The delete command is at the end of this section. Use it.
+- A cost expectation. Google listed `g2-standard-8` at about $0.85 per hour
+  on demand in `us-central1` on 2026-07-28, before disk and network charges.
+  That is about $623 for 730 hours. Check the
+  [current G2 price](https://cloud.google.com/products/compute/pricing/accelerator-optimized)
+  before creating the VM, and use the delete command at the end.
 
 Create the VM. The Deep Learning image ships the CUDA driver preinstalled, so there is no driver dance on first boot:
 
@@ -197,7 +226,16 @@ gcloud compute instances create sbproxy-l4 \
 gcloud compute ssh sbproxy-l4 --zone=us-central1-a
 ```
 
-The repo wraps these commands in `scripts/provision-l4.sh` (`up`, `ssh`, `down`) if you would rather not retype them, and [`deploy/terraform/l4-demo`](../deploy/terraform/l4-demo) is the Terraform version with a public IP, Let's Encrypt TLS, and a bearer token in front, for when this stops being an experiment. [model-host-certification.md](model-host-certification.md#final-gcp-nvidia-gate) walks the same provisioning through `scripts/provision-l4.sh`, plus the certification gate itself: a config naming the vLLM engine and a placeholder model — deliberately not a working config yet, since the certified model and variant are not pinned until that PR lands — the digest-pinned container repeat, and the checks a real run must prove: device detection, a one-time artifact download, managed uv provisioning, a real completion, full status shape, drain-and-stop, and restart cache reuse.
+The repo wraps these commands in `scripts/provision-l4.sh` (`up`, `ssh`,
+`down`). [`deploy/terraform/l4-demo`](../deploy/terraform/l4-demo) adds a
+public IP, Let's Encrypt TLS, and bearer authentication.
+
+[model-host-certification.md](model-host-certification.md#gcp-nvidia-certification-procedure)
+covers the same provisioning and the certification gate. Its config uses
+vLLM with a placeholder model, so it is not a working certification config
+until a model and variant have live evidence. A real run must prove device
+detection, one-time artifact download, managed uv provisioning, completion,
+status, drain-and-stop, and restart cache reuse.
 
 `sbproxy doctor` already reports real hardware truthfully on an L4 box today; hardware discovery does not wait on the engine certification gate:
 
@@ -221,7 +259,11 @@ model cache
 ...
 ```
 
-The `fp8 yes` on the GPU line reflects the compute capability 8.9 the fit planner gates on for vLLM. `llama_cpp` resolving here is real too, and that is exactly why this policy needs saying out loud: an L4 box with `llama-server` on `PATH` can technically boot the stand-in config from this page and answer a completion through llama.cpp. That is not the certified NVIDIA path, is not evidence for the table in [model-host-certification.md](model-host-certification.md), and should not appear in a done-when for this box. The certified path is `engine: vllm` or `engine: sglang` against a digest-pinned container, proven with the checklist above, once the final integration PR closes that gate.
+The `fp8 yes` line reflects compute capability 8.9, which the fit planner
+uses to gate FP8 under vLLM. `llama_cpp` may also resolve on this host, but
+a llama.cpp completion does not certify the NVIDIA path. Certification
+requires `engine: vllm` or `engine: sglang` and the live evidence listed
+above.
 
 Then stop the meter:
 

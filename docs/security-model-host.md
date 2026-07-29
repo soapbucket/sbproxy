@@ -1,6 +1,6 @@
 # Model host security
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-07-28*
 
 The model host starts inference processes beside a gateway that may hold cloud
 provider credentials. Treat write access to `sb.yml`, the deployment revision
@@ -304,9 +304,9 @@ contract:
 - strict distributed budget reservation and lease recovery across gateways;
 - complete server-derived key introspection for every managed route decision.
 
-Live NVIDIA and multi-node validation runs on GCP in the final PR group. Until
-that evidence is recorded, the NVIDIA uv and container paths remain preview even
-though their deterministic process and isolation contracts run in CI.
+Live NVIDIA and multi-node GCP certification has not been recorded. Until that
+evidence exists, the NVIDIA uv and container paths remain preview even though
+their deterministic process and isolation contracts run in CI.
 
 ## Related
 

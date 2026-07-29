@@ -335,6 +335,11 @@ pub struct RequestContext {
     /// Buffered request body, populated only when `validate_request_body`
     /// is true.
     pub request_body_buf: Option<BytesMut>,
+    /// True while origin-level threat protection is buffering the
+    /// request body. The body filter clears this after it can classify
+    /// a non-JSON payload or after the complete JSON body passes its
+    /// configured limits.
+    pub threat_scan_pending: bool,
     /// WOR-819: set in `upstream_request_filter` when the request matched
     /// a `transcode` route on a `grpc` action. While true, the body
     /// filters re-fetch the transcoder from the pipeline and rewrite the
@@ -1302,6 +1307,7 @@ impl RequestContext {
             agent_budget_guards: Vec::new(),
             validate_request_body: false,
             request_body_buf: None,
+            threat_scan_pending: false,
             transcode_active: false,
             transcode_grpc_method: None,
             transcode_response_buf: None,

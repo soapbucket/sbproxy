@@ -22,8 +22,9 @@ ORIGIN_PORT=18889
 PROXY_HOST="loadtest.test"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TMP_DIR="$SCRIPT_DIR/load-test-tmp"
+WORKSPACE="$(cd "$SCRIPT_DIR/../.." && pwd)"
+SBPROXY_BIN="${SBPROXY_BIN:-$WORKSPACE/target/release/sbproxy}"
+TMP_DIR=""
 
 # ---------------------------------------------------------------------------
 # Colors
@@ -54,30 +55,71 @@ done
 # ---------------------------------------------------------------------------
 PIDS_TO_KILL=()
 
+stop_pid() {
+    local pid=$1
+    if ! kill -0 "$pid" 2>/dev/null; then
+        wait "$pid" 2>/dev/null || true
+        return
+    fi
+    kill "$pid" 2>/dev/null || true
+    for _ in {1..20}; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+}
+
 cleanup() {
+    local index name
     echo ""
     echo -e "${DIM}Cleaning up...${RESET}"
-    for pid in "${PIDS_TO_KILL[@]}"; do
-        if kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-        fi
+    for ((index=${#PIDS_TO_KILL[@]} - 1; index >= 0; index--)); do
+        stop_pid "${PIDS_TO_KILL[$index]}"
     done
-    rm -rf "$TMP_DIR"
+    if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
+        for name in \
+            sb.yml proxy.log \
+            direct_hey.csv proxy_hey.csv \
+            direct_wrk.txt proxy_wrk.txt \
+            direct_raw.txt proxy_raw.txt \
+            direct_times.txt proxy_times.txt; do
+            rm -f -- "$TMP_DIR/$name"
+        done
+        rmdir -- "$TMP_DIR" 2>/dev/null || true
+    fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-log() { echo -e "${BLUE}>>>${RESET} $*"; }
+log() {
+    [ "$QUIET" -eq 1 ] || echo -e "${BLUE}>>>${RESET} $*"
+}
 warn() { echo -e "${YELLOW}WARNING:${RESET} $*"; }
 err() { echo -e "${RED}ERROR:${RESET} $*" >&2; }
 
+reject_occupied_port() {
+    local port=$1 name=$2 owners
+    owners="$(lsof -ti "tcp:$port" 2>/dev/null || true)"
+    if [ -n "$owners" ]; then
+        err "$name port $port is occupied by PID(s): $(echo "$owners" | tr '\n' ' ')"
+        return 1
+    fi
+}
+
 wait_for_port() {
-    local port=$1 name=$2 tries=30
-    while ! curl -sf "http://127.0.0.1:$port/health" >/dev/null 2>&1 && \
-          ! curl -sf "http://127.0.0.1:$port/echo" >/dev/null 2>&1; do
+    local port=$1 name=$2 host=${3:-} tries=30
+    local curl_args=(-sS -o /dev/null --max-time 1)
+    if [ -n "$host" ]; then
+        curl_args+=(-H "Host: $host")
+    fi
+    while ! curl "${curl_args[@]}" "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
         tries=$((tries - 1))
         if [ "$tries" -le 0 ]; then
             err "$name did not start on port $port"
@@ -114,15 +156,17 @@ sum() {
 # ---------------------------------------------------------------------------
 # Step 0: Prepare temp directory
 # ---------------------------------------------------------------------------
-mkdir -p "$TMP_DIR"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sbproxy-load-test.XXXXXX")"
 
 # ---------------------------------------------------------------------------
-# Step 1: Build sbproxy
+# Step 1: Use a Rust sbproxy binary
 # ---------------------------------------------------------------------------
-log "Building sbproxy..."
-cd "$PROJECT_DIR"
-go build -o "$SCRIPT_DIR/sbproxy" ./cmd/sbproxy/
-log "Build complete."
+if [ ! -x "$SBPROXY_BIN" ]; then
+    err "Rust sbproxy binary not found or not executable at $SBPROXY_BIN"
+    err "Build it first with: cargo build --release -p sbproxy"
+    exit 1
+fi
+log "Using sbproxy binary: $SBPROXY_BIN"
 
 # ---------------------------------------------------------------------------
 # Step 2: Create sb.yml config
@@ -130,6 +174,10 @@ log "Build complete."
 cat > "$TMP_DIR/sb.yml" <<'YAML'
 proxy:
   http_bind_port: 18080
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - 127.0.0.0/8
 origins:
   "loadtest.test":
     action:
@@ -140,6 +188,8 @@ YAML
 # ---------------------------------------------------------------------------
 # Step 3: Start callback server (origin) on port 18889
 # ---------------------------------------------------------------------------
+reject_occupied_port "$ORIGIN_PORT" "origin"
+reject_occupied_port "$PROXY_PORT" "proxy"
 log "Starting origin server on port $ORIGIN_PORT..."
 TEST_SERVER_PORT=$ORIGIN_PORT node "$SCRIPT_DIR/servers/test-server.js" &
 PIDS_TO_KILL+=($!)
@@ -150,14 +200,26 @@ log "Origin server ready."
 # Step 4: Start sbproxy on port 18080
 # ---------------------------------------------------------------------------
 log "Starting sbproxy on port $PROXY_PORT..."
-"$SCRIPT_DIR/sbproxy" serve -f "$TMP_DIR/sb.yml" --log-level error >"$TMP_DIR/proxy.log" 2>&1 &
+"$SBPROXY_BIN" serve -f "$TMP_DIR/sb.yml" --log-level error >"$TMP_DIR/proxy.log" 2>&1 &
 PIDS_TO_KILL+=($!)
 sleep 0.5
-wait_for_port "$PROXY_PORT" "sbproxy"
+wait_for_port "$PROXY_PORT" "sbproxy" "$PROXY_HOST"
 log "sbproxy ready."
 
 # ---------------------------------------------------------------------------
-# Step 5: Detect best load testing tool
+# Step 5: Refuse to benchmark error responses
+# ---------------------------------------------------------------------------
+direct_status="$(curl -sS -o /dev/null -w '%{http_code}' \
+    "http://127.0.0.1:$ORIGIN_PORT/echo")"
+proxy_status="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Host: $PROXY_HOST" "http://127.0.0.1:$PROXY_PORT/echo")"
+if [ "$direct_status" != "200" ] || [ "$proxy_status" != "200" ]; then
+    err "smoke request failed (direct=$direct_status, proxy=$proxy_status)"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Step 6: Detect best load testing tool
 # ---------------------------------------------------------------------------
 TOOL="curl"
 if command -v hey >/dev/null 2>&1; then
@@ -338,4 +400,4 @@ if [ -f "$TMP_DIR/direct_times.txt" ] && [ -f "$TMP_DIR/proxy_times.txt" ]; then
     echo ""
 fi
 
-log "Done. Proxy log: $TMP_DIR/proxy.log"
+log "Done."

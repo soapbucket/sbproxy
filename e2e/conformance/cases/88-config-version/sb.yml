@@ -1,4 +1,6 @@
-# 88 - Config Version: origin with config_version: 2
+# 88 - Removed Config Version: validation must reject origin config_version
+# This fixture is intentionally invalid. run-tests.sh invokes `sbproxy validate`
+# and asserts that the diagnostic names the removed key.
 proxy:
   http_bind_port: 18080
 
@@ -7,4 +9,4 @@ origins:
     config_version: 2
     action:
       type: proxy
-      url: http://127.0.0.1:18888
+      url: https://test.sbproxy.dev

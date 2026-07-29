@@ -3560,6 +3560,115 @@ impl ProxyHttp for SbProxy {
             }
         }
 
+        // --- Origin-level JSON threat protection ---
+        //
+        // request_filter marks threat-protected requests but must not read
+        // their bodies: doing so drains the downstream stream before Pingora
+        // can send it upstream. Hold JSON candidates here, enforce a bounded
+        // buffer while chunks arrive, scan the complete representation at
+        // end-of-stream, then release the exact bytes on success. A clearly
+        // non-JSON body is released as soon as its first non-whitespace byte
+        // is available.
+        if ctx.threat_scan_pending {
+            const THREAT_SCAN_HARD_CAP: usize = 8 * 1024 * 1024;
+
+            let pipeline = ctx.pipeline.clone();
+            let threat = ctx
+                .origin_idx
+                .and_then(|idx| pipeline.threat_protections.get(idx))
+                .and_then(Option::as_ref)
+                .filter(|threat| threat.enabled);
+
+            if let Some(threat) = threat {
+                let declared_json = session
+                    .req_header()
+                    .headers
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.contains("application/json"));
+                let size_cap = threat
+                    .json
+                    .as_ref()
+                    .and_then(|json| json.max_total_size)
+                    .unwrap_or(THREAT_SCAN_HARD_CAP);
+                let buf = ctx
+                    .request_body_buf
+                    .get_or_insert_with(bytes::BytesMut::new);
+                let incoming_len = body.as_ref().map_or(0, Bytes::len);
+                let first_non_whitespace = buf
+                    .iter()
+                    .chain(body.as_ref().into_iter().flat_map(|chunk| chunk.iter()))
+                    .find(|byte| !byte.is_ascii_whitespace())
+                    .copied();
+                let looks_json = matches!(first_non_whitespace, Some(b'{' | b'['));
+                let json_candidate = declared_json || looks_json || first_non_whitespace.is_none();
+
+                if json_candidate && buf.len().saturating_add(incoming_len) > size_cap {
+                    debug!("threat protection blocked request: body exceeds size cap");
+                    ctx.validator_failed = Some((
+                        413,
+                        error_json_body("request entity too large"),
+                        "application/json".to_string(),
+                    ));
+                    *body = None;
+                    return Err(pingora_error::Error::explain(
+                        pingora_error::ErrorType::HTTPStatus(413),
+                        "threat protection body exceeded size cap",
+                    ));
+                }
+
+                if let Some(chunk) = body.take() {
+                    buf.extend_from_slice(&chunk);
+                }
+
+                if !json_candidate {
+                    let collected = ctx.request_body_buf.take().unwrap_or_default();
+                    ctx.threat_scan_pending = false;
+                    if !collected.is_empty() {
+                        *body = Some(collected.freeze());
+                    }
+                } else if end_of_stream {
+                    let collected = ctx.request_body_buf.take().unwrap_or_default();
+                    ctx.threat_scan_pending = false;
+                    if !collected.is_empty() {
+                        if let Err(detail) = threat.check_json_body(&collected) {
+                            debug!(detail = %detail, "threat protection blocked request");
+                            ctx.validator_failed = Some((
+                                413,
+                                error_json_body("request entity too large"),
+                                "application/json".to_string(),
+                            ));
+                            return Err(pingora_error::Error::explain(
+                                pingora_error::ErrorType::HTTPStatus(413),
+                                "threat protection rejected request body",
+                            ));
+                        }
+                        *body = Some(collected.freeze());
+                    }
+                } else {
+                    // Hold JSON candidates until the complete body can be
+                    // scanned. Pingora treats `None` as upstream end-of-body,
+                    // so use an empty chunk to pause forwarding without
+                    // terminating the stream. Other body consumers receive
+                    // the released representation after this branch completes.
+                    *body = Some(Bytes::new());
+                    return Ok(());
+                }
+            } else {
+                // A hot reload may remove threat protection after the
+                // request phase. Do not strand the request body in that case.
+                ctx.threat_scan_pending = false;
+                if let Some(mut buffered) = ctx.request_body_buf.take() {
+                    if let Some(chunk) = body.take() {
+                        buffered.extend_from_slice(&chunk);
+                    }
+                    if !buffered.is_empty() {
+                        *body = Some(buffered.freeze());
+                    }
+                }
+            }
+        }
+
         // --- WOR-819: REST -> gRPC request body transcoding ---
         //
         // When `upstream_request_filter` matched a transcode route, hold

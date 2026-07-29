@@ -1,6 +1,6 @@
 # Migrating from LiteLLM
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-07-28*
 
 ![The importer translating a LiteLLM config, then a completion served through the migrated result](assets/migrate-litellm.gif)
 
@@ -10,7 +10,7 @@ This guide moves a LiteLLM proxy deployment to SBproxy in an afternoon. Your Ope
 
 ```bash
 sbproxy config import-litellm litellm_config.yaml --out sb.yml
-sbproxy sb.yml
+sbproxy serve -f sb.yml
 ```
 
 `import-litellm` reads a LiteLLM `config.yaml` and writes an equivalent SBproxy `sb.yml` with one `ai_proxy` origin. It prints a warnings report to stderr listing every key that needs manual attention, and never fails on an unmapped key (only on a YAML parse error). Every configured key is accounted for as mapped, warned, or unsupported: nothing under `litellm_params`, `router_settings`, `litellm_settings`, `general_settings`, or the top-level document is silently dropped. Clients that already speak the OpenAI API need no change: keep calling `/v1/chat/completions`, `/v1/embeddings`, and the rest. `os.environ/VAR` references become SBproxy's `${VAR}` interpolation.
@@ -34,7 +34,8 @@ By the end you have an `sb.yml` that answers the same `/v1/chat/completions` cal
 ## Install
 
 ```bash
-# Linux / macOS, single static binary:
+# Prebuilt release executable for Linux amd64/arm64 (glibc) or Apple Silicon macOS.
+# No Rust, Python, JVM, or Node toolchain/runtime is required.
 curl -fsSL https://download.sbproxy.dev | sh
 
 # macOS via Homebrew:
@@ -152,7 +153,7 @@ $ sbproxy validate sb.yml
 ok: sb.yml is a valid sbproxy config
 $ export OPENAI_API_KEY=sk-...
 $ export ANTHROPIC_API_KEY=sk-ant...
-$ sbproxy sb.yml
+$ sbproxy serve -f sb.yml
 ```
 
 Send the request your clients already send, changing only the port:

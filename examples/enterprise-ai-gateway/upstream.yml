@@ -1,0 +1,34 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Credential-free local fixture for the progressive enterprise AI gateway.
+#
+# Run:
+#   sbproxy serve -f examples/enterprise-ai-gateway/upstream.yml
+#
+# Test:
+#   curl -s http://127.0.0.1:8091/v1/chat/completions | jq .
+
+proxy:
+  http_bind_port: 8091
+
+origins:
+  "127.0.0.1":
+    action:
+      type: mock
+      status: 200
+      content_type: application/json
+      body:
+        gateway: sbproxy
+        id: chatcmpl-local-demo
+        object: chat.completion
+        created: 0
+        model: local-demo
+        choices:
+          - index: 0
+            message:
+              role: assistant
+              content: "Hello from the local sbproxy fixture."
+            finish_reason: stop
+        usage:
+          prompt_tokens: 8
+          completion_tokens: 7
+          total_tokens: 15

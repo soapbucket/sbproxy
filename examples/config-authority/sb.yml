@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Config authority: the node that validates, signs, and serves
 # configuration to a fleet of subscribers.
 #

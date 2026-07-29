@@ -1,11 +1,9 @@
 # 89 - Access Logging: proxy with request logging configured
 proxy:
   http_bind_port: 18080
-  logging:
-    format: json
-    request:
-      enabled: true
-      level: info
+
+access_log:
+  enabled: true
 
 origins:
   "accesslog.test":

@@ -1,5 +1,5 @@
-# Blue-green deployment using load balancer with "first" algorithm
-# Active target (blue) gets all traffic; standby (green) is deprioritized
+# Blue-green deployment using the active deployment group.
+# The blue group receives all traffic until active is changed to green.
 proxy:
   http_bind_port: 18080
 
@@ -7,17 +7,16 @@ origins:
   "bluegreen.test":
     action:
       type: load_balancer
-      algorithm: first
+      algorithm: round_robin
+      deployment_mode:
+        mode: blue_green
+        active: blue
       targets:
-        - url: http://127.0.0.1:18888/echo?env=blue
+        - url: http://127.0.0.1:18888
+          host_override: blue.internal
+          group: blue
           weight: 1
-          request_modifiers:
-            - type: header
-              set:
-                X-Upstream: blue
-        - url: http://127.0.0.1:18888/echo?env=green
+        - url: http://127.0.0.1:18888
+          host_override: green.internal
+          group: green
           weight: 1
-          request_modifiers:
-            - type: header
-              set:
-                X-Upstream: green

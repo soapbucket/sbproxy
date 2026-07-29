@@ -2192,8 +2192,8 @@ First Rust release of SBproxy on this repository.
   Pingora. The Go implementation that previously occupied this repo
   (`v0.1.0` through `v0.1.2`) has moved to
   [`soapbucket/sbproxy-go`](https://github.com/soapbucket/sbproxy-go),
-  preserved as the `v0.1.2-go-final` branch and tag, and is now in
-  maintenance-only mode.
+  which is archived and read-only; its `v0.1.2` release tag preserves
+  the final historical release.
 - **Data plane**: routing, AI gateway, MCP gateway, guardrails, security
   policies, and scripting (CEL, Lua, JavaScript, WebAssembly) all ship
   open source in this release. See [`docs/architecture.md`](docs/architecture.md)

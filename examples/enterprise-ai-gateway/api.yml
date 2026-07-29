@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Stage 1: proxy a conventional HTTP API.
+
+proxy:
+  http_bind_port: 8080
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - 127.0.0.0/8
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: http://127.0.0.1:8091

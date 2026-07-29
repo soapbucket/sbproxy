@@ -1,5 +1,5 @@
 # Benchmark
-*Last modified: 2026-05-03*
+*Last modified: 2026-07-28*
 
 Head-to-head results for SBproxy against the AI gateways and reverse
 proxies most teams already evaluate. Numbers are from the public
@@ -7,6 +7,9 @@ competitor campaign **`20260424-220610`** in
 [`sbproxy-bench`](https://github.com/soapbucket/sbproxy-bench), run on
 identical hardware, same kernel, same load generator, same scenario
 files.
+
+The `sbproxy-go` rows preserve results for the archived implementation at
+[`soapbucket/sbproxy-go`](https://github.com/soapbucket/sbproxy-go).
 
 If you only have time for one paragraph: SBproxy serves **68,512 RPS at
 0.69 ms p99** as an AI gateway, on an 8 vCPU GCE box, with a 100% 2xx

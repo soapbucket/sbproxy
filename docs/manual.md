@@ -34,11 +34,21 @@ This section is the canonical install reference; other docs link here rather tha
 
 ### Install script
 
-The quickest path on macOS and Linux. The script detects your OS and architecture, fetches the matching release binary, and drops it in `~/.local/bin`:
+The quickest path for Linux on amd64 or arm64, and macOS on Apple Silicon. The
+script detects the platform, fetches the matching release binary, and drops it
+in `~/.local/bin`:
 
 ```bash
 curl -fsSL https://download.sbproxy.dev | sh
 ```
+
+On a Linux host with an NVIDIA GPU, the installer makes a best-effort attempt
+to prepare the optional container runtime used for managed model serving. Set
+`SBPROXY_SKIP_GPU_SETUP=1` to skip that step. It does not affect the gateway
+binary installation.
+
+Intel macOS binaries are not published. Use the Linux amd64 container or build
+from source on an Intel Mac.
 
 ### Homebrew
 
@@ -48,7 +58,10 @@ brew install soapbucket/tap/sbproxy
 
 ### Binary download
 
-Pre-built binaries for Linux, macOS, and Windows are on the releases page. Download the archive for your platform, extract it, and put the `sbproxy` binary somewhere in your `PATH`.
+The releases page publishes three archives: Linux amd64, Linux arm64, and
+macOS arm64. The Linux artifacts target the GNU ABI and require glibc 2.36 or
+newer. Download the archive for your platform, extract it, and put `sbproxy`
+somewhere in your `PATH`.
 
 ```bash
 # Linux (amd64)
@@ -68,7 +81,8 @@ sbproxy --version
 
 ### Docker
 
-The official image runs the release binary on a distroless base (`gcr.io/distroless/cc-debian12`); there is no shell or package manager in the runtime layer. The binary is built against glibc 2.36, so the same tarball also runs on Debian 12, Ubuntu 23.04, and anything newer.
+The official image runs the matching Linux release binary on a distroless
+Debian 12 base; there is no shell or package manager in the runtime layer.
 
 The image has no default config path, so every `docker run` must name the config explicitly, either as `serve -f <path>` or as a positional argument. Mount your config at `/etc/sbproxy` and point the command at it:
 
@@ -656,16 +670,17 @@ The managed runtime resolves an engine in this order:
 - An explicit trusted binary path wins: set `engines.<kind>.acquire.path` with
   `engines.<kind>.acquire.source: path`.
 - A compatible binary on `PATH` is next for ordinary binary launch.
-- llama.cpp can fetch a pinned release. Built-in prebuilt assets have checked-in
-  digests and identity-scoped caches. It serves GGUF models on CPU and Apple
-  Metal; NVIDIA GPU serving uses the vLLM and SGLang container engines.
+- llama.cpp can fetch a pinned CPU or Metal release. Built-in prebuilt assets
+  have checked-in digests and identity-scoped caches. On a compatible NVIDIA
+  Linux host, it can instead build digest-pinned source with CUDA.
 - vLLM can use a version-pinned managed uv environment or a digest-pinned
   private container.
 
-GPU drivers are never installed by sbproxy; a missing driver is
-reported with guidance only. See [model-host.md](model-host.md) for canonical
-fields, per-engine details, and host prerequisites. Live NVIDIA certification
-remains in the final GCP integration PR.
+GPU drivers are never installed by sbproxy; a missing driver is reported with
+guidance only. The pending NVIDIA certification procedure targets vLLM or
+SGLang, not the llama.cpp CUDA path. See [model-host.md](model-host.md) for
+canonical fields, per-engine details, and host prerequisites. Live NVIDIA
+certification has not been recorded, so those paths remain preview.
 
 ### `update` - keep the binary, engines, and models current
 
@@ -1627,7 +1642,11 @@ header / query parsing is wired today.
 
 ### Single container
 
-Mount a config directory containing `sb.yml` and map ports; the image's default command is `serve -f /etc/sbproxy/sb.yml`. The container exposes `8080/tcp`, `8443/tcp`, and `8443/udp` (UDP will be required for HTTP/3 QUIC when HTTP/3 returns; HTTP/3 is currently disabled, so the UDP mapping is presently unused).
+Mount a config directory containing `sb.yml`, map the listener ports, and pass
+the startup command explicitly. The published `soapbucket/sbproxy` and
+`ghcr.io/soapbucket/sbproxy` images set the `sbproxy` entrypoint but no default
+command. Their image metadata exposes 8080 and 9090; Docker can map any ports
+you configure.
 
 ```bash
 docker run -d \
@@ -1638,7 +1657,7 @@ docker run -d \
   -p 8443:8443/udp \
   -v /etc/sbproxy:/etc/sbproxy:ro \
   -e SB_LOG_LEVEL=info \
-  soapbucket/sbproxy:latest
+  soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
 ```
 
 For a read-only config with a writable ACME certificate store (the default `proxy.acme.storage_path` is `/var/lib/sbproxy/certs`):
@@ -1652,7 +1671,7 @@ docker run -d \
   -v /etc/sbproxy/sb.yml:/etc/sbproxy/sb.yml:ro \
   -v sbproxy-acme-certs:/var/lib/sbproxy/certs \
   -e SB_LOG_LEVEL=info \
-  soapbucket/sbproxy:latest
+  soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
 ```
 
 ### Docker Compose stack
@@ -1689,11 +1708,13 @@ make docker
 docker build -f Dockerfile.cloudbuild -t sbproxy:dev .
 ```
 
-The image uses a multi-stage build: the builder stages compile the
+This locally built image uses a multi-stage build: the builder stages compile the
 binary and the embedded admin UI, and the final image is
 `gcr.io/distroless/cc-debian12`, with no shell or package manager. The
 default command is `serve -f /etc/sbproxy/sb.yml`, so mounting a
-config at that path is all a derived deployment needs.
+config at that path is enough for this local image. The published release
+images are assembled separately in `.github/workflows/release.yml` and do not
+set that command.
 
 ---
 
@@ -1995,7 +2016,7 @@ docker run --rm \
   -p 8443:8443 \
   -p 8443:8443/udp \
   -v /etc/sbproxy:/etc/sbproxy:ro \
-  soapbucket/sbproxy:latest
+  soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
 ```
 
 ### HTTP/3 limitations

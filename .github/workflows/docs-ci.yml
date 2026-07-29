@@ -22,8 +22,17 @@ on:
       # prefix predates the repo split and matched nothing, so this
       # workflow never fired on doc changes.
       - 'docs/**'
+      - 'README.md'
+      - 'MIGRATION.md'
+      - 'CHANGELOG.md'
+      - 'examples/**'
+      - 'Makefile'
       - 'scripts/docs-ci.sh'
       - 'scripts/check-spec-citations.sh'
+      - 'scripts/gen-example-tapes.py'
+      - 'scripts/record-tapes.sh'
+      - 'scripts/wire-example-gifs.py'
+      - 'scripts/tests/test_doc_generators.py'
       - 'scripts/regen-llms-full.sh'
       - '.lycheeignore'
       - '.github/workflows/docs-ci.yml'
@@ -93,6 +102,9 @@ jobs:
             exit 1
           fi
           bash scripts/docs-ci.sh
+
+      - name: generated tapes and GIF wiring are current
+        run: make tapes-check
 
       # WOR-528: catch the four spec-citation regressions called out in
       # the 2026-05-15 Public RFCs audit before they ship.

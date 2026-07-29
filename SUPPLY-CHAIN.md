@@ -1,6 +1,6 @@
 # SBproxy Supply Chain
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-07-28*
 
 The long-form companion to `SECURITY.md`, intended for security teams, procurement reviewers, and anyone whose job is to answer the question "can we trust this binary?"
 
@@ -243,12 +243,12 @@ There are **no Python or Node runtime dependencies** in the gateway hot path. Th
 
 The release workflow itself is part of the supply chain. The following invariants are enforced:
 
-- **All third-party GitHub Actions are pinned by commit SHA, not by tag.** Action authors can re-tag silently; SHAs cannot be changed retroactively. Renovate keeps the SHAs current with full diffs.
-- **Job-level minimum permissions.** The release job has only `id-token: write` (for keyless cosign), `contents: write` (for release publish), and `packages: write` (for GHCR push). No `permissions: write-all`, ever.
+- **Third-party GitHub Actions use explicit reviewed versions.** The workflow currently uses major-version tags such as `actions/checkout@v5`; updates are visible in review.
+- **Job-level minimum permissions.** The binary release job has `contents: write`, `id-token: write`, and `attestations: write`. The separate image job also has `packages: write`. Other jobs inherit `contents: read` unless they declare a narrower publish need. No job uses `permissions: write-all`.
 - **Hosted runners only.** SLSA Level 3 requires this. Self-hosted runners are not used for release jobs.
-- **No secrets in environment variables that scripts can echo.** Where unavoidable, secrets are scoped to a single step.
+- **Publish secrets are scoped to the steps that need them.** Release and registry credentials are not set as workflow-wide environment variables.
 - **No interactive prompts in CI.** Every command is non-interactive; every flag is explicit.
-- **Branch protection on `main` and `archive/go`.** Force-push and deletion are disabled. `main` requires PR review and a passing CI run before merge.
+- **Branch protection on `main`.** Force-push and deletion are disabled. Changes require PR review and a passing CI run before merge.
 - **Tag protection on `v*` tags.** Only specific roles can create release tags.
 - **Provenance includes the workflow file SHA.** A change to `release.yml` is visible in the next release's attestation.
 

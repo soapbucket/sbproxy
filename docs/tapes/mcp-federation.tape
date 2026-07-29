@@ -20,11 +20,11 @@ Type `export PS1='$ '; clear`
 Enter
 Show
 
-Type `curl -s -X POST http://127.0.0.1:8080 -H 'Host: mcp.example.com' -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}'`
+Type `curl -s -X POST http://127.0.0.1:8080 -H 'Host: mcp.example.com' -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-demo","version":"1.0.0"}}}' | jq .`
 Enter
 Sleep 1.6s
 
-Type `curl -s -X POST http://127.0.0.1:8080 -H 'Host: mcp.example.com' -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | jq .`
+Type `curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8080 -H 'Host: mcp.example.com' -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H 'MCP-Protocol-Version: 2025-06-18' -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'`
 Enter
 Sleep 1.6s
 

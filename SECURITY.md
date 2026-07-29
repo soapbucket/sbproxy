@@ -1,6 +1,6 @@
 # Security Policy
 
-*Last modified: 2026-04-26*
+*Last modified: 2026-07-28*
 
 The supply-chain detail lives separately in `SUPPLY-CHAIN.md`; this file covers the disclosure policy and a fast-path summary of how to verify a release.
 
@@ -38,10 +38,11 @@ We follow coordinated disclosure: we will work with you on a public advisory and
 
 | Version | Supported |
 |---|---|
-| v1.0.x (Rust, current) | Yes. Security patches, bug fixes, new features. |
-| v0.1.x (Go, archived) | No. Critical-severity security patches considered case-by-case for 90 days after v1.0.0 release; nothing else. After 90 days, no support. Existing artifacts remain available indefinitely but are not maintained. |
+| v1.9.x (Rust, current) | Yes. Security patches, bug fixes, new features. |
+| v0.1.x (Go, archived) | No. The repository is read-only; existing artifacts remain available but are not maintained. |
 
-The Go implementation source lives at https://github.com/soapbucket/sbproxy-go and on the `archive/go` branch of this repository.
+The Go implementation source lives in the archived, read-only
+[`soapbucket/sbproxy-go`](https://github.com/soapbucket/sbproxy-go) repository.
 
 ---
 
@@ -53,7 +54,7 @@ If you are pulling SBproxy into production, **verify before you run**. Four comm
 
 ```bash
 # 1. Download the artifact and its cosign bundle
-VERSION=1.5.0
+VERSION=1.9.0
 PLATFORM=linux_amd64
 BASE="https://github.com/soapbucket/sbproxy/releases/download/v${VERSION}"
 curl -fsSL -o sbproxy.tar.gz       "${BASE}/sbproxy_${PLATFORM}.tar.gz"
