@@ -99,7 +99,7 @@ impl GuardrailMode {
     }
 
     pub fn is_output(self) -> bool {
-        matches!(self, Self::PostCall | Self::DuringCall)
+        matches!(self, Self::PostCall | Self::DuringCall | Self::LoggingOnly)
     }
 
     pub fn blocks(self) -> bool {
@@ -904,6 +904,44 @@ pub async fn run_output_external_guardrails(
     run_external_guardrails(configs, content, model, GuardrailPhase::Output).await
 }
 
+/// Apply output guardrail fail modes when the upstream response cannot be
+/// represented as text. The raw bytes are deliberately not converted or sent
+/// to an external service: logging-only and fail-open entries record a
+/// fail-open verdict, while the first enforcing fail-closed entry blocks with
+/// a fixed operator-safe reason.
+pub fn run_output_external_guardrails_without_content(
+    configs: &[ExternalGuardrailConfig],
+) -> Option<(String, String)> {
+    const CONTENT_UNAVAILABLE_REASON: &str =
+        "external output guardrail could not inspect response content";
+
+    for config in configs {
+        if !config.default_on || !config.mode.is_output() {
+            continue;
+        }
+
+        let blocks = config.mode.blocks() && !config.fail_open;
+        let outcome = if blocks { "fail_closed" } else { "fail_open" };
+        record_external_guardrail_verdict(
+            config.provider.as_str(),
+            GuardrailPhase::Output.as_str(),
+            outcome,
+        );
+        tracing::debug!(
+            guardrail = %config.name,
+            provider = config.provider.as_str(),
+            phase = GuardrailPhase::Output.as_str(),
+            outcome,
+            "external guardrail skipped because response content is unavailable"
+        );
+
+        if blocks {
+            return Some((config.name.clone(), CONTENT_UNAVAILABLE_REASON.to_string()));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1168,5 +1206,63 @@ mod tests {
             .await
             .allowed
         );
+    }
+
+    fn unavailable_output_config(mode: &str, fail_open: bool) -> ExternalGuardrailConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": "binary-policy",
+            "url": "https://8.8.8.8/check",
+            "mode": mode,
+            "default_on": true,
+            "fail_open": fail_open
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn unavailable_output_content_fails_closed_without_exposing_bytes() {
+        let blocked = run_output_external_guardrails_without_content(&[unavailable_output_config(
+            "post_call",
+            false,
+        )])
+        .expect("fail-closed output guardrail must block");
+
+        assert_eq!(blocked.0, "binary-policy");
+        assert_eq!(
+            blocked.1,
+            "external output guardrail could not inspect response content"
+        );
+    }
+
+    #[test]
+    fn unavailable_output_content_honors_fail_open_and_logging_only_once() {
+        let fail_open_before =
+            crate::ai_metrics::external_guardrail_verdict_value("generic", "output", "fail_open");
+        assert!(run_output_external_guardrails_without_content(&[
+            unavailable_output_config("post_call", true),
+            unavailable_output_config("logging_only", false),
+        ])
+        .is_none());
+        let fail_open_after =
+            crate::ai_metrics::external_guardrail_verdict_value("generic", "output", "fail_open");
+
+        assert_eq!(fail_open_after - fail_open_before, 2.0);
+    }
+
+    #[test]
+    fn unavailable_output_content_ignores_disabled_and_input_only_guardrails() {
+        let fail_closed_before =
+            crate::ai_metrics::external_guardrail_verdict_value("generic", "output", "fail_closed");
+        let mut disabled = unavailable_output_config("post_call", false);
+        disabled.default_on = false;
+        assert!(run_output_external_guardrails_without_content(&[
+            disabled,
+            unavailable_output_config("pre_call", false),
+        ])
+        .is_none());
+        let fail_closed_after =
+            crate::ai_metrics::external_guardrail_verdict_value("generic", "output", "fail_closed");
+
+        assert_eq!(fail_closed_after, fail_closed_before);
     }
 }

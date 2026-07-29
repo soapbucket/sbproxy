@@ -4879,10 +4879,6 @@ pub(super) async fn handle_ai_proxy(
                         .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
                         .map(|(_, v)| v.clone())
                         .unwrap_or_else(|| "application/json".to_string());
-                    let translated = sbproxy_ai::format::rewrap_response_for_inbound(
-                        ctx.ai_inbound_format.as_deref(),
-                        &o.body,
-                    );
                     emit_ai_billing_event(
                         hostname,
                         surface_label,
@@ -4896,6 +4892,51 @@ pub(super) async fn handle_ai_proxy(
                         ctx.principal.api_key_id(),
                         &ctx.rollup_properties,
                         &ai_span,
+                    );
+                    if (200..300).contains(&o.status) {
+                        let output_external = config
+                            .guardrails
+                            .as_ref()
+                            .map(|guardrails| guardrails.external.as_slice())
+                            .unwrap_or_default();
+                        if let Some(block) =
+                            external_output_guardrail_block(output_external, &o.body, &o.model)
+                                .await
+                        {
+                            warn!(
+                                guardrail = %block.name,
+                                reason = %block.reason,
+                                "AI proxy: cascade output guardrail blocked response"
+                            );
+                            sbproxy_ai::tracing_spans::record_error(
+                                &ai_span,
+                                sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                                &block.reason,
+                            );
+                            mark_guardrail_block(ctx, block.name.clone());
+                            let body_bytes =
+                                ErrorEnvelope::new("guardrail_violation", &block.reason)
+                                    .code(&block.name)
+                                    .request_id(ctx.request_id.as_str())
+                                    .to_bytes();
+                            // Cascade bodies are materialized outside the relay
+                            // path, so a blocked body must not reach the
+                            // idempotency cache or the downstream client.
+                            let _ = idem_capture.take();
+                            let extras = public_route_headers(ctx);
+                            return send_response_with_extras(
+                                session,
+                                403,
+                                "application/json",
+                                &body_bytes,
+                                &extras,
+                            )
+                            .await;
+                        }
+                    }
+                    let translated = sbproxy_ai::format::rewrap_response_for_inbound(
+                        ctx.ai_inbound_format.as_deref(),
+                        &o.body,
                     );
                     // Drop any idempotency capture: cascade does not
                     // engage the idempotency cache write in v1
@@ -6214,6 +6255,27 @@ pub(super) async fn read_capped_response_body(
     Ok(buf.freeze())
 }
 
+async fn external_output_guardrail_block(
+    configs: &[sbproxy_ai::external_guardrail::ExternalGuardrailConfig],
+    body: &[u8],
+    model: &str,
+) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
+    if configs.is_empty() {
+        return None;
+    }
+
+    let blocked = match std::str::from_utf8(body) {
+        Ok(content) => {
+            sbproxy_ai::external_guardrail::run_output_external_guardrails(configs, content, model)
+                .await
+        }
+        Err(_) => {
+            sbproxy_ai::external_guardrail::run_output_external_guardrails_without_content(configs)
+        }
+    };
+    blocked.map(|(name, reason)| sbproxy_ai::guardrails::GuardrailBlock { name, reason })
+}
+
 /// Relay a non-streaming AI response and, when `miss_info` is present,
 /// write the response back into the semantic cache on behalf of the hook.
 ///
@@ -6384,40 +6446,31 @@ pub(super) async fn relay_ai_response_with_cache(
     // we return a 403 with a `guardrail_violation` envelope and skip
     // every cache write below via the early return.
     // WOR-1529: an output-guardrail block can come from the compiled sync
-    // pipeline or from an external provider (`post_call` / `during_call`).
-    // Only 2xx text is checked; external runs only when the sync pipeline
-    // did not already block, and works even when no sync pipeline is set.
-    let output_block: Option<sbproxy_ai::guardrails::GuardrailBlock> = if (200..300)
-        .contains(&status)
-    {
-        match std::str::from_utf8(&resp_body) {
-            Ok(text) => {
-                let sync_block = output_guardrails
-                    .as_ref()
-                    .and_then(|g| g.check_output_bytes(&resp_body));
-                if sync_block.is_some() {
-                    sync_block
-                } else if output_external.is_empty() {
-                    None
-                } else {
-                    sbproxy_ai::external_guardrail::run_output_external_guardrails(
-                        &output_external,
-                        text,
-                        ctx.as_ref()
-                            .and_then(|context| context.ai_model.as_deref())
-                            .unwrap_or(""),
-                    )
-                    .await
-                    .map(|(name, reason)| sbproxy_ai::guardrails::GuardrailBlock { name, reason })
-                }
-            }
-            Err(_) => output_guardrails
+    // pipeline or from an external provider (`post_call`, `during_call`, or
+    // nonblocking `logging_only`).
+    // Only 2xx bodies are checked; external runs only when the sync pipeline
+    // did not already block, and applies its configured fail mode when bytes
+    // cannot be represented as text.
+    let output_block: Option<sbproxy_ai::guardrails::GuardrailBlock> =
+        if (200..300).contains(&status) {
+            let sync_block = output_guardrails
                 .as_ref()
-                .and_then(|g| g.check_output_bytes(&resp_body)),
-        }
-    } else {
-        None
-    };
+                .and_then(|g| g.check_output_bytes(&resp_body));
+            if sync_block.is_some() {
+                sync_block
+            } else {
+                external_output_guardrail_block(
+                    &output_external,
+                    &resp_body,
+                    ctx.as_ref()
+                        .and_then(|context| context.ai_model.as_deref())
+                        .unwrap_or(""),
+                )
+                .await
+            }
+        } else {
+            None
+        };
     if let Some(block) = output_block {
         warn!(
             guardrail = %block.name,
@@ -9146,6 +9199,104 @@ mod external_guardrail_context_tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[derive(Default)]
+    struct RecordingSemanticCache {
+        lookups: AtomicUsize,
+        stores: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct RecordingIdempotencyCache {
+        gets: AtomicUsize,
+        puts: AtomicUsize,
+    }
+
+    impl sbproxy_middleware::idempotency::IdempotencyCache for RecordingIdempotencyCache {
+        fn get(
+            &self,
+            _workspace_id: &str,
+            _key: &str,
+        ) -> Option<sbproxy_middleware::idempotency::CachedResponse> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+
+        fn put(
+            &self,
+            _workspace_id: &str,
+            _key: &str,
+            _response: sbproxy_middleware::idempotency::CachedResponse,
+        ) {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hooks::SemanticLookupHook for RecordingSemanticCache {
+        async fn lookup(&self, _req: &crate::hooks::LookupRequest) -> crate::hooks::LookupOutcome {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            crate::hooks::LookupOutcome {
+                miss_key: Some("recording-miss".to_string()),
+                ..Default::default()
+            }
+        }
+
+        async fn store(
+            &self,
+            _req: crate::hooks::StoreRequest,
+            _resp: crate::hooks::CachedResponse,
+        ) -> anyhow::Result<()> {
+            self.stores.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn purge(&self, _scope: crate::hooks::PurgeScope) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    fn pipeline_with_recording_caches() -> (
+        crate::pipeline::CompiledPipeline,
+        Arc<RecordingSemanticCache>,
+        Arc<RecordingIdempotencyCache>,
+    ) {
+        let source = serde_json::json!({
+            "origins": {
+                "ai.test": {
+                    "action": {
+                        "type": "static",
+                        "status": 200,
+                        "body": "fixture"
+                    },
+                    "idempotency": {"enabled": true}
+                }
+            }
+        });
+        let compiled =
+            sbproxy_config::compile_config(&source.to_string()).expect("compile test origin");
+        let mut pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .expect("construct test pipeline");
+        let recording_semantic = Arc::new(RecordingSemanticCache::default());
+        pipeline.hooks.semantic_lookup = Some(recording_semantic.clone());
+
+        let configured = pipeline.idempotencies[0]
+            .as_ref()
+            .expect("compiled idempotency");
+        let recording_idempotency = Arc::new(RecordingIdempotencyCache::default());
+        let replacement = crate::pipeline::CompiledIdempotency {
+            cache: recording_idempotency.clone(),
+            header_name: configured.header_name.clone(),
+            ttl_secs: configured.ttl_secs,
+            methods: configured.methods.clone(),
+            max_request_body_bytes: configured.max_request_body_bytes,
+            max_response_body_bytes: configured.max_response_body_bytes,
+            permits: configured.permits.clone(),
+        };
+        pipeline.idempotencies[0] = Some(Arc::new(replacement));
+
+        (pipeline, recording_semantic, recording_idempotency)
+    }
+
     async fn blocking_guardrail() -> (String, tokio::sync::oneshot::Receiver<serde_json::Value>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -9216,7 +9367,7 @@ mod external_guardrail_context_tests {
                 .await
                 .expect("connect downstream fixture");
             let request = format!(
-                "POST /v1/chat/completions HTTP/1.1\r\nHost: ai.test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: ai.test\r\ncontent-type: application/json\r\nIdempotency-Key: guardrail-test\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()
             );
             stream
@@ -9247,18 +9398,29 @@ mod external_guardrail_context_tests {
         guardrail_url: String,
         mode: &str,
     ) -> sbproxy_ai::AiHandlerConfig {
+        proxy_config_with_fail_mode(upstream_url, guardrail_url, mode, false)
+    }
+
+    fn proxy_config_with_fail_mode(
+        upstream_url: &str,
+        guardrail_url: String,
+        mode: &str,
+        fail_open: bool,
+    ) -> sbproxy_ai::AiHandlerConfig {
         sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
             "providers": [{
                 "name": "fixture",
                 "base_url": upstream_url,
                 "allow_private_base_url": true,
-                "api_key": "fixture-key"
+                "api_key": "fixture-key",
+                "model_map": {"requested-model": "selected-model"}
             }],
             "guardrails": {"external": [{
                 "name": "customer-policy",
                 "url": guardrail_url,
                 "mode": mode,
                 "default_on": true,
+                "fail_open": fail_open,
                 "allow_private_url": true
             }]}
         }))
@@ -9266,6 +9428,13 @@ mod external_guardrail_context_tests {
     }
 
     async fn upstream_fixture(body: &'static str) -> (String, Arc<AtomicUsize>) {
+        upstream_bytes_fixture(body.as_bytes().to_vec(), "application/json").await
+    }
+
+    async fn upstream_bytes_fixture(
+        body: Vec<u8>,
+        content_type: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind upstream fixture");
@@ -9281,15 +9450,49 @@ mod external_guardrail_context_tests {
                 .await
                 .expect("read upstream request");
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(), body
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
             );
             stream
                 .write_all(response.as_bytes())
                 .await
                 .expect("write upstream response");
+            stream
+                .write_all(&body)
+                .await
+                .expect("write upstream response body");
         });
         (format!("http://{address}/v1"), hits)
+    }
+
+    fn cascade_proxy_config(
+        upstream_url: &str,
+        guardrail_url: String,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "cascade-fixture",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [{
+                    "provider_id": "cascade-fixture",
+                    "model": "cascade-selected-model",
+                    "quality_threshold": 0.5
+                }]
+            },
+            "guardrails": {"external": [{
+                "name": "customer-policy",
+                "url": guardrail_url,
+                "mode": "post_call",
+                "default_on": true,
+                "allow_private_url": true
+            }]}
+        }))
+        .expect("cascade proxy config")
     }
 
     #[tokio::test]
@@ -9368,11 +9571,14 @@ mod external_guardrail_context_tests {
         drop(session);
 
         let response = client.await.expect("downstream client");
+        let response = std::str::from_utf8(&response).expect("response utf8");
         assert!(
-            std::str::from_utf8(&response)
-                .expect("response utf8")
-                .starts_with("HTTP/1.1 400"),
+            response.starts_with("HTTP/1.1 400"),
             "input violation must be returned to the client"
+        );
+        assert!(
+            response.contains("guardrail_violation"),
+            "input violation must use the safe guardrail envelope: {response}"
         );
         assert_eq!(
             upstream_hits.load(Ordering::SeqCst),
@@ -9401,19 +9607,21 @@ mod external_guardrail_context_tests {
         .await;
         let config = proxy_config(&upstream_url, guardrail_url, "post_call");
         let (mut session, client) = downstream_session(serde_json::json!({
-            "model": "selected-model",
+            "model": "requested-model",
             "messages": [{"role": "user", "content": "fixture prompt"}]
         }))
         .await;
         let mut context = crate::context::RequestContext::new();
+        let (pipeline, recording_semantic, recording_idempotency) =
+            pipeline_with_recording_caches();
 
         super::handle_ai_proxy(
             &mut session,
             &config,
-            &crate::pipeline::CompiledPipeline::default(),
+            &pipeline,
             "ai.test",
             &mut context,
-            None,
+            Some(0),
         )
         .await
         .expect("output block is a handled response");
@@ -9438,6 +9646,18 @@ mod external_guardrail_context_tests {
             1,
             "buffered output guardrails run after exactly one upstream response"
         );
+        assert_eq!(recording_semantic.lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            recording_semantic.stores.load(Ordering::SeqCst),
+            0,
+            "blocked output must not be written to the semantic cache"
+        );
+        assert_eq!(recording_idempotency.gets.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            recording_idempotency.puts.load(Ordering::SeqCst),
+            0,
+            "blocked output must not be written to the idempotency cache"
+        );
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), received)
                 .await
@@ -9449,6 +9669,122 @@ mod external_guardrail_context_tests {
                 "phase": "output"
             })
         );
+    }
+
+    #[tokio::test]
+    async fn cascade_external_output_guardrail_blocks_the_selected_tier_model() {
+        let (guardrail_url, received) = blocking_guardrail().await;
+        let (upstream_url, upstream_hits) = upstream_fixture(
+            r#"{"confidence_score":1.0,"choices":[{"message":{"role":"assistant","content":"cascade provider text"}}]}"#,
+        )
+        .await;
+        let config = cascade_proxy_config(&upstream_url, guardrail_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, recording_semantic, recording_idempotency) =
+            pipeline_with_recording_caches();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("cascade output block is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(client.await.expect("downstream client")).expect("response utf8");
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "response was {response}"
+        );
+        assert!(
+            response.contains("guardrail_violation"),
+            "response was {response}"
+        );
+        assert!(
+            !response.contains("cascade provider text"),
+            "blocked cascade output reached the client: {response}"
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(context.ai_model.as_deref(), Some("cascade-selected-model"));
+        assert_eq!(context.ai_outcome.as_deref(), Some("guardrail_block"));
+        assert_eq!(recording_semantic.lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            recording_semantic.stores.load(Ordering::SeqCst),
+            0,
+            "blocked cascade output must not be written to the semantic cache"
+        );
+        assert_eq!(recording_idempotency.gets.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            recording_idempotency.puts.load(Ordering::SeqCst),
+            0,
+            "blocked cascade output must not be written to the idempotency cache"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), received)
+                .await
+                .expect("cascade guardrail request timed out")
+                .expect("cascade guardrail fixture dropped"),
+            serde_json::json!({
+                "input": r#"{"confidence_score":1.0,"choices":[{"message":{"role":"assistant","content":"cascade provider text"}}]}"#,
+                "model": "cascade-selected-model",
+                "phase": "output"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_output_external_guardrail_honors_fail_mode_without_egress() {
+        for (fail_open, expected_status) in [(false, 403), (true, 200)] {
+            let (upstream_url, _) =
+                upstream_bytes_fixture(vec![0xff, 0xfe, 0xfd], "application/octet-stream").await;
+            let config = proxy_config_with_fail_mode(
+                &upstream_url,
+                "https://8.8.8.8/check".to_string(),
+                "post_call",
+                fail_open,
+            );
+            let (mut session, client) = downstream_session(serde_json::json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }))
+            .await;
+            let mut context = crate::context::RequestContext::new();
+
+            super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &crate::pipeline::CompiledPipeline::default(),
+                "ai.test",
+                &mut context,
+                None,
+            )
+            .await
+            .expect("invalid UTF-8 output is handled");
+            drop(session);
+
+            let response = client.await.expect("downstream client");
+            assert!(
+                response.starts_with(format!("HTTP/1.1 {expected_status}").as_bytes()),
+                "unexpected response status: {response:?}"
+            );
+            if fail_open {
+                assert!(response.ends_with(&[0xff, 0xfe, 0xfd]));
+            } else {
+                let response = std::str::from_utf8(&response).expect("safe block response utf8");
+                assert!(response.contains("guardrail_violation"));
+                assert!(!response.contains('\u{fffd}'));
+            }
+        }
     }
 }
 
