@@ -232,6 +232,45 @@ pub(super) async fn handle_action(
                     .port_or_known_default()
                     .unwrap_or(if tls { 443 } else { 80 });
 
+                // Hold quota only after every local gate and URL check has
+                // passed. Settlement is deferred until the final outbound
+                // request seam so peer validation and credential preparation
+                // cannot consume quota for a request that never leaves.
+                let key_plane = crate::key_plane::current_key_plane();
+                let quota_pool_config = ai.config.quota_pool.clone();
+                let quota_pool_admission =
+                    sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
+                        quota_pool_config.clone(),
+                        ai.config.quota_pool_store(key_plane.as_ref().map(|plane| {
+                            (plane.governance_store(), plane.governance_consistency())
+                        })),
+                        super::ai_dispatch::quota_pool_member_id_for_request(ctx),
+                    );
+                let reservation_id = format!("{}:quota-pool:realtime:0", ctx.request_id);
+                match quota_pool_admission.reserve_attempt(&reservation_id).await {
+                    Ok(attempt) => {
+                        ctx.ai_realtime_quota_attempt = Some(attempt);
+                        ctx.ai_realtime_quota_config = quota_pool_config;
+                    }
+                    Err(error) => {
+                        if let Some(failure) = crate::context::RealtimeQuotaFailure::from_pool_error(
+                            quota_pool_config.as_ref(),
+                            &error,
+                        ) {
+                            send_error(session, failure.status, failure.message).await?;
+                            return Ok(true);
+                        }
+                        // `reserve_attempt` already converts the explicit
+                        // allow-unreserved backend failure into a no-op
+                        // guard. Keep this defensive branch aligned with
+                        // the public pool contract.
+                        if let Some(config) = quota_pool_config.as_ref() {
+                            sbproxy_ai::ai_metrics::record_quota_pool_fail_open(&config.name);
+                        }
+                        ctx.ai_realtime_quota_config = quota_pool_config;
+                    }
+                }
+
                 ctx.ai_realtime_dispatch = Some(crate::context::RealtimeDispatchCtx {
                     provider_name: provider.name.to_string(),
                     upstream_host: host.clone(),

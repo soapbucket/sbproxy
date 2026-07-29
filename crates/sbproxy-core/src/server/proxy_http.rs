@@ -714,6 +714,39 @@ fn apply_realtime_credential(
     insert_outbound_credential_header(request, credential.header.clone(), &credential.value)
 }
 
+async fn commit_realtime_quota_attempt(ctx: &mut RequestContext) -> Result<()> {
+    let Some(attempt) = ctx.ai_realtime_quota_attempt.take() else {
+        ctx.ai_realtime_quota_config.take();
+        return Ok(());
+    };
+
+    match attempt.commit().await {
+        Ok(()) => {
+            ctx.ai_realtime_quota_config.take();
+            Ok(())
+        }
+        Err(error) => {
+            let config = ctx.ai_realtime_quota_config.take();
+            let Some(failure) =
+                crate::context::RealtimeQuotaFailure::from_pool_error(config.as_ref(), &error)
+            else {
+                // The guard normally handles this branch itself. Retain a
+                // defensive fail-open path if a future store returns backend
+                // unavailability after settlement semantics evolve.
+                if let Some(config) = config.as_ref() {
+                    sbproxy_ai::ai_metrics::record_quota_pool_fail_open(&config.name);
+                }
+                return Ok(());
+            };
+            ctx.ai_realtime_quota_failure = Some(failure);
+            Err(pingora_error::Error::explain(
+                pingora_error::ErrorType::HTTPStatus(failure.status),
+                failure.message,
+            ))
+        }
+    }
+}
+
 fn realtime_response_accepts_session(status: u16) -> bool {
     status == http::StatusCode::SWITCHING_PROTOCOLS.as_u16()
 }
@@ -2303,6 +2336,10 @@ impl ProxyHttp for SbProxy {
                 &realtime_inbound_key_headers,
                 &realtime_credential_headers,
             )?;
+        }
+
+        if is_realtime {
+            commit_realtime_quota_attempt(ctx).await?;
         }
 
         Ok(())
@@ -5009,6 +5046,18 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // Quota settlement is intentionally the final realtime outbound seam.
+        // Preserve its exact response and bypass origin fallback if it fails
+        // after Pingora has selected an upstream.
+        if let Some(failure) = ctx.ai_realtime_quota_failure.take() {
+            let _ = send_error(session, failure.status, failure.message).await;
+            ctx.response_status = Some(failure.status);
+            return FailToProxy {
+                error_code: failure.status,
+                can_reuse_downstream: false,
+            };
+        }
+
         // --- Request body validator rejection ---
         // The body filter intentionally aborted the upstream after a
         // validation failure. Surface the configured status / body

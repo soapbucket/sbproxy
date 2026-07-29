@@ -31,6 +31,14 @@ fn chat_reply(provider: &str, prompt_tokens: u64, completion_tokens: u64) -> Val
 }
 
 fn shadow_config(primary_url: &str, shadow_url: &str) -> String {
+    shadow_config_with_action_extra(primary_url, shadow_url, "")
+}
+
+fn shadow_config_with_action_extra(
+    primary_url: &str,
+    shadow_url: &str,
+    action_extra: &str,
+) -> String {
     format!(
         r#"
 proxy:
@@ -56,6 +64,7 @@ origins:
           models: [gpt-4o]
       routing:
         strategy: round_robin
+{action_extra}
       shadow:
         provider: shadow
         sample_rate: 1.0
@@ -378,6 +387,51 @@ fn copied_shadow_request_cannot_delay_the_primary_response() {
 
     shadow.release.send(()).expect("release shadow response");
     request_thread.join().expect("request thread");
+}
+
+#[test]
+fn terminal_primary_4xx_is_still_shadowed_when_content_fallback_is_enabled() {
+    let primary_body = json!({
+        "error": {
+            "message": "ordinary client error",
+            "type": "invalid_request_error",
+            "code": "bad_request"
+        }
+    });
+    let primary =
+        MockUpstream::start_with_status(primary_body.clone(), 400).expect("primary upstream");
+    let shadow = MockUpstream::start(chat_reply("shadow", 2, 2)).expect("shadow upstream");
+    let config = shadow_config_with_action_extra(
+        &primary.base_url(),
+        &shadow.base_url(),
+        "      resilience:\n        content_policy_fallback: true",
+    );
+    let proxy = ProxyHarness::start_with_yaml(&config).expect("proxy");
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "mirror terminal errors"}]
+    });
+
+    let response = proxy
+        .post_json("/v1/chat/completions", "ai.localhost", &request, &[])
+        .expect("terminal primary response");
+    assert_eq!(response.status, 400);
+    assert_eq!(
+        response.json().expect("primary error JSON"),
+        primary_body,
+        "the shadow path must not replace the primary response"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while shadow.captured().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(primary.captured().len(), 1);
+    assert_eq!(
+        shadow.captured().len(),
+        1,
+        "a terminal upstream response still reaches deferred shadow dispatch"
+    );
 }
 
 #[test]

@@ -108,6 +108,47 @@ pub struct ModelPlaneClient {
     security: ModelPlaneClientSecurity,
 }
 
+pub(crate) struct ModelPlaneQuotaAttempt {
+    state: tokio::sync::Mutex<ModelPlaneQuotaAttemptState>,
+}
+
+struct ModelPlaneQuotaAttemptState {
+    attempt: Option<sbproxy_ai::quota_pool::QuotaPoolAttemptGuard>,
+    error: Option<sbproxy_ai::quota_pool::PoolError>,
+}
+
+impl ModelPlaneQuotaAttempt {
+    pub(crate) fn new(attempt: sbproxy_ai::quota_pool::QuotaPoolAttemptGuard) -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(ModelPlaneQuotaAttemptState {
+                attempt: Some(attempt),
+                error: None,
+            }),
+        }
+    }
+
+    pub(crate) async fn commit(&self) -> Result<(), ModelPlaneError> {
+        let mut state = self.state.lock().await;
+        if state.error.is_some() {
+            return Err(ModelPlaneError::InvalidRequest);
+        }
+        let Some(attempt) = state.attempt.take() else {
+            return Ok(());
+        };
+        match attempt.commit().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                state.error = Some(error);
+                Err(ModelPlaneError::InvalidRequest)
+            }
+        }
+    }
+
+    pub(crate) async fn error(&self) -> Option<sbproxy_ai::quota_pool::PoolError> {
+        self.state.lock().await.error.clone()
+    }
+}
+
 impl ModelPlaneClient {
     /// Create a client for one configured cluster security mode.
     pub const fn new(security: ModelPlaneClientSecurity) -> Self {
@@ -121,8 +162,32 @@ impl ModelPlaneClient {
         signed: &SignedDispatchEnvelope,
         request_body: Bytes,
     ) -> Result<ModelPlaneResponse, ModelPlaneError> {
+        self.dispatch_observed(endpoint, signed, request_body, None)
+            .await
+    }
+
+    pub(crate) async fn dispatch_with_quota(
+        &self,
+        endpoint: &str,
+        signed: &SignedDispatchEnvelope,
+        request_body: Bytes,
+        quota: &ModelPlaneQuotaAttempt,
+    ) -> Result<ModelPlaneResponse, ModelPlaneError> {
+        self.dispatch_observed(endpoint, signed, request_body, Some(quota))
+            .await
+    }
+
+    async fn dispatch_observed(
+        &self,
+        endpoint: &str,
+        signed: &SignedDispatchEnvelope,
+        request_body: Bytes,
+        quota: Option<&ModelPlaneQuotaAttempt>,
+    ) -> Result<ModelPlaneResponse, ModelPlaneError> {
         let started = std::time::Instant::now();
-        let result = self.dispatch_inner(endpoint, signed, request_body).await;
+        let result = self
+            .dispatch_inner(endpoint, signed, request_body, quota)
+            .await;
         sbproxy_observe::metrics::record_model_plane_peer_dispatch(
             if result.is_ok() { "success" } else { "error" },
             started.elapsed().as_secs_f64(),
@@ -135,6 +200,7 @@ impl ModelPlaneClient {
         endpoint: &str,
         signed: &SignedDispatchEnvelope,
         request_body: Bytes,
+        quota: Option<&ModelPlaneQuotaAttempt>,
     ) -> Result<ModelPlaneResponse, ModelPlaneError> {
         let mut url = url::Url::parse(endpoint)
             .map_err(|error| ModelPlaneError::InvalidConfiguration(error.to_string()))?;
@@ -211,6 +277,9 @@ impl ModelPlaneClient {
             )
             .body(Full::new(wire))
             .map_err(|_| ModelPlaneError::InvalidRequest)?;
+        if let Some(quota) = quota {
+            quota.commit().await?;
+        }
         let response = sender
             .send_request(request)
             .await
@@ -302,4 +371,124 @@ fn encode_wire_request(
     wire.extend_from_slice(&envelope);
     wire.extend_from_slice(request_body);
     Ok(wire.freeze())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingQuotaStore {
+        settled: tokio::sync::Mutex<Vec<String>>,
+        released: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_ai::quota_pool::QuotaPoolStore for RecordingQuotaStore {
+        async fn reserve(
+            &self,
+            pool: &str,
+            member: &str,
+            units: u64,
+            reservation_id: &str,
+        ) -> Result<sbproxy_ai::quota_pool::QuotaReservation, sbproxy_ai::quota_pool::PoolError>
+        {
+            Ok(sbproxy_ai::quota_pool::QuotaReservation {
+                pool: pool.to_string(),
+                member: member.to_string(),
+                units,
+                reservation_id: reservation_id.to_string(),
+            })
+        }
+
+        async fn reconcile(
+            &self,
+            reservation: sbproxy_ai::quota_pool::QuotaReservation,
+            _actual: sbproxy_ai::quota_pool::PoolUsage,
+        ) -> Result<(), sbproxy_ai::quota_pool::PoolError> {
+            self.settled.lock().await.push(reservation.reservation_id);
+            Ok(())
+        }
+
+        async fn release(
+            &self,
+            reservation: sbproxy_ai::quota_pool::QuotaReservation,
+        ) -> Result<(), sbproxy_ai::quota_pool::PoolError> {
+            self.released.lock().await.push(reservation.reservation_id);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_aware_peer_dispatch_releases_on_local_endpoint_failure() {
+        let pool_config: sbproxy_ai::quota_pool::QuotaPoolConfig =
+            serde_json::from_value(serde_json::json!({
+                "name": "peer-preflight",
+                "total_limit": 10,
+                "weights": {"virtual-key-a": 1},
+                "policy": "burst"
+            }))
+            .expect("quota fixture");
+        let recording = Arc::new(RecordingQuotaStore::default());
+        let store: Arc<dyn sbproxy_ai::quota_pool::QuotaPoolStore> = recording.clone();
+        let admission = sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
+            Some(pool_config),
+            Ok(Some(store)),
+            Ok("virtual-key-a".to_string()),
+        );
+        let quota = ModelPlaneQuotaAttempt::new(
+            admission
+                .reserve_attempt("peer-preflight-attempt")
+                .await
+                .expect("quota reservation"),
+        );
+        let signed = SignedDispatchEnvelope {
+            envelope: crate::model_plane::DispatchEnvelope {
+                schema_version: crate::model_plane::DISPATCH_ENVELOPE_SCHEMA_VERSION,
+                issuer_node_id: "gateway-a".to_string(),
+                audience_node_id: "worker-a".to_string(),
+                request_id: "request-a".to_string(),
+                nonce: "nonce-a".to_string(),
+                issued_at_unix_ms: 1,
+                expires_at_unix_ms: 2,
+                hop_count: 1,
+                tenant_id: "tenant-a".to_string(),
+                governed_key_id: "virtual-key-a".to_string(),
+                policy_revision: "revision-a".to_string(),
+                deployment: "deployment-a".to_string(),
+                deployment_generation: 1,
+                logical_model: "model-a".to_string(),
+                priority: sbproxy_model_host::PriorityClass::Standard,
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                content_type: Some("application/json".to_string()),
+                body_sha256: "0".repeat(64),
+            },
+            auth: crate::model_plane::DispatchAuthProof::DevelopmentHmac {
+                signature: "signature".to_string(),
+            },
+        };
+        let client = ModelPlaneClient::new(ModelPlaneClientSecurity::DevelopmentSharedKey {
+            key: Arc::from(b"0123456789abcdef".as_slice()),
+        });
+
+        client
+            .dispatch_with_quota("not a URL", &signed, Bytes::new(), &quota)
+            .await
+            .expect_err("invalid endpoint fails before transport send");
+        drop(quota);
+
+        for _ in 0..16 {
+            if !recording.released.lock().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            recording.released.lock().await.as_slice(),
+            ["peer-preflight-attempt"]
+        );
+        assert!(recording.settled.lock().await.is_empty());
+        tokio::task::yield_now().await;
+    }
 }

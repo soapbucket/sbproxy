@@ -252,6 +252,12 @@ Copyright The HuggingFace Inc. team
 Licensed under the Apache License, Version 2.0
 https://github.com/huggingface/hf-hub
 
+Hugging Face Xet (hf-xet, xet-client, xet-core-structures, xet-data,
+                  xet-runtime)
+Copyright 2024 The HuggingFace Team. All rights reserved.
+Licensed under the Apache License, Version 2.0
+https://github.com/huggingface/xet-core
+
 hound
 Copyright Ruud van Asseldonk
 Licensed under the Apache License, Version 2.0

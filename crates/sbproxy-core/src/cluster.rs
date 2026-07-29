@@ -1616,9 +1616,7 @@ pub(crate) fn start_governance_dissemination() {
         return;
     };
     let clustered = handle.mesh_node().is_some();
-    let approximate_store =
-        crate::key_plane::current_key_plane().and_then(|plane| plane.approximate_store());
-    if !should_disseminate_governance(clustered, approximate_store.is_some()) {
+    if !should_disseminate_governance(clustered, current_approximate_governance_store().is_some()) {
         return;
     }
     if STARTED
@@ -1627,12 +1625,16 @@ pub(crate) fn start_governance_dissemination() {
     {
         return;
     }
-    let store = approximate_store.expect("checked Some by should_disseminate_governance");
     cluster_runtime().spawn(crate::governance_cluster::run_loop(
         handle.clone(),
-        store,
+        current_approximate_governance_store,
         15,
     ));
+}
+
+fn current_approximate_governance_store(
+) -> Option<Arc<sbproxy_ai::governance::InMemoryGovernanceStore>> {
+    crate::key_plane::current_key_plane().and_then(|plane| plane.approximate_store())
 }
 
 /// Dissemination runs only for a clustered node in approximate mode.

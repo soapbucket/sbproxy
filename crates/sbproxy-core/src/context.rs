@@ -57,6 +57,47 @@ pub struct RealtimeDispatchCtx {
     pub surface_label: &'static str,
 }
 
+/// Exact client response to emit when realtime quota admission fails after
+/// Pingora has entered the upstream pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealtimeQuotaFailure {
+    /// HTTP status preserved from the fair-share admission contract.
+    pub status: u16,
+    /// Stable client-facing error message.
+    pub message: &'static str,
+}
+
+impl RealtimeQuotaFailure {
+    /// Map a pool failure to its client response, or admit the one explicit
+    /// backend-unavailable fail-open mode.
+    pub fn from_pool_error(
+        config: Option<&sbproxy_ai::QuotaPoolConfig>,
+        error: &sbproxy_ai::PoolError,
+    ) -> Option<Self> {
+        match error {
+            sbproxy_ai::PoolError::Denied(_) => Some(Self {
+                status: 429,
+                message: "fair-share quota pool exhausted",
+            }),
+            sbproxy_ai::PoolError::BackendUnavailable
+                if config.is_some_and(|config| {
+                    config.failure_mode == sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved
+                }) =>
+            {
+                None
+            }
+            sbproxy_ai::PoolError::BackendUnavailable => Some(Self {
+                status: 503,
+                message: "fair-share quota backend unavailable",
+            }),
+            sbproxy_ai::PoolError::InvalidState => Some(Self {
+                status: 503,
+                message: "fair-share quota state unavailable",
+            }),
+        }
+    }
+}
+
 /// Parameters captured at `request_filter` time and consumed by
 /// `request_body_filter` to fire a request mirror with the optional
 /// teed body.
@@ -1013,6 +1054,16 @@ pub struct RequestContext {
     /// `logging` hook can observe session duration + emit the
     /// session-end `AiBillingEvent`.
     pub ai_realtime_dispatch: Option<RealtimeDispatchCtx>,
+    /// Fair-share reservation held across realtime peer validation and final
+    /// outbound request preparation. Dropping it before commit releases the
+    /// reservation without consuming quota.
+    pub ai_realtime_quota_attempt: Option<sbproxy_ai::quota_pool::QuotaPoolAttemptGuard>,
+    /// Pinned pool policy used to preserve fail-open vs fail-closed behavior
+    /// if final settlement reports a backend failure.
+    pub ai_realtime_quota_config: Option<sbproxy_ai::QuotaPoolConfig>,
+    /// Exact quota response to emit from `fail_to_proxy` when settlement at
+    /// the outbound-send seam rejects the realtime request.
+    pub ai_realtime_quota_failure: Option<RealtimeQuotaFailure>,
 
     /// WOR-1044: reversible PII redaction map for this request.
     /// Each entry is `(rule_name, placeholder, original)` recorded by
@@ -1398,6 +1449,9 @@ impl RequestContext {
             ai_admission: None,
             ai_realtime_session: None,
             ai_realtime_dispatch: None,
+            ai_realtime_quota_attempt: None,
+            ai_realtime_quota_config: None,
+            ai_realtime_quota_failure: None,
             ai_reversible_redactions: Vec::new(),
             content_shape_pricing: None,
             content_shape_transform: None,
@@ -1468,6 +1522,9 @@ mod tests {
         assert!(ctx.response_body_buf.is_none());
         assert!(ctx.governance_lease.is_none());
         assert!(ctx.effective_key_policy.is_none());
+        assert!(ctx.ai_realtime_quota_attempt.is_none());
+        assert!(ctx.ai_realtime_quota_config.is_none());
+        assert!(ctx.ai_realtime_quota_failure.is_none());
         assert!(!ctx.buffering_body);
         assert!(ctx.upstream_content_type.is_none());
         assert!(ctx.forward_rule_idx.is_none());
@@ -1654,5 +1711,73 @@ mod tests {
             .expect("extension set");
         assert_eq!(ext["hits"], 0);
         assert!(ctx.classifier_extension("enterprise.language").is_none());
+    }
+
+    fn quota_pool_config(
+        failure_mode: sbproxy_ai::QuotaPoolFailureMode,
+    ) -> sbproxy_ai::QuotaPoolConfig {
+        sbproxy_ai::QuotaPoolConfig {
+            name: "shared".to_string(),
+            window: std::time::Duration::from_secs(60),
+            total_limit: 10,
+            weights: HashMap::from([("member".to_string(), 1)]),
+            policy: sbproxy_ai::QuotaPoolPolicy::Burst,
+            dimension: sbproxy_ai::QuotaPoolDimension::Request,
+            consistency: sbproxy_ai::QuotaPoolConsistency::Local,
+            failure_mode,
+        }
+    }
+
+    #[test]
+    fn realtime_quota_denial_preserves_the_429_response() {
+        let failure = RealtimeQuotaFailure::from_pool_error(
+            Some(&quota_pool_config(sbproxy_ai::QuotaPoolFailureMode::Closed)),
+            &sbproxy_ai::PoolError::Denied(sbproxy_ai::PoolDeny::PoolExhausted {
+                total_load: 10,
+                total_limit: 10,
+            }),
+        )
+        .expect("denial must reject");
+
+        assert_eq!(failure.status, 429);
+        assert_eq!(failure.message, "fair-share quota pool exhausted");
+    }
+
+    #[test]
+    fn realtime_quota_backend_failure_preserves_closed_and_open_modes() {
+        let closed = RealtimeQuotaFailure::from_pool_error(
+            Some(&quota_pool_config(sbproxy_ai::QuotaPoolFailureMode::Closed)),
+            &sbproxy_ai::PoolError::BackendUnavailable,
+        )
+        .expect("closed mode must reject");
+        assert_eq!(closed.status, 503);
+        assert_eq!(closed.message, "fair-share quota backend unavailable");
+
+        let allow_unreserved = RealtimeQuotaFailure::from_pool_error(
+            Some(&quota_pool_config(
+                sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved,
+            )),
+            &sbproxy_ai::PoolError::BackendUnavailable,
+        );
+        assert!(
+            allow_unreserved.is_none(),
+            "allow_unreserved must bypass only backend unavailability"
+        );
+    }
+
+    #[test]
+    fn realtime_quota_invalid_state_never_fails_open() {
+        for failure_mode in [
+            sbproxy_ai::QuotaPoolFailureMode::Closed,
+            sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved,
+        ] {
+            let failure = RealtimeQuotaFailure::from_pool_error(
+                Some(&quota_pool_config(failure_mode)),
+                &sbproxy_ai::PoolError::InvalidState,
+            )
+            .expect("invalid state must reject");
+            assert_eq!(failure.status, 503);
+            assert_eq!(failure.message, "fair-share quota state unavailable");
+        }
     }
 }

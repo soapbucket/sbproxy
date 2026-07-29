@@ -348,6 +348,12 @@ pub fn install_key_plane(plane: Arc<KeyPlane>) {
     plane_slot().store(Some(plane));
 }
 
+/// Remove the live key plane when dynamic key management is disabled or
+/// removed during reload.
+pub fn uninstall_key_plane() {
+    plane_slot().store(None);
+}
+
 /// A dedicated, process-lifetime runtime that hosts key-plane async work
 /// (seeding, the Redis invalidation subscriber). Kept alive for the whole
 /// process so any Redis connection driver it spawns stays running.
@@ -796,13 +802,15 @@ async fn seed_records(
 
 /// Build, seed, and install the key plane from config. Idempotent across
 /// reloads: re-seeds config records and replaces the installed plane. A no-op
-/// when the block is disabled.
+/// when the block is disabled, in which case any previously installed plane
+/// is removed.
 ///
 /// Synchronous: runs async seeding on the dedicated key runtime and returns once
 /// the seed is applied, so seeded keys are usable as soon as the server accepts
 /// traffic.
 pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
     if !cfg.enabled {
+        uninstall_key_plane();
         return Ok(());
     }
     let (governance_store, approximate_store) = build_governance_store(&cfg.governance)?;
@@ -1001,6 +1009,25 @@ mod tests {
         assert!(
             plane.approximate_store().is_some(),
             "approximate consistency must expose the concrete in-memory store"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn disabling_key_management_uninstalls_the_live_plane() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let mut cfg = base_cfg(&path);
+
+        init_key_plane(&cfg).expect("install enabled key plane");
+        assert!(current_key_plane().is_some());
+
+        cfg.enabled = false;
+        init_key_plane(&cfg).expect("disable key plane");
+        assert!(
+            current_key_plane().is_none(),
+            "disabled key management must not leave stale governance state installed"
         );
 
         std::fs::remove_file(&path).ok();

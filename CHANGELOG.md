@@ -10,6 +10,18 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+### Added
+
+- **AI routing learns live locality and shares caller quota across the
+  fleet.** Prefix affinity records bounded, expiring provider holders and
+  falls back by recent token load; outcome-aware routing blends learned
+  feedback during warm-up and keeps that feedback across config reloads;
+  and weighted request pools support local, approximate mesh, and strict
+  Redis accounting keyed by immutable credential ids. Each external
+  provider attempt reserves independently and settles only at its outbound
+  send boundary, with explicit closed or `allow_unreserved` backend failure
+  behavior.
+
 ## [1.9.0] - 2026-07-28
 
 ### Added

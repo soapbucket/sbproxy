@@ -32,6 +32,20 @@ fn value_ledger_for_sink(
     ledger
 }
 
+struct CachedQuotaPoolStore {
+    kind: &'static str,
+    store: std::sync::Arc<dyn crate::quota_pool::QuotaPoolStore>,
+}
+
+impl std::fmt::Debug for CachedQuotaPoolStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CachedQuotaPoolStore")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
 /// AI gateway handler configuration.
 #[derive(Debug, Deserialize)]
 pub struct AiHandlerConfig {
@@ -219,11 +233,9 @@ pub struct AiHandlerConfig {
     #[serde(skip)]
     pub(crate) ai_policy_compiled:
         OnceLock<Option<std::sync::Arc<crate::ai_policy::CompiledAiPolicy>>>,
-    /// Lazy-built fair-share pool store (WOR-1880). `None` inside the
-    /// OnceLock means no pool is configured or validation failed at build.
+    /// Lazy-built fair-share pool store (WOR-1880, WOR-1993).
     #[serde(skip)]
-    pub(crate) quota_pool_store:
-        OnceLock<Option<std::sync::Arc<crate::quota_pool::LocalQuotaPool>>>,
+    quota_pool_store: OnceLock<std::sync::Arc<CachedQuotaPoolStore>>,
 }
 
 fn default_usage_parser() -> String {
@@ -415,24 +427,68 @@ impl AiHandlerConfig {
             .clone()
     }
 
-    /// Return the shared fair-share quota pool for this handler (WOR-1880).
-    /// `None` when unset or when config validation rejected the pool.
-    pub fn quota_pool_store(&self) -> Option<&std::sync::Arc<crate::quota_pool::LocalQuotaPool>> {
-        self.quota_pool_store
-            .get_or_init(|| {
-                let config = self.quota_pool.as_ref()?;
-                match crate::quota_pool::LocalQuotaPool::new(vec![config.clone()]) {
-                    Ok(store) => Some(std::sync::Arc::new(store)),
-                    Err(error) => {
-                        tracing::error!(
-                            error = %error,
-                            "ai quota_pool: disabled (failed to build local store)"
-                        );
-                        None
-                    }
+    /// Return the enforcing fair-share quota store for this handler.
+    ///
+    /// Local pools need no runtime backend. Approximate and strong pools bind
+    /// to the installed governance store only when its consistency guarantee
+    /// matches the configured pool.
+    pub fn quota_pool_store(
+        &self,
+        governance: Option<(
+            std::sync::Arc<dyn crate::governance::GovernanceStore>,
+            crate::governance::GovernanceConsistency,
+        )>,
+    ) -> Result<
+        Option<std::sync::Arc<dyn crate::quota_pool::QuotaPoolStore>>,
+        crate::quota_pool::PoolError,
+    > {
+        let Some(config) = self.quota_pool.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(cached) = self.quota_pool_store.get() {
+            return Ok(Some(std::sync::Arc::clone(&cached.store)));
+        }
+
+        let cached = match config.consistency {
+            crate::quota_pool::QuotaPoolConsistency::Local => {
+                let store = crate::quota_pool::LocalQuotaPool::new(vec![config.clone()])
+                    .map_err(|_| crate::quota_pool::PoolError::InvalidState)?;
+                CachedQuotaPoolStore {
+                    kind: "local",
+                    store: std::sync::Arc::new(store),
                 }
-            })
-            .as_ref()
+            }
+            crate::quota_pool::QuotaPoolConsistency::Approximate => {
+                let (store, consistency) =
+                    governance.ok_or(crate::quota_pool::PoolError::InvalidState)?;
+                if consistency != crate::governance::GovernanceConsistency::Approximate {
+                    return Err(crate::quota_pool::PoolError::InvalidState);
+                }
+                let store = crate::quota_pool::SharedQuotaPool::new(vec![config.clone()], store)
+                    .map_err(|_| crate::quota_pool::PoolError::InvalidState)?;
+                CachedQuotaPoolStore {
+                    kind: "approximate",
+                    store: std::sync::Arc::new(store),
+                }
+            }
+            crate::quota_pool::QuotaPoolConsistency::Strong => {
+                let (store, consistency) =
+                    governance.ok_or(crate::quota_pool::PoolError::InvalidState)?;
+                if consistency != crate::governance::GovernanceConsistency::Strict {
+                    return Err(crate::quota_pool::PoolError::InvalidState);
+                }
+                let store = crate::quota_pool::SharedQuotaPool::new(vec![config.clone()], store)
+                    .map_err(|_| crate::quota_pool::PoolError::InvalidState)?;
+                CachedQuotaPoolStore {
+                    kind: "strong",
+                    store: std::sync::Arc::new(store),
+                }
+            }
+        };
+        let cached = self
+            .quota_pool_store
+            .get_or_init(|| std::sync::Arc::new(cached));
+        Ok(Some(std::sync::Arc::clone(&cached.store)))
     }
 
     /// Apply PII redaction to a parsed request body. Returns whether
@@ -699,6 +755,7 @@ where
     D: serde::Deserializer<'de>,
 {
     use crate::routing::{CascadeConfig, CascadeTier, PeakEwmaConfig};
+    use crate::routing_state::PrefixAffinityConfig;
     use serde::de::Error;
 
     // Step 1: capture the raw input. Cascade carries a struct
@@ -751,6 +808,15 @@ where
         let config: PeakEwmaConfig = serde_json::from_value(serde_json::Value::Object(obj.clone()))
             .map_err(Error::custom)?;
         return Ok(RoutingStrategy::PeakEwma(config));
+    }
+
+    if strategy_name == "prefix_affinity" {
+        let mut fields = obj.clone();
+        fields.remove("strategy");
+        let config: PrefixAffinityConfig =
+            serde_json::from_value(serde_json::Value::Object(fields)).map_err(Error::custom)?;
+        config.validate().map_err(Error::custom)?;
+        return Ok(RoutingStrategy::PrefixAffinity(config));
     }
 
     // WOR-797: cost/quality routing carries cheap_provider /
@@ -1722,24 +1788,146 @@ mod tests {
     }
 
     #[test]
-    fn from_config_rejects_strong_quota_pool_without_atomic_backend() {
+    fn from_config_accepts_strong_quota_pool_for_runtime_backend_binding() {
         let json = serde_json::json!({
             "providers": [{"name": "openai", "api_key": "sk-test"}],
             "quota_pool": {
                 "name": "shared",
                 "total_limit": 100,
-                "weights": {"openai": 1},
+                "weights": {"virtual-key-a": 1},
                 "policy": "hard",
                 "consistency": "strong"
             }
         });
-        let err = AiHandlerConfig::from_config(json)
-            .expect_err("strong consistency must fail closed")
-            .to_string();
-        assert!(
-            err.contains("atomic backend") || err.contains("strong"),
-            "unexpected error: {err}"
+        let config = AiHandlerConfig::from_config(json)
+            .expect("backend-independent config validation accepts strong consistency");
+        assert_eq!(
+            config.quota_pool.as_ref().expect("quota pool").consistency,
+            crate::quota_pool::QuotaPoolConsistency::Strong
         );
+    }
+
+    fn handler_with_quota_consistency(consistency: &str) -> AiHandlerConfig {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "quota_pool": {
+                "name": "shared",
+                "total_limit": 10,
+                "weights": {"virtual-key-a": 1},
+                "policy": "burst",
+                "consistency": consistency
+            }
+        }))
+        .expect("valid handler quota config")
+    }
+
+    #[tokio::test]
+    async fn local_quota_pool_builds_without_a_governance_backend() {
+        let config = handler_with_quota_consistency("local");
+        let store = config
+            .quota_pool_store(None)
+            .expect("local store builds")
+            .expect("quota configured");
+
+        let reservation = store
+            .reserve("shared", "virtual-key-a", 1, "local-request:0")
+            .await
+            .expect("local pool admits configured member");
+        store
+            .reconcile(reservation, crate::quota_pool::PoolUsage { units: 1 })
+            .await
+            .expect("local reservation settles");
+    }
+
+    #[tokio::test]
+    async fn approximate_quota_pool_requires_a_matching_governance_backend() {
+        let missing = handler_with_quota_consistency("approximate");
+        assert!(matches!(
+            missing.quota_pool_store(None),
+            Err(crate::quota_pool::PoolError::InvalidState)
+        ));
+
+        let mismatched = handler_with_quota_consistency("approximate");
+        let governance: std::sync::Arc<dyn crate::governance::GovernanceStore> =
+            std::sync::Arc::new(
+                crate::governance::InMemoryGovernanceStore::new(Default::default())
+                    .expect("memory governance"),
+            );
+        assert!(matches!(
+            mismatched.quota_pool_store(Some((
+                governance,
+                crate::governance::GovernanceConsistency::Strict,
+            ))),
+            Err(crate::quota_pool::PoolError::InvalidState)
+        ));
+
+        let matching = handler_with_quota_consistency("approximate");
+        let governance: std::sync::Arc<dyn crate::governance::GovernanceStore> =
+            std::sync::Arc::new(
+                crate::governance::InMemoryGovernanceStore::new(Default::default())
+                    .expect("memory governance"),
+            );
+        let store = matching
+            .quota_pool_store(Some((
+                governance,
+                crate::governance::GovernanceConsistency::Approximate,
+            )))
+            .expect("matching approximate backend")
+            .expect("quota configured");
+        assert!(store
+            .reserve("shared", "virtual-key-a", 1, "approximate-request:0")
+            .await
+            .is_ok());
+    }
+
+    #[test]
+    fn strong_quota_pool_treats_a_missing_or_mismatched_backend_as_invalid_state() {
+        let missing = handler_with_quota_consistency("strong");
+        assert!(matches!(
+            missing.quota_pool_store(None),
+            Err(crate::quota_pool::PoolError::InvalidState)
+        ));
+
+        let mismatched = handler_with_quota_consistency("strong");
+        let governance: std::sync::Arc<dyn crate::governance::GovernanceStore> =
+            std::sync::Arc::new(
+                crate::governance::InMemoryGovernanceStore::new(Default::default())
+                    .expect("memory governance"),
+            );
+        assert!(matches!(
+            mismatched.quota_pool_store(Some((
+                governance,
+                crate::governance::GovernanceConsistency::Approximate,
+            ))),
+            Err(crate::quota_pool::PoolError::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn prefix_affinity_object_parses_and_rejects_zero_bounds() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "routing": {
+                "strategy": "prefix_affinity",
+                "ttl_secs": 45,
+                "max_prefixes_per_provider": 64
+            }
+        }))
+        .expect("bounded prefix config");
+        let RoutingStrategy::PrefixAffinity(prefix) = config.routing else {
+            panic!("expected prefix affinity");
+        };
+        assert_eq!(prefix.ttl_secs, 45);
+        assert_eq!(prefix.max_prefixes_per_provider, 64);
+
+        let invalid = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "routing": {
+                "strategy": "prefix_affinity",
+                "ttl_secs": 0
+            }
+        }));
+        assert!(invalid.is_err(), "zero TTL must fail config loading");
     }
 
     #[test]

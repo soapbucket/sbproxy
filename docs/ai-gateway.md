@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-07-28*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -254,7 +254,13 @@ See [examples/ai-race](../examples/ai-race/sb.yml). Billing implications, stream
 
 ### least_token_usage
 
-Routes to the provider with the lowest absolute observed token throughput in the current minute, regardless of any configured limit. Unlike `token_rate`, which scores remaining headroom against a declared per-provider TPM cap, this scores raw observed throughput, so it suits self-hosted vLLM or SGLang pools that do not pre-declare a token cap. Untried providers sort lowest and are explored first.
+Routes to the provider with the lowest absolute observed token throughput in
+the current 60-second window, regardless of any configured limit. Unlike
+`token_rate`, which scores remaining headroom against a declared per-provider
+TPM cap, this scores raw observed throughput, so it suits self-hosted vLLM or
+SGLang pools that do not pre-declare a token cap. Untried providers sort lowest
+and are explored first. The same recent-token state breaks ties for
+`prefix_affinity`.
 
 ```yaml
 routing:
@@ -263,12 +269,42 @@ routing:
 
 ### prefix_affinity
 
-Hashes a stable prefix of the request body to an enabled provider so requests that share a prompt prefix land on the same upstream and reuse its KV cache (vLLM, SGLang). The hash is deterministic and stable across reloads as long as the provider list does not reorder. Falls back to round_robin when no prefix can be extracted.
+Routes a repeated prompt prefix to a provider that has already accepted that
+prefix, so a vLLM or SGLang replica can reuse its local KV cache. This is
+observed affinity, not a hash assignment. On the first request for a prefix,
+the router picks the eligible provider with the lowest recent token load and
+records that provider as a holder only after it accepts the response. A live
+holder wins on later turns. When there is no live holder, recent token load
+chooses the fallback provider; exact load ties rotate with round-robin.
 
 ```yaml
 routing:
   strategy: prefix_affinity
+  ttl_secs: 300
+  max_prefixes_per_provider: 1024
 ```
+
+The default TTL is five minutes and the default capacity is 1,024 prefixes per
+provider. Expired entries and least-recently-used entries beyond the capacity
+are removed. Disabled or credential-ineligible providers are never selected,
+even if they hold the prefix.
+
+The affinity identity comes from the translated hub request. It includes
+leading `system` and `developer` messages plus the first `user` message, and
+ignores later conversation turns. The normalizer preserves roles, content,
+part order, whitespace, case, and Unicode, canonicalizes JSON object keys, and
+caps the canonical input at a valid UTF-8 boundary before hashing it. The
+resolved model or deployment is part of the namespace, so incompatible caches
+do not share an identity. A request without a usable first user message falls
+back to the least-loaded eligible provider.
+
+Prefix locations are deliberately process-local. Each gateway replica learns
+its own bounded directory; locations are not looked up through the cluster
+mesh. This keeps remote cluster latency out of every routing decision. Use
+`sbproxy_ai_prefix_affinity_decisions_total{outcome}` to distinguish hits,
+misses, and missing signals, and
+`sbproxy_ai_prefix_affinity_evictions_total{reason}` to see TTL and capacity
+evictions.
 
 ### peak_ewma
 
@@ -331,7 +367,10 @@ Scores each provider by realized cost per successful request, learned from the g
 routing: outcome_aware
 ```
 
-The scoring formula, warm-up behavior, and the feedback store are in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md).
+The strategy blends learned picks with deterministic round-robin during
+warm-up instead of waiting for a hard threshold. The scoring formula,
+confidence schedule, and feedback lifetime are in
+[ai-outcome-aware-routing.md](ai-outcome-aware-routing.md).
 
 ## Resilience
 
@@ -375,6 +414,11 @@ The same block hosts the legacy `llm_aware.context_compress` shorthand, which ma
 ## Shadow eval
 
 Mirror a sampled set of non-streaming chat evaluation requests to a second provider. V1 includes Chat Completions plus Messages and Responses requests after those native formats are normalized to the chat hub. Mutating and non-chat surfaces, including Assistants, Threads, Batches, Fine Tuning, Files, images, audio, embeddings, moderation, and reranking, are never copied. The copy is taken after request policy, guardrails, model rewrites, and context compression. Shadow admission is bounded by both 16 in-flight tasks and a 64 MiB reservation budget per live AI client, and the upstream call is fire-and-forget: a slow, failed, timed-out, policy-disallowed, or saturated shadow never delays or rejects the primary. Streaming requests are intentionally skipped.
+
+When a fair-share quota pool is enabled, a sampled shadow copy reserves its
+own request unit after the local shadow gates and commits it only at the
+background send boundary. A quota denial suppresses only the optional copy;
+it never replaces or delays the primary response.
 
 The shadow body is drained while at most 1 MiB is retained for comparison metadata, which is logged at `target=sbproxy_ai_shadow` (status, latency, prompt/completion tokens, finish reason). Configured usage sinks also receive a separate row with `tag: shadow` and a fresh server-generated request ID ending in `:shadow`. That row estimates shadow cost for comparison, but it never debits the primary budget tracker.
 
@@ -454,6 +498,68 @@ origins:
 ```
 
 Clients exceeding the limit receive a `429 Too Many Requests` response with a `Retry-After` header.
+
+### Fair-share quota pools
+
+An AI action can reserve every upstream attempt against a weighted request
+pool. Pool members are immutable virtual-key or API-key ids from the resolved
+request principal, not provider names. Use the credential's immutable public
+`key_id` in `weights`; a mutable display `name` is never an accounting key.
+Only traffic on an origin with no authentication or explicit `noop`
+authentication uses the literal `__anonymous__` member. A request accepted by
+Bearer, forward-auth, plugin, or another authentication provider without an
+immutable key id fails closed when a quota pool is enabled; add `key_id` to
+legacy inline credentials before enabling the pool. Every admitted identity
+must appear in `weights`; an unknown member is denied instead of borrowing
+another member's share.
+
+```yaml
+action:
+  type: ai_proxy
+  providers:
+    - name: openai
+      api_key: ${OPENAI_API_KEY}
+    - name: anthropic
+      api_key: ${ANTHROPIC_API_KEY}
+  quota_pool:
+    name: shared-agents
+    window: 1m
+    total_limit: 120
+    weights:
+      team-a: 3
+      team-b: 1
+    policy: hard
+    dimension: request
+    consistency: local
+    failure_mode: closed
+```
+
+`local` is the dependency-free default. `approximate` reuses the installed
+approximate governance store and its cluster-mesh dissemination. `strong`
+reuses the installed strict Redis governance store for atomic cross-process
+admission. A shared pool's consistency must match
+`proxy.key_management.governance.consistency`: quota `approximate` pairs with
+governance `approximate`, while quota `strong` pairs with governance `strict`.
+See [Governed admission: strict and approximate](key-management.md#governed-admission-strict-and-approximate)
+for the mesh and Redis configuration.
+
+The policies have these admission guarantees:
+
+| Policy | Behavior |
+| --- | --- |
+| `hard` | Enforces both the aggregate limit and each member's weighted entitlement. |
+| `soft` | Enforces the aggregate limit, admits over-entitlement use while capacity remains, and meters the over-share. |
+| `burst` | Lets a busy member borrow idle aggregate capacity while preserving the pool total. |
+
+Each failover or retry is a separate upstream attempt and receives its own
+reservation. Failures before dispatch release the reservation; once an
+attempt can leave the process it is committed even if the upstream later
+returns an error. A real policy denial returns `429` and never fails open.
+
+Shared-backend failure defaults to `failure_mode: closed`, which returns `503`
+before dispatch. `allow_unreserved` admits an attempt only when the backend is
+unavailable; it does not bypass a real quota denial. Every such admission
+increments `sbproxy_ai_quota_pool_fail_open_total{pool}`.
 
 ### Per-surface rate limits
 
@@ -1121,7 +1227,7 @@ To vectorize via an OpenAI-compatible endpoint that is not one of the origin's c
           timeout_ms: 2000
 ```
 
-Auth defaults to `Authorization: Bearer ${api_key}`. For endpoints that expect a different header (Azure `api-key`, an `x-api-key` gateway), set `auth_header` and clear `auth_prefix`; endpoints that need extra headers (such as OpenRouter's `HTTP-Referer` / `X-Title`) take a `headers` list of name/value pairs, sent verbatim. For header-only auth, omit `api_key` and carry the credential in `headers`. The endpoint base URL joins `/v1/embeddings` the same way chat provider base URLs do (an overlapping trailing `/v1` is collapsed). On any embedding error the lookup degrades to an uncached upstream call. See [local-inference.md](local-inference.md) and [examples/semantic-cache-openai](../examples/semantic-cache-openai/sb.yml).
+Auth defaults to `Authorization: Bearer ${api_key}`. For endpoints that expect a different header (Azure `api-key`, an `x-api-key` gateway), set `auth_header` and clear `auth_prefix`; endpoints that need extra headers (such as OpenRouter's `HTTP-Referer` / `X-Title`) take a `headers` list of name/value pairs, sent verbatim. For header-only auth, omit `api_key` and carry the credential in `headers`. The endpoint base URL joins `/v1/embeddings` the same way chat provider base URLs do (an overlapping trailing `/v1` is collapsed). Embedding transport or parse errors degrade to an uncached upstream call. A configured fair-share quota still applies to an external embedding attempt; quota denial or closed-backend failure returns `429` or `503` instead of failing open. See [local-inference.md](local-inference.md) and [examples/semantic-cache-openai](../examples/semantic-cache-openai/sb.yml).
 
 ### Idempotency middleware (RFC 8594)
 

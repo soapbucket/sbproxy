@@ -615,26 +615,44 @@ pub async fn compute_embedding(
     text: &str,
 ) -> anyhow::Result<Vec<f32>> {
     let body = serde_json::json!({ "model": model, "input": text });
-    let resp = client
+    let response = client
         .forward_request(provider, "/v1/embeddings", &body)
         .await?;
-    let status = resp.status();
+    parse_embedding_response(response, &format!("embedding provider {}", provider.name)).await
+}
+
+/// Compute a provider-backed embedding with settlement at the HTTP send seam.
+pub async fn compute_embedding_with_quota(
+    client: &crate::client::AiClient,
+    provider: &crate::provider::ProviderConfig,
+    model: &str,
+    text: &str,
+    quota_attempt: crate::quota_pool::QuotaPoolAttemptGuard,
+) -> anyhow::Result<Vec<f32>> {
+    let body = serde_json::json!({ "model": model, "input": text });
+    let response = client
+        .forward_request_with_quota(provider, "/v1/embeddings", &body, quota_attempt)
+        .await?;
+    parse_embedding_response(response, &format!("embedding provider {}", provider.name)).await
+}
+
+async fn parse_embedding_response(
+    response: reqwest::Response,
+    endpoint: &str,
+) -> anyhow::Result<Vec<f32>> {
+    let status = response.status();
     if !status.is_success() {
-        anyhow::bail!(
-            "embedding provider {} returned status {}",
-            provider.name,
-            status
-        );
+        anyhow::bail!("{endpoint} returned status {status}");
     }
-    let parsed: crate::types::EmbeddingResponse = resp
+    let parsed: crate::types::EmbeddingResponse = response
         .json()
         .await
-        .map_err(|e| anyhow::anyhow!("embedding response parse failed: {e}"))?;
+        .map_err(|error| anyhow::anyhow!("{endpoint} response parse failed: {error}"))?;
     let first = parsed
         .data
         .into_iter()
         .next()
-        .ok_or_else(|| anyhow::anyhow!("embedding response contained no vectors"))?;
+        .ok_or_else(|| anyhow::anyhow!("{endpoint} response contained no vectors"))?;
     Ok(first.embedding.into_iter().map(|x| x as f32).collect())
 }
 
@@ -676,34 +694,41 @@ pub async fn compute_embedding_openai(
     cfg: &OpenAiEmbeddingConfig,
     text: &str,
 ) -> anyhow::Result<Vec<f32>> {
-    let url = crate::client::build_url(cfg.base_url.trim_end_matches('/'), "/v1/embeddings");
+    compute_embedding_openai_impl(cfg, text, None).await
+}
+
+/// Compute a standalone OpenAI-compatible embedding with quota settlement at send.
+pub async fn compute_embedding_openai_with_quota(
+    cfg: &OpenAiEmbeddingConfig,
+    text: &str,
+    quota_attempt: crate::quota_pool::QuotaPoolAttemptGuard,
+) -> anyhow::Result<Vec<f32>> {
+    compute_embedding_openai_impl(cfg, text, Some(quota_attempt)).await
+}
+
+async fn compute_embedding_openai_impl(
+    cfg: &OpenAiEmbeddingConfig,
+    text: &str,
+    quota_attempt: Option<crate::quota_pool::QuotaPoolAttemptGuard>,
+) -> anyhow::Result<Vec<f32>> {
+    let url_string = crate::client::build_url(cfg.base_url.trim_end_matches('/'), "/v1/embeddings");
+    let url = reqwest::Url::parse(&url_string)
+        .map_err(|error| anyhow::anyhow!("openai embed URL: {error}"))?;
     let headers = openai_request_headers(cfg)?;
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(cfg.timeout_ms))
         .build()
         .map_err(|e| anyhow::anyhow!("openai embed client build: {e}"))?;
     let body = serde_json::json!({ "model": cfg.model, "input": text });
-    let resp = http
-        .post(&url)
-        .headers(headers)
-        .json(&body)
+    let request = http.post(url).headers(headers).json(&body);
+    if let Some(attempt) = quota_attempt {
+        attempt.commit().await.map_err(anyhow::Error::new)?;
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("openai embed request: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        anyhow::bail!("openai embedding endpoint returned status {status}");
-    }
-    let parsed: crate::types::EmbeddingResponse = resp
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("openai embedding response parse failed: {e}"))?;
-    let first = parsed
-        .data
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("openai embedding response contained no vectors"))?;
-    Ok(first.embedding.into_iter().map(|x| x as f32).collect())
+    parse_embedding_response(response, "openai embedding endpoint").await
 }
 
 /// L2-normalize a vector. Returns an empty vec for a zero or empty
@@ -729,6 +754,58 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
     use crate::types::Message;
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct RecordingQuotaStore {
+        settled: tokio::sync::Mutex<Vec<String>>,
+        released: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::quota_pool::QuotaPoolStore for RecordingQuotaStore {
+        async fn reserve(
+            &self,
+            pool: &str,
+            member: &str,
+            units: u64,
+            reservation_id: &str,
+        ) -> Result<crate::quota_pool::QuotaReservation, crate::quota_pool::PoolError> {
+            Ok(crate::quota_pool::QuotaReservation {
+                pool: pool.to_string(),
+                member: member.to_string(),
+                units,
+                reservation_id: reservation_id.to_string(),
+            })
+        }
+
+        async fn reconcile(
+            &self,
+            reservation: crate::quota_pool::QuotaReservation,
+            _actual: crate::quota_pool::PoolUsage,
+        ) -> Result<(), crate::quota_pool::PoolError> {
+            self.settled.lock().await.push(reservation.reservation_id);
+            Ok(())
+        }
+
+        async fn release(
+            &self,
+            reservation: crate::quota_pool::QuotaReservation,
+        ) -> Result<(), crate::quota_pool::PoolError> {
+            self.released.lock().await.push(reservation.reservation_id);
+            Ok(())
+        }
+    }
+
+    fn quota_config() -> crate::quota_pool::QuotaPoolConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": "semantic",
+            "total_limit": 10,
+            "weights": {"virtual-key-a": 1},
+            "policy": "burst"
+        }))
+        .expect("quota fixture")
+    }
 
     #[test]
     fn store_and_lookup() {
@@ -1174,5 +1251,42 @@ mod tests {
         }))
         .unwrap();
         assert!(compute_embedding_openai(&cfg, "hello").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn quota_aware_openai_embedding_releases_on_local_header_failure() {
+        let cfg: OpenAiEmbeddingConfig = serde_json::from_value(serde_json::json!({
+            "base_url": "http://127.0.0.1:1/v1",
+            "model": "m",
+            "headers": [["invalid header", "value"]]
+        }))
+        .expect("embedding fixture");
+        let recording = Arc::new(RecordingQuotaStore::default());
+        let store: Arc<dyn crate::quota_pool::QuotaPoolStore> = recording.clone();
+        let admission = crate::quota_pool::QuotaPoolAdmission::new(
+            Some(quota_config()),
+            Ok(Some(store)),
+            Ok("virtual-key-a".to_string()),
+        );
+        let attempt = admission
+            .reserve_attempt("semantic-local-header")
+            .await
+            .expect("quota reservation");
+
+        compute_embedding_openai_with_quota(&cfg, "hello", attempt)
+            .await
+            .expect_err("invalid local header must stop before send");
+
+        for _ in 0..16 {
+            if !recording.released.lock().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            recording.released.lock().await.as_slice(),
+            ["semantic-local-header"]
+        );
+        assert!(recording.settled.lock().await.is_empty());
     }
 }

@@ -789,6 +789,8 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
                 tracing::error!(error = %e, "failed to reconcile dynamic key plane on reload");
                 outcome.degrade(DegradedSubsystem::KeyPlane);
             }
+        } else {
+            crate::key_plane::uninstall_key_plane();
         }
     }
 
@@ -1314,6 +1316,8 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         if let Err(e) = crate::key_plane::init_key_plane(km) {
             tracing::error!(error = %e, "failed to install dynamic key plane");
         }
+    } else {
+        crate::key_plane::uninstall_key_plane();
     }
 
     // WOR-1835: start cross-node governance-counter dissemination now that

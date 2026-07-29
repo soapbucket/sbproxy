@@ -94,6 +94,36 @@ mod routed_provider_observation_tests {
         .await
         .expect("attempt succeeds");
     }
+
+    #[test]
+    fn completed_upstream_usage_reaches_router_before_any_relay_early_return() {
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai", "api_key": "test"},
+                {"name": "anthropic", "api_key": "test"}
+            ],
+            "routing": {"strategy": "least_token_usage"}
+        }))
+        .expect("valid AI config");
+        let router = config.router();
+        let sink = RouterTokenSink {
+            router: &router,
+            config_providers: &config.providers,
+            provider_name: "openai",
+        };
+
+        record_router_tokens_from_response(
+            &sink,
+            200,
+            br#"{"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        );
+
+        assert_eq!(
+            router.select(&config.providers),
+            Some(1),
+            "provider usage must be visible even if relay later blocks the response"
+        );
+    }
 }
 
 fn effective_policy_to_virtual_key(
@@ -802,6 +832,397 @@ fn governance_admits_on_backend_unavailable(
         failure_mode,
         sbproxy_config::types::GovernanceFailureMode::AllowUnreserved
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuotaPoolErrorDisposition {
+    AllowUnreserved,
+    Reject { status: u16, message: &'static str },
+}
+
+fn quota_pool_error_disposition(
+    config: &sbproxy_ai::QuotaPoolConfig,
+    error: &sbproxy_ai::PoolError,
+) -> QuotaPoolErrorDisposition {
+    match error {
+        sbproxy_ai::PoolError::Denied(_) => QuotaPoolErrorDisposition::Reject {
+            status: 429,
+            message: "fair-share quota pool exhausted",
+        },
+        sbproxy_ai::PoolError::BackendUnavailable
+            if config.failure_mode == sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved =>
+        {
+            QuotaPoolErrorDisposition::AllowUnreserved
+        }
+        sbproxy_ai::PoolError::BackendUnavailable => QuotaPoolErrorDisposition::Reject {
+            status: 503,
+            message: "fair-share quota backend unavailable",
+        },
+        sbproxy_ai::PoolError::InvalidState => QuotaPoolErrorDisposition::Reject {
+            status: 503,
+            message: "fair-share quota state unavailable",
+        },
+    }
+}
+
+fn quota_pool_error_from_attempt(
+    config: Option<&sbproxy_ai::QuotaPoolConfig>,
+    error: &anyhow::Error,
+) -> Option<QuotaPoolErrorDisposition> {
+    let pool_error = error.downcast_ref::<sbproxy_ai::PoolError>()?;
+    Some(match config {
+        Some(config) => quota_pool_error_disposition(config, pool_error),
+        None => QuotaPoolErrorDisposition::Reject {
+            status: 503,
+            message: "fair-share quota state unavailable",
+        },
+    })
+}
+
+async fn send_quota_pool_attempt_error(
+    session: &mut Session,
+    config: Option<&sbproxy_ai::QuotaPoolConfig>,
+    error: &anyhow::Error,
+) -> Result<bool> {
+    match quota_pool_error_from_attempt(config, error) {
+        Some(QuotaPoolErrorDisposition::Reject { status, message }) => {
+            send_error(session, status, message).await?;
+            Ok(true)
+        }
+        Some(QuotaPoolErrorDisposition::AllowUnreserved) | None => Ok(false),
+    }
+}
+
+fn quota_pool_member_id(
+    principal: &sbproxy_plugin::Principal,
+    anonymous_is_uncredentialed: bool,
+) -> Result<String, sbproxy_ai::PoolError> {
+    let key_id = principal.api_key_id();
+    if !key_id.is_empty() {
+        return Ok(key_id.to_string());
+    }
+    if anonymous_is_uncredentialed && principal.is_anonymous() {
+        return Ok("__anonymous__".to_string());
+    }
+    Err(sbproxy_ai::PoolError::InvalidState)
+}
+
+/// Resolve quota membership from the request's authenticated context.
+///
+/// `Principal::anonymous()` and an out-of-tree auth plugin that allows a
+/// request without a subject currently have the same principal shape. Treat
+/// that shape as anonymous only when the origin has no auth provider or uses
+/// the explicit no-op provider. All authenticated or indeterminate empty
+/// identities fail closed instead of sharing the anonymous member.
+pub(super) fn quota_pool_member_id_for_request(
+    ctx: &RequestContext,
+) -> Result<String, sbproxy_ai::PoolError> {
+    let anonymous_is_uncredentialed = if ctx.resolved_inbound_key.is_some() {
+        false
+    } else {
+        match ctx
+            .origin_idx
+            .and_then(|origin_idx| ctx.pipeline.auths.get(origin_idx))
+        {
+            Some(None) | Some(Some(sbproxy_modules::auth::Auth::Noop)) => true,
+            Some(Some(_)) | None => false,
+        }
+    };
+    quota_pool_member_id(&ctx.principal, anonymous_is_uncredentialed)
+}
+
+fn sequential_attempt_limit(
+    is_failover: bool,
+    content_policy_fallback: bool,
+    provider_count: usize,
+) -> usize {
+    if is_failover || content_policy_fallback {
+        provider_count
+    } else {
+        1
+    }
+}
+
+#[cfg(test)]
+async fn admit_quota_pool_attempt(
+    config: Option<&sbproxy_ai::QuotaPoolConfig>,
+    admission: &sbproxy_ai::quota_pool::QuotaPoolAdmission,
+    reservation_id: &str,
+) -> Result<(), QuotaPoolErrorDisposition> {
+    match admission.consume(reservation_id).await {
+        Ok(()) => Ok(()),
+        Err(error) => match config {
+            Some(config) => match quota_pool_error_disposition(config, &error) {
+                // `QuotaPoolAdmission` normally consumes this branch and
+                // records the metric itself. Keep the defensive fallback so
+                // a future admission implementation cannot accidentally turn
+                // an explicit allow-unreserved policy into a hard failure.
+                QuotaPoolErrorDisposition::AllowUnreserved => {
+                    sbproxy_ai::ai_metrics::record_quota_pool_fail_open(&config.name);
+                    Ok(())
+                }
+                reject => Err(reject),
+            },
+            None => Err(QuotaPoolErrorDisposition::Reject {
+                status: 503,
+                message: "fair-share quota state unavailable",
+            }),
+        },
+    }
+}
+
+async fn reserve_quota_pool_attempt(
+    config: Option<&sbproxy_ai::QuotaPoolConfig>,
+    admission: &sbproxy_ai::quota_pool::QuotaPoolAdmission,
+    reservation_id: &str,
+) -> std::result::Result<sbproxy_ai::quota_pool::QuotaPoolAttemptGuard, QuotaPoolErrorDisposition> {
+    match admission.reserve_attempt(reservation_id).await {
+        Ok(attempt) => Ok(attempt),
+        Err(error) => match config {
+            Some(config) => match quota_pool_error_disposition(config, &error) {
+                QuotaPoolErrorDisposition::AllowUnreserved => {
+                    debug_assert!(
+                        false,
+                        "reserve_attempt must convert allow-unreserved to a no-op guard"
+                    );
+                    Err(QuotaPoolErrorDisposition::AllowUnreserved)
+                }
+                reject => Err(reject),
+            },
+            None => Err(QuotaPoolErrorDisposition::Reject {
+                status: 503,
+                message: "fair-share quota state unavailable",
+            }),
+        },
+    }
+}
+
+async fn reserve_quota_pool_attempt_or_respond(
+    session: &mut Session,
+    config: Option<&sbproxy_ai::QuotaPoolConfig>,
+    admission: &sbproxy_ai::quota_pool::QuotaPoolAdmission,
+    reservation_id: &str,
+) -> Result<Option<sbproxy_ai::quota_pool::QuotaPoolAttemptGuard>> {
+    match reserve_quota_pool_attempt(config, admission, reservation_id).await {
+        Ok(attempt) => Ok(Some(attempt)),
+        Err(QuotaPoolErrorDisposition::Reject { status, message }) => {
+            send_error(session, status, message).await?;
+            Ok(None)
+        }
+        Err(QuotaPoolErrorDisposition::AllowUnreserved) => {
+            debug_assert!(
+                false,
+                "reserve_attempt must convert allow-unreserved to a no-op guard"
+            );
+            send_error(session, 503, "fair-share quota state unavailable").await?;
+            Ok(None)
+        }
+    }
+}
+
+/// Launch an optional shadow only after the primary dispatch has produced a
+/// response. Primary traffic therefore has first claim on shared quota; a
+/// denied or unavailable shadow admission suppresses that copy without
+/// replacing an already-earned client response.
+#[allow(clippy::too_many_arguments)]
+fn try_spawn_governed_shadow_after_primary(
+    config: &AiHandlerConfig,
+    surface: &sbproxy_ai::handler::AiSurface,
+    path: &str,
+    body: &serde_json::Value,
+    is_stream: bool,
+    allowed_providers: &[String],
+    blocked_providers: &[String],
+    disallow_prompt_training: bool,
+    ctx: &RequestContext,
+    quota: &sbproxy_ai::quota_pool::QuotaPoolAdmission,
+) {
+    if !shadow_surface_is_eligible(surface) {
+        return;
+    }
+    let usage = super::ai_support::shadow_usage_record_from_context(ctx);
+    let reservation_prefix = format!("{}:quota-pool", ctx.request_id);
+    let _ = AI_CLIENT.load().try_spawn_shadow_with_quota_detached(
+        config,
+        path,
+        body,
+        is_stream,
+        allowed_providers,
+        blocked_providers,
+        disallow_prompt_training,
+        usage,
+        quota.clone(),
+        &reservation_prefix,
+    );
+}
+
+#[cfg(test)]
+mod quota_pool_dispatch_tests {
+    use super::*;
+
+    fn pool(failure_mode: sbproxy_ai::QuotaPoolFailureMode) -> sbproxy_ai::QuotaPoolConfig {
+        let mut config: sbproxy_ai::QuotaPoolConfig = serde_json::from_value(serde_json::json!({
+            "name": "shared-upstream",
+            "total_limit": 10,
+            "weights": {"virtual-key-a": 1},
+            "policy": "burst"
+        }))
+        .expect("quota fixture");
+        config.failure_mode = failure_mode;
+        config
+    }
+
+    #[test]
+    fn quota_pool_denial_and_backend_failure_map_to_exact_statuses() {
+        let closed = pool(sbproxy_ai::QuotaPoolFailureMode::Closed);
+        assert_eq!(
+            quota_pool_error_disposition(
+                &closed,
+                &sbproxy_ai::PoolError::Denied(sbproxy_ai::PoolDeny::PoolExhausted {
+                    total_load: 10,
+                    total_limit: 10,
+                }),
+            ),
+            QuotaPoolErrorDisposition::Reject {
+                status: 429,
+                message: "fair-share quota pool exhausted",
+            }
+        );
+        assert_eq!(
+            quota_pool_error_disposition(&closed, &sbproxy_ai::PoolError::BackendUnavailable,),
+            QuotaPoolErrorDisposition::Reject {
+                status: 503,
+                message: "fair-share quota backend unavailable",
+            }
+        );
+
+        let allow = pool(sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved);
+        assert_eq!(
+            quota_pool_error_disposition(&allow, &sbproxy_ai::PoolError::BackendUnavailable,),
+            QuotaPoolErrorDisposition::AllowUnreserved
+        );
+        assert!(matches!(
+            quota_pool_error_disposition(&allow, &sbproxy_ai::PoolError::InvalidState),
+            QuotaPoolErrorDisposition::Reject { status: 503, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn allow_unreserved_applies_only_to_backend_unavailability() {
+        let allow = pool(sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved);
+        let unavailable = sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
+            Some(allow.clone()),
+            Err(sbproxy_ai::PoolError::BackendUnavailable),
+            Ok("virtual-key-a".to_string()),
+        );
+        assert!(
+            admit_quota_pool_attempt(Some(&allow), &unavailable, "request:0")
+                .await
+                .is_ok()
+        );
+
+        let invalid = sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
+            Some(allow.clone()),
+            Err(sbproxy_ai::PoolError::InvalidState),
+            Ok("virtual-key-a".to_string()),
+        );
+        assert!(matches!(
+            admit_quota_pool_attempt(Some(&allow), &invalid, "request:1").await,
+            Err(QuotaPoolErrorDisposition::Reject { status: 503, .. })
+        ));
+    }
+
+    #[test]
+    fn quota_pool_members_use_immutable_key_ids_and_anonymous_sentinel() {
+        let anonymous = sbproxy_plugin::Principal::anonymous();
+        assert_eq!(
+            quota_pool_member_id(&anonymous, true).expect("anonymous sentinel"),
+            "__anonymous__"
+        );
+        assert!(matches!(
+            quota_pool_member_id(&anonymous, false),
+            Err(sbproxy_ai::PoolError::InvalidState)
+        ));
+
+        let identified = sbproxy_plugin::Principal {
+            attrs: sbproxy_plugin::PrincipalAttrs {
+                key_id: Some("virtual-key-a".to_string()),
+                ..Default::default()
+            },
+            ..sbproxy_plugin::Principal::anonymous()
+        };
+        assert_eq!(
+            quota_pool_member_id(&identified, false).expect("immutable key id"),
+            "virtual-key-a"
+        );
+
+        let credential_without_immutable_id = sbproxy_plugin::Principal {
+            sub: "authenticated-user".to_string(),
+            ..sbproxy_plugin::Principal::anonymous()
+        };
+        assert!(matches!(
+            quota_pool_member_id(&credential_without_immutable_id, false),
+            Err(sbproxy_ai::PoolError::InvalidState)
+        ));
+
+        let shared_bearer_without_immutable_id = sbproxy_plugin::Principal {
+            source: sbproxy_plugin::PrincipalSource::Bearer,
+            ..sbproxy_plugin::Principal::anonymous()
+        };
+        assert!(matches!(
+            quota_pool_member_id(&shared_bearer_without_immutable_id, false),
+            Err(sbproxy_ai::PoolError::InvalidState)
+        ));
+    }
+
+    fn request_with_auth(auth: Option<sbproxy_modules::auth::Auth>) -> RequestContext {
+        let mut pipeline = crate::pipeline::CompiledPipeline::default();
+        pipeline.auths.push(auth);
+        let mut ctx = RequestContext::new();
+        ctx.pipeline = std::sync::Arc::new(pipeline);
+        ctx.origin_idx = Some(0);
+        ctx
+    }
+
+    #[test]
+    fn request_context_distinguishes_uncredentialed_from_empty_authenticated_principals() {
+        let no_auth = request_with_auth(None);
+        assert_eq!(
+            quota_pool_member_id_for_request(&no_auth).expect("origin has no authentication"),
+            "__anonymous__"
+        );
+
+        let noop = request_with_auth(Some(sbproxy_modules::auth::Auth::Noop));
+        assert_eq!(
+            quota_pool_member_id_for_request(&noop).expect("explicit noop is uncredentialed"),
+            "__anonymous__"
+        );
+
+        let bearer = sbproxy_modules::compile_auth(&serde_json::json!({
+            "type": "bearer",
+            "tokens": ["test-token"]
+        }))
+        .expect("bearer fixture");
+        let authenticated_without_key_id = request_with_auth(Some(bearer));
+        assert!(matches!(
+            quota_pool_member_id_for_request(&authenticated_without_key_id),
+            Err(sbproxy_ai::PoolError::InvalidState)
+        ));
+
+        let mut indeterminate = RequestContext::new();
+        indeterminate.origin_idx = None;
+        assert!(matches!(
+            quota_pool_member_id_for_request(&indeterminate),
+            Err(sbproxy_ai::PoolError::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn quota_pool_alone_does_not_enable_provider_failover() {
+        assert_eq!(sequential_attempt_limit(false, false, 3), 1);
+        assert_eq!(sequential_attempt_limit(true, false, 3), 3);
+        assert_eq!(sequential_attempt_limit(false, true, 3), 3);
+    }
 }
 
 /// Process-global per-key rate limiter (WOR-1558). Accumulates request counts
@@ -1675,8 +2096,15 @@ pub(super) async fn handle_ai_proxy(
     // survives across requests. A per-request router would reset that
     // state every call and make the latency/usage-aware strategies inert.
     let router = config.router();
-    let quota_pool_store = config.quota_pool_store().cloned();
-    let quota_pool_name = config.quota_pool.as_ref().map(|pool| pool.name.clone());
+    let quota_pool_admission = sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
+        config.quota_pool.clone(),
+        config.quota_pool_store(
+            key_plane
+                .as_ref()
+                .map(|plane| (plane.governance_store(), plane.governance_consistency())),
+        ),
+        quota_pool_member_id_for_request(ctx),
+    );
     // Serve model discovery locally; other GET surfaces use ordinary dispatch.
     if method == http::Method::GET {
         if matches!(
@@ -1768,21 +2196,47 @@ pub(super) async fn handle_ai_proxy(
             return Ok(());
         }
 
+        let reservation_id = format!("{}:quota-pool:get:0", ctx.request_id);
+        let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
+            session,
+            config.quota_pool.as_ref(),
+            &quota_pool_admission,
+            &reservation_id,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
         ctx.record_admin_ai_attempt(&provider.name);
-        let resp = run_routed_provider_attempt(&router, provider_idx, async {
-            AI_CLIENT.load().forward_get_request(provider, &path).await
+        let resp = match run_routed_provider_attempt(&router, provider_idx, async {
+            AI_CLIENT
+                .load()
+                .forward_get_request_with_quota(provider, &path, quota_attempt)
+                .await
         })
         .await
-        .map_err(|e| {
-            record_ai_transport_failure(
-                &ai_span,
-                Some(provider.name.as_str()),
-                &e,
-                "AI upstream GET request failed",
-            );
-            warn!(error = %e, "AI proxy: upstream GET request failed");
-            Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
-        })?;
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                if send_quota_pool_attempt_error(session, config.quota_pool.as_ref(), &error)
+                    .await?
+                {
+                    return Ok(());
+                }
+                record_ai_transport_failure(
+                    &ai_span,
+                    Some(provider.name.as_str()),
+                    &error,
+                    "AI upstream GET request failed",
+                );
+                warn!(error = %error, "AI proxy: upstream GET request failed");
+                return Err(Error::because(
+                    ErrorType::ConnectError,
+                    "AI upstream request failed",
+                    error,
+                ));
+            }
+        };
         record_ai_provider_response_failure(
             &ai_span,
             provider.name.as_str(),
@@ -1907,29 +2361,58 @@ pub(super) async fn handle_ai_proxy(
                 ),
             };
 
+        let reservation_id = format!("{}:quota-pool:method:0", ctx.request_id);
+        let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
+            session,
+            config.quota_pool.as_ref(),
+            &quota_pool_admission,
+            &reservation_id,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
         ctx.record_admin_ai_attempt(&provider.name);
-        let resp = run_routed_provider_attempt(&router, provider_idx, async {
+        let resp = match run_routed_provider_attempt(&router, provider_idx, async {
             AI_CLIENT
                 .load()
-                .forward_with_method(provider, &method_str, &path, body_opt.as_ref())
+                .forward_with_method_and_quota(
+                    provider,
+                    &method_str,
+                    &path,
+                    body_opt.as_ref(),
+                    quota_attempt,
+                )
                 .await
         })
         .await
-        .map_err(|e| {
-            record_ai_transport_failure(
-                &ai_span,
-                Some(provider.name.as_str()),
-                &e,
-                "AI upstream method-aware request failed",
-            );
-            warn!(
-                error = %e,
-                method = %method_str,
-                ai.surface = surface.label(),
-                "AI proxy: upstream method-aware request failed"
-            );
-            Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
-        })?;
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                if send_quota_pool_attempt_error(session, config.quota_pool.as_ref(), &error)
+                    .await?
+                {
+                    return Ok(());
+                }
+                record_ai_transport_failure(
+                    &ai_span,
+                    Some(provider.name.as_str()),
+                    &error,
+                    "AI upstream method-aware request failed",
+                );
+                warn!(
+                    error = %error,
+                    method = %method_str,
+                    ai.surface = surface.label(),
+                    "AI proxy: upstream method-aware request failed"
+                );
+                return Err(Error::because(
+                    ErrorType::ConnectError,
+                    "AI upstream request failed",
+                    error,
+                ));
+            }
+        };
         record_ai_provider_response_failure(
             &ai_span,
             provider.name.as_str(),
@@ -2155,12 +2638,6 @@ pub(super) async fn handle_ai_proxy(
                 return Ok(());
             }
         }
-        let primary_idx = router
-            .select_with_policy(&config.providers, allowed_providers, blocked_providers)
-            .ok_or_else(|| {
-                warn!("AI proxy: no enabled providers");
-                Error::new(ErrorType::HTTPStatus(502))
-            })?;
         let mut provider_order = config
             .providers
             .iter()
@@ -2182,16 +2659,25 @@ pub(super) async fn handle_ai_proxy(
                 provider_order = eligible;
             }
         }
+        provider_order = router.eligible_candidate_indices(&config.providers, &provider_order);
+        if provider_order.is_empty() {
+            send_error(session, 503, "no healthy eligible AI provider").await?;
+            return Ok(());
+        }
         let is_failover = matches!(config.routing, sbproxy_ai::RoutingStrategy::FallbackChain);
         if is_failover {
             provider_order
                 .sort_by_key(|&index| config.providers[index].priority.unwrap_or(u32::MAX));
-        } else if let Some(position) = provider_order
-            .iter()
-            .position(|&index| index == primary_idx)
+        } else if let Some(primary_idx) =
+            router.select_with_candidates(&config.providers, &provider_order)
         {
-            let primary = provider_order.remove(position);
-            provider_order.insert(0, primary);
+            if let Some(position) = provider_order
+                .iter()
+                .position(|&index| index == primary_idx)
+            {
+                let primary = provider_order.remove(position);
+                provider_order.insert(0, primary);
+            }
         }
         ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
         ctx.admin_load_balancer_target = provider_order
@@ -2205,6 +2691,17 @@ pub(super) async fn handle_ai_proxy(
                 break;
             }
             let provider = &config.providers[provider_idx];
+            let reservation_id = format!("{}:quota-pool:multipart:{attempt}", ctx.request_id);
+            let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
+                session,
+                config.quota_pool.as_ref(),
+                &quota_pool_admission,
+                &reservation_id,
+            )
+            .await?
+            else {
+                return Ok(());
+            };
             ctx.record_admin_ai_attempt(&provider.name);
             let distributed_managed =
                 crate::server::model_host::distributed_managed_provider(provider);
@@ -2247,6 +2744,7 @@ pub(super) async fn handle_ai_proxy(
                                 preferred_region: preferred_region.as_deref(),
                                 requested_adapter: None,
                                 max_body_bytes: maximum,
+                                quota_attempt,
                             },
                         )
                         .await
@@ -2262,6 +2760,9 @@ pub(super) async fn handle_ai_proxy(
                             Ok(None) => Err(anyhow::anyhow!(
                                 "distributed managed provider did not produce an attempt"
                             )),
+                            Err(crate::server::model_host::ManagedDistributedError::Quota(
+                                error,
+                            )) => Err(anyhow::Error::new(error)),
                             Err(error) => {
                                 if let Some(trace) = error.trace() {
                                     ctx.managed_route_trace = Some(trace.clone());
@@ -2275,12 +2776,13 @@ pub(super) async fn handle_ai_proxy(
                     } else {
                         AI_CLIENT
                             .load()
-                            .forward_bytes(
+                            .forward_bytes_with_quota(
                                 provider,
                                 &method_str,
                                 &path,
                                 forwarded_body.clone(),
                                 &request_content_type,
+                                quota_attempt,
                             )
                             .await
                     }
@@ -2304,6 +2806,11 @@ pub(super) async fn handle_ai_proxy(
                     break;
                 }
                 Err(error) => {
+                    if send_quota_pool_attempt_error(session, config.quota_pool.as_ref(), &error)
+                        .await?
+                    {
+                        return Ok(());
+                    }
                     record_ai_transport_failure(
                         &ai_span,
                         Some(provider.name.as_str()),
@@ -3733,12 +4240,25 @@ pub(super) async fn handle_ai_proxy(
                                 )
                         }) {
                             Some(provider) => {
+                                let reservation_id =
+                                    format!("{}:quota-pool:embedding:provider", ctx.request_id);
+                                let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
+                                    session,
+                                    config.quota_pool.as_ref(),
+                                    &quota_pool_admission,
+                                    &reservation_id,
+                                )
+                                .await?
+                                else {
+                                    return Ok(());
+                                };
                                 let ai_client = AI_CLIENT.load_full();
-                                sbproxy_ai::semantic_cache::compute_embedding(
+                                sbproxy_ai::semantic_cache::compute_embedding_with_quota(
                                     &ai_client,
                                     provider,
                                     cache.model(),
                                     &extracted_prompt,
+                                    quota_attempt,
                                 )
                                 .await
                             }
@@ -3792,9 +4312,22 @@ pub(super) async fn handle_ai_proxy(
                             allowed_providers.is_empty() && blocked_providers.is_empty()
                         }) {
                             Some(oc) => {
-                                sbproxy_ai::semantic_cache::compute_embedding_openai(
+                                let reservation_id =
+                                    format!("{}:quota-pool:embedding:openai", ctx.request_id);
+                                let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
+                                    session,
+                                    config.quota_pool.as_ref(),
+                                    &quota_pool_admission,
+                                    &reservation_id,
+                                )
+                                .await?
+                                else {
+                                    return Ok(());
+                                };
+                                sbproxy_ai::semantic_cache::compute_embedding_openai_with_quota(
                                     oc,
                                     &extracted_prompt,
+                                    quota_attempt,
                                 )
                                 .await
                             }
@@ -3804,6 +4337,13 @@ pub(super) async fn handle_ai_proxy(
                         }
                     }
                 };
+                if let Err(error) = &query_vec_result {
+                    if send_quota_pool_attempt_error(session, config.quota_pool.as_ref(), error)
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                }
                 let source_label: &str = match cache.source() {
                     sbproxy_ai::semantic_cache::EmbeddingSource::Provider => "provider",
                     sbproxy_ai::semantic_cache::EmbeddingSource::Sidecar => "sidecar",
@@ -4059,14 +4599,11 @@ pub(super) async fn handle_ai_proxy(
         .unwrap_or(false);
 
     // Parse retry config from the action config's routing.retry section.
-    // This is done by inspecting the raw handler config.
-    // WOR-1880: a configured quota pool must be allowed to advance past a
-    // denied member to the next candidate even outside failover_chain.
-    let max_attempts = if is_failover || content_policy_fallback || config.quota_pool.is_some() {
-        config.providers.len()
-    } else {
-        1
-    };
+    // This is done by inspecting the raw handler config. Quota membership
+    // follows the caller identity, so switching providers cannot make a
+    // denied member eligible and a quota pool alone never enables failover.
+    let max_attempts =
+        sequential_attempt_limit(is_failover, content_policy_fallback, config.providers.len());
 
     // Build sorted provider list for failover (by priority).
     let mut provider_order: Vec<usize> = config
@@ -4129,28 +4666,11 @@ pub(super) async fn handle_ai_proxy(
             return Ok(());
         }
     }
-
-    // WOR-1973: mirror the final, policy-approved request body only after
-    // guardrails, model rewrites, compression, credential provider policy,
-    // and prompt-training opt-out enforcement have finished. V1 is restricted
-    // to canonical chat evaluation surfaces so mutating APIs such as
-    // Assistants, Batches, and FineTuning are never replayed. Admission is
-    // synchronous and bounded; the upstream work itself is detached, so a
-    // slow, failed, or saturated shadow target cannot delay or reject primary
-    // dispatch. Streaming requests are intentionally skipped.
-    if shadow_surface_is_eligible(&surface) {
-        let shadow_usage = super::ai_support::shadow_usage_record_from_context(ctx);
-        let _shadow_outcome = AI_CLIENT.load().try_spawn_shadow(
-            config,
-            &path,
-            &body,
-            is_stream,
-            allowed_providers,
-            blocked_providers,
-            disallow_training,
-            shadow_usage,
-        );
-    }
+    // Shadow dispatch is deferred until after the primary response so primary
+    // quota wins. Own its policy lists now rather than extending a borrow from
+    // `ctx.principal` across the mutable primary-attempt bookkeeping below.
+    let shadow_allowed_providers = allowed_providers.to_vec();
+    let shadow_blocked_providers = blocked_providers.to_vec();
 
     // WOR-1534: model-based provider routing. When the requested model is
     // declared in one or more providers' `models` lists, restrict the routing
@@ -4162,6 +4682,16 @@ pub(super) async fn handle_ai_proxy(
     // all choose from the model-eligible set.
     if let Some(eligible) = model_eligible_providers(&provider_order, &config.providers, &model) {
         provider_order = eligible;
+    }
+
+    // Intersect the request's final policy/model candidate set with live
+    // resilience state before any strategy can choose or order providers.
+    // This strict path never revives an unhealthy, ejected, or breaker-blocked
+    // provider when the intersection is empty.
+    provider_order = router.eligible_candidate_indices(&config.providers, &provider_order);
+    if provider_order.is_empty() {
+        send_error(session, 503, "no healthy eligible AI provider").await?;
+        return Ok(());
     }
 
     // WOR-797: cost/quality routing. When configured, score the inbound
@@ -4212,21 +4742,24 @@ pub(super) async fn handle_ai_proxy(
     // order; the remaining providers stay as fallbacks. Failover
     // (priority sort above), cascade, and cost_quality manage their own
     // ordering and are left untouched.
+    let routing_prefix = router
+        .is_prefix_affinity()
+        .then(|| {
+            let namespace = body
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(model.as_str());
+            sbproxy_ai::normalize_prefix(&body, namespace)
+        })
+        .flatten();
     if !is_failover && router.cascade_config().is_none() && router.cost_quality_config().is_none() {
-        // WOR-798: prefix-affinity strategies (self-hosted vLLM /
-        // SGLang KV-cache reuse) need the request's prompt prefix
-        // to hash to a sticky upstream. Other strategies ignore the
-        // prefix and select() handles them.
+        // Prefix-affinity consults the bounded observed-holder directory over
+        // the exact candidates this dispatch can run. Other strategies use
+        // their ordinary selection path.
         let primary = if router.is_prefix_affinity() {
-            let prefix = extract_prefix_key(&body, 1024);
-            router.select_with_prefix_policy(
-                &config.providers,
-                &prefix,
-                allowed_providers,
-                blocked_providers,
-            )
+            router.select_with_prefix_candidates(&config.providers, routing_prefix, &provider_order)
         } else {
-            router.select_with_policy(&config.providers, allowed_providers, blocked_providers)
+            router.select_with_candidates(&config.providers, &provider_order)
         };
         if let Some(primary) = primary {
             if let Some(pos) = provider_order.iter().position(|&i| i == primary) {
@@ -4301,9 +4834,10 @@ pub(super) async fn handle_ai_proxy(
         .filter(|_| !disallow_training && !has_managed_local)
     {
         if !is_stream {
+            let cascade_quota_reservation = format!("{}:quota-pool:cascade", ctx.request_id);
             let outcome = AI_CLIENT
                 .load()
-                .forward_cascade_with_policy(
+                .forward_cascade_with_policy_and_quota(
                     config,
                     cascade_cfg,
                     allowed_providers,
@@ -4312,10 +4846,24 @@ pub(super) async fn handle_ai_proxy(
                     &body,
                     &ctx.attribution_tags,
                     surface_label,
+                    &quota_pool_admission,
+                    &cascade_quota_reservation,
                 )
                 .await;
             match outcome {
                 Ok(o) => {
+                    try_spawn_governed_shadow_after_primary(
+                        config,
+                        &surface,
+                        &path,
+                        &body,
+                        is_stream,
+                        &shadow_allowed_providers,
+                        &shadow_blocked_providers,
+                        disallow_training,
+                        ctx,
+                        &quota_pool_admission,
+                    );
                     ctx.admin_load_balancer_target = Some(o.provider_name.clone());
                     for provider in &o.attempted_providers {
                         ctx.record_admin_ai_attempt(provider);
@@ -4365,6 +4913,17 @@ pub(super) async fn handle_ai_proxy(
                     .await;
                 }
                 Err(e) => {
+                    if let (Some(error), Some(pool)) = (
+                        e.downcast_ref::<sbproxy_ai::PoolError>(),
+                        config.quota_pool.as_ref(),
+                    ) {
+                        if let QuotaPoolErrorDisposition::Reject { status, message } =
+                            quota_pool_error_disposition(pool, error)
+                        {
+                            send_error(session, status, message).await?;
+                            return Ok(());
+                        }
+                    }
                     warn!(
                         error = %e,
                         "AI proxy: cascade dispatch failed; returning 502"
@@ -4398,10 +4957,15 @@ pub(super) async fn handle_ai_proxy(
         router.is_race() && !is_stream && provider_order.len() >= 2 && !has_managed_local;
     if race_mode {
         use futures::stream::{FuturesUnordered, StreamExt as _};
+        enum RacedAttemptError {
+            Upstream(anyhow::Error),
+            Quota(QuotaPoolErrorDisposition),
+        }
+
         let client = AI_CLIENT.load();
         let race_start = std::time::Instant::now();
         let mut futs = FuturesUnordered::new();
-        for &idx in &provider_order {
+        for (race_attempt, &idx) in provider_order.iter().enumerate() {
             let provider = &config.providers[idx];
             let mut attempt_body = body.clone();
             if !model.is_empty() {
@@ -4413,13 +4977,31 @@ pub(super) async fn handle_ai_proxy(
             let path_ref = path.as_str();
             let cl = &client;
             let attempt_router = std::sync::Arc::clone(&router);
+            let quota_config = config.quota_pool.as_ref();
+            let quota_admission = quota_pool_admission.clone();
+            let quota_reservation_id = format!("{}:quota-pool:race:{race_attempt}", ctx.request_id);
             futs.push(async move {
+                let quota_attempt = match reserve_quota_pool_attempt(
+                    quota_config,
+                    &quota_admission,
+                    &quota_reservation_id,
+                )
+                .await
+                {
+                    Ok(attempt) => attempt,
+                    Err(rejection) => return (idx, Err(RacedAttemptError::Quota(rejection))),
+                };
                 let r = run_routed_provider_attempt(
                     &attempt_router,
                     idx,
-                    cl.forward_request(provider, path_ref, &attempt_body),
+                    cl.forward_request_with_quota(provider, path_ref, &attempt_body, quota_attempt),
                 )
-                .await;
+                .await
+                .map_err(|error| {
+                    quota_pool_error_from_attempt(quota_config, &error)
+                        .map(RacedAttemptError::Quota)
+                        .unwrap_or(RacedAttemptError::Upstream(error))
+                });
                 (idx, r)
             });
         }
@@ -4429,6 +5011,7 @@ pub(super) async fn handle_ai_proxy(
         // synthetic one when every candidate fails.
         let mut winner: Option<(usize, reqwest::Response)> = None;
         let mut fallback: Option<(usize, reqwest::Response)> = None;
+        let mut quota_rejection = None;
         while let Some((idx, res)) = futs.next().await {
             match res {
                 Ok(resp) => {
@@ -4451,13 +5034,16 @@ pub(super) async fn handle_ai_proxy(
                         fallback = Some((idx, resp));
                     }
                 }
-                Err(e) => {
+                Err(RacedAttemptError::Upstream(e)) => {
                     sbproxy_observe::metrics::record_provider_attempt(
                         &config.providers[idx].name,
                         "error",
                     );
                     last_error_type = ai_transport_error_type(&e);
                     last_error = Some(e);
+                }
+                Err(RacedAttemptError::Quota(rejection)) => {
+                    quota_rejection = Some(rejection);
                 }
             }
         }
@@ -4506,6 +5092,11 @@ pub(super) async fn handle_ai_proxy(
                 .and_then(|u| u.host_str().map(|h| h.to_string()));
             last_provider_name = provider.name.to_string();
             last_resp = Some(resp);
+        } else if last_error.is_none() {
+            if let Some(QuotaPoolErrorDisposition::Reject { status, message }) = quota_rejection {
+                send_error(session, status, message).await?;
+                return Ok(());
+            }
         }
     }
 
@@ -4617,33 +5208,6 @@ pub(super) async fn handle_ai_proxy(
         }
         let provider = &resolved_provider;
 
-        // WOR-1880: fair-share pool reservation. A deny advances to the
-        // next candidate rather than failing the whole request when
-        // alternatives remain.
-        let mut quota_reservation = None;
-        if let (Some(store), Some(pool_name)) =
-            (quota_pool_store.as_ref(), quota_pool_name.as_deref())
-        {
-            match sbproxy_ai::QuotaReservationGuard::reserve(
-                std::sync::Arc::clone(store),
-                pool_name,
-                provider.name.as_str(),
-                1,
-            ) {
-                Ok(guard) => quota_reservation = Some(guard),
-                Err(deny) => {
-                    debug!(
-                        provider = %provider.name,
-                        pool = %pool_name,
-                        deny = ?deny,
-                        attempt = %attempt,
-                        "AI proxy: quota pool denied provider; trying next candidate"
-                    );
-                    continue;
-                }
-            }
-        }
-
         // Map model name for this provider.
         let mut attempt_body = body.clone();
         let resolved_model = if !model.is_empty() {
@@ -4754,6 +5318,21 @@ pub(super) async fn handle_ai_proxy(
             None => None,
         };
 
+        // Reserve one shared-quota unit after local validation. The selected
+        // transport commits it immediately before bytes can leave the
+        // process; any local preparation failure drops and releases it.
+        let quota_reservation_id = format!("{}:quota-pool:attempt:{attempt}", ctx.request_id);
+        let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
+            session,
+            config.quota_pool.as_ref(),
+            &quota_pool_admission,
+            &quota_reservation_id,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
         ctx.record_admin_ai_attempt(&provider.name);
         let attempt_start = std::time::Instant::now();
         // WOR-1103: wrap each upstream attempt in its own span so a
@@ -4819,6 +5398,7 @@ pub(super) async fn handle_ai_proxy(
                                     preferred_region: preferred_region.as_deref(),
                                     requested_adapter: requested_adapter.as_deref(),
                                     max_body_bytes: maximum,
+                                    quota_attempt,
                                 },
                             )
                             .instrument(attempt_span)
@@ -4834,6 +5414,9 @@ pub(super) async fn handle_ai_proxy(
                                 Ok(None) => Err(anyhow::anyhow!(
                                     "distributed managed provider did not produce an attempt"
                                 )),
+                                Err(crate::server::model_host::ManagedDistributedError::Quota(
+                                    error,
+                                )) => Err(anyhow::Error::new(error)),
                                 Err(error) => {
                                     if let Some(trace) = error.trace() {
                                         ctx.managed_route_trace = Some(trace.clone());
@@ -4852,17 +5435,23 @@ pub(super) async fn handle_ai_proxy(
                         if let Some((bypass_body, native_path)) = upstream_call {
                             AI_CLIENT
                                 .load()
-                                .forward_native_bypass(
+                                .forward_native_bypass_with_quota(
                                     provider,
                                     &method_str,
                                     native_path,
                                     bypass_body,
+                                    quota_attempt,
                                 )
                                 .await
                         } else {
                             AI_CLIENT
                                 .load()
-                                .forward_request(provider, &path, &attempt_body)
+                                .forward_request_with_quota(
+                                    provider,
+                                    &path,
+                                    &attempt_body,
+                                    quota_attempt,
+                                )
                                 .await
                         }
                     }
@@ -4980,6 +5569,18 @@ pub(super) async fn handle_ai_proxy(
                         continue;
                     }
                     sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
+                    try_spawn_governed_shadow_after_primary(
+                        config,
+                        &surface,
+                        &path,
+                        &body,
+                        is_stream,
+                        &shadow_allowed_providers,
+                        &shadow_blocked_providers,
+                        disallow_training,
+                        ctx,
+                        &quota_pool_admission,
+                    );
                     let extras = public_route_headers(ctx);
                     return send_response_with_extras(
                         session,
@@ -5039,13 +5640,18 @@ pub(super) async fn handle_ai_proxy(
                     upstream_secs,
                 );
                 last_provider_name = provider.name.to_string();
-                if let Some(guard) = quota_reservation.take() {
-                    guard.settle(sbproxy_ai::PoolUsage { units: 1 });
+                if (200..300).contains(&status) {
+                    if let Some(prefix) = routing_prefix {
+                        router.record_prefix(provider_idx, prefix);
+                    }
                 }
                 last_resp = Some(resp);
                 break;
             }
             Err(e) => {
+                if send_quota_pool_attempt_error(session, config.quota_pool.as_ref(), &e).await? {
+                    return Ok(());
+                }
                 // WOR-1103: a transport-level failure is an attempt
                 // outcome too; count it per provider.
                 sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
@@ -5088,6 +5694,18 @@ pub(super) async fn handle_ai_proxy(
     }
 
     if let Some(resp) = last_resp {
+        try_spawn_governed_shadow_after_primary(
+            config,
+            &surface,
+            &path,
+            &body,
+            is_stream,
+            &shadow_allowed_providers,
+            &shadow_blocked_providers,
+            disallow_training,
+            ctx,
+            &quota_pool_admission,
+        );
         if is_stream {
             // SSE streaming with idempotency engaged: drop the capture
             // (releases the per-origin pool permit) and abandon
@@ -5744,6 +6362,11 @@ pub(super) async fn relay_ai_response_with_cache(
     if (200..300).contains(&status) {
         record_ai_response_span_metadata(&ai_span, &resp_body);
     }
+    // The upstream has already performed and billed this generation. Feed the
+    // router before output guardrails or any later relay branch can return
+    // early, then omit token recording from the mutually exclusive budget
+    // branches below so every completed response is counted exactly once.
+    record_router_tokens_from_response(&router_sink, status, &resp_body);
 
     // --- WOR-1141: enforce OUTPUT guardrails ---
     //
@@ -6027,12 +6650,6 @@ pub(super) async fn relay_ai_response_with_cache(
                     }
                 }
             }
-            // WOR-798: feed the router's per-provider token counter
-            // so the `LeastTokenUsage` / `TokenRate` strategies see
-            // the load this provider just absorbed. The minute
-            // window resets via the existing `reset_tokens` ticker
-            // (sbproxy-ai/src/routing.rs).
-            router_sink.record(budget_prompt_tokens + budget_completion_tokens);
             record_budget_usage(
                 args.config,
                 args.keys,
@@ -6180,21 +6797,6 @@ pub(super) async fn relay_ai_response_with_cache(
                         .await;
                 }
             }
-            // WOR-798: feed the router's per-provider token counter
-            // even on no-budget origins. The previous wire only
-            // fired when `budget_recorder` was Some, which made
-            // `LeastTokenUsage` invisible to origins that opted out
-            // of budgets. The wire is independent of budgeting.
-            router_sink.record(prompt_tokens + completion_tokens);
-        }
-    } else {
-        // No budget AND no ctx (rare; the dispatch path almost always
-        // hands one). Still record router observations off the
-        // upstream usage block so the router stays accurate for
-        // unattached requests.
-        if (200..300).contains(&status) {
-            let (prompt_tokens, completion_tokens) = extract_usage(&resp_body);
-            router_sink.record(prompt_tokens + completion_tokens);
         }
     }
 
@@ -6605,6 +7207,17 @@ impl<'a> RouterTokenSink<'a> {
     fn record(&self, tokens: u64) {
         self.router
             .record_tokens_for_provider(self.config_providers, self.provider_name, tokens);
+    }
+}
+
+fn record_router_tokens_from_response(
+    router_sink: &RouterTokenSink<'_>,
+    status: u16,
+    response_body: &[u8],
+) {
+    if (200..300).contains(&status) {
+        let (prompt_tokens, completion_tokens) = extract_usage(response_body);
+        router_sink.record(prompt_tokens.saturating_add(completion_tokens));
     }
 }
 
@@ -8316,7 +8929,9 @@ pub(super) async fn relay_ai_stream(
 }
 
 /// WOR-798: extract a stable prefix key from an AI chat / completion
-/// request body for prefix-affinity routing. Preference order:
+/// request body for distributed managed-replica placement. The ordinary
+/// provider router uses `sbproxy_ai::normalize_prefix` instead. Preference
+/// order:
 ///
 /// 1. `body["messages"]` - the chat history is the prefix that
 ///    matters for KV-cache reuse on vLLM / SGLang. Two requests
@@ -8329,8 +8944,7 @@ pub(super) async fn relay_ai_stream(
 /// the leading bytes (which is exactly what KV-cache reuse needs;
 /// the divergent tail is the new tokens that won't be cached
 /// anyway). Returns an empty `Vec<u8>` when no JSON-serialisable
-/// prefix exists, in which case `select_with_prefix` falls back to
-/// round-robin so body-less requests do not herd onto one upstream.
+/// prefix exists.
 fn extract_prefix_key(body: &serde_json::Value, max_bytes: usize) -> Vec<u8> {
     let source = body
         .get("messages")

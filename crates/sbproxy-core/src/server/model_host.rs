@@ -2187,6 +2187,8 @@ pub struct ManagedDistributedRequest<'a> {
     pub requested_adapter: Option<&'a str>,
     /// Maximum engine-facing request body size.
     pub max_body_bytes: usize,
+    /// Reserved quota unit committed only when a managed transport sends.
+    pub quota_attempt: sbproxy_ai::quota_pool::QuotaPoolAttemptGuard,
 }
 
 /// Selected distributed response and its public route identity.
@@ -2219,6 +2221,9 @@ pub enum ManagedDistributedError {
     /// Every safe current replica attempt failed.
     #[error(transparent)]
     Dispatch(#[from] crate::model_plane::ManagedDispatchFailure),
+    /// Quota settlement failed at the managed transport boundary.
+    #[error(transparent)]
+    Quota(#[from] sbproxy_ai::quota_pool::PoolError),
 }
 
 impl ManagedDistributedError {
@@ -2228,6 +2233,7 @@ impl ManagedDistributedError {
             Self::Resolution(_) => None,
             Self::ColdStartFallback { trace } => Some(trace),
             Self::Dispatch(failure) => Some(&failure.trace),
+            Self::Quota(_) => None,
         }
     }
 
@@ -2243,7 +2249,7 @@ impl ManagedDistributedError {
             {
                 Some("no_eligible_replica")
             }
-            Self::Resolution(_) | Self::Dispatch(_) => None,
+            Self::Resolution(_) | Self::Dispatch(_) | Self::Quota(_) => None,
         }
     }
 }
@@ -2289,6 +2295,7 @@ struct ProductionManagedReplicaExecutor {
     content_type: Option<String>,
     priority: sbproxy_model_host::PriorityClass,
     max_body_bytes: usize,
+    quota: crate::model_plane::ModelPlaneQuotaAttempt,
 }
 
 #[async_trait]
@@ -2331,11 +2338,22 @@ impl ProductionManagedReplicaExecutor {
             &execution.engine_model,
             self.max_body_bytes,
         )?;
-        let target = format!("{}{}", execution.base_url, self.path);
+        let target = reqwest::Url::parse(&format!("{}{}", execution.base_url, self.path)).map_err(
+            |error| crate::model_plane::ModelPlaneError::InvalidConfiguration(error.to_string()),
+        )?;
+        let content_type = self
+            .content_type
+            .as_deref()
+            .map(reqwest::header::HeaderValue::from_str)
+            .transpose()
+            .map_err(|error| {
+                crate::model_plane::ModelPlaneError::InvalidConfiguration(error.to_string())
+            })?;
         let mut request = managed_loopback_client().post(target).body(body);
-        if let Some(content_type) = self.content_type.as_deref() {
+        if let Some(content_type) = content_type {
             request = request.header(reqwest::header::CONTENT_TYPE, content_type);
         }
+        self.quota.commit().await?;
         let response = request
             .send()
             .await
@@ -2406,8 +2424,9 @@ impl ProductionManagedReplicaExecutor {
                 },
             ),
         };
-        let response = crate::model_plane::ModelPlaneClient::new(security)
-            .dispatch(endpoint, &signed, self.body.clone())
+        let client = crate::model_plane::ModelPlaneClient::new(security);
+        let response = client
+            .dispatch_with_quota(endpoint, &signed, self.body.clone(), &self.quota)
             .await?;
         Ok(crate::model_plane::ManagedAttemptResponse::without_permit(
             response.into(),
@@ -2748,17 +2767,21 @@ pub async fn distributed_managed_upstream(
         content_type: request.content_type.map(str::to_string),
         priority: request.priority,
         max_body_bytes: request.max_body_bytes,
+        quota: crate::model_plane::ModelPlaneQuotaAttempt::new(request.quota_attempt),
     };
     let deployment = deployment_id;
-    match crate::model_plane::dispatch_managed_candidates(
+    let dispatch = crate::model_plane::dispatch_managed_candidates(
         selection,
         &executor,
         request.tenant_id,
         request.governed_key_id,
         request.policy_revision,
     )
-    .await
-    {
+    .await;
+    if let Some(error) = executor.quota.error().await {
+        return Err(ManagedDistributedError::Quota(error));
+    }
+    match dispatch {
         Ok(outcome) => {
             record_managed_route_trace(request.provider.name.as_str(), &deployment, &outcome.trace);
             Ok(Some(ManagedDistributedUpstream {
@@ -2958,6 +2981,112 @@ pub(crate) fn test_runtime_with_job_store(cache_root: &Path) -> ProductionModelR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingManagedQuotaStore {
+        settled: tokio::sync::Mutex<Vec<String>>,
+        released: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_ai::quota_pool::QuotaPoolStore for RecordingManagedQuotaStore {
+        async fn reserve(
+            &self,
+            pool: &str,
+            member: &str,
+            units: u64,
+            reservation_id: &str,
+        ) -> Result<sbproxy_ai::quota_pool::QuotaReservation, sbproxy_ai::quota_pool::PoolError>
+        {
+            Ok(sbproxy_ai::quota_pool::QuotaReservation {
+                pool: pool.to_string(),
+                member: member.to_string(),
+                units,
+                reservation_id: reservation_id.to_string(),
+            })
+        }
+
+        async fn reconcile(
+            &self,
+            reservation: sbproxy_ai::quota_pool::QuotaReservation,
+            _actual: sbproxy_ai::quota_pool::PoolUsage,
+        ) -> Result<(), sbproxy_ai::quota_pool::PoolError> {
+            self.settled.lock().await.push(reservation.reservation_id);
+            Ok(())
+        }
+
+        async fn release(
+            &self,
+            reservation: sbproxy_ai::quota_pool::QuotaReservation,
+        ) -> Result<(), sbproxy_ai::quota_pool::PoolError> {
+            self.released.lock().await.push(reservation.reservation_id);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn distributed_managed_preflight_exit_releases_uncommitted_quota() {
+        let pool_config: sbproxy_ai::quota_pool::QuotaPoolConfig =
+            serde_json::from_value(serde_json::json!({
+                "name": "managed-preflight",
+                "total_limit": 10,
+                "weights": {"virtual-key-a": 1},
+                "policy": "burst"
+            }))
+            .expect("quota fixture");
+        let recording = Arc::new(RecordingManagedQuotaStore::default());
+        let store: Arc<dyn sbproxy_ai::quota_pool::QuotaPoolStore> = recording.clone();
+        let admission = sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
+            Some(pool_config),
+            Ok(Some(store)),
+            Ok("virtual-key-a".to_string()),
+        );
+        let quota_attempt = admission
+            .reserve_attempt("managed-preflight-attempt")
+            .await
+            .expect("quota reservation");
+        let provider: sbproxy_ai::provider::ProviderConfig =
+            serde_json::from_value(serde_json::json!({
+                "name": "managed-preflight-no-route",
+                "provider_type": "managed_model",
+                "deployment": "managed-preflight-no-deployment",
+                "api_key": null
+            }))
+            .expect("managed provider fixture");
+
+        let _ = distributed_managed_upstream(ManagedDistributedRequest {
+            origin: "managed-preflight-no-origin",
+            provider: &provider,
+            requested_model: Some("managed-preflight-no-model"),
+            request_id: "managed-preflight-request",
+            tenant_id: "tenant-a",
+            governed_key_id: "virtual-key-a",
+            policy_revision: "revision-a",
+            path: "/v1/chat/completions",
+            body: Bytes::from_static(br#"{"model":"managed-preflight-no-model"}"#),
+            content_type: Some("application/json"),
+            priority: sbproxy_model_host::PriorityClass::Standard,
+            prefix_key: b"managed-preflight",
+            preferred_region: None,
+            requested_adapter: None,
+            max_body_bytes: 1024,
+            quota_attempt,
+        })
+        .await;
+
+        for _ in 0..16 {
+            if !recording.released.lock().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            recording.released.lock().await.as_slice(),
+            ["managed-preflight-attempt"]
+        );
+        assert!(recording.settled.lock().await.is_empty());
+        tokio::task::yield_now().await;
+    }
 
     #[test]
     fn prompt_token_fit_reserves_room_to_generate() {

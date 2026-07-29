@@ -83,7 +83,7 @@ dependencies = [
  "rand 0.8.6",
  "rand_distr",
  "sbproxy-ai",
- "sha2 0.10.9",
+ "serde_json",
 ]
 
 [[package]]
@@ -3970,7 +3970,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy-observe"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

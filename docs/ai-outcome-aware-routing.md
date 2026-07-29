@@ -1,5 +1,5 @@
 # Outcome-aware routing
-*Last modified: 2026-06-24*
+*Last modified: 2026-07-28*
 
 The latency- and cost-aware routing strategies decide from live signals or
 static catalog price. None of them consume the *realized* outcome of a
@@ -46,11 +46,25 @@ avoided. Selection routes to the lowest-scoring eligible provider.
 
 ## Warm-up
 
-While any candidate has fewer than a handful of samples, the strategy
-round-robins so every provider earns an estimate before the store commits
-to the cheapest-per-success one. A fresh deployment therefore behaves
-exactly like round-robin until it has data, which makes the strategy safe
-to enable with no other change.
+Warm-up blends learned selection with deterministic round-robin rather than
+switching all at once. Let `n` be the smallest sample count among the eligible
+candidates, capped at five. In each repeating five-selection schedule, `n`
+selections use the learned score and `5 - n` selections round-robin:
+
+| Least-observed candidate | Learned selections | Round-robin selections |
+| --- | --- | --- |
+| 0 samples | 0 of 5 | 5 of 5 |
+| 1 sample | 1 of 5 | 4 of 5 |
+| 2 samples | 2 of 5 | 3 of 5 |
+| 3 samples | 3 of 5 | 2 of 5 |
+| 4 samples | 4 of 5 | 1 of 5 |
+| 5 or more samples | 5 of 5 | 0 of 5 |
+
+A fresh process therefore starts with pure round-robin. The first observation
+from every candidate begins contributing learned choices without starving
+exploration. The schedule uses the router's counter, so it is deterministic
+for a fixed request order. Round-robin branches increment
+`sbproxy_ai_routing_fallbacks_total{strategy="outcome_aware",reason="warmup"}`.
 
 ## Behavior
 
@@ -60,8 +74,17 @@ to enable with no other change.
 - Between two healthy providers, the one with the lower realized
   cost-per-success wins, which is not always the lower list price.
 
-The feedback store is process-wide and keyed by provider name, so it
-survives a config hot reload and is shared across an origin's deployments.
+The feedback store is process-wide and keyed by provider name. Replacing a
+handler during a config hot reload does not discard its observations, so a
+new router immediately sees the same learned scores. Restarting the process
+does reset the store. Changing a provider name also creates a new feedback
+identity.
+
+The store is not a cluster-wide ledger. Each gateway process learns from its
+own completed calls. It exposes read-only per-provider snapshots containing
+sample count, accumulated latency-sensitive reward, realized cost, success,
+refusal, and latency aggregates. Future bandit strategies can consume that
+same snapshot instead of building a second feedback pipeline.
 
 ## Try it
 

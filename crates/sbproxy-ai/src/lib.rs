@@ -44,6 +44,7 @@ pub mod ratelimit;
 pub mod realtime;
 pub mod routing;
 pub mod routing_feedback;
+pub mod routing_state;
 pub mod semantic_cache;
 pub mod session;
 pub mod token_estimate;
@@ -87,15 +88,20 @@ pub use providers::{
 };
 pub use quota_pool::{
     rank_by_fair_share, reserve_next_candidate, validate_quota_pool_config, LocalQuotaPool,
-    OverShareRecord, PoolDeny, PoolUsage, QuotaPoolConfig, QuotaPoolConfigError,
-    QuotaPoolConsistency, QuotaPoolDimension, QuotaPoolPolicy, QuotaPoolStore, QuotaReservation,
-    QuotaReservationGuard,
+    OverShareRecord, PoolDeny, PoolError, PoolUsage, QuotaPoolAdmission, QuotaPoolAttemptGuard,
+    QuotaPoolConfig, QuotaPoolConfigError, QuotaPoolConsistency, QuotaPoolDimension,
+    QuotaPoolFailureMode, QuotaPoolPolicy, QuotaPoolStore, QuotaReservation, QuotaReservationGuard,
+    SharedQuotaPool,
 };
 pub use ratelimit::{
     Admission, ModelRateConfig, ModelRateLimiter, RejectReason, Rejection, SurfaceRateConfig,
     SurfaceRateLimiter, DEFAULT_ESTIMATED_TOKENS, DEFAULT_MAX_KEYS,
 };
 pub use routing::{FilteredSelectionFallback, PeakEwmaConfig, Router, RoutingStrategy};
+pub use routing_state::{
+    normalize_prefix, PrefixAffinityConfig, PrefixAffinityConfigError, PrefixDigest,
+    ReplicaRoutingState,
+};
 pub use semantic_cache::{
     CachedAiResponse, CachedHttpResponse, EmbeddingCache, EmbeddingCacheConfig, EmbeddingHit,
     SemanticCache,

@@ -215,6 +215,75 @@ static AI_LB_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// AI routing decisions that intentionally use a fallback path.
+///
+/// `strategy` comes from the closed routing enum. `reason` is normalized by
+/// [`record_routing_fallback`] so request data cannot create new series.
+static AI_ROUTING_FALLBACKS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_routing_fallbacks_total",
+            "AI routing selections that used an explicit fallback path"
+        ),
+        &["strategy", "reason"]
+    )
+    .unwrap()
+});
+
+/// Prefix-affinity selections by observed-cache outcome.
+static AI_PREFIX_AFFINITY_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_prefix_affinity_decisions_total",
+            "Prefix-affinity selections by cache-location outcome"
+        ),
+        &["outcome"]
+    )
+    .unwrap()
+});
+
+/// Bounded prefix-table evictions by cause.
+static AI_PREFIX_AFFINITY_EVICTIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_prefix_affinity_evictions_total",
+            "Entries evicted from the bounded prefix-affinity table"
+        ),
+        &["reason"]
+    )
+    .unwrap()
+});
+
+/// Distributed quota-pool admissions allowed during backend unavailability.
+///
+/// Pool names are operator-declared config values. Virtual-key identities are
+/// deliberately excluded from this family.
+static AI_QUOTA_POOL_FAIL_OPEN: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_quota_pool_fail_open_total",
+            "Quota-pool admissions allowed while the shared backend was unavailable"
+        ),
+        &["pool"]
+    )
+    .unwrap()
+});
+
+/// Soft-policy quota-pool admissions beyond a member's entitlement.
+///
+/// Pool names are operator-declared config values. Caller identities are
+/// deliberately excluded from this family.
+static AI_QUOTA_POOL_OVERSHARE: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_quota_pool_overshare_total",
+            "Soft quota-pool admissions beyond a member entitlement"
+        ),
+        &["pool"]
+    )
+    .unwrap()
+});
+
 static AI_GUARDRAIL_BLOCKS: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(
@@ -660,6 +729,52 @@ pub fn record_lb_decision(strategy: &str, provider: &str) {
     AI_LB_DECISIONS
         .with_label_values(&[strategy, provider])
         .inc();
+}
+
+/// Record an intentional routing fallback.
+///
+/// Reasons are a closed vocabulary shared by the outcome-aware and
+/// prefix-affinity strategies.
+pub fn record_routing_fallback(strategy: &str, reason: &str) {
+    let reason = match reason {
+        "warmup" | "missing_signal" | "no_holder" | "no_feedback" => reason,
+        _ => "unknown",
+    };
+    AI_ROUTING_FALLBACKS
+        .with_label_values(&[strategy, reason])
+        .inc();
+}
+
+/// Record whether prefix affinity found a live holder or used a fallback.
+pub fn record_prefix_affinity_decision(outcome: &str) {
+    let outcome = match outcome {
+        "hit" | "miss" | "missing_signal" => outcome,
+        _ => "unknown",
+    };
+    AI_PREFIX_AFFINITY_DECISIONS
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Record removal from the bounded prefix table.
+pub fn record_prefix_affinity_eviction(reason: &str) {
+    let reason = match reason {
+        "ttl" | "capacity" => reason,
+        _ => "unknown",
+    };
+    AI_PREFIX_AFFINITY_EVICTIONS
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Record an admission that bypassed a failed shared quota backend.
+pub fn record_quota_pool_fail_open(pool: &str) {
+    AI_QUOTA_POOL_FAIL_OPEN.with_label_values(&[pool]).inc();
+}
+
+/// Record a soft-policy admission beyond a member's weighted entitlement.
+pub fn record_quota_pool_overshare(pool: &str) {
+    AI_QUOTA_POOL_OVERSHARE.with_label_values(&[pool]).inc();
 }
 
 /// Record a streaming time-to-first-token observation, in seconds.
@@ -1754,6 +1869,79 @@ mod tests {
             assert!(
                 reasons.contains(expected),
                 "missing failover reason {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn routing_depth_counters_register_bounded_labels_and_increment() {
+        record_routing_fallback("outcome_aware", "warmup");
+        record_routing_fallback("outcome_aware", "operator-controlled");
+        record_prefix_affinity_decision("hit");
+        record_prefix_affinity_decision("operator-controlled");
+        record_prefix_affinity_eviction("ttl");
+        record_prefix_affinity_eviction("operator-controlled");
+        record_quota_pool_fail_open("shared-upstream");
+        record_quota_pool_overshare("shared-upstream");
+
+        let families = prometheus::gather();
+        let expected = [
+            (
+                "sbproxy_ai_routing_fallbacks_total",
+                vec![("strategy", "outcome_aware"), ("reason", "warmup")],
+            ),
+            (
+                "sbproxy_ai_prefix_affinity_decisions_total",
+                vec![("outcome", "hit")],
+            ),
+            (
+                "sbproxy_ai_prefix_affinity_evictions_total",
+                vec![("reason", "ttl")],
+            ),
+            (
+                "sbproxy_ai_quota_pool_fail_open_total",
+                vec![("pool", "shared-upstream")],
+            ),
+            (
+                "sbproxy_ai_quota_pool_overshare_total",
+                vec![("pool", "shared-upstream")],
+            ),
+        ];
+
+        for (name, labels) in expected {
+            let family = families
+                .iter()
+                .find(|family| family.name() == name)
+                .unwrap_or_else(|| panic!("{name} must be registered"));
+            assert!(
+                family.get_metric().iter().any(|metric| {
+                    labels.iter().all(|(label_name, label_value)| {
+                        metric.get_label().iter().any(|label| {
+                            label.name() == *label_name && label.value() == *label_value
+                        })
+                    }) && metric.get_counter().value() >= 1.0
+                }),
+                "{name} must contain the expected incremented label set"
+            );
+        }
+
+        for (name, label_name) in [
+            ("sbproxy_ai_routing_fallbacks_total", "reason"),
+            ("sbproxy_ai_prefix_affinity_decisions_total", "outcome"),
+            ("sbproxy_ai_prefix_affinity_evictions_total", "reason"),
+        ] {
+            let family = families
+                .iter()
+                .find(|family| family.name() == name)
+                .expect("metric family registered above");
+            assert!(
+                family.get_metric().iter().any(|metric| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == label_name && label.value() == "unknown")
+                }),
+                "{name} must normalize unexpected label values"
             );
         }
     }
