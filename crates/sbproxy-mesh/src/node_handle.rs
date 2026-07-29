@@ -1,7 +1,7 @@
 //! Live handle returned by [`crate::bootstrap::bootstrap`].
 //!
 //! Bundles the cluster-wide distributed cache with the local node identity and
-//! the snapshot of peers discovered at bootstrap time. Enterprise consumers
+//! the snapshot of peers discovered at bootstrap time. Optional consumers
 //! (semantic cache, rate-limit, etc.) clone the `Arc<DistributedCache<_>>` to
 //! route reads/writes through the mesh without depending on the bootstrap
 //! call site.
@@ -33,7 +33,7 @@ pub struct MeshNode {
     pub peers: Vec<String>,
 
     /// Cluster-wide distributed cache, keyed by `String`, value `Bytes`.
-    /// Enterprise consumers (e.g. `MeshSemanticCacheStore`) clone this `Arc`
+    /// Consumers (e.g. `MeshSemanticCacheStore`) clone this `Arc`
     /// to dispatch reads/writes through the mesh.
     pub distributed_cache: Arc<DistributedCache<Bytes>>,
 

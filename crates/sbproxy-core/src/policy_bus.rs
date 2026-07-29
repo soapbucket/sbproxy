@@ -10,7 +10,7 @@
 //! In OSS the consumer is a stub that drops events to stderr as
 //! JSON-lines; this is sufficient for local dev and gives operators
 //! a way to inspect decisions without provisioning a NATS cluster.
-//! Enterprise replaces the stub with a NATS-backed audit-chain
+//! An extension can replace the stub with a NATS-backed audit-chain
 //! consumer that hash-chains and KMS-signs Merkle roots downstream.
 //!
 //! Backpressure: the producer side bounds the in-memory queue at
@@ -28,7 +28,7 @@ use tokio::sync::mpsc;
 pub type PolicyBus = mpsc::Sender<PolicyVerdictEvent>;
 
 /// Receiver half of the policy verdict audit bus. The OSS stub
-/// consumes this; enterprise wraps it with the NATS bridge.
+/// consumes this; an extension can wrap it with a NATS bridge.
 pub type PolicyVerdictReceiver = mpsc::Receiver<PolicyVerdictEvent>;
 
 /// Default channel capacity. Sized at 10 000 events per the
@@ -96,9 +96,9 @@ const MAX_AUDIT_LINE_BYTES: usize = 64 * 1024;
 ///
 /// The output format matches the on-wire shape of
 /// `PolicyVerdictEvent`, so an operator who pipes stderr through
-/// `jq` or a structured-log shipper sees the same payload the
-/// enterprise consumer would receive on NATS. Production: enterprise
-/// extends this with the NATS subscriber that does hash-chained
+/// `jq` or a structured-log shipper sees the same payload an external
+/// consumer would receive on NATS. A production extension can add a
+/// NATS subscriber that does hash-chained
 /// Merkle commits.
 pub async fn drain_to_stderr(mut rx: PolicyVerdictReceiver) {
     while let Some(event) = rx.recv().await {
@@ -107,7 +107,7 @@ pub async fn drain_to_stderr(mut rx: PolicyVerdictReceiver) {
                 // Stderr is the audit-event channel for the OSS
                 // stub. Operators who want a different sink wrap
                 // the stub binary or replace this consumer at the
-                // enterprise extension point. We deliberately use
+                // policy-bus extension point. We deliberately use
                 // `eprintln!` rather than the tracing subscriber
                 // so the audit emission survives even when log
                 // sampling is on for the broader proxy. This is

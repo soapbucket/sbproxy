@@ -162,7 +162,7 @@ Storage backends you configure (Postgres, ClickHouse, and similar systems) are r
 We track open hardening items publicly. As of the latest release:
 
 - **Streaming SSE response capture in the semantic cache** is intentionally bypassed. See `SUPPLY-CHAIN.md` for the rationale and the framing-aware capture roadmap (Q3 2026).
-- **First-party prompt-injection detection** is heuristic. For strict use cases, integrate a supported guardrail vendor (Aporia, Lakera, Model Armor, Patronus, Pangea, or CrowdStrike).
+- **First-party prompt-injection detection** is heuristic. For strict use cases, integrate an external guardrail service.
 - **Reproducible builds** are deterministic at the dependency-graph level: the committed `Cargo.lock` pins every dependency version and CI builds with `--locked`. The toolchain is a fixed Rust release channel installed in CI, and the workspace minimum is declared in `Cargo.toml` (`rust-version`). Bit-for-bit reproducibility across builders, including an exact pinned toolchain version, is on the roadmap; we publish CI verification status as it lands.
 
 ---

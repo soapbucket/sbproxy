@@ -89,7 +89,7 @@ pub trait PipelineLifecycleHook: Send + Sync {
 
 /// Input to [`PromptClassifierHook::classify_prompt`].
 ///
-/// Carries the fields the enterprise classifier needs to label the prompt
+/// Carries the fields a classifier needs to label the prompt
 /// (origin id, model id, prompt text, and relevant request headers).
 #[derive(Debug, Clone)]
 pub struct ClassifyRequest {
@@ -117,7 +117,7 @@ pub struct ClassifyRequest {
     pub headers: HashMap<String, String>,
 }
 
-/// Labels + confidence returned by the enterprise classifier.
+/// Labels and confidence returned by a classifier.
 ///
 /// `labels` and `scores` come straight from the classifier sidecar;
 /// `confidence` is the top-label confidence in `[0.0, 1.0]`. Consumers
@@ -134,8 +134,8 @@ pub struct ClassifyVerdict {
 
 /// Classifies an incoming prompt through an external classifier sidecar.
 ///
-/// Enterprise builds supply a gRPC-backed implementation; OSS leaves the
-/// slot as `None`. Implementations must be fail-open: any transport,
+/// Extensions may supply a gRPC-backed implementation; the slot otherwise
+/// remains `None`. Implementations must be fail-open: any transport,
 /// deadline, or decode error should yield `None` so the request can
 /// continue unannotated.
 #[async_trait]
@@ -149,7 +149,7 @@ pub trait PromptClassifierHook: Send + Sync {
 
 /// Coarse intent bucket used for routing decisions.
 ///
-/// Producers (enterprise classifier, heuristic fallback) pick one of these
+/// Producers (classifier, heuristic fallback) pick one of these
 /// per prompt; consumers (model routers, cost optimizers) key on this to
 /// choose a provider or model family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,8 +208,8 @@ pub struct QualityScore {
 /// Scores provider candidates for a given prompt so the router can pick
 /// the highest-quality option for this specific request.
 ///
-/// Enterprise-only. Fail-open: returning `None` means "no opinion, use
-/// the router's default ordering."
+/// Optional and fail-open: returning `None` means "no opinion, use the
+/// router's default ordering."
 #[async_trait]
 pub trait QualityScoringHook: Send + Sync {
     /// Score each provider in `req.candidate_providers` for `req.prompt`.
@@ -267,8 +267,8 @@ pub struct StreamSafetyVerdict {
 /// Opens a streaming safety session that validates response chunks as
 /// they are emitted by the upstream model.
 ///
-/// Enterprise-only. Returning `None` from `start_session` means "no
-/// safety check for this request" and the stream is forwarded as-is.
+/// Optional and fail-open. Returning `None` from `start_session` means
+/// "no safety check for this request" and the stream is forwarded as-is.
 #[async_trait]
 pub trait StreamSafetyHook: Send + Sync {
     /// Start a safety session for the request described by `ctx`.
@@ -375,7 +375,7 @@ pub enum PurgeScope {
 /// The OSS forwarding path currently only honours [`ResponseMode::Buffered`];
 /// the streamed-replay path is gated on a separate follow-up that will
 /// teach `handle_ai_proxy` to dispatch on this enum and emit chunks
-/// paced by the configured strategy. Enterprise implementations may
+/// paced by the configured strategy. Recorder implementations may
 /// already set this to [`ResponseMode::Streamed`] today: the OSS proxy
 /// will fall back to a buffered replay until the forwarding-path change
 /// lands. See `docs/roadmap.md` (F3.26) for tracking.
@@ -406,7 +406,7 @@ pub enum ResponseMode {
 /// Affects how `handle_ai_proxy` schedules `write_response_body` calls
 /// when replaying a [`ResponseMode::Streamed`] hit. The OSS forwarding
 /// path will dispatch on this once the streamed-replay follow-up
-/// lands; enterprise recorders may already set the field today.
+/// lands; recorder extensions may already set the field today.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ReplayPacing {
     /// Emit every cached chunk back-to-back. Targets a TTFB measured
@@ -432,7 +432,7 @@ pub enum ReplayPacing {
 /// cap) without duplicating that configuration.
 ///
 /// `response_mode` defaults to [`ResponseMode::Buffered`], matching the
-/// pre-streamed-replay forwarding behaviour. Enterprise streaming-cache
+/// pre-streamed-replay forwarding behaviour. Streaming-cache
 /// implementations may set [`ResponseMode::Streamed`] when the cached
 /// entry was captured from an SSE response and the operator opted into
 /// streamed replay. The OSS forwarding path currently always replays
@@ -453,14 +453,14 @@ pub struct LookupOutcome {
     /// How the cached response should be replayed (buffered vs streamed).
     /// Defaults to [`ResponseMode::Buffered`]. The OSS forwarding path
     /// currently honours only `Buffered`; `Streamed` is wired through
-    /// for enterprise recorders ahead of the OSS replay-path follow-up.
+    /// for recorder extensions ahead of the OSS replay-path follow-up.
     pub response_mode: ResponseMode,
 }
 
 /// Semantic (embedding-based) response cache.
 ///
-/// Enterprise-only. The OSS pipeline carries only a literal response
-/// cache (`sbproxy_cache::CacheStore`); this hook layers semantic
+/// Optional. The built-in pipeline carries only a literal response cache
+/// (`sbproxy_cache::CacheStore`); this hook layers semantic
 /// similarity on top so near-duplicate prompts can share a cached
 /// response.
 ///
@@ -498,7 +498,7 @@ pub trait SemanticLookupHook: Send + Sync {
 /// pre-derived semantic cache key passed through verbatim from the
 /// pre-existing semantic-lookup machinery (`LookupOutcome::miss_key`).
 /// The OSS proxy never recomputes embeddings, key templates, or LSH
-/// buckets here; if the enterprise side needs more signals it can
+/// buckets here; if the recorder needs more signals it can
 /// extend the carried `policy` blob.
 #[derive(Debug, Clone)]
 pub struct StreamCacheCtx {
@@ -511,7 +511,7 @@ pub struct StreamCacheCtx {
     /// per-request context. Useful for joining recorder events back to
     /// the request log.
     pub request_id: String,
-    /// Optional semantic cache key derived by the enterprise lookup
+    /// Optional semantic cache key derived by the lookup
     /// machinery (mirrors [`LookupOutcome::miss_key`]). `None` when the
     /// caller could not derive a key (e.g. empty prompt, lookup
     /// disabled). Implementations typically refuse recording when this
@@ -519,10 +519,10 @@ pub struct StreamCacheCtx {
     pub semantic_key: Option<String>,
     /// Optional model identifier in flight on this stream.
     pub model_id: Option<String>,
-    /// Opaque enterprise policy blob copied from the AI handler's
-    /// `semantic_cache.streaming` config (e.g. `replay_pacing`). The OSS
-    /// proxy does not validate or interpret this value; the enterprise
-    /// recorder reads whatever shape it expects.
+    /// Opaque recorder policy blob copied from the AI handler's
+    /// `semantic_cache.streaming` config (e.g. `replay_pacing`). The
+    /// proxy does not validate or interpret this value; the recorder
+    /// reads whatever shape it expects.
     pub policy: serde_json::Value,
 }
 
@@ -554,12 +554,12 @@ pub enum StreamCacheEvent {
 /// Default capacity for the bounded recorder channel.
 ///
 /// Sized for ~1 second of headroom at 1k events/sec on a typical SSE
-/// stream. The receiver lives inside the enterprise recorder and is
+/// stream. The receiver lives inside the recorder and is
 /// expected to drain at least as fast as the upstream produces chunks;
 /// when it temporarily falls behind, the proxy drops the chunk and
 /// increments `sbproxy_hooks_channel_dropped_total{reason="channel_full"}`
 /// rather than buffering without bound and risking OOM under load.
-/// Enterprise call sites that want a different bound can construct
+/// Call sites that want a different bound can construct
 /// their own [`tokio::sync::mpsc::channel`] of any size and assign the
 /// sender to [`StreamCacheChannel::tx`] directly.
 pub const STREAM_CACHE_CHANNEL_CAPACITY: usize = 1024;
@@ -568,12 +568,12 @@ pub const STREAM_CACHE_CHANNEL_CAPACITY: usize = 1024;
 ///
 /// The proxy owns `tx` and sends one [`StreamCacheEvent::Chunk`] per
 /// forwarded SSE chunk, followed by exactly one terminal
-/// [`StreamCacheEvent::End`]. The receiver lives inside the enterprise
-/// implementation; OSS code never reads from it.
+/// [`StreamCacheEvent::End`]. The receiver lives inside the recorder
+/// implementation; the proxy never reads from it.
 ///
 /// Sends are non-blocking and use [`tokio::sync::mpsc::Sender::try_send`]
 /// so a slow or unreachable receiver never stalls the hot path. A
-/// closed channel (the enterprise side dropped the receiver early)
+/// closed channel (the recorder dropped the receiver early)
 /// is not an error: the proxy increments
 /// `sbproxy_hooks_channel_dropped_total{reason="receiver_closed"}` and
 /// stops sending. A full channel surfaces as
@@ -582,7 +582,7 @@ pub struct StreamCacheChannel {
     /// Sender used by the proxy to push events into the recorder session.
     ///
     /// Bounded at [`STREAM_CACHE_CHANNEL_CAPACITY`] by default;
-    /// enterprise implementations that want a different bound can
+    /// implementations that want a different bound can
     /// build a [`tokio::sync::mpsc::channel`] of any size and assign
     /// the sender here.
     pub tx: tokio::sync::mpsc::Sender<StreamCacheEvent>,
@@ -595,12 +595,12 @@ pub struct StreamCacheChannel {
 /// [`StreamCacheGuard::chunk`] forwards a copy of the chunk to the
 /// recorder. Calling [`StreamCacheGuard::finish`] sends
 /// `End { complete: true }`. Dropping the guard without calling `finish`
-/// sends `End { complete: false }` so the enterprise impl can
+/// sends `End { complete: false }` so the recorder can
 /// distinguish a partial recording (client cancel, upstream error,
 /// mid-stream abort) from a clean recording.
 ///
 /// `chunk` and `finish` swallow `SendError`: a closed channel means the
-/// enterprise side dropped the recorder, which is an explicit "stop
+/// recorder dropped the receiver, which is an explicit "stop
 /// recording" signal, not a fatal error.
 pub struct StreamCacheGuard {
     channel: StreamCacheChannel,
@@ -681,12 +681,12 @@ fn record_stream_cache_drop(err: &tokio::sync::mpsc::error::TrySendError<StreamC
 /// Records a streaming AI response into a downstream cache for later
 /// replay.
 ///
-/// Enterprise-only. The OSS proxy's only job is to fan SSE chunks into
+/// Optional and fail-open. The proxy fans SSE chunks into
 /// the channel returned by `start_session` and emit a terminal `End`
 /// event when the stream finishes (or aborts). All policy decisions
 /// (deterministic tool calls only, image data by reference only,
-/// replay pacing, eviction, persistence) live in the enterprise
-/// implementation and are out of scope for OSS.
+/// replay pacing, eviction, persistence) live in the recorder
+/// implementation.
 ///
 /// Returning `None` from `start_session` means "do not record this
 /// stream" (e.g. the caller could not derive a semantic key, or the
@@ -964,7 +964,7 @@ mod tests {
 
     #[tokio::test]
     async fn guard_finish_is_idempotent_against_closed_channel() {
-        // If the enterprise side drops its receiver early (an explicit
+        // If the recorder drops its receiver early (an explicit
         // "stop recording" signal), `chunk` and `finish` must not
         // panic; they swallow SendError silently.
         let (tx, rx) = mpsc::channel(STREAM_CACHE_CHANNEL_CAPACITY);
@@ -1050,7 +1050,7 @@ mod tests {
     #[tokio::test]
     async fn receiver_closed_drops_send_and_increments_counter() {
         let (tx, rx) = mpsc::channel(STREAM_CACHE_CHANNEL_CAPACITY);
-        drop(rx); // explicit "stop recording" signal from the enterprise side
+        drop(rx); // explicit "stop recording" signal from the recorder
         let guard = StreamCacheGuard::new(StreamCacheChannel { tx });
 
         let before = hooks_drop_total("receiver_closed");

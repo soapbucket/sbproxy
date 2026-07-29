@@ -54,9 +54,8 @@ sed -i.bak 's|RUST_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"|RUST_ROOT="'"$TMP_TREE"'
 
 set +e
 out=$(
-  ENTERPRISE_ROOT="/nonexistent-enterprise-root" \
   DOCS_CI_QUIET=0 \
-  bash "$TMP_TREE/docs-ci.sh" --code --tree rust 2>&1
+  bash "$TMP_TREE/docs-ci.sh" --code 2>&1
 )
 rc=$?
 set -e

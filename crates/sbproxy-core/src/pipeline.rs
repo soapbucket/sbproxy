@@ -465,7 +465,7 @@ impl ReserveAdmission {
 /// Build the OSS Cache Reserve backend from the YAML config block.
 ///
 /// Returns `(None, None)` when the block is absent, disabled, or
-/// targets an enterprise backend the OSS pipeline does not know how
+/// targets an extension-provided backend the pipeline does not know how
 /// to instantiate. Failures during construction (e.g. an invalid
 /// Redis URL) are logged at `warn` level and surfaced as `(None, None)`
 /// so a misconfigured reserve degrades to plain hot-cache behavior
@@ -513,7 +513,7 @@ fn build_cache_reserve(
         },
         sbproxy_config::CacheReserveBackendConfig::Other => {
             tracing::warn!(
-                "cache_reserve backend type is unknown to OSS; if this is an enterprise backend, the enterprise startup hook should attach it"
+                "cache_reserve backend type is unknown; a pipeline lifecycle hook may attach an implementation"
             );
             None
         }
@@ -1401,7 +1401,7 @@ impl CompiledPipeline {
         //
         // Built from the top-level `cache_reserve:` block. The OSS
         // backends (memory / filesystem / redis) are instantiated here;
-        // unknown / enterprise backends drop through to `None` with a
+        // unknown or extension-provided backends drop through to `None` with a
         // warning so a pipeline lifecycle hook can swap in its own
         // implementation post-compile.
         let (cache_reserve, cache_reserve_admission) =

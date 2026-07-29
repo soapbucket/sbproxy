@@ -3734,7 +3734,7 @@ origins:
     #[test]
     fn parse_kya_authentication_minimal_compiles() {
         // Minimal config: only the required `type` and `issuers` array.
-        // Defaults are filled in by the enterprise verifier at
+        // Defaults are filled in by the verifier at
         // `KyaConfig::validate` time, not by the OSS compiler.
         let yaml = r#"
 origins:
@@ -3757,7 +3757,7 @@ origins:
         // Operators may add forward-compat fields (e.g. `audit_sample_rate`)
         // that the OSS compiler does not type-check. The opaque-value
         // contract requires those fields to round-trip unchanged into
-        // the snapshot so the enterprise verifier sees them.
+        // the snapshot so the verifier sees them.
         let yaml = r#"
 origins:
   "kya-extra.test":
@@ -3779,7 +3779,7 @@ origins:
         assert_eq!(
             auth.get("audit_sample_rate").and_then(|v| v.as_u64()),
             Some(50),
-            "forward-compat fields must round-trip to the enterprise verifier"
+            "forward-compat fields must round-trip to the verifier"
         );
         assert_eq!(auth.get("fail_open").and_then(|v| v.as_bool()), Some(true));
     }
@@ -4086,8 +4086,8 @@ origins:
     #[test]
     fn compile_config_propagates_origin_extensions() {
         // Opaque per-origin extensions must round-trip from the raw
-        // YAML into the compiled snapshot so enterprise crates (e.g.
-        // the semantic-cache hook) can read their own keys.
+        // YAML into the compiled snapshot so extensions (e.g. the
+        // semantic-cache hook) can read their own keys.
         let yaml = r#"
 origins:
   "api.example.com":

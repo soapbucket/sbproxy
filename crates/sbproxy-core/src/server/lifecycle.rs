@@ -477,7 +477,7 @@ fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<ReloadOutc
 ///    the candidate outright, before anything observable changes.
 /// 2. **Construct.** Install the AI provider catalog (the one process
 ///    global `CompiledPipeline::from_config` reads while it builds), then
-///    build the pipeline, load listings, run the enterprise hook, and
+///    build the pipeline, load listings, run the pipeline lifecycle hook, and
 ///    reconcile the model runtime. A failure anywhere in this phase
 ///    returns `Err` and rolls the catalog back, so the node is left
 ///    exactly as it was.
@@ -1352,8 +1352,8 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // Construct a bounded mpsc channel and install the sender as the
     // process-wide audit bus before the pipeline is loaded. The
     // dispatcher emits a `PolicyVerdictEvent` for every policy
-    // decision; the OSS drain stub on the receiver prints each event
-    // to stderr as a JSON line. Enterprise replaces the consumer
+    // decision; the default drain stub on the receiver prints each event
+    // to stderr as a JSON line. An extension can replace the consumer
     // with a NATS-backed audit-chain subscriber per
     // `docs/adr-policy-audit-binding.md`.
     //
@@ -3184,6 +3184,14 @@ fn compile_one_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_lifecycle_hook_has_product_neutral_identifiers() {
+        let subsystem = DegradedSubsystem::PipelineLifecycleHook;
+
+        assert_eq!(subsystem.as_str(), "pipeline_lifecycle_hook");
+        assert_eq!(subsystem.to_string(), "pipeline lifecycle hook");
+    }
 
     #[test]
     fn safety_centroid_preflight_rejects_mismatched_model_before_publication() {
