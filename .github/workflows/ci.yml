@@ -116,6 +116,19 @@ jobs:
         if: steps.filter.outputs.code == 'true'
         run: cargo fmt --all -- --check
 
+      - name: standalone workspace lockfiles are current
+        if: steps.filter.outputs.code == 'true'
+        run: |
+          for manifest in \
+            bench-synthetic/Cargo.toml \
+            sbproxy-bench/harness/ai_crawl_tiers/Cargo.toml \
+            sbproxy-bench/harness/ai_lb_strategy/Cargo.toml \
+            sbproxy-bench/harness/context_compression_eval/Cargo.toml \
+            test/fixtures/refresh-tool/Cargo.toml
+          do
+            cargo metadata --manifest-path "${manifest}" --locked --format-version=1 >/dev/null
+          done
+
       # Reject internal tracker placeholders in source-available rustdoc.
       # A literal `WOR-XXX` is an unfinished TODO that announces incomplete
       # work without making it trackable. If a tracker reference is needed,

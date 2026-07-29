@@ -3790,6 +3790,7 @@ dependencies = [
  "sbproxy-classifier-client",
  "sbproxy-config",
  "sbproxy-extension",
+ "sbproxy-httpkit",
  "sbproxy-model-host",
  "sbproxy-platform",
  "sbproxy-plugin",
@@ -3934,6 +3935,15 @@ dependencies = [
  "wasi-common",
  "wasmtime",
  "yaml_serde",
+]
+
+[[package]]
+name = "sbproxy-httpkit"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "parking_lot",
+ "reqwest",
 ]
 
 [[package]]
