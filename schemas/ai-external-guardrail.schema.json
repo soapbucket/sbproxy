@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "SBproxy AI external guardrail configuration",
-  "description": "Deserialized wire configuration. Provider-specific fields remain optional here so legacy generic configurations stay valid; `compile` makes their requirements explicit before a handler is published.",
+  "description": "Deserialized wire configuration. Provider-specific fields remain optional here so legacy generic configurations stay valid; `validate` makes their requirements explicit before a handler is published.",
   "type": "object",
   "required": [
     "mode",
@@ -9,8 +9,9 @@
   ],
   "properties": {
     "name": {
-      "description": "Stable name used in logs and metrics. It must not be empty.",
-      "type": "string"
+      "description": "Stable identifier used in safe logs and client error codes. It must contain at least one non-whitespace character.",
+      "type": "string",
+      "pattern": "\\S"
     },
     "url": {
       "description": "Provider endpoint. Generic, Presidio, Azure, and CrowdStrike require it. Other providers supply a documented default or derive it from their fields.",
@@ -29,7 +30,7 @@
       ]
     },
     "default_on": {
-      "description": "Run this guardrail when a request does not explicitly select a guardrail set.",
+      "description": "Enable this guardrail automatically for each matching phase on the route.",
       "default": false,
       "type": "boolean"
     },

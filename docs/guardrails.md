@@ -21,9 +21,15 @@ guardrails:
       timeout_ms: 500
 ```
 
-`name` is the safe error code and metric label. `provider: generic` selects the small JSON contract below. A loopback URL needs `allow_private_url: true`; public URLs are resolved and pinned before use, while private targets are rejected by default. `mode: pre_call` evaluates the request before provider dispatch. `default_on: true` is required for this configuration to run. `fail_open: false` makes a timeout, a non-success response, malformed JSON, or a response larger than 64 KiB block the request. `timeout_ms` accepts 1 through 30000 and defaults to 2000.
+`name` is a safe identifier for logs and client error codes. Metrics use bounded provider, phase, and outcome labels instead. `provider: generic` selects the small JSON contract below. A loopback URL needs `allow_private_url: true`; public URLs are resolved and pinned before use, while private targets are rejected by default. `mode: pre_call` evaluates the request before provider dispatch. `default_on: true` automatically enables the configured phases on this route. `fail_open: false` makes a timeout, a non-success response, malformed JSON, or a response larger than 64 KiB block the request. `timeout_ms` accepts 1 through 30000 and defaults to 2000.
 
-Modes decide which content is sent to the adapter. `pre_call` checks input. `post_call` checks a buffered, non-streaming model response. `during_call` checks both. `logging_only` checks the selected phases but never blocks. Streaming responses cannot run a post-call external check because bytes may already have reached the client.
+Modes decide which content is sent to the adapter. `pre_call` checks input. `post_call` checks a buffered, non-streaming model response. `during_call` checks both. `logging_only` checks both input and output but never blocks.
+
+## Streaming and multipart content
+
+An enforcing output adapter with `fail_open: false` rejects a request with `stream: true` before replay, cache lookup, or provider dispatch. SBproxy cannot inspect a stream before forwarding its bytes. Adapters with `fail_open: true` and adapters in `logging_only` mode permit the stream and record that output content was unavailable.
+
+Multipart request content is also unavailable to external input adapters. An enforcing, fail-closed input adapter rejects it before provider dispatch. Fail-open and logging-only adapters permit it and record the unavailable-content outcome. For a successful multipart response, SBproxy runs the output adapter when the media type is textual and the body is valid UTF-8. It applies the same unavailable-content policy to other response bodies before forwarding them.
 
 ## Credentials and generic responses
 
@@ -43,7 +49,7 @@ The webhook must return JSON with `allowed` set to a boolean. `categories` may b
 
 ## Hosted adapters
 
-The schema describes every wire field, but a provider choice makes some fields required at configuration compile time. The compiler reports those cross-field errors because JSON Schema alone cannot express each provider's endpoint derivation and credential rules.
+The schema describes every wire field, but a provider choice makes some fields required during configuration validation. The validator reports those cross-field errors because JSON Schema alone cannot express each provider's endpoint derivation and credential rules.
 
 | Provider | Required fields | Defaults and notes |
 |---|---|---|
@@ -53,7 +59,7 @@ The schema describes every wire field, but a provider choice makes some fields r
 | `aporia` | `api_key`, `project_id` | URL derives from the project when omitted. |
 | `azure_content_safety` | `url`, `api_key` | SBproxy adds `contentsafety/text:analyze` and API version `2024-09-01`; `severity_threshold` is 0 through 7 and defaults to 4. |
 | `bedrock` | `api_key`, `guardrail_id`, `guardrail_version`, plus `url` or `region` | Uses `Authorization: Bearer` for current Bedrock API keys. |
-| `crowdstrike` | `url`, `api_key` | `application_id` is optional. |
+| `crowd_strike` | `url`, `api_key` | `application_id` is optional. |
 | `mistral` | `api_key` | URL and model default to Mistral moderation; `score_threshold` is 0 through 1. |
 | `pangea` | `api_key` | URL and input/output recipes have documented defaults. |
 | `patronus` | `api_key` | URL and evaluator default; `criteria` is optional. |

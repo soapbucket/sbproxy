@@ -596,7 +596,7 @@ remain unavailable on the OSS path.
 
 Input guardrails inspect the parsed prompt ahead of egress ([config](../examples/ai-guardrails/)).
 
-The proxy supports ten guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, `context_poisoning`, `agent_alignment`, and `classifier`. Guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. For CEL-based request gating see the CEL section below, and [configuration.md](configuration.md#guardrails-guardrails) for the per-type field schema.
+The built-in pipeline supports ten guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, `context_poisoning`, `agent_alignment`, and `classifier`. Built-in guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. For HTTP policy services, use [external guardrail adapters](guardrails.md). For CEL-based request gating see the CEL section below, and [configuration.md](configuration.md#guardrails-guardrails) for the per-type field schema.
 
 Input guardrails apply to whichever body field the surface carries user text in:
 
@@ -608,7 +608,7 @@ Input guardrails apply to whichever body field the surface carries user text in:
 | `reranking` | `body["query"]` |
 | `moderations` | `body["input"]` |
 
-A single guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. Multipart-bodied surfaces (image edits, image variations, audio transcription) bypass the input-guardrail check today because their bodies are forwarded byte-transparently; output-side scanning for those surfaces is reserved for a follow-up.
+A single built-in guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. Multipart-bodied surfaces (image edits, image variations, audio transcription) bypass the built-in input check today because their bodies are forwarded byte-transparently; built-in output scanning for those surfaces is reserved for a follow-up. External adapters apply their documented [unavailable-content policy](guardrails.md#streaming-and-multipart-content) to multipart bodies.
 
 ### Safety guardrail modes
 

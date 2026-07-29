@@ -9,6 +9,7 @@ origins:
   "ai.local":
     action:
       type: ai_proxy
+      allowed_models: [fixture-model]
       routing: round_robin
       providers:
         - name: fixture-model

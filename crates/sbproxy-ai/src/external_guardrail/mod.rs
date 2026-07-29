@@ -144,11 +144,13 @@ impl GuardrailProvider {
 }
 
 /// Deserialized wire configuration. Provider-specific fields remain optional
-/// here so legacy generic configurations stay valid; `compile` makes their
+/// here so legacy generic configurations stay valid; `validate` makes their
 /// requirements explicit before a handler is published.
 #[derive(Clone, Deserialize, JsonSchema)]
 pub struct ExternalGuardrailConfig {
-    /// Stable name used in logs and metrics. It must not be empty.
+    /// Stable identifier used in safe logs and client error codes.
+    /// It must contain at least one non-whitespace character.
+    #[schemars(regex(pattern = "\\S"))]
     pub name: String,
     /// Provider endpoint. Generic, Presidio, Azure, and CrowdStrike require it.
     /// Other providers supply a documented default or derive it from their fields.
@@ -156,7 +158,7 @@ pub struct ExternalGuardrailConfig {
     pub url: Option<String>,
     /// When to evaluate this provider: before a call, after a call, both, or logging only.
     pub mode: GuardrailMode,
-    /// Run this guardrail when a request does not explicitly select a guardrail set.
+    /// Enable this guardrail automatically for each matching phase on the route.
     #[serde(default)]
     pub default_on: bool,
     /// Allow traffic when this provider cannot be reached or returns an invalid response.
@@ -1092,6 +1094,29 @@ fn run_external_guardrails_without_content(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_rejects_blank_external_guardrail_names() {
+        let schema = serde_json::to_value(schemars::schema_for!(ExternalGuardrailConfig))
+            .expect("external guardrail schema serializes");
+        assert_eq!(
+            schema.pointer("/properties/name/pattern"),
+            Some(&serde_json::json!("\\S"))
+        );
+
+        let validator =
+            jsonschema::JSONSchema::compile(&schema).expect("external guardrail schema compiles");
+        for name in ["", " \t\n"] {
+            let document = serde_json::json!({"name": name, "mode": "pre_call"});
+            assert!(
+                validator.validate(&document).is_err(),
+                "schema must reject blank name {name:?}"
+            );
+        }
+        let document = serde_json::json!({"name": "local-policy", "mode": "pre_call"});
+        assert!(validator.validate(&document).is_ok());
+    }
+
     #[test]
     fn legacy_generic_config_defaults_provider() {
         let cfg: ExternalGuardrailConfig = serde_json::from_str(r#"{"name":"custom","url":"https://guard.example.test/check","mode":"pre_call","default_on":true,"api_key":"secret://guard-key"}"#).unwrap();

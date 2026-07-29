@@ -2,10 +2,24 @@
 """Bounded local fixtures for the external-guardrail example."""
 
 import json
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 MAX_BODY_BYTES = 64 * 1024
+SAFE_LOG_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:/-"
+)
+
+
+def safe_log_value(value, max_length):
+    """Return one bounded log field with no control or separator characters."""
+    text = str(value)
+    return "".join(
+        character if character in SAFE_LOG_CHARACTERS else "_" for character in text
+    )[:max_length]
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -39,8 +53,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/check":
-            model = str(request.get("model", ""))[:80]
-            phase = str(request.get("phase", ""))[:32]
+            model = safe_log_value(request.get("model", ""), 80)
+            phase = safe_log_value(request.get("phase", ""), 32)
             blocked = "blocked" in str(request.get("input", "")).lower()
             verdict = "block" if blocked else "allow"
             print(
@@ -54,7 +68,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/v1/chat/completions":
-            model = str(request.get("model", ""))[:80]
+            model = safe_log_value(request.get("model", ""), 80)
             print(
                 f"method=POST path=/v1/chat/completions model={model} phase=model verdict=allow",
                 flush=True,
@@ -88,7 +102,19 @@ def serve(port):
     return server
 
 
+def self_test():
+    assert safe_log_value("fixture-model", 80) == "fixture-model"
+    assert safe_log_value("model:v1/path", 80) == "model:v1/path"
+    assert safe_log_value("safe\nforged\tline\x1b", 80) == "safe_forged_line_"
+    assert safe_log_value("café", 80) == "caf_"
+    assert safe_log_value("x" * 81, 80) == "x" * 80
+    print("fixture sanitization self-test: passed")
+
+
 if __name__ == "__main__":
-    serve(18080)
-    serve(18081)
-    threading.Event().wait()
+    if sys.argv[1:] == ["--self-test"]:
+        self_test()
+    else:
+        serve(18080)
+        serve(18081)
+        threading.Event().wait()

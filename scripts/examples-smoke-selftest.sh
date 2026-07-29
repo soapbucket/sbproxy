@@ -26,19 +26,45 @@ esac
 SH
   chmod +x "$dir/fake-compose"
 
-  cat > "$dir/curl" <<'SH'
+cat > "$dir/curl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-url="${*: -1}"
+url=""
+request_body=""
+request_body_set=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --data-binary)
+      [ "$#" -ge 2 ] || {
+        echo "missing --data-binary value" >&2
+        exit 1
+      }
+      request_body="$2"
+      request_body_set=1
+      shift 2
+      ;;
+    http://*|https://*)
+      url="$1"
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
 case "$url" in
   */healthz)
     exit 0
     ;;
   */json)
-    case " $* " in
-      *' --data-binary '{"message":"hello"}' '*) ;;
-      *) echo "missing serialized request body" >&2; exit 1 ;;
-    esac
+    [ "$request_body_set" -eq 1 ] || {
+      echo "missing serialized request body" >&2
+      exit 1
+    }
+    [ "$request_body" = '{"message":"hello"}' ] || {
+      echo "incorrect serialized request body: $request_body" >&2
+      exit 1
+    }
     printf 'HTTP/1.1 201 Created\r\nx-smoke-token: abc-123\r\ncontent-type: application/json\r\n\r\n{"ok":true,"nested":{"count":3},"extra":"kept"}'
     exit 0
     ;;
