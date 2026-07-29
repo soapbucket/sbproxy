@@ -9564,9 +9564,43 @@ mod external_guardrail_context_tests {
         .expect("guardrail config")
     }
 
-    async fn downstream_session(
-        body: serde_json::Value,
-    ) -> (Session, tokio::task::JoinHandle<Vec<u8>>) {
+    struct DownstreamClient {
+        task: Option<tokio::task::JoinHandle<Vec<u8>>>,
+    }
+
+    impl DownstreamClient {
+        fn new(task: tokio::task::JoinHandle<Vec<u8>>) -> Self {
+            Self { task: Some(task) }
+        }
+
+        async fn abort_and_wait(&mut self) {
+            if let Some(task) = self.task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
+    impl Drop for DownstreamClient {
+        fn drop(&mut self) {
+            if let Some(task) = self.task.as_ref() {
+                task.abort();
+            }
+        }
+    }
+
+    async fn live_downstream_body(mut client: DownstreamClient) -> Vec<u8> {
+        let task = client.task.as_mut().expect("downstream client task");
+        match tokio::time::timeout(Duration::from_secs(2), task).await {
+            Ok(result) => result.expect("downstream client"),
+            Err(error) => {
+                client.abort_and_wait().await;
+                panic!("downstream response timed out after session close: {error:?}");
+            }
+        }
+    }
+
+    async fn downstream_session(body: serde_json::Value) -> (Session, DownstreamClient) {
         downstream_bytes_session(
             "/v1/chat/completions",
             "application/json",
@@ -9579,14 +9613,14 @@ mod external_guardrail_context_tests {
         path: &str,
         content_type: &str,
         body: Vec<u8>,
-    ) -> (Session, tokio::task::JoinHandle<Vec<u8>>) {
+    ) -> (Session, DownstreamClient) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind downstream fixture");
         let address = listener.local_addr().expect("downstream address");
         let path = path.to_string();
         let content_type = content_type.to_string();
-        let client = tokio::spawn(async move {
+        let mut client = DownstreamClient::new(tokio::spawn(async move {
             let mut stream = tokio::net::TcpStream::connect(address)
                 .await
                 .expect("connect downstream fixture");
@@ -9600,19 +9634,41 @@ mod external_guardrail_context_tests {
                 .expect("write request headers");
             stream.write_all(&body).await.expect("write request body");
             let mut response = Vec::new();
-            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            stream
+                .read_to_end(&mut response)
                 .await
-                .expect("downstream response timed out")
                 .expect("read downstream response");
             response
-        });
-        let (stream, _) = listener.accept().await.expect("accept downstream request");
+        }));
+        let (stream, _) =
+            match tokio::time::timeout(Duration::from_secs(2), listener.accept()).await {
+                Ok(Ok(accepted)) => accepted,
+                Ok(Err(error)) => {
+                    client.abort_and_wait().await;
+                    panic!("accept downstream request: {error}");
+                }
+                Err(error) => {
+                    client.abort_and_wait().await;
+                    panic!("accept downstream request timed out: {error:?}");
+                }
+            };
         let mut session = Session::new_h1(Box::new(Stream::from(stream)));
-        session
-            .as_downstream_mut()
-            .read_request()
-            .await
-            .expect("parse downstream request");
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            session.as_downstream_mut().read_request(),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                client.abort_and_wait().await;
+                panic!("parse downstream request: {error}");
+            }
+            Err(error) => {
+                client.abort_and_wait().await;
+                panic!("parse downstream request timed out: {error:?}");
+            }
+        }
         (session, client)
     }
 
@@ -9817,7 +9873,7 @@ mod external_guardrail_context_tests {
         .expect("input block is a handled response");
         drop(session);
 
-        let response = client.await.expect("downstream client");
+        let response = live_downstream_body(client).await;
         let response = std::str::from_utf8(&response).expect("response utf8");
         assert!(
             response.starts_with("HTTP/1.1 400"),
@@ -9873,7 +9929,7 @@ mod external_guardrail_context_tests {
         drop(session);
 
         let response =
-            String::from_utf8(client.await.expect("downstream client")).expect("response utf8");
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
         assert!(response.starts_with("HTTP/1.1 400"), "{response}");
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
         let payload = tokio::time::timeout(Duration::from_secs(1), received)
@@ -9918,7 +9974,7 @@ mod external_guardrail_context_tests {
         drop(session);
 
         let response =
-            String::from_utf8(client.await.expect("downstream client")).expect("response utf8");
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
         assert!(response.contains("guardrail_violation"), "{response}");
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
@@ -9961,7 +10017,7 @@ mod external_guardrail_context_tests {
         drop(session);
 
         let response =
-            String::from_utf8(client.await.expect("downstream client")).expect("response utf8");
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
         assert!(!response.contains("provider-controlled"), "{response}");
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
@@ -10011,7 +10067,7 @@ mod external_guardrail_context_tests {
         drop(session);
 
         let response =
-            String::from_utf8(client.await.expect("downstream client")).expect("response utf8");
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
         assert!(!response.contains("provider-controlled"), "{response}");
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
@@ -10050,7 +10106,7 @@ mod external_guardrail_context_tests {
         drop(session);
 
         let response =
-            String::from_utf8(client.await.expect("downstream client")).expect("response utf8");
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
         assert!(response.starts_with("HTTP/1.1 400"), "{response}");
         assert!(response.contains("guardrail_violation"), "{response}");
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
@@ -10080,7 +10136,7 @@ mod external_guardrail_context_tests {
         drop(session);
 
         let response =
-            String::from_utf8(client.await.expect("downstream client")).expect("response utf8");
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
         assert!(response.contains("guardrail_violation"), "{response}");
         assert!(!response.contains("provider-controlled"), "{response}");
@@ -10129,8 +10185,8 @@ mod external_guardrail_context_tests {
             .expect("uninspectable multipart output block is handled");
             drop(session);
 
-            let response = String::from_utf8(client.await.expect("downstream client"))
-                .expect("safe response utf8");
+            let response =
+                String::from_utf8(live_downstream_body(client).await).expect("safe response utf8");
             assert!(response.starts_with("HTTP/1.1 403"), "{response}");
             assert!(response.contains("guardrail_violation"), "{response}");
             assert!(!response.contains('\u{fffd}'), "{response}");
@@ -10173,7 +10229,7 @@ mod external_guardrail_context_tests {
         drop(session);
 
         let response =
-            String::from_utf8(client.await.expect("downstream client")).expect("response utf8");
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
         assert!(
             response.starts_with("HTTP/1.1 403"),
             "response was {response}"
@@ -10246,7 +10302,7 @@ mod external_guardrail_context_tests {
         drop(session);
 
         let response =
-            String::from_utf8(client.await.expect("downstream client")).expect("response utf8");
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
         assert!(
             response.starts_with("HTTP/1.1 403"),
             "response was {response}"
@@ -10317,7 +10373,7 @@ mod external_guardrail_context_tests {
             .expect("invalid UTF-8 output is handled");
             drop(session);
 
-            let response = client.await.expect("downstream client");
+            let response = live_downstream_body(client).await;
             assert!(
                 response.starts_with(format!("HTTP/1.1 {expected_status}").as_bytes()),
                 "unexpected response status: {response:?}"
