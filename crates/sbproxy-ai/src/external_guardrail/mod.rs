@@ -7,6 +7,8 @@
 #![allow(missing_docs)]
 
 mod aporia;
+mod azure;
+mod bedrock;
 mod generic;
 mod lakera;
 
@@ -426,27 +428,29 @@ impl ExternalGuardrailConfig {
             }
             GuardrailProvider::AzureContentSafety => {
                 CompiledGuardrailProvider::AzureContentSafety(AzureConfig {
-                    url: self.required_url()?,
+                    url: azure_endpoint(&self.required_url()?)?,
                     severity_threshold: self.severity_threshold.unwrap_or(4),
                     auth: self.required_provider_auth("Ocp-Apim-Subscription-Key", "")?,
                 })
             }
             GuardrailProvider::Bedrock => {
                 let region = self.region.clone();
-                let url = match (&self.url, &region) {
+                let base_url = match (&self.url, &region) {
                     (Some(url), _) => url.clone(),
                     (None, Some(region)) if !region.trim().is_empty() => {
                         format!("https://bedrock-runtime.{region}.amazonaws.com")
                     }
                     (None, _) => bail!("missing region"),
                 };
+                let guardrail_id =
+                    self.required_string("guardrail_id", self.guardrail_id.as_ref())?;
+                let guardrail_version =
+                    self.required_string("guardrail_version", self.guardrail_version.as_ref())?;
                 CompiledGuardrailProvider::Bedrock(BedrockConfig {
-                    url,
+                    url: bedrock_endpoint(&base_url, &guardrail_id, &guardrail_version)?,
                     region,
-                    guardrail_id: self
-                        .required_string("guardrail_id", self.guardrail_id.as_ref())?,
-                    guardrail_version: self
-                        .required_string("guardrail_version", self.guardrail_version.as_ref())?,
+                    guardrail_id,
+                    guardrail_version,
                     auth: self.required_provider_auth("Authorization", "Bearer")?,
                 })
             }
@@ -608,6 +612,35 @@ fn validate_http_url(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn azure_endpoint(base: &str) -> Result<String> {
+    let mut url = url::Url::parse(base).context("invalid Azure Content Safety URL")?;
+    url.set_query(Some("api-version=2024-09-01"));
+    let mut segments = url
+        .path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("Azure Content Safety URL cannot be a base"))?;
+    segments.pop_if_empty();
+    segments.extend(["contentsafety", "text:analyze"]);
+    drop(segments);
+    Ok(url.into())
+}
+
+fn bedrock_endpoint(base: &str, guardrail_id: &str, guardrail_version: &str) -> Result<String> {
+    let mut url = url::Url::parse(base).context("invalid Bedrock URL")?;
+    let mut segments = url
+        .path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("Bedrock URL cannot be a base"))?;
+    segments.pop_if_empty();
+    segments.extend([
+        "guardrail",
+        guardrail_id,
+        "version",
+        guardrail_version,
+        "apply",
+    ]);
+    drop(segments);
+    Ok(url.into())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GuardrailCallError {
     #[error("request failed")]
@@ -667,6 +700,10 @@ async fn dispatch(
         }
         CompiledGuardrailProvider::Lakera(provider) => lakera::lakera_request(provider, request),
         CompiledGuardrailProvider::Aporia(provider) => aporia::aporia_request(provider, request),
+        CompiledGuardrailProvider::AzureContentSafety(provider) => {
+            azure::azure_request(provider, request)
+        }
+        CompiledGuardrailProvider::Bedrock(provider) => bedrock::bedrock_request(provider, request),
         _ => return Err(GuardrailCallError::UnsupportedProvider),
     };
     let mut call = config
@@ -700,6 +737,10 @@ async fn dispatch(
         CompiledGuardrailProvider::Presidio(_) => generic::parse_presidio(&body),
         CompiledGuardrailProvider::Lakera(_) => lakera::parse_lakera(&body),
         CompiledGuardrailProvider::Aporia(_) => aporia::parse_aporia(&body),
+        CompiledGuardrailProvider::AzureContentSafety(provider) => {
+            azure::parse_azure(&body, provider)
+        }
+        CompiledGuardrailProvider::Bedrock(_) => bedrock::parse_bedrock(&body),
         _ => Err(GuardrailCallError::UnsupportedProvider),
     }
 }

@@ -1,6 +1,6 @@
 use sbproxy_ai::external_guardrail::{
-    check_external_guardrail, ExternalGuardrailConfig, ExternalGuardrailRequest, GuardrailPhase,
-    GuardrailProvider,
+    check_external_guardrail, CompiledGuardrailProvider, ExternalGuardrailConfig,
+    ExternalGuardrailRequest, GuardrailPhase, GuardrailProvider,
 };
 use std::time::Duration;
 
@@ -319,6 +319,225 @@ async fn aporia_modify_and_rephrase_obey_both_fail_modes() {
                 .contains("vendor controlled"),
             "vendor response text must not become an operator reason"
         );
+        let _ = received.await;
+    }
+}
+
+fn azure_config(url: String, fail_open: bool, timeout_ms: u64) -> ExternalGuardrailConfig {
+    serde_json::from_value(serde_json::json!({
+        "name": "azure",
+        "provider": "azure_content_safety",
+        "url": url,
+        "mode": "during_call",
+        "api_key": "fixture-key",
+        "allow_private_url": true,
+        "fail_open": fail_open,
+        "timeout_ms": timeout_ms
+    }))
+    .expect("Azure fixture config")
+}
+
+fn bedrock_config(url: String, fail_open: bool, timeout_ms: u64) -> ExternalGuardrailConfig {
+    serde_json::from_value(serde_json::json!({
+        "name": "bedrock",
+        "provider": "bedrock",
+        "url": url,
+        "mode": "during_call",
+        "api_key": "fixture-key",
+        "guardrail_id": "fixture-guardrail",
+        "guardrail_version": "1",
+        "allow_private_url": true,
+        "fail_open": fail_open,
+        "timeout_ms": timeout_ms
+    }))
+    .expect("Bedrock fixture config")
+}
+
+#[tokio::test]
+async fn azure_content_safety_contract_uses_subscription_key_and_eight_level_output() {
+    let (base_url, received) = fixture_server(
+        200,
+        r#"{"categoriesAnalysis":[{"category":"Hate","severity":0}],"blocklistsMatch":[]}"#,
+        Duration::ZERO,
+    )
+    .await;
+
+    let verdict = check_external_guardrail(
+        &azure_config(base_url, false, 2_000),
+        request(GuardrailPhase::Input),
+    )
+    .await;
+
+    assert!(verdict.allowed);
+    let wire_request = received.await.expect("fixture task");
+    assert!(wire_request
+        .starts_with("POST /contentsafety/text:analyze?api-version=2024-09-01 HTTP/1.1\r\n"));
+    assert!(wire_request.contains("ocp-apim-subscription-key: fixture-key\r\n"));
+    assert!(
+        wire_request.ends_with(r#"{"outputType":"EightSeverityLevels","text":"fixture prompt"}"#)
+    );
+}
+
+#[tokio::test]
+async fn azure_content_safety_blocks_severity_or_blocklist_match() {
+    for body in [
+        r#"{"categoriesAnalysis":[{"category":"Violence","severity":4}],"blocklistsMatch":[]}"#,
+        r#"{"categoriesAnalysis":[{"category":"Violence","severity":0}],"blocklistsMatch":[{"blocklistName":"fixture","blocklistItemId":"item","blocklistItemText":"prompt"}]}"#,
+    ] {
+        let (base_url, received) = fixture_server(200, body, Duration::ZERO).await;
+        let verdict = check_external_guardrail(
+            &azure_config(base_url, false, 2_000),
+            request(GuardrailPhase::Output),
+        )
+        .await;
+        assert!(!verdict.allowed);
+        assert_eq!(
+            verdict.reason.as_deref(),
+            Some("azure content safety blocked content")
+        );
+        let _ = received.await;
+    }
+}
+
+#[test]
+fn azure_content_safety_threshold_defaults_to_four_and_is_bounded() {
+    let default: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
+        "name":"azure", "provider":"azure_content_safety", "url":"https://8.8.8.8",
+        "mode":"pre_call", "api_key":"fixture-key"
+    }))
+    .expect("valid Azure configuration");
+    let CompiledGuardrailProvider::AzureContentSafety(default) = default
+        .validate()
+        .expect("valid Azure configuration compiles")
+    else {
+        panic!("expected Azure configuration");
+    };
+    assert_eq!(default.severity_threshold, 4);
+    for severity_threshold in [8, 255] {
+        let config: ExternalGuardrailConfig = serde_json::from_value(serde_json::json!({
+            "name":"azure", "provider":"azure_content_safety", "url":"https://8.8.8.8",
+            "mode":"pre_call", "api_key":"fixture-key", "severity_threshold":severity_threshold
+        }))
+        .expect("configuration deserializes before validation");
+        assert!(config.validate().is_err());
+    }
+}
+
+#[tokio::test]
+async fn azure_content_safety_malformed_status_timeout_and_fail_modes_are_safe() {
+    for (status, body, delay, fail_open, expected_allowed) in [
+        (200, r#"{}"#, Duration::ZERO, false, false),
+        (
+            200,
+            r#"{"categoriesAnalysis":[{"category":"Hate","severity":1.5}],"blocklistsMatch":[]}"#,
+            Duration::ZERO,
+            true,
+            true,
+        ),
+        (
+            200,
+            r#"{"categoriesAnalysis":[{"category":"Hate","severity":8}],"blocklistsMatch":[]}"#,
+            Duration::ZERO,
+            false,
+            false,
+        ),
+        (
+            200,
+            r#"{"categoriesAnalysis":[{"category":"Unknown","severity":0}],"blocklistsMatch":[]}"#,
+            Duration::ZERO,
+            false,
+            false,
+        ),
+        (
+            200,
+            r#"{"categoriesAnalysis":[],"blocklistsMatch":[{}]}"#,
+            Duration::ZERO,
+            true,
+            true,
+        ),
+        (502, r#"{}"#, Duration::ZERO, false, false),
+        (
+            200,
+            r#"{"categoriesAnalysis":[],"blocklistsMatch":[]}"#,
+            Duration::from_millis(50),
+            true,
+            true,
+        ),
+    ] {
+        let (base_url, received) = fixture_server(status, body, delay).await;
+        let timeout_ms = if delay.is_zero() { 2_000 } else { 1 };
+        let verdict = check_external_guardrail(
+            &azure_config(base_url, fail_open, timeout_ms),
+            request(GuardrailPhase::Input),
+        )
+        .await;
+        assert_eq!(verdict.allowed, expected_allowed);
+        let _ = received.await;
+    }
+}
+
+#[tokio::test]
+async fn bedrock_guardrail_contract_uses_apply_guardrail_input_and_output_shapes() {
+    for (phase, source) in [
+        (GuardrailPhase::Input, "INPUT"),
+        (GuardrailPhase::Output, "OUTPUT"),
+    ] {
+        let (base_url, received) =
+            fixture_server(200, r#"{"action":"NONE"}"#, Duration::ZERO).await;
+        let verdict =
+            check_external_guardrail(&bedrock_config(base_url, false, 2_000), request(phase)).await;
+        assert!(verdict.allowed);
+        let wire_request = received.await.expect("fixture task");
+        assert!(wire_request
+            .starts_with("POST /guardrail/fixture-guardrail/version/1/apply HTTP/1.1\r\n"));
+        assert!(wire_request.contains("authorization: Bearer fixture-key\r\n"));
+        assert!(wire_request.ends_with(&format!(
+            r#"{{"content":[{{"text":{{"text":"fixture prompt"}}}}],"source":"{source}"}}"#
+        )));
+    }
+}
+
+#[tokio::test]
+async fn bedrock_guardrail_blocks_intervention_and_rejects_unknown_actions_safely() {
+    let (base_url, received) = fixture_server(
+        200,
+        r#"{"action":"GUARDRAIL_INTERVENED","actionReason":"raw vendor detail"}"#,
+        Duration::ZERO,
+    )
+    .await;
+    let verdict = check_external_guardrail(
+        &bedrock_config(base_url, false, 2_000),
+        request(GuardrailPhase::Input),
+    )
+    .await;
+    assert!(!verdict.allowed);
+    assert_eq!(
+        verdict.reason.as_deref(),
+        Some("bedrock guardrail intervened")
+    );
+    let _ = received.await;
+
+    for (status, body, delay, fail_open, expected_allowed) in [
+        (200, r#"{}"#, Duration::ZERO, false, false),
+        (200, r#"{"action":"UNKNOWN"}"#, Duration::ZERO, true, true),
+        (200, r#"{"action":false}"#, Duration::ZERO, false, false),
+        (502, r#"{}"#, Duration::ZERO, true, true),
+        (
+            200,
+            r#"{"action":"NONE"}"#,
+            Duration::from_millis(50),
+            false,
+            false,
+        ),
+    ] {
+        let (base_url, received) = fixture_server(status, body, delay).await;
+        let timeout_ms = if delay.is_zero() { 2_000 } else { 1 };
+        let verdict = check_external_guardrail(
+            &bedrock_config(base_url, fail_open, timeout_ms),
+            request(GuardrailPhase::Input),
+        )
+        .await;
+        assert_eq!(verdict.allowed, expected_allowed);
         let _ = received.await;
     }
 }
