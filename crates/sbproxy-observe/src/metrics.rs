@@ -273,6 +273,9 @@ pub struct ProxyMetrics {
     /// Counter `sbproxy_trust_tier_requests_total` of requests partitioned
     /// by the closed trust-tier decision.
     pub trust_tier_requests: IntCounterVec,
+    /// Counter `sbproxy_inbound_key_requests_total` of requests partitioned
+    /// by caller credential mode and its recognized provider.
+    pub inbound_key_requests: IntCounterVec,
 
     // --- Per-origin metrics (Sprint 1A) ---
     /// Total HTTP requests with origin, method, and status labels.
@@ -540,6 +543,14 @@ impl ProxyMetrics {
             &["tier"],
         )
         .unwrap();
+        let inbound_key_requests = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_inbound_key_requests_total",
+                "Requests partitioned by inbound credential mode and provider",
+            ),
+            &["provider", "key_mode"],
+        )
+        .unwrap();
 
         // --- Per-origin metrics (Sprint 1A) ---
 
@@ -780,6 +791,9 @@ impl ProxyMetrics {
             .register(Box::new(trust_tier_requests.clone()))
             .unwrap();
         registry
+            .register(Box::new(inbound_key_requests.clone()))
+            .unwrap();
+        registry
             .register(Box::new(per_origin_requests_total.clone()))
             .unwrap();
         registry
@@ -847,6 +861,7 @@ impl ProxyMetrics {
             agent_detect_score,
             agent_detect_inference_seconds,
             trust_tier_requests,
+            inbound_key_requests,
             per_origin_requests_total,
             per_origin_request_duration,
             per_origin_active_connections,
@@ -1259,6 +1274,25 @@ pub fn record_trust_tier(tier: &str) {
     metrics()
         .trust_tier_requests
         .with_label_values(&[tier])
+        .inc();
+}
+
+/// Record the request's inbound credential mode without exposing credential
+/// material. `key_mode` is a closed set; provider labels pass through the
+/// shared cardinality budget because operators may configure custom hints.
+pub fn record_inbound_key_request(provider: Option<&str>, key_mode: &str) {
+    let key_mode = match key_mode {
+        "none" | "minted" | "native" => key_mode,
+        _ => "none",
+    };
+    let provider = sanitize_label_budget(
+        "sbproxy_inbound_key_requests_total",
+        "provider",
+        provider.unwrap_or("none"),
+    );
+    metrics()
+        .inbound_key_requests
+        .with_label_values(&[provider.as_str(), key_mode])
         .inc();
 }
 
@@ -5013,6 +5047,26 @@ mod tests {
             .with_label_values(&["strong"])
             .get();
         assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn record_inbound_key_request_emits_only_provider_and_closed_key_mode() {
+        let before = metrics()
+            .inbound_key_requests
+            .with_label_values(&["openai", "native"])
+            .get();
+        record_inbound_key_request(Some("openai"), "native");
+        let after = metrics()
+            .inbound_key_requests
+            .with_label_values(&["openai", "native"])
+            .get();
+
+        assert_eq!(after, before + 1);
+        let rendered = metrics().render();
+        assert!(rendered.contains(
+            "sbproxy_inbound_key_requests_total{key_mode=\"native\",provider=\"openai\"}"
+        ));
+        assert!(!rendered.contains("sk-caller-owned-canary"));
     }
 
     #[test]

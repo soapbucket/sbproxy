@@ -627,6 +627,26 @@ fn realtime_provider_credential(
     Some(RealtimeCredential { header, value })
 }
 
+fn realtime_native_provider_credential(
+    provider: &sbproxy_ai::ProviderConfig,
+    headers: &http::HeaderMap,
+    hints: &[sbproxy_config::types::ProviderHintConfig],
+    native_provider: &str,
+) -> Option<RealtimeCredential> {
+    let effective_provider = provider
+        .provider_type
+        .as_deref()
+        .unwrap_or(provider.name.as_str());
+    if !effective_provider.eq_ignore_ascii_case(native_provider) {
+        return None;
+    }
+    let api_key =
+        crate::inbound_key::resolve_native_provider_credential(headers, hints, native_provider)?;
+    let mut resolved_provider = provider.clone();
+    resolved_provider.api_key = Some(api_key.to_string());
+    realtime_provider_credential(&resolved_provider)
+}
+
 fn choose_realtime_credential(
     bound: Option<RealtimeCredential>,
     provider: Option<RealtimeCredential>,
@@ -1426,7 +1446,19 @@ impl ProxyHttp for SbProxy {
                         .providers
                         .iter()
                         .find(|provider| provider.name.as_str() == dispatch.provider_name)
-                        .and_then(realtime_provider_credential);
+                        .and_then(|provider| {
+                            if ctx.inbound_key_mode != crate::context::InboundKeyMode::Native {
+                                return realtime_provider_credential(provider);
+                            }
+                            let native_provider = ctx.native_key_provider.as_deref()?;
+                            let key_plane = crate::key_plane::current_key_plane()?;
+                            realtime_native_provider_credential(
+                                provider,
+                                &session.req_header().headers,
+                                &key_plane.inbound().provider_hints,
+                                native_provider,
+                            )
+                        });
                 }
 
                 // WOR-819: REST -> gRPC transcoding. When the resolved
@@ -5466,6 +5498,10 @@ impl ProxyHttp for SbProxy {
             ctx.response_body_bytes,
             agent_labels,
         );
+        sbproxy_observe::metrics::record_inbound_key_request(
+            ctx.native_key_provider.as_deref(),
+            ctx.inbound_key_mode.as_str(),
+        );
 
         // WOR-1718: mirror the completed request into the admin request-log
         // ring buffer (and its SSE tail) when the admin server is running.
@@ -5980,6 +6016,40 @@ mod tests {
         let provider_auth = realtime_provider_credential(&provider);
         assert!(provider_auth.is_none(), "blank API keys are unavailable");
         assert!(choose_realtime_credential(None, provider_auth).is_err());
+    }
+
+    #[test]
+    fn realtime_native_credential_replaces_operator_key_for_matching_provider_only() {
+        let provider: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "primary",
+            "provider_type": "openai",
+            "api_key": "operator-key-must-not-be-billed"
+        }))
+        .unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer sk-caller-owned-canary"),
+        );
+        let inbound = sbproxy_config::types::KeyInboundConfig::default();
+
+        let credential = realtime_native_provider_credential(
+            &provider,
+            &headers,
+            &inbound.provider_hints,
+            "openai",
+        )
+        .expect("matching caller credential");
+        assert_eq!(credential.header, "Authorization");
+        assert_eq!(credential.value, "Bearer sk-caller-owned-canary");
+        assert!(!credential.value.contains("operator-key-must-not-be-billed"));
+        assert!(realtime_native_provider_credential(
+            &provider,
+            &headers,
+            &inbound.provider_hints,
+            "anthropic",
+        )
+        .is_none());
     }
 
     #[test]

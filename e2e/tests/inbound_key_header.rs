@@ -186,6 +186,10 @@ proxy:
         - name: x-sb-api
           scheme: ""
       require: false
+      native_key_policy:
+        allowed_providers:
+          - anthropic
+          - openai
 
 origins:
   tools.local:
@@ -369,6 +373,144 @@ fn a_callers_own_provider_key_still_reaches_the_upstream() {
         seen.get("x-api-key"),
         Some("sk-ant-api03-not-one-of-ours"),
         "a key that is not ours passes through untouched: {seen:?}"
+    );
+}
+
+#[test]
+fn a_native_provider_key_is_refused_without_an_operator_policy() {
+    let admin_port = free_port();
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let yaml = config(admin_port, upstream.port, "").replace(
+        "      native_key_policy:\n        allowed_providers:\n          - anthropic\n          - openai\n",
+        "",
+    );
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("proxy starts");
+
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{}/anything", harness.base_url()))
+        .header("Host", "tools.local")
+        .header("x-api-key", "sk-ant-api03-caller-owned")
+        .send()
+        .expect("proxy response");
+
+    assert_eq!(response.status().as_u16(), 403);
+    assert!(
+        upstream
+            .seen
+            .recv_timeout(Duration::from_millis(200))
+            .is_err(),
+        "a native key without a resolvable policy must fail before upstream dispatch"
+    );
+}
+
+#[test]
+fn a_native_provider_key_is_refused_when_its_provider_is_not_allowed() {
+    let admin_port = free_port();
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let harness = ProxyHarness::start_with_yaml(&config(admin_port, upstream.port, ""))
+        .expect("proxy starts");
+
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{}/anything", harness.base_url()))
+        .header("Host", "tools.local")
+        .header("api-key", "caller-owned-azure-key")
+        .send()
+        .expect("proxy response");
+
+    assert_eq!(response.status().as_u16(), 403);
+    assert!(
+        upstream
+            .seen
+            .recv_timeout(Duration::from_millis(200))
+            .is_err(),
+        "a provider outside the native-key allowlist must fail before upstream dispatch"
+    );
+}
+
+#[test]
+fn an_ai_route_uses_the_callers_native_key_instead_of_the_operator_key() {
+    let admin_port = free_port();
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let ai_origin = format!(
+        r#"  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: operator-key-must-not-be-billed
+          base_url: http://127.0.0.1:{}
+          allow_private_base_url: true
+          models: [gpt-test]
+"#,
+        upstream.port
+    );
+    let harness = ProxyHarness::start_with_yaml(&config(admin_port, upstream.port, &ai_origin))
+        .expect("proxy starts");
+
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{}/v1/chat/completions", harness.base_url()))
+        .header("Host", "ai.local")
+        .header("authorization", "Bearer sk-caller-owned-ai")
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .expect("AI proxy response");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let seen = upstream.next_request();
+    assert_eq!(
+        seen.get("authorization"),
+        Some("Bearer sk-caller-owned-ai"),
+        "the caller owns the native provider key and must remain the billed upstream identity"
+    );
+    assert!(
+        !seen
+            .get("authorization")
+            .is_some_and(|value| value.contains("operator-key")),
+        "the operator credential must never silently replace a caller-owned native key"
+    );
+}
+
+#[test]
+fn an_ai_route_refuses_a_native_key_for_a_different_provider() {
+    let admin_port = free_port();
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let ai_origin = format!(
+        r#"  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: anthropic
+          api_key: operator-key-must-not-be-billed
+          base_url: http://127.0.0.1:{}
+          allow_private_base_url: true
+          models: [gpt-test]
+"#,
+        upstream.port
+    );
+    let harness = ProxyHarness::start_with_yaml(&config(admin_port, upstream.port, &ai_origin))
+        .expect("proxy starts");
+
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{}/v1/chat/completions", harness.base_url()))
+        .header("Host", "ai.local")
+        .header("authorization", "Bearer sk-caller-owned-ai")
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .expect("AI proxy response");
+
+    assert_eq!(response.status().as_u16(), 403);
+    assert!(
+        upstream
+            .seen
+            .recv_timeout(Duration::from_millis(200))
+            .is_err(),
+        "provider mismatch must fail before an operator credential can be dispatched"
     );
 }
 

@@ -1689,6 +1689,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_inbound_key_requests_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_inbound_key_request"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["provider", "key_mode"],
+        description: "Requests partitioned by caller credential mode and recognized provider.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_inference_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_inference"),

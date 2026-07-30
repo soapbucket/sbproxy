@@ -231,6 +231,8 @@ pub fn dispatch_terminal_event(
         "" => None,
         id => Some(id.to_string()),
     };
+    ev.key_provider = ctx.native_key_provider.clone();
+    ev.key_mode = Some(ctx.inbound_key_mode.as_str().to_string());
     ev.properties = ctx.properties.clone();
     ev.provider = ctx.ai_provider.clone();
     ev.model = ctx.ai_model.clone();
@@ -294,6 +296,8 @@ mod dispatch_tests {
         ctx.ai_tokens_in = Some(100);
         ctx.ai_tokens_out = Some(25);
         ctx.ai_cost_usd_micros = Some(375);
+        ctx.native_key_provider = Some("openai".to_string());
+        ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
 
         CAPTURED.lock().expect("test sink lock").clear();
         dispatch_terminal_event(&ctx, DEFAULT_WORKSPACE_ID, Some(42), None);
@@ -311,6 +315,11 @@ mod dispatch_tests {
         assert_eq!(ev.tokens_in, Some(100));
         assert_eq!(ev.tokens_out, Some(25));
         assert_eq!(ev.cost_usd_micros, Some(375));
+        assert_eq!(ev.key_provider.as_deref(), Some("openai"));
+        assert_eq!(ev.key_mode.as_deref(), Some("native"));
+        assert!(!serde_json::to_string(ev)
+            .expect("request event serializes")
+            .contains("sk-caller-owned-canary"));
         assert!(matches!(ev.event_type, EventType::RequestCompleted));
     }
 

@@ -118,6 +118,12 @@ pub struct SecurityAuditEntry {
     /// by this field for per-tenant deny dashboards.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
+    /// Recognized native provider label. Never contains credential material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_provider: Option<String>,
+    /// Inbound credential mode (`none`, `minted`, or `native`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_mode: Option<String>,
 }
 
 impl SecurityAuditEntry {
@@ -141,6 +147,8 @@ impl SecurityAuditEntry {
             method,
             status_code: 400,
             tenant_id: None,
+            key_provider: None,
+            key_mode: None,
         }
     }
 
@@ -171,6 +179,8 @@ impl SecurityAuditEntry {
             method,
             status_code,
             tenant_id: None,
+            key_provider: None,
+            key_mode: None,
         }
     }
 
@@ -198,6 +208,8 @@ impl SecurityAuditEntry {
             method,
             status_code,
             tenant_id: None,
+            key_provider: None,
+            key_mode: None,
         }
     }
 
@@ -205,6 +217,18 @@ impl SecurityAuditEntry {
     /// `self` so call sites can chain `SecurityAuditEntry::policy_violation(...).with_tenant_id(ctx.tenant_id.to_string())`.
     pub fn with_tenant_id(mut self, tenant_id: impl Into<String>) -> Self {
         self.tenant_id = Some(tenant_id.into());
+        self
+    }
+
+    /// Stamp the request's credential classification without retaining the
+    /// credential itself.
+    pub fn with_key_context(
+        mut self,
+        key_provider: Option<impl Into<String>>,
+        key_mode: impl Into<String>,
+    ) -> Self {
+        self.key_provider = key_provider.map(Into::into);
+        self.key_mode = Some(key_mode.into());
         self
     }
 
@@ -437,6 +461,25 @@ mod tests {
         assert!(v.get("client_ip").is_none());
         assert!(v.get("request_id").is_none());
         assert!(v.get("method").is_none());
+    }
+
+    #[test]
+    fn security_audit_records_native_key_context_without_secret_material() {
+        let entry = SecurityAuditEntry::auth_failure(
+            "auth_denied",
+            "native_provider_key",
+            403,
+            Some("api.example.com".to_string()),
+            None,
+            Some("req-native".to_string()),
+            Some("POST".to_string()),
+        )
+        .with_key_context(Some("openai"), "native");
+        let json = serde_json::to_string(&entry).unwrap();
+
+        assert!(json.contains("\"key_provider\":\"openai\""));
+        assert!(json.contains("\"key_mode\":\"native\""));
+        assert!(!json.contains("sk-caller-owned-canary"));
     }
 
     #[test]

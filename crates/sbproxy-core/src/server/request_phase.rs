@@ -2394,16 +2394,44 @@ pub(super) async fn request_filter(
             resolve_inbound_key(&plane, &session.req_header().headers, raw_peer_ip, ctx).await;
         match outcome {
             InboundKeyPhase::Resolved => {
+                ctx.inbound_key_mode = crate::context::InboundKeyMode::Minted;
                 sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", true);
             }
             InboundKeyPhase::NotPresent => {
-                // No minted key: attribute a native provider credential, if
-                // one is recognizable, so this traffic stops being invisible
-                // to metrics, audit, and policy. Attribution never refuses.
-                ctx.native_key_provider = crate::inbound_key::resolve_provider_hint(
+                // No minted key: recognize and govern a caller-owned native
+                // provider credential. The explicit default policy is what
+                // prevents this path from silently spending an operator key.
+                match crate::inbound_key::resolve_native_key_policy(
                     &session.req_header().headers,
-                    &plane.inbound().provider_hints,
-                );
+                    plane.inbound(),
+                ) {
+                    crate::inbound_key::NativeKeyPolicyDecision::NotPresent => {}
+                    crate::inbound_key::NativeKeyPolicyDecision::Allowed { provider } => {
+                        ctx.native_key_provider = Some(provider);
+                        ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
+                    }
+                    crate::inbound_key::NativeKeyPolicyDecision::PolicyMissing { provider }
+                    | crate::inbound_key::NativeKeyPolicyDecision::ProviderDenied { provider } => {
+                        ctx.native_key_provider = Some(provider);
+                        ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
+                        finalize_inbound_key_trust(ctx, AuthTrustOutcome::Missing);
+                        sbproxy_observe::metrics::record_auth(
+                            &origin_label,
+                            "native_provider_key",
+                            false,
+                        );
+                        emit_auth_audit(
+                            "auth_denied",
+                            "native_provider_key",
+                            403,
+                            &origin_label,
+                            ctx,
+                            session,
+                        );
+                        send_error(session, 403, "native provider key is not allowed").await?;
+                        return Ok(true);
+                    }
+                }
                 if crate::inbound_key::requires_minted_key(plane.inbound()) {
                     finalize_inbound_key_trust(ctx, AuthTrustOutcome::Missing);
                     sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", false);

@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-07-26*
+*Last modified: 2026-07-30*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -48,6 +48,8 @@ proxy:
         - {name: x-api-key,     scheme: ""}
         - {name: x-sb-api,      scheme: ""}
       require: false                       # 401 when no minted key resolved
+      native_key_policy:
+        allowed_providers: [openai, anthropic]
     failure_mode_allow: false        # fail closed when the store is down
     allow_api_override: false        # config records win on reload
     oidc_claim_map:
@@ -75,7 +77,8 @@ A minted token looks like `sbp_<16 hex>_<64 hex>`, a fixed 85 characters over a
 fixed alphabet. That means a swept header is accepted or rejected on length and
 prefix alone, with no store lookup, so sweeping a header your origin already
 proxies cannot misfire. A caller presenting their own `sk-proj-...` or
-`sk-ant-...` provider key passes straight through to the upstream that owns it.
+`sk-ant-...` provider key is governed by the native-key policy described below
+and, when allowed, passes through to the upstream that owns it.
 
 The header a key arrives in is always removed before the request goes upstream.
 Your key is not an upstream credential, and forwarding it would hand a governed
@@ -109,15 +112,32 @@ credential, if any, is written to its own header.
 ### Attributing native provider keys
 
 A request that carries no minted key but does carry a recognizable provider
-credential is attributed to that provider. The rules live under
+credential is attributed to and governed as that provider. The rules live under
 `inbound.provider_hints`, ship with defaults for the common shapes (`sk-ant-`
 is Anthropic, `sk-or-` is OpenRouter, a bare `sk-` bearer is OpenAI,
 `x-goog-api-key` is Gemini, `api-key` is Azure), and are ordered: the first
 match wins, so specific prefixes belong before loose ones.
 
-Attribution is observational. It never refuses a request, and a credential
-matching no rule is admitted unattributed. It exists so native-key traffic
-shows up in metrics, audit, and policy instead of being invisible.
+Recognized native credentials require an explicit
+`inbound.native_key_policy.allowed_providers` allowlist. If the policy is
+absent or the recognized provider is not listed, SBproxy returns 403 before
+dispatch. A credential matching no hint remains unattributed and follows the
+origin's ordinary auth behavior.
+
+On a generic proxy route, an allowed caller-owned credential passes upstream
+unchanged. On an AI route, it can select only configured providers whose
+`provider_type` (or provider name when no type is set) matches the recognized
+provider, and it replaces that provider's configured `api_key` for this request
+only. This precedence prevents native-key traffic from silently spending the
+operator credential. If the credential cannot be re-resolved or no matching AI
+provider exists, the request fails before any upstream call. Minted `sbp_...`
+keys always take precedence and never enter native-key policy resolution.
+
+The companion metric
+`sbproxy_inbound_key_requests_total{provider,key_mode}` uses the closed
+`key_mode` values `none`, `minted`, and `native`. Access logs, request events,
+and security audit records carry the same `key_provider` and `key_mode` fields.
+No raw provider key is stored in those records or metric labels.
 
 ### Requiring a key
 

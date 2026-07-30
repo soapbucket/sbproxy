@@ -1866,6 +1866,30 @@ pub struct ProviderHintConfig {
     pub also_header: Option<String>,
 }
 
+/// Default admission policy for caller-owned native provider keys.
+///
+/// Native keys cannot carry an SBproxy policy record because the caller, not
+/// the operator, owns their secret. This explicit allowlist is therefore the
+/// policy applied to every native key recognized by `provider_hints`. Leaving
+/// the block absent fails closed for recognized native-key traffic.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct NativeKeyPolicyConfig {
+    /// Canonical provider labels admitted to use caller-owned credentials.
+    ///
+    /// Matching is case-insensitive and ignores surrounding whitespace. The
+    /// list must be non-empty and may not contain duplicates.
+    pub allowed_providers: Vec<String>,
+}
+
+impl NativeKeyPolicyConfig {
+    /// Whether this policy admits the canonical provider label.
+    pub fn allows(&self, provider: &str) -> bool {
+        self.allowed_providers
+            .iter()
+            .any(|allowed| allowed.trim().eq_ignore_ascii_case(provider.trim()))
+    }
+}
+
 /// `key_management.inbound:` block. Controls which request headers are swept
 /// for a minted key, and whether a route refuses requests that carry none.
 ///
@@ -1890,6 +1914,10 @@ pub struct KeyInboundConfig {
     /// matching no rule is admitted unattributed.
     #[serde(default = "default_provider_hints")]
     pub provider_hints: Vec<ProviderHintConfig>,
+    /// Explicit default policy for recognized caller-owned native provider
+    /// keys. Absent by default, which fails closed if a provider hint matches.
+    #[serde(default)]
+    pub native_key_policy: Option<NativeKeyPolicyConfig>,
 }
 
 impl Default for KeyInboundConfig {
@@ -1898,6 +1926,7 @@ impl Default for KeyInboundConfig {
             headers: default_inbound_headers(),
             require: false,
             provider_hints: default_provider_hints(),
+            native_key_policy: None,
         }
     }
 }
@@ -2030,6 +2059,29 @@ impl KeyInboundConfig {
                 {
                     return Err(format!(
                         "key_management.inbound.provider_hints: {name:?} is not a valid HTTP header name"
+                    ));
+                }
+            }
+        }
+        if let Some(policy) = &self.native_key_policy {
+            if policy.allowed_providers.is_empty() {
+                return Err(
+                    "key_management.inbound.native_key_policy.allowed_providers must not be empty"
+                        .to_string(),
+                );
+            }
+            let mut providers = std::collections::HashSet::new();
+            for provider in &policy.allowed_providers {
+                let canonical = provider.trim().to_ascii_lowercase();
+                if canonical.is_empty() {
+                    return Err(
+                        "key_management.inbound.native_key_policy.allowed_providers entries must not be empty"
+                            .to_string(),
+                    );
+                }
+                if !providers.insert(canonical) {
+                    return Err(format!(
+                        "key_management.inbound.native_key_policy.allowed_providers: {provider:?} is listed more than once"
                     ));
                 }
             }
@@ -9046,6 +9098,38 @@ mod inbound_key_header_tests {
     use super::*;
 
     #[test]
+    fn native_key_policy_requires_a_nonempty_unique_provider_allowlist() {
+        let mut cfg = KeyInboundConfig {
+            native_key_policy: Some(NativeKeyPolicyConfig {
+                allowed_providers: vec!["openai".to_string(), "anthropic".to_string()],
+            }),
+            ..KeyInboundConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+
+        cfg.native_key_policy = Some(NativeKeyPolicyConfig {
+            allowed_providers: Vec::new(),
+        });
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("allowed_providers must not be empty"));
+
+        cfg.native_key_policy = Some(NativeKeyPolicyConfig {
+            allowed_providers: vec!["OpenAI".to_string(), " openai ".to_string()],
+        });
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("listed more than once"));
+    }
+
+    #[test]
+    fn native_key_policy_is_absent_by_default_so_native_traffic_fails_closed() {
+        assert!(KeyInboundConfig::default().native_key_policy.is_none());
+    }
+
+    #[test]
     fn inbound_header_defaults_cover_the_three_common_shapes() {
         let cfg = KeyInboundConfig::default();
         let names: Vec<&str> = cfg.headers.iter().map(|h| h.name.as_str()).collect();
@@ -9068,6 +9152,7 @@ mod inbound_key_header_tests {
             }],
             require: false,
             provider_hints: Vec::new(),
+            native_key_policy: None,
         };
         assert!(bad.validate().is_err());
     }
@@ -9082,6 +9167,7 @@ mod inbound_key_header_tests {
                 }],
                 require: false,
                 provider_hints: Vec::new(),
+                native_key_policy: None,
             };
             assert!(cfg.validate().is_err(), "{forbidden} must be rejected");
         }
@@ -9106,6 +9192,7 @@ mod inbound_key_header_tests {
                 }],
                 require: false,
                 provider_hints: Vec::new(),
+                native_key_policy: None,
             };
             assert!(cfg.validate().is_err(), "{forbidden} must be rejected");
         }
@@ -9126,6 +9213,7 @@ mod inbound_key_header_tests {
             ],
             require: false,
             provider_hints: Vec::new(),
+            native_key_policy: None,
         };
         assert!(dupe.validate().is_err());
     }
@@ -9136,6 +9224,7 @@ mod inbound_key_header_tests {
             headers: vec![],
             require: false,
             provider_hints: Vec::new(),
+            native_key_policy: None,
         };
         assert!(cfg.validate().is_ok());
         assert!(cfg.header_names().is_empty());
@@ -9150,6 +9239,7 @@ mod inbound_key_header_tests {
             }],
             require: false,
             provider_hints: Vec::new(),
+            native_key_policy: None,
         };
         assert_eq!(cfg.header_names(), ["x-tool-auth"]);
     }

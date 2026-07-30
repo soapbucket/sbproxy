@@ -109,7 +109,31 @@ pub fn resolve_provider_hint(
     headers: &http::HeaderMap,
     hints: &[sbproxy_config::types::ProviderHintConfig],
 ) -> Option<String> {
+    matching_provider_credential(headers, hints, None).map(|(provider, _)| provider)
+}
+
+/// Return the caller-owned credential for one already-authorized provider.
+///
+/// The returned value borrows the request header and omits the configured
+/// authentication scheme. Callers should keep it request-local and must never
+/// log or serialize it.
+pub fn resolve_native_provider_credential<'a>(
+    headers: &'a http::HeaderMap,
+    hints: &[sbproxy_config::types::ProviderHintConfig],
+    provider: &str,
+) -> Option<&'a str> {
+    matching_provider_credential(headers, hints, Some(provider)).map(|(_, credential)| credential)
+}
+
+fn matching_provider_credential<'a>(
+    headers: &'a http::HeaderMap,
+    hints: &[sbproxy_config::types::ProviderHintConfig],
+    expected_provider: Option<&str>,
+) -> Option<(String, &'a str)> {
     for hint in hints {
+        if expected_provider.is_some_and(|expected| !hint.provider.eq_ignore_ascii_case(expected)) {
+            continue;
+        }
         let lower = hint.header.trim().to_ascii_lowercase();
         let Ok(name) = http::header::HeaderName::from_bytes(lower.as_bytes()) else {
             // Rejected at config load; skip a hand-built bad rule.
@@ -146,11 +170,53 @@ pub fn resolve_provider_hint(
                 continue;
             }
             if candidate.starts_with(&hint.value_prefix) {
-                return Some(hint.provider.clone());
+                return Some((hint.provider.clone(), candidate));
             }
         }
     }
     None
+}
+
+/// Admission result for a caller-owned native provider key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeKeyPolicyDecision {
+    /// No configured provider hint recognized a native credential.
+    NotPresent,
+    /// The credential's provider is explicitly admitted.
+    Allowed {
+        /// Canonical provider label resolved by the matching hint.
+        provider: String,
+    },
+    /// A provider was recognized but no operator policy was available.
+    PolicyMissing {
+        /// Canonical provider label resolved by the matching hint.
+        provider: String,
+    },
+    /// The operator policy does not admit the recognized provider.
+    ProviderDenied {
+        /// Canonical provider label resolved by the matching hint.
+        provider: String,
+    },
+}
+
+/// Resolve and authorize a caller-owned native provider key.
+///
+/// A minted token is excluded by [`resolve_provider_hint`] and therefore
+/// always remains on the higher-precedence governed path. Recognized native
+/// credentials require an explicit policy; absence is a closed failure rather
+/// than permission to spend an operator credential.
+pub fn resolve_native_key_policy(
+    headers: &http::HeaderMap,
+    cfg: &KeyInboundConfig,
+) -> NativeKeyPolicyDecision {
+    let Some(provider) = resolve_provider_hint(headers, &cfg.provider_hints) else {
+        return NativeKeyPolicyDecision::NotPresent;
+    };
+    match cfg.native_key_policy.as_ref() {
+        Some(policy) if policy.allows(&provider) => NativeKeyPolicyDecision::Allowed { provider },
+        Some(_) => NativeKeyPolicyDecision::ProviderDenied { provider },
+        None => NativeKeyPolicyDecision::PolicyMissing { provider },
+    }
 }
 
 /// Strip `scheme` from the front of `value`, case-insensitively, returning the
@@ -170,7 +236,7 @@ fn strip_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sbproxy_config::types::{InboundHeaderConfig, KeyInboundConfig};
+    use sbproxy_config::types::{InboundHeaderConfig, KeyInboundConfig, NativeKeyPolicyConfig};
 
     fn token() -> String {
         format!("sbp_{}_{}", "0".repeat(16), "a".repeat(64))
@@ -289,6 +355,7 @@ mod tests {
             headers: vec![],
             require: false,
             provider_hints: Vec::new(),
+            native_key_policy: None,
         };
         assert_eq!(sweep_headers(&h, &off), SweepOutcome::None);
     }
@@ -310,6 +377,7 @@ mod tests {
             ],
             require: false,
             provider_hints: Vec::new(),
+            native_key_policy: None,
         };
         match sweep_headers(&h, &ordered) {
             SweepOutcome::Found { header, .. } => assert_eq!(header, "x-sb-api"),
@@ -371,6 +439,32 @@ mod tests {
     }
 
     #[test]
+    fn authorized_native_credential_is_extracted_only_for_its_provider() {
+        let defaults = KeyInboundConfig::default();
+        let h = headers(&[("authorization", "Bearer sk-caller-owned-canary")]);
+
+        assert_eq!(
+            resolve_native_provider_credential(&h, &defaults.provider_hints, "OPENAI"),
+            Some("sk-caller-owned-canary")
+        );
+        assert_eq!(
+            resolve_native_provider_credential(&h, &defaults.provider_hints, "anthropic"),
+            None
+        );
+    }
+
+    #[test]
+    fn minted_credentials_are_never_extracted_as_native_provider_keys() {
+        let defaults = KeyInboundConfig::default();
+        let h = headers(&[("authorization", &format!("Bearer {}", token()))]);
+
+        assert_eq!(
+            resolve_native_provider_credential(&h, &defaults.provider_hints, "openai"),
+            None
+        );
+    }
+
+    #[test]
     fn an_unrecognized_credential_is_unattributed_not_refused() {
         let defaults = KeyInboundConfig::default();
         let h = headers(&[("authorization", "Bearer some-opaque-jwt")]);
@@ -386,5 +480,66 @@ mod tests {
         let defaults = KeyInboundConfig::default();
         let h = headers(&[("x-api-key", &token()), ("anthropic-version", "2023-06-01")]);
         assert_eq!(resolve_provider_hint(&h, &defaults.provider_hints), None);
+    }
+
+    #[test]
+    fn a_recognized_native_key_requires_an_explicit_allowing_policy() {
+        let h = headers(&[("authorization", "Bearer sk-caller-owned")]);
+        let mut cfg = KeyInboundConfig::default();
+
+        assert_eq!(
+            resolve_native_key_policy(&h, &cfg),
+            NativeKeyPolicyDecision::PolicyMissing {
+                provider: "openai".to_string()
+            }
+        );
+
+        cfg.native_key_policy = Some(NativeKeyPolicyConfig {
+            allowed_providers: vec!["anthropic".to_string()],
+        });
+        assert_eq!(
+            resolve_native_key_policy(&h, &cfg),
+            NativeKeyPolicyDecision::ProviderDenied {
+                provider: "openai".to_string()
+            }
+        );
+
+        cfg.native_key_policy = Some(NativeKeyPolicyConfig {
+            allowed_providers: vec![" OpenAI ".to_string()],
+        });
+        assert_eq!(
+            resolve_native_key_policy(&h, &cfg),
+            NativeKeyPolicyDecision::Allowed {
+                provider: "openai".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn non_native_traffic_does_not_require_a_native_key_policy() {
+        let cfg = KeyInboundConfig::default();
+        assert_eq!(
+            resolve_native_key_policy(&headers(&[("authorization", "Bearer an-opaque-jwt")]), &cfg),
+            NativeKeyPolicyDecision::NotPresent
+        );
+        assert_eq!(
+            resolve_native_key_policy(&headers(&[]), &cfg),
+            NativeKeyPolicyDecision::NotPresent
+        );
+    }
+
+    #[test]
+    fn minted_keys_never_enter_native_policy_resolution() {
+        let cfg = KeyInboundConfig {
+            native_key_policy: Some(NativeKeyPolicyConfig {
+                allowed_providers: vec!["anthropic".to_string()],
+            }),
+            ..KeyInboundConfig::default()
+        };
+        let h = headers(&[("x-api-key", &token()), ("anthropic-version", "2023-06-01")]);
+        assert_eq!(
+            resolve_native_key_policy(&h, &cfg),
+            NativeKeyPolicyDecision::NotPresent
+        );
     }
 }

@@ -267,6 +267,12 @@ pub struct AccessLogEntry {
     /// un-credentialed requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_id: Option<String>,
+    /// Recognized native provider label. Never contains credential material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_provider: Option<String>,
+    /// Inbound credential mode (`none`, `minted`, or `native`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_mode: Option<String>,
     /// True when this request was served from cache (hot or reserve)
     /// without contacting the upstream. Mirrors `cache_result == "hit"`
     /// but distinguishes hit-then-revalidated paths.
@@ -611,6 +617,8 @@ impl Default for AccessLogEntry {
             auth_type: None,
             principal_kind: None,
             api_key_id: None,
+            key_provider: None,
+            key_mode: None,
             served_from_cache: None,
             fallback_triggered: None,
             retry_count: None,
@@ -915,6 +923,8 @@ mod tests {
             auth_type: None,
             principal_kind: None,
             api_key_id: None,
+            key_provider: None,
+            key_mode: None,
             served_from_cache: None,
             fallback_triggered: None,
             retry_count: None,
@@ -961,6 +971,18 @@ mod tests {
         assert_eq!(v["bytes_in"], 128);
         assert_eq!(v["bytes_out"], 512);
         assert_eq!(v["client_ip"], "10.0.0.1");
+    }
+
+    #[test]
+    fn native_key_context_serializes_without_secret_material() {
+        let mut entry = minimal_entry();
+        entry.key_provider = Some("openai".to_string());
+        entry.key_mode = Some("native".to_string());
+        let json = serde_json::to_string(&entry).unwrap();
+
+        assert!(json.contains("\"key_provider\":\"openai\""));
+        assert!(json.contains("\"key_mode\":\"native\""));
+        assert!(!json.contains("sk-caller-owned-canary"));
     }
 
     #[test]

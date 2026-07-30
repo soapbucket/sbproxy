@@ -3782,6 +3782,7 @@
                 "scheme": ""
               }
             ],
+            "native_key_policy": null,
             "provider_hints": [
               {
                 "also_header": null,
@@ -4494,6 +4495,18 @@
           "items": {
             "$ref": "#/definitions/ProviderHintConfig"
           }
+        },
+        "native_key_policy": {
+          "description": "Explicit default policy for recognized caller-owned native provider keys. Absent by default, which fails closed if a provider hint matches.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/NativeKeyPolicyConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -4548,6 +4561,22 @@
             "string",
             "null"
           ]
+        }
+      }
+    },
+    "NativeKeyPolicyConfig": {
+      "description": "Default admission policy for caller-owned native provider keys.\n\nNative keys cannot carry an SBproxy policy record because the caller, not the operator, owns their secret. This explicit allowlist is therefore the policy applied to every native key recognized by `provider_hints`. Leaving the block absent fails closed for recognized native-key traffic.",
+      "type": "object",
+      "required": [
+        "allowed_providers"
+      ],
+      "properties": {
+        "allowed_providers": {
+          "description": "Canonical provider labels admitted to use caller-owned credentials.\n\nMatching is case-insensitive and ignores surrounding whitespace. The list must be non-empty and may not contain duplicates.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     },

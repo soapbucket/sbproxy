@@ -115,6 +115,14 @@ pub struct RequestEvent {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub api_key_id: Option<String>,
 
+    /// Recognized native provider label. Never contains credential material.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub key_provider: Option<String>,
+
+    /// Inbound credential mode (`none`, `minted`, or `native`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub key_mode: Option<String>,
+
     /// Custom properties. Lowercased keys, allowlist-checked,
     /// length-capped, redaction-applied. Empty map serializes as absent.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
@@ -202,6 +210,8 @@ impl RequestEvent {
             user_id: None,
             user_id_source: None,
             api_key_id: None,
+            key_provider: None,
+            key_mode: None,
             properties: BTreeMap::new(),
             provider: None,
             model: None,
@@ -249,6 +259,8 @@ mod tests {
             user_id: Some("user_42".to_string()),
             user_id_source: Some(UserIdSource::Header),
             api_key_id: Some("sk_deadbeef0001".to_string()),
+            key_provider: Some("openai".to_string()),
+            key_mode: Some("native".to_string()),
             properties: props,
             provider: Some("openai".to_string()),
             model: Some("gpt-4o".to_string()),
@@ -294,6 +306,8 @@ mod tests {
         assert_eq!(decoded.session_id, original.session_id);
         assert_eq!(decoded.user_id, original.user_id);
         assert_eq!(decoded.user_id_source, original.user_id_source);
+        assert_eq!(decoded.key_provider, original.key_provider);
+        assert_eq!(decoded.key_mode, original.key_mode);
         assert_eq!(decoded.properties, original.properties);
         assert_eq!(decoded.cost_usd_micros, original.cost_usd_micros);
         assert_eq!(decoded.tokens_cached, original.tokens_cached);

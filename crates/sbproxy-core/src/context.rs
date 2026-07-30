@@ -136,6 +136,29 @@ pub struct RequestMetrics {
     pub stripped_bytes: u64,
 }
 
+/// Stable, secret-free classification of the inbound key path.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum InboundKeyMode {
+    /// No governed or recognized native key was admitted.
+    #[default]
+    None,
+    /// An SBproxy-minted key resolved through the governed key plane.
+    Minted,
+    /// A caller-owned native provider key resolved through the default policy.
+    Native,
+}
+
+impl InboundKeyMode {
+    /// Closed vocabulary used by metrics and audit records.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minted => "minted",
+            Self::Native => "native",
+        }
+    }
+}
+
 /// Bounded cache outcome carried to the admin request ring.
 ///
 /// The declaration order is the precedence order used when multiple cache
@@ -1027,6 +1050,8 @@ pub struct RequestContext {
     /// to refuse. Read by metrics, audit, and policy so native-key traffic
     /// stops being invisible.
     pub native_key_provider: Option<String>,
+    /// Secret-free inbound key classification for metrics and audit.
+    pub inbound_key_mode: InboundKeyMode,
     /// Accepted ingress governance reservation owned by this request.
     ///
     /// Successful response accounting settles it with actual usage. Paths
@@ -1451,6 +1476,7 @@ impl RequestContext {
             resolved_inbound_key: None,
             inbound_key_header: None,
             native_key_provider: None,
+            inbound_key_mode: InboundKeyMode::None,
             governance_lease: None,
             ai_admission: None,
             ai_realtime_session: None,

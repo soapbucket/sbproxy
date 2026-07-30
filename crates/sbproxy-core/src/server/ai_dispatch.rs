@@ -11,6 +11,26 @@ use crate::key_policy::StoredPolicyErrorKind;
 use crate::key_policy::{key_record_to_effective_policy, StoredPolicyError};
 use crate::model_discovery::ErrorEnvelope;
 
+fn provider_matches_native_key(
+    provider: &sbproxy_ai::ProviderConfig,
+    native_provider: &str,
+) -> bool {
+    provider
+        .provider_type
+        .as_deref()
+        .unwrap_or(provider.name.as_str())
+        .eq_ignore_ascii_case(native_provider)
+}
+
+fn apply_native_provider_credential(
+    provider: &mut sbproxy_ai::ProviderConfig,
+    native_api_key: Option<&str>,
+) {
+    if let Some(api_key) = native_api_key {
+        provider.api_key = Some(api_key.to_string());
+    }
+}
+
 /// Outcome of resolving an inbound bearer token against the dynamic key plane
 /// (WOR-1551).
 enum DynamicKeyOutcome {
@@ -1079,6 +1099,13 @@ fn try_spawn_governed_shadow_after_primary(
     quota: &sbproxy_ai::quota_pool::QuotaPoolAdmission,
     reasoning_eligibility: sbproxy_ai::ReasoningEligibility,
 ) {
+    // A shadow is a second billable provider request. The caller authorized
+    // only the provider represented by their native credential, while this
+    // API currently accepts an operator-owned config snapshot. Suppress the
+    // copy rather than silently spending the operator credential.
+    if ctx.inbound_key_mode == crate::context::InboundKeyMode::Native {
+        return;
+    }
     if !shadow_surface_is_eligible(surface) {
         return;
     }
@@ -1989,7 +2016,7 @@ pub(super) async fn handle_ai_proxy(
     if let Some(user) = trace_user {
         ai_span.record("sbproxy.user", user);
     }
-    let allowed_providers = resolved_request_vk
+    let policy_allowed_providers = resolved_request_vk
         .as_ref()
         .map(ResolvedRequestKey::allowed_providers)
         .or_else(|| {
@@ -2003,6 +2030,68 @@ pub(super) async fn handle_ai_proxy(
         .as_ref()
         .map(ResolvedRequestKey::blocked_providers)
         .unwrap_or(&[]);
+    let native_provider = (ctx.inbound_key_mode == crate::context::InboundKeyMode::Native)
+        .then(|| ctx.native_key_provider.as_deref())
+        .flatten();
+    let native_api_key = if let Some(provider) = native_provider {
+        let Some(key_plane) = key_plane.as_deref() else {
+            send_error(
+                session,
+                503,
+                "native provider credential context is unavailable",
+            )
+            .await?;
+            return Ok(());
+        };
+        let Some(api_key) = crate::inbound_key::resolve_native_provider_credential(
+            &session.req_header().headers,
+            &key_plane.inbound().provider_hints,
+            provider,
+        ) else {
+            send_error(
+                session,
+                503,
+                "native provider credential context is unresolved",
+            )
+            .await?;
+            return Ok(());
+        };
+        Some(api_key.to_string())
+    } else {
+        None
+    };
+    let native_allowed_providers: Vec<String> = native_provider
+        .map(|native_provider| {
+            config
+                .providers
+                .iter()
+                .filter(|provider| {
+                    provider.enabled
+                        && provider_matches_native_key(provider, native_provider)
+                        && sbproxy_ai::routing::provider_allowed_by_policy(
+                            provider.name.as_str(),
+                            policy_allowed_providers,
+                            blocked_providers,
+                        )
+                })
+                .map(|provider| provider.name.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if native_provider.is_some() && native_allowed_providers.is_empty() {
+        send_error(
+            session,
+            403,
+            "native provider key does not match an AI provider",
+        )
+        .await?;
+        return Ok(());
+    }
+    let allowed_providers = if native_provider.is_some() {
+        native_allowed_providers.as_slice()
+    } else {
+        policy_allowed_providers
+    };
     let allowed_models = resolved_request_vk
         .as_ref()
         .map(ResolvedRequestKey::allowed_models)
@@ -2200,7 +2289,9 @@ pub(super) async fn handle_ai_proxy(
                 warn!("AI proxy: no enabled providers");
                 Error::new(ErrorType::HTTPStatus(502))
             })?;
-        let provider = &config.providers[provider_idx];
+        let mut resolved_provider = config.providers[provider_idx].clone();
+        apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
+        let provider = &resolved_provider;
         ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
         ctx.admin_load_balancer_target = Some(provider.name.to_string());
 
@@ -2332,7 +2423,9 @@ pub(super) async fn handle_ai_proxy(
                 warn!("AI proxy: no enabled providers");
                 Error::new(ErrorType::HTTPStatus(502))
             })?;
-        let provider = &config.providers[provider_idx];
+        let mut resolved_provider = config.providers[provider_idx].clone();
+        apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
+        let provider = &resolved_provider;
         ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
         ctx.admin_load_balancer_target = Some(provider.name.to_string());
 
@@ -2756,7 +2849,9 @@ pub(super) async fn handle_ai_proxy(
             if attempt > 0 && !is_failover && ctx.managed_fallback_reason.is_none() {
                 break;
             }
-            let provider = &config.providers[provider_idx];
+            let mut resolved_provider = config.providers[provider_idx].clone();
+            apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
+            let provider = &resolved_provider;
             let reservation_id = format!("{}:quota-pool:multipart:{attempt}", ctx.request_id);
             let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
                 session,
@@ -4447,6 +4542,11 @@ pub(super) async fn handle_ai_proxy(
                                 )
                         }) {
                             Some(provider) => {
+                                let mut resolved_provider = provider.clone();
+                                apply_native_provider_credential(
+                                    &mut resolved_provider,
+                                    native_api_key.as_deref(),
+                                );
                                 let reservation_id =
                                     format!("{}:quota-pool:embedding:provider", ctx.request_id);
                                 let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
@@ -4462,7 +4562,7 @@ pub(super) async fn handle_ai_proxy(
                                 let ai_client = AI_CLIENT.load_full();
                                 sbproxy_ai::semantic_cache::compute_embedding_with_quota(
                                     &ai_client,
-                                    provider,
+                                    &resolved_provider,
                                     cache.model(),
                                     &extracted_prompt,
                                     quota_attempt,
@@ -5052,6 +5152,20 @@ pub(super) async fn handle_ai_proxy(
     // skipping `relay_ai_response_with_cache` also means cascade
     // does not engage the semantic cache write or idempotency
     // capture in v1, which is documented in the example README.
+    if native_api_key.is_some()
+        && !is_stream
+        && !has_managed_local
+        && router.cascade_config().is_some()
+        && !disallow_training
+    {
+        send_error(
+            session,
+            503,
+            "native provider keys are unavailable for confidence cascade routing",
+        )
+        .await?;
+        return Ok(());
+    }
     if let Some(cascade_cfg) = router
         .cascade_config()
         .filter(|_| !disallow_training && !has_managed_local)
@@ -5216,7 +5330,6 @@ pub(super) async fn handle_ai_proxy(
              failover path so local admission and engine lifecycle remain governed"
         );
     }
-
     // --- Hedged / raced dispatch (WOR-1545) ---
     //
     // When the configured strategy is `race`, fan the request out to every
@@ -5239,7 +5352,8 @@ pub(super) async fn handle_ai_proxy(
         let race_start = std::time::Instant::now();
         let mut futs = FuturesUnordered::new();
         for (race_attempt, &idx) in provider_order.iter().enumerate() {
-            let provider = &config.providers[idx];
+            let mut provider = config.providers[idx].clone();
+            apply_native_provider_credential(&mut provider, native_api_key.as_deref());
             let mut attempt_body = body.clone();
             let resolved_model = if !model.is_empty() {
                 let mapped = provider.map_model(&model);
@@ -5260,7 +5374,7 @@ pub(super) async fn handle_ai_proxy(
                 } else {
                     sbproxy_ai::ReasoningPolicy::Off
                 },
-                provider,
+                &provider,
                 &resolved_model,
                 &mut attempt_body,
                 reasoning_eligibility,
@@ -5290,7 +5404,12 @@ pub(super) async fn handle_ai_proxy(
                 let r = run_routed_provider_attempt(
                     &attempt_router,
                     idx,
-                    cl.forward_request_with_quota(provider, path_ref, &attempt_body, quota_attempt),
+                    cl.forward_request_with_quota(
+                        &provider,
+                        path_ref,
+                        &attempt_body,
+                        quota_attempt,
+                    ),
                 )
                 .await
                 .map_err(|error| {
@@ -5420,6 +5539,7 @@ pub(super) async fn handle_ai_proxy(
         ctx.managed_route_trace = None;
         ctx.managed_route_class = None;
         let mut resolved_provider = config.providers[provider_idx].clone();
+        apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
         let mut local_public_model = None;
         let mut local_engine_model = None;
         let distributed_managed =
