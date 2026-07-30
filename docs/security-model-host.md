@@ -138,9 +138,9 @@ source remain part of the operator's network and mirror policy.
 ### vLLM container
 
 Container launch requires `repository@sha256:<64 hex>`. Tags and `latest` are
-rejected. The runtime:
+rejected. For a pinned artifact, the runtime:
 
-- creates an internal private network;
+- creates an internal private network with no egress;
 - publishes the engine port on loopback only;
 - mounts the verified artifact snapshot read-only;
 - scopes the selected NVIDIA devices;
@@ -149,6 +149,28 @@ rejected. The runtime:
 
 The container runtime daemon is a privileged trust boundary. Anyone who can
 control its socket may already have host-level authority.
+
+#### Unpinned raw `hf:` references are weaker, on purpose
+
+A serve entry naming a raw `hf:` reference instead of a catalog artifact runs
+in repo mode, where sbproxy has no verified local bytes because the engine
+downloads the weights itself. Three of the protections above do not apply:
+
+- the container runs on the default bridge, **with DNS and external egress**,
+  because it has to reach Hugging Face;
+- the Hugging Face cache is mounted **writable**, not read-only;
+- the launch-time trust-state gate and file-map cross-check are skipped, since
+  there is nothing local to check. No digest is ever computed for these
+  weights, so the pull policy, offline mode, and digest-failure contract cover
+  nothing on this path.
+
+This is the intended trade for `sbproxy run <model>` on a workstation and for
+evaluating a model that has no catalog entry yet. It is a poor fit for a
+long-lived fleet worker holding cluster identity. A `proxy.model_host` managed
+deployment already refuses raw references; the legacy provider-level `serve:`
+form still accepts them. Prefer a catalog entry with real per-file digests on
+anything you would call production, and treat repo mode as a development
+affordance.
 
 ## Process lifecycle
 
