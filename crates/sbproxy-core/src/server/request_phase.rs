@@ -176,12 +176,16 @@ pub(super) enum InboundKeyPhase {
 /// Resolve a minted virtual key out of the configured inbound headers, before
 /// the origin's configured auth provider runs.
 ///
+/// `raw_peer_ip` must come directly from `Session::client_addr`, before trusted
+/// forwarding headers can replace `ctx.client_ip`.
+///
 /// Fail-closed on a store outage unless `failure_mode_allow` is set. An unknown
 /// id and a wrong secret return the same status so neither is an existence
 /// oracle.
 pub(super) async fn resolve_inbound_key(
     plane: &crate::key_plane::KeyPlane,
     headers: &http::HeaderMap,
+    raw_peer_ip: Option<std::net::IpAddr>,
     ctx: &mut RequestContext,
 ) -> InboundKeyPhase {
     // Playground impersonation ticket: always presented as a Bearer token
@@ -193,7 +197,7 @@ pub(super) async fn resolve_inbound_key(
     // ordinarily-presented minted key uses below; a header that carries
     // no ticket-shaped token at all falls through to the ordinary sweep
     // unchanged.
-    if let Some(outcome) = resolve_impersonation_ticket(plane, headers, ctx).await {
+    if let Some(outcome) = resolve_impersonation_ticket(plane, headers, raw_peer_ip, ctx).await {
         return outcome;
     }
 
@@ -272,15 +276,16 @@ fn finalize_inbound_key_trust(ctx: &mut RequestContext, trust_outcome: AuthTrust
 /// 401 an unknown minted key gets, rather than silently falling through
 /// to whatever auth the origin has configured.
 ///
-/// Redemption is bound to a loopback peer: `admin_playground`'s dispatch
-/// route is the only legitimate minter and it always redeems its own
-/// ticket via a direct loopback call, so nothing outside this process
-/// should ever be able to present one. Checked before consuming (not
-/// after), so a wrong-peer attempt cannot burn a ticket the legitimate
-/// loopback caller still needs.
+/// Redemption is bound to both a loopback TCP peer and a loopback effective
+/// client: `admin_playground`'s dispatch route is the only legitimate minter
+/// and it always redeems its own ticket via a direct loopback call, so nothing
+/// outside this process should ever be able to present one. Both are checked
+/// before consuming (not after), so a wrong-peer attempt cannot burn a ticket
+/// the legitimate loopback caller still needs.
 async fn resolve_impersonation_ticket(
     plane: &crate::key_plane::KeyPlane,
     headers: &http::HeaderMap,
+    raw_peer_ip: Option<std::net::IpAddr>,
     ctx: &mut RequestContext,
 ) -> Option<InboundKeyPhase> {
     let auth = headers.get("authorization")?.to_str().ok()?;
@@ -292,7 +297,9 @@ async fn resolve_impersonation_ticket(
     if !token.starts_with(crate::admin_playground::ticket::PREFIX) {
         return None;
     }
-    if !ctx.client_ip.is_some_and(|ip| ip.is_loopback()) {
+    if !raw_peer_ip.is_some_and(|ip| ip.is_loopback())
+        || !ctx.client_ip.is_some_and(|ip| ip.is_loopback())
+    {
         return Some(InboundKeyPhase::Deny {
             status: 401,
             message: "invalid key".to_string(),
@@ -409,11 +416,13 @@ pub(super) async fn request_filter(
         }
     }
 
-    // Extract client IP from the downstream connection.
-    ctx.client_ip = session
+    // Preserve the raw TCP peer before trusted forwarding headers can
+    // replace ctx.client_ip with the derived client identity.
+    let raw_peer_ip = session
         .client_addr()
         .and_then(|addr| addr.as_inet())
         .map(|addr| addr.ip());
+    ctx.client_ip = raw_peer_ip;
 
     // Trust boundary for inbound forwarding headers.
     //
@@ -2381,7 +2390,8 @@ pub(super) async fn request_filter(
         // Bind the outcome before matching so the immutable borrow of
         // `session` ends here rather than spanning the arms, which need it
         // mutably to write an error response.
-        let outcome = resolve_inbound_key(&plane, &session.req_header().headers, ctx).await;
+        let outcome =
+            resolve_inbound_key(&plane, &session.req_header().headers, raw_peer_ip, ctx).await;
         match outcome {
             InboundKeyPhase::Resolved => {
                 sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", true);
@@ -5524,12 +5534,16 @@ mod inbound_key_phase_tests {
         RequestContext::default()
     }
 
+    fn loopback_ip() -> std::net::IpAddr {
+        "127.0.0.1".parse().unwrap()
+    }
+
     /// A context whose peer looks like the admin server's own loopback
     /// dispatch call, the only shape an impersonation ticket is ever
     /// allowed to redeem from.
     fn loopback_ctx() -> RequestContext {
         let mut c = ctx();
-        c.client_ip = Some("127.0.0.1".parse().unwrap());
+        c.client_ip = Some(loopback_ip());
         c
     }
 
@@ -5555,7 +5569,8 @@ mod inbound_key_phase_tests {
     async fn a_minted_key_on_x_api_key_resolves_and_records_its_header() {
         let (plane, token, _) = plane_with_keys().await;
         let mut c = ctx();
-        let outcome = resolve_inbound_key(&plane, &headers(&[("x-api-key", &token)]), &mut c).await;
+        let outcome =
+            resolve_inbound_key(&plane, &headers(&[("x-api-key", &token)]), None, &mut c).await;
         assert!(matches!(outcome, InboundKeyPhase::Resolved), "{outcome:?}");
         assert!(c.resolved_inbound_key.is_some());
         // The caller strips exactly this header, so the proxy's own key never
@@ -5569,7 +5584,7 @@ mod inbound_key_phase_tests {
         let mut c = ctx();
         let h = headers(&[("authorization", &format!("Bearer {token}"))]);
         assert!(matches!(
-            resolve_inbound_key(&plane, &h, &mut c).await,
+            resolve_inbound_key(&plane, &h, None, &mut c).await,
             InboundKeyPhase::Resolved
         ));
         assert_eq!(c.inbound_key_header.as_deref(), Some("authorization"));
@@ -5581,7 +5596,7 @@ mod inbound_key_phase_tests {
         let mut c = ctx();
         let h = headers(&[("authorization", "Bearer some-opaque-jwt")]);
         assert!(matches!(
-            resolve_inbound_key(&plane, &h, &mut c).await,
+            resolve_inbound_key(&plane, &h, None, &mut c).await,
             InboundKeyPhase::NotPresent
         ));
         assert!(c.resolved_inbound_key.is_none());
@@ -5596,7 +5611,7 @@ mod inbound_key_phase_tests {
         let mut c = ctx();
         let h = headers(&[("x-api-key", "sk-ant-api03-abcdefghijklmnopqrstuvwxyz")]);
         assert!(matches!(
-            resolve_inbound_key(&plane, &h, &mut c).await,
+            resolve_inbound_key(&plane, &h, None, &mut c).await,
             InboundKeyPhase::NotPresent
         ));
     }
@@ -5606,7 +5621,7 @@ mod inbound_key_phase_tests {
         let (plane, _, revoked) = plane_with_keys().await;
         let mut c = ctx();
         let outcome =
-            resolve_inbound_key(&plane, &headers(&[("x-api-key", &revoked)]), &mut c).await;
+            resolve_inbound_key(&plane, &headers(&[("x-api-key", &revoked)]), None, &mut c).await;
         assert_denial(outcome, 403, AuthTrustOutcome::InvalidProof);
         assert!(
             c.resolved_inbound_key.is_none(),
@@ -5620,7 +5635,7 @@ mod inbound_key_phase_tests {
         let mut c = ctx();
         let unknown = format!("sbp_{}_{}", "f".repeat(16), "e".repeat(64));
         let outcome =
-            resolve_inbound_key(&plane, &headers(&[("x-api-key", &unknown)]), &mut c).await;
+            resolve_inbound_key(&plane, &headers(&[("x-api-key", &unknown)]), None, &mut c).await;
         assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
     }
 
@@ -5631,7 +5646,8 @@ mod inbound_key_phase_tests {
         let key_id = &token[4..20];
         let wrong = format!("sbp_{key_id}_{}", "0".repeat(64));
         let mut c = ctx();
-        let outcome = resolve_inbound_key(&plane, &headers(&[("x-api-key", &wrong)]), &mut c).await;
+        let outcome =
+            resolve_inbound_key(&plane, &headers(&[("x-api-key", &wrong)]), None, &mut c).await;
         assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
     }
 
@@ -5640,7 +5656,7 @@ mod inbound_key_phase_tests {
         let (plane, token, revoked) = plane_with_keys().await;
         let mut c = ctx();
         let h = headers(&[("x-api-key", &token), ("x-sb-api", &revoked)]);
-        let outcome = resolve_inbound_key(&plane, &h, &mut c).await;
+        let outcome = resolve_inbound_key(&plane, &h, None, &mut c).await;
         assert_denial(outcome, 400, AuthTrustOutcome::InvalidProof);
     }
 
@@ -5655,7 +5671,8 @@ mod inbound_key_phase_tests {
         let plane = crate::key_plane::KeyPlane::from_parts(crypto, cache, false, false, None);
         let mut c = ctx();
 
-        let outcome = resolve_inbound_key(&plane, &headers(&[("x-api-key", &token)]), &mut c).await;
+        let outcome =
+            resolve_inbound_key(&plane, &headers(&[("x-api-key", &token)]), None, &mut c).await;
 
         assert_denial(outcome, 503, AuthTrustOutcome::BackendFailure);
     }
@@ -5667,7 +5684,7 @@ mod inbound_key_phase_tests {
         let ticket = crate::admin_playground::ticket::mint(&key_id);
         let mut c = loopback_ctx();
         let h = headers(&[("authorization", &format!("Bearer {ticket}"))]);
-        let outcome = resolve_inbound_key(&plane, &h, &mut c).await;
+        let outcome = resolve_inbound_key(&plane, &h, Some(loopback_ip()), &mut c).await;
         assert!(matches!(outcome, InboundKeyPhase::Resolved), "{outcome:?}");
         assert_eq!(
             c.resolved_inbound_key
@@ -5689,12 +5706,12 @@ mod inbound_key_phase_tests {
 
         let mut first = loopback_ctx();
         assert!(matches!(
-            resolve_inbound_key(&plane, &h, &mut first).await,
+            resolve_inbound_key(&plane, &h, Some(loopback_ip()), &mut first).await,
             InboundKeyPhase::Resolved
         ));
 
         let mut second = loopback_ctx();
-        let outcome = resolve_inbound_key(&plane, &h, &mut second).await;
+        let outcome = resolve_inbound_key(&plane, &h, Some(loopback_ip()), &mut second).await;
         assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
     }
 
@@ -5705,7 +5722,7 @@ mod inbound_key_phase_tests {
         let ticket = crate::admin_playground::ticket::mint(&key_id);
         let mut c = loopback_ctx();
         let h = headers(&[("authorization", &format!("Bearer {ticket}"))]);
-        let outcome = resolve_inbound_key(&plane, &h, &mut c).await;
+        let outcome = resolve_inbound_key(&plane, &h, Some(loopback_ip()), &mut c).await;
         assert_denial(outcome, 403, AuthTrustOutcome::InvalidProof);
     }
 
@@ -5717,29 +5734,59 @@ mod inbound_key_phase_tests {
             "authorization",
             &format!("Bearer {}deadbeef", crate::admin_playground::ticket::PREFIX),
         )]);
-        let outcome = resolve_inbound_key(&plane, &h, &mut c).await;
+        let outcome = resolve_inbound_key(&plane, &h, Some(loopback_ip()), &mut c).await;
         assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
     }
 
     #[tokio::test]
-    async fn an_impersonation_ticket_from_a_non_loopback_peer_denies_401_and_is_not_consumed() {
+    async fn an_impersonation_ticket_from_a_non_loopback_client_denies_401_and_is_not_consumed() {
         let (plane, token, _) = plane_with_keys().await;
         let key_id = token[4..20].to_string();
         let ticket = crate::admin_playground::ticket::mint(&key_id);
         let h = headers(&[("authorization", &format!("Bearer {ticket}"))]);
 
-        // A valid, unexpired, never-redeemed ticket presented from
-        // somewhere other than the admin server's own loopback dispatch
-        // must be denied exactly like an unknown one.
+        // Preserve the existing effective-client gate independently of
+        // the raw-peer gate: even through a loopback TCP peer, a forwarded
+        // non-loopback client must be denied exactly like an unknown ticket.
         let mut off_loopback = ctx();
         off_loopback.client_ip = Some("10.0.0.5".parse().unwrap());
-        let outcome = resolve_inbound_key(&plane, &h, &mut off_loopback).await;
+        let outcome = resolve_inbound_key(&plane, &h, Some(loopback_ip()), &mut off_loopback).await;
         assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
 
         // The wrong-peer attempt must not have burned the ticket: the
         // legitimate loopback caller can still redeem it afterward.
         let mut loopback = loopback_ctx();
-        let outcome = resolve_inbound_key(&plane, &h, &mut loopback).await;
+        let outcome = resolve_inbound_key(&plane, &h, Some(loopback_ip()), &mut loopback).await;
+        assert!(matches!(outcome, InboundKeyPhase::Resolved), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_non_loopback_trusted_proxy_cannot_spoof_a_loopback_impersonation_ticket() {
+        let (plane, token, _) = plane_with_keys().await;
+        let key_id = token[4..20].to_string();
+        let ticket = crate::admin_playground::ticket::mint(&key_id);
+        let h = headers(&[
+            ("authorization", &format!("Bearer {ticket}")),
+            ("x-forwarded-for", "127.0.0.1"),
+        ]);
+
+        // request_filter first sees this raw TCP peer, then replaces
+        // ctx.client_ip with the trusted proxy's X-Forwarded-For value.
+        // Ticket redemption must retain both identities.
+        let raw_peer_ip: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+        assert!(!raw_peer_ip.is_loopback());
+        let forwarded_client_ip = h["x-forwarded-for"].to_str().unwrap().parse().unwrap();
+        let mut spoofed_loopback = ctx();
+        spoofed_loopback.client_ip = Some(forwarded_client_ip);
+        let outcome =
+            resolve_inbound_key(&plane, &h, Some(raw_peer_ip), &mut spoofed_loopback).await;
+        assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
+
+        // Reject before consuming so the genuine loopback dispatch can
+        // still redeem the ticket.
+        let mut genuine_loopback = loopback_ctx();
+        let outcome =
+            resolve_inbound_key(&plane, &h, Some(loopback_ip()), &mut genuine_loopback).await;
         assert!(matches!(outcome, InboundKeyPhase::Resolved), "{outcome:?}");
     }
 
@@ -5751,7 +5798,7 @@ mod inbound_key_phase_tests {
         let mut c = ctx();
         let h = headers(&[("authorization", &format!("Bearer {token}"))]);
         assert!(matches!(
-            resolve_inbound_key(&plane, &h, &mut c).await,
+            resolve_inbound_key(&plane, &h, None, &mut c).await,
             InboundKeyPhase::Resolved
         ));
         assert_eq!(c.inbound_key_header.as_deref(), Some("authorization"));
