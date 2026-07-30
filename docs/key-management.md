@@ -31,6 +31,8 @@ proxy:
     enabled: true
     store:
       backend: embedded              # embedded | redis | secrets_manager
+      # node-local: see "Clustered deployments" below before using this
+      # on more than one node
       path: /var/lib/sbproxy/keystore.redb
     cache:
       ttl_secs: 60                   # how long a resolved key stays cached
@@ -212,6 +214,43 @@ vault, which reads external secrets you do not own.
   from `token_env`), `aws` (default credential chain), or `local` (in-memory, for
   dev and tests). Only writable managers are supported; read-only backends are
   not offered here.
+
+### Clustered deployments
+
+A key minted on one node is resolvable on every node only when the store itself
+is shared, which `redis` and `secrets_manager` are. The `embedded` backend is a
+redb file on local disk, so a key minted on node A is written only to node A and
+node B cannot resolve it.
+
+A shared `cache.tier` changes how bad that is, though it does not make the store
+shared. Both the `mesh` and `redis` tiers propagate records to peers, so a key
+minted on node A is readable on node B for as long as it stays cached. What you
+do not get is durability: once the entry expires or a node restarts, the peer
+falls back to its own store and cannot resolve the key. A revocation may also
+fail to deny on a peer that never cached the record.
+
+So a node declaring `proxy.cluster.seeds` with `key_management.enabled: true` and
+`store.backend: embedded` gets one of two outcomes at boot:
+
+- **With `cache.tier: mesh` or `redis`, it warns.** Cross-node resolution works
+  while cached, so this is a usable development topology, but it is not a durable
+  cluster-wide keystore and the log says so.
+- **With `cache.tier: none`, it fails to start.** Nothing propagates records, so a
+  minted key is invisible to peers from the moment it is created. Minting keys
+  that silently do not work elsewhere is worse than not starting.
+
+For a durable cluster-wide keystore, set `store.backend` to `redis` or
+`secrets_manager`. A single node with no seeds keeps the embedded default and
+needs no change.
+
+One gap worth knowing: the check fires on nodes that declare seeds. A node others
+join, which has no seeds of its own, is not itself classified, though every node
+that joins it is, so the misconfiguration still surfaces.
+
+A bulk credential purge on any node is cluster-wide. It fans out to every peer
+rather than clearing only the local cache, so peers do not keep serving stale
+resolved credentials until their TTL expires. A peer that cannot be reached is
+logged, because the purge did not fully take.
 
 ### Atomic policy mutation support
 

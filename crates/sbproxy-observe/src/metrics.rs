@@ -2462,6 +2462,35 @@ pub fn record_policy_audit_emitted(verdict: &str, surface: &str, policy_id: &str
         .inc();
 }
 
+/// Count one rate-limit denial that required peer counts to reach the limit.
+///
+/// This is the observable form of mesh rate limiting's approximation. On a
+/// mesh-only cluster a node admits against its own count plus a merged view of
+/// its peers, so this counter rises exactly when the merged view changed the
+/// outcome: the local count alone would have admitted the request.
+///
+/// Read it two ways. Rising means convergence is doing work, which is the
+/// healthy state on a busy multi-node cluster. Flat at zero while several
+/// nodes serve the same limited key means dissemination is not reaching this
+/// node, and it is enforcing a per-node limit while believing otherwise.
+///
+/// A counter rather than a gauge of the divergence magnitude on purpose. Every
+/// request for every bucket would overwrite such a gauge, so it would sample
+/// whichever bucket happened to be last rather than describing the cluster.
+pub fn record_rate_limit_cluster_peer_denial() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_rate_limit_cluster_peer_denials_total",
+            "Rate-limit denials that needed peer counts: the local count alone would have admitted",
+        )
+        .expect("rate_limit_cluster_peer_denials counter registers")
+    })
+    .inc();
+}
+
 /// WOR-1130: increment `sbproxy_rate_limit_total{workspace, result}`.
 /// `result` is `soft` (above the soft threshold, not throttled) or
 /// `throttle` (burst ceiling hit).

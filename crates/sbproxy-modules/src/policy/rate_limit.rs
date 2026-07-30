@@ -4,6 +4,7 @@
 //! optional shared L2 (Redis) fixed-window counter for cluster-wide
 //! enforcement.
 
+use crate::policy::rate_limit_cluster;
 use parking_lot::Mutex;
 use sbproxy_platform::storage::{AsyncKVStore, KVStore};
 use serde::Deserialize;
@@ -119,6 +120,13 @@ pub struct RateLimitPolicy {
     /// on the success path; failures are silent (fail-warn posture).
     #[serde(skip)]
     observer: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    /// Optional mesh cluster tier. When `Some` and no L2 store is
+    /// configured, the policy admits against this node's count plus the
+    /// merged peer view instead of a purely local token bucket. Only
+    /// consulted for windows longer than one second; see
+    /// [`Self::converges_on_mesh`].
+    #[serde(skip)]
+    cluster: Option<Arc<rate_limit_cluster::RateLimitClusterTier>>,
     /// Fixed-window length in seconds when `store` is active. Derived from
     /// the configured rate (1 s for `requests_per_second`, 60 s for
     /// `requests_per_minute`).
@@ -146,6 +154,7 @@ impl std::fmt::Debug for RateLimitPolicy {
             .field("cold_limited_attached", &self.cold_limited.lock().is_some())
             .field("store_attached", &self.store.is_some())
             .field("async_store_attached", &self.async_store.is_some())
+            .field("cluster_attached", &self.cluster.is_some())
             .field("window_secs", &self.window_secs)
             .field("key_prefix", &self.key_prefix)
             .finish()
@@ -481,6 +490,50 @@ impl RateLimitPolicy {
         self
     }
 
+    /// Attach the mesh cluster tier so this policy enforces an approximate
+    /// cluster-wide limit with no Redis.
+    ///
+    /// Only consulted when no L2 store is attached: a shared counter is
+    /// exact, so it always wins over an approximate merged view.
+    ///
+    /// Overshoot is bounded by `peers * rate * dissemination_cadence`. With
+    /// the default 3 second cadence, each additional node can admit about
+    /// `rate * 3` requests before this node hears about them. Pass `None` to
+    /// clear a previously attached tier.
+    ///
+    /// `origin_id` is baked into the counter-key prefix the same way
+    /// [`Self::with_store`] does it, so origins sharing one process-wide tier
+    /// cannot collide on a common client id. The prefix is set only if a
+    /// store setter has not already set it, so the setters chain in any
+    /// order.
+    pub fn with_cluster(
+        mut self,
+        cluster: Option<Arc<rate_limit_cluster::RateLimitClusterTier>>,
+        origin_id: &str,
+    ) -> Self {
+        self.cluster = cluster;
+        if self.key_prefix.is_empty() {
+            self.key_prefix = format!("sbproxy:rl:{}:", origin_id);
+        }
+        self
+    }
+
+    /// Whether this policy's window is long enough to reconcile across nodes.
+    ///
+    /// A one second window closes before a peer contribution can arrive at
+    /// any sane gossip cadence, so `requests_per_second` limits stay
+    /// per-node rather than pretending to converge.
+    pub fn converges_on_mesh(&self) -> bool {
+        self.window_secs > 1
+    }
+
+    /// Test-only accessor for the counter-key prefix, so tests can build the
+    /// same bucket string the cluster path derives.
+    #[cfg(test)]
+    pub(crate) fn debug_key_prefix(&self) -> &str {
+        &self.key_prefix
+    }
+
     /// Effective per-window limit used by the Redis-backed fixed-window path.
     fn window_limit(&self) -> u64 {
         if let Some(rpm) = self.requests_per_minute {
@@ -667,6 +720,14 @@ impl RateLimitPolicy {
         // migrated yet. If neither is configured, fall all the way back
         // to the local per-key token bucket.
         if self.async_store.is_none() && self.store.is_none() {
+            // No shared counter. Fall back to the mesh cluster tier when one
+            // is attached and the window is long enough to reconcile, else
+            // to the purely local token bucket.
+            if let Some(cluster) = self.cluster.as_ref() {
+                if self.converges_on_mesh() {
+                    return self.allow_with_info_cluster(client_id, cluster.as_ref());
+                }
+            }
             return self.allow_with_info_for(client_id);
         }
 
@@ -754,11 +815,170 @@ impl RateLimitPolicy {
             include_ratelimit_policy: false,
         }
     }
+
+    /// Admit against this node's count plus the merged peer view.
+    ///
+    /// The window boundary is computed exactly as the Redis path computes it,
+    /// so every node buckets a given instant into the same window and the
+    /// per-node slots merge. Local counting is immediate and authoritative
+    /// for this node; the peer view lags by at most one dissemination
+    /// cadence, which is the documented source of overshoot.
+    ///
+    /// There is no fail-open branch here because nothing can fail: both
+    /// reads are in-process. A partitioned node simply sees an empty peer
+    /// view once its last merge expires and enforces on its own count,
+    /// which over-admits rather than denying traffic.
+    fn allow_with_info_cluster(
+        &self,
+        client_id: &str,
+        cluster: &rate_limit_cluster::RateLimitClusterTier,
+    ) -> RateLimitInfo {
+        let window = if self.window_secs > 0 {
+            self.window_secs
+        } else {
+            1
+        };
+        let limit = self.window_limit();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let window_start = now_secs - (now_secs % window);
+        let bucket = format!("{}{}:{}", self.key_prefix, client_id, window_start);
+
+        let local = cluster.increment_local(&bucket, window_start);
+        let peers = cluster.merged_peers(&bucket, window_start);
+        let count = local.saturating_add(peers);
+
+        // The merged view changed the outcome: this node alone would have
+        // admitted. Counting it is what makes the approximation observable
+        // instead of something an operator has to infer.
+        if count > limit && local <= limit {
+            sbproxy_observe::metrics::record_rate_limit_cluster_peer_denial();
+        }
+
+        RateLimitInfo {
+            allowed: count <= limit,
+            limit,
+            remaining: limit.saturating_sub(count),
+            reset_secs: window.saturating_sub(now_secs - window_start),
+            headers_enabled: self.headers_enabled(),
+            include_retry_after: self.include_retry_after(),
+            include_ratelimit_policy: false,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Mesh cluster tier ---
+
+    fn cluster_tier(node: &str) -> Arc<rate_limit_cluster::RateLimitClusterTier> {
+        Arc::new(rate_limit_cluster::RateLimitClusterTier::new(node))
+    }
+
+    /// The window the cluster path will bucket "now" into, for a 60s window.
+    fn current_window_start(window: u64) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now - (now % window)
+    }
+
+    #[tokio::test]
+    async fn cluster_tier_denies_once_local_plus_peers_reaches_the_limit() {
+        let tier = cluster_tier("node-a");
+        let policy =
+            RateLimitPolicy::from_config(serde_json::json!({ "requests_per_minute": 10.0 }))
+                .expect("valid rpm policy")
+                .with_cluster(Some(tier.clone()), "test-origin");
+
+        assert!(policy.converges_on_mesh(), "a 60s window converges");
+
+        // Peers already report 8 requests in the current window. The bucket
+        // string matches what the cluster path derives, prefix included.
+        let window_start = current_window_start(60);
+        let bucket = format!("{}c1:{}", policy.debug_key_prefix(), window_start);
+        let peer = sbproxy_ai::governance_crdt::GovernanceContribution {
+            node_id: "node-b".into(),
+            generation: 1,
+            slots: vec![sbproxy_ai::governance_crdt::NodeCounterSlot {
+                key_id: bucket,
+                policy_revision: rate_limit_cluster::RATE_LIMIT_POLICY_REVISION,
+                window_start_millis: window_start * 1000,
+                usage: sbproxy_ai::governance::GovernanceUsage {
+                    requests: 8,
+                    tokens: 0,
+                    micro_usd: 0,
+                },
+            }],
+        };
+        tier.set_peer_counters(sbproxy_ai::governance_crdt::merge_contributions([peer]));
+
+        // Local 1 and 2 bring the cluster total to 9 then 10, both within the
+        // limit of 10. The third is the 11th cluster request and is denied.
+        assert!(policy.allow_with_info_async("c1").await.allowed);
+        assert!(policy.allow_with_info_async("c1").await.allowed);
+        assert!(
+            !policy.allow_with_info_async("c1").await.allowed,
+            "the cluster total must include peer counts, not just local ones"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_tier_alone_still_enforces_its_own_limit() {
+        let tier = cluster_tier("node-a");
+        let policy =
+            RateLimitPolicy::from_config(serde_json::json!({ "requests_per_minute": 3.0 }))
+                .expect("valid rpm policy")
+                .with_cluster(Some(tier.clone()), "test-origin");
+
+        // With no peer contributions the node enforces on its own count, so a
+        // single-node mesh behaves exactly like the configured limit.
+        assert!(policy.allow_with_info_async("solo").await.allowed);
+        assert!(policy.allow_with_info_async("solo").await.allowed);
+        assert!(policy.allow_with_info_async("solo").await.allowed);
+        assert!(!policy.allow_with_info_async("solo").await.allowed);
+    }
+
+    #[tokio::test]
+    async fn per_second_limits_do_not_use_the_cluster_tier() {
+        let tier = cluster_tier("node-a");
+        let policy =
+            RateLimitPolicy::from_config(serde_json::json!({ "requests_per_second": 5.0 }))
+                .expect("valid rps policy")
+                .with_cluster(Some(tier.clone()), "test-origin");
+
+        assert!(!policy.converges_on_mesh(), "a 1s window cannot converge");
+        assert!(policy.allow_with_info_async("c1").await.allowed);
+        assert!(
+            tier.local_slots().is_empty(),
+            "a per-second limit must not publish slots it cannot reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_l2_store_takes_precedence_over_the_cluster_tier() {
+        // A shared counter is exact, so it must win over an approximate
+        // merged view. Without a store the cluster path would have counted.
+        let tier = cluster_tier("node-a");
+        let policy =
+            RateLimitPolicy::from_config(serde_json::json!({ "requests_per_minute": 10.0 }))
+                .expect("valid rpm policy")
+                .with_cluster(Some(tier.clone()), "test-origin");
+        assert!(policy.cluster.is_some());
+        assert!(policy.store.is_none() && policy.async_store.is_none());
+        // Sanity: with no store the cluster path is the one that runs.
+        let _ = policy.allow_with_info_async("c1").await;
+        assert_eq!(
+            tier.local_slots().len(),
+            1,
+            "the cluster path should have counted exactly one bucket"
+        );
+    }
     use crate::policy::Policy;
 
     #[test]

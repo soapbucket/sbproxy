@@ -1632,6 +1632,43 @@ pub(crate) fn start_governance_dissemination() {
     ));
 }
 
+/// Start cross-node dissemination of rate-limit counters on a clustered node.
+///
+/// Separate from [`start_governance_dissemination`] because the cadence
+/// differs: governance guards spend on a long window, while a rate limit is a
+/// promise about a 60 second window and needs several exchanges inside one to
+/// keep the overshoot bound tight.
+///
+/// Unlike governance this has no approximate-store predicate. The tier is
+/// process-owned and always present, so the only gate is whether this node is
+/// clustered at all. Idempotent behind its own atomic.
+pub(crate) fn start_rate_limit_dissemination() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(handle) = current_cluster_handle() else {
+        return;
+    };
+    if handle.mesh_node().is_none() {
+        return;
+    }
+    let Some(tier) = crate::rate_limit_cluster::tier_if_clustered() else {
+        return;
+    };
+    if STARTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    cluster_runtime().spawn(crate::rate_limit_cluster::run_loop(
+        handle.clone(),
+        tier,
+        crate::rate_limit_cluster::DEFAULT_RATE_LIMIT_CADENCE_SECS,
+    ));
+}
+
 fn current_approximate_governance_store(
 ) -> Option<Arc<sbproxy_ai::governance::InMemoryGovernanceStore>> {
     crate::key_plane::current_key_plane().and_then(|plane| plane.approximate_store())

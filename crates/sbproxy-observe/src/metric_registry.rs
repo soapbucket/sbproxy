@@ -2471,6 +2471,17 @@ pub const METRICS: &[MetricCapability] = &[
         ),
     },
     MetricCapability {
+        name: "sbproxy_rate_limit_cluster_peer_denials_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_rate_limit_cluster_peer_denial"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &[],
+        description: "Mesh rate-limit denials that needed peer counts, so the approximation is observable.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_rate_limit_decisions_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_rate_limit_decision"),

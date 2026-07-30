@@ -799,6 +799,7 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
     // installed. A no-op once the loop is already running, and a no-op
     // until both clustering and approximate governance are configured.
     crate::cluster::start_governance_dissemination();
+    crate::cluster::start_rate_limit_dissemination();
 
     reload::load_pipeline(new_pipeline);
 
@@ -1328,6 +1329,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // approximate governance store. See `cluster::start_governance_dissemination`
     // for the idempotency contract.
     crate::cluster::start_governance_dissemination();
+    crate::cluster::start_rate_limit_dissemination();
 
     // --- WOR-1186: register the session-ledger sink when enabled ---
     //
