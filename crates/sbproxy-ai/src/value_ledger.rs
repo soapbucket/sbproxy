@@ -729,7 +729,7 @@ fn ensure_redb_overflow_lane(
 thread_local! {
     /// When set, redb write transactions on this thread skip their fsync.
     ///
-    /// Only [`tests::redb_ledger_persists_the_bounded_overflow_lane`] sets it.
+    /// Only `tests::redb_ledger_persists_the_bounded_overflow_lane` sets it.
     /// That test makes 999 sequential `record_compression` calls to fill the
     /// model cap so the next write lands in the overflow lane, and each call
     /// commits its own transaction, so it was paying 999 fsyncs. The loop count
@@ -745,8 +745,10 @@ thread_local! {
 
 /// Begin a value-ledger write transaction.
 ///
-/// Always fully durable in production. See [`RELAX_REDB_DURABILITY`] for the
-/// single test that opts out.
+/// Always fully durable in production. A `RELAX_REDB_DURABILITY` thread-local,
+/// compiled in only under `cfg(test)`, lets the bounded-overflow test skip the
+/// fsync it would otherwise pay 999 times. Not a rustdoc link because the item
+/// does not exist outside test builds.
 fn begin_ledger_write(database: &Database) -> anyhow::Result<redb::WriteTransaction> {
     #[allow(unused_mut, reason = "only test builds mutate the transaction")]
     let mut write = database
