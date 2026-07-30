@@ -778,14 +778,20 @@ browser profiles or give each node its own loopback address
 
 ## Documentation coverage audit
 
-The 2026-07-30 audit accounts for all 25 named console routes. It found
-three documentation-only gaps, Get started, Jobs, and Operators, which
-the sections above close. Sessions, Alerts, custom request properties,
-and their related administration were already shipped and documented
-by the observability work in PR #755. The audit found no missing
-product implementation requiring a follow-up issue. The remaining
-action is preventative: every new component route must declare a
-documentation slug, enforced by the focused router test.
+The 2026-07-30 audit accounts for all 25 named console routes. It checked
+the request ring's session links and custom properties, routing, retry,
+failover, load-balancer, cache, and guardrail decisions, spend grouping,
+the alert engine's burn-rate, certificate, rate-limit, budget, and
+circuit-breaker evaluations, and model-host deployments, jobs, and
+storage. Those shipped capabilities already have console surfaces from
+the observability work in PR #755 or the current model-host views.
+
+The audit found three documentation-only gaps, Get started, Jobs, and
+Operators, which the sections above close. It found no shipped feature
+in this scope without a console surface, so no product follow-up issue
+is warranted. The remaining action is preventative: every new component
+route must declare a documentation slug, enforced by the focused router
+test.
 
 ## See also
 
