@@ -53,11 +53,6 @@ impl RedisReserve {
         })
     }
 
-    /// Build a reserve using the default `sbproxy:reserve:` prefix.
-    pub fn with_default_prefix(url: &str) -> Result<Self> {
-        Self::new(url, "sbproxy:reserve:")
-    }
-
     fn full_key(&self, key: &str) -> String {
         let mut full = String::with_capacity(self.key_prefix.len() + key.len());
         full.push_str(&self.key_prefix);
@@ -176,7 +171,7 @@ mod tests {
 
     #[test]
     fn default_prefix_is_namespaced() {
-        let r = RedisReserve::with_default_prefix("redis://127.0.0.1:6379").unwrap();
+        let r = RedisReserve::new("redis://127.0.0.1:6379", "sbproxy:reserve:").unwrap();
         assert_eq!(r.full_key("abc"), "sbproxy:reserve:abc");
     }
 

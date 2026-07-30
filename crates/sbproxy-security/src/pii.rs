@@ -455,6 +455,9 @@ impl PiiRedactor {
     /// Redact a request/response body. Tries JSON first; on parse
     /// failure falls back to treating the body as opaque text and
     /// redacting in place.
+    /// Kept `pub` for the out-of-tree consumer, which calls this directly.
+    /// Nothing in this repository does, so a dead-code scan will flag it;
+    /// this note is the answer.
     pub fn redact_body(&self, body: &[u8]) -> Vec<u8> {
         if self.is_empty() || body.is_empty() {
             return body.to_vec();
@@ -489,7 +492,7 @@ impl PiiRedactor {
     /// restored, so running every rule unconditionally on the
     /// capture path keeps the logic simple and the matched-text
     /// accounting straightforward.
-    pub fn redact_with_capture<'a>(
+    pub(crate) fn redact_with_capture<'a>(
         &self,
         input: &'a str,
         capture: &mut ReversibleCapture,
@@ -509,7 +512,7 @@ impl PiiRedactor {
 
     /// WOR-1044: capture-aware variant of [`Self::redact_json`]. Walks
     /// the value in place; every string leaf is fed through
-    /// [`Self::redact_with_capture`] so reversible rules surface
+    /// `redact_with_capture` so reversible rules surface
     /// their `(placeholder, original)` pairs on `capture`.
     pub fn redact_json_with_capture(
         &self,

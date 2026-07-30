@@ -173,7 +173,20 @@ impl EgressAuthorizer {
     }
 
     /// Confirm a dial address matches the pin set (DNS-rebind defense).
-    pub fn verify_pinned(
+    ///
+    /// **This has no production call site.** The authorizer resolves a
+    /// destination and records its pinned addresses, but nothing calls
+    /// back here before dialling, so the rebind window between resolve
+    /// and connect is currently unguarded. Its own tests cover the
+    /// function; they do not cover the path that should be using it.
+    ///
+    /// Kept rather than deleted because the defence is wanted, not
+    /// obsolete. The allow is deliberate: narrowing the visibility is what
+    /// made the gap visible in the first place, and reverting to `pub` to
+    /// silence rustc would hide it again. Tracked at
+    /// <https://linear.app/soapbucket/issue/WOR-2080>.
+    #[allow(dead_code)]
+    pub(crate) fn verify_pinned(
         &self,
         destination: &AuthorizedDestination,
         dial: &SocketAddr,
