@@ -1092,80 +1092,155 @@ fn compare<T: PartialEq + std::fmt::Debug>(
     Ok(())
 }
 
-/// Reject a clustered deployment whose keystore cannot be shared between nodes.
+/// What a clustered node's keystore configuration means for cross-node keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClusteredKeystoreVerdict {
+    /// The keystore is shared, or there is nothing to share.
+    Fine,
+    /// Records reach peers through a shared cache tier, so a minted key does
+    /// resolve cluster-wide, but only while it stays cached. The system of
+    /// record is still node-local, so the guarantee does not survive cache
+    /// expiry or a restart. Carries the warning text.
+    NotDurable(String),
+    /// Nothing shares records at all. Carries the error text.
+    Broken(String),
+}
+
+/// Classify a clustered deployment's keystore for cross-node key resolution.
 ///
-/// `MeshCacheTier` caches in front of the keystore; it is not a system of
-/// record. With the embedded redb backend a key minted on one node is written
-/// only to that node's file, so peers cannot resolve it whether or not it is
-/// cached. Minting keys that silently do not work on the rest of the cluster is
-/// worse than refusing to start, so this fails at boot.
+/// The distinction that matters is what shares records, not just what stores
+/// them. With `backend: embedded` the system of record is a redb file on local
+/// disk, but a `cache.tier` of `mesh` or `redis` still propagates records to
+/// peers: the mesh tier routes writes through the consistent-hash ring, so a
+/// key minted on node A is readable on node B for as long as it stays cached.
+/// That configuration is degraded rather than broken, so it warns loudly
+/// instead of refusing to boot, which would break working single-file
+/// two-node topologies.
+///
+/// With no shared tier there is nothing to propagate through, so a minted key
+/// is invisible to peers from the moment it is created. That fails at boot,
+/// because minting keys which silently do not work on the rest of the cluster
+/// is worse than not starting.
 ///
 /// Gated on `seeds` being non-empty rather than on the cluster block merely
-/// being present. A node with seeds is explicitly joining other nodes, which is
-/// unambiguous; a seedless node may legitimately be a single-node deployment
-/// that happens to declare a cluster block. A node others join without itself
-/// having seeds is not caught here, but every node that joins it is, so the
+/// being present. A node with seeds is explicitly joining other nodes; a
+/// seedless node may legitimately be a single-node deployment that happens to
+/// declare a cluster block. A node others join without itself having seeds is
+/// not classified here, but every node that joins it is, so the
 /// misconfiguration still surfaces.
-pub fn validate_clustered_keystore_is_shareable(
+pub fn classify_clustered_keystore(
     seeds: &[String],
     key_management_enabled: bool,
     backend: crate::types::KeyStoreBackend,
-) -> Result<(), String> {
-    if seeds.is_empty() || !key_management_enabled {
-        return Ok(());
+    cache_tier: crate::types::KeyCacheTier,
+) -> ClusteredKeystoreVerdict {
+    use crate::types::{KeyCacheTier, KeyStoreBackend};
+
+    if seeds.is_empty() || !key_management_enabled || backend != KeyStoreBackend::Embedded {
+        return ClusteredKeystoreVerdict::Fine;
     }
-    if backend == crate::types::KeyStoreBackend::Embedded {
-        return Err(
-            "proxy.cluster declares seeds, so this node is joining a cluster, but \
-             proxy.key_management.store.backend is 'embedded'. The embedded redb store is \
-             node-local, so a key minted on one node cannot be resolved by its peers and a \
-             revocation on one node will not deny on the rest. Set the backend to 'redis' or \
-             'secrets_manager' so the keystore is shared, or remove proxy.cluster.seeds if \
-             per-node keys are intended."
+
+    match cache_tier {
+        KeyCacheTier::Mesh | KeyCacheTier::Redis => ClusteredKeystoreVerdict::NotDurable(
+            "proxy.cluster declares seeds and proxy.key_management.store.backend is 'embedded', \
+             which is node-local. The configured cache tier does propagate records to peers, so \
+             a key minted on one node resolves on the others while it stays cached, but the \
+             system of record is still per-node: that resolution does not survive cache expiry \
+             or a restart, and a revocation may not deny on peers that never cached the record. \
+             Set the backend to 'redis' or 'secrets_manager' for a durable cluster-wide keystore."
                 .to_string(),
-        );
+        ),
+        KeyCacheTier::None => ClusteredKeystoreVerdict::Broken(
+            "proxy.cluster declares seeds, so this node is joining a cluster, but \
+             proxy.key_management.store.backend is 'embedded' with no shared cache tier. The \
+             embedded redb store is node-local and nothing propagates records, so a key minted \
+             on one node cannot be resolved by its peers and a revocation on one node will not \
+             deny on the rest. Set the backend to 'redis' or 'secrets_manager' so the keystore \
+             is shared, set proxy.key_management.cache.tier to 'mesh' or 'redis' to at least \
+             propagate cached records, or remove proxy.cluster.seeds if per-node keys are \
+             intended."
+                .to_string(),
+        ),
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod keystore_sharing_tests {
-    use super::validate_clustered_keystore_is_shareable as check;
-    use crate::types::KeyStoreBackend;
+    use super::{classify_clustered_keystore as classify, ClusteredKeystoreVerdict as V};
+    use crate::types::{KeyCacheTier, KeyStoreBackend};
 
     fn seeds() -> Vec<String> {
         vec!["10.0.0.1:7946".to_string()]
     }
 
     #[test]
-    fn a_clustered_node_rejects_the_node_local_embedded_keystore() {
-        let err = check(&seeds(), true, KeyStoreBackend::Embedded)
-            .expect_err("embedded redb cannot be shared across nodes");
+    fn embedded_with_no_shared_tier_is_broken() {
+        let V::Broken(msg) = classify(
+            &seeds(),
+            true,
+            KeyStoreBackend::Embedded,
+            KeyCacheTier::None,
+        ) else {
+            panic!("nothing propagates records, so this must be a hard failure");
+        };
+        assert!(msg.contains("embedded"), "names the backend: {msg}");
         assert!(
-            err.contains("embedded"),
-            "names the offending backend: {err}"
+            msg.contains("redis") && msg.contains("secrets_manager"),
+            "names a durable fix: {msg}"
         );
         assert!(
-            err.contains("redis") && err.contains("secrets_manager"),
-            "names an actionable fix: {err}"
+            msg.contains("mesh"),
+            "names the propagate-only fix too: {msg}"
         );
     }
 
     #[test]
-    fn a_clustered_node_accepts_a_shared_keystore() {
-        assert!(check(&seeds(), true, KeyStoreBackend::Redis).is_ok());
-        assert!(check(&seeds(), true, KeyStoreBackend::SecretsManager).is_ok());
+    fn embedded_behind_a_shared_tier_warns_instead_of_refusing() {
+        // The mesh tier routes writes through the ring, so a minted key does
+        // reach peers while cached. Degraded is not broken, and refusing to
+        // boot here would break working two-node topologies.
+        for tier in [KeyCacheTier::Mesh, KeyCacheTier::Redis] {
+            let V::NotDurable(msg) = classify(&seeds(), true, KeyStoreBackend::Embedded, tier)
+            else {
+                panic!("a shared cache tier propagates records, so this warns");
+            };
+            assert!(
+                msg.contains("does not survive cache expiry"),
+                "says what the operator actually loses: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shared_backend_is_fine_on_any_tier() {
+        for backend in [KeyStoreBackend::Redis, KeyStoreBackend::SecretsManager] {
+            assert_eq!(
+                classify(&seeds(), true, backend, KeyCacheTier::None),
+                V::Fine
+            );
+        }
     }
 
     #[test]
     fn a_single_node_deployment_keeps_the_embedded_default() {
         // No seeds means nothing to share with, so the default must keep working.
-        assert!(check(&[], true, KeyStoreBackend::Embedded).is_ok());
+        assert_eq!(
+            classify(&[], true, KeyStoreBackend::Embedded, KeyCacheTier::None),
+            V::Fine
+        );
     }
 
     #[test]
     fn key_management_off_is_not_this_checks_business() {
         // Without a key plane there is nothing to mint, so the backend is moot.
-        assert!(check(&seeds(), false, KeyStoreBackend::Embedded).is_ok());
+        assert_eq!(
+            classify(
+                &seeds(),
+                false,
+                KeyStoreBackend::Embedded,
+                KeyCacheTier::None
+            ),
+            V::Fine
+        );
     }
 }

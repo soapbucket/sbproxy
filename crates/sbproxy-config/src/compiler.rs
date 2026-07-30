@@ -1532,16 +1532,24 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         }
     }
 
-    // A clustered node whose keystore is node-local would mint keys its peers
-    // cannot resolve. Fail at boot rather than at first cross-node request.
+    // A clustered node whose keystore is node-local mints keys its peers may
+    // not resolve. How bad that is depends on whether a shared cache tier
+    // propagates records, so classify rather than blanket-reject.
     if let Some(cluster) = &config_file.proxy.cluster {
         let km = config_file.proxy.key_management.as_ref();
-        if let Err(message) = crate::cluster::validate_clustered_keystore_is_shareable(
+        match crate::cluster::classify_clustered_keystore(
             &cluster.seeds,
             km.map(|k| k.enabled).unwrap_or(false),
             km.map(|k| k.store.backend).unwrap_or_default(),
+            km.map(|k| k.cache.tier).unwrap_or_default(),
         ) {
-            anyhow::bail!("config compile: {message}");
+            crate::cluster::ClusteredKeystoreVerdict::Fine => {}
+            crate::cluster::ClusteredKeystoreVerdict::NotDurable(message) => {
+                tracing::warn!("{message}");
+            }
+            crate::cluster::ClusteredKeystoreVerdict::Broken(message) => {
+                anyhow::bail!("config compile: {message}");
+            }
         }
     }
 

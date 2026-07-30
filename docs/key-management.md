@@ -222,22 +222,29 @@ is shared, which `redis` and `secrets_manager` are. The `embedded` backend is a
 redb file on local disk, so a key minted on node A is written only to node A and
 node B cannot resolve it.
 
-The mesh cache tier does not change that. It is a cache in front of the system of
-record, not a system of record, so it can only serve records some node already
-holds.
+A shared `cache.tier` changes how bad that is, though it does not make the store
+shared. Both the `mesh` and `redis` tiers propagate records to peers, so a key
+minted on node A is readable on node B for as long as it stays cached. What you
+do not get is durability: once the entry expires or a node restarts, the peer
+falls back to its own store and cannot resolve the key. A revocation may also
+fail to deny on a peer that never cached the record.
 
-Because minting keys that silently do not work on the rest of the cluster is
-worse than refusing to start, a node that declares `proxy.cluster.seeds` with
-`key_management.enabled: true` and `store.backend: embedded` fails at boot with
-an error naming the fix. Choose one:
+So a node declaring `proxy.cluster.seeds` with `key_management.enabled: true` and
+`store.backend: embedded` gets one of two outcomes at boot:
 
-- Set `store.backend` to `redis` or `secrets_manager` so the store is shared.
-- Remove `proxy.cluster.seeds` if per-node keys are genuinely what you want.
+- **With `cache.tier: mesh` or `redis`, it warns.** Cross-node resolution works
+  while cached, so this is a usable development topology, but it is not a durable
+  cluster-wide keystore and the log says so.
+- **With `cache.tier: none`, it fails to start.** Nothing propagates records, so a
+  minted key is invisible to peers from the moment it is created. Minting keys
+  that silently do not work elsewhere is worse than not starting.
 
-A single node with no seeds keeps the embedded default and needs no change.
+For a durable cluster-wide keystore, set `store.backend` to `redis` or
+`secrets_manager`. A single node with no seeds keeps the embedded default and
+needs no change.
 
 One gap worth knowing: the check fires on nodes that declare seeds. A node others
-join, which has no seeds of its own, is not itself rejected, though every node
+join, which has no seeds of its own, is not itself classified, though every node
 that joins it is, so the misconfiguration still surfaces.
 
 A bulk credential purge on any node is cluster-wide. It fans out to every peer

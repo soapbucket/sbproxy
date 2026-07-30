@@ -52,13 +52,15 @@ the next version cut.
   node-wide distributed cache, the old blanket purge also discarded unrelated
   entries such as compression sessions. The purge is now scoped to the key-plane
   prefixes.
-- **A clustered node with a node-local keystore no longer starts.** The
-  `embedded` redb store is per-node, so a key minted on one node could not be
-  resolved by its peers and a revocation on one did not deny on the rest.
-  Declaring `proxy.cluster.seeds` with `key_management.enabled: true` and
-  `store.backend: embedded` now fails at boot with an error naming the fix. A
-  single node with no seeds keeps the embedded default. See
-  [`docs/key-management.md`](docs/key-management.md).
+- **A clustered node now says what its node-local keystore does and does not
+  guarantee.** The `embedded` redb store is per-node, so a key minted on one node
+  is not durably resolvable by its peers and a revocation may not deny on all of
+  them. A node declaring `proxy.cluster.seeds` with `key_management.enabled: true`
+  and `store.backend: embedded` now warns at boot when a `mesh` or `redis`
+  `cache.tier` propagates records (resolution works while cached, but does not
+  survive expiry or a restart), and fails to start when `cache.tier: none` leaves
+  nothing to propagate through. A single node with no seeds keeps the embedded
+  default. See [`docs/key-management.md`](docs/key-management.md).
 
 ## [1.9.0] - 2026-07-28
 
