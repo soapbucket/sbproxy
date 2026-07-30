@@ -291,6 +291,14 @@ pub fn response_to_openai(body: Value) -> Value {
         other => return other,
     };
 
+    // WOR-2054: Gemini failures use a top-level `error` envelope rather
+    // than a generation shape. Preserve it for the status-aware dispatch
+    // path instead of fabricating an empty successful completion from
+    // missing candidates.
+    if m.contains_key("error") {
+        return Value::Object(m);
+    }
+
     let model = m
         .get("modelVersion")
         .cloned()
@@ -596,6 +604,20 @@ mod tests {
         let parsed: Value =
             serde_json::from_str(tool_calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["city"], "SF");
+    }
+
+    #[test]
+    fn response_error_envelope_passes_through() {
+        let body = json!({
+            "error": {
+                "code": 400,
+                "message": "API key not valid. Please pass a valid API key.",
+                "status": "INVALID_ARGUMENT",
+                "details": [{"reason": "API_KEY_INVALID"}]
+            }
+        });
+
+        assert_eq!(response_to_openai(body.clone()), body);
     }
 
     #[test]

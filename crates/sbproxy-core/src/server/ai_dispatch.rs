@@ -6162,12 +6162,91 @@ fn record_ai_provider_response_failure(
     };
     let message = ai_provider_response_error_message(status, kind);
     sbproxy_ai::tracing_spans::record_error(span, kind, message.as_str());
+    let diagnostic = ai_provider_error_diagnostic(body);
+    warn!(
+        provider = %provider,
+        status,
+        error_type = kind,
+        upstream_error_code = %diagnostic.code.as_deref().unwrap_or("unavailable"),
+        upstream_error_status = %diagnostic.status.as_deref().unwrap_or("unavailable"),
+        upstream_error_reason = %diagnostic.reason.as_deref().unwrap_or("unavailable"),
+        "AI proxy: provider returned error response"
+    );
     if !provider.is_empty() {
         sbproxy_ai::ai_metrics::record_provider_error(
             provider,
             ai_metric_error_kind_for_span_error_type(kind),
         );
     }
+}
+
+#[derive(Default)]
+struct AiProviderErrorDiagnostic {
+    code: Option<String>,
+    status: Option<String>,
+    reason: Option<String>,
+}
+
+/// Extract low-cardinality provider error labels without retaining an
+/// arbitrary upstream message or body. Values must fit the same conservative
+/// character set used by provider error enums, so credentials and free-form
+/// content cannot enter the diagnostic event.
+fn ai_provider_error_diagnostic(body: Option<&[u8]>) -> AiProviderErrorDiagnostic {
+    let Some(value) = body.and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+    else {
+        return AiProviderErrorDiagnostic::default();
+    };
+    let error = value.get("error").unwrap_or(&value);
+    let code = error.get("code").and_then(safe_provider_error_label);
+    let status = error.get("status").and_then(safe_provider_error_label);
+    let reason = error
+        .get("reason")
+        .and_then(safe_provider_error_label)
+        .or_else(|| {
+            error
+                .get("details")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|details| {
+                    details
+                        .iter()
+                        .find_map(|detail| detail.get("reason").and_then(safe_provider_error_label))
+                })
+        });
+    AiProviderErrorDiagnostic {
+        code,
+        status,
+        reason,
+    }
+}
+
+fn safe_provider_error_label(value: &serde_json::Value) -> Option<String> {
+    let label = match value {
+        serde_json::Value::String(value) => value.trim().to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        _ => return None,
+    };
+    let has_ascii_lowercase = label.bytes().any(|byte| byte.is_ascii_lowercase());
+    let has_ascii_uppercase = label.bytes().any(|byte| byte.is_ascii_uppercase());
+    if label.is_empty()
+        || label.len() > 64
+        || sbproxy_observe::redact::contains_secret(&label)
+        || looks_like_google_api_key(&label)
+        || (has_ascii_lowercase && has_ascii_uppercase)
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(label)
+}
+
+fn looks_like_google_api_key(value: &str) -> bool {
+    value.starts_with("AIza")
+        && value.len() >= 35
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn ai_provider_response_error_type(status: u16, body: Option<&[u8]>) -> Option<&'static str> {
@@ -11024,8 +11103,34 @@ mod compression_selection_tests {
 mod ai_error_classification_tests {
     use super::{
         ai_metric_error_kind_for_span_error_type, ai_provider_response_error_type,
-        ai_response_body_indicates_content_filter,
+        ai_response_body_indicates_content_filter, record_ai_provider_response_failure,
+        safe_provider_error_label,
     };
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogWriter {
+        type Writer = SharedLogGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogGuard(Arc::clone(&self.0))
+        }
+    }
+
+    impl std::io::Write for SharedLogGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log capture").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn provider_429_maps_to_rate_limited() {
@@ -11080,6 +11185,68 @@ mod ai_error_classification_tests {
             ai_provider_response_error_type(400, Some(br#"{"error":{"code":"bad_request"}}"#)),
             Some(sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR)
         );
+    }
+
+    #[test]
+    fn provider_error_log_reports_safe_metadata_without_upstream_message() {
+        // Capture the actual tracing event emitted by the dispatch failure
+        // boundary.
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(SharedLogWriter(Arc::clone(&captured)))
+            .finish();
+        let body = br#"{
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": "request rejected for key AIzaSyA123456789012345678901234567890123",
+                "details": [{"reason": "API_KEY_INVALID"}]
+            }
+        }"#;
+
+        tracing::subscriber::with_default(subscriber, || {
+            record_ai_provider_response_failure(&tracing::Span::none(), "gemini", 400, Some(body));
+        });
+
+        let output =
+            String::from_utf8(captured.lock().expect("log capture").clone()).expect("UTF-8 log");
+        assert!(
+            output.contains("AI proxy: provider returned error response"),
+            "{output}"
+        );
+        assert!(output.contains("provider=gemini"), "{output}");
+        assert!(output.contains("status=400"), "{output}");
+        assert!(output.contains("upstream_error_code=400"), "{output}");
+        assert!(
+            output.contains("upstream_error_status=INVALID_ARGUMENT"),
+            "{output}"
+        );
+        assert!(
+            output.contains("upstream_error_reason=API_KEY_INVALID"),
+            "{output}"
+        );
+        assert!(!output.contains("request rejected for key"), "{output}");
+        assert!(
+            !output.contains("AIzaSyA123456789012345678901234567890123"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn provider_error_metadata_rejects_credential_shaped_labels() {
+        for secret in [
+            "AIzaSyA123456789012345678901234567890123",
+            "sk-abcdefghijklmnopqrstu1234567890",
+        ] {
+            assert_eq!(
+                safe_provider_error_label(&serde_json::Value::String(secret.to_string())),
+                None,
+                "{secret}"
+            );
+        }
     }
 
     #[test]
