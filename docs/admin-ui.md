@@ -1,6 +1,6 @@
 # Admin UI
 
-*Last modified: 2026-07-26*
+*Last modified: 2026-07-30*
 
 The built-in admin UI is a Vue 3 + Vite single-page app that drives the
 same [admin API](admin-api-reference.md) any curl script can call. It
@@ -19,6 +19,15 @@ mutation that succeeds says what it did ("Key revoked"), and one that
 fails names the action and carries the server's hint. Validation
 detail that belongs next to a form (a config document that failed to
 compile, a policy revision conflict) stays inline instead.
+
+Every page header includes a Documentation link for that view. These
+are passive external anchors to `https://sbproxy.dev/docs/`: the
+console does not fetch or preload documentation, and the destination
+opens in a new tab. This is an intentional air-gapped behavior. If the
+browser cannot reach the public site, only the new tab fails to load;
+the console and every control in it remain operational. Air-gapped
+operators can mirror the same Markdown from this repository's `docs/`
+directory into an internal documentation service.
 
 Pages that refresh on a timer keep the last good data on screen when a
 refresh fails, rather than blanking a dashboard over one bad response.
@@ -121,6 +130,23 @@ request-log count, and the local model host at a glance.
   expected on a minimal config and renders as informational, not an
   error; only an `unhealthy` component or a fetch failure renders the
   error state.
+
+## Get started (`/get-started`)
+
+The shortest path from an empty model host to a running local model.
+It presents deployable catalog variants, writes the selected deployment
+to desired state, starts it, and follows the resulting durable job.
+
+- **Shows:** `GET /admin/model-host/catalog`,
+  `GET /admin/model-host/deployments`, `GET /admin/model-host/status`,
+  and `GET /admin/model-host/jobs`.
+- **Mutations:** `PUT /admin/model-host/deployments` followed by
+  `POST /admin/model-host/load` for the chosen deployment.
+- **Empty/error notes:** an empty catalog explains that no deployable
+  variants are configured. File-managed or cluster-verifier desired
+  state remains read-only and names the authority that must be changed.
+  Once a load is queued, the page shows its current job state and links
+  to the Jobs view for the full history.
 
 ## Keys (`/keys`)
 
@@ -593,6 +619,20 @@ fleet-wide deployment publication.
   runtime evidence is stale or it is ready/preparing/draining, with the
   reason shown inline.
 
+## Jobs (`/jobs`)
+
+Durable model-host work, including model loads and evictions, artifact
+pulls, and verification.
+
+- **Shows:** `GET /admin/model-host/jobs`, newest first, with filters
+  for deployment, kind, state, and job ID. Expanding a non-terminal row
+  follows `GET /admin/model-host/jobs/{id}/stream`; the browser resumes
+  the server-sent event stream after a dropped connection.
+- **Mutations:** none.
+- **Empty/error notes:** no retained jobs is a normal empty state.
+  Terminal jobs remain inspectable without holding an event stream
+  open, and a stream reconnect never blocks the list's regular refresh.
+
 ## Storage (`/storage`)
 
 ![Storage: the verified weight cache with per-artifact size, residency, and delete controls](assets/admin-storage.png)
@@ -645,6 +685,20 @@ Who can sign in to this console, and what each account may do.
   drift from the accounts that actually work. The admin server always
   has at least the top-level credential, so an empty list means the
   build could not read its own config.
+
+## Operators (`/operators`)
+
+The configured RBAC operator subset, separated from Users so an
+operator can quickly audit delegated accounts without the top-level
+admin credential in the table.
+
+- **Shows:** `GET /api/operators`, with each configured username and
+  its `admin` or `read_only` role.
+- **Mutations:** none. Edit `proxy.admin.operators` in config and
+  reload to add, remove, or re-role an operator.
+- **Empty/error notes:** an empty list means no delegated operators
+  are configured; the top-level admin credential can still sign in.
+  Passwords never leave the server and are not returned by this route.
 
 ## Cluster (`/cluster`)
 
@@ -721,6 +775,17 @@ browser profiles or give each node its own loopback address
 ![Cluster page with a three-node roster, health rail, and placement summary](assets/admin-cluster.png)
 
 ![The same cluster after killing node-c: the health rail marks it unhealthy and an alert reports membership as dead](assets/admin-cluster-degraded.png)
+
+## Documentation coverage audit
+
+The 2026-07-30 audit accounts for all 25 named console routes. It found
+three documentation-only gaps, Get started, Jobs, and Operators, which
+the sections above close. Sessions, Alerts, custom request properties,
+and their related administration were already shipped and documented
+by the observability work in PR #755. The audit found no missing
+product implementation requiring a follow-up issue. The remaining
+action is preventative: every new component route must declare a
+documentation slug, enforced by the focused router test.
 
 ## See also
 
