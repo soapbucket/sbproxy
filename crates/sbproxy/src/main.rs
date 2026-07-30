@@ -1097,6 +1097,15 @@ struct DoctorArgs {
     /// emits a single structured object for tooling.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+    /// Run the managed-worker startup gate and exit 3 if any check
+    /// fails. Checks driver presence, visible accelerators, per-entry
+    /// CUDA compatibility, the shared memory an engine asked for, the
+    /// weight-cache mount against `serve.cache_budget_gib`, and
+    /// model-plane identity material. Intended for a VM bootstrap or a
+    /// container entrypoint that should refuse to come up rather than
+    /// fail at the first customer request.
+    #[arg(long = "strict")]
+    strict: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -2231,6 +2240,7 @@ fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
         .clone()
         .or_else(|| std::env::var_os("SB_CONFIG_FILE").map(PathBuf::from));
     let mut exit = 0;
+    let mut plane = None;
     if let Some(path) = config_path {
         match std::fs::read_to_string(&path) {
             Ok(yaml) => {
@@ -2246,11 +2256,24 @@ fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
                         exit = 2;
                     }
                 }
+                plane = extract_model_plane_identity(&yaml, config_dir);
             }
             Err(e) => {
                 eprintln!("doctor: could not read config '{}': {e}", path.display());
             }
         }
+    }
+    // The strict gate is evaluated (and reported) whenever asked for,
+    // even with no config: "nothing was configured to check" is itself
+    // the answer a bootstrap needs, and every check reports `skip`
+    // rather than a misleading pass.
+    let strict_checks = if args.strict {
+        report.strict_checks(plane.as_ref())
+    } else {
+        Vec::new()
+    };
+    if args.strict {
+        exit = report.strict_exit_code(&strict_checks);
     }
     // WOR-1863: weights other local tools already cached (Ollama, LM
     // Studio, the HF hub), discovered read-only and summarized per
@@ -2261,6 +2284,9 @@ fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
             let mut text = report.render_text();
             insert_after_model_cache_block(&mut text, &render_foreign_caches_text(&foreign));
             print!("{text}");
+            if args.strict {
+                print!("{}", render_strict_checks_text(&strict_checks));
+            }
         }
         OutputFormat::Json => {
             // `DoctorReport` lives in sbproxy-core; attach the foreign
@@ -2272,11 +2298,112 @@ fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
                     "foreign_model_caches".to_string(),
                     serde_json::to_value(&foreign)?,
                 );
+                if args.strict {
+                    object.insert(
+                        "strict_checks".to_string(),
+                        serde_json::to_value(&strict_checks)?,
+                    );
+                }
             }
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
     }
     Ok(exit)
+}
+
+/// Render the `startup gate` block `doctor --strict` appends, one line
+/// per named check, in the same two-space style as the rest of the
+/// report. The trailing verdict line is what an operator reads first.
+fn render_strict_checks_text(checks: &[sbproxy_core::doctor::StrictCheck]) -> String {
+    let mut out = String::from("\nstartup gate\n");
+    for check in checks {
+        out.push_str(&format!(
+            "  {:<22} {:<5} {}\n",
+            check.check, check.status, check.detail
+        ));
+    }
+    let failed = checks.iter().filter(|c| c.failed()).count();
+    out.push_str(&match failed {
+        0 => "  verdict: pass (no startup blocker on this host)\n".to_string(),
+        1 => "  verdict: FAIL (1 startup blocker)\n".to_string(),
+        n => format!("  verdict: FAIL ({n} startup blockers)\n"),
+    });
+    out
+}
+
+/// Read the model-plane identity material `proxy.cluster` names, for the
+/// strict gate's `model_plane_identity` check.
+///
+/// Parses the same YAML the proxy boots from, but only the security
+/// block: this is deliberately not `compile_config`, because a bootstrap
+/// wants the identity verdict even for a config whose origins reference
+/// a secret backend that is not reachable yet. Relative paths resolve
+/// against the config's own directory, matching how the proxy loads them.
+/// `None` means no cluster block, which the check reports as `skip`.
+fn extract_model_plane_identity(
+    yaml: &str,
+    config_dir: &std::path::Path,
+) -> Option<sbproxy_core::doctor::ModelPlaneIdentity> {
+    let root: serde_yaml::Value = serde_yaml::from_str(yaml).ok()?;
+    let cluster = root.get("proxy")?.get("cluster")?;
+    let security = cluster.get("security");
+    let mode = security
+        .and_then(|s| s.get("mode"))
+        .and_then(serde_yaml::Value::as_str)
+        .unwrap_or("shared_key");
+    let mtls = mode == "mtls";
+    let worker_role = cluster
+        .get("roles")
+        .and_then(serde_yaml::Value::as_sequence)
+        .is_some_and(|roles| {
+            roles
+                .iter()
+                .filter_map(serde_yaml::Value::as_str)
+                .any(|role| role == "worker")
+        });
+
+    let resolve = |value: &str| -> PathBuf {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            path
+        } else {
+            config_dir.join(path)
+        }
+    };
+    let read = |key: &str| -> Option<String> {
+        security?
+            .get(key)
+            .and_then(serde_yaml::Value::as_str)
+            .map(str::to_string)
+    };
+
+    let mut files = Vec::new();
+    let mut missing_keys = Vec::new();
+    for key in ["cert_file", "key_file", "ca_file"] {
+        match read(key) {
+            Some(value) => files.push((key, resolve(&value))),
+            // Only mTLS makes the three files mandatory; shared-key mode
+            // legitimately omits all of them.
+            None if mtls => missing_keys.push(key),
+            None => {}
+        }
+    }
+    // Interpolated references (`env:`, `file:`, a vault URI) are resolved
+    // by the secret layer at boot, not here, so treat a non-literal
+    // shared key as present and let the boot path own that failure.
+    let shared_key_present = if mtls {
+        None
+    } else {
+        Some(read("shared_key").is_some_and(|value| !value.trim().is_empty()))
+    };
+
+    Some(sbproxy_core::doctor::ModelPlaneIdentity {
+        worker_role,
+        mtls,
+        files,
+        missing_keys,
+        shared_key_present,
+    })
 }
 
 /// Per-source rollup of the read-only foreign model-cache scan
@@ -8194,6 +8321,79 @@ mod tests {
 
         assert!(catalog.get("exact").is_some());
         let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[test]
+    fn model_plane_identity_is_absent_without_a_cluster_block() {
+        // A single-box config has no model plane, and the strict gate has
+        // to be able to report that rather than inventing a failure.
+        let config = "origins:\n  ai.local:\n    action:\n      providers:\n        - name: local\n";
+        assert!(
+            extract_model_plane_identity(config, std::path::Path::new(".")).is_none(),
+            "no proxy.cluster block means no model-plane identity to check"
+        );
+    }
+
+    #[test]
+    fn model_plane_identity_lists_mtls_files_and_missing_keys() {
+        let config = "proxy:\n  cluster:\n    cluster_id: fleet\n    roles: [worker]\n    security:\n      mode: mtls\n      cert_file: tls/worker.crt\n      key_file: /abs/worker.key\n";
+        let plane = extract_model_plane_identity(config, std::path::Path::new("/etc/sbproxy"))
+            .expect("cluster block parses");
+
+        assert!(plane.worker_role, "roles: [worker] is the worker role");
+        assert!(plane.mtls);
+        // A relative path resolves against the config's own directory,
+        // matching how the proxy loads it.
+        assert_eq!(
+            plane.files[0].1,
+            std::path::Path::new("/etc/sbproxy/tls/worker.crt")
+        );
+        // An absolute path is left alone.
+        assert_eq!(plane.files[1].1, std::path::Path::new("/abs/worker.key"));
+        // mTLS makes the unset CA a violation, not a shrug.
+        assert_eq!(plane.missing_keys, vec!["ca_file"]);
+        assert_eq!(plane.shared_key_present, None);
+    }
+
+    #[test]
+    fn model_plane_identity_flags_shared_key_mode_with_no_key() {
+        let missing = "proxy:\n  cluster:\n    cluster_id: fleet\n    roles: [gateway]\n    security:\n      mode: shared_key\n";
+        let plane = extract_model_plane_identity(missing, std::path::Path::new("."))
+            .expect("cluster block parses");
+        assert!(!plane.worker_role);
+        assert!(!plane.mtls);
+        assert_eq!(plane.shared_key_present, Some(false));
+        // Shared-key mode does not owe the three mTLS files.
+        assert!(plane.missing_keys.is_empty());
+
+        let present = "proxy:\n  cluster:\n    cluster_id: fleet\n    security:\n      mode: shared_key\n      shared_key: env:SB_MESH_KEY\n";
+        let plane = extract_model_plane_identity(present, std::path::Path::new("."))
+            .expect("cluster block parses");
+        assert_eq!(plane.shared_key_present, Some(true));
+    }
+
+    #[test]
+    fn strict_text_block_names_every_check_and_the_verdict() {
+        use sbproxy_core::doctor::StrictCheck;
+        let text = render_strict_checks_text(&[
+            StrictCheck {
+                check: "driver",
+                status: "pass",
+                detail: "NVIDIA driver 550.54.15 present".to_string(),
+            },
+            StrictCheck {
+                check: "cache_mount",
+                status: "fail",
+                detail: "not enough space".to_string(),
+            },
+        ]);
+        assert!(text.contains("startup gate"));
+        assert!(text.contains("driver"));
+        assert!(text.contains("cache_mount"));
+        assert!(
+            text.contains("verdict: FAIL (1 startup blocker)"),
+            "the verdict line is what an operator reads first: {text}"
+        );
     }
 
     #[test]

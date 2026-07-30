@@ -133,14 +133,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends openssl \
 # substitute the CPU-bound Vulkan prebuilt for a CUDA request -- so a
 # worker serving GGUF-on-CUDA needs that build added separately; it is
 # out of scope here.
+#
+# VLLM_VERSION is pinned to sbproxy's own DEFAULT_VLLM_VERSION
+# (crates/sbproxy-model-host/src/vllm_driver.rs). This is the certified
+# vLLM contract, and the pin is the point: an unpinned `pip install vllm`
+# resolves to whatever is newest at build time, so the image would drift
+# off the version the fit planner, the argv builder, and the L4
+# certification all target -- exactly the "release claims backed by no
+# evidence" failure SH-23 exists to stop. Bump both together, re-run the
+# NVIDIA lane, and record the result in docs/model-host-certification.md.
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+ARG VLLM_VERSION=0.10.0
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      python3 python3-pip python3-dev build-essential ca-certificates \
+      python3 python3-pip python3-dev build-essential ca-certificates jq \
  && rm -rf /var/lib/apt/lists/* \
- && pip3 install --no-cache-dir vllm
+ && pip3 install --no-cache-dir "vllm==${VLLM_VERSION}"
 COPY --from=builder /usr/local/bin/sbproxy /usr/local/bin/sbproxy
 COPY --from=cert-gen /out/etc/sbproxy/tls.crt /etc/sbproxy/tls.crt
 COPY --from=cert-gen /out/etc/sbproxy/tls.key /etc/sbproxy/tls.key
-ENTRYPOINT ["/usr/local/bin/sbproxy"]
+COPY docker/worker-entrypoint.sh /usr/local/bin/worker-entrypoint.sh
+# The entrypoint runs the startup gate (`sbproxy doctor --strict`) before
+# exec'ing the proxy, so a worker handed a GPU-less container, a
+# too-small /dev/shm, an undersized cache mount, or incomplete
+# model-plane identity fails at boot with a named reason instead of at
+# the first customer request. Set SBPROXY_SKIP_STARTUP_GATE=1 to bypass.
+ENTRYPOINT ["/usr/local/bin/worker-entrypoint.sh"]
 CMD ["serve", "-f", "/etc/sbproxy/sb.yml"]
