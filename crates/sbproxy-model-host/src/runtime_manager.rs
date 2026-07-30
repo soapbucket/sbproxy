@@ -3288,6 +3288,17 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
             .as_ref()
             .map(|entry| entry.kv_quant)
             .unwrap_or(KvCacheQuant::Auto);
+        // Size from what this engine will actually run, not from what was
+        // asked for. vLLM and SGLang substitute fp8 for int4, so sizing
+        // the request would book half the cache the engine allocates
+        // (WOR-2069).
+        let effective_kv = crate::config::effective_kv_cache(kv_quant, resolved.engine);
+        warn_on_kv_substitution(
+            kv_quant,
+            effective_kv,
+            resolved.engine,
+            &resolved.logical_model,
+        );
         let concurrency = request.desired.desired.max_concurrency.unwrap_or(1);
         crate::fit::plan_replica_fits(
             &self.probe.probe(),
@@ -3296,7 +3307,7 @@ impl DeploymentPreparer for ProductionDeploymentPreparer {
             seq_len,
             crate::fit::DEFAULT_OVERHEAD,
             request.control.safety_margin,
-            kv_quant.bytes_per_element(),
+            effective_kv.bytes_per_element,
             concurrency,
             replicas,
             tensor_parallel,
@@ -3453,9 +3464,12 @@ impl ProductionPreparedDeployment {
                     self.safety_margin,
                     // WOR-1908: a non-decode modality holds no KV cache, so
                     // its KV term is zeroed regardless of the KV-quant lever.
-                    self.resolved
-                        .modality
-                        .kv_bytes_per_element_override(kv_quant.bytes_per_element()),
+                    // WOR-2069: size from what this engine actually runs,
+                    // since vLLM and SGLang substitute fp8 for int4.
+                    self.resolved.modality.kv_bytes_per_element_override(
+                        crate::config::effective_kv_cache(kv_quant, self.resolved.engine)
+                            .bytes_per_element,
+                    ),
                     concurrency,
                     self.desired
                         .desired
@@ -3668,6 +3682,31 @@ impl PreparedDeploymentRuntime for ProductionPreparedDeployment {
 /// The curated digest-pinned default container image for a
 /// container-capable Python engine (WOR-1917), or `None` for an engine that
 /// has no container-first default here (llama.cpp, the embedded engine).
+/// Say so when an engine cannot run the KV mode that was configured.
+///
+/// The fit planner sizes the substitute, so nothing is mis-planned, but
+/// an operator who wrote `kv_quant: int4` expecting to halve their cache
+/// is getting fp8 on vLLM and SGLang and would otherwise have no way to
+/// find that out (WOR-2069).
+fn warn_on_kv_substitution(
+    requested: KvCacheQuant,
+    effective: crate::config::EffectiveKvCache,
+    engine: EngineKind,
+    model: &str,
+) {
+    if !effective.is_substituted(requested) {
+        return;
+    }
+    tracing::warn!(
+        model = %model,
+        engine = ?engine,
+        requested = ?requested,
+        effective = ?effective.effective,
+        "engine has no kernel for the configured kv_quant; serving the nearest mode it supports \
+         and sizing the fit for that"
+    );
+}
+
 fn default_container_image(kind: EngineKind) -> Option<&'static str> {
     match kind {
         EngineKind::Vllm => Some(crate::vllm_driver::DEFAULT_VLLM_IMAGE),
