@@ -119,7 +119,7 @@ launchd's default and still leaks.
 Until this is fixed, stop the deployment before stopping the gateway:
 
 ```bash
-sbproxy models stop <deployment>   # reaps the engine
+sbproxy models stop local          # reaps the engine
 sbproxy service uninstall          # then remove the agent
 ```
 
