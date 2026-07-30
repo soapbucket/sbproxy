@@ -2407,6 +2407,18 @@ pub(super) async fn request_filter(
                 ) {
                     crate::inbound_key::NativeKeyPolicyDecision::NotPresent => {}
                     crate::inbound_key::NativeKeyPolicyDecision::Allowed { provider } => {
+                        let policy = plane
+                            .inbound()
+                            .native_key_policy
+                            .as_ref()
+                            .expect("allowed native key decision requires a policy");
+                        ctx.native_key_policy_record =
+                            Some(Box::new(crate::inbound_key::native_policy_record(
+                                policy,
+                                ctx.tenant_id.as_str(),
+                                ctx.hostname.as_str(),
+                                &provider,
+                            )));
                         ctx.native_key_provider = Some(provider);
                         ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
                     }
@@ -3045,6 +3057,10 @@ pub(super) async fn request_filter(
                 Some(session.req_header().method.as_str().to_string()),
             )
             .with_tenant_id(ctx.tenant_id.to_string())
+            .with_key_context(
+                ctx.native_key_provider.clone(),
+                ctx.inbound_key_mode.as_str(),
+            )
             .emit();
             if let Some(response) =
                 take_concurrent_limit_denial_response(ctx, status, &msg, policy_type)

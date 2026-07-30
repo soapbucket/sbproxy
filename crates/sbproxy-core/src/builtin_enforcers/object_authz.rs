@@ -112,6 +112,11 @@ impl PolicyEnforcer for ObjectAuthzEnforcer {
                     Some(request_id),
                     Some(method),
                 )
+                .with_tenant_id(ctx.tenant_id.to_string())
+                .with_key_context(
+                    ctx.native_key_provider.clone(),
+                    ctx.inbound_key_mode.as_str(),
+                )
                 .emit();
 
                 if policy.test_mode() {

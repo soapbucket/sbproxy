@@ -109,6 +109,13 @@ impl StubUpstream {
             .recv_timeout(Duration::from_secs(10))
             .expect("the upstream received a request")
     }
+
+    fn assert_no_request(&self, reason: &str) {
+        assert!(
+            self.seen.recv_timeout(Duration::from_millis(250)).is_err(),
+            "{reason}"
+        );
+    }
 }
 
 impl Drop for StubUpstream {
@@ -377,6 +384,72 @@ fn a_callers_own_provider_key_still_reaches_the_upstream() {
 }
 
 #[test]
+fn a_generic_native_key_is_not_replaced_by_an_origin_credential() {
+    let admin_port = free_port();
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let yaml = config(admin_port, upstream.port, "").replace(
+        &format!("      url: http://127.0.0.1:{}", upstream.port),
+        &format!(
+            r#"      url: http://127.0.0.1:{}
+    outbound_credential:
+      type: vault_secret
+      secret: operator-secret-must-not-replace-native
+      header: x-api-key
+      scheme: """#,
+            upstream.port
+        ),
+    );
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("proxy starts");
+
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{}/anything", harness.base_url()))
+        .header("Host", "tools.local")
+        .header("x-api-key", "sk-ant-api03-caller-owned")
+        .send()
+        .expect("proxied request");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let seen = upstream.next_request();
+    assert_eq!(
+        seen.get("x-api-key"),
+        Some("sk-ant-api03-caller-owned"),
+        "generic pass-through must preserve the caller-owned native credential: {seen:?}"
+    );
+}
+
+#[test]
+fn native_provider_shape_does_not_bypass_configured_origin_auth() {
+    let admin_port = free_port();
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let yaml = config(admin_port, upstream.port, "").replace(
+        &format!("      url: http://127.0.0.1:{}", upstream.port),
+        &format!(
+            r#"      url: http://127.0.0.1:{}
+    authentication:
+      type: basic_auth
+      users:
+        - username: admin
+          password: s3cret"#,
+            upstream.port
+        ),
+    );
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("proxy starts");
+
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{}/anything", harness.base_url()))
+        .header("Host", "tools.local")
+        .header("x-api-key", "sk-ant-api03-caller-owned")
+        .send()
+        .expect("proxy response");
+    assert_eq!(
+        response.status().as_u16(),
+        401,
+        "provider-key shape is attribution, not proof of origin identity"
+    );
+    upstream.assert_no_request("configured origin auth must still fail closed");
+}
+
+#[test]
 fn a_native_provider_key_is_refused_without_an_operator_policy() {
     let admin_port = free_port();
     let upstream = StubUpstream::start().expect("stub upstream");
@@ -471,6 +544,199 @@ fn an_ai_route_uses_the_callers_native_key_instead_of_the_operator_key() {
             .is_some_and(|value| value.contains("operator-key")),
         "the operator credential must never silently replace a caller-owned native key"
     );
+}
+
+fn native_ai_request(harness: &ProxyHarness, model: &str) -> reqwest::blocking::Response {
+    reqwest::blocking::Client::new()
+        .post(format!("{}/v1/chat/completions", harness.base_url()))
+        .header("Host", "ai.local")
+        .header("authorization", "Bearer sk-caller-owned-ai")
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .expect("AI proxy response")
+}
+
+fn openai_origin(upstream_port: u16, action_extra: &str) -> String {
+    format!(
+        r#"  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: operator-key-must-not-be-billed
+          base_url: http://127.0.0.1:{upstream_port}
+          allow_private_base_url: true
+          models: [gpt-test]
+{action_extra}
+"#
+    )
+}
+
+fn add_native_policy_fields(yaml: String, fields: &str) -> String {
+    yaml.replace(
+        "          - openai\n",
+        &format!("          - openai\n{fields}"),
+    )
+}
+
+#[test]
+fn native_policy_enforces_model_and_pii_requirements_before_dispatch() {
+    let upstream = StubUpstream::start().expect("stub upstream");
+
+    let model_admin = free_port();
+    let model_yaml = add_native_policy_fields(
+        config(
+            model_admin,
+            upstream.port,
+            &openai_origin(upstream.port, ""),
+        ),
+        "        allowed_models: [gpt-allowed]\n",
+    );
+    let model_harness = ProxyHarness::start_with_yaml(&model_yaml).expect("model proxy starts");
+    assert_eq!(
+        native_ai_request(&model_harness, "gpt-test")
+            .status()
+            .as_u16(),
+        403
+    );
+    upstream.assert_no_request("native model denial must happen before dispatch");
+    drop(model_harness);
+
+    let pii_admin = free_port();
+    let pii_yaml = add_native_policy_fields(
+        config(pii_admin, upstream.port, &openai_origin(upstream.port, "")),
+        "        require_pii_redaction: [email]\n",
+    );
+    let pii_harness = ProxyHarness::start_with_yaml(&pii_yaml).expect("PII proxy starts");
+    assert_eq!(
+        native_ai_request(&pii_harness, "gpt-test")
+            .status()
+            .as_u16(),
+        500
+    );
+    upstream.assert_no_request("missing required PII redaction must fail before dispatch");
+}
+
+#[test]
+fn native_policy_enforces_rate_and_budget_limits() {
+    let rate_upstream = StubUpstream::start().expect("rate upstream");
+    let rate_admin = free_port();
+    let rate_yaml = add_native_policy_fields(
+        config(
+            rate_admin,
+            rate_upstream.port,
+            &openai_origin(rate_upstream.port, ""),
+        ),
+        "        max_requests_per_minute: 1\n",
+    );
+    let rate_harness = ProxyHarness::start_with_yaml(&rate_yaml).expect("rate proxy starts");
+    assert_eq!(
+        native_ai_request(&rate_harness, "gpt-test")
+            .status()
+            .as_u16(),
+        200
+    );
+    let _ = rate_upstream.next_request();
+    assert_eq!(
+        native_ai_request(&rate_harness, "gpt-test")
+            .status()
+            .as_u16(),
+        429
+    );
+    rate_upstream.assert_no_request("exhausted native RPM must block the second dispatch");
+
+    let budget_upstream = StubUpstream::start().expect("budget upstream");
+    let budget_admin = free_port();
+    let budget_yaml = add_native_policy_fields(
+        config(
+            budget_admin,
+            budget_upstream.port,
+            &openai_origin(budget_upstream.port, ""),
+        ),
+        "        max_budget_tokens: 0\n",
+    );
+    let budget_harness = ProxyHarness::start_with_yaml(&budget_yaml).expect("budget proxy starts");
+    assert_eq!(
+        native_ai_request(&budget_harness, "gpt-test")
+            .status()
+            .as_u16(),
+        402
+    );
+    budget_upstream.assert_no_request("exhausted native token budget must block dispatch");
+}
+
+#[test]
+fn native_keys_fail_closed_for_confidence_cascade() {
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let admin_port = free_port();
+    let action_extra = r#"      routing:
+        strategy: cascade
+        tiers:
+          - provider_id: openai
+            model: gpt-test
+            quality_threshold: 0.8
+"#;
+    let yaml = config(
+        admin_port,
+        upstream.port,
+        &openai_origin(upstream.port, action_extra),
+    );
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("cascade proxy starts");
+
+    assert_eq!(
+        native_ai_request(&harness, "gpt-test").status().as_u16(),
+        503
+    );
+    upstream.assert_no_request("native confidence cascade must fail before dispatch");
+}
+
+#[test]
+fn native_keys_suppress_shadow_copies_without_affecting_primary() {
+    let primary = StubUpstream::start().expect("primary upstream");
+    let shadow = StubUpstream::start().expect("shadow upstream");
+    let admin_port = free_port();
+    let ai_origin = format!(
+        r#"  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: operator-primary-key
+          base_url: http://127.0.0.1:{}
+          allow_private_base_url: true
+          models: [gpt-test]
+        - name: shadow
+          provider_type: openai
+          api_key: operator-shadow-key
+          base_url: http://127.0.0.1:{}
+          allow_private_base_url: true
+          enabled: false
+          models: [gpt-test]
+      routing:
+        strategy: round_robin
+      shadow:
+        provider: shadow
+        sample_rate: 1.0
+        timeout_ms: 5000
+        task_timeout_ms: 5000
+"#,
+        primary.port, shadow.port
+    );
+    let yaml = config(admin_port, primary.port, &ai_origin);
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("shadow proxy starts");
+
+    assert_eq!(
+        native_ai_request(&harness, "gpt-test").status().as_u16(),
+        200
+    );
+    let seen = primary.next_request();
+    assert_eq!(seen.get("authorization"), Some("Bearer sk-caller-owned-ai"));
+    shadow.assert_no_request("native caller credentials must never be copied to a shadow");
 }
 
 #[test]

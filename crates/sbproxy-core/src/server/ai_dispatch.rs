@@ -978,17 +978,18 @@ fn quota_pool_member_id(
 pub(super) fn quota_pool_member_id_for_request(
     ctx: &RequestContext,
 ) -> Result<String, sbproxy_ai::PoolError> {
-    let anonymous_is_uncredentialed = if ctx.resolved_inbound_key.is_some() {
-        false
-    } else {
-        match ctx
-            .origin_idx
-            .and_then(|origin_idx| ctx.pipeline.auths.get(origin_idx))
-        {
-            Some(None) | Some(Some(sbproxy_modules::auth::Auth::Noop)) => true,
-            Some(Some(_)) | None => false,
-        }
-    };
+    let anonymous_is_uncredentialed =
+        if ctx.resolved_inbound_key.is_some() || ctx.native_key_policy_record.is_some() {
+            false
+        } else {
+            match ctx
+                .origin_idx
+                .and_then(|origin_idx| ctx.pipeline.auths.get(origin_idx))
+            {
+                Some(None) | Some(Some(sbproxy_modules::auth::Auth::Noop)) => true,
+                Some(Some(_)) | None => false,
+            }
+        };
     quota_pool_member_id(&ctx.principal, anonymous_is_uncredentialed)
 }
 
@@ -1419,6 +1420,9 @@ async fn resolve_request_virtual_key(
     // dispatch UNGOVERNED: no model allowlist, no budget, no rate limit, no
     // tool injection, no PII requirement, and no error or log to say so.
     if let Some(record) = ctx.resolved_inbound_key.as_deref() {
+        return lower_stored_request_key(record, origin_tenant_id).map(Some);
+    }
+    if let Some(record) = ctx.native_key_policy_record.as_deref() {
         return lower_stored_request_key(record, origin_tenant_id).map(Some);
     }
     let auth_value = req_header_value(session, "authorization");
@@ -3687,6 +3691,10 @@ pub(super) async fn handle_ai_proxy(
                             Some(session.req_header().method.as_str().to_string()),
                         )
                         .with_tenant_id(ctx.tenant_id.as_str())
+                        .with_key_context(
+                            ctx.native_key_provider.clone(),
+                            ctx.inbound_key_mode.as_str(),
+                        )
                         .emit();
                         sbproxy_observe::metrics::record_governance_fail_open(&key_id);
                         // No lease: there is no reservation to settle or

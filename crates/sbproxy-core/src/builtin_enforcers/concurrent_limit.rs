@@ -49,13 +49,13 @@ impl PolicyEnforcer for ConcurrentLimitEnforcer {
         };
         let origin_id = ctx.origin_idx.map(|i| i.to_string()).unwrap_or_default();
         let client_ip_str = ctx.client_ip.map(|ip| ip.to_string());
-        // Bucket a verified minted key on its immutable public id, never on the
-        // presented secret. Policies run before the upstream filter strips the
-        // header, so without this the 85-character token becomes the map key
-        // and a secret rotation silently resets the caller's bucket.
+        // Bucket governed credentials on their secret-free public policy id,
+        // never on the presented secret. Native traffic uses its stable
+        // tenant/origin/provider policy-bucket id.
         let resolved_key_id = ctx
             .resolved_inbound_key
             .as_deref()
+            .or(ctx.native_key_policy_record.as_deref())
             .map(|record| record.key_id.as_str());
         let key = policy.resolve_key(
             resolved_key_id,

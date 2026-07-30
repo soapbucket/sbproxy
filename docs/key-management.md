@@ -50,6 +50,13 @@ proxy:
       require: false                       # 401 when no minted key resolved
       native_key_policy:
         allowed_providers: [openai, anthropic]
+        max_requests_per_minute: 600
+        max_tokens_per_minute: 200000
+        max_budget_tokens: 10000000
+        max_budget_usd: 250.00
+        allowed_models: [gpt-5, claude-sonnet-4]
+        blocked_models: []
+        require_pii_redaction: [email]
     failure_mode_allow: false        # fail closed when the store is down
     allow_api_override: false        # config records win on reload
     oidc_claim_map:
@@ -124,8 +131,18 @@ absent or the recognized provider is not listed, SBproxy returns 403 before
 dispatch. A credential matching no hint remains unattributed and follows the
 origin's ordinary auth behavior.
 
+The same block is the KeyRecord-shaped default for admitted native traffic.
+`max_requests_per_minute`, `max_tokens_per_minute`, `max_budget_tokens`,
+`max_budget_usd`, `allowed_models`, `blocked_models`, and
+`require_pii_redaction` enter the ordinary governed-key enforcement path.
+Limits are bucketed by tenant, origin, and recognized provider; no credential
+bytes are hashed, retained, or used as an identifier. Model, PII, exhausted
+rate, and exhausted budget decisions fail before upstream dispatch.
+
 On a generic proxy route, an allowed caller-owned credential passes upstream
-unchanged. On an AI route, it can select only configured providers whose
+unchanged, even when that origin also configures `outbound_credential`: native
+mode represents an explicit caller-owned identity, so the origin credential
+must not replace it. On an AI route, it can select only configured providers whose
 `provider_type` (or provider name when no type is set) matches the recognized
 provider, and it replaces that provider's configured `api_key` for this request
 only. This precedence prevents native-key traffic from silently spending the
@@ -133,11 +150,21 @@ operator credential. If the credential cannot be re-resolved or no matching AI
 provider exists, the request fails before any upstream call. Minted `sbp_...`
 keys always take precedence and never enter native-key policy resolution.
 
+Confidence cascade routing is unavailable for native credentials and returns
+503 before the first tier runs. A cascade can move between billable providers,
+but the caller authorized only the provider represented by their credential.
+For the same reason, configured shadow copies are suppressed for native
+traffic: the primary response proceeds normally, while neither the caller
+credential nor an operator credential is sent to the shadow target.
+
 The companion metric
-`sbproxy_inbound_key_requests_total{provider,key_mode}` uses the closed
-`key_mode` values `none`, `minted`, and `native`. Access logs, request events,
-and security audit records carry the same `key_provider` and `key_mode` fields.
-No raw provider key is stored in those records or metric labels.
+`sbproxy_inbound_key_requests_total{provider,key_mode,tenant_id,api_key_id}`
+uses the closed `key_mode` values `none`, `minted`, and `native`. An unresolved
+provider or key id is the empty label value. Native `api_key_id` is the stable,
+secret-free tenant/origin/provider policy-bucket id. Access logs, request
+events, and security audit records carry the same `key_provider` and
+`key_mode` fields. No raw provider key is stored in those records or metric
+labels.
 
 ### Requiring a key
 
@@ -164,8 +191,9 @@ policies:
 
 The header carries the presented secret, so bucketing on it means the bucket
 changes when you rotate the key and the caller gets a fresh budget. The key id
-does not change. `request.key_id` is an empty string when no minted key
-resolved, so the expression still evaluates on unauthenticated traffic.
+does not change. `request.key_id` is the secret-free native policy-bucket id for
+admitted native traffic and an empty string when no key policy resolved, so the
+expression still evaluates on unauthenticated traffic.
 
 `concurrent_limit` with `key_by: api_key` already does this for you: it uses the
 resolved key id when there is one and falls back to the header otherwise.

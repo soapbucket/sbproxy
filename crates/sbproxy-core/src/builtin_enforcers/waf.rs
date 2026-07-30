@@ -99,6 +99,8 @@ impl PolicyEnforcer for WafEnforcer {
         // inside the `async move` closures below (which cannot borrow
         // `ctx`). Each match arm moves its own clone.
         let tenant = ctx.tenant_id.to_string();
+        let key_provider = ctx.native_key_provider.clone();
+        let key_mode = ctx.inbound_key_mode.as_str().to_string();
         let block_state = policy.block_store().map(|store| {
             let kind = store.key_kind();
             let key = resolve_block_key(kind, store.cel_key(), req, ctx);
@@ -162,6 +164,8 @@ impl PolicyEnforcer for WafEnforcer {
                                         None,
                                         None,
                                     )
+                                    .with_tenant_id(tenant.clone())
+                                    .with_key_context(key_provider.clone(), key_mode.clone())
                                     .emit();
                                 }
                                 sbproxy_modules::policy::waf::StrikeOutcome::Counted => {

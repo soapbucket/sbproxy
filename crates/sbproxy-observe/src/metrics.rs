@@ -548,7 +548,7 @@ impl ProxyMetrics {
                 "sbproxy_inbound_key_requests_total",
                 "Requests partitioned by inbound credential mode and provider",
             ),
-            &["provider", "key_mode"],
+            &["provider", "key_mode", "tenant_id", "api_key_id"],
         )
         .unwrap();
 
@@ -1278,21 +1278,37 @@ pub fn record_trust_tier(tier: &str) {
 }
 
 /// Record the request's inbound credential mode without exposing credential
-/// material. `key_mode` is a closed set; provider labels pass through the
-/// shared cardinality budget because operators may configure custom hints.
-pub fn record_inbound_key_request(provider: Option<&str>, key_mode: &str) {
+/// material. `key_mode` is a closed set; provider, tenant, and public key-id
+/// labels pass through bounded cardinality budgets. `None` is represented by
+/// the empty sentinel, never a made-up provider name.
+pub fn record_inbound_key_request(
+    provider: Option<&str>,
+    key_mode: &str,
+    tenant_id: &str,
+    api_key_id: Option<&str>,
+) {
+    const METRIC: &str = "sbproxy_inbound_key_requests_total";
     let key_mode = match key_mode {
         "none" | "minted" | "native" => key_mode,
         _ => "none",
     };
-    let provider = sanitize_label_budget(
-        "sbproxy_inbound_key_requests_total",
-        "provider",
-        provider.unwrap_or("none"),
+    let tenant_id = sanitize_label_budget(METRIC, "tenant_id", tenant_id);
+    let provider =
+        sanitize_label_budget_tenant(METRIC, "provider", provider.unwrap_or_default(), &tenant_id);
+    let api_key_id = sanitize_label_budget_tenant(
+        METRIC,
+        "api_key_id",
+        api_key_id.unwrap_or_default(),
+        &tenant_id,
     );
     metrics()
         .inbound_key_requests
-        .with_label_values(&[provider.as_str(), key_mode])
+        .with_label_values(&[
+            provider.as_str(),
+            key_mode,
+            tenant_id.as_str(),
+            api_key_id.as_str(),
+        ])
         .inc();
 }
 
@@ -5050,21 +5066,30 @@ mod tests {
     }
 
     #[test]
-    fn record_inbound_key_request_emits_only_provider_and_closed_key_mode() {
+    fn record_inbound_key_request_emits_safe_tenant_and_key_dimensions() {
         let before = metrics()
             .inbound_key_requests
-            .with_label_values(&["openai", "native"])
+            .with_label_values(&["openai", "native", "tenant-a", "native:tenant-a:api:openai"])
             .get();
-        record_inbound_key_request(Some("openai"), "native");
+        record_inbound_key_request(
+            Some("openai"),
+            "native",
+            "tenant-a",
+            Some("native:tenant-a:api:openai"),
+        );
         let after = metrics()
             .inbound_key_requests
-            .with_label_values(&["openai", "native"])
+            .with_label_values(&["openai", "native", "tenant-a", "native:tenant-a:api:openai"])
             .get();
 
         assert_eq!(after, before + 1);
+        record_inbound_key_request(None, "none", "tenant-a", None);
         let rendered = metrics().render();
         assert!(rendered.contains(
-            "sbproxy_inbound_key_requests_total{key_mode=\"native\",provider=\"openai\"}"
+            "sbproxy_inbound_key_requests_total{api_key_id=\"native:tenant-a:api:openai\",key_mode=\"native\",provider=\"openai\",tenant_id=\"tenant-a\"}"
+        ));
+        assert!(rendered.contains(
+            "sbproxy_inbound_key_requests_total{api_key_id=\"\",key_mode=\"none\",provider=\"\",tenant_id=\"tenant-a\"}"
         ));
         assert!(!rendered.contains("sk-caller-owned-canary"));
     }

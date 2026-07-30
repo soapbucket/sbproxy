@@ -1869,16 +1869,37 @@ pub struct ProviderHintConfig {
 /// Default admission policy for caller-owned native provider keys.
 ///
 /// Native keys cannot carry an SBproxy policy record because the caller, not
-/// the operator, owns their secret. This explicit allowlist is therefore the
-/// policy applied to every native key recognized by `provider_hints`. Leaving
-/// the block absent fails closed for recognized native-key traffic.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+/// the operator, owns their secret. This block supplies the equivalent default
+/// policy for every native key recognized by `provider_hints`. Leaving it
+/// absent fails closed for recognized native-key traffic.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct NativeKeyPolicyConfig {
     /// Canonical provider labels admitted to use caller-owned credentials.
     ///
     /// Matching is case-insensitive and ignores surrounding whitespace. The
     /// list must be non-empty and may not contain duplicates.
     pub allowed_providers: Vec<String>,
+    /// Max requests per minute for each origin/provider native-key bucket.
+    #[serde(default)]
+    pub max_requests_per_minute: Option<u64>,
+    /// Max input and output tokens per minute.
+    #[serde(default)]
+    pub max_tokens_per_minute: Option<u64>,
+    /// Max total tokens for the native-key budget window.
+    #[serde(default)]
+    pub max_budget_tokens: Option<u64>,
+    /// Max total cost in USD for the native-key budget window.
+    #[serde(default)]
+    pub max_budget_usd: Option<f64>,
+    /// Models native-key traffic may use (empty = all).
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+    /// Models native-key traffic may not use.
+    #[serde(default)]
+    pub blocked_models: Vec<String>,
+    /// Named PII redaction rules that must be active before dispatch.
+    #[serde(default)]
+    pub require_pii_redaction: Vec<String>,
 }
 
 impl NativeKeyPolicyConfig {
@@ -2084,6 +2105,25 @@ impl KeyInboundConfig {
                         "key_management.inbound.native_key_policy.allowed_providers: {provider:?} is listed more than once"
                     ));
                 }
+            }
+            for (name, value) in [
+                ("max_requests_per_minute", policy.max_requests_per_minute),
+                ("max_tokens_per_minute", policy.max_tokens_per_minute),
+            ] {
+                if value == Some(0) {
+                    return Err(format!(
+                        "key_management.inbound.native_key_policy.{name} must be greater than zero"
+                    ));
+                }
+            }
+            if policy
+                .max_budget_usd
+                .is_some_and(|value| !value.is_finite() || value < 0.0)
+            {
+                return Err(
+                    "key_management.inbound.native_key_policy.max_budget_usd must be finite and non-negative"
+                        .to_string(),
+                );
             }
         }
         Ok(())
@@ -9102,6 +9142,7 @@ mod inbound_key_header_tests {
         let mut cfg = KeyInboundConfig {
             native_key_policy: Some(NativeKeyPolicyConfig {
                 allowed_providers: vec!["openai".to_string(), "anthropic".to_string()],
+                ..NativeKeyPolicyConfig::default()
             }),
             ..KeyInboundConfig::default()
         };
@@ -9109,6 +9150,7 @@ mod inbound_key_header_tests {
 
         cfg.native_key_policy = Some(NativeKeyPolicyConfig {
             allowed_providers: Vec::new(),
+            ..NativeKeyPolicyConfig::default()
         });
         assert!(cfg
             .validate()
@@ -9117,6 +9159,7 @@ mod inbound_key_header_tests {
 
         cfg.native_key_policy = Some(NativeKeyPolicyConfig {
             allowed_providers: vec!["OpenAI".to_string(), " openai ".to_string()],
+            ..NativeKeyPolicyConfig::default()
         });
         assert!(cfg
             .validate()
@@ -9127,6 +9170,56 @@ mod inbound_key_header_tests {
     #[test]
     fn native_key_policy_is_absent_by_default_so_native_traffic_fails_closed() {
         assert!(KeyInboundConfig::default().native_key_policy.is_none());
+    }
+
+    #[test]
+    fn native_key_policy_accepts_key_record_governance_fields() {
+        let cfg: KeyInboundConfig = serde_yaml::from_str(
+            r#"
+native_key_policy:
+  allowed_providers: [openai]
+  max_requests_per_minute: 12
+  max_tokens_per_minute: 3456
+  max_budget_tokens: 7890
+  max_budget_usd: 1.25
+  allowed_models: [gpt-5]
+  blocked_models: [gpt-4]
+  require_pii_redaction: [email]
+"#,
+        )
+        .expect("native KeyRecord policy fields should deserialize");
+
+        let policy = cfg.native_key_policy.expect("policy");
+        assert_eq!(policy.max_requests_per_minute, Some(12));
+        assert_eq!(policy.max_tokens_per_minute, Some(3456));
+        assert_eq!(policy.max_budget_tokens, Some(7890));
+        assert_eq!(policy.max_budget_usd, Some(1.25));
+        assert_eq!(policy.allowed_models, ["gpt-5"]);
+        assert_eq!(policy.blocked_models, ["gpt-4"]);
+        assert_eq!(policy.require_pii_redaction, ["email"]);
+    }
+
+    #[test]
+    fn native_key_policy_rejects_zero_limits_and_invalid_cost_budget() {
+        let mut cfg = KeyInboundConfig {
+            native_key_policy: Some(NativeKeyPolicyConfig {
+                allowed_providers: vec!["openai".to_string()],
+                max_requests_per_minute: Some(0),
+                ..NativeKeyPolicyConfig::default()
+            }),
+            ..KeyInboundConfig::default()
+        };
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("must be greater than zero"));
+
+        cfg.native_key_policy = Some(NativeKeyPolicyConfig {
+            allowed_providers: vec!["openai".to_string()],
+            max_budget_usd: Some(f64::NAN),
+            ..NativeKeyPolicyConfig::default()
+        });
+        assert!(cfg.validate().unwrap_err().contains("finite"));
     }
 
     #[test]

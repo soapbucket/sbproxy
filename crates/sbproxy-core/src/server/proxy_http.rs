@@ -1998,7 +1998,9 @@ impl ProxyHttp for SbProxy {
                     ));
                 }
             }
-        } else if let Some(cred_cfg) = outbound_cred.as_ref().filter(|_| !is_realtime) {
+        } else if let Some(cred_cfg) = outbound_cred.as_ref().filter(|_| {
+            !is_realtime && ctx.inbound_key_mode != crate::context::InboundKeyMode::Native
+        }) {
             let inbound_bearer: Option<String> = session
                 .req_header()
                 .headers
@@ -5498,9 +5500,16 @@ impl ProxyHttp for SbProxy {
             ctx.response_body_bytes,
             agent_labels,
         );
+        let inbound_api_key_id = ctx
+            .resolved_inbound_key
+            .as_deref()
+            .or(ctx.native_key_policy_record.as_deref())
+            .map(|record| record.key_id.as_str());
         sbproxy_observe::metrics::record_inbound_key_request(
             ctx.native_key_provider.as_deref(),
             ctx.inbound_key_mode.as_str(),
+            ctx.tenant_id.as_str(),
+            inbound_api_key_id,
         );
 
         // WOR-1718: mirror the completed request into the admin request-log

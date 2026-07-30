@@ -171,7 +171,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_http_framing_blocks_total` | Counter | `stable` | `beta` | `reason`, `tenant` | Requests rejected by the http_framing policy (request smuggling defense). |
 | `sbproxy_idempotency_cache_duration_seconds` | Histogram | `stable` | `beta` | `backend` | Idempotency cache lookup duration, by backend. |
 | `sbproxy_idempotency_cache_results_total` | Counter | `stable` | `beta` | `backend`, `result` | Idempotency cache outcomes, by backend and result. |
-| `sbproxy_inbound_key_requests_total` | Counter | `stable` | `beta` | `provider`, `key_mode` | Requests partitioned by caller credential mode and recognized provider. |
+| `sbproxy_inbound_key_requests_total` | Counter | `stable` | `beta` | `provider`, `key_mode`, `tenant_id`, `api_key_id` | Requests partitioned by caller credential mode and recognized provider. |
 | `sbproxy_inference_duration_seconds` | Histogram | `stable` | `beta` | `kind`, `backend`, `model` | Local inference latency in seconds. |
 | `sbproxy_inference_requests_total` | Counter | `stable` | `beta` | `kind`, `backend`, `model`, `result` | Local inference call counts. |
 | `sbproxy_judge_budget_exhausted_total` | Counter | `stable` | `beta` | `tenant` | Judge calls denied because the per-tenant budget was empty. |

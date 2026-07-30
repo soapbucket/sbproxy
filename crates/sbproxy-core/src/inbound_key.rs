@@ -10,7 +10,7 @@
 //! sends whatever its author picked. Sweeping a configured list is what lets a
 //! minted key be presented by a tool nobody is going to rewrite.
 
-use sbproxy_config::types::KeyInboundConfig;
+use sbproxy_config::types::{KeyInboundConfig, NativeKeyPolicyConfig};
 
 /// Values scanned per header name before the rest are ignored.
 ///
@@ -217,6 +217,45 @@ pub fn resolve_native_key_policy(
         Some(_) => NativeKeyPolicyDecision::ProviderDenied { provider },
         None => NativeKeyPolicyDecision::PolicyMissing { provider },
     }
+}
+
+/// Lower the operator's native-key defaults into the same secret-free record
+/// shape used by minted-key governance.
+///
+/// The stable id is scoped to tenant, origin, and provider. It is safe for
+/// metrics and quota buckets because it contains only operator-controlled
+/// labels, never any part of the caller-owned credential.
+pub fn native_policy_record(
+    policy: &NativeKeyPolicyConfig,
+    tenant_id: &str,
+    origin: &str,
+    provider: &str,
+) -> sbproxy_keystore::record::KeyRecord {
+    let now = chrono::Utc::now();
+    let key_id = format!(
+        "native:{}:{}:{}",
+        tenant_id.trim(),
+        origin.trim().to_ascii_lowercase(),
+        provider.trim().to_ascii_lowercase()
+    );
+    let mut record = sbproxy_keystore::record::KeyRecord::new(key_id, "", now);
+    record.name = Some(format!("native:{}", provider.trim().to_ascii_lowercase()));
+    record.max_requests_per_minute = policy.max_requests_per_minute;
+    record.max_tokens_per_minute = policy.max_tokens_per_minute;
+    if policy.max_budget_tokens.is_some() || policy.max_budget_usd.is_some() {
+        record.budget = Some(sbproxy_keystore::record::RecordBudget {
+            max_tokens: policy.max_budget_tokens,
+            max_cost_usd: policy.max_budget_usd,
+        });
+    }
+    record.allowed_models.clone_from(&policy.allowed_models);
+    record.blocked_models.clone_from(&policy.blocked_models);
+    record
+        .require_pii_redaction
+        .clone_from(&policy.require_pii_redaction);
+    record.tenant_id = Some(tenant_id.to_string());
+    record.source = sbproxy_keystore::record::RecordSource::Config;
+    record
 }
 
 /// Strip `scheme` from the front of `value`, case-insensitively, returning the
@@ -496,6 +535,7 @@ mod tests {
 
         cfg.native_key_policy = Some(NativeKeyPolicyConfig {
             allowed_providers: vec!["anthropic".to_string()],
+            ..NativeKeyPolicyConfig::default()
         });
         assert_eq!(
             resolve_native_key_policy(&h, &cfg),
@@ -506,6 +546,7 @@ mod tests {
 
         cfg.native_key_policy = Some(NativeKeyPolicyConfig {
             allowed_providers: vec![" OpenAI ".to_string()],
+            ..NativeKeyPolicyConfig::default()
         });
         assert_eq!(
             resolve_native_key_policy(&h, &cfg),
@@ -533,6 +574,7 @@ mod tests {
         let cfg = KeyInboundConfig {
             native_key_policy: Some(NativeKeyPolicyConfig {
                 allowed_providers: vec!["anthropic".to_string()],
+                ..NativeKeyPolicyConfig::default()
             }),
             ..KeyInboundConfig::default()
         };
@@ -541,5 +583,42 @@ mod tests {
             resolve_native_key_policy(&h, &cfg),
             NativeKeyPolicyDecision::NotPresent
         );
+    }
+
+    #[test]
+    fn native_policy_record_carries_key_record_governance_without_a_secret() {
+        let policy = NativeKeyPolicyConfig {
+            allowed_providers: vec!["openai".to_string()],
+            max_requests_per_minute: Some(12),
+            max_tokens_per_minute: Some(3456),
+            max_budget_tokens: Some(7890),
+            max_budget_usd: Some(1.25),
+            allowed_models: vec!["gpt-5".to_string()],
+            blocked_models: vec!["gpt-4".to_string()],
+            require_pii_redaction: vec!["email".to_string()],
+        };
+
+        let record = native_policy_record(&policy, "tenant-a", "api.example", "openai");
+        assert_eq!(record.key_id, "native:tenant-a:api.example:openai");
+        assert!(record.secret_hash.is_empty());
+        assert_eq!(record.max_requests_per_minute, Some(12));
+        assert_eq!(record.max_tokens_per_minute, Some(3456));
+        assert_eq!(
+            record.budget,
+            Some(sbproxy_keystore::record::RecordBudget {
+                max_tokens: Some(7890),
+                max_cost_usd: Some(1.25),
+            })
+        );
+        assert_eq!(record.allowed_models, ["gpt-5"]);
+        assert_eq!(record.blocked_models, ["gpt-4"]);
+        assert_eq!(record.require_pii_redaction, ["email"]);
+        assert_eq!(record.tenant_id.as_deref(), Some("tenant-a"));
+
+        let effective =
+            crate::key_policy::key_record_to_effective_policy(&record, "tenant-a").unwrap();
+        assert_eq!(effective.key_id, record.key_id);
+        assert_eq!(effective.max_requests_per_minute, Some(12));
+        assert_eq!(effective.require_pii_redaction, ["email"]);
     }
 }

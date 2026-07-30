@@ -1038,6 +1038,13 @@ pub struct RequestContext {
     /// Downstream code reads this instead of re-reading `authorization`, which
     /// an earlier phase may already have consumed.
     pub resolved_inbound_key: Option<Box<sbproxy_keystore::record::KeyRecord>>,
+    /// Secret-free policy synthesized for an admitted caller-owned provider
+    /// credential.
+    ///
+    /// Kept separate from `resolved_inbound_key`: provider-shape attribution
+    /// is not authentication and must never short-circuit the origin's
+    /// configured auth provider.
+    pub native_key_policy_record: Option<Box<sbproxy_keystore::record::KeyRecord>>,
     /// Lowercase name of the header the minted key arrived in.
     ///
     /// Stripped from the upstream request so the proxy's own key never reaches
@@ -1474,6 +1481,7 @@ impl RequestContext {
             ai_native_bypass: false,
             effective_key_policy: None,
             resolved_inbound_key: None,
+            native_key_policy_record: None,
             inbound_key_header: None,
             native_key_provider: None,
             inbound_key_mode: InboundKeyMode::None,
