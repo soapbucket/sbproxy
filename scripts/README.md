@@ -1,7 +1,6 @@
 # scripts/
 
-*Last modified: 2026-07-10*
-
+*Last modified: 2026-07-30*
 
 Helper scripts that wrap the day-to-day dev loop and the CI runners
 the GitHub workflows invoke. Run from the repository root unless a
@@ -20,6 +19,7 @@ script's header says otherwise.
 | `generate-certs.sh` | Mint a local CA + leaf cert for TLS tests. | local only |
 | `install.sh` | One-command install of `sbproxy` from a release archive. | end-user |
 | `docs-ci.sh` | Wave 1 / Q1.10 doc CI runner: lychee + code-block check. | `.github/workflows/docs-ci.yml` (B1.10) |
+| `sync-doc-configs.py` | Sync strict documentation configs from compiler-validated examples, or report drift with `--check`. | local + `.github/workflows/docs-ci.yml` |
 | `check-model-host-capabilities.sh` | Fail when the generated model-host capability matrix drifts from the executable registry. | `.github/workflows/ci.yml` |
 | `examples-smoke.sh` | Local examples smoke runner. | local only: `make examples-smoke` |
 
@@ -44,6 +44,45 @@ is too expensive for the default CI lanes. Both scripts exit non-zero on
 failure and print one line per checked artifact.
 
 `docs-ci.sh` lints and link-checks every doc under `docs/`.
+
+### Documentation configuration sources
+
+Complete, copyable configuration blocks use files under `examples/` as their
+source of truth. The existing `validate_examples` Rust test compiles those
+files against the runtime schema. `sync-doc-configs.py` supplies the other
+half of the contract by keeping opted-in documentation blocks identical to
+their canonical source.
+
+Delimit the complete body in the canonical example:
+
+```yaml
+# sbproxy-docs:begin
+proxy:
+  http_bind_port: 8080
+# sbproxy-docs:end
+```
+
+Bind a documentation fence to that file by placing this marker immediately
+before it:
+
+```text
+<!-- sbproxy-config: examples/basic-proxy/sb.yml -->
+```
+
+The next fence must be a `yaml` fence. Run `scripts/sync-doc-configs.py` to
+refresh strict blocks, or `scripts/sync-doc-configs.py --check` to fail on
+drift without writing. Canonical paths must use a compiler-swept
+`examples/<name>/sb.yml` or one of the additional multi-file gateway configs
+explicitly included in that sweep. Each source exposes exactly one ordered
+begin/end pair.
+
+Partial topology maps and field fragments are intentional excerpts, not
+runnable files. Mark the immediately following YAML fence with
+`<!-- sbproxy-config-excerpt -->`; the checker records but does not sync that
+block. Unmarked legacy fences remain unchanged so pages can adopt this
+contract incrementally. New or edited blocks presented as complete and
+usable should use the strict source marker. Intentionally partial blocks
+should use the excerpt marker.
 
 `examples-smoke.sh` discovers every directory under `examples/` that
 ships a `docker-compose.yml` and runs a smoke probe against the

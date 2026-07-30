@@ -17,6 +17,7 @@
 #   curl -H 'Host: myapp.example.com' http://127.0.0.1:8080/health
 #   curl -H 'Host: myapp.example.com' http://127.0.0.1:8080/status/418
 
+# sbproxy-docs:begin
 proxy:
   http_bind_port: 8080
 
@@ -25,3 +26,4 @@ origins:
     action:
       type: proxy
       url: https://test.sbproxy.dev
+# sbproxy-docs:end

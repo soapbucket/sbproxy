@@ -296,6 +296,76 @@ pub struct CacheBudgetCheck {
     pub sufficient: bool,
 }
 
+/// What a `serve:` block demands of the host it was handed to, derived
+/// from the config rather than guessed from the hardware present.
+///
+/// The strict startup gate ([`DoctorReport::strict_checks`]) compares
+/// these demands against what the host actually has. Every field is a
+/// statement about the *config*, so an empty demand set is the honest
+/// answer for a gateway-only node that serves no models locally.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ServeDemand {
+    /// The config asks for CUDA: an engine pinned to `acceleration: cuda`,
+    /// or a vLLM / SGLang engine, both of which only run on NVIDIA.
+    pub requires_cuda: bool,
+    /// Engine kinds that drove [`requires_cuda`](Self::requires_cuda),
+    /// so a failure can name the entry the operator has to change.
+    pub cuda_engines: Vec<String>,
+    /// Largest `engines.*.shm_size_gib` the config declares, in bytes.
+    /// vLLM and SGLang pass this to the container runtime for their
+    /// multiprocess tensor handles, so a `/dev/shm` smaller than this is
+    /// a launch failure the operator can be told about at boot.
+    pub required_shm_bytes: Option<u64>,
+}
+
+/// Peer identity a node needs before it can join the private model
+/// plane, extracted from `proxy.cluster` by the caller.
+///
+/// The doctor deliberately takes this as a flat, pre-resolved input
+/// rather than depending on the cluster config type: the only thing it
+/// checks is whether the material this node was told to present exists
+/// and is readable, which is the failure that turns a fresh worker into
+/// a node that gossips but can never serve.
+#[derive(Debug, Clone)]
+pub struct ModelPlaneIdentity {
+    /// This node performs the worker role, so it must be able to
+    /// authenticate to the gateway that dispatches to it.
+    pub worker_role: bool,
+    /// Peer security is mTLS, so cert, key, and CA are all mandatory.
+    pub mtls: bool,
+    /// Files the config named, each with the config key that named it.
+    /// Checked for existence and readability, never parsed here.
+    pub files: Vec<(&'static str, PathBuf)>,
+    /// mTLS keys the config left unset. Each one is a violation.
+    pub missing_keys: Vec<&'static str>,
+    /// Shared-key mode resolved a secret. `None` outside shared-key mode.
+    pub shared_key_present: Option<bool>,
+}
+
+/// One named startup check and its verdict.
+///
+/// `check` is a stable snake-case id so a bootstrap script can grep for
+/// a specific failure; `detail` is the human sentence. A check that does
+/// not apply to this host is reported `skipped`, never silently dropped:
+/// a certification lane has to be able to tell "passed" from "never ran".
+#[derive(Debug, Clone, Serialize)]
+pub struct StrictCheck {
+    /// Stable check id: `driver`, `visible_devices`, `cuda_compatibility`,
+    /// `shared_memory`, `cache_mount`, `model_plane_identity`.
+    pub check: &'static str,
+    /// `pass`, `fail`, or `skip`.
+    pub status: &'static str,
+    /// One sentence naming what was compared and what was found.
+    pub detail: String,
+}
+
+impl StrictCheck {
+    /// Whether this check failed, which is what the exit code keys on.
+    pub fn failed(&self) -> bool {
+        self.status == "fail"
+    }
+}
+
 /// The full diagnostics report. Serializes to the JSON shape
 /// `sbproxy doctor --format json` emits.
 #[derive(Debug, Clone, Serialize)]
@@ -344,6 +414,9 @@ pub struct DoctorReport {
     /// `serve.cache_budget_gib`, when a `serve:` config was supplied
     /// (`None` otherwise).
     pub cache_budget_check: Option<CacheBudgetCheck>,
+    /// What the supplied `serve:` block demands of this host. Default
+    /// (all-empty) until a config is supplied.
+    pub serve_demand: ServeDemand,
     /// The `serve:` readiness verdict for this host.
     pub local_serving: LocalServing,
 }
@@ -474,6 +547,7 @@ impl DoctorReport {
             shared_memory,
             serve_entries: Vec::new(),
             cache_budget_check: None,
+            serve_demand: ServeDemand::default(),
             local_serving,
         }
     }
@@ -493,6 +567,52 @@ impl DoctorReport {
             serve.cache_budget_gib,
             self.model_cache_free_bytes,
         ));
+        self.serve_demand = serve_demand(serve);
+        self
+    }
+
+    /// Record what the canonical `proxy.model_host` block demands of this
+    /// host, for the strict gate.
+    ///
+    /// Two config forms reach the model host: the inline provider-level
+    /// `serve:` block, which [`with_serve_config`](Self::with_serve_config)
+    /// covers, and `proxy.model_host`, which the examples and the
+    /// self-host docs lead with. The strict gate has to see both, or it
+    /// reports six cheerful `skip`s for a worker config it cannot serve,
+    /// which is precisely the hollow pass the gate exists to prevent.
+    ///
+    /// Takes pre-extracted values rather than the config type so this
+    /// crate keeps its current dependency direction; the caller reads
+    /// them off the parsed config.
+    pub fn with_control_plane_demand(
+        mut self,
+        demand: ServeDemand,
+        cache_budget_gib: Option<f64>,
+    ) -> Self {
+        // Whichever form asks for more wins: a config can legitimately
+        // carry both, and the host has to satisfy the union.
+        self.serve_demand.requires_cuda |= demand.requires_cuda;
+        self.serve_demand.cuda_engines.extend(demand.cuda_engines);
+        self.serve_demand.cuda_engines.sort();
+        self.serve_demand.cuda_engines.dedup();
+        self.serve_demand.required_shm_bytes = match (
+            self.serve_demand.required_shm_bytes,
+            demand.required_shm_bytes,
+        ) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        if cache_budget_gib.is_some() {
+            let existing = self
+                .cache_budget_check
+                .as_ref()
+                .and_then(|check| check.budget_gib);
+            let budget = match (existing, cache_budget_gib) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            self.cache_budget_check = Some(cache_budget_check(budget, self.model_cache_free_bytes));
+        }
         self
     }
 
@@ -624,6 +744,232 @@ impl DoctorReport {
             1
         } else {
             0
+        }
+    }
+
+    /// The startup gate a managed worker boots behind (SH-19): the
+    /// host conditions that no amount of later retrying can fix, each
+    /// reported as a named [`StrictCheck`].
+    ///
+    /// This is deliberately narrower than the advisory report. `doctor`
+    /// on its own answers "what does this host have"; the strict gate
+    /// answers the single question a bootstrap script needs: "is booting
+    /// this config on this host going to work, or should the boot stop
+    /// now with a legible reason". So a missing engine binary is *not* a
+    /// violation (acquisition fetches it at the first request), while a
+    /// config that asks for CUDA on a box with no driver is: the engine
+    /// will never start, and failing at boot beats failing at the first
+    /// customer request.
+    ///
+    /// Checks that do not apply to the supplied config are reported
+    /// `skip` rather than omitted, so a certification lane can prove a
+    /// check ran instead of inferring it from silence.
+    pub fn strict_checks(&self, plane: Option<&ModelPlaneIdentity>) -> Vec<StrictCheck> {
+        let mut checks = Vec::new();
+        let demand = &self.serve_demand;
+
+        // 1. Driver. Only a CUDA config needs one; Metal and CPU do not.
+        checks.push(if !demand.requires_cuda {
+            StrictCheck {
+                check: "driver",
+                status: "skip",
+                detail: "the config does not ask for CUDA, so no NVIDIA driver is required"
+                    .to_string(),
+            }
+        } else {
+            match &self.drivers.nvidia_driver {
+                Some(version) => StrictCheck {
+                    check: "driver",
+                    status: "pass",
+                    detail: format!("NVIDIA driver {version} present"),
+                },
+                None => StrictCheck {
+                    check: "driver",
+                    status: "fail",
+                    detail: format!(
+                        "the config asks for CUDA ({}) but no NVIDIA driver is installed; \
+                         boot this on a driver-provided image or install the driver",
+                        demand.cuda_engines.join(", ")
+                    ),
+                },
+            }
+        });
+
+        // 2. Visible devices. A driver with no visible device is the
+        //    classic container misconfiguration (`--gpus` omitted): the
+        //    driver answers, the probe sees nothing, every launch fails.
+        let cuda_devices = self
+            .gpus
+            .iter()
+            .filter(|gpu| {
+                gpu.total_vram_bytes > 0 && gpu.vendor == sbproxy_model_host::GpuVendor::Nvidia
+            })
+            .count();
+        checks.push(if !demand.requires_cuda {
+            StrictCheck {
+                check: "visible_devices",
+                status: "skip",
+                detail: "the config does not ask for CUDA, so no accelerator is required"
+                    .to_string(),
+            }
+        } else if cuda_devices > 0 {
+            StrictCheck {
+                check: "visible_devices",
+                status: "pass",
+                detail: format!("{cuda_devices} accelerator(s) visible to the probe"),
+            }
+        } else {
+            StrictCheck {
+                check: "visible_devices",
+                status: "fail",
+                detail: "the config asks for CUDA and a driver may be present, but the probe \
+                         sees no accelerator; in a container check that the runtime was given \
+                         the devices (docker --gpus, podman --device)"
+                    .to_string(),
+            }
+        });
+
+        // 3. CUDA compatibility. `runnable` already folds in compute
+        //    capability and FP8 refusals per configured entry.
+        let unrunnable: Vec<&ServeEntryReport> =
+            self.serve_entries.iter().filter(|e| !e.runnable).collect();
+        checks.push(if self.serve_entries.is_empty() {
+            StrictCheck {
+                check: "cuda_compatibility",
+                status: "skip",
+                detail: "the config declares no serve entries to resolve".to_string(),
+            }
+        } else if unrunnable.is_empty() {
+            StrictCheck {
+                check: "cuda_compatibility",
+                status: "pass",
+                detail: format!(
+                    "all {} configured serve entries resolve to an engine this host can run",
+                    self.serve_entries.len()
+                ),
+            }
+        } else {
+            StrictCheck {
+                check: "cuda_compatibility",
+                status: "fail",
+                detail: unrunnable
+                    .iter()
+                    .map(|e| {
+                        format!(
+                            "{}: {}",
+                            e.model,
+                            e.blocker.as_deref().unwrap_or("no viable engine")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            }
+        });
+
+        // 4. IPC / shared memory. Compared against the size the config
+        //    asked the container runtime for, not an invented floor.
+        checks.push(
+            match (demand.required_shm_bytes, self.shared_memory.total_bytes) {
+                (None, _) => StrictCheck {
+                    check: "shared_memory",
+                    status: "skip",
+                    detail:
+                        "no engine declares shm_size_gib, so there is no requested size to check"
+                            .to_string(),
+                },
+                (Some(required), None) => StrictCheck {
+                    check: "shared_memory",
+                    status: "fail",
+                    detail: format!(
+                        "the config asks for {:.1} GiB of shared memory but this host exposes no \
+                     readable /dev/shm to satisfy it",
+                        required as f64 / GIB
+                    ),
+                },
+                (Some(required), Some(total)) if total >= required => StrictCheck {
+                    check: "shared_memory",
+                    status: "pass",
+                    detail: format!(
+                        "/dev/shm is {:.1} GiB, at or above the {:.1} GiB the config asks for",
+                        total as f64 / GIB,
+                        required as f64 / GIB
+                    ),
+                },
+                (Some(required), Some(total)) => StrictCheck {
+                    check: "shared_memory",
+                    status: "fail",
+                    detail: format!(
+                        "/dev/shm is {:.1} GiB but the config asks for {:.1} GiB; a multiprocess \
+                     engine launch will fail allocating cross-process tensor handles",
+                        total as f64 / GIB,
+                        required as f64 / GIB
+                    ),
+                },
+            },
+        );
+
+        // 5. Cache mount. A mount that cannot hold the configured budget
+        //    is a disk-full failure mid-pull, which is worse than a
+        //    refusal at boot.
+        checks.push(match &self.cache_budget_check {
+            None => StrictCheck {
+                check: "cache_mount",
+                status: "skip",
+                detail: "no serve config was supplied, so there is no cache budget to check"
+                    .to_string(),
+            },
+            Some(check) if check.budget_gib.is_none() => StrictCheck {
+                check: "cache_mount",
+                status: "skip",
+                detail: "serve.cache_budget_gib is unset, so the weight cache is unbounded and \
+                         there is no budget to compare against the mount"
+                    .to_string(),
+            },
+            Some(check) if check.sufficient => StrictCheck {
+                check: "cache_mount",
+                status: "pass",
+                detail: format!(
+                    "{} has {} free for the {} GiB cache budget",
+                    self.model_cache_dir.display(),
+                    check
+                        .free_gib
+                        .map(|g| format!("{g:.1} GiB"))
+                        .unwrap_or_else(|| "an unreadable amount of space".to_string()),
+                    check.budget_gib.unwrap_or_default()
+                ),
+            },
+            Some(check) => StrictCheck {
+                check: "cache_mount",
+                status: "fail",
+                detail: format!(
+                    "{} has only {:.1} GiB free but serve.cache_budget_gib is {:.1} GiB; the \
+                     mount cannot hold the configured cache",
+                    self.model_cache_dir.display(),
+                    check.free_gib.unwrap_or_default(),
+                    check.budget_gib.unwrap_or_default()
+                ),
+            },
+        });
+
+        // 6. Model-plane identity. A worker that cannot present its
+        //    identity joins gossip and then refuses every dispatch, which
+        //    reads as a routing bug from the gateway side.
+        checks.push(strict_model_plane_check(plane));
+
+        checks
+    }
+
+    /// Process exit code for `doctor --strict`: `3` when any startup
+    /// check failed, otherwise [`exit_code`](Self::exit_code)'s verdict.
+    ///
+    /// `3` is distinct from `1` (a configured model has no viable engine)
+    /// and `2` (the config could not be read) so a bootstrap can tell a
+    /// hardware refusal from a config mistake without parsing output.
+    pub fn strict_exit_code(&self, checks: &[StrictCheck]) -> i32 {
+        if checks.iter().any(StrictCheck::failed) {
+            3
+        } else {
+            self.exit_code()
         }
     }
 
@@ -1290,6 +1636,92 @@ fn shared_memory_info() -> SharedMemoryInfo {
     }
 }
 
+/// What a `serve:` block demands of its host, read off the config.
+///
+/// vLLM and SGLang are counted as CUDA demands on their engine kind
+/// alone: neither has a non-NVIDIA backend sbproxy can launch, so a
+/// config naming them on a driverless box is asking for something that
+/// cannot happen, whatever `accel` says.
+fn serve_demand(serve: &ModelHostConfig) -> ServeDemand {
+    use sbproxy_model_host::{EngineAccel, EngineKind};
+    let mut demand = ServeDemand::default();
+    for (kind, provisioning) in &serve.engines {
+        let cuda_engine = matches!(kind, EngineKind::Vllm | EngineKind::SGLang);
+        let cuda_accel = provisioning
+            .acquire
+            .as_ref()
+            .is_some_and(|acquire| acquire.accel == EngineAccel::Cuda);
+        if cuda_engine || cuda_accel {
+            demand.requires_cuda = true;
+            demand
+                .cuda_engines
+                .push(format!("engines.{kind:?}").to_lowercase());
+        }
+        if let Some(gib) = provisioning.shm_size_gib {
+            let bytes = gib.saturating_mul(1024 * 1024 * 1024);
+            demand.required_shm_bytes = Some(demand.required_shm_bytes.unwrap_or(0).max(bytes));
+        }
+    }
+    demand
+}
+
+/// Evaluate the model-plane identity a node was told to present.
+///
+/// Absent input is a `skip`, not a pass: a config with no cluster block
+/// has no model plane to join, and reporting that honestly is what lets
+/// a certification lane tell a single-box run from a fleet run.
+fn strict_model_plane_check(plane: Option<&ModelPlaneIdentity>) -> StrictCheck {
+    let Some(plane) = plane else {
+        return StrictCheck {
+            check: "model_plane_identity",
+            status: "skip",
+            detail: "the config declares no proxy.cluster block, so this node joins no model plane"
+                .to_string(),
+        };
+    };
+    let mut problems = Vec::new();
+    for key in &plane.missing_keys {
+        problems.push(format!(
+            "proxy.cluster.security.{key} is unset but mTLS requires it"
+        ));
+    }
+    for (key, path) in &plane.files {
+        match std::fs::File::open(path) {
+            Ok(_) => {}
+            Err(error) => problems.push(format!(
+                "proxy.cluster.security.{key} names '{}' which is not readable: {error}",
+                path.display()
+            )),
+        }
+    }
+    if plane.shared_key_present == Some(false) {
+        problems.push(
+            "proxy.cluster.security.mode is shared_key but no shared_key resolved".to_string(),
+        );
+    }
+    if !problems.is_empty() {
+        return StrictCheck {
+            check: "model_plane_identity",
+            status: "fail",
+            detail: problems.join("; "),
+        };
+    }
+    let mode = if plane.mtls { "mTLS" } else { "shared-key" };
+    let role = if plane.worker_role {
+        "worker"
+    } else {
+        "non-worker"
+    };
+    StrictCheck {
+        check: "model_plane_identity",
+        status: "pass",
+        detail: format!(
+            "{role} node presents complete {mode} identity material ({} file(s) readable)",
+            plane.files.len()
+        ),
+    }
+}
+
 /// Whether the weight-cache mount has enough free space for
 /// `serve.cache_budget_gib`. An unset budget and an unreadable
 /// free-space probe both report `sufficient: true`: neither is
@@ -1330,6 +1762,299 @@ mod tests {
             assert!(json.get(key).is_some(), "missing key {key}");
         }
         let _ = report.render_text();
+    }
+
+    /// Look one named check up out of a strict run, so a test asserts on
+    /// the check it is about and fails loudly if the id ever moves.
+    fn strict_check<'a>(checks: &'a [StrictCheck], name: &str) -> &'a StrictCheck {
+        checks
+            .iter()
+            .find(|check| check.check == name)
+            .unwrap_or_else(|| panic!("no strict check named {name}"))
+    }
+
+    /// A `serve:` block with one engine, for the demand-extraction tests.
+    fn serve_with_engine(
+        kind: sbproxy_model_host::EngineKind,
+        provisioning: sbproxy_model_host::EngineProvisioning,
+    ) -> ModelHostConfig {
+        let mut serve = ModelHostConfig::default();
+        serve.engines.insert(kind, provisioning);
+        serve
+    }
+
+    #[test]
+    fn strict_without_a_serve_config_skips_every_check_and_exits_zero() {
+        // A gateway-only node has nothing local to validate. Every check
+        // must say so explicitly rather than reporting a hollow pass.
+        let report = DoctorReport::collect();
+        let checks = report.strict_checks(None);
+        assert_eq!(checks.len(), 6, "every check reports, none are dropped");
+        for check in &checks {
+            assert_eq!(
+                check.status, "skip",
+                "check {} should skip with no config, got {}: {}",
+                check.check, check.status, check.detail
+            );
+        }
+        assert_eq!(report.strict_exit_code(&checks), 0);
+    }
+
+    #[test]
+    fn strict_fails_when_cuda_is_configured_without_a_driver() {
+        let mut report = DoctorReport::collect();
+        report.serve_demand = ServeDemand {
+            requires_cuda: true,
+            cuda_engines: vec!["engines.vllm".to_string()],
+            required_shm_bytes: None,
+        };
+        report.drivers.nvidia_driver = None;
+        report.gpus = Vec::new();
+
+        let checks = report.strict_checks(None);
+        let driver = strict_check(&checks, "driver");
+        assert_eq!(driver.status, "fail", "{}", driver.detail);
+        assert!(
+            driver.detail.contains("engines.vllm"),
+            "the failure names the offending engine: {}",
+            driver.detail
+        );
+        assert_eq!(report.strict_exit_code(&checks), 3);
+    }
+
+    #[test]
+    fn strict_fails_when_a_driver_is_present_but_no_device_is_visible() {
+        // The `docker run` without `--gpus` case: the driver answers and
+        // the probe still sees nothing.
+        let mut report = DoctorReport::collect();
+        report.serve_demand = ServeDemand {
+            requires_cuda: true,
+            cuda_engines: vec!["engines.vllm".to_string()],
+            required_shm_bytes: None,
+        };
+        report.drivers.nvidia_driver = Some("550.54.15".to_string());
+        report.gpus = Vec::new();
+
+        let checks = report.strict_checks(None);
+        assert_eq!(strict_check(&checks, "driver").status, "pass");
+        let devices = strict_check(&checks, "visible_devices");
+        assert_eq!(devices.status, "fail", "{}", devices.detail);
+        assert!(
+            devices.detail.contains("--gpus"),
+            "the failure names the fix: {}",
+            devices.detail
+        );
+    }
+
+    #[test]
+    fn strict_passes_visible_devices_on_a_real_nvidia_descriptor() {
+        let mut report = DoctorReport::collect();
+        report.serve_demand = ServeDemand {
+            requires_cuda: true,
+            cuda_engines: vec!["engines.vllm".to_string()],
+            required_shm_bytes: None,
+        };
+        report.drivers.nvidia_driver = Some("550.54.15".to_string());
+        report.gpus = vec![sbproxy_model_host::GpuDescriptor::t4()];
+
+        let checks = report.strict_checks(None);
+        assert_eq!(strict_check(&checks, "visible_devices").status, "pass");
+    }
+
+    #[test]
+    fn strict_fails_when_dev_shm_is_smaller_than_the_engine_asked_for() {
+        let mut report = DoctorReport::collect();
+        report.serve_demand = ServeDemand {
+            requires_cuda: false,
+            cuda_engines: Vec::new(),
+            required_shm_bytes: Some(8 * 1024 * 1024 * 1024),
+        };
+        report.shared_memory = SharedMemoryInfo {
+            path: Some(PathBuf::from("/dev/shm")),
+            total_bytes: Some(64 * 1024 * 1024),
+            available_bytes: Some(64 * 1024 * 1024),
+        };
+
+        let checks = report.strict_checks(None);
+        let shm = strict_check(&checks, "shared_memory");
+        assert_eq!(shm.status, "fail", "{}", shm.detail);
+        assert!(
+            shm.detail.contains("8.0 GiB"),
+            "the failure names the requested size: {}",
+            shm.detail
+        );
+
+        // The same host with a large enough tmpfs passes.
+        report.shared_memory.total_bytes = Some(16 * 1024 * 1024 * 1024);
+        let checks = report.strict_checks(None);
+        assert_eq!(strict_check(&checks, "shared_memory").status, "pass");
+    }
+
+    #[test]
+    fn strict_fails_when_the_cache_mount_cannot_hold_the_budget() {
+        let mut report = DoctorReport::collect();
+        report.cache_budget_check = Some(CacheBudgetCheck {
+            budget_gib: Some(200.0),
+            free_gib: Some(12.5),
+            sufficient: false,
+        });
+
+        let checks = report.strict_checks(None);
+        let mount = strict_check(&checks, "cache_mount");
+        assert_eq!(mount.status, "fail", "{}", mount.detail);
+        assert!(
+            mount.detail.contains("12.5") && mount.detail.contains("200.0"),
+            "the failure names both sides of the comparison: {}",
+            mount.detail
+        );
+    }
+
+    #[test]
+    fn strict_skips_the_cache_mount_when_the_budget_is_unset() {
+        // An unbounded cache is a deliberate choice, not a blocker.
+        let mut report = DoctorReport::collect();
+        report.cache_budget_check = Some(CacheBudgetCheck {
+            budget_gib: None,
+            free_gib: Some(12.5),
+            sufficient: true,
+        });
+        let checks = report.strict_checks(None);
+        assert_eq!(strict_check(&checks, "cache_mount").status, "skip");
+    }
+
+    #[test]
+    fn strict_fails_when_mtls_identity_material_is_missing_or_unreadable() {
+        let report = DoctorReport::collect();
+
+        // Config named no files at all under mTLS.
+        let unset = ModelPlaneIdentity {
+            worker_role: true,
+            mtls: true,
+            files: Vec::new(),
+            missing_keys: vec!["cert_file", "key_file", "ca_file"],
+            shared_key_present: None,
+        };
+        let checks = report.strict_checks(Some(&unset));
+        let plane = strict_check(&checks, "model_plane_identity");
+        assert_eq!(plane.status, "fail", "{}", plane.detail);
+        assert!(plane.detail.contains("cert_file"), "{}", plane.detail);
+        assert_eq!(report.strict_exit_code(&checks), 3);
+
+        // Config named a file that is not on disk.
+        let absent = ModelPlaneIdentity {
+            worker_role: true,
+            mtls: true,
+            files: vec![("cert_file", PathBuf::from("/nonexistent/worker.crt"))],
+            missing_keys: Vec::new(),
+            shared_key_present: None,
+        };
+        let checks = report.strict_checks(Some(&absent));
+        let plane = strict_check(&checks, "model_plane_identity");
+        assert_eq!(plane.status, "fail", "{}", plane.detail);
+        assert!(
+            plane.detail.contains("worker.crt"),
+            "the failure names the unreadable path: {}",
+            plane.detail
+        );
+    }
+
+    #[test]
+    fn strict_passes_model_plane_identity_when_every_named_file_is_readable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = dir.path().join("worker.crt");
+        let key = dir.path().join("worker.key");
+        std::fs::write(&cert, b"pem").expect("write cert");
+        std::fs::write(&key, b"pem").expect("write key");
+
+        let report = DoctorReport::collect();
+        let plane = ModelPlaneIdentity {
+            worker_role: true,
+            mtls: true,
+            files: vec![("cert_file", cert), ("key_file", key)],
+            missing_keys: Vec::new(),
+            shared_key_present: None,
+        };
+        let checks = report.strict_checks(Some(&plane));
+        let check = strict_check(&checks, "model_plane_identity");
+        assert_eq!(check.status, "pass", "{}", check.detail);
+        assert!(check.detail.contains("worker"), "{}", check.detail);
+        assert_eq!(report.strict_exit_code(&checks), 0);
+    }
+
+    #[test]
+    fn strict_fails_shared_key_mode_with_no_resolved_secret() {
+        let report = DoctorReport::collect();
+        let plane = ModelPlaneIdentity {
+            worker_role: true,
+            mtls: false,
+            files: Vec::new(),
+            missing_keys: Vec::new(),
+            shared_key_present: Some(false),
+        };
+        let checks = report.strict_checks(Some(&plane));
+        let check = strict_check(&checks, "model_plane_identity");
+        assert_eq!(check.status, "fail", "{}", check.detail);
+        assert!(check.detail.contains("shared_key"), "{}", check.detail);
+    }
+
+    #[test]
+    fn serve_demand_treats_vllm_and_sglang_as_cuda_demands() {
+        use sbproxy_model_host::{EngineKind, EngineProvisioning};
+        for kind in [EngineKind::Vllm, EngineKind::SGLang] {
+            let serve = serve_with_engine(kind, EngineProvisioning::default());
+            let demand = serve_demand(&serve);
+            assert!(
+                demand.requires_cuda,
+                "{kind:?} has no non-NVIDIA backend sbproxy can launch"
+            );
+            assert_eq!(demand.cuda_engines.len(), 1);
+        }
+    }
+
+    #[test]
+    fn serve_demand_reads_cuda_acceleration_off_a_llama_cpp_acquire_block() {
+        use sbproxy_model_host::{EngineAccel, EngineAcquire, EngineKind, EngineProvisioning};
+        // llama.cpp is portable, so only an explicit `accel: cuda` makes
+        // it a CUDA demand.
+        let portable = serve_with_engine(EngineKind::LlamaCpp, EngineProvisioning::default());
+        assert!(!serve_demand(&portable).requires_cuda);
+
+        let pinned = serve_with_engine(
+            EngineKind::LlamaCpp,
+            EngineProvisioning {
+                acquire: Some(EngineAcquire {
+                    accel: EngineAccel::Cuda,
+                    ..EngineAcquire::default()
+                }),
+                ..EngineProvisioning::default()
+            },
+        );
+        assert!(serve_demand(&pinned).requires_cuda);
+    }
+
+    #[test]
+    fn serve_demand_takes_the_largest_requested_shm_size() {
+        use sbproxy_model_host::{EngineKind, EngineProvisioning};
+        let mut serve = ModelHostConfig::default();
+        serve.engines.insert(
+            EngineKind::Vllm,
+            EngineProvisioning {
+                shm_size_gib: Some(4),
+                ..EngineProvisioning::default()
+            },
+        );
+        serve.engines.insert(
+            EngineKind::SGLang,
+            EngineProvisioning {
+                shm_size_gib: Some(16),
+                ..EngineProvisioning::default()
+            },
+        );
+        assert_eq!(
+            serve_demand(&serve).required_shm_bytes,
+            Some(16 * 1024 * 1024 * 1024),
+            "the gate has to satisfy the hungriest engine, not the first one"
+        );
     }
 
     #[test]

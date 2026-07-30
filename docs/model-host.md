@@ -808,7 +808,7 @@ Host-wide settings sit on the `serve:` block itself.
 |---|---|
 | `catalog_file` | Operator catalog file that replaces the built-in certified catalog. |
 | `cache_dir` | Directory for the content-addressed weight cache. |
-| `cache_budget_gib` | Disk budget in GiB for the weight cache before garbage collection. |
+| `cache_budget_gib` | Size at which the weight cache starts evicting, in GiB. It is a garbage-collection threshold, not a limit the OS enforces: the cache can exceed it transiently, and a single artifact larger than the budget still downloads. Size the mount for the weights you intend to hold, and let this decide when old ones go. `sbproxy doctor` compares it against free space on the cache mount, and `sbproxy doctor --strict` refuses to boot a worker whose mount cannot hold it. |
 | `eviction` | VRAM-pressure policy: `lru` (default) or `never`. |
 | `engines` | Per-engine provisioning map (`launch`, `image`, `acquire`, `shm_size_gib`). |
 | `max_concurrent_requests` | Cap on concurrently dispatched served-lane requests. |

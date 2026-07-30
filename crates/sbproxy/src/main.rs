@@ -1177,6 +1177,15 @@ struct DoctorArgs {
     /// emits a single structured object for tooling.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+    /// Run the managed-worker startup gate and exit 3 if any check
+    /// fails. Checks driver presence, visible accelerators, per-entry
+    /// CUDA compatibility, the shared memory an engine asked for, the
+    /// weight-cache mount against `serve.cache_budget_gib`, and
+    /// model-plane identity material. Intended for a VM bootstrap or a
+    /// container entrypoint that should refuse to come up rather than
+    /// fail at the first customer request.
+    #[arg(long = "strict")]
+    strict: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -2311,6 +2320,7 @@ fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
         .clone()
         .or_else(|| std::env::var_os("SB_CONFIG_FILE").map(PathBuf::from));
     let mut exit = 0;
+    let mut plane = None;
     if let Some(path) = config_path {
         match std::fs::read_to_string(&path) {
             Ok(yaml) => {
@@ -2326,11 +2336,29 @@ fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
                         exit = 2;
                     }
                 }
+                plane = extract_model_plane_identity(&yaml, config_dir);
+                // The canonical `proxy.model_host` form, which the inline
+                // `serve:` extraction above does not see.
+                if let Some((demand, budget)) = extract_control_plane_demand(&yaml) {
+                    report = report.with_control_plane_demand(demand, budget);
+                }
             }
             Err(e) => {
                 eprintln!("doctor: could not read config '{}': {e}", path.display());
             }
         }
+    }
+    // The strict gate is evaluated (and reported) whenever asked for,
+    // even with no config: "nothing was configured to check" is itself
+    // the answer a bootstrap needs, and every check reports `skip`
+    // rather than a misleading pass.
+    let strict_checks = if args.strict {
+        report.strict_checks(plane.as_ref())
+    } else {
+        Vec::new()
+    };
+    if args.strict {
+        exit = report.strict_exit_code(&strict_checks);
     }
     // WOR-1863: weights other local tools already cached (Ollama, LM
     // Studio, the HF hub), discovered read-only and summarized per
@@ -2341,6 +2369,9 @@ fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
             let mut text = report.render_text();
             insert_after_model_cache_block(&mut text, &render_foreign_caches_text(&foreign));
             print!("{text}");
+            if args.strict {
+                print!("{}", render_strict_checks_text(&strict_checks));
+            }
         }
         OutputFormat::Json => {
             // `DoctorReport` lives in sbproxy-core; attach the foreign
@@ -2352,11 +2383,153 @@ fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
                     "foreign_model_caches".to_string(),
                     serde_json::to_value(&foreign)?,
                 );
+                if args.strict {
+                    object.insert(
+                        "strict_checks".to_string(),
+                        serde_json::to_value(&strict_checks)?,
+                    );
+                }
             }
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
     }
     Ok(exit)
+}
+
+/// Render the `startup gate` block `doctor --strict` appends, one line
+/// per named check, in the same two-space style as the rest of the
+/// report. The trailing verdict line is what an operator reads first.
+fn render_strict_checks_text(checks: &[sbproxy_core::doctor::StrictCheck]) -> String {
+    let mut out = String::from("\nstartup gate\n");
+    for check in checks {
+        out.push_str(&format!(
+            "  {:<22} {:<5} {}\n",
+            check.check, check.status, check.detail
+        ));
+    }
+    let failed = checks.iter().filter(|c| c.failed()).count();
+    out.push_str(&match failed {
+        0 => "  verdict: pass (no startup blocker on this host)\n".to_string(),
+        1 => "  verdict: FAIL (1 startup blocker)\n".to_string(),
+        n => format!("  verdict: FAIL ({n} startup blockers)\n"),
+    });
+    out
+}
+
+/// Read what the canonical `proxy.model_host` block demands of the host,
+/// for the strict gate.
+///
+/// `extract_serve_and_catalog` only sees the inline provider-level
+/// `serve:` form. `proxy.model_host` is the form the examples and the
+/// self-host docs lead with, so a gate blind to it would report six
+/// `skip`s for a worker config that cannot run here. Parses only the
+/// engine and cache policy, and tolerates a config it cannot fully
+/// understand: an unparseable block yields no demand rather than a
+/// spurious blocker.
+fn extract_control_plane_demand(
+    yaml: &str,
+) -> Option<(sbproxy_core::doctor::ServeDemand, Option<f64>)> {
+    use sbproxy_config::model_host::{
+        ManagedEngineAcceleration, ManagedEngineKind, ModelHostControlConfig,
+    };
+
+    let root: serde_yaml::Value = serde_yaml::from_str(yaml).ok()?;
+    let block = root.get("proxy")?.get("model_host")?;
+    let control: ModelHostControlConfig = serde_yaml::from_value(block.clone()).ok()?;
+
+    let mut demand = sbproxy_core::doctor::ServeDemand::default();
+    for (kind, engine) in &control.engines {
+        // vLLM and SGLang have no non-NVIDIA backend sbproxy can launch,
+        // so naming either is a CUDA demand whatever `acceleration` says.
+        let cuda_engine = matches!(kind, ManagedEngineKind::Vllm | ManagedEngineKind::SGLang);
+        let cuda_accel = engine.acceleration == ManagedEngineAcceleration::Cuda;
+        if cuda_engine || cuda_accel {
+            demand.requires_cuda = true;
+            demand
+                .cuda_engines
+                .push(format!("proxy.model_host.engines.{kind:?}").to_lowercase());
+        }
+        if let Some(gib) = engine.shm_size_gib {
+            let bytes = gib.saturating_mul(1024 * 1024 * 1024);
+            demand.required_shm_bytes = Some(demand.required_shm_bytes.unwrap_or(0).max(bytes));
+        }
+    }
+    Some((demand, control.cache.budget_gib))
+}
+
+/// Read the model-plane identity material `proxy.cluster` names, for the
+/// strict gate's `model_plane_identity` check.
+///
+/// Parses the same YAML the proxy boots from, but only the security
+/// block: this is deliberately not `compile_config`, because a bootstrap
+/// wants the identity verdict even for a config whose origins reference
+/// a secret backend that is not reachable yet. Relative paths resolve
+/// against the config's own directory, matching how the proxy loads them.
+/// `None` means no cluster block, which the check reports as `skip`.
+fn extract_model_plane_identity(
+    yaml: &str,
+    config_dir: &std::path::Path,
+) -> Option<sbproxy_core::doctor::ModelPlaneIdentity> {
+    let root: serde_yaml::Value = serde_yaml::from_str(yaml).ok()?;
+    let cluster = root.get("proxy")?.get("cluster")?;
+    let security = cluster.get("security");
+    let mode = security
+        .and_then(|s| s.get("mode"))
+        .and_then(serde_yaml::Value::as_str)
+        .unwrap_or("shared_key");
+    let mtls = mode == "mtls";
+    let worker_role = cluster
+        .get("roles")
+        .and_then(serde_yaml::Value::as_sequence)
+        .is_some_and(|roles| {
+            roles
+                .iter()
+                .filter_map(serde_yaml::Value::as_str)
+                .any(|role| role == "worker")
+        });
+
+    let resolve = |value: &str| -> PathBuf {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            path
+        } else {
+            config_dir.join(path)
+        }
+    };
+    let read = |key: &str| -> Option<String> {
+        security?
+            .get(key)
+            .and_then(serde_yaml::Value::as_str)
+            .map(str::to_string)
+    };
+
+    let mut files = Vec::new();
+    let mut missing_keys = Vec::new();
+    for key in ["cert_file", "key_file", "ca_file"] {
+        match read(key) {
+            Some(value) => files.push((key, resolve(&value))),
+            // Only mTLS makes the three files mandatory; shared-key mode
+            // legitimately omits all of them.
+            None if mtls => missing_keys.push(key),
+            None => {}
+        }
+    }
+    // Interpolated references (`env:`, `file:`, a vault URI) are resolved
+    // by the secret layer at boot, not here, so treat a non-literal
+    // shared key as present and let the boot path own that failure.
+    let shared_key_present = if mtls {
+        None
+    } else {
+        Some(read("shared_key").is_some_and(|value| !value.trim().is_empty()))
+    };
+
+    Some(sbproxy_core::doctor::ModelPlaneIdentity {
+        worker_role,
+        mtls,
+        files,
+        missing_keys,
+        shared_key_present,
+    })
 }
 
 /// Per-source rollup of the read-only foreign model-cache scan
@@ -2945,6 +3118,33 @@ fn write_private_run_config(path: &std::path::Path, yaml: &[u8]) -> anyhow::Resu
 /// second one, mirroring how `sbproxy run` serves one model at a time.
 const SERVICE_LABEL: &str = "dev.sbproxy.agent";
 
+/// Seconds launchd waits for the agent to exit after SIGTERM before it
+/// escalates to SIGKILL.
+///
+/// launchd's default is 20 seconds, which is shorter than the proxy's own
+/// 30-second default shutdown grace (`SBPROXY_SHUTDOWN_GRACE_MS`). An
+/// agent still draining in-flight requests at 20 seconds would be
+/// SIGKILLed part-way through, skipping every Rust destructor on the
+/// shutdown path. 45 leaves the full drain room to finish; raise it
+/// alongside any increase to the default grace.
+///
+/// This is hardening, not a fix for the engine-orphan defect the Mac
+/// certification lane found: an agent with no in-flight requests exits
+/// in about two seconds, well inside even launchd's default, and the
+/// managed engine is orphaned anyway. See the "known gap" note on the
+/// Apple Silicon lane in `docs/model-host-certification.md`.
+const SERVICE_EXIT_TIMEOUT_SECS: u32 = 45;
+
+/// The proxy's default shutdown grace in seconds, which
+/// [`SERVICE_EXIT_TIMEOUT_SECS`] has to exceed. Kept next to it so the
+/// relationship is checked at compile time rather than in a test that
+/// someone has to remember to run.
+const DEFAULT_SHUTDOWN_GRACE_SECS: u32 = 30;
+const _: () = assert!(
+    SERVICE_EXIT_TIMEOUT_SECS > DEFAULT_SHUTDOWN_GRACE_SECS,
+    "launchd would SIGKILL the agent before its shutdown drain could finish"
+);
+
 /// Filesystem locations the `service` subcommands read and write,
 /// resolved from `$HOME` once so every handler agrees on the same
 /// paths. The config lives under Application Support: unlike
@@ -2957,20 +3157,67 @@ struct ServicePaths {
     plist: PathBuf,
     stdout_log: PathBuf,
     stderr_log: PathBuf,
+    env_file: PathBuf,
 }
 
 fn service_paths() -> anyhow::Result<ServicePaths> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("$HOME is not set"))?;
+    let service_dir = home.join("Library/Application Support/sbproxy/service");
     Ok(ServicePaths {
-        config: home.join("Library/Application Support/sbproxy/service/sb.yml"),
+        config: service_dir.join("sb.yml"),
         plist: home
             .join("Library/LaunchAgents")
             .join(format!("{SERVICE_LABEL}.plist")),
         stdout_log: home.join("Library/Logs/sbproxy/service.log"),
         stderr_log: home.join("Library/Logs/sbproxy/service.err.log"),
+        env_file: service_dir.join("env"),
     })
+}
+
+/// Header written into a freshly created service environment file.
+///
+/// A launchd agent inherits almost nothing from the shell that installed
+/// it, so a `HF_TOKEN` exported in a terminal is invisible to the agent
+/// and a gated model fails to pull with no obvious cause. This file is
+/// where those values live. It is created once and never rewritten, so
+/// reinstalling to change model or port does not discard the operator's
+/// token.
+const SERVICE_ENV_TEMPLATE: &str = "\
+# sbproxy launchd agent environment.
+#
+# Sourced before the agent starts, so anything set here is visible to
+# the served process. One KEY=value per line; no shell expansion, no
+# quotes needed. `sbproxy service install` creates this file once and
+# never overwrites it, so a token set here survives a reinstall.
+#
+# HF_TOKEN=hf_...        # required to pull a gated model
+# RUST_LOG=info          # raise or lower the agent's log level
+";
+
+/// Create the environment file if it is absent, leaving an existing one
+/// untouched. Mode 0600: it is the documented home for a Hugging Face
+/// token.
+fn ensure_service_env_file(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    if path.exists() {
+        return Ok(());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("create '{}': {error}", path.display()))?;
+    file.write_all(SERVICE_ENV_TEMPLATE.as_bytes())
+        .map_err(|error| anyhow::anyhow!("write '{}': {error}", path.display()))?;
+    Ok(())
 }
 
 /// Escape the five XML predefined entities. Every value interpolated
@@ -2986,10 +3233,32 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Wrap a path in single quotes for a POSIX shell, escaping any single
+/// quote it contains the standard way (`'\''`).
+///
+/// The plist below interpolates paths into a `/bin/sh -c` string, and
+/// [`xml_escape`] turns `'` into `&apos;`, which the plist parser hands
+/// back to the shell as a literal `'`. Without this the shell quoting in
+/// a home directory containing an apostrophe would break, so quote for
+/// the shell first and let XML escaping wrap the result.
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
 /// Render the launchd property list that runs `binary serve <config>`
 /// at load and restarts it if it exits. Pure string building: no
 /// filesystem or `launchctl` access, so it is covered by a plain unit
 /// test.
+///
+/// The program is `/bin/sh -c '... exec sbproxy serve config'` rather
+/// than the binary directly, because launchd has no way to source an
+/// environment file and a launchd agent inherits nothing from the shell
+/// that installed it: without this, an `HF_TOKEN` the operator exported
+/// in a terminal is invisible to the agent and a gated model fails to
+/// pull for no visible reason. The `exec` matters. It replaces the shell
+/// with the proxy, so the pid launchd supervises is the proxy's, and
+/// `KeepAlive` restarts plus signal delivery behave exactly as they did
+/// when the binary was the program.
 fn render_service_plist(binary: &std::path::Path, paths: &ServicePaths) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -3000,14 +3269,16 @@ fn render_service_plist(binary: &std::path::Path, paths: &ServicePaths) -> Strin
 	<string>{label}</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>{binary}</string>
-		<string>serve</string>
-		<string>{config}</string>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>set -a; [ -f {env_file} ] &amp;&amp; . {env_file}; set +a; exec {binary} serve {config}</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
+	<key>ExitTimeOut</key>
+	<integer>{exit_timeout}</integer>
 	<key>StandardOutPath</key>
 	<string>{stdout}</string>
 	<key>StandardErrorPath</key>
@@ -3016,10 +3287,15 @@ fn render_service_plist(binary: &std::path::Path, paths: &ServicePaths) -> Strin
 </plist>
 "#,
         label = SERVICE_LABEL,
-        binary = xml_escape(&binary.to_string_lossy()),
-        config = xml_escape(&paths.config.to_string_lossy()),
+        exit_timeout = SERVICE_EXIT_TIMEOUT_SECS,
+        // The three shell-interpolated paths are quoted for the shell
+        // first, then XML-escaped; the two log paths are plain plist
+        // strings and only need XML escaping.
+        binary = xml_escape(&shell_single_quote(&binary.to_string_lossy())),
+        config = xml_escape(&shell_single_quote(&paths.config.to_string_lossy())),
         stdout = xml_escape(&paths.stdout_log.to_string_lossy()),
         stderr = xml_escape(&paths.stderr_log.to_string_lossy()),
+        env_file = xml_escape(&shell_single_quote(&paths.env_file.to_string_lossy())),
     )
 }
 
@@ -3091,6 +3367,10 @@ fn handle_service_install(args: &ServiceInstallArgs) -> anyhow::Result<i32> {
     }
     prepared.yaml.zeroize();
 
+    // Created once, never rewritten: reinstalling to change the model or
+    // the port must not throw away a token the operator put here.
+    ensure_service_env_file(&paths.env_file)?;
+
     let binary = std::env::current_exe()
         .map_err(|error| anyhow::anyhow!("resolve current executable: {error}"))?;
     let plist = render_service_plist(&binary, &paths);
@@ -3122,12 +3402,13 @@ fn handle_service_install(args: &ServiceInstallArgs) -> anyhow::Result<i32> {
 
     match args.format {
         OutputFormat::Text => println!(
-            "Installed {} as launchd agent '{}'.\nConfig: {}\nPlist:  {}\nLogs:   {}\n",
+            "Installed {} as launchd agent '{}'.\nConfig: {}\nPlist:  {}\nLogs:   {}\nEnv:    {}\n",
             prepared.name,
             SERVICE_LABEL,
             paths.config.display(),
             paths.plist.display(),
             paths.stdout_log.display(),
+            paths.env_file.display(),
         ),
         OutputFormat::Json => println!(
             "{}",
@@ -3140,6 +3421,7 @@ fn handle_service_install(args: &ServiceInstallArgs) -> anyhow::Result<i32> {
                     "plist_path": paths.plist.to_string_lossy(),
                     "stdout_log": paths.stdout_log.to_string_lossy(),
                     "stderr_log": paths.stderr_log.to_string_lossy(),
+                    "env_file": paths.env_file.to_string_lossy(),
                 }),
             ))?
         ),
@@ -3208,15 +3490,32 @@ fn handle_service_status(args: &ServiceStatusArgs) -> anyhow::Result<i32> {
         None
     };
     let running = pid.is_some();
+    // Report the paths a running agent is actually using, so recovering
+    // an agent installed months ago does not start with a hunt for its
+    // logs or its token file.
+    let paths = service_paths()?;
 
     match args.format {
         OutputFormat::Text => {
             if !registered {
                 println!("{SERVICE_LABEL}: not installed");
-            } else if let Some(pid) = pid {
-                println!("{SERVICE_LABEL}: running (pid {pid})");
             } else {
-                println!("{SERVICE_LABEL}: registered, not running");
+                if let Some(pid) = pid {
+                    println!("{SERVICE_LABEL}: running (pid {pid})");
+                } else {
+                    println!("{SERVICE_LABEL}: registered, not running");
+                }
+                println!("Config: {}", paths.config.display());
+                println!("Logs:   {}", paths.stdout_log.display());
+                println!(
+                    "Env:    {}{}",
+                    paths.env_file.display(),
+                    if paths.env_file.exists() {
+                        ""
+                    } else {
+                        " (absent)"
+                    }
+                );
             }
         }
         OutputFormat::Json => println!(
@@ -3228,6 +3527,11 @@ fn handle_service_status(args: &ServiceStatusArgs) -> anyhow::Result<i32> {
                     "registered": registered,
                     "running": running,
                     "pid": pid,
+                    "config_path": paths.config.to_string_lossy(),
+                    "stdout_log": paths.stdout_log.to_string_lossy(),
+                    "stderr_log": paths.stderr_log.to_string_lossy(),
+                    "env_file": paths.env_file.to_string_lossy(),
+                    "env_file_present": paths.env_file.exists(),
                 }),
             ))?
         ),
@@ -8372,6 +8676,117 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_demand_reads_the_canonical_model_host_block() {
+        // Regression: the strict gate originally only saw the inline
+        // provider-level `serve:` form, so a `proxy.model_host` worker
+        // config reported six skips and a pass on a host with no GPU.
+        let config = "proxy:\n  model_host:\n    cache:\n      budget_gib: 40\n    engines:\n      vllm:\n        launch: container\n        image: vllm/vllm-openai:v0.10.0\n        shm_size_gib: 8\n";
+        let (demand, budget) =
+            extract_control_plane_demand(config).expect("proxy.model_host parses");
+
+        assert!(demand.requires_cuda, "a vLLM engine is a CUDA demand");
+        assert_eq!(demand.cuda_engines, vec!["proxy.model_host.engines.vllm"]);
+        assert_eq!(demand.required_shm_bytes, Some(8 * 1024 * 1024 * 1024));
+        assert_eq!(budget, Some(40.0));
+    }
+
+    #[test]
+    fn control_plane_demand_is_absent_without_the_block() {
+        let config = "origins:\n  api.local:\n    upstream: https://test.sbproxy.dev\n";
+        assert!(extract_control_plane_demand(config).is_none());
+    }
+
+    #[test]
+    fn control_plane_demand_treats_portable_llama_cpp_as_no_cuda_demand() {
+        // llama.cpp runs on Metal and CPU, so only an explicit
+        // `acceleration: cuda` makes it a CUDA demand.
+        let portable = "proxy:\n  model_host:\n    engines:\n      llama_cpp:\n        launch: binary\n        version: b9905\n        acceleration: auto\n";
+        let (demand, _) = extract_control_plane_demand(portable).expect("parses");
+        assert!(
+            !demand.requires_cuda,
+            "auto acceleration is not a CUDA demand"
+        );
+
+        let pinned = "proxy:\n  model_host:\n    engines:\n      llama_cpp:\n        launch: binary\n        acceleration: cuda\n";
+        let (demand, _) = extract_control_plane_demand(pinned).expect("parses");
+        assert!(demand.requires_cuda);
+    }
+
+    #[test]
+    fn model_plane_identity_is_absent_without_a_cluster_block() {
+        // A single-box config has no model plane, and the strict gate has
+        // to be able to report that rather than inventing a failure.
+        let config =
+            "origins:\n  ai.local:\n    action:\n      providers:\n        - name: local\n";
+        assert!(
+            extract_model_plane_identity(config, std::path::Path::new(".")).is_none(),
+            "no proxy.cluster block means no model-plane identity to check"
+        );
+    }
+
+    #[test]
+    fn model_plane_identity_lists_mtls_files_and_missing_keys() {
+        let config = "proxy:\n  cluster:\n    cluster_id: fleet\n    roles: [worker]\n    security:\n      mode: mtls\n      cert_file: tls/worker.crt\n      key_file: /abs/worker.key\n";
+        let plane = extract_model_plane_identity(config, std::path::Path::new("/etc/sbproxy"))
+            .expect("cluster block parses");
+
+        assert!(plane.worker_role, "roles: [worker] is the worker role");
+        assert!(plane.mtls);
+        // A relative path resolves against the config's own directory,
+        // matching how the proxy loads it.
+        assert_eq!(
+            plane.files[0].1,
+            std::path::Path::new("/etc/sbproxy/tls/worker.crt")
+        );
+        // An absolute path is left alone.
+        assert_eq!(plane.files[1].1, std::path::Path::new("/abs/worker.key"));
+        // mTLS makes the unset CA a violation, not a shrug.
+        assert_eq!(plane.missing_keys, vec!["ca_file"]);
+        assert_eq!(plane.shared_key_present, None);
+    }
+
+    #[test]
+    fn model_plane_identity_flags_shared_key_mode_with_no_key() {
+        let missing = "proxy:\n  cluster:\n    cluster_id: fleet\n    roles: [gateway]\n    security:\n      mode: shared_key\n";
+        let plane = extract_model_plane_identity(missing, std::path::Path::new("."))
+            .expect("cluster block parses");
+        assert!(!plane.worker_role);
+        assert!(!plane.mtls);
+        assert_eq!(plane.shared_key_present, Some(false));
+        // Shared-key mode does not owe the three mTLS files.
+        assert!(plane.missing_keys.is_empty());
+
+        let present = "proxy:\n  cluster:\n    cluster_id: fleet\n    security:\n      mode: shared_key\n      shared_key: env:SB_MESH_KEY\n";
+        let plane = extract_model_plane_identity(present, std::path::Path::new("."))
+            .expect("cluster block parses");
+        assert_eq!(plane.shared_key_present, Some(true));
+    }
+
+    #[test]
+    fn strict_text_block_names_every_check_and_the_verdict() {
+        use sbproxy_core::doctor::StrictCheck;
+        let text = render_strict_checks_text(&[
+            StrictCheck {
+                check: "driver",
+                status: "pass",
+                detail: "NVIDIA driver 550.54.15 present".to_string(),
+            },
+            StrictCheck {
+                check: "cache_mount",
+                status: "fail",
+                detail: "not enough space".to_string(),
+            },
+        ]);
+        assert!(text.contains("startup gate"));
+        assert!(text.contains("driver"));
+        assert!(text.contains("cache_mount"));
+        assert!(
+            text.contains("verdict: FAIL (1 startup blocker)"),
+            "the verdict line is what an operator reads first: {text}"
+        );
+    }
+
+    #[test]
     fn run_name_defaults_to_catalog_id_and_rejects_raw_refs() {
         // A plain catalog id is its own name.
         assert_eq!(resolve_run_name("qwen3-14b", None).unwrap(), "qwen3-14b");
@@ -8471,22 +8886,157 @@ mod tests {
         assert!(!prepared.yaml.contains("serve:"));
     }
 
+    /// The service paths a plist test renders against, with an overridable
+    /// home so the shell-quoting case can use an awkward one.
+    fn service_paths_fixture(home: &str) -> ServicePaths {
+        ServicePaths {
+            config: PathBuf::from(format!(
+                "{home}/Library/Application Support/sbproxy/service/sb.yml"
+            )),
+            plist: PathBuf::from(format!("{home}/Library/LaunchAgents/{SERVICE_LABEL}.plist")),
+            stdout_log: PathBuf::from(format!("{home}/Library/Logs/sbproxy/service.log")),
+            stderr_log: PathBuf::from(format!("{home}/Library/Logs/sbproxy/service.err.log")),
+            env_file: PathBuf::from(format!(
+                "{home}/Library/Application Support/sbproxy/service/env"
+            )),
+        }
+    }
+
     #[test]
     fn service_plist_contains_program_arguments_and_serve() {
-        let paths = ServicePaths {
-            config: PathBuf::from("/Users/test/Library/Application Support/sbproxy/service/sb.yml"),
-            plist: PathBuf::from(format!(
-                "/Users/test/Library/LaunchAgents/{SERVICE_LABEL}.plist"
-            )),
-            stdout_log: PathBuf::from("/Users/test/Library/Logs/sbproxy/service.log"),
-            stderr_log: PathBuf::from("/Users/test/Library/Logs/sbproxy/service.err.log"),
-        };
+        let paths = service_paths_fixture("/Users/test");
         let plist = render_service_plist(std::path::Path::new("/usr/local/bin/sbproxy"), &paths);
         assert!(plist.contains("<key>ProgramArguments</key>"));
-        assert!(plist.contains("<string>serve</string>"));
-        assert!(plist.contains("<string>/usr/local/bin/sbproxy</string>"));
+        assert!(plist.contains("serve"));
+        assert!(plist.contains("/usr/local/bin/sbproxy"));
         assert!(plist.contains(&format!("<string>{SERVICE_LABEL}</string>")));
         assert!(plist.contains("/Users/test/Library/Application Support/sbproxy/service/sb.yml"));
+    }
+
+    #[test]
+    fn service_plist_sources_the_environment_file_and_execs_the_proxy() {
+        let paths = service_paths_fixture("/Users/test");
+        let plist = render_service_plist(std::path::Path::new("/usr/local/bin/sbproxy"), &paths);
+
+        // The env file is sourced with auto-export on, so a bare
+        // `HF_TOKEN=...` line reaches the served process.
+        assert!(plist.contains("set -a;"), "{plist}");
+        assert!(
+            plist.contains("/Users/test/Library/Application Support/sbproxy/service/env"),
+            "the plist does not reference the environment file: {plist}"
+        );
+        // `exec` is load-bearing: without it launchd supervises the shell,
+        // so KeepAlive restarts and signals target the wrong process.
+        assert!(
+            plist.contains("exec "),
+            "the shell must exec the proxy so launchd supervises the proxy's pid: {plist}"
+        );
+        // The guard keeps a missing env file from failing the boot.
+        assert!(plist.contains("[ -f "), "{plist}");
+    }
+
+    #[test]
+    fn service_plist_quotes_a_home_directory_containing_an_apostrophe() {
+        // XML-escaping alone would turn the apostrophe into `&apos;`, which
+        // the plist parser hands back to the shell as a bare quote that
+        // ends the string early. Shell-quote first, then XML-escape, so
+        // the shell receives `'a'\''b'`.
+        let paths = service_paths_fixture("/Users/o'brien");
+        let plist = render_service_plist(std::path::Path::new("/usr/local/bin/sbproxy"), &paths);
+
+        // What the plist parser hands the shell, with XML entities resolved.
+        let shell_sees = plist.replace("&apos;", "'").replace("&amp;", "&");
+        assert!(
+            shell_sees
+                .contains(r"'/Users/o'\''brien/Library/Application Support/sbproxy/service/env'"),
+            "the shell must see a correctly escaped single-quoted path: {shell_sees}"
+        );
+        assert!(
+            !shell_sees.contains("'/Users/o'brien"),
+            "a bare apostrophe would terminate the shell string early: {shell_sees}"
+        );
+    }
+
+    #[test]
+    fn service_plist_gives_the_drain_longer_than_launchd_would() {
+        // launchd's default ExitTimeOut (20s) is shorter than the proxy's
+        // default shutdown grace (30s), so an agent still draining
+        // in-flight requests at 20 seconds would be SIGKILLed part-way
+        // through, skipping every destructor on the shutdown path.
+        let paths = service_paths_fixture("/Users/test");
+        let plist = render_service_plist(std::path::Path::new("/usr/local/bin/sbproxy"), &paths);
+        assert!(
+            plist.contains("<key>ExitTimeOut</key>"),
+            "the plist must set ExitTimeOut or launchd kills the drain early: {plist}"
+        );
+        // The ordering against the default shutdown grace is a compile-time
+        // assertion next to the constant itself, so it cannot drift.
+        assert!(
+            plist.contains(&format!("<integer>{SERVICE_EXIT_TIMEOUT_SECS}</integer>")),
+            "{plist}"
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_wraps_and_escapes() {
+        assert_eq!(shell_single_quote("/plain/path"), "'/plain/path'");
+        assert_eq!(shell_single_quote("a'b"), r"'a'\''b'");
+    }
+
+    /// A unique scratch path for the env-file tests. Mirrors
+    /// `temp_config`'s pid-plus-counter convention rather than adding a
+    /// dev-dependency this crate does not otherwise carry.
+    fn temp_env_path(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "sbproxy-service-env-{tag}-{}-{n}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn service_env_file_is_created_once_and_never_overwritten() {
+        let env_file = temp_env_path("once");
+        let _ = std::fs::remove_file(&env_file);
+
+        ensure_service_env_file(&env_file).expect("create");
+        let template = std::fs::read_to_string(&env_file).expect("read");
+        assert!(
+            template.contains("HF_TOKEN"),
+            "the template must name the variable a gated model needs: {template}"
+        );
+
+        // An operator's token has to survive a reinstall that changes the
+        // model or the port.
+        std::fs::write(&env_file, "HF_TOKEN=hf_operator_secret\n").expect("write");
+        ensure_service_env_file(&env_file).expect("second call is a no-op");
+        assert_eq!(
+            std::fs::read_to_string(&env_file).expect("read"),
+            "HF_TOKEN=hf_operator_secret\n",
+            "reinstalling must not discard the operator's environment file"
+        );
+        let _ = std::fs::remove_file(&env_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_env_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let env_file = temp_env_path("mode");
+        let _ = std::fs::remove_file(&env_file);
+        ensure_service_env_file(&env_file).expect("create");
+        let mode = std::fs::metadata(&env_file)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the documented home for a Hugging Face token must not be group or world readable"
+        );
+        let _ = std::fs::remove_file(&env_file);
     }
 
     #[test]

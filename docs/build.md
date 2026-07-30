@@ -16,7 +16,26 @@ cargo-chef layout:
 | `Dockerfile.cloudbuild` | Cloud Build / GCR amd64 image. | `gcloud builds submit`; bench loadtest stack. |
 | `Dockerfile.ci` | Kind-based smoke-test image. | `make k8s-operator-smoke`. |
 | `Dockerfile.gateway` | Gateway/authority fleet image: no CUDA. | `ClusterRole::Gateway` and `ClusterRole::Authority` nodes. |
-| `Dockerfile.worker` | Worker fleet image: CUDA runtime + bundled vLLM. | `ClusterRole::Worker` nodes. |
+| `Dockerfile.worker` | Worker fleet image: CUDA runtime + version-pinned vLLM, booting behind the startup gate. | `ClusterRole::Worker` nodes. |
+
+Two things about the worker image are load-bearing:
+
+- **vLLM is pinned**, via the `VLLM_VERSION` build arg, to the same version
+  `DEFAULT_VLLM_VERSION` names in
+  `crates/sbproxy-model-host/src/vllm_driver.rs`. An unpinned
+  `pip install vllm` resolves to whatever is newest at build time, so the
+  image would drift off the version the fit planner, the argv builder, and
+  the recorded NVIDIA certification all target. Bump both together, re-run
+  the NVIDIA lane, and record the result in
+  [`docs/model-host-certification.md`](model-host-certification.md).
+- **The entrypoint is `docker/worker-entrypoint.sh`**, which runs
+  `sbproxy doctor --strict` before exec'ing the proxy. A worker handed a
+  container with no devices, a `/dev/shm` smaller than the engine asked for,
+  an undersized cache mount, or unreadable model-plane identity refuses to
+  start with a named blocker, rather than joining gossip, advertising itself
+  as eligible, and failing every dispatch. Set
+  `SBPROXY_SKIP_STARTUP_GATE=1` to bypass it while debugging a box the gate
+  is wrong about.
 
 `Dockerfile.gateway` and `Dockerfile.worker` are forks of
 `Dockerfile.cloudbuild`: identical through the `builder` stage, and

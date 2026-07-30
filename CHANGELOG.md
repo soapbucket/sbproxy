@@ -12,6 +12,37 @@ the next version cut.
 
 ### Added
 
+- **A managed worker refuses to boot into a configuration it cannot
+  serve.** `sbproxy doctor --strict <config>` runs six named startup checks
+  (NVIDIA driver, visible accelerators, per-entry engine compatibility,
+  `/dev/shm` against the size an engine asked for, the weight-cache mount
+  against `cache_budget_gib`, and `proxy.cluster` identity material) and
+  exits 3 when any of them blocks. Each check compares the config's own
+  demands against the host, reads both the provider-level `serve:` form and
+  the canonical `proxy.model_host` form, and reports `skip` rather than a
+  hollow pass when it does not apply. The worker image and the generic VM
+  bootstrap now boot behind it, so a box handed no GPU devices, a too-small
+  `/dev/shm`, an undersized cache mount, or unreadable model-plane identity
+  fails at boot with a named blocker instead of joining the cluster,
+  advertising itself as eligible, and failing every dispatch. See
+  [`docs/manual.md`](docs/manual.md).
+- **The self-host matrix has a runner and an evidence ledger.**
+  `scripts/certify-selfhost.sh` gives every lane in the certification table
+  one reproducible command, a recorded expected result, captured host and
+  version metadata, and a retained log. A lane passes only when its command
+  ran on this host and succeeded; a host that cannot provide what a lane
+  needs is recorded `unsupported` with the reason, never as a pass. Apple
+  Silicon and NVIDIA single-GPU CUDA now have live evidence dated
+  2026-07-30, including a real vLLM container completion on an L4. See
+  [`docs/model-host-certification.md`](docs/model-host-certification.md).
+- **The macOS launchd agent has an environment file.**
+  `sbproxy service install` creates
+  `~/Library/Application Support/sbproxy/service/env` (mode 0600) once and
+  never overwrites it, so an `HF_TOKEN` a gated model needs survives
+  reinstalling to change the model or the port. A launchd agent inherits
+  almost nothing from the shell that installed it, so a token exported in a
+  terminal was previously invisible to the agent. `service status` now also
+  reports the config, log, and environment-file paths.
 - **Rate limits converge across a gossip mesh with no Redis.** A clustered
   deployment previously enforced `requests_per_minute` once per node, so 600 rpm
   on three nodes admitted roughly 1800. Each node now admits against its own
@@ -224,6 +255,17 @@ the next version cut.
   with no path suffix appended.
 
 ### Fixed
+
+- **The worker image pins vLLM.** `Dockerfile.worker` installed vLLM with a
+  bare `pip3 install vllm`, so every rebuild resolved to whatever version was
+  newest and drifted the image off `DEFAULT_VLLM_VERSION`, which the fit
+  planner, the argv builder, and the recorded NVIDIA certification all target.
+  It is now pinned through a `VLLM_VERSION` build arg. See
+  [`docs/build.md`](docs/build.md).
+- **The launchd agent gives a shutdown drain room to finish.** launchd's
+  default `ExitTimeOut` is 20 seconds, shorter than the proxy's 30-second
+  default shutdown grace, so an agent still draining in-flight requests was
+  SIGKILLed part-way through. The plist now sets it above the grace period.
 
 - **OTLP spans are flushed on graceful shutdown.** A
   `shutdown_otlp_pipeline` call existed but nothing in the binary invoked

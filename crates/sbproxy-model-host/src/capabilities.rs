@@ -1333,8 +1333,12 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         id: "platform.nvidia_cuda",
         domain: CapabilityDomain::Platform,
         status: SupportLevel::Preview,
-        summary: "NVIDIA discovery and the vLLM and SGLang container engines have deterministic coverage; live GPU serving is recorded in the certification ledger.",
-        evidence: &["test.cuda_build", "test.local_admission"],
+        summary: "One NVIDIA device completed a live gateway completion, status, and stop on an L4, with the digest-pinned vLLM container. Multi-device serving stays uncertified: the lane has never had a two-GPU host to run on, so this is deliberately not promoted on single-device evidence alone.",
+        evidence: &[
+            "test.cuda_build",
+            "test.local_admission",
+            "cert.nvidia_l4_single_gpu.2026-07-30",
+        ],
         consumer: None,
     },
     CapabilityEntry {

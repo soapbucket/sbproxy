@@ -5,43 +5,40 @@ dashboard served by the `sbproxy` binary. It is a UI over admin API
 endpoints that already exist; it adds no backend of its own.
 
 The app is a control surface for operators: a light editorial surface
-with a two-tier accent, matching the current sbproxy.dev brand. Navy
-(#0e2a4d) is the commit tier (primary buttons, brand mark); azure
-(#2563eb) is the interaction tier (links, focus, active states); amber
-is a warning color only. Type is Instrument Sans with JetBrains Mono
-for code and identifiers. It reads as the same product as sbproxy.dev,
-not as a generic dashboard theme.
+matching the current sbproxy.dev paper, ink, and green system. Ink is
+the commit tier, green is the interaction tier, and amber is a warning
+color only. Type is Instrument Sans with JetBrains Mono for code and
+identifiers. It reads as the same product as sbproxy.dev, not as a
+generic dashboard theme.
 
 ## Views
 
-The left sidebar routes between seven views, each driven by
-same-origin admin endpoints:
-
-- Overview: `/health`, `/api/stats`, `/admin/model-host/status`.
-- Keys: list and manage `/admin/keys` (create, edit policy, rotate,
-  block, unblock, revoke, delete). A newly created key returns a
-  plaintext token once; it is shown in a copy-once modal and is not
-  retrievable again.
-- Credentials: the same lifecycle over `/admin/credentials`. Secret
-  values are write-only and are never displayed.
-- Config: `/api/openapi.json` (readable summary plus raw JSON view),
-  `/admin/drift` (in-sync or drifted badge with the diff),
-  `/admin/reload` (behind a confirm), and `/api/health/targets`.
-- Logs: `/api/requests` as a client-filterable table (by method,
-  status, and path), newest first, with a manual refresh. Live
-  streaming is a planned follow-up.
-- Metrics: parses the Prometheus `/metrics` text client-side and
-  summarizes a few key `sbproxy_*` series as stat tiles and simple
-  bars, with a raw view.
-- Prompts: `/admin/prompts` with add-version
-  (`POST /admin/prompts/{host}/{name}/versions`) and pin
-  (`PUT /admin/prompts/{host}/{name}/pin`).
+The router currently exposes 25 named views covering onboarding, keys
+and credentials, config, request observability, AI operations, model
+hosting, storage, administration, and cluster health. The authoritative
+page-by-page behavior and endpoint inventory lives in
+[`docs/admin-ui.md`](../docs/admin-ui.md).
 
 Every request uses `credentials: "same-origin"` and an absolute path.
-The page is served behind the admin port's HTTP Basic auth, so the
-browser carries those credentials. Fetch failures (401, 403, 404, 5xx,
-or network) render a clear error surface, and empty lists render an
-empty state, rather than a blank panel.
+The login route exchanges credentials for an `HttpOnly` session cookie
+and an in-memory CSRF token. Fetch failures (401, 403, 404, 5xx, or
+network) render a clear error surface, and empty lists render an empty
+state rather than a blank panel.
+
+## Documentation links
+
+Every component route declares a `meta.documentation` slug in
+`src/router.ts`. The shared `PageHeader` turns it into a visible
+`https://sbproxy.dev/docs/<slug>` link, and the login card reuses the
+same link component. Redirect-only records explicitly use
+`documentation: null`; `src/router.test.ts` fails when any route is
+left unaccounted for.
+
+The links are passive anchors that open in a new tab. The UI never
+prefetches documentation and does not depend on the public site. In an
+air-gapped deployment an unreachable docs tab has no effect on the
+console; operators can mirror the repository's `docs/` Markdown to an
+internal host.
 
 ## Routing
 

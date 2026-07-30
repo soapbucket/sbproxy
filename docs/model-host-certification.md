@@ -1,143 +1,233 @@
 # Model host hardware certification
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-07-30*
 
-This page separates evidence already produced by deterministic tests from work
-that requires a real accelerator. It is an evidence ledger and a repeatable
-procedure. Passing a simulated GPU test is never recorded as live hardware
-certification.
+This page is the evidence ledger for the self-host matrix, and the procedure
+that reproduces it. Passing a simulated GPU test is never recorded as live
+hardware certification.
+
+A lane is `passed` only when its command ran on real hardware and succeeded. A
+host that cannot provide what a lane needs is recorded `unsupported` with the
+reason, and a capability is not promoted to `stable` in the [capability
+matrix](model-host-capabilities.md) without a dated record below. Every
+selected lane gets a verdict, so a gap in the matrix is visible rather than
+absent.
+
+## Running the matrix
+
+`scripts/certify-selfhost.sh` is the runner. One reproducible command per lane,
+a recorded expected result, captured host and version metadata, and retained
+per-lane logs.
+
+```bash
+scripts/certify-selfhost.sh list          # the lane table and what each asserts
+scripts/certify-selfhost.sh metadata      # what this host would record
+scripts/certify-selfhost.sh run local     # every lane needing no accelerator
+scripts/certify-selfhost.sh run all       # add the hardware lanes
+scripts/certify-selfhost.sh run apple_metal nvidia_single_gpu
+```
+
+Evidence lands in `.cert-evidence/<utc-timestamp>/`: a `metadata.json` with the
+git revision and dirty flag, binary version, OS, kernel, driver, CUDA,
+container runtime, and visible device count; a `summary.tsv` with one row per
+lane; and a `<lane>.log` per lane carrying the exact command, the expected
+result, and the full output. The runner exits non-zero if any lane failed. An
+`unsupported` lane does not fail the run, because a missing accelerator is a
+gap to report, not a regression.
+
+`run local` is the pre-hardware gate. It must be green before a GPU box is
+billed.
 
 ## Current evidence
 
-| Target | Status | Evidence |
+| Lane | Status | Recorded |
 |---|---|---|
-| CPU contracts | covered in CI | Artifact, driver, fit, admission, reconcile, reload, and CLI suites. |
-| Apple Silicon Metal | passed 2026-07-11 | Real managed GGUF completion, status and stop truth, cache reuse, maintenance health, and ready-engine Ctrl-C shutdown on Apple M4 Max. |
-| NVIDIA CUDA single node | pending live certification | Deterministic T4/L4 descriptors, vLLM plans, and container isolation tests exist. No live CUDA evidence is recorded. |
-| NVIDIA multi-GPU | pending live certification | Deterministic placement and device-scoping tests only. |
-| Local multi-process cluster control | passed 2026-07-11 | Four real processes, enrolled identities, signed gossip and state, node-specific mTLS, controller restart fencing, rolling and recreate transitions, worker loss, post-GC tombstone, partition callout, digest mismatch and recovery, and child cleanup. |
-| Local three-process data plane | passed 2026-07-13 | A gateway and two workers prove authenticated HTTP/2 dispatch, logical discovery, unary and SSE responses, coordinated cold start, pre-output failover, no mid-stream replay, cancellation, permit release, and absence of the bearer sentinel from worker logs. |
-| Three-node GCP runtime | pending live certification | Local control and data-plane tests exist. Live GCP networking, NVIDIA engines, and hardware evidence remain pending. |
+| Deterministic model-host suites | passed 2026-07-30 | Artifact, driver, fit, admission, reconcile, reload, capability, and CLI suites. |
+| CPU admission | passed 2026-07-30 | Local admission and cold-start policy on an accelerator-free path. |
+| Apple Silicon Metal | **failing** 2026-07-30 | 11 of 12 checks pass on Apple M4 Max: live managed GGUF completion, truthful status, stop, clean shutdown, cache reuse. The port-release check fails on an open defect, below. |
+| NVIDIA CUDA single GPU | passed 2026-07-30 | Live vLLM container completion on an NVIDIA L4: NVML probe, fit plan, public model echo, full status, and a stop that returned the device to 0 MiB. |
+| NVIDIA multi-GPU | unsupported | Needs two visible devices. The billing account this project runs under is capped at one GPU, so the lane has never had hardware to run on. Detail below. |
+| Air-gapped | passed 2026-07-30 | Offline, manual, and file pull policies short-circuit transport; a digest mismatch fails closed. |
+| Split cluster (gateway plus workers) | passed 2026-07-30 | Authenticated dispatch, logical discovery, unary and SSE, coordinated cold start, pre-output failover. |
+| Symmetric cluster | passed 2026-07-30 | Four real processes converge on one directory and assignment, signed gossip, node-specific mTLS, controller restart fencing. |
+| Three-node kill test | passed 2026-07-30 | Directory exclusion, roster retention, unhealthy-node alert, and failover before first output. |
+| Rolling deployment update | passed 2026-07-30 | Prepare and observe the target before removing the prior replica; no unrelated-engine restart. |
+| Clustered key revoke | passed 2026-07-30 | A key revoked on one gateway is refused by a peer within two seconds. |
+| Strict budget under concurrency | passed 2026-07-30 | Two gateways never admit more than the shared strict request limit. |
+| External provider fallback | passed 2026-07-30 | A managed cold start advances to a cloud provider in the same array. |
+| Managed-worker startup gate | passed 2026-07-30 | Refuses an unsatisfiable config with exit 3 and a named blocker per check, on both macOS and NVIDIA hosts. |
+| Capability matrix | passed 2026-07-30 | The generated matrix matches the registry. |
+| Three-node live GCP runtime | unsupported | Blocked by the same one-GPU cap: a three-worker GPU fleet cannot be provisioned. Local multi-process control and data-plane evidence stands in. |
 
-The generated [capability matrix](model-host-capabilities.md) records Apple
-Metal and the deterministic cluster control plane as stable. Remote dispatch,
-NVIDIA, and GCP multi-node certification stay at `preview` until their owning
-executable and live gates are recorded.
+## Apple Silicon evidence from 2026-07-30
 
-### Local data-plane evidence from 2026-07-13
-
-The hermetic fixture runs a gateway and two worker processes with distinct
-gossip, typed-state, admin, model-plane, and loopback engine ports. It uses an
-explicit development shared key so it can run in CI without an enrollment
-authority. Production mTLS authentication has separate envelope, HTTP/2, TLS,
-and peer-identity tests.
-
-```bash
-cargo build -p sbproxy
-SBPROXY_E2E_BIN=target/debug/sbproxy \
-  cargo test -p sbproxy-e2e --test model_cluster_dispatch -- --nocapture
-```
-
-The gate proves:
-
-- `/v1/models` exposes one logical model with aggregate availability and no
-  node ID, endpoint, or loopback address;
-- two concurrent cold requests share one assigned engine launch;
-- live reload expands the deployment to two current replicas before failure
-  drills begin;
-- unary and SSE requests traverse a peer, preserve usage and safe route
-  headers, and leave no public bearer sentinel in worker stdout or stderr;
-- a retryable failure before output selects the other current replica;
-- a worker failure after the first SSE frame produces partial output without
-  replaying on the second replica;
-- dropping a client stream cancels the peer and engine work, then a following
-  request proves the admission permit was released;
-- graceful fixture shutdown reaps every proxy and engine process.
-
-This is executable local distributed-serving evidence, not live GCP or NVIDIA
-certification. The split-role example separately documents the production mTLS
-configuration.
-
-### Local multi-process evidence from 2026-07-11
-
-The hermetic fixture runs one authority, one gateway, and two workers as real
-`sbproxy` child processes. It uses the production enrollment authority to
-create signed per-node identities, unique keys and certificates, an
-authenticated gossip key, distinct state and model caches, and temporary
-UDP, transport, proxy, admin, and engine ports. A tiny local catalog artifact is
-verified through the production artifact manager and launched through the typed
-llama.cpp driver into an e2e-only health server.
+Recorded on arm64 macOS 26.5.2 build 25F84, Apple M4 Max, 36 GiB of memory,
+binary `sbproxy 1.9.0` at revision `2ef06ad0`.
 
 ```bash
-cargo build -p sbproxy
-SBPROXY_E2E_BIN=target/debug/sbproxy \
-  cargo test -p sbproxy-e2e --test model_cluster_control -- --nocapture
+scripts/certify-selfhost.sh run apple_metal
 ```
 
-The gate proves:
-
-- every process converges on the same eligible directory and exact assignment;
-- restarting a controller with unchanged desired state preserves deployment
-  generation and assignment identity;
-- rolling replacement starts and observes the target before removing the prior
-  replica, while recreate publishes a drain-only phase before starting the
-  target generation;
-- the key cache and model controller reuse one gossip and transport mesh;
-- a control-only node can retain a non-builtin global catalog without creating
-  an engine;
-- removing the assigned worker keeps it in the full node roster, excludes it
-  from model eligibility, and adds a nonempty `unhealthy_nodes` alert;
-- the tombstone and callout remain after the two-second routing-membership GC;
-- the remaining worker takes the deterministic replacement assignment and
-  reports exact readiness before every surviving admin view converges;
-- a signed restart with an unreachable gossip advertisement is called out as a
-  partition, while a correct replacement receives the full authenticated
-  roster and fences stale dead gossip;
-- a file-managed desired-state mismatch excludes unsafe workers, then clears
-  when the replacement returns with matching content;
-- graceful proxy shutdown releases gossip, transport, admin, and fake-engine
-  resources, and the test verifies no child process remains.
-
-Pure placement, directory, and rollout suites additionally prove suspect,
-dead, unreachable, stale, malformed, and incompatible exclusion; minimal
-movement; partition-local routing; per-deployment generation fencing; and
-rolling versus recreate ordering. This is local control-plane certification,
-not GCP or remote inference certification.
-
-### Apple Metal evidence from 2026-07-11
-
-The recorded gate ran on arm64 macOS 26.5.1 build 25F80, Apple M4 Max,
-with 36 GiB of memory.
+Eleven of twelve checks pass. The failing one is recorded below, and the lane
+stays red until it is fixed.
 
 - Model: `qwen2.5-0.5b-instruct:q4_k_m`
-- Managed engine: llama.cpp b9905 on Metal
-- Artifact identity: `830f2915ca0008994cbddaeba38634f6e999d34fea89c048ebb73753be0a0591`
-- Engine archive SHA-256: `0d3deb02fd7912c8ef360fa33b3b4a8c97967a3ac703c0ed7d5edd3680723ea8`
-- Completion content: `Ready`
-- Ready status: deployment `local`, state `ready`, top-level `serving: true`, and `local_serving.ready: true`
-- Stopped status: deployment `local`, state `stopped`, top-level `serving: false`, and `local_serving.ready: false`
-- Cache reuse: the verified engine archive mtime remained `1783790888` across the repeated launch
-- Shutdown: Ctrl-C exited the gateway cleanly and the observed ready engine PID `8710` was absent afterward
-- Maintenance: repeated health ticks completed without a Tokio panic
+- Managed engine: llama.cpp b9905 on Metal, selected device `[0]`
+- Artifact identity: `830f2915ca0008994cbddaeba38634f6e999d34fea89c048ebb73753be0a0591`,
+  identical across both runs
+- Start to ready: 8 seconds against a warm artifact cache, 11 seconds on the
+  second run; 65 seconds when the first 469 MB weight pull and its digest
+  verification are included
+- Completion content: `ready`, returned through the gateway
+- Echoed `model` field: `qwen2.5-0.5b-instruct`, the public name, never the
+  weights path
+- Status while ready: `state: ready`, `serving: true`, engine `llama_cpp`
+  version `b9905`, a full memory breakdown, and the engine's loopback port
+- Status after stop: `state: stopped`, `serving: false`, snapshot preserved
+- Stop reaped the engine process
+- SIGINT exited the gateway in 1 second with no engine orphaned
+- Cache reuse: zero download lines on the second run, same artifact digest
+- **Failing check:** the public port was still bound 60 seconds after
+  shutdown, by a surviving `sbproxy` process
+
+### Open defect: a process survives shutdown holding the listener
+
+Found by this lane, reproduced four times, not yet fixed.
+
+`sbproxy models stop` reaps the engine, and SIGINT after a stop exits clean.
+But a gateway that goes away *without* a prior stop leaves its engine running:
+
+- `sbproxy serve <config>` sent SIGTERM exits in about two seconds and leaves
+  the `llama-server` child alive.
+- `sbproxy service uninstall` leaves the engine alive; it was still running 181
+  seconds later.
+- SIGKILL on the gateway leaves the engine alive, and the `KeepAlive` restart
+  then launches a *second* engine beside the first, so two engines hold
+  unified memory at once.
+- A process can also outlive the pid the launcher signalled while still holding
+  the public listener, so the obvious next move (restart on the same port)
+  cannot bind. When that bind finally fails, the panic takes out only the
+  Pingora listener thread: the process stays alive with no listener and stops
+  responding to SIGTERM, so it has to be SIGKILLed.
+
+The engine reap runs from a shutdown guard on the graceful path. Any exit that
+does not reach it leaks the engine. The launchd plist now sets `ExitTimeOut`
+above the default shutdown grace so launchd cannot SIGKILL a drain in progress,
+but that is hardening, not the fix: an idle agent exits well inside even
+launchd's default and still leaks.
+
+Until this is fixed, stop the deployment before stopping the gateway:
+
+```bash
+sbproxy models stop local          # reaps the engine
+sbproxy service uninstall          # then remove the agent
+```
+
+The certification lane asserts the port is released after shutdown, so a
+regression here fails the Apple lane rather than passing quietly.
+
+### Sleep and wake
+
+Not automated: suspending the certification host would end the run that is
+recording the evidence. Documented expectation instead. `KeepAlive` restarts
+the agent if the process dies across a sleep cycle, and the artifact cache is
+content-addressed on disk, so a wake reuses verified weights with no
+re-download. The engine-orphan gap above applies to any restart, so an agent
+that has cycled may be holding more than one engine.
+
+## NVIDIA CUDA single-GPU evidence from 2026-07-30
+
+Recorded on GCP `g2-standard-8` (8 vCPU, one NVIDIA L4) in `us-east1-b`, Ubuntu
+kernel `6.8.0-1063-gcp`, NVIDIA driver `580.159.03`, Docker `29.6.2`, binary
+`sbproxy 1.9.0` at revision `2ef06ad0` built from source on the box.
+
+Probe, through sbproxy's own detection rather than parsed `nvidia-smi`:
+
+- Device: NVIDIA L4, `24152899584` bytes total, compute capability 8.9
+- FP8 kernels: available
+- Memory bandwidth: 300 GB/s
+- `/dev/shm`: 16825987072 bytes
+- Container runtime: Docker, daemon reachable
+
+Startup gate against a worker config, every check on real values:
+
+```
+driver                 pass  NVIDIA driver 580.159.03 present
+visible_devices        pass  1 accelerator(s) visible to the probe
+cuda_compatibility     pass  all 1 configured serve entries resolve to an engine this host can run
+shared_memory          pass  /dev/shm is 15.7 GiB, at or above the 8.0 GiB the config asks for
+cache_mount            pass  /home/rick/.cache/sbproxy/models has 64.8 GiB free for the 40 GiB cache budget
+model_plane_identity   pass  worker node presents complete shared-key identity material
+verdict: pass (no startup blocker on this host)
+```
+
+Live serving, digest-pinned vLLM container, raw `hf:Qwen/Qwen3-0.6B`:
+
+- Cold completion: HTTP 200 in 163 seconds, including the weight pull and vLLM
+  engine initialization
+- Warm completion: HTTP 200 in 0.109 seconds
+- Echoed `model` field: `qwen3-06b`, the configured public name, not the
+  `hf:` reference
+- Engine: vLLM `0.10.1.dev1+gbcc0a3cbe`, image pinned by the
+  `sha256:05a31dc4...878271` digest
+- Selected device `[0]`, engine loopback port `40855`
+- Artifact digest: `2208fff05b0093aa39a82a19ac63fa5062846163e330b99d0ba1fa337b3c5f2d`
+- Memory breakdown: 1074528256 weight bytes, 4697620480 KV bytes, 865822310
+  runtime overhead, 663797104 safety margin, 7301768150 total
+- Device memory in use while ready: 9126 MiB
+- Stop: state `stopped`, `serving: false`, container torn down, device memory
+  back to 0 MiB
+
+A reconcile refusal was also recorded as legible rather than generic. A
+deployment pinning `engine: vllm` against a GGUF-only variant failed at boot
+with `model 'qwen3-8b' has no compatible artifact variant: q4_k_m: no
+compatible selected engine on worker`, not a stack trace and not a hang.
+
+## NVIDIA multi-GPU: why the lane is unsupported
+
+The lane needs two visible devices. It has never had them.
+
+```
+$ gcloud compute regions describe us-east1 --format='value(quotas)'
+NVIDIA_L4_GPUS 0.0 / 1.0
+$ gcloud compute project-info describe --format='value(quotas)'
+GPUS_ALL_REGIONS 0.0 / 1.0
+```
+
+The cap is on the billing account, not the project, and it is one GPU. Every
+self-service increase request against it has been auto-denied, so switching
+project does not route around it. Lifting this needs a billing-side change or
+a different established account.
+
+What that leaves:
+
+- Device-set math, disjoint device-group packing for tensor parallelism, and
+  the oversubscription refusal are covered deterministically by
+  `runtime_replicas` and `placement`, which run in the `deterministic` lane.
+- The startup gate's `cuda_compatibility` check reports `skip`, not `pass`, for
+  a `proxy.model_host` deployment whose per-device fit it did not evaluate. It
+  will not claim a multi-GPU config is servable on evidence it does not have.
+- `platform.nvidia_cuda` stays below an unqualified claim in the capability
+  matrix while this lane is open.
+
+The epic gate "a 70B model runs on a 2-GPU box" cannot be closed from this
+account. It is a hardware-access problem, not a code problem.
 
 ## Deterministic gate
 
-These suites run without a GPU and must pass before any hardware run:
+These suites run without a GPU and must pass before any hardware run. The
+`deterministic`, `cpu`, `air_gapped`, and `rolling_update` lanes cover them;
+run them directly when iterating:
 
 ```bash
-cargo test -p sbproxy-model-host --test engine_drivers
-cargo test -p sbproxy-model-host --test cuda_build
-cargo test -p sbproxy-model-host --test runtime_reconcile
-cargo test -p sbproxy-model-host --test local_admission
+cargo nextest run -p sbproxy-model-host -p sbproxy-capability --no-fail-fast
 cargo test -p sbproxy-core --test model_host_reload
 cargo test -p sbproxy --test models_lifecycle_cli
-cargo test -p sbproxy-model-host --test placement
-cargo test -p sbproxy-model-host --test capability_contract
 cargo test -p sbproxy-ai --test managed_replica_routing
 cargo test -p sbproxy-core --test cluster_control_plane
 cargo test -p sbproxy-core --test model_plane_envelope --test model_plane_transport --test managed_replica_dispatch
-cargo test -p sbproxy-e2e --test model_cluster_control -- --nocapture
-cargo test -p sbproxy-e2e --test model_cluster_dispatch -- --nocapture
+SBPROXY_E2E_BIN=target/debug/sbproxy cargo test -p sbproxy-e2e --test model_cluster_control -- --nocapture
+SBPROXY_E2E_BIN=target/debug/sbproxy cargo test -p sbproxy-e2e --test model_cluster_dispatch -- --nocapture
 ```
 
 They prove immutable artifact selection, process argv, container isolation,
@@ -145,50 +235,7 @@ source-build publication, per-device capacity, bounded queue behavior, atomic
 rollback, status shape, and CLI contracts. They cannot prove a driver loads a
 model or returns tokens on real hardware.
 
-## Apple Metal verification procedure
-
-Use an isolated cache and ports on Apple Silicon:
-
-```bash
-export SBPROXY_SMOKE_CACHE="$(mktemp -d)"
-sbproxy run qwen2.5-0.5b-instruct \
-  --variant q4_k_m \
-  --cache-dir "${SBPROXY_SMOKE_CACHE}" \
-  --port 48123 \
-  --admin-port 48124
-```
-
-After the ready banner:
-
-```bash
-curl http://127.0.0.1:48123/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"qwen2.5-0.5b-instruct","messages":[{"role":"user","content":"Return only the word ready."}]}'
-
-export SB_ADMIN_URL=http://127.0.0.1:48124
-export SB_ADMIN_USERNAME=admin
-export SB_ADMIN_PASSWORD='paste-the-generated-password'
-sbproxy models ps --format json
-sbproxy models stop local --format json
-```
-
-The completion must contain nonempty assistant content. Status must report
-deployment `local`, state `ready`, engine `llama_cpp`, a Metal-selected worker,
-and the verified artifact digest. Stop must reach `stopped` without deleting the
-snapshot. A second run against the same cache must verify a cache hit without
-another weight download.
-
-Record the tested binary revision and retain the command output with the
-certification evidence. The evidence above supports the Apple capability at
-`stable`; regenerate the matrix whenever this record changes.
-
-## GCP NVIDIA certification procedure
-
-NVIDIA CUDA and live GCP multi-node certification remain pending. The
-deterministic and local tests above do not supply live hardware evidence. Run
-this procedure when recording that evidence.
-
-### Provision an L4 worker
+## Provisioning a GPU box for the NVIDIA lanes
 
 ```bash
 export SBPROXY_GCP_PROJECT="your-gcp-project-id"
@@ -198,82 +245,44 @@ scripts/provision-l4.sh up
 scripts/provision-l4.sh ssh
 ```
 
-Set `SBPROXY_GCP_PROJECT` explicitly in every certification shell before using
-the provisioning script. Do not rely on the script's development project
-default for a billable hardware run.
+Set `SBPROXY_GCP_PROJECT` explicitly in every certification shell. Do not rely
+on the provisioning script's development default for a billable run.
 
-Check regional quota if provisioning fails:
+Check quota first if provisioning fails, and read both numbers: the
+per-region-per-type quota and the global `GPUS_ALL_REGIONS`. Booting N devices
+needs both at N or above.
 
 ```bash
-gcloud compute regions describe us-central1 \
-  --project="${SBPROXY_GCP_PROJECT}" \
+gcloud compute regions describe us-east1 --project="${SBPROXY_GCP_PROJECT}" \
+  --format='value(quotas)'
+gcloud compute project-info describe --project="${SBPROXY_GCP_PROJECT}" \
   --format='value(quotas)'
 ```
 
-Tear the VM down after the run:
+Tear the VM down as soon as the run is recorded. A GPU instance left running is
+the most expensive way to store evidence.
 
 ```bash
 : "${SBPROXY_GCP_PROJECT:?export SBPROXY_GCP_PROJECT first}"
 scripts/provision-l4.sh down
 ```
 
-### Single-node vLLM
-
-Use a catalog v2 safetensors artifact and canonical engine policy:
-
-```yaml
-proxy:
-  model_host:
-    engines:
-      vllm:
-        launch: uv
-        version: 0.10.0
-        acceleration: cuda
-    deployments:
-      gpu-qwen:
-        model: REPLACE_WITH_CERTIFIED_SAFETENSORS_MODEL
-        variant: REPLACE_WITH_PINNED_VARIANT
-        pull: on_boot
-        warm: true
-        engine: vllm
-```
-
-The gate must prove all of the following with retained logs and status output:
-
-1. NVML or the `nvidia-smi` fallback reports the exact device and compute
-   capability.
-2. The artifact downloads once, verifies, and reaches the immutable snapshot.
-3. Managed uv provisions the pinned vLLM version and passes Python, torch, and
-   CUDA compatibility checks.
-4. A chat completion returns nonempty assistant content through the gateway.
-5. Status reports selected device, artifact digest, memory breakdown, engine
-   port, active and queued counts, and ready state.
-6. Stop drains, reaps the engine process tree, and preserves verified bytes.
-7. Restart reuses the artifact and managed environment.
-
-Repeat with a digest-pinned container. Inspect the exact Docker or Podman argv,
-private network, loopback port, read-only snapshot mount, selected devices, and
-shared-memory bound.
+Prefer the digest-pinned container over a host toolchain for vLLM. A host
+`uv`/`pip` install resolves to whatever is newest, needs Python headers and a C
+toolchain for the Triton JIT, and cascades; the pinned image packages the whole
+environment and serves cleanly. `deploy/terraform/l4-demo/bootstrap-generic.sh`
+takes the container path by default and boots behind the startup gate.
 
 ### T4 capability refusal
 
 Repeat the compatibility portion on a T4. An FP8-only artifact must fail with a
-bounded incompatibility reason, while a compatible int4 or GGUF variant may be
+bounded incompatibility reason while a compatible int4 or GGUF variant is
 selected. A generic engine error is not acceptable evidence.
-
-### Multi-node gate
-
-Provision three GCP nodes with mixed labels or devices. Record membership
-convergence, deterministic placement, peer identity, signed revision
-propagation, request dispatch, node loss, replacement, and fleet CLI and admin
-status. A worker must never select a variant outside the catalog or receive an
-artifact path from another node without passing the peer and artifact trust
-boundaries. Capture the complete roster and unhealthy-node alert before and
-after recovery.
 
 ## Evidence retention
 
-For every live run, retain:
+`scripts/certify-selfhost.sh` records most of this automatically. For every
+live run, retain:
 
 - git revision and dirty status;
 - binary version and feature set;
@@ -286,5 +295,5 @@ For every live run, retain:
 - GCP machine type, accelerator type, zone, and teardown confirmation.
 
 Do not promote a capability from this checklist alone. Promotion requires
-retained output tied to the tested revision and a deterministic regression test
-for any bug found during the hardware run.
+retained output tied to the tested revision, and a deterministic regression
+test for any bug the hardware run found.

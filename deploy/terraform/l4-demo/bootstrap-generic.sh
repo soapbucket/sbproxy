@@ -30,6 +30,10 @@
 #   AUTO_START           "true" to start sbproxy immediately (plain-HTTP
 #                        demo mode); "false" to install and leave it
 #                        stopped (TLS mode waits for DNS). Default: true
+#   STARTUP_GATE         "enforce" (default) fails the boot when
+#                        `sbproxy doctor --strict` finds a blocker no
+#                        retry can fix; "report" logs the gate and
+#                        continues; "off" skips it. See step 4.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
@@ -37,6 +41,7 @@ INSTALL_URL="${INSTALL_URL:-https://download.sbproxy.dev}"
 SBPROXY_CONFIG_FILE="${SBPROXY_CONFIG_FILE:-/etc/sbproxy/sb.yml}"
 SBPROXY_PUBLIC_HOST="${SBPROXY_PUBLIC_HOST:-}"
 AUTO_START="${AUTO_START:-true}"
+STARTUP_GATE="${STARTUP_GATE:-enforce}"
 
 # 1. Runtime deps only. The curl installer needs curl and jq (doctor
 #    validation below parses its JSON report); `unzip` is used by
@@ -89,9 +94,18 @@ fi
 #    nvidia-smi parsing: doctor is the one detection layer engine
 #    acquisition, `sbproxy run`, and the CLI already share (see
 #    crates/sbproxy-core/src/doctor.rs), so this box never disagrees
-#    with sbproxy itself about what hardware it has. Informational only
-#    (`|| true`): a missing engine here is still recoverable by
-#    acquisition at the first request, so this must not fail the boot.
+#    with sbproxy itself about what hardware it has.
+#
+#    Two halves, and the split matters. The advisory summary below is
+#    informational (`|| true`): a missing engine binary is recoverable
+#    by acquisition at the first request, so it must not fail the boot.
+#    The startup gate (`--strict`) is the opposite: it only reports
+#    conditions no retry can fix (a CUDA config with no driver, a driver
+#    with no visible device, /dev/shm below what the engine asked for, a
+#    cache mount that cannot hold the configured budget, unreadable
+#    model-plane identity), and by default a failure stops the boot.
+#    A box that comes up broken advertises itself as eligible and then
+#    fails every request, which is strictly worse than not coming up.
 DOCTOR_JSON="$(/usr/local/bin/sbproxy doctor "$SBPROXY_CONFIG_FILE" --format json || true)"
 if [ -n "$DOCTOR_JSON" ]; then
   echo "$DOCTOR_JSON" | jq -r '
@@ -101,12 +115,46 @@ if [ -n "$DOCTOR_JSON" ]; then
     + ", local serving ready: " + (.local_serving.ready | tostring)
   '
   echo "$DOCTOR_JSON" | jq -r '.local_serving.blockers[]? | "[doctor] blocker: " + .'
-  if echo "$DOCTOR_JSON" | jq -e '.cache_budget_check.sufficient == false' >/dev/null 2>&1; then
-    echo "[doctor] warning: the weight-cache mount does not have enough free space for the configured cache_budget_gib"
-  fi
 else
   echo "[bootstrap] sbproxy doctor produced no output"
 fi
+
+case "$STARTUP_GATE" in
+  off)
+    echo "[startup-gate] skipped (STARTUP_GATE=off)"
+    ;;
+  enforce | report)
+    # This script tracks the repository; INSTALL_URL serves the latest
+    # *release*. When a box installs a binary older than the gate, treat
+    # the gate as unavailable rather than failing the boot on a clap
+    # "unexpected argument" error, which would be a false blocker.
+    if ! /usr/local/bin/sbproxy doctor --help 2>&1 | grep -q -- '--strict'; then
+      echo "[startup-gate] skipped: the installed sbproxy predates 'doctor --strict'"
+    else
+      # Capture first, print second: a pipeline reports the *last*
+      # command's status, so piping doctor straight into `sed` would
+      # throw away the exit code this gate is entirely about.
+      gate_status=0
+      gate_output="$(/usr/local/bin/sbproxy doctor --strict "$SBPROXY_CONFIG_FILE" 2>&1)" \
+        || gate_status=$?
+      printf '%s\n' "$gate_output" | sed -n '/^startup gate/,$p'
+      if [ "$gate_status" -ne 0 ]; then
+        if [ "$STARTUP_GATE" = "enforce" ]; then
+          echo "[startup-gate] FAILED (exit ${gate_status}); not starting sbproxy." >&2
+          echo "[startup-gate] fix the blockers above, or re-run with STARTUP_GATE=report to boot anyway." >&2
+          exit "$gate_status"
+        fi
+        echo "[startup-gate] failed (exit ${gate_status}); continuing because STARTUP_GATE=report"
+      else
+        echo "[startup-gate] passed"
+      fi
+    fi
+    ;;
+  *)
+    echo "[bootstrap] unknown STARTUP_GATE='$STARTUP_GATE' (want enforce|report|off)" >&2
+    exit 1
+    ;;
+esac
 
 # 5. systemd unit. Binds :80/:443 via CAP_NET_BIND_SERVICE; the model
 #    host fetches weights + the engine over HTTPS, so raise NOFILE.
