@@ -19,6 +19,7 @@ pub mod v1 {
 pub use v1::inference_service_client::InferenceServiceClient;
 pub use v1::inference_service_server::{InferenceService, InferenceServiceServer};
 pub use v1::{
-    ClassifyRequest, ClassifyResponse, EmbedRequest, EmbedResponse, Embedding, Label,
-    ModelInfoRequest, ModelInfoResponse, VersionRequest, VersionResponse,
+    compress_request, ClassifyRequest, ClassifyResponse, CompressRequest, CompressResponse,
+    EmbedRequest, EmbedResponse, Embedding, Label, ModelInfoRequest, ModelInfoResponse,
+    VersionRequest, VersionResponse,
 };

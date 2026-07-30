@@ -14,6 +14,7 @@ path = "src/main.rs"
 sbproxy-classifier-proto = { path = "../sbproxy-classifier-proto" }
 sbproxy-classifiers = { path = "../sbproxy-classifiers" }
 tonic = { workspace = true }
+prost = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }

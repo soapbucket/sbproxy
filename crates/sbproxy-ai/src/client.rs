@@ -308,6 +308,7 @@ struct PreparedShadowRequest {
     task_timeout_ms: u64,
     usage_provider: String,
     usage_model: String,
+    reasoning_outcome: &'static str,
     usage: Option<ShadowUsageRecord>,
     quota_attempt: Option<crate::quota_pool::QuotaPoolAttemptGuard>,
 }
@@ -407,6 +408,7 @@ impl AiClient {
             blocked_providers,
             disallow_prompt_training,
             usage,
+            None,
         ) {
             Ok(prepared) => Self::spawn_prepared_shadow(prepared),
             Err(outcome) => outcome,
@@ -442,6 +444,7 @@ impl AiClient {
             blocked_providers,
             disallow_prompt_training,
             usage,
+            None,
         ) {
             Ok(prepared) => prepared,
             Err(outcome) => return Ok(outcome),
@@ -474,6 +477,68 @@ impl AiClient {
         quota: crate::quota_pool::QuotaPoolAdmission,
         quota_reservation_prefix: &str,
     ) -> ShadowDispatchOutcome {
+        self.try_spawn_shadow_with_quota_detached_impl(
+            config,
+            path,
+            body,
+            is_stream,
+            allowed_providers,
+            blocked_providers,
+            disallow_prompt_training,
+            usage,
+            quota,
+            quota_reservation_prefix,
+            None,
+        )
+    }
+
+    /// Queue a governed shadow while preserving safety facts captured before
+    /// lossy request transformations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_spawn_shadow_with_quota_detached_with_reasoning_eligibility(
+        &self,
+        config: &AiHandlerConfig,
+        path: &str,
+        body: &serde_json::Value,
+        is_stream: bool,
+        allowed_providers: &[String],
+        blocked_providers: &[String],
+        disallow_prompt_training: bool,
+        usage: Option<ShadowUsageRecord>,
+        quota: crate::quota_pool::QuotaPoolAdmission,
+        quota_reservation_prefix: &str,
+        reasoning_eligibility: crate::reasoning::ReasoningEligibility,
+    ) -> ShadowDispatchOutcome {
+        self.try_spawn_shadow_with_quota_detached_impl(
+            config,
+            path,
+            body,
+            is_stream,
+            allowed_providers,
+            blocked_providers,
+            disallow_prompt_training,
+            usage,
+            quota,
+            quota_reservation_prefix,
+            Some(reasoning_eligibility),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_spawn_shadow_with_quota_detached_impl(
+        &self,
+        config: &AiHandlerConfig,
+        path: &str,
+        body: &serde_json::Value,
+        is_stream: bool,
+        allowed_providers: &[String],
+        blocked_providers: &[String],
+        disallow_prompt_training: bool,
+        usage: Option<ShadowUsageRecord>,
+        quota: crate::quota_pool::QuotaPoolAdmission,
+        quota_reservation_prefix: &str,
+        reasoning_eligibility: Option<crate::reasoning::ReasoningEligibility>,
+    ) -> ShadowDispatchOutcome {
         let mut prepared = match self.prepare_shadow(
             config,
             path,
@@ -483,6 +548,7 @@ impl AiClient {
             blocked_providers,
             disallow_prompt_training,
             usage,
+            reasoning_eligibility,
         ) {
             Ok(prepared) => prepared,
             Err(outcome) => return outcome,
@@ -516,6 +582,7 @@ impl AiClient {
         blocked_providers: &[String],
         disallow_prompt_training: bool,
         usage: Option<ShadowUsageRecord>,
+        reasoning_eligibility: Option<crate::reasoning::ReasoningEligibility>,
     ) -> std::result::Result<PreparedShadowRequest, ShadowDispatchOutcome> {
         let Some(shadow_cfg) = config.shadow.as_ref() else {
             return Err(ShadowDispatchOutcome::NotConfigured);
@@ -590,10 +657,6 @@ impl AiClient {
             return Err(ShadowDispatchOutcome::EgressDenied);
         }
 
-        let request_bytes = serialized_json_len(body);
-        let Some(permit) = self.shadow_supervisor.try_admit_request(request_bytes) else {
-            return Err(ShadowDispatchOutcome::Saturated);
-        };
         let mut body_owned = if let Some(model) = shadow_cfg.model.as_ref() {
             let mut body = body.clone();
             if let Some(object) = body.as_object_mut() {
@@ -618,6 +681,30 @@ impl AiClient {
                 );
             }
         }
+        let reasoning_model = body_owned
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let reasoning = match reasoning_eligibility {
+            Some(eligibility) => crate::reasoning::apply_reasoning_policy_with_eligibility(
+                config.reasoning,
+                &shadow_provider,
+                &reasoning_model,
+                &mut body_owned,
+                eligibility,
+            ),
+            None => crate::reasoning::apply_reasoning_policy(
+                config.reasoning,
+                &shadow_provider,
+                &reasoning_model,
+                &mut body_owned,
+            ),
+        };
+        let request_bytes = serialized_json_len(&body_owned);
+        let Some(permit) = self.shadow_supervisor.try_admit_request(request_bytes) else {
+            return Err(ShadowDispatchOutcome::Saturated);
+        };
         let http_timeout_ms = shadow_cfg.timeout_ms;
         let task_timeout_ms = shadow_cfg.task_timeout_ms;
         let http_timeout = Duration::from_millis(http_timeout_ms);
@@ -639,6 +726,7 @@ impl AiClient {
             task_timeout_ms,
             usage_provider,
             usage_model,
+            reasoning_outcome: reasoning.outcome_label(),
             usage,
             quota_attempt: None,
         })
@@ -656,12 +744,14 @@ impl AiClient {
             task_timeout_ms,
             usage_provider,
             usage_model,
+            reasoning_outcome,
             usage,
             quota_attempt,
         } = prepared;
         tokio::spawn(async move {
             let _permit = permit;
             let _gauge = ShadowInflightGuard::enter();
+            ai_metrics::record_reasoning_policy_attempt(&provider.name, reasoning_outcome);
             match tokio::time::timeout(
                 task_timeout,
                 run_shadow_request(http, provider, path, body, http_timeout, quota_attempt),
@@ -809,7 +899,10 @@ impl AiClient {
 
             let per_provider_attempts = provider_retry_attempts(provider);
             for provider_attempt in 0..per_provider_attempts {
-                match self.forward_request(provider, path, body).await {
+                let (attempt_body, reasoning_outcome) =
+                    prepare_provider_attempt_body(config, provider, body);
+                ai_metrics::record_reasoning_policy_attempt(&provider.name, reasoning_outcome);
+                match self.forward_request(provider, path, &attempt_body).await {
                     Ok(resp) if resp.status().is_server_error() => {
                         let status = resp.status();
                         last_err = Some(anyhow::anyhow!(
@@ -1342,6 +1435,29 @@ fn provider_retry_backoff_with_jitter(retry_number: usize, jitter_seed: u64) -> 
     Duration::from_millis(base_ms.saturating_add(jitter))
 }
 
+fn prepare_provider_attempt_body(
+    config: &AiHandlerConfig,
+    provider: &ProviderConfig,
+    body: &serde_json::Value,
+) -> (serde_json::Value, &'static str) {
+    let mut attempt_body = body.clone();
+    let logical_model = attempt_body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let provider_model = provider.map_model(logical_model);
+    if !logical_model.is_empty() {
+        attempt_body["model"] = serde_json::Value::String(provider_model.clone());
+    }
+    let transform = crate::reasoning::apply_reasoning_policy(
+        config.reasoning,
+        provider,
+        &provider_model,
+        &mut attempt_body,
+    );
+    (attempt_body, transform.outcome_label())
+}
+
 impl AiClient {
     async fn forward_race(
         &self,
@@ -1360,7 +1476,9 @@ impl AiClient {
             // No race needed; single provider just forwards.
             let idx = candidates[0];
             let p = &config.providers[idx];
-            return match self.forward_request(p, path, body).await {
+            let (attempt_body, reasoning_outcome) = prepare_provider_attempt_body(config, p, body);
+            ai_metrics::record_reasoning_policy_attempt(&p.name, reasoning_outcome);
+            return match self.forward_request(p, path, &attempt_body).await {
                 Ok(r) if r.status().is_server_error() => {
                     router.record_provider_failure(idx, p.name.as_str());
                     Err(anyhow::anyhow!(
@@ -1384,7 +1502,8 @@ impl AiClient {
         for idx in &candidates {
             let provider = config.providers[*idx].clone();
             let path_owned = path.to_string();
-            let body_owned = body.clone();
+            let (body_owned, reasoning_outcome) =
+                prepare_provider_attempt_body(config, &provider, body);
             let http = self.http.clone();
             let i = *idx;
             // Pre-authorize before spawning so an unlisted host is
@@ -1414,6 +1533,7 @@ impl AiClient {
                 if matches!(format, ProviderFormat::Anthropic) {
                     req = req.header("anthropic-version", "2023-06-01");
                 }
+                ai_metrics::record_reasoning_policy_attempt(&provider.name, reasoning_outcome);
                 let resp = req.json(send_body).send().await;
                 (i, provider, resp)
             });
@@ -1569,6 +1689,7 @@ impl AiClient {
             surface,
             None,
             "",
+            None,
         )
         .await
     }
@@ -1603,6 +1724,40 @@ impl AiClient {
             surface,
             Some(quota),
             quota_reservation_prefix,
+            None,
+        )
+        .await
+    }
+
+    /// Dispatch a quota-governed confidence cascade while preserving
+    /// eligibility captured before lossy request transformations.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_cascade_with_policy_and_quota_with_reasoning_eligibility(
+        &self,
+        config: &AiHandlerConfig,
+        cascade: &crate::routing::CascadeConfig,
+        allowed_providers: &[String],
+        blocked_providers: &[String],
+        path: &str,
+        body: &serde_json::Value,
+        tags: &crate::attribution::AttributionTags,
+        surface: &str,
+        quota: &crate::quota_pool::QuotaPoolAdmission,
+        quota_reservation_prefix: &str,
+        reasoning_eligibility: crate::reasoning::ReasoningEligibility,
+    ) -> Result<CascadeOutcome> {
+        self.forward_cascade_with_policy_impl(
+            config,
+            cascade,
+            allowed_providers,
+            blocked_providers,
+            path,
+            body,
+            tags,
+            surface,
+            Some(quota),
+            quota_reservation_prefix,
+            Some(reasoning_eligibility),
         )
         .await
     }
@@ -1620,6 +1775,7 @@ impl AiClient {
         surface: &str,
         quota: Option<&crate::quota_pool::QuotaPoolAdmission>,
         quota_reservation_prefix: &str,
+        reasoning_eligibility: Option<crate::reasoning::ReasoningEligibility>,
     ) -> Result<CascadeOutcome> {
         if cascade.tiers.is_empty() {
             return Err(anyhow::anyhow!("cascade has no tiers"));
@@ -1681,12 +1837,33 @@ impl AiClient {
             // remap because the tier-specified model is the
             // authoritative choice.
             let mut tier_body = body.clone();
+            let provider_model = provider.map_model(&tier.model);
             if let Some(obj) = tier_body.as_object_mut() {
                 obj.insert(
                     "model".to_string(),
-                    serde_json::Value::String(tier.model.clone()),
+                    serde_json::Value::String(provider_model.clone()),
                 );
             }
+            let policy = if matches!(surface, "chat_completions" | "messages" | "responses") {
+                config.reasoning
+            } else {
+                crate::reasoning::ReasoningPolicy::Off
+            };
+            let reasoning = match reasoning_eligibility {
+                Some(eligibility) => crate::reasoning::apply_reasoning_policy_with_eligibility(
+                    policy,
+                    provider,
+                    &provider_model,
+                    &mut tier_body,
+                    eligibility,
+                ),
+                None => crate::reasoning::apply_reasoning_policy(
+                    policy,
+                    provider,
+                    &provider_model,
+                    &mut tier_body,
+                ),
+            };
 
             debug!(
                 tier = tier_idx,
@@ -1703,9 +1880,17 @@ impl AiClient {
                     .reserve_attempt(&reservation_id)
                     .await
                     .map_err(anyhow::Error::new)?;
+                ai_metrics::record_reasoning_policy_attempt(
+                    &provider.name,
+                    reasoning.outcome_label(),
+                );
                 self.forward_request_with_quota(provider, path, &tier_body, attempt)
                     .await
             } else {
+                ai_metrics::record_reasoning_policy_attempt(
+                    &provider.name,
+                    reasoning.outcome_label(),
+                );
                 self.forward_request(provider, path, &tier_body).await
             };
             let resp = match resp {
@@ -2192,7 +2377,11 @@ impl Default for AiClient {
 /// pass-through path) for unknown / custom provider names so existing
 /// configurations keep working unchanged.
 pub fn provider_format(provider: &ProviderConfig) -> ProviderFormat {
-    get_provider_info(&provider.name)
+    let provider_key = provider
+        .provider_type
+        .as_deref()
+        .unwrap_or(provider.name.as_str());
+    get_provider_info(provider_key)
         .map(|info| info.format)
         .unwrap_or(ProviderFormat::OpenAi)
 }
@@ -3025,6 +3214,62 @@ mod tests {
         let body = request_text.split_once("\r\n\r\n").expect("HTTP body").1;
         let body: serde_json::Value = serde_json::from_str(body).expect("JSON request body");
         assert_eq!(body["model"], "upstream-shadow-model");
+    }
+
+    #[test]
+    fn shadow_preserves_pre_compression_code_bypass() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "primary", "api_key": "primary-test-key"},
+                {
+                    "name": "shadow",
+                    "provider_type": "openai",
+                    "api_key": "shadow-test-key",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "allow_private_base_url": true
+                }
+            ],
+            "reasoning": "concise",
+            "shadow": {
+                "provider": "shadow",
+                "model": "gpt-5-mini",
+                "sample_rate": 1.0,
+                "timeout_ms": 50,
+                "task_timeout_ms": 50
+            }
+        }))
+        .expect("valid reasoning shadow fixture");
+        let original = serde_json::json!({
+            "model": "gpt-5-mini",
+            "messages": [{
+                "role": "user",
+                "content": "Implement fn parse(input: &str) -> Result<Value, Error>."
+            }]
+        });
+        let eligibility = crate::reasoning::reasoning_eligibility(&original);
+        let compressed = serde_json::json!({
+            "model": "gpt-5-mini",
+            "messages": [{"role": "user", "content": "Implement the parser."}]
+        });
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
+
+        let prepared = client
+            .prepare_shadow(
+                &config,
+                "/v1/chat/completions",
+                &compressed,
+                false,
+                &[],
+                &[],
+                false,
+                None,
+                Some(eligibility),
+            )
+            .expect("shadow is admitted");
+
+        assert_eq!(prepared.reasoning_outcome, "code_bypass");
+        assert!(prepared.body.get("reasoning_effort").is_none());
+        assert_eq!(prepared.body["messages"], compressed["messages"]);
     }
 
     #[tokio::test]

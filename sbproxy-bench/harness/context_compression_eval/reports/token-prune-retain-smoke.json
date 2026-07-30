@@ -1,0 +1,163 @@
+{
+  "schema_version": 4,
+  "profile": "token-prune-retain-recorded-smoke-v1",
+  "pipeline": [
+    {
+      "type": "token_prune",
+      "min_tokens": 32,
+      "endpoint": "recorded://token-prune-v1",
+      "model": "llmlingua-2-recorded-smoke-v1",
+      "timeout_ms": 25,
+      "max_chunks": 8,
+      "target": {
+        "mode": "retain_ratio",
+        "retain_percent": 45
+      }
+    }
+  ],
+  "token_counter": "sbproxy_target_model",
+  "latency_mode": "omitted_for_deterministic_gate",
+  "token_prune_certification": {
+    "evaluation_backend": "deterministic_recorded_v1",
+    "production_backend": "llmlingua_2_sidecar",
+    "network_access": false
+  },
+  "verified_provenance": {
+    "manifest_sha256": "a9a08b96937b1f7b022d69806bf9b5a0ccbc18a036c7c3ffe225f8db30702542",
+    "artifacts": [
+      {
+        "path": "fixtures/token-prune-smoke.jsonl",
+        "corpus": "token_prune_smoke",
+        "provenance": "independently_authored_recorded_token_prune_smoke",
+        "license": "Apache-2.0",
+        "contains_customer_data": false,
+        "official_benchmark_score": false,
+        "sha256": "ad5adc58804edc19b0c14f681a2594f8e6ce764c598109d4203c77bacea917f9"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "id": "token_prune_depot_lookup",
+      "corpus": "token_prune_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 327,
+        "output_tokens": 327,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 327,
+        "output_tokens": 179,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 148,
+      "savings_ratio": 0.452599,
+      "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "token_prune",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 327,
+          "after_tokens": 179,
+          "tokens_saved": 148
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": 0.3,
+        "min_on_quality_score": 1.0,
+        "min_quality_delta": -0.02,
+        "require_non_expanding": true
+      },
+      "acceptance_passed": true,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    },
+    {
+      "id": "token_prune_route_lookup",
+      "corpus": "token_prune_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 319,
+        "output_tokens": 319,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 319,
+        "output_tokens": 171,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 148,
+      "savings_ratio": 0.46395,
+      "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "token_prune",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 319,
+          "after_tokens": 171,
+          "tokens_saved": 148
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": 0.3,
+        "min_on_quality_score": 1.0,
+        "min_quality_delta": -0.02,
+        "require_non_expanding": true
+      },
+      "acceptance_passed": true,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    }
+  ],
+  "corpora": {
+    "token_prune_smoke": {
+      "case_count": 2,
+      "input_tokens": 646,
+      "output_tokens": 350,
+      "tokens_saved": 296,
+      "savings_ratio": 0.458204,
+      "off_quality_score": 1.0,
+      "on_quality_score": 1.0,
+      "quality_delta": 0.0,
+      "added_compression_latency_micros": null,
+      "applied_count": 2,
+      "skipped_count": 0,
+      "fallback_count": 0,
+      "skip_rate": 0.0,
+      "outcomes": {
+        "applied": 2
+      },
+      "reasons": {},
+      "acceptance_passed": true,
+      "recommendation": "build"
+    }
+  },
+  "overall": {
+    "case_count": 2,
+    "input_tokens": 646,
+    "output_tokens": 350,
+    "tokens_saved": 296,
+    "savings_ratio": 0.458204,
+    "off_quality_score": 1.0,
+    "on_quality_score": 1.0,
+    "quality_delta": 0.0,
+    "added_compression_latency_micros": null,
+    "applied_count": 2,
+    "skipped_count": 0,
+    "fallback_count": 0,
+    "skip_rate": 0.0,
+    "outcomes": {
+      "applied": 2
+    },
+    "reasons": {},
+    "acceptance_passed": true,
+    "recommendation": "build"
+  }
+}

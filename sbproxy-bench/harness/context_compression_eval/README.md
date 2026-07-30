@@ -1,6 +1,6 @@
 # Context compression evaluation harness
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-07-29*
 
 This standalone Rust harness compares context compression off and on with the
 same target model and original message array. The off arm uses an empty public
@@ -8,7 +8,7 @@ same target model and original message array. The off arm uses an empty public
 an ordered typed pipeline of production stateless levers. Both arms start from
 identical messages and use sbproxy's target-model token counter.
 
-The committed gate is intentionally small and deterministic. It is a
+The committed gate is small and deterministic. It is a
 first-party smoke evaluation, not an official benchmark score for RULER,
 HELMET, LongBench-v2, or NoLiMa.
 
@@ -48,10 +48,20 @@ pipeline, so a later lever such as WindowFit may still trim the request.
 Each checked pipeline file has `schema_version: 1`, a report profile, and an
 ordered `levers` array that deserializes directly to production
 `CompressionLeverConfig`. The harness builds the actual `RagSelectLever`,
-`CompactSerializationLever`, `PositionReorderLever`, and `WindowFitLever`
-objects in declaration order. Summary buffering requires external state and
-is rejected with `stateful levers are not supported by the deterministic
-harness`.
+`CompactSerializationLever`, `PositionReorderLever`, `QuerySelectLever`,
+`TokenPruneLever`, and `WindowFitLever` objects in declaration order. Summary
+buffering requires external state, so stateful levers are not supported by the
+deterministic harness.
+
+Token-prune reports use the special endpoint
+`recorded://token-prune-v1`. That endpoint injects a fixed, credential-free
+backend through the production `TokenPruneBackend` seam. The harness rejects
+every live endpoint and never dials the network. These reports certify marked
+span handling, retain-ratio and target-token budgets, target-model accounting,
+and evidence retention for their applied cases. Focused harness tests verify
+that live endpoints and unrecorded spans fail closed. The reports do not
+certify LLMLingua-2 model quality. Production requests use the
+operator-configured LLMLingua-2 classifier sidecar.
 
 The report CLI requires `--pipeline-config`. Profile and lever-specific
 budgets come only from that checked file, so command-line defaults cannot
@@ -115,7 +125,8 @@ passes the production `input_budget_tokens` setting explicitly in
 smaller of 192 tokens and the known model window minus the 8,000-token
 completion reserve.
 
-CI runs the matching `check` command for all five deterministic report pairs:
+The test lane runs the matching `check` command for all eight deterministic
+report pairs:
 
 - `reports/rag-select-smoke.json` and `reports/rag-select-smoke.md`;
 - `reports/compact-serialization-smoke.json` and
@@ -123,7 +134,13 @@ CI runs the matching `check` command for all five deterministic report pairs:
 - `reports/position-reorder-smoke.json` and
   `reports/position-reorder-smoke.md`;
 - `reports/phase1-pipeline-smoke.json` and
-  `reports/phase1-pipeline-smoke.md`; and
+  `reports/phase1-pipeline-smoke.md`;
+- `reports/query-select-smoke.json` and
+  `reports/query-select-smoke.md`;
+- `reports/token-prune-retain-smoke.json` and
+  `reports/token-prune-retain-smoke.md`;
+- `reports/token-prune-target-smoke.json` and
+  `reports/token-prune-target-smoke.md`; and
 - `reports/window-fit-smoke.json` and `reports/window-fit-smoke.md`.
 
 `check` rejects byte drift and also rejects a regenerated overall
@@ -175,7 +192,7 @@ contains independently authored and sanitized shapes for tool output, git
 diffs, `rg` output, and logs. It contains no credentials, customer prompts,
 absolute user paths, or raw session identifiers.
 
-Four lever-specific fixtures use independently authored sanitized shapes:
+Six lever-specific fixtures use independently authored sanitized shapes:
 
 - `rag-select-smoke.jsonl` has useful ranked evidence and long ranked
   distractors;
@@ -183,9 +200,15 @@ Four lever-specific fixtures use independently authored sanitized shapes:
   marked JSON chunk and requires at least 30% whole-request savings with
   treatment quality 1.0;
 - `position-reorder-smoke.jsonl` starts required evidence at the center and
-  requires non-expansion plus a positive quality delta; and
+  requires non-expansion plus a positive quality delta;
 - `phase1-pipeline-smoke.jsonl` requires marked query and evidence retention
-  plus positive savings through the recommended four-lever order.
+  plus positive savings through the recommended four-lever order;
+- `query-select-smoke.jsonl` covers multi-document question answering and
+  missing-query fallback; and
+- `token-prune-smoke.jsonl` pins two marked, multi-span evidence cases for the
+  deterministic recorded backend. The retain-ratio and target-token pipelines
+  each require at least 30% savings, full evidence retention, and a quality
+  delta no worse than -0.02.
 
 `fixtures/provenance.json` pins each fixture's origin, Apache-2.0 license,
 privacy declarations, official-score declaration, corpus identity, and exact

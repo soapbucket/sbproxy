@@ -1,6 +1,6 @@
 # Dependency degradation matrix
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-07-29*
 
 What happens when each dependency that SBproxy talks to is unavailable, and how the proxy degrades while it heals.
 
@@ -19,6 +19,7 @@ What happens when each dependency that SBproxy talks to is unavailable, and how 
 | AI provider (OpenAI, Anthropic, OpenRouter, ...) | 5xx, timeout, rate-limit | Routing strategy picks the next provider in the chain (`fallback_chain` / `cost_optimized`). All-providers-failed returns 502. | Auto on next successful request | `sbproxy_ai_failovers_total`, `sbproxy_ai_provider_errors_total` |
 | Redis (`proxy.l2_cache_settings`) | Connection, TLS, authentication, database selection, protocol, or command failure | A response-cache lookup failure bypasses the cache and does not arm write-back for that request. A shared rate-limit operation failure admits the request fail-open instead of switching to a local bucket. AI `summary_buffer` state never falls back to worker memory: that lever fails open, preserves the last committed message list, and lets later levers run. Other L2 consumers keep their feature-specific failure posture. | A later operation opens a fresh connection automatically; summary updates resume on a later request | `sbproxy_redis_kv_connections_total`, `sbproxy_redis_kv_operation_duration_seconds`, `sbproxy_redis_kv_operation_errors_total`, plus the compression state metrics |
 | Dedicated AI compression summarizer | Timeout, provider failure, invalid output, policy denial, or budget denial | `summary_buffer` skips safe admission denials or fails open on runtime errors. The primary AI request continues with the last committed messages, and a later `window_fit` lever still runs. | Next eligible request retries under the configured policy and timeout | `sbproxy_ai_compression_lever_total`, `sbproxy_ai_compression_requests_total`, `sbproxy_ai_compression_duration_seconds` |
+| Token-pruning classifier sidecar | Connection failure, timeout, unknown model, or invalid extractive output | `token_prune` fails open at its lever boundary. The primary request keeps the last committed messages, and later entries such as `window_fit` still run. | The route connects lazily again on the next eligible request | `sbproxy_ai_compression_lever_total{lever="token_prune"}`, `sbproxy_ai_compression_requests_total`, `sbproxy_ai_compression_duration_seconds` |
 | Governed-key budget backend (`key_management.governance.backend`, strict tier only) | Connection / command failure | Only affects keys governed under `consistency: strict`. The default `approximate` tier does not depend on this backend at all; its per-node counters keep disseminating over the cluster mesh. For a strict key, a reserve call that cannot reach the backend denies the request (`503`) by default (`failure_mode: closed`); `failure_mode: allow_unreserved` admits it instead without a reservation. A settle call on an already-admitted request is unaffected by `failure_mode` and stays best-effort. | Auto-reconnect; enforcement resumes on the next successful call | `sbproxy_governance_fail_open_total{key_id}` on `allow_unreserved`; also logged at WARN (fail-open/fail-closed) or DEBUG (other reserve/settle errors) |
 | ACME CA (Let's Encrypt) | Renewal request fails | Existing cert keeps serving until expiry. With no usable cert, an HTTP-01 self-signed bootstrap is served and an `ERROR` is logged loudly. | Retry with exponential backoff (1m to 24h) | `sbproxy_acme_renewals_total{result}` |
 | Upstream DNS (`service_discovery`) | Resolver timeout / NXDOMAIN | The cached A/AAAA set keeps serving past TTL until the next refresh succeeds. New unseen hostnames fall back to Pingora's connect-time resolver. | Auto on next refresh | None dedicated; resolver failures are logged at WARN |
@@ -205,8 +206,19 @@ fit, the lever skips as `not_eligible` and preserves the original message list.
 It does not drop half of a tool exchange or dispatch old history without the
 current turn.
 
+`query_select` is dependency-free and deterministic. A malformed retrieval
+shape, more than 4,096 source sentences in one block, a blank query in any
+block, or any structured chunk skips the whole lever without a partial rewrite.
+The sentence limit is checked before ranking. A block with no positive-scoring
+sentence stays unchanged; another block can still produce a complete candidate.
+`token_prune` depends on its configured classifier sidecar, but a failed RPC or
+invalid response changes no messages and does not stop the rest of the ordered
+pipeline. Keep `window_fit` last when the route needs a bound that survives a
+sidecar outage.
+
 Semantic-cache bypass is decided before either cache can read. Explicit
-selectors, profile-capable routes, explicit-budget route defaults, and
+selectors, profile-capable routes, `token_prune`, `query_select`,
+retrieval-aware route defaults, explicit-budget route defaults, and
 session-dependent summaries remain bypassed even when selection resolves to
 `off` or a lever later skips. Legacy default-only compatibility fitting keeps
 its existing cache behavior.

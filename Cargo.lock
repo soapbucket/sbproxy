@@ -8788,6 +8788,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "prost 0.13.5",
  "sbproxy-classifier-proto",
  "sbproxy-classifiers",
  "tokio",
@@ -8808,6 +8809,7 @@ dependencies = [
  "dirs 5.0.1",
  "ed25519-dalek",
  "hex",
+ "prost 0.11.9",
  "prost 0.13.5",
  "regex",
  "reqwest 0.12.28",

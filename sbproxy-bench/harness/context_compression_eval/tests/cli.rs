@@ -141,6 +141,15 @@ fn committed_reports_match_deterministic_regeneration() {
             "phase1-pipeline-smoke",
             "fixtures/phase1-pipeline-smoke.jsonl",
         ),
+        ("query-select-smoke", "fixtures/query-select-smoke.jsonl"),
+        (
+            "token-prune-retain-smoke",
+            "fixtures/token-prune-smoke.jsonl",
+        ),
+        (
+            "token-prune-target-smoke",
+            "fixtures/token-prune-smoke.jsonl",
+        ),
     ] {
         let pipeline = format!("pipelines/{name}.json");
         let json_report = format!("reports/{name}.json");

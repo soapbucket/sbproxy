@@ -3,7 +3,7 @@
 use crate::provider::ProviderConfig;
 use anyhow::bail;
 use schemars::schema::{
-    NumberValidation, ObjectValidation, Schema, SchemaObject, SubschemaValidation,
+    InstanceType, NumberValidation, ObjectValidation, Schema, SchemaObject, SubschemaValidation,
 };
 use schemars::{r#gen::SchemaGenerator, JsonSchema};
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,30 @@ pub const DEFAULT_COMPRESSION_STATE_TTL_SECS: u64 = 24 * 60 * 60;
 
 /// Maximum request-selectable compression profile name length.
 pub const MAX_COMPRESSION_PROFILE_NAME_LEN: usize = 64;
+
+/// Maximum sentence count accepted by one query-selection lever.
+pub const MAX_QUERY_SELECT_SENTENCES: usize = 4_096;
+
+/// Maximum target-token budget accepted by one query-selection lever.
+pub const MAX_QUERY_SELECT_TARGET_TOKENS: u64 = 1_000_000;
+
+/// Default classifier-sidecar timeout for token pruning.
+pub const DEFAULT_TOKEN_PRUNE_TIMEOUT_MS: u64 = 250;
+
+/// Default maximum number of marked chunks sent to token pruning per request.
+pub const DEFAULT_TOKEN_PRUNE_MAX_CHUNKS: usize = 64;
+
+/// Maximum bounded chunk fan-out for one token-pruning lever.
+pub const MAX_TOKEN_PRUNE_CHUNKS: usize = 256;
+
+/// Maximum absolute token-pruning target.
+pub const MAX_TOKEN_PRUNE_TARGET_TOKENS: u32 = 1_000_000;
+
+/// Maximum UTF-8 byte length of one token-pruning model id.
+pub const MAX_TOKEN_PRUNE_MODEL_ID_BYTES: usize = 256;
+
+/// Maximum classifier-sidecar timeout accepted from configuration.
+pub const MAX_TOKEN_PRUNE_TIMEOUT_MS: u64 = 60_000;
 
 /// Closed request selector for a route-local compression pipeline.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -187,12 +211,169 @@ pub enum CompressionLeverConfig {
     SummaryBuffer(SummaryBufferConfig),
     /// Deterministic compatibility trimming to the target model window.
     WindowFit(WindowFitConfig),
+    /// Sidecar-backed LLMLingua-2 token pruning over marked text chunks.
+    TokenPrune(TokenPruneConfig),
+    /// Query-aware sentence selection from marked text chunks.
+    QuerySelect(QuerySelectConfig),
     /// Retrieval-aware selection of marked context chunks.
     RagSelect(RagSelectConfig),
     /// Deterministic compact serialization of supported structured content.
     CompactSerialization(CompactSerializationConfig),
     /// Reorder marked context to mitigate lost-in-the-middle effects.
     PositionReorder(PositionReorderConfig),
+}
+
+/// Sidecar-backed extractive token-pruning configuration.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TokenPruneConfig {
+    /// Minimum target-model tokens across marked text bodies before pruning.
+    #[schemars(range(min = 1))]
+    pub min_tokens: u64,
+    /// Classifier gRPC URI or absolute `unix://` socket path.
+    #[schemars(length(min = 1))]
+    pub endpoint: String,
+    /// Sidecar token-classification model id.
+    #[schemars(length(min = 1, max = 256))]
+    pub model: String,
+    /// Per-RPC timeout in milliseconds.
+    #[serde(default = "default_token_prune_timeout_ms")]
+    #[schemars(range(min = 1, max = 60_000))]
+    pub timeout_ms: u64,
+    /// Maximum marked chunks sent to the sidecar in one request.
+    #[serde(default = "default_token_prune_max_chunks")]
+    #[schemars(range(min = 1, max = 256))]
+    pub max_chunks: usize,
+    /// Compression target interpreted by the sidecar and rechecked by the gateway.
+    pub target: TokenPruneTarget,
+}
+
+impl fmt::Debug for TokenPruneConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TokenPruneConfig")
+            .field("min_tokens", &self.min_tokens)
+            .field("endpoint", &"<redacted>")
+            .field("model", &self.model)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("max_chunks", &self.max_chunks)
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+/// Exactly one explicit token-pruning target mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TokenPruneTarget {
+    /// Retain a percentage of pruning-tokenizer tokens in each marked chunk.
+    RetainRatio {
+        /// Percentage retained, from 1 through 99.
+        #[schemars(range(min = 1, max = 99))]
+        retain_percent: u8,
+    },
+    /// Retain marked bodies within one target-model token budget.
+    TargetTokens {
+        /// Aggregate target-model token budget for marked bodies.
+        #[schemars(range(min = 1, max = 1_000_000))]
+        target_tokens: u32,
+    },
+}
+
+/// Exactly one bounded budget for query-aware sentence selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum QuerySelectConfig {
+    /// Retain at most this many relevant sentences across each retrieval block.
+    Sentences {
+        /// Maximum relevant sentence count.
+        max_sentences: usize,
+    },
+    /// Retain relevant sentences within this target-model token budget.
+    TargetTokens {
+        /// Maximum estimated tokens across selected sentence bodies.
+        target_tokens: u64,
+    },
+}
+
+impl<'de> Deserialize<'de> for QuerySelectConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireConfig {
+            #[serde(default)]
+            max_sentences: Option<usize>,
+            #[serde(default)]
+            target_tokens: Option<u64>,
+        }
+
+        let wire = WireConfig::deserialize(deserializer)?;
+        match (wire.max_sentences, wire.target_tokens) {
+            (Some(max_sentences), None) => Ok(Self::Sentences { max_sentences }),
+            (None, Some(target_tokens)) => Ok(Self::TargetTokens { target_tokens }),
+            _ => Err(serde::de::Error::custom(
+                "query_select requires exactly one of max_sentences or target_tokens",
+            )),
+        }
+    }
+}
+
+impl JsonSchema for QuerySelectConfig {
+    fn schema_name() -> String {
+        "QuerySelectConfig".to_string()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        let bounded_integer = |format: &str, maximum: f64| {
+            SchemaObject {
+                instance_type: Some(InstanceType::Integer.into()),
+                format: Some(format.to_string()),
+                number: Some(Box::new(NumberValidation {
+                    minimum: Some(1.0),
+                    maximum: Some(maximum),
+                    ..NumberValidation::default()
+                })),
+                ..SchemaObject::default()
+            }
+            .into()
+        };
+        let required = |property: &str| {
+            SchemaObject {
+                object: Some(Box::new(ObjectValidation {
+                    required: BTreeSet::from([property.to_string()]),
+                    ..ObjectValidation::default()
+                })),
+                ..SchemaObject::default()
+            }
+            .into()
+        };
+        let mut object = ObjectValidation {
+            additional_properties: Some(Box::new(false.into())),
+            ..ObjectValidation::default()
+        };
+        object.properties.insert(
+            "max_sentences".to_string(),
+            bounded_integer("uint", MAX_QUERY_SELECT_SENTENCES as f64),
+        );
+        object.properties.insert(
+            "target_tokens".to_string(),
+            bounded_integer("uint64", MAX_QUERY_SELECT_TARGET_TOKENS as f64),
+        );
+
+        SchemaObject {
+            instance_type: Some(InstanceType::Object.into()),
+            object: Some(Box::new(object)),
+            subschemas: Some(Box::new(SubschemaValidation {
+                one_of: Some(vec![required("max_sentences"), required("target_tokens")]),
+                ..SubschemaValidation::default()
+            })),
+            ..SchemaObject::default()
+        }
+        .into()
+    }
 }
 
 /// Configuration for retrieval-aware marked-context selection.
@@ -470,6 +651,81 @@ fn validate_pipeline(
                     bail!("{path}.levers[{index}].input_budget_tokens must be greater than zero");
                 }
             }
+            CompressionLeverConfig::TokenPrune(token_prune) => {
+                if token_prune.min_tokens == 0 {
+                    bail!("{path}.levers[{index}].min_tokens must be greater than zero");
+                }
+                if token_prune.model.trim().is_empty() {
+                    bail!("{path}.levers[{index}].model must not be empty");
+                }
+                if token_prune.model.len() > MAX_TOKEN_PRUNE_MODEL_ID_BYTES {
+                    bail!(
+                        "{path}.levers[{index}].model must be at most {MAX_TOKEN_PRUNE_MODEL_ID_BYTES} UTF-8 bytes"
+                    );
+                }
+                if token_prune.endpoint.trim().is_empty() {
+                    bail!("{path}.levers[{index}].endpoint must not be empty");
+                }
+                if let Some(socket_path) = token_prune.endpoint.strip_prefix("unix://") {
+                    if !std::path::Path::new(socket_path).is_absolute() {
+                        bail!("{path}.levers[{index}].endpoint unix socket path must be absolute");
+                    }
+                } else {
+                    sbproxy_classifier_client::ClassifierClient::validate_endpoint(
+                        &token_prune.endpoint,
+                    )
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "{path}.levers[{index}].endpoint must be a valid classifier gRPC URI or absolute unix:// path"
+                        )
+                    })?;
+                }
+                if token_prune.timeout_ms == 0
+                    || token_prune.timeout_ms > MAX_TOKEN_PRUNE_TIMEOUT_MS
+                {
+                    bail!(
+                        "{path}.levers[{index}].timeout_ms must be between 1 and {MAX_TOKEN_PRUNE_TIMEOUT_MS}"
+                    );
+                }
+                if token_prune.max_chunks == 0 || token_prune.max_chunks > MAX_TOKEN_PRUNE_CHUNKS {
+                    bail!(
+                        "{path}.levers[{index}].max_chunks must be between 1 and {MAX_TOKEN_PRUNE_CHUNKS}"
+                    );
+                }
+                match token_prune.target {
+                    TokenPruneTarget::RetainRatio { retain_percent }
+                        if !(1..=99).contains(&retain_percent) =>
+                    {
+                        bail!(
+                            "{path}.levers[{index}].target.retain_percent must be between 1 and 99"
+                        );
+                    }
+                    TokenPruneTarget::TargetTokens { target_tokens }
+                        if target_tokens == 0 || target_tokens > MAX_TOKEN_PRUNE_TARGET_TOKENS =>
+                    {
+                        bail!(
+                            "{path}.levers[{index}].target.target_tokens must be between 1 and {MAX_TOKEN_PRUNE_TARGET_TOKENS}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            CompressionLeverConfig::QuerySelect(query_select) => match query_select {
+                QuerySelectConfig::Sentences { max_sentences } => {
+                    if *max_sentences == 0 || *max_sentences > MAX_QUERY_SELECT_SENTENCES {
+                        bail!(
+                            "{path}.levers[{index}].max_sentences must be between 1 and {MAX_QUERY_SELECT_SENTENCES}"
+                        );
+                    }
+                }
+                QuerySelectConfig::TargetTokens { target_tokens } => {
+                    if *target_tokens == 0 || *target_tokens > MAX_QUERY_SELECT_TARGET_TOKENS {
+                        bail!(
+                            "{path}.levers[{index}].target_tokens must be between 1 and {MAX_QUERY_SELECT_TARGET_TOKENS}"
+                        );
+                    }
+                }
+            },
             CompressionLeverConfig::RagSelect(rag_select) => {
                 if rag_select.min_tokens == 0 {
                     bail!("{path}.levers[{index}].min_tokens must be greater than zero");
@@ -501,6 +757,14 @@ fn default_completion_reserve_tokens() -> u64 {
     DEFAULT_COMPLETION_RESERVE_TOKENS
 }
 
+fn default_token_prune_timeout_ms() -> u64 {
+    DEFAULT_TOKEN_PRUNE_TIMEOUT_MS
+}
+
+fn default_token_prune_max_chunks() -> usize {
+    DEFAULT_TOKEN_PRUNE_MAX_CHUNKS
+}
+
 fn default_tabular_min_rows() -> usize {
     8
 }
@@ -517,7 +781,7 @@ enum DurationSchema {
 mod tests {
     use super::{
         CompressionLeverConfig, CompressionPolicy, CompressionSelector, CompressionStateBackend,
-        RetrievalRanking,
+        QuerySelectConfig, RetrievalRanking, TokenPruneConfig, TokenPruneTarget,
     };
     use crate::handler::AiHandlerConfig;
     use jsonschema::JSONSchema;
@@ -580,6 +844,53 @@ mod tests {
     fn generated_schema_rejects_runtime_invalid_stateless_bounds() {
         let schema = compression_schema();
         let invalid = [
+            serde_json::json!({
+                "type": "token_prune",
+                "min_tokens": 0,
+                "endpoint": "http://127.0.0.1:9440",
+                "model": "llmlingua-2",
+                "target": {"mode": "retain_ratio", "retain_percent": 50}
+            }),
+            serde_json::json!({
+                "type": "token_prune",
+                "min_tokens": 1,
+                "endpoint": "http://127.0.0.1:9440",
+                "model": "llmlingua-2",
+                "timeout_ms": 60_001,
+                "target": {"mode": "retain_ratio", "retain_percent": 50}
+            }),
+            serde_json::json!({
+                "type": "token_prune",
+                "min_tokens": 1,
+                "endpoint": "http://127.0.0.1:9440",
+                "model": "llmlingua-2",
+                "max_chunks": 257,
+                "target": {"mode": "retain_ratio", "retain_percent": 50}
+            }),
+            serde_json::json!({
+                "type": "token_prune",
+                "min_tokens": 1,
+                "endpoint": "http://127.0.0.1:9440",
+                "model": "llmlingua-2",
+                "target": {"mode": "retain_ratio", "retain_percent": 100}
+            }),
+            serde_json::json!({
+                "type": "token_prune",
+                "min_tokens": 1,
+                "endpoint": "http://127.0.0.1:9440",
+                "model": "llmlingua-2",
+                "target": {"mode": "target_tokens", "target_tokens": 1_000_001}
+            }),
+            serde_json::json!({"type": "query_select", "max_sentences": 0}),
+            serde_json::json!({"type": "query_select", "max_sentences": 4_097}),
+            serde_json::json!({"type": "query_select", "target_tokens": 0}),
+            serde_json::json!({"type": "query_select", "target_tokens": 1_000_001}),
+            serde_json::json!({"type": "query_select"}),
+            serde_json::json!({
+                "type": "query_select",
+                "max_sentences": 8,
+                "target_tokens": 512
+            }),
             serde_json::json!({"type": "rag_select", "min_tokens": 0, "max_chunks": 1}),
             serde_json::json!({"type": "rag_select", "min_tokens": 1, "max_chunks": 0}),
             serde_json::json!({
@@ -606,6 +917,174 @@ mod tests {
             "min_relevance_percent": 100
         }));
         assert!(schema.is_valid(&valid));
+        assert!(schema.is_valid(&policy_with_lever(serde_json::json!({
+            "type": "query_select",
+            "max_sentences": 4_096
+        }))));
+        assert!(schema.is_valid(&policy_with_lever(serde_json::json!({
+            "type": "query_select",
+            "target_tokens": 1_000_000
+        }))));
+        assert!(schema.is_valid(&policy_with_lever(serde_json::json!({
+            "type": "token_prune",
+            "min_tokens": 1,
+            "endpoint": "unix:///run/sbproxy/classifier.sock",
+            "model": "llmlingua-2",
+            "timeout_ms": 60_000,
+            "max_chunks": 256,
+            "target": {"mode": "retain_ratio", "retain_percent": 99}
+        }))));
+    }
+
+    #[test]
+    fn parses_both_token_pruning_targets_and_defaults() {
+        let config = AiHandlerConfig::from_config(config_with_levers(serde_json::json!([
+            {
+                "type": "token_prune",
+                "min_tokens": 1_024,
+                "endpoint": "http://127.0.0.1:9440",
+                "model": "llmlingua-2",
+                "target": {"mode": "retain_ratio", "retain_percent": 40}
+            },
+            {
+                "type": "token_prune",
+                "min_tokens": 2_048,
+                "endpoint": "unix:///run/sbproxy/classifier.sock",
+                "model": "llmlingua-2",
+                "timeout_ms": 500,
+                "max_chunks": 12,
+                "target": {"mode": "target_tokens", "target_tokens": 768}
+            }
+        ])))
+        .expect("token-pruning targets parse");
+        let levers = &config.compression.expect("compression policy").levers;
+
+        let CompressionLeverConfig::TokenPrune(ratio) = &levers[0] else {
+            panic!("expected ratio token-prune config");
+        };
+        assert_eq!(ratio.timeout_ms, 250);
+        assert_eq!(ratio.max_chunks, 64);
+        assert_eq!(
+            ratio.target,
+            TokenPruneTarget::RetainRatio { retain_percent: 40 }
+        );
+        let CompressionLeverConfig::TokenPrune(tokens) = &levers[1] else {
+            panic!("expected absolute token-prune config");
+        };
+        assert_eq!(tokens.timeout_ms, 500);
+        assert_eq!(tokens.max_chunks, 12);
+        assert_eq!(
+            tokens.target,
+            TokenPruneTarget::TargetTokens { target_tokens: 768 }
+        );
+    }
+
+    #[test]
+    fn token_prune_debug_redacts_endpoint_through_enclosing_configs() {
+        let sensitive_endpoint = "unix:///private/customer-a/classifier.sock";
+        let token_prune = TokenPruneConfig {
+            min_tokens: 1_024,
+            endpoint: sensitive_endpoint.to_string(),
+            model: "llmlingua-2".to_string(),
+            timeout_ms: 250,
+            max_chunks: 64,
+            target: TokenPruneTarget::TargetTokens { target_tokens: 768 },
+        };
+        let lever = CompressionLeverConfig::TokenPrune(token_prune.clone());
+        let policy = CompressionPolicy {
+            levers: vec![lever.clone()],
+            ..CompressionPolicy::default()
+        };
+
+        for debug in [
+            format!("{token_prune:?}"),
+            format!("{lever:?}"),
+            format!("{policy:?}"),
+        ] {
+            assert!(!debug.contains(sensitive_endpoint), "{debug}");
+            assert!(debug.contains("<redacted>"), "{debug}");
+            assert!(debug.contains("llmlingua-2"), "{debug}");
+        }
+    }
+
+    #[test]
+    fn schema_rejects_token_prune_model_ids_longer_than_256_characters() {
+        let schema = compression_schema();
+        let policy = policy_with_lever(serde_json::json!({
+            "type": "token_prune",
+            "min_tokens": 1_024,
+            "endpoint": "http://127.0.0.1:9440",
+            "model": "m".repeat(257),
+            "target": {"mode": "retain_ratio", "retain_percent": 50}
+        }));
+
+        assert!(!schema.is_valid(&policy));
+    }
+
+    #[test]
+    fn runtime_bounds_token_prune_model_ids_by_utf8_bytes() {
+        let exactly_256_bytes = "é".repeat(128);
+        let valid = config_with_levers(serde_json::json!([{
+            "type": "token_prune",
+            "min_tokens": 1_024,
+            "endpoint": "http://127.0.0.1:9440",
+            "model": exactly_256_bytes,
+            "target": {"mode": "retain_ratio", "retain_percent": 50}
+        }]));
+        AiHandlerConfig::from_config(valid).expect("a 256-byte model id is valid");
+
+        let oversized = format!("{exactly_256_bytes}x");
+        let invalid = config_with_levers(serde_json::json!([{
+            "type": "token_prune",
+            "min_tokens": 1_024,
+            "endpoint": "http://127.0.0.1:9440",
+            "model": oversized,
+            "target": {"mode": "retain_ratio", "retain_percent": 50}
+        }]));
+        let error = AiHandlerConfig::from_config(invalid)
+            .expect_err("a 257-byte model id must fail before runtime")
+            .to_string();
+
+        assert!(error.contains("at most 256 UTF-8 bytes"), "{error}");
+    }
+
+    #[test]
+    fn parses_exactly_one_bounded_query_selection_budget() {
+        let config = AiHandlerConfig::from_config(config_with_levers(serde_json::json!([
+            {"type": "query_select", "max_sentences": 12},
+            {"type": "query_select", "target_tokens": 768}
+        ])))
+        .expect("query selection budgets parse");
+        let levers = &config.compression.expect("compression policy").levers;
+
+        assert_eq!(
+            levers[0],
+            CompressionLeverConfig::QuerySelect(QuerySelectConfig::Sentences { max_sentences: 12 })
+        );
+        assert_eq!(
+            levers[1],
+            CompressionLeverConfig::QuerySelect(QuerySelectConfig::TargetTokens {
+                target_tokens: 768
+            })
+        );
+
+        for invalid in [
+            serde_json::json!({"type": "query_select"}),
+            serde_json::json!({
+                "type": "query_select",
+                "max_sentences": 12,
+                "target_tokens": 768
+            }),
+            serde_json::json!({"type": "query_select", "max_sentences": 0}),
+            serde_json::json!({"type": "query_select", "max_sentences": 4_097}),
+            serde_json::json!({"type": "query_select", "target_tokens": 0}),
+            serde_json::json!({"type": "query_select", "target_tokens": 1_000_001}),
+        ] {
+            assert!(
+                AiHandlerConfig::from_config(config_with_levers(serde_json::json!([invalid])))
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -792,6 +1271,19 @@ mod tests {
     #[test]
     fn rejects_unknown_fields_in_every_stateless_config() {
         let cases = [
+            serde_json::json!({
+                "type": "token_prune",
+                "min_tokens": 1_024,
+                "endpoint": "http://127.0.0.1:9440",
+                "model": "llmlingua-2",
+                "target": {"mode": "retain_ratio", "retain_percent": 50},
+                "unknown": true
+            }),
+            serde_json::json!({
+                "type": "query_select",
+                "max_sentences": 8,
+                "unknown": true
+            }),
             serde_json::json!({
                 "type": "rag_select",
                 "min_tokens": 1_024,

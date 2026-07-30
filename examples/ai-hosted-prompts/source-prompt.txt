@@ -1,0 +1,1 @@
+Classify the access decision. Return exactly "approved" when the input says access was granted. Return exactly "denied" when the input says access was denied. Do not add punctuation or explanation.

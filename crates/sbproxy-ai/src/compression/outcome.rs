@@ -10,6 +10,10 @@ pub enum LeverKind {
     SummaryBuffer,
     /// Deterministic target-window fitting.
     WindowFit,
+    /// Sidecar-backed extractive token pruning.
+    TokenPrune,
+    /// Query-aware sentence selection from marked context.
+    QuerySelect,
     /// Retrieval-aware selection of marked context chunks.
     RagSelect,
     /// Deterministic compact serialization of supported structured content.
@@ -24,6 +28,8 @@ impl LeverKind {
         match self {
             Self::SummaryBuffer => "summary_buffer",
             Self::WindowFit => "window_fit",
+            Self::TokenPrune => "token_prune",
+            Self::QuerySelect => "query_select",
             Self::RagSelect => "rag_select",
             Self::CompactSerialization => "compact_serialization",
             Self::PositionReorder => "position_reorder",
@@ -68,6 +74,8 @@ pub enum SkipReason {
     LockContended,
     /// No marked context was present in the request.
     NoMarkedContext,
+    /// No usable nonblank marked query was present.
+    MissingQuery,
     /// Marked context could not be parsed without ambiguity.
     MalformedMarkedContext,
     /// Marked context exceeded the lever's bounded processing limit.
@@ -103,6 +111,7 @@ impl SkipReason {
             Self::PolicyDenied => "policy_denied",
             Self::LockContended => "lock_contended",
             Self::NoMarkedContext => "no_marked_context",
+            Self::MissingQuery => "missing_query",
             Self::MalformedMarkedContext => "malformed_marked_context",
             Self::MarkedContextTooLarge => "marked_context_too_large",
             Self::MissingRelevanceScore => "missing_relevance_score",
@@ -128,6 +137,10 @@ pub enum FailureReason {
     SummarizerProvider,
     /// The summarizer response was empty, oversized, or malformed.
     InvalidSummary,
+    /// The token-pruning sidecar could not complete the request.
+    TokenPruneUnavailable,
+    /// The token-pruning sidecar returned an invalid or over-budget result.
+    InvalidTokenPruneOutput,
     /// A record or message could not be serialized safely.
     Serialization,
     /// A bounded internal invariant failed without exposing raw details.
@@ -144,6 +157,8 @@ impl FailureReason {
             Self::SummarizerTimeout => "summarizer_timeout",
             Self::SummarizerProvider => "summarizer_provider",
             Self::InvalidSummary => "invalid_summary",
+            Self::TokenPruneUnavailable => "token_prune_unavailable",
+            Self::InvalidTokenPruneOutput => "invalid_token_prune_output",
             Self::Serialization => "serialization",
             Self::Internal => "internal",
         }
@@ -214,6 +229,8 @@ mod tests {
 
     #[test]
     fn stateless_lever_kinds_have_stable_labels() {
+        assert_eq!(LeverKind::TokenPrune.as_str(), "token_prune");
+        assert_eq!(LeverKind::QuerySelect.as_str(), "query_select");
         assert_eq!(LeverKind::RagSelect.as_str(), "rag_select");
         assert_eq!(
             LeverKind::CompactSerialization.as_str(),
@@ -224,6 +241,7 @@ mod tests {
 
     #[test]
     fn stateless_skip_reasons_have_stable_labels() {
+        assert_eq!(SkipReason::MissingQuery.as_str(), "missing_query");
         assert_eq!(SkipReason::NoMarkedContext.as_str(), "no_marked_context");
         assert_eq!(
             SkipReason::MalformedMarkedContext.as_str(),

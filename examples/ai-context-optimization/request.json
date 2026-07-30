@@ -1,0 +1,9 @@
+{
+  "model": "gpt-5-mini",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Use the marked deployment records to answer the question. Cite the matching chunk IDs.\n\n<sbproxy-retrieval>\n<sbproxy-query>\nWhy did checkout-api fail to start after the 14:02 deployment?\n</sbproxy-query>\n<sbproxy-chunk id=\"release\" format=\"text\">\nThe checkout-api release began at 14:02. The deployment used image registry.internal/checkout:v184. Three replicas were requested. The release owner was the payments team.\n</sbproxy-chunk>\n<sbproxy-chunk id=\"events\" format=\"text\">\nAll new checkout-api pods entered ImagePullBackOff. The registry returned manifest unknown for checkout:v184. The previous v183 image remained available. The scheduler placed every pod successfully.\n</sbproxy-chunk>\n<sbproxy-chunk id=\"database\" format=\"text\">\nDatabase latency stayed below 8 milliseconds during the release. No connection errors were recorded. The migration job completed before deployment.\n</sbproxy-chunk>\n<sbproxy-chunk id=\"network\" format=\"text\">\nThe service mesh reported healthy sidecars. DNS resolution and outbound registry connectivity both passed their probes. No network policy changed.\n</sbproxy-chunk>\n</sbproxy-retrieval>"
+    }
+  ]
+}
