@@ -723,6 +723,86 @@ struct AiCmd {
 enum AiSub {
     /// Verifiable usage ledger commands.
     Ledger(LedgerCmd),
+    /// Versioned prompt tools.
+    Prompt(Box<PromptCmd>),
+}
+
+#[derive(clap::Args, Debug)]
+struct PromptCmd {
+    #[command(subcommand)]
+    sub: PromptSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum PromptSub {
+    /// Compile a shorter static system prompt against an evaluation set.
+    Optimize(PromptOptimizeArgs),
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptEvalMetricArg {
+    ExactMatch,
+    Contains,
+    JsonExact,
+}
+
+impl From<PromptEvalMetricArg> for sbproxy_ai::prompt_optimizer::PromptEvalMetric {
+    fn from(value: PromptEvalMetricArg) -> Self {
+        match value {
+            PromptEvalMetricArg::ExactMatch => Self::ExactMatch,
+            PromptEvalMetricArg::Contains => Self::Contains,
+            PromptEvalMetricArg::JsonExact => Self::JsonExact,
+        }
+    }
+}
+
+#[derive(clap::Args, Debug)]
+struct PromptOptimizeArgs {
+    /// UTF-8 file containing the source system prompt.
+    #[arg(long)]
+    prompt: PathBuf,
+    /// Customer-owned JSONL evaluation set.
+    #[arg(long = "eval-set")]
+    eval_set: PathBuf,
+    /// OpenAI-compatible base URL or full chat-completions endpoint.
+    #[arg(long)]
+    endpoint: String,
+    /// Optional HTTP Host header when the endpoint uses a separate dial address.
+    #[arg(long = "host-header")]
+    host_header: Option<String>,
+    /// Environment variable containing the endpoint API key.
+    #[arg(long = "api-key-env")]
+    api_key_env: Option<String>,
+    /// Model used to evaluate the source and candidate prompts.
+    #[arg(long = "task-model")]
+    task_model: String,
+    /// Model used once to propose shorter instructions. Defaults to task model.
+    #[arg(long = "optimizer-model")]
+    optimizer_model: Option<String>,
+    /// Deterministic evaluation metric.
+    #[arg(long, value_enum, default_value_t = PromptEvalMetricArg::ExactMatch)]
+    metric: PromptEvalMetricArg,
+    /// Maximum accepted aggregate quality drop.
+    #[arg(long = "noise-tolerance", default_value_t = 0.02)]
+    noise_tolerance: f64,
+    /// Maximum candidate instructions evaluated.
+    #[arg(long = "max-candidates", default_value_t = 8)]
+    max_candidates: usize,
+    /// Hard cap on all model requests in this run.
+    #[arg(long = "max-requests", default_value_t = 256)]
+    max_requests: usize,
+    /// Per-request timeout in seconds.
+    #[arg(long = "timeout-secs", default_value_t = 60)]
+    timeout_secs: u64,
+    /// Prompt-store name written into the artifact.
+    #[arg(long)]
+    name: String,
+    /// Prompt version label written into the artifact.
+    #[arg(long = "prompt-version")]
+    prompt_version: String,
+    /// JSON artifact output path.
+    #[arg(long)]
+    output: PathBuf,
 }
 
 #[derive(clap::Args, Debug)]
@@ -7674,7 +7754,102 @@ fn handle_ai_subcommand(cmd: &AiCmd) -> anyhow::Result<i32> {
         AiSub::Ledger(ledger) => match &ledger.sub {
             LedgerSub::Verify(args) => handle_ledger_verify(args),
         },
+        AiSub::Prompt(prompt) => match &prompt.sub {
+            PromptSub::Optimize(args) => handle_prompt_optimize(args),
+        },
     }
+}
+
+fn handle_prompt_optimize(args: &PromptOptimizeArgs) -> anyhow::Result<i32> {
+    const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+    const MAX_EVAL_SET_BYTES: usize = 16 * 1024 * 1024;
+
+    let prompt_bytes = read_bounded_cli_file(&args.prompt, MAX_PROMPT_BYTES, "system prompt")?;
+    let prompt = std::str::from_utf8(&prompt_bytes)
+        .map_err(|error| anyhow::anyhow!("system prompt must be UTF-8: {error}"))?;
+    let eval_bytes = read_bounded_cli_file(&args.eval_set, MAX_EVAL_SET_BYTES, "eval set")?;
+    let cases = sbproxy_ai::prompt_optimizer::parse_prompt_eval_jsonl(&eval_bytes)?;
+    let api_key = match args.api_key_env.as_deref() {
+        Some(name) => {
+            if name.trim().is_empty() || name.contains('=') {
+                anyhow::bail!("--api-key-env must name one environment variable");
+            }
+            Some(
+                std::env::var(name)
+                    .map_err(|_| anyhow::anyhow!("environment variable {name:?} is not set"))?,
+            )
+        }
+        None => None,
+    };
+    let mut client = sbproxy_ai::prompt_optimizer::OpenAiPromptOptimizationClient::new(
+        &args.endpoint,
+        api_key,
+        std::time::Duration::from_secs(args.timeout_secs),
+    )?;
+    if let Some(host) = args.host_header.as_deref() {
+        client = client.with_host_header(host)?;
+    }
+    let config = sbproxy_ai::prompt_optimizer::PromptOptimizationConfig {
+        name: args.name.clone(),
+        version: args.prompt_version.clone(),
+        task_model: args.task_model.clone(),
+        optimizer_model: args
+            .optimizer_model
+            .clone()
+            .unwrap_or_else(|| args.task_model.clone()),
+        metric: args.metric.into(),
+        noise_tolerance: args.noise_tolerance,
+        max_candidates: args.max_candidates,
+        max_requests: args.max_requests,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("build prompt optimizer runtime: {error}"))?;
+    let artifact = runtime.block_on(sbproxy_ai::prompt_optimizer::optimize_prompt(
+        &client, prompt, &cases, &config,
+    ))?;
+    let mut output = serde_json::to_vec_pretty(&artifact)
+        .map_err(|error| anyhow::anyhow!("serialize prompt artifact: {error}"))?;
+    output.push(b'\n');
+    std::fs::write(&args.output, output).map_err(|error| {
+        anyhow::anyhow!("write prompt artifact {}: {error}", args.output.display())
+    })?;
+    println!(
+        "prompt optimize: wrote {} ({} -> {} tokens, quality {:.4} -> {:.4})",
+        args.output.display(),
+        artifact.original_tokens,
+        artifact.optimized_tokens,
+        artifact.baseline_score,
+        artifact.optimized_score
+    );
+    Ok(0)
+}
+
+fn read_bounded_cli_file(
+    path: &std::path::Path,
+    maximum: usize,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| anyhow::anyhow!("read {label} {}: {error}", path.display()))?;
+    if metadata.len() > maximum as u64 {
+        anyhow::bail!(
+            "{label} {} exceeds the {} byte limit",
+            path.display(),
+            maximum
+        );
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| anyhow::anyhow!("read {label} {}: {error}", path.display()))?;
+    if bytes.len() > maximum {
+        anyhow::bail!(
+            "{label} {} exceeds the {} byte limit",
+            path.display(),
+            maximum
+        );
+    }
+    Ok(bytes)
 }
 
 fn handle_ledger_verify(args: &LedgerVerifyArgs) -> anyhow::Result<i32> {
@@ -10650,5 +10825,144 @@ origins:
             password_stdin: true,
         };
         assert!(handle_admin_hash_password_to(&both, None, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn prompt_optimize_cli_parses_nested_contract() {
+        let cli = Cli::try_parse_from([
+            "sbproxy",
+            "ai",
+            "prompt",
+            "optimize",
+            "--prompt",
+            "system.txt",
+            "--eval-set",
+            "eval.jsonl",
+            "--endpoint",
+            "http://127.0.0.1:8080/v1",
+            "--host-header",
+            "ai.local",
+            "--task-model",
+            "task",
+            "--name",
+            "answer",
+            "--prompt-version",
+            "2",
+            "--output",
+            "artifact.json",
+        ])
+        .expect("prompt optimizer CLI parses");
+        let Some(Cmd::Ai(AiCmd {
+            sub: AiSub::Prompt(prompt),
+        })) = cli.cmd
+        else {
+            panic!("expected ai prompt optimize");
+        };
+        let PromptCmd {
+            sub: PromptSub::Optimize(args),
+        } = *prompt;
+        assert_eq!(args.metric, PromptEvalMetricArg::ExactMatch);
+        assert_eq!(args.max_candidates, 8);
+        assert_eq!(args.max_requests, 256);
+        assert_eq!(args.timeout_secs, 60);
+        assert_eq!(args.host_header.as_deref(), Some("ai.local"));
+        assert_eq!(args.prompt_version, "2");
+    }
+
+    #[test]
+    fn prompt_optimize_handler_writes_admin_ready_static_artifact() {
+        use std::io::{Read as _, Write as _};
+
+        fn read_request(stream: &mut std::net::TcpStream) {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut scratch = [0u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut scratch).unwrap();
+                assert!(read > 0);
+                bytes.extend_from_slice(&scratch[..read]);
+                if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::trim)
+                        .map(str::to_string)
+                })
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            while bytes.len() < header_end + content_length {
+                let read = stream.read(&mut scratch).unwrap();
+                assert!(read > 0);
+                bytes.extend_from_slice(&scratch[..read]);
+            }
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for content in ["alpha", r#"["Return only the requested word."]"#, "alpha"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                read_request(&mut stream);
+                let body = serde_json::json!({
+                    "choices": [{"message": {"content": content}}]
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let prompt = temp_config(
+            "You are a careful assistant. Return exactly the requested word and no other text.",
+        );
+        let eval_set = temp_config(r#"{"id":"one","input":"Say alpha","expected":"alpha"}"#);
+        let output = temp_config("{}");
+        let args = PromptOptimizeArgs {
+            prompt: prompt.clone(),
+            eval_set: eval_set.clone(),
+            endpoint: format!("http://{address}/v1"),
+            host_header: None,
+            api_key_env: None,
+            task_model: "task-model".to_string(),
+            optimizer_model: None,
+            metric: PromptEvalMetricArg::ExactMatch,
+            noise_tolerance: 0.0,
+            max_candidates: 1,
+            max_requests: 3,
+            timeout_secs: 5,
+            name: "concise-answer".to_string(),
+            prompt_version: "2".to_string(),
+            output: output.clone(),
+        };
+
+        assert_eq!(handle_prompt_optimize(&args).unwrap(), 0);
+        server.join().unwrap();
+        let artifact: sbproxy_ai::prompt_optimizer::OptimizedPromptArtifact =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(artifact.name, "concise-answer");
+        assert_eq!(artifact.prompt_version.version, "2");
+        assert_eq!(
+            artifact.prompt_version.template,
+            "Return only the requested word."
+        );
+        assert!(artifact.prompt_version.variables.is_empty());
+        assert!(artifact.optimized_tokens < artifact.original_tokens);
+
+        for path in [prompt, eval_set, output] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }

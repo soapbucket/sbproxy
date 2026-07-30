@@ -97,7 +97,9 @@ pub fn verify_fixture_set(root: &Path, manifest: &ProvenanceManifest) -> Result<
         }
         let first_party = matches!(
             artifact.provenance.as_str(),
-            "independently_authored_synthetic" | "independently_authored_sanitized_shape"
+            "independently_authored_synthetic"
+                | "independently_authored_sanitized_shape"
+                | "independently_authored_recorded_token_prune_smoke"
         );
         let operator_supplied = artifact.provenance == "operator_supplied_external";
         if !first_party && !operator_supplied {

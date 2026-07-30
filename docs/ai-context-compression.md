@@ -1,15 +1,18 @@
 # AI context compression
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-07-29*
 
 SBproxy can transform an AI chat request through an ordered, route-local
 compression pipeline before provider selection and dispatch. A route can keep
 one default pipeline and declare named profiles for different callers. Use
-the retrieval-aware stateless levers for explicitly marked context, then use
-`window_fit` for a final deterministic input bound. Add `summary_buffer` when
-conversations need a compact running summary. With no `state` block,
-`summary_buffer` uses a process-owned Local redb database with a 24-hour TTL.
-Select Redis or mesh explicitly when summaries must move between replicas.
+the retrieval-aware stateless levers for explicitly marked context. The
+`query_select` lever keeps sentences related to the marked question.
+`token_prune` can then use an operator-supplied LLMLingua-2-compatible ONNX
+model to remove lower-value tokens. Finish with `window_fit` for a deterministic
+input bound. Add `summary_buffer` when conversations need a compact running
+summary. With no `state` block, `summary_buffer` uses a process-owned Local redb
+database with a 24-hour TTL. Select Redis or mesh explicitly when summaries
+must move between replicas.
 
 This page is the canonical operator guide for compression configuration,
 runtime behavior, state, degradation, and telemetry.
@@ -20,23 +23,29 @@ Each `ai_proxy` action can declare one `compression.levers` array. SBproxy runs
 the entries in declaration order against one working message list:
 
 1. A lever sees the output committed by earlier levers.
-2. `summary_buffer`, `window_fit`, `rag_select`, and
-   `compact_serialization` replace the working list only when the candidate
+2. `summary_buffer`, `window_fit`, `token_prune`, `query_select`, `rag_select`,
+   and `compact_serialization` replace the working list only when the candidate
    strictly reduces SBproxy's token estimate for the effective model.
    `position_reorder` may commit a changed, non-expanding candidate.
 3. A skipped or failed lever leaves the working list unchanged.
 4. Later levers still run after a skip or failure.
 5. Provider routing and failover see only the final committed list.
 
-For explicitly marked retrieval input, the recommended order is `rag_select`,
-`compact_serialization`, `position_reorder`, then `window_fit`. Stateful chat
-history commonly uses `summary_buffer` followed by `window_fit`. These can be
-separate named profiles on one route.
+For explicitly marked retrieval input, a useful quality-first order is
+`query_select`, `token_prune`, then `window_fit`. Put `rag_select` before
+`query_select` when the retriever returns many independent chunks. Run
+`compact_serialization` only on structured chunks, which `token_prune` and
+`query_select` deliberately skip. `query_select` already places the strongest
+retained chunks at the block edges, so a following `position_reorder` is
+usually redundant. Stateful chat history commonly uses `summary_buffer`
+followed by `window_fit`. These can be separate named profiles on one route.
 
 | Lever | State | Purpose | Typical position |
 |---|---|---|---|
 | `summary_buffer` | Local by default; explicit Redis or mesh | Replace eligible older text history with a bounded, incremental summary | First |
 | `rag_select` | None | Retain the most relevant chunks in explicitly marked retrieval blocks | Before serialization |
+| `query_select` | None | Retain query-related sentences and place the strongest retained chunks at block edges | Before token pruning |
+| `token_prune` | None in SBproxy; ONNX model in the classifier sidecar | Remove lower-value source tokens from marked text chunks | After sentence selection |
 | `compact_serialization` | None | Compact safe marked JSON and uniform scalar object rows | After selection |
 | `position_reorder` | None | Move highly ranked chunks toward block edges | Before the final bound |
 | `window_fit` | None | Apply the legacy newest-to-oldest message-selection heuristic within the known model window | Last |
@@ -56,11 +65,11 @@ original messages are not stored in the record.
 
 ## Marked retrieval context
 
-`rag_select`, `compact_serialization`, and `position_reorder` inspect only
-string-valued `content` on `user` and `tool` messages. Callers must mark the
-retrieval context explicitly. SBproxy does not infer it from ordinary text,
-and it ignores marker-like strings in `system`, `developer`, or `assistant`
-messages.
+`token_prune`, `query_select`, `rag_select`, `compact_serialization`, and
+`position_reorder` inspect only string-valued `content` on `user` and `tool`
+messages. Callers must mark the retrieval context explicitly. SBproxy does not
+infer it from ordinary text, and it ignores marker-like strings in `system`,
+`developer`, or `assistant` messages.
 
 One block has this exact line-delimited shape:
 
@@ -126,6 +135,9 @@ compression:
       min_relevance_percent: 15
       drop_empty: true
 
+    - type: query_select
+      max_sentences: 12
+
     - type: compact_serialization
       min_tokens: 128
       tabular:
@@ -147,6 +159,119 @@ scores. Lexical ranking is deterministic normalized TF-IDF cosine similarity
 between the marked query and each chunk. It lowercases Unicode text, splits on
 non-alphanumeric boundaries, and uses original chunk order to break ties. It
 does not call a model or network service.
+
+### Query-aware sentence selection
+
+`query_select` uses the query already present in each marked retrieval block.
+It segments every `format="text"` chunk into sentences, ranks the sentences
+against that query with deterministic normalized TF-IDF, and keeps only
+positive-scoring sentences. It makes no network call.
+
+Choose exactly one bound:
+
+```yaml
+# Keep at most 12 sentences in each retrieval block.
+- type: query_select
+  max_sentences: 12
+
+# Or bound selected sentence bodies by the target model's token estimate.
+- type: query_select
+  target_tokens: 2048
+```
+
+`max_sentences` accepts from 1 through 4,096. `target_tokens` accepts from 1
+through 1,000,000. Each configured bound applies independently to each marked
+block. In either mode, SBproxy processes at most 4,096 source sentences in one
+block. A larger block skips the whole lever as `marked_context_too_large`
+before ranking and leaves its input unchanged. The token form counts selected
+sentence bodies, including one separator between sentences retained from the
+same chunk. Retrieval tags and surrounding message text are outside that
+target, and the runner still requires the complete message candidate to be
+smaller.
+
+Within a retained chunk, sentences return to their original source order.
+Chunks are ranked by their strongest retained sentence and placed from the
+outside inward, alternating between the beginning and end of the block. This
+reduces lost-in-the-middle exposure without changing sentence wording.
+Original chunk IDs remain attached to the selected text.
+
+The lever skips ordinary unmarked input, malformed or oversized marked input,
+blank queries, and non-text chunks. It also skips when no sentence has positive
+lexical overlap with the query. A later `token_prune` or `window_fit` lever
+still runs against the unchanged input.
+
+### Sidecar token pruning
+
+`token_prune` sends marked `format="text"` chunk bodies to the OSS classifier
+sidecar's `Compress` RPC. The sidecar runs an operator-supplied
+LLMLingua-2-compatible token classifier and returns text assembled from source
+spans. SBproxy validates the returned counts, checks that the text is
+extractive, and remeasures the complete candidate before it can commit.
+
+```yaml
+- type: token_prune
+  min_tokens: 512
+  endpoint: http://127.0.0.1:9440
+  model: llmlingua-2
+  timeout_ms: 250
+  max_chunks: 32
+  target:
+    mode: retain_ratio
+    retain_percent: 60
+```
+
+`min_tokens` is the target model's estimate across all marked chunk bodies in
+the request. Below it, the sidecar is not called. `max_chunks` limits sidecar
+calls per request. It defaults to 64 and accepts values from 1 through 256.
+`timeout_ms` applies to each call, accepts from 1 through 60,000, and defaults
+to 250.
+Connections are lazy and shared by the compiled route. A Unix socket is also
+accepted, for example `unix:///run/sbproxy/classifier.sock`; the socket path
+must be absolute.
+
+The target has two exclusive forms:
+
+```yaml
+# Retain 60 percent of each chunk according to the pruning tokenizer.
+target:
+  mode: retain_ratio
+  retain_percent: 60
+
+# Fit all marked bodies within 2,048 target-model tokens.
+target:
+  mode: target_tokens
+  target_tokens: 2048
+```
+
+`retain_percent` accepts from 1 through 99. In ratio mode, the sidecar applies
+the percentage to each chunk using its pruning tokenizer. SBproxy then counts
+each returned chunk with the request's target model and rejects any chunk over
+the same percentage of its original target-model estimate. In `target_tokens`
+mode, SBproxy divides the aggregate budget across chunks in proportion to their
+target-model estimates, sends those allocations to the sidecar, then counts
+all returned bodies again with the request's target model. The lever fails
+open when either target check fails. Each chunk needs an allocation of at
+least one token. If `target_tokens` is smaller than the marked chunk count, the
+lever skips as `not_eligible` without calling the sidecar.
+
+All marked chunks in the current request must use `format="text"`. The lever
+does not send JSON or `sbproxy_table_v1` to the model. It also skips when the
+marked fanout exceeds `max_chunks`. A timeout, unavailable sidecar, unknown
+sidecar model, or invalid response records a closed lever failure and preserves
+the messages received by the lever. Later levers continue, so `window_fit`
+remains a dependency-free final bound.
+
+The runtime submits batch size 1. A compatible ONNX model may declare that
+batch axis as fixed `1`, symbolic, or unspecified, and must emit `f32` logits
+whose final dimension is `2`. Class index 1 is the probability that a source
+token should be retained. The tokenizer must provide source offsets and word
+IDs. The sidecar averages subtoken scores into whole-word decisions and
+divides longer input at punctuation-aware boundaries. Model IDs are limited
+to 256 UTF-8 bytes. The matching tokenizer must use the official mBERT
+WordPiece or XLM-R Unigram LLMLingua-2 layout, add exactly two model special
+tokens, and contain no non-special added tokens. See
+[Local inference](local-inference.md#run-token-pruning) for the model command
+and isolation guidance.
 
 ### RAG selection
 
@@ -662,6 +787,16 @@ and `mesh_tombstone_gc_*` families.
 | `summary_buffer.summarizer.provider` | Yes | Enabled provider on the same handler |
 | `summary_buffer.summarizer.model` | Yes | Non-empty model allowed by the handler and configured provider |
 | `summary_buffer.summarizer.timeout` | Yes | Positive seconds or human duration |
+| `token_prune.min_tokens` | Yes | Greater than zero; minimum target-model estimate across marked bodies before a sidecar call |
+| `token_prune.endpoint` | Yes | Classifier gRPC URI or `unix://` plus an absolute socket path |
+| `token_prune.model` | Yes | Non-empty token model ID loaded by the sidecar; at most 256 UTF-8 bytes |
+| `token_prune.timeout_ms` | No | Defaults to `250`; from `1` through `60000`, applied per chunk |
+| `token_prune.max_chunks` | No | Defaults to `64`; from `1` through `256` |
+| `token_prune.target` | Yes | Exactly one tagged target: `mode: retain_ratio` with `retain_percent`, or `mode: target_tokens` with `target_tokens` |
+| `token_prune.target.retain_percent` | For ratio mode | From `1` through `99` |
+| `token_prune.target.target_tokens` | For token mode | From `1` through `1000000`; aggregate marked-body target measured again with the request model |
+| `query_select.max_sentences` | One query bound is required | From `1` through `4096`; mutually exclusive with `target_tokens` |
+| `query_select.target_tokens` | One query bound is required | From `1` through `1000000`; mutually exclusive with `max_sentences` |
 | `rag_select.min_tokens` | Yes | Greater than zero; minimum marked-block estimate before selection |
 | `rag_select.ranking` | No | `auto`, `supplied`, or `lexical`; defaults to `auto` |
 | `rag_select.max_chunks` | Yes | Greater than zero |
@@ -700,9 +835,10 @@ decision prevents write-back after an upstream response.
 |---|---|
 | Any explicit header, governed-key, or CEL selector | Bypassed for read and write |
 | Route declares one or more named profiles | Bypassed for every request on that route |
-| Route default contains `rag_select`, `compact_serialization`, or `position_reorder` | Bypassed for every request on that route |
+| Route default contains `token_prune`, `query_select`, `rag_select`, `compact_serialization`, or `position_reorder` | Bypassed for every request on that route |
 | Route default uses `input_budget_tokens` | Bypassed for every request on that route |
 | `summary_buffer` and captured session | Bypassed for read and write |
+| Supported chat surface with a non-`off` reasoning policy | Bypassed for read and write |
 | Legacy default-only compatibility `window_fit` | Existing cache scope is unchanged |
 | No compression policy | Existing cache scope is unchanged |
 
@@ -735,8 +871,14 @@ otherwise it records `skipped`, `no_savings`.
 | Condition | Lever outcome | Request and state behavior |
 |---|---|---|
 | Missing captured session | `skipped`, `missing_session` | No state access; later levers run |
-| No explicit retrieval block | `skipped`, `no_marked_context` | Current working messages continue; later levers run |
-| Malformed or oversized marked context | `skipped`, `malformed_marked_context` or `marked_context_too_large` | The current retrieval lever makes no partial rewrite; later levers may still act |
+| No explicit retrieval block | `query_select`: `skipped`, `missing_query`; other marked-context levers: `skipped`, `no_marked_context` | Current working messages continue; later levers run |
+| Malformed marked context, parser limits, or more than 4,096 source sentences in one `query_select` block | `skipped`, `malformed_marked_context` or `marked_context_too_large` | The current retrieval lever makes no partial rewrite; later levers may still act |
+| Query is blank or no sentence has positive lexical overlap | A blank query is `skipped`, `malformed_marked_context`; no positive overlap is `skipped`, `no_selected_chunks` when no other block changes | The affected block stays unchanged; later levers run |
+| Token-prune marked-body estimate is below `min_tokens` | `skipped`, `below_threshold` | No sidecar call; later levers run |
+| Token-prune chunk count exceeds `max_chunks` | `skipped`, `marked_context_too_large` | No sidecar call or partial rewrite; later levers run |
+| Token-prune `target_tokens` is smaller than the marked chunk count | `skipped`, `not_eligible` | No sidecar call; later levers run |
+| Token-prune sidecar is unavailable or times out | `failed`, `token_prune_unavailable` | Current messages continue unchanged; later levers run |
+| Token-prune response is empty, non-extractive, over target, or has invalid counts | `failed`, `invalid_token_prune_output` | Candidate is discarded; later levers run |
 | Supplied ranking lacks a score | `skipped`, `missing_relevance_score` when no other block changes | The affected retrieval block is unchanged; a change in another block yields a complete candidate |
 | Selection retains no chunks with `drop_empty: false` | `skipped`, `no_selected_chunks` when no other block changes | The affected retrieval block is unchanged; a change in another block yields a complete candidate |
 | Invalid JSON in a marked JSON chunk | `skipped`, `unsafe_structured_shape` only when no other chunk changes | The invalid chunk remains byte-for-byte unchanged; a change in another chunk yields a candidate instead of the aggregate skip |
@@ -774,13 +916,14 @@ empty `reason` label. Skip reasons are:
 `state_expired`, `no_new_history`, `summarizer_input_too_large`, `budget_denied`,
 `policy_denied`, `lock_contended`, `no_marked_context`,
 `malformed_marked_context`, `marked_context_too_large`,
-`missing_relevance_score`, `no_selected_chunks`, `unsafe_structured_shape`, and
-`already_ordered`.
+`missing_query`, `missing_relevance_score`, `no_selected_chunks`,
+`unsafe_structured_shape`, and `already_ordered`.
 
 Failure reasons are:
 
 `state_unavailable`, `lease_lost`, `stale_version`, `summarizer_timeout`,
-`summarizer_provider`, `invalid_summary`, `serialization`, and `internal`.
+`summarizer_provider`, `invalid_summary`, `token_prune_unavailable`,
+`invalid_token_prune_output`, `serialization`, and `internal`.
 
 The request outcome is failure-first:
 
@@ -829,11 +972,11 @@ double-counted in the request distribution.
 | `sbproxy_ai_compression_value_tokens_saved_total` | Counter | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Per-lever target-model input tokens avoided on terminal provider success |
 | `sbproxy_ai_compression_value_cost_saved_micros_total` | Counter | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Gross target-model input cost avoided on terminal provider success, in micro-USD |
 
-`lever` is `summary_buffer`, `window_fit`, `rag_select`,
-`compact_serialization`, or `position_reorder`. `backend` is `local`, `redis`,
-`mesh`, or `none`. Request `cache_bypass` is `true` or `false`. State `operation` is
-`get`, `commit`, `delete`, `list`, or `purge`; its `outcome` is `ok`,
-`missing`, or `error`.
+`lever` is `summary_buffer`, `window_fit`, `token_prune`, `query_select`,
+`rag_select`, `compact_serialization`, or `position_reorder`. `backend` is
+`local`, `redis`, `mesh`, or `none`. Request `cache_bypass` is `true` or
+`false`. State `operation` is `get`, `commit`, `delete`, `list`, or `purge`;
+its `outcome` is `ok`, `missing`, or `error`.
 
 Coordination `event` values are `contention`, `lease_expiry`,
 `stale_version`, and `fence_rejection` on both coordination counters. On the
@@ -986,7 +1129,10 @@ A RAG-selection target contains `lever`, `min_tokens`, `ranking`,
 `max_chunks`, `min_relevance_percent`, and `drop_empty`. A compact-serialization
 target contains `lever`, `min_tokens`, `tabular_enabled`, and
 `tabular_min_rows`. A position-reorder target contains only `lever` and
-`ranking`.
+`ranking`. A query-selection target contains `lever` and exactly one of
+`max_sentences` or `target_tokens`. A token-pruning target contains `lever`,
+`min_tokens`, `model`, `timeout_ms`, `max_chunks`, and its tagged target. The
+sidecar endpoint is deliberately absent from this event.
 
 The event never contains message text, generated or prior summary content, raw
 session IDs, record IDs, request bodies, provider credentials, bearer values,
@@ -1015,6 +1161,27 @@ cargo run --locked -- check \
   --provenance fixtures/provenance.json \
   --json-report reports/rag-select-smoke.json \
   --markdown-report reports/rag-select-smoke.md
+
+cargo run --locked -- check \
+  --pipeline-config pipelines/query-select-smoke.json \
+  --input fixtures/query-select-smoke.jsonl \
+  --provenance fixtures/provenance.json \
+  --json-report reports/query-select-smoke.json \
+  --markdown-report reports/query-select-smoke.md
+
+cargo run --locked -- check \
+  --pipeline-config pipelines/token-prune-retain-smoke.json \
+  --input fixtures/token-prune-smoke.jsonl \
+  --provenance fixtures/provenance.json \
+  --json-report reports/token-prune-retain-smoke.json \
+  --markdown-report reports/token-prune-retain-smoke.md
+
+cargo run --locked -- check \
+  --pipeline-config pipelines/token-prune-target-smoke.json \
+  --input fixtures/token-prune-smoke.jsonl \
+  --provenance fixtures/provenance.json \
+  --json-report reports/token-prune-target-smoke.json \
+  --markdown-report reports/token-prune-target-smoke.md
 
 cargo run --locked -- check \
   --pipeline-config pipelines/compact-serialization-smoke.json \
@@ -1046,7 +1213,7 @@ cargo run --locked -- check \
   --markdown-report reports/window-fit-smoke.md
 ```
 
-Those commands check all five committed JSON and Markdown report pairs. Each
+Those commands check all eight committed JSON and Markdown report pairs. Each
 pipeline file deserializes through the production typed lever configuration.
 Report schema 4 embeds the exact verified provenance-manifest SHA-256 and the
 metadata for only the selected fixture inputs, including their fixture
@@ -1074,21 +1241,27 @@ sanitized; the repository does not describe them as production captures.
 2. Add a named profile containing only `rag_select`. Send marked canary traffic
    and check required-evidence retention, selection rates, and closed skip
    reasons.
-3. Test `compact_serialization` in its own profile. Decode sampled Table v1
+3. Test `query_select` against a labeled multi-document question set. Check
+   answer evidence as well as token savings, then tune one sentence or token
+   bound.
+4. Run `token_prune` in a separate profile. Start the classifier sidecar with
+   an operator-reviewed model, choose a conservative retain ratio, and watch
+   both `token_prune_unavailable` and `invalid_token_prune_output`.
+5. Test `compact_serialization` in its own profile. Decode sampled Table v1
    output in a controlled test and compare the exact JSON value.
-4. Test `position_reorder` independently. Watch applied operations as well as
+6. Test `position_reorder` independently. Watch applied operations as well as
    token savings because a useful reorder can save zero tokens.
-5. Combine `rag_select`, `compact_serialization`, `position_reorder`, and
-   `window_fit` in the recommended order only after each lever's structural
-   evidence and telemetry are understood. Widen the named profile gradually.
-6. For stateful history, make callers send and reuse a stable captured session
+7. Combine the levers only after each one has passed its own quality check.
+   Keep `window_fit` last so an unavailable sidecar cannot remove the final
+   deterministic bound.
+8. For stateful history, make callers send and reuse a stable captured session
    ULID. Start with the Local default on one process; configure Redis or mesh
    explicitly before distributing sessions across replicas.
-7. Put `summary_buffer` before `window_fit` with conservative thresholds,
+9. Put `summary_buffer` before `window_fit` with conservative thresholds,
    recent-tail size, summary target, and timeout. Watch state errors,
    coordination when applicable, request savings, and summarizer spend before
    widening it.
-8. Use the authenticated Admin API for metadata, deletion, and purge. Leave
+10. Use the authenticated Admin API for metadata, deletion, and purge. Leave
    content inspection disabled unless an audited incident workflow requires it.
 
 To disable the new pipeline explicitly, set `compression.levers: []`. Existing
@@ -1098,10 +1271,10 @@ selected external backend is configured. An existing Local database is retained
 for Admin discovery without creating a missing file, even when no active
 handler uses `summary_buffer`; content inspection stays disabled without an
 active origin opt-in. To keep only stateless protection, remove
-`summary_buffer` and its `state` block, then leave `rag_select`, `window_fit`,
-or the other stateless levers configured. A stateless-only process does not
-create a Local database. A newly committed summary refreshes its TTL, while an
-exact-summary reuse does not.
+`summary_buffer` and its `state` block, then leave `query_select`,
+`token_prune`, `rag_select`, `window_fit`, or the other stateless levers
+configured. A stateless-only process does not create a Local database. A newly
+committed summary refreshes its TTL, while an exact-summary reuse does not.
 
 SBproxy has no OmniRoute runtime dependency, compatibility layer, state import,
 or migration path for context compression. Configure SBproxy policies directly
@@ -1109,6 +1282,9 @@ and begin with fresh external summary state.
 
 ## See also
 
+- [`examples/ai-context-optimization/`](../examples/ai-context-optimization/)
+  for a stateless `query_select`, `token_prune`, and `window_fit` pipeline with
+  a marked multi-document request.
 - [`examples/ai-context-compression-redis/`](../examples/ai-context-compression-redis/)
   for a runnable copy of this pipeline: start Redis, then `curl` the chat
   endpoint with a captured session ID to see the summary state persist across

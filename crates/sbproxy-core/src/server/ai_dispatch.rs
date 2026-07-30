@@ -1036,24 +1036,28 @@ fn try_spawn_governed_shadow_after_primary(
     disallow_prompt_training: bool,
     ctx: &RequestContext,
     quota: &sbproxy_ai::quota_pool::QuotaPoolAdmission,
+    reasoning_eligibility: sbproxy_ai::ReasoningEligibility,
 ) {
     if !shadow_surface_is_eligible(surface) {
         return;
     }
     let usage = super::ai_support::shadow_usage_record_from_context(ctx);
     let reservation_prefix = format!("{}:quota-pool", ctx.request_id);
-    let _ = AI_CLIENT.load().try_spawn_shadow_with_quota_detached(
-        config,
-        path,
-        body,
-        is_stream,
-        allowed_providers,
-        blocked_providers,
-        disallow_prompt_training,
-        usage,
-        quota.clone(),
-        &reservation_prefix,
-    );
+    let _ = AI_CLIENT
+        .load()
+        .try_spawn_shadow_with_quota_detached_with_reasoning_eligibility(
+            config,
+            path,
+            body,
+            is_stream,
+            allowed_providers,
+            blocked_providers,
+            disallow_prompt_training,
+            usage,
+            quota.clone(),
+            &reservation_prefix,
+            reasoning_eligibility,
+        );
 }
 
 #[cfg(test)]
@@ -3000,6 +3004,7 @@ pub(super) async fn handle_ai_proxy(
             return Ok(());
         }
     };
+    let reasoning_eligibility = sbproxy_ai::reasoning_eligibility(&body);
 
     // PII redaction (request body): walk the parsed JSON in place so
     // every downstream code path - guardrails, classifier, semantic
@@ -4122,6 +4127,14 @@ pub(super) async fn handle_ai_proxy(
     ) || compression_runtime
         .as_ref()
         .is_some_and(|runtime| runtime.bypasses_semantic_cache(ctx.session_id.is_some()));
+    // Reasoning controls are applied after provider selection, while semantic
+    // cache lookups happen before dispatch. Existing cache keys do not carry
+    // the route reasoning policy, so replaying a hit could silently bypass a
+    // newly configured reasoning or output budget. Conservatively bypass both
+    // semantic cache implementations for every supported, non-off policy.
+    let semantic_cache_bypass = compression_cache_bypass
+        || (surface.supports_reasoning_policy()
+            && config.reasoning != sbproxy_ai::ReasoningPolicy::Off);
 
     // Streaming responses cannot be buffered for external post-call
     // inspection. Apply each configured no-content fail mode before any
@@ -4154,8 +4167,11 @@ pub(super) async fn handle_ai_proxy(
     }
 
     // POST idempotency is owned by the AI path and runs only after canonical
-    // input guardrails and the current request policy. Replayed output is
-    // evaluated against today's output policy before any cached bytes leave.
+    // input guardrails and the current request safety policy. Exact replay
+    // deliberately preserves the response from the original accepted key,
+    // even if request transforms such as compression or reasoning changed
+    // after a route reload. Replayed output is still evaluated against today's
+    // output guardrails before any cached bytes leave.
     let (idem_skip_reason, mut idem_capture) =
         match engage_ai_idempotency(session, pipeline, origin_idx, body_bytes.as_ref(), false)
             .await?
@@ -4224,7 +4240,7 @@ pub(super) async fn handle_ai_proxy(
     // When populated, the relay path below dispatches a `hook.store`
     // after the upstream call completes (subject to status + size gates).
     let mut semcache_miss: Option<PendingSemcacheMiss> = None;
-    if !compression_cache_bypass {
+    if !semantic_cache_bypass {
         if let Some(hook) = pipeline.hooks.semantic_lookup.as_ref().cloned() {
             if !extracted_prompt.is_empty() {
                 let model_id = if model.is_empty() {
@@ -4327,7 +4343,7 @@ pub(super) async fn handle_ai_proxy(
     // the relay can store the upstream response. Embedding failures
     // fail open (proceed to the upstream uncached).
     let mut embed_miss: Option<PendingEmbedMiss> = None;
-    if !compression_cache_bypass && pipeline.hooks.semantic_lookup.is_none() {
+    if !semantic_cache_bypass && pipeline.hooks.semantic_lookup.is_none() {
         if let Some(cache) = config.embedding_cache() {
             // WOR-1142: scope cache entries to the caller so one
             // tenant/credential never receives another's cached response.
@@ -4953,7 +4969,7 @@ pub(super) async fn handle_ai_proxy(
             let cascade_quota_reservation = format!("{}:quota-pool:cascade", ctx.request_id);
             let outcome = AI_CLIENT
                 .load()
-                .forward_cascade_with_policy_and_quota(
+                .forward_cascade_with_policy_and_quota_with_reasoning_eligibility(
                     config,
                     cascade_cfg,
                     allowed_providers,
@@ -4964,6 +4980,7 @@ pub(super) async fn handle_ai_proxy(
                     surface_label,
                     &quota_pool_admission,
                     &cascade_quota_reservation,
+                    reasoning_eligibility,
                 )
                 .await;
             match outcome {
@@ -4979,6 +4996,7 @@ pub(super) async fn handle_ai_proxy(
                         disallow_training,
                         ctx,
                         &quota_pool_admission,
+                        reasoning_eligibility,
                     );
                     ctx.admin_load_balancer_target = Some(o.provider_name.clone());
                     for provider in &o.attempted_providers {
@@ -5132,12 +5150,31 @@ pub(super) async fn handle_ai_proxy(
         for (race_attempt, &idx) in provider_order.iter().enumerate() {
             let provider = &config.providers[idx];
             let mut attempt_body = body.clone();
-            if !model.is_empty() {
+            let resolved_model = if !model.is_empty() {
                 let mapped = provider.map_model(&model);
                 if mapped != model {
-                    attempt_body["model"] = serde_json::Value::String(mapped);
+                    attempt_body["model"] = serde_json::Value::String(mapped.clone());
                 }
-            }
+                mapped
+            } else {
+                attempt_body
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let reasoning = sbproxy_ai::apply_reasoning_policy_with_eligibility(
+                if surface.supports_reasoning_policy() {
+                    config.reasoning
+                } else {
+                    sbproxy_ai::ReasoningPolicy::Off
+                },
+                provider,
+                &resolved_model,
+                &mut attempt_body,
+                reasoning_eligibility,
+            );
+            let reasoning_outcome = reasoning.outcome_label();
             let path_ref = path.as_str();
             let cl = &client;
             let attempt_router = std::sync::Arc::clone(&router);
@@ -5155,6 +5192,10 @@ pub(super) async fn handle_ai_proxy(
                     Ok(attempt) => attempt,
                     Err(rejection) => return (idx, Err(RacedAttemptError::Quota(rejection))),
                 };
+                sbproxy_ai::ai_metrics::record_reasoning_policy_attempt(
+                    &provider.name,
+                    reasoning_outcome,
+                );
                 let r = run_routed_provider_attempt(
                     &attempt_router,
                     idx,
@@ -5387,6 +5428,22 @@ pub(super) async fn handle_ai_proxy(
         if let Some(engine_model) = local_engine_model.as_deref() {
             rewrite_managed_request_model(&mut attempt_body, engine_model);
         }
+        let reasoning_model = attempt_body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(resolved_model.as_str())
+            .to_string();
+        let reasoning = sbproxy_ai::apply_reasoning_policy_with_eligibility(
+            if surface.supports_reasoning_policy() {
+                config.reasoning
+            } else {
+                sbproxy_ai::ReasoningPolicy::Off
+            },
+            provider,
+            &reasoning_model,
+            &mut attempt_body,
+            reasoning_eligibility,
+        );
 
         // Stamp the resolved provider + model on the context so the
         // access log captures them even when the upstream errors out
@@ -5423,7 +5480,10 @@ pub(super) async fn handle_ai_proxy(
         // Anthropic native bypass reconstructs the original inbound body. If
         // a compression runtime was selected, use the canonical translation
         // path so the compressed message list in `attempt_body` is retained.
-        let bypass = if !native_bypass_is_safe(is_stream, compression_runtime.is_some()) {
+        let bypass = if !native_bypass_is_safe(
+            is_stream,
+            compression_runtime.is_some() || reasoning.applied,
+        ) {
             None
         } else {
             sbproxy_ai::format::native_bypass_for(
@@ -5496,6 +5556,10 @@ pub(super) async fn handle_ai_proxy(
         else {
             return Ok(());
         };
+        sbproxy_ai::ai_metrics::record_reasoning_policy_attempt(
+            &provider.name,
+            reasoning.outcome_label(),
+        );
 
         ctx.record_admin_ai_attempt(&provider.name);
         let attempt_start = std::time::Instant::now();
@@ -5750,6 +5814,7 @@ pub(super) async fn handle_ai_proxy(
                         disallow_training,
                         ctx,
                         &quota_pool_admission,
+                        reasoning_eligibility,
                     );
                     let extras = public_route_headers(ctx);
                     return send_response_with_extras(
@@ -5875,6 +5940,7 @@ pub(super) async fn handle_ai_proxy(
             disallow_training,
             ctx,
             &quota_pool_admission,
+            reasoning_eligibility,
         );
         if is_stream {
             // SSE streaming with idempotency engaged: drop the capture
@@ -6005,7 +6071,7 @@ pub(super) async fn handle_ai_proxy(
                     origin_id,
                     semantic_key: semcache_key,
                     policy: stream_policy,
-                    cache_bypass: compression_cache_bypass,
+                    cache_bypass: semantic_cache_bypass,
                 },
                 stream_recorder,
                 stream_router_sink,
@@ -10537,6 +10603,61 @@ mod external_guardrail_context_tests {
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
         assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
         assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn reasoning_policy_bypasses_semantic_hit_before_provider_dispatch() {
+        let (upstream_url, upstream_hits) =
+            upstream_fixture(r#"{"choices":[{"message":{"content":"fresh-under-budget"}}]}"#).await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "models": ["gpt-5-mini"]
+            }],
+            "reasoning": {"budget": 32}
+        }))
+        .expect("reasoning config");
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "gpt-5-mini",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, _) = pipeline_with_recording_caches();
+        *semantic.hit.lock().expect("semantic hit lock") = Some(crate::hooks::CachedResponse {
+            status: 200,
+            headers: std::collections::HashMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]),
+            body: bytes::Bytes::from_static(
+                br#"{"choices":[{"message":{"content":"stale-over-budget"}}]}"#,
+            ),
+            cached_at: std::time::SystemTime::now(),
+        });
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("reasoning request is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(response.contains("fresh-under-budget"), "{response}");
+        assert!(!response.contains("stale-over-budget"), "{response}");
+        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

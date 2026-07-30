@@ -1430,6 +1430,18 @@
             "null"
           ]
         },
+        "prompt_persistence_encryption": {
+          "description": "At-rest encryption for [`Self::prompt_persistence_path`]. Absent or disabled stores prompt records as plaintext JSON, which is the pre-existing behaviour and stays the default so an upgrade cannot orphan an existing file.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PromptPersistenceEncryptionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "trace_url_template": {
           "description": "URL template for trace deep-links in the admin UI. The literal `{trace_id}` is replaced with the request's trace id, e.g. `https://jaeger.internal/trace/{trace_id}`. Unset renders trace ids as plain text (no broken default link).",
           "default": null,
@@ -1480,6 +1492,33 @@
           "type": "array",
           "items": {
             "$ref": "#/definitions/AdminOperator"
+          }
+        }
+      }
+    },
+    "PromptPersistenceEncryptionConfig": {
+      "description": "At-rest encryption settings for the prompt-persistence redb file.\n\nPersisted `NamedPrompt` records are sealed with AES-256-GCM before they reach redb. Keys stay readable because hydration is a prefix scan over `prompts:<host>:<name>`, and the key is authenticated as associated data so a sealed value cannot be moved to another host or prompt name.\n\nSame reference syntax and the same no-plaintext-fallback rule as [`ResponseCacheEncryptionConfig`]: a key that is missing, unresolvable, or shorter than 16 bytes aborts startup. That is deliberately stricter than the surrounding prompt-persistence behaviour, where an unreadable file only degrades to ephemeral mutations. An unreadable file loses saved prompts; a key the operator asked for and cannot supply would silently write secrets in the clear.\n\nDerived under its own HKDF purpose, so pointing this and the response cache at one operator secret still yields two unrelated keys.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Master switch. Defaults to `false`.",
+          "default": false,
+          "type": "boolean"
+        },
+        "key": {
+          "description": "Secret reference for the active key. Used to seal new records and to open records sealed under it.\n\nResolved through the same mechanism as every other config secret: a provider URI (`secret://backend/name`, `vault://...`) against a backend declared under `proxy.secrets.backends`, a `file:/path` reference, or a whole-value `${ENV_VAR}`. Required when [`Self::enabled`] is `true`.\n\nThe resolved value should be 32 random bytes (base64 or hex encoded) rather than a human-chosen passphrase.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "previous_keys": {
+          "description": "Retired keys, used only to open records sealed before a rotation. Same reference syntax as [`Self::key`].\n\nTo rotate: move the current `key` into this list and name the new one as `key`. Records reseal under the active key the next time they are written.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
           }
         }
       }

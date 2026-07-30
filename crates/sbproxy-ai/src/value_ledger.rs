@@ -725,14 +725,48 @@ fn ensure_redb_overflow_lane(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// When set, redb write transactions on this thread skip their fsync.
+    ///
+    /// Only `tests::redb_ledger_persists_the_bounded_overflow_lane` sets it.
+    /// That test makes 999 sequential `record_compression` calls to fill the
+    /// model cap so the next write lands in the overflow lane, and each call
+    /// commits its own transaction, so it was paying 999 fsyncs. The loop count
+    /// is the thing under test and cannot shrink, but the test asserts the cap
+    /// and the overflow lane rather than crash durability, and it reopens the
+    /// database inside the same process, where a clean drop still makes every
+    /// write visible.
+    ///
+    /// Compiled out of production builds entirely, so the write path below has
+    /// no extra branch outside tests.
+    static RELAX_REDB_DURABILITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Begin a value-ledger write transaction.
+///
+/// Always fully durable in production. A `RELAX_REDB_DURABILITY` thread-local,
+/// compiled in only under `cfg(test)`, lets the bounded-overflow test skip the
+/// fsync it would otherwise pay 999 times. Not a rustdoc link because the item
+/// does not exist outside test builds.
+fn begin_ledger_write(database: &Database) -> anyhow::Result<redb::WriteTransaction> {
+    #[allow(unused_mut, reason = "only test builds mutate the transaction")]
+    let mut write = database
+        .begin_write()
+        .context("value ledger: begin write")?;
+    #[cfg(test)]
+    if RELAX_REDB_DURABILITY.get() {
+        write.set_durability(redb::Durability::None);
+    }
+    Ok(write)
+}
+
 fn update_redb_lane(
     database: &Database,
     model: &str,
     update: impl FnOnce(&mut LaneSplit),
 ) -> anyhow::Result<()> {
-    let write = database
-        .begin_write()
-        .context("value ledger: begin write")?;
+    let write = begin_ledger_write(database)?;
     {
         let mut table = write
             .open_table(LANES)
@@ -1192,6 +1226,10 @@ mod tests {
 
     #[test]
     fn redb_ledger_persists_the_bounded_overflow_lane() {
+        // 999 commits to fill the model cap. See RELAX_REDB_DURABILITY: the
+        // assertions below are about the cap and the overflow lane, not about
+        // surviving a crash, so this test does not pay 999 fsyncs for them.
+        RELAX_REDB_DURABILITY.set(true);
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("bounded-value.redb");
         {

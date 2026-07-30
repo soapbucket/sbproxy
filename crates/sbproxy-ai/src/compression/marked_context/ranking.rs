@@ -2,10 +2,16 @@
 
 use super::RetrievalBlock;
 use crate::compression::RetrievalRanking;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RankedChunk {
+    pub index: usize,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RankedSentence {
     pub index: usize,
     pub score: f64,
 }
@@ -50,58 +56,141 @@ fn rank_supplied(block: &RetrievalBlock) -> Result<Vec<RankedChunk>, RankError> 
 }
 
 fn rank_lexical(block: &RetrievalBlock) -> Vec<RankedChunk> {
-    let query_terms = term_counts(block.query());
-    let document_terms = block
+    let document_bodies = block
         .chunks()
         .iter()
-        .map(|chunk| term_counts(chunk.body()))
+        .map(|chunk| chunk.body())
         .collect::<Vec<_>>();
+    let scores = lexical_scores(block.query(), &document_bodies);
+    let mut ranked = scores
+        .into_iter()
+        .enumerate()
+        .map(|(index, score)| RankedChunk { index, score })
+        .collect::<Vec<_>>();
+    sort_ranked(block, &mut ranked);
+    ranked
+}
 
-    let mut vocabulary = BTreeSet::new();
-    vocabulary.extend(query_terms.keys().cloned());
-    for terms in &document_terms {
-        vocabulary.extend(terms.keys().cloned());
+/// Segment no more than `max_sentences`, stopping as soon as another is found.
+pub(crate) fn segment_sentences_bounded(text: &str, max_sentences: usize) -> Option<Vec<&str>> {
+    fn push_trimmed<'a>(
+        text: &'a str,
+        start: usize,
+        end: usize,
+        max_sentences: usize,
+        output: &mut Vec<&'a str>,
+    ) -> bool {
+        let sentence = text[start..end].trim();
+        if !sentence.is_empty() {
+            if output.len() == max_sentences {
+                return false;
+            }
+            output.push(sentence);
+        }
+        true
     }
 
-    let mut document_frequency = vocabulary
-        .iter()
-        .cloned()
-        .map(|term| (term, 0_usize))
-        .collect::<BTreeMap<_, _>>();
-    for terms in &document_terms {
-        let present_terms = terms.keys().cloned().collect::<BTreeSet<_>>();
-        for term in present_terms {
-            if let Some(frequency) = document_frequency.get_mut(&term) {
-                *frequency += 1;
+    let mut characters = text.char_indices().peekable();
+    let mut sentences = Vec::new();
+    let mut start = 0;
+
+    while let Some((index, character)) = characters.next() {
+        if character == '\n' {
+            if !push_trimmed(text, start, index, max_sentences, &mut sentences) {
+                return None;
             }
+            start = index + character.len_utf8();
+            continue;
+        }
+        if !matches!(character, '.' | '?' | '!') {
+            continue;
+        }
+
+        let mut end = index + character.len_utf8();
+        while characters.peek().is_some_and(|(_, character)| {
+            matches!(*character, '"' | '\'' | '”' | '’' | ')' | ']' | '}')
+        }) {
+            let (index, character) = characters.next().expect("peeked character exists");
+            end = index + character.len_utf8();
+        }
+        let is_boundary = characters
+            .peek()
+            .is_none_or(|(_, character)| character.is_whitespace());
+        if is_boundary {
+            if !push_trimmed(text, start, end, max_sentences, &mut sentences) {
+                return None;
+            }
+            start = end;
+        }
+    }
+    if !push_trimmed(text, start, text.len(), max_sentences, &mut sentences) {
+        return None;
+    }
+    Some(sentences)
+}
+
+/// Rank sentences by deterministic TF-IDF cosine relevance to one query.
+pub(crate) fn rank_sentences(query: &str, sentences: &[&str]) -> Vec<RankedSentence> {
+    let scores = lexical_scores(query, sentences);
+    let mut ranked = scores
+        .into_iter()
+        .enumerate()
+        .map(|(index, score)| RankedSentence { index, score })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    ranked
+}
+
+fn lexical_scores(query: &str, documents: &[&str]) -> Vec<f64> {
+    let query_terms = term_counts(query);
+    let document_terms = documents
+        .iter()
+        .map(|document| term_counts(document))
+        .collect::<Vec<_>>();
+    let mut document_frequency = BTreeMap::<&str, usize>::new();
+    for terms in &document_terms {
+        for term in terms.keys() {
+            *document_frequency.entry(term.as_str()).or_default() += 1;
         }
     }
 
     let document_count = document_terms.len() as f64;
-    let inverse_document_frequency = vocabulary
+    let query_norm_squared = query_terms
         .iter()
-        .map(|term| {
-            let frequency = document_frequency.get(term).copied().unwrap_or(0) as f64;
-            let idf = ((document_count + 1.0) / (frequency + 1.0)).ln() + 1.0;
-            (term.clone(), idf)
+        .map(|(term, count)| {
+            let idf = inverse_document_frequency(
+                document_count,
+                document_frequency
+                    .get(term.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+            );
+            let weight = *count as f64 * idf;
+            weight * weight
         })
-        .collect::<BTreeMap<_, _>>();
+        .sum::<f64>();
 
-    let mut ranked = document_terms
+    document_terms
         .iter()
-        .enumerate()
-        .map(|(index, terms)| RankedChunk {
-            index,
-            score: cosine_similarity(
+        .map(|terms| {
+            cosine_similarity(
                 &query_terms,
                 terms,
-                &vocabulary,
-                &inverse_document_frequency,
-            ),
+                &document_frequency,
+                document_count,
+                query_norm_squared,
+            )
         })
-        .collect::<Vec<_>>();
-    sort_ranked(block, &mut ranked);
-    ranked
+        .collect()
+}
+
+fn inverse_document_frequency(document_count: f64, document_frequency: usize) -> f64 {
+    ((document_count + 1.0) / (document_frequency as f64 + 1.0)).ln() + 1.0
 }
 
 fn term_counts(text: &str) -> BTreeMap<String, usize> {
@@ -119,20 +208,27 @@ fn term_counts(text: &str) -> BTreeMap<String, usize> {
 fn cosine_similarity(
     query_terms: &BTreeMap<String, usize>,
     document_terms: &BTreeMap<String, usize>,
-    vocabulary: &BTreeSet<String>,
-    inverse_document_frequency: &BTreeMap<String, f64>,
+    document_frequency: &BTreeMap<&str, usize>,
+    document_count: f64,
+    query_norm_squared: f64,
 ) -> f64 {
     let mut dot_product = 0.0;
-    let mut query_norm_squared = 0.0;
     let mut document_norm_squared = 0.0;
 
-    for term in vocabulary {
-        let idf = inverse_document_frequency.get(term).copied().unwrap_or(1.0);
-        let query_weight = query_terms.get(term).copied().unwrap_or(0) as f64 * idf;
-        let document_weight = document_terms.get(term).copied().unwrap_or(0) as f64 * idf;
-        dot_product += query_weight * document_weight;
-        query_norm_squared += query_weight * query_weight;
+    for (term, count) in document_terms {
+        let idf = inverse_document_frequency(
+            document_count,
+            document_frequency
+                .get(term.as_str())
+                .copied()
+                .unwrap_or_default(),
+        );
+        let document_weight = *count as f64 * idf;
         document_norm_squared += document_weight * document_weight;
+        if let Some(query_count) = query_terms.get(term) {
+            let query_weight = *query_count as f64 * idf;
+            dot_product += query_weight * document_weight;
+        }
     }
 
     if query_norm_squared == 0.0 || document_norm_squared == 0.0 {
@@ -159,7 +255,8 @@ fn sort_ranked(block: &RetrievalBlock, ranked: &mut [RankedChunk]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{rank_chunks, RankError};
+    use super::{rank_chunks, rank_sentences, segment_sentences_bounded, RankError};
+    use crate::compression::config::MAX_QUERY_SELECT_SENTENCES;
     use crate::compression::marked_context::{
         ChunkFormat, LineEnding, RetrievalBlock, RetrievalChunk,
     };
@@ -335,5 +432,67 @@ mod tests {
                 baseline_bits
             );
         }
+    }
+
+    #[test]
+    fn sentence_segmentation_is_deterministic_and_keeps_terminal_punctuation() {
+        let text =
+            "  First sentence.  \"Second question?\"\nThird line!\r\nFinal fragment without punctuation  ";
+
+        let sentences =
+            segment_sentences_bounded(text, usize::MAX).expect("unbounded segmentation");
+
+        assert_eq!(
+            sentences,
+            [
+                "First sentence.",
+                "\"Second question?\"",
+                "Third line!",
+                "Final fragment without punctuation"
+            ]
+        );
+    }
+
+    #[test]
+    fn sentence_ranking_uses_block_wide_tfidf_and_stable_source_ties() {
+        let sentences = [
+            "Rust ownership prevents memory races.",
+            "Gardening needs water and sunlight.",
+            "Memory safety comes from Rust ownership.",
+            "A completely unrelated sentence.",
+        ];
+
+        let ranked = rank_sentences("How does Rust ownership improve memory safety?", &sentences);
+
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|sentence| sentence.index)
+                .collect::<Vec<_>>(),
+            [2, 0, 1, 3]
+        );
+        assert!(ranked[0].score > ranked[1].score);
+        assert_eq!(ranked[2].score.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(ranked[3].score.to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
+    fn sentence_ranking_stays_sparse_at_the_closed_sentence_bound() {
+        let mut query = (0..10_000)
+            .map(|index| format!("query_term_{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        query.push_str(" needle");
+        let sentences = vec!["needle"; MAX_QUERY_SELECT_SENTENCES];
+
+        let ranked = rank_sentences(&query, &sentences);
+
+        assert_eq!(ranked.len(), MAX_QUERY_SELECT_SENTENCES);
+        assert_eq!(ranked[0].index, 0);
+        assert_eq!(
+            ranked[MAX_QUERY_SELECT_SENTENCES - 1].index,
+            MAX_QUERY_SELECT_SENTENCES - 1
+        );
+        assert!(ranked.iter().all(|sentence| sentence.score > 0.0));
     }
 }

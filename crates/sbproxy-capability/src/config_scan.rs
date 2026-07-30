@@ -246,7 +246,7 @@ pub fn verify_config_readers(
         .filter(|source| source_is_production(&source.path))
         .collect();
     for source in &production_sources {
-        if let Err(error) = syn::parse_file(&source.raw_text) {
+        if let Err(error) = &source.ast {
             errors.push(RegistryError {
                 subject: source.path.display().to_string(),
                 message: format!(
@@ -2887,12 +2887,12 @@ fn rust_type_index(sources: &[&SourceFile]) -> RustTypeIndex {
             continue;
         };
         index.record_context(&context);
-        if let Ok(file) = syn::parse_file(&source.raw_text) {
+        if let Ok(file) = &source.ast {
             let mut visitor = TypeIndexVisitor {
                 index: &mut index,
                 context,
             };
-            visitor.visit_file(&file);
+            visitor.visit_file(file);
         }
     }
     index.finalize_trait_method_candidates();
@@ -5751,9 +5751,9 @@ fn typed_field_reads(sources: &[&SourceFile], types: &RustTypeIndex) -> BTreeSet
         let Some(context) = ModuleContext::from_source_path(&source.path) else {
             continue;
         };
-        if let Ok(file) = syn::parse_file(&source.raw_text) {
+        if let Ok(file) = &source.ast {
             let mut visitor = FieldReadVisitor::new(types, context);
-            visitor.visit_file(&file);
+            visitor.visit_file(file);
             reads.extend(visitor.reads);
         }
     }
@@ -5801,12 +5801,12 @@ fn production_consumer_exists(consumer: &str, sources: &[&SourceFile]) -> bool {
         expected_files
             .iter()
             .any(|expected| normalized.ends_with(expected))
-            && source_declares_function(&source.raw_text, symbol)
+            && source_declares_function(source, symbol)
     })
 }
 
-fn source_declares_function(source: &str, symbol: &str) -> bool {
-    let Ok(file) = syn::parse_file(source) else {
+fn source_declares_function(source: &SourceFile, symbol: &str) -> bool {
+    let Ok(file) = &source.ast else {
         return false;
     };
     file.items.iter().any(|item| {
@@ -5900,11 +5900,7 @@ mod tests {
     }
 
     fn source_at(path: &str, text: &str) -> SourceFile {
-        SourceFile {
-            path: PathBuf::from(path),
-            raw_text: text.to_string(),
-            text: crate::scan::strip_test_regions(text),
-        }
+        source_with_views(path, text, &crate::scan::strip_test_regions(text))
     }
 
     fn source_with_views(path: &str, raw_text: &str, text: &str) -> SourceFile {
@@ -5912,6 +5908,11 @@ mod tests {
             path: PathBuf::from(path),
             raw_text: raw_text.to_string(),
             text: text.to_string(),
+            // Parsed here so fixtures carry the same invariant the collector
+            // guarantees: `ast` is always `raw_text` parsed. Fixtures that are
+            // deliberately unparseable land in `Err`, which is what the
+            // parse-error path expects to see.
+            ast: syn::parse_file(raw_text).map_err(|error| error.to_string()),
         }
     }
 
@@ -9072,7 +9073,7 @@ fn cfg_test(config: &Config) {
                 rust_owner: Some("GuardConfig".to_string()),
             }];
             let sources = crate::scan::rust_sources(temp.path());
-            let errors = verify_config_readers(&keys, &[], &sources);
+            let errors = verify_config_readers(&keys, &[], sources);
 
             assert_eq!(
                 errors.len(),

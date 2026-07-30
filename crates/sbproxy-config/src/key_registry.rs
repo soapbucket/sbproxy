@@ -918,7 +918,7 @@ origins:
             .expect("sbproxy-config crate lives under crates/");
         let sources = rust_sources(repo_root);
 
-        let errors = verify_config_readers(&keys, CONFIG_KEY_OVERRIDES, &sources);
+        let errors = verify_config_readers(&keys, CONFIG_KEY_OVERRIDES, sources);
 
         assert!(
             errors.is_empty(),

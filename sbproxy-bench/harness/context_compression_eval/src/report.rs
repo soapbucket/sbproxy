@@ -29,6 +29,28 @@ pub fn render_markdown(report: &EvalReport) -> String {
         "- Latency mode: `{}`\n\n",
         escape_inline(&report.latency_mode)
     ));
+    if let Some(certification) = &report.token_prune_certification {
+        output.push_str("## Token-prune certification boundary\n\n");
+        output.push_str(
+            "The checked report uses a deterministic recorded backend with network access disabled. ",
+        );
+        output.push_str(
+            "It certifies gateway targeting, accounting, and evidence retention. In production, ",
+        );
+        output.push_str("the gateway uses the configured LLMLingua-2 sidecar.\n\n");
+        output.push_str(&format!(
+            "- Evaluation backend: `{}`\n",
+            escape_inline(&certification.evaluation_backend)
+        ));
+        output.push_str(&format!(
+            "- Production backend: `{}`\n",
+            escape_inline(&certification.production_backend)
+        ));
+        output.push_str(&format!(
+            "- Network access: `{}`\n\n",
+            yes_no(certification.network_access)
+        ));
+    }
     output.push_str("## Verified provenance\n\n");
     if let Some(provenance) = &report.verified_provenance {
         output.push_str(&format!(

@@ -447,6 +447,44 @@ fn target_log(policy: &CompressionPolicy) -> String {
                 }
                 target
             }
+            CompressionLeverConfig::TokenPrune(config) => {
+                let target = match config.target {
+                    sbproxy_ai::compression::TokenPruneTarget::RetainRatio { retain_percent } => {
+                        serde_json::json!({
+                            "mode": "retain_ratio",
+                            "retain_percent": retain_percent,
+                        })
+                    }
+                    sbproxy_ai::compression::TokenPruneTarget::TargetTokens { target_tokens } => {
+                        serde_json::json!({
+                            "mode": "target_tokens",
+                            "target_tokens": target_tokens,
+                        })
+                    }
+                };
+                serde_json::json!({
+                    "lever": "token_prune",
+                    "min_tokens": config.min_tokens,
+                    "model": config.model.as_str(),
+                    "timeout_ms": config.timeout_ms,
+                    "max_chunks": config.max_chunks,
+                    "target": target,
+                })
+            }
+            CompressionLeverConfig::QuerySelect(config) => match config {
+                sbproxy_ai::compression::QuerySelectConfig::Sentences { max_sentences } => {
+                    serde_json::json!({
+                        "lever": "query_select",
+                        "max_sentences": max_sentences,
+                    })
+                }
+                sbproxy_ai::compression::QuerySelectConfig::TargetTokens { target_tokens } => {
+                    serde_json::json!({
+                        "lever": "query_select",
+                        "target_tokens": target_tokens,
+                    })
+                }
+            },
             CompressionLeverConfig::RagSelect(config) => serde_json::json!({
                 "lever": "rag_select",
                 "min_tokens": config.min_tokens,
@@ -666,9 +704,9 @@ mod tests {
     use sbproxy_ai::compression::{
         CompactSerializationConfig, CompressionBackend, CompressionLeverConfig, CompressionPolicy,
         CompressionRun, CompressionStateBackend, CompressionStateConfig, FailureReason, LeverKind,
-        LeverOutcome, LeverResult, PositionReorderConfig, RagSelectConfig, RetrievalRanking,
-        SkipReason, SummarizerConfig, SummaryBufferConfig, TabularSerializationConfig,
-        WindowFitConfig,
+        LeverOutcome, LeverResult, PositionReorderConfig, QuerySelectConfig, RagSelectConfig,
+        RetrievalRanking, SkipReason, SummarizerConfig, SummaryBufferConfig,
+        TabularSerializationConfig, TokenPruneConfig, TokenPruneTarget, WindowFitConfig,
     };
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -789,6 +827,17 @@ mod tests {
             state: None,
             allow_admin_content_inspection: false,
             levers: vec![
+                CompressionLeverConfig::TokenPrune(TokenPruneConfig {
+                    min_tokens: 512,
+                    endpoint: "unix:///secret/operator/classifier.sock".to_string(),
+                    model: "llmlingua-2".to_string(),
+                    timeout_ms: 250,
+                    max_chunks: 64,
+                    target: TokenPruneTarget::RetainRatio { retain_percent: 50 },
+                }),
+                CompressionLeverConfig::QuerySelect(QuerySelectConfig::Sentences {
+                    max_sentences: 16,
+                }),
                 CompressionLeverConfig::RagSelect(RagSelectConfig {
                     min_tokens: 512,
                     ranking: RetrievalRanking::Auto,
@@ -823,6 +872,8 @@ mod tests {
             .find_map(|lever| match lever {
                 CompressionLeverConfig::WindowFit(config) => Some(config),
                 CompressionLeverConfig::SummaryBuffer(_)
+                | CompressionLeverConfig::TokenPrune(_)
+                | CompressionLeverConfig::QuerySelect(_)
                 | CompressionLeverConfig::RagSelect(_)
                 | CompressionLeverConfig::CompactSerialization(_)
                 | CompressionLeverConfig::PositionReorder(_) => None,
@@ -845,6 +896,21 @@ mod tests {
             targets,
             serde_json::json!([
                 {
+                    "lever": "token_prune",
+                    "min_tokens": 512,
+                    "model": "llmlingua-2",
+                    "timeout_ms": 250,
+                    "max_chunks": 64,
+                    "target": {
+                        "mode": "retain_ratio",
+                        "retain_percent": 50
+                    }
+                },
+                {
+                    "lever": "query_select",
+                    "max_sentences": 16
+                },
+                {
                     "lever": "rag_select",
                     "min_tokens": 512,
                     "ranking": "auto",
@@ -863,6 +929,12 @@ mod tests {
                     "ranking": "auto"
                 }
             ])
+        );
+        assert!(
+            !targets
+                .to_string()
+                .contains("unix:///secret/operator/classifier.sock"),
+            "operator endpoint must not enter telemetry"
         );
     }
 

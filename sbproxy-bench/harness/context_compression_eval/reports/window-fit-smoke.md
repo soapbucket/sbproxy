@@ -9,7 +9,7 @@ This is a first-party smoke evaluation, not an official third-party benchmark sc
 
 ## Verified provenance
 
-- Manifest SHA-256: `f96e77cd1248de3c5d0dc9d528e0a21e768a4d335a599caa5d2084f94afbb5b3`
+- Manifest SHA-256: `a9a08b96937b1f7b022d69806bf9b5a0ccbc18a036c7c3ffe225f8db30702542`
 - Evidence boundary: only the selected, manifest-covered inputs listed below.
 - No customer data; no official benchmark scores.
 

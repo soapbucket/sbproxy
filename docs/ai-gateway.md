@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-07-29*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -8,7 +8,7 @@ Three providers behind one wire format ([config](../examples/ai-gateway-quicksta
 
 SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 72 native providers behind one OpenAI-compatible API, including native Anthropic, Gemini, and Bedrock translators. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
 
-This guide owns the end-to-end picture: provider setup, wire compatibility, routing, streaming, budgets, caching, and per-request attribution. Seven features get a summary here and a full page of their own: the [guardrail mesh](ai-guardrail-mesh.md), [outcome-aware routing](ai-outcome-aware-routing.md), the [AI policy plane](ai-policy-cel.md), [predictive budgets with soft-landing](ai-predictive-budget.md), the [verifiable usage ledger](ai-usage-ledger.md), [LLM-aware resilience](ai-llm-aware-resilience.md), and [AI context compression](ai-context-compression.md). For those seven, the linked page is canonical; it carries the semantics, tuning advice, and reference tables.
+This guide owns the end-to-end picture: provider setup, wire compatibility, routing, streaming, budgets, caching, prompt controls, and per-request attribution. Seven features get a summary here and a full page of their own: the [guardrail mesh](ai-guardrail-mesh.md), [outcome-aware routing](ai-outcome-aware-routing.md), the [AI policy plane](ai-policy-cel.md), [predictive budgets with soft-landing](ai-predictive-budget.md), the [verifiable usage ledger](ai-usage-ledger.md), [LLM-aware resilience](ai-llm-aware-resilience.md), and [AI context compression](ai-context-compression.md). For those seven, the linked page is canonical; it carries the semantics, tuning advice, and reference tables.
 
 ## Provider setup
 
@@ -409,7 +409,7 @@ resilience:
     content_policy: 0  # never retry a refusal in place
 ```
 
-The same block hosts the legacy `llm_aware.context_compress` shorthand, which maps to stateless `window_fit` when no explicit compression policy is present, and `content_policy_fallback`, which routes a refusal to the next provider in priority order. The failure-cause table and hedged-request behavior are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). The ordered `summary_buffer` and `window_fit` pipeline is documented in [AI context compression](ai-context-compression.md).
+The same block hosts the legacy `llm_aware.context_compress` shorthand, which maps to stateless `window_fit` when no explicit compression policy is present, and `content_policy_fallback`, which routes a refusal to the next provider in priority order. The failure-cause table and hedged-request behavior are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). Ordered summary, query selection, token pruning, retrieval shaping, and final fitting are documented in [AI context compression](ai-context-compression.md).
 
 ## Shadow eval
 
@@ -1169,8 +1169,11 @@ Serves cached responses to prompts that mean the same thing without a provider c
 
 A request bypasses semantic-cache reads and writes when it carries an explicit
 header, governed-key, or CEL compression selector; when its route declares
-named profiles; when the route default has an explicit input budget; or when a
-captured session could use `summary_buffer`. The decision happens before
+named profiles; when the route default uses `token_prune`, `query_select`, a
+retrieval-aware lever, or an explicit input budget; or when a captured session
+could use `summary_buffer`. A supported chat surface also bypasses the cache
+when its route has a non-`off` reasoning policy, because current cache keys do
+not include that policy or its output budget. The decision happens before
 lookup and also prevents write-back. A legacy default-only compatibility
 `window_fit` route keeps its prior cache behavior. See
 [Semantic cache interaction](ai-context-compression.md#semantic-cache-interaction).
@@ -1408,15 +1411,114 @@ Per-surface knobs live under `per_surface_rate_limits` (see [Per-surface rate li
 
 `reranking` ships in the OSS build. It classifies the surface, dispatches it when a configured provider supports it (Cohere today), and captures the request's document count for per-unit billing. When no configured provider supports reranking, the proxy returns 501 before any upstream call, the same as every other surface.
 
+## Reasoning policy
+
+An AI route can ask eligible models to use less reasoning:
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-5-mini]
+      reasoning: concise
+```
+
+The closed values are:
+
+```yaml
+reasoning: off
+reasoning: concise
+reasoning:
+  budget: 2048
+```
+
+`off` is the default and leaves the body unchanged at this stage. `concise`
+selects the provider's lowest known native reasoning setting. `{budget: N}`
+requires a positive integer and uses a native token budget when the provider
+offers one. A provider attempt sees this policy after its `model_map` rewrite,
+so support is decided from the model that will reach that provider. Retries,
+fallback tiers, cascade tiers, race participants, and admitted shadow calls
+each apply the policy to their own mapped model.
+
+Because reasoning transforms happen after provider selection, a supported
+chat surface with `concise` or `{budget: N}` bypasses semantic-cache reads and
+writes. This prevents an older cached response from skipping the current
+reasoning policy. Exact idempotency replay remains a separate contract: an
+accepted key replays its original response until that entry expires, even
+across a route-policy reload. New keys and cache misses use the current
+reasoning policy, and every replay still passes current output guardrails.
+
+`N` has provider-specific wire semantics. Anthropic and Gemini use it as the
+native thinking-token budget when the mapped model accepts that value.
+Anthropic requires `budget_tokens` to remain below `max_tokens`, so SBproxy
+keeps a separate visible-output allowance and raises `max_tokens` to cover the
+thinking budget plus that allowance. OpenAI exposes effort rather than a
+numeric reasoning-token budget. SBproxy therefore selects low effort and caps
+the available completion at `N`, using `max_completion_tokens` for Chat
+Completions or `max_output_tokens` for a direct Responses-shaped call. The
+fixed fallback also caps the available completion or output field at `N`.
+Native values outside a model's supported range use that fallback safely.
+
+| Provider capability | `concise` | `{budget: N}` |
+|---|---|---|
+| OpenAI, Azure OpenAI, or Azure Foundry reasoning model | Chat Completions uses `reasoning_effort: low`; direct Responses uses `reasoning.effort: low` | Keep low effort; cap Chat Completions `max_completion_tokens` or Responses `max_output_tokens` at `N` |
+| Anthropic model with adaptive thinking | Set `thinking.type: adaptive` and `output_config.effort: low` | Use manual thinking only when that model supports it and `N` meets Anthropic's 1,024-token minimum; otherwise use the fixed fallback |
+| Anthropic model with manual thinking | Use the fixed prompt fallback when adaptive thinking is unavailable | Set `thinking.type: enabled` and `thinking.budget_tokens: N`; preserve the visible-output allowance in `max_tokens` |
+| Gemini model with thinking levels | Set `generationConfig.thinkingConfig.thinkingLevel: low` | Use a native budget only when that model exposes one and `N` is within its model-specific bounds; otherwise use the fixed fallback |
+| Gemini model with thinking budgets | Set `thinkingBudget: 1024` | Set `thinkingBudget: N` when `N` is within the model-specific minimum and maximum |
+| Bedrock with an Anthropic model | Use the matching Anthropic control under `additionalModelRequestFields` | Use the matching Anthropic budget under `additionalModelRequestFields`, subject to the same support and minimum checks |
+| Other providers and models | Fixed prompt fallback | Fixed prompt fallback with a completion cap |
+
+The runtime keeps the provider capability checks, including new adaptive
+Anthropic families and Gemini budget ranges. Treat the table as the wire
+behavior for a matched capability, not a permanent model-name allowlist.
+
+For Chat Completions and Messages, the fallback prepends this fixed system
+message once:
+
+```text
+Use brief, compact draft reasoning with only essential intermediate steps, then give the answer.
+```
+
+For a Responses-shaped call, SBproxy prepends the same fixed text to
+`instructions` instead. The fallback contains no request text. A budget
+fallback caps `max_output_tokens` for Responses. For other request shapes, it
+caps an existing `max_completion_tokens` or `max_tokens` at `N`; when neither
+exists it adds `max_tokens: N`.
+
+Tool and code safety takes priority. A non-empty top-level `tools` or legacy
+`functions` declaration bypasses reasoning changes. Code-shaped input also
+bypasses them. The detector recognizes fenced code, common source declarations,
+source syntax, common source-file paths such as `src/main.rs`, and explicit
+requests such as "debug this Rust function." It does not treat a prose mention
+of "code" or "function" as sufficient. SBproxy captures these eligibility
+facts before context compression, so a compression lever cannot erase the
+evidence and make the request eligible later.
+
+Only Chat Completions, Anthropic Messages, and OpenAI Responses use this
+policy. Images, audio, embeddings, reranking, moderation, assistants, threads,
+batches, files, fine tuning, model listing, and Realtime keep their existing
+request behavior.
+
+`sbproxy_ai_reasoning_policy_attempts_total{provider,outcome}` records one
+closed result per provider attempt. `outcome` is `native`, `prompt_fallback`,
+`off`, `tool_bypass`, or `code_bypass`. It contains no prompt or tool content.
+
 ## Context handling
 
 The shipped answer to a prompt that approaches a model's context window is an
-ordered, per-handler compression pipeline. `summary_buffer` compacts eligible
-older text into externally stored running summary state. `window_fit` can keep
-the legacy model-window behavior or enforce a positive `input_budget_tokens`
-target with the target-model counter. Levers run in declaration order, only
-strict token reductions commit, and a skip or runtime failure leaves the last
-committed messages in place while later levers continue.
+ordered, per-handler compression pipeline. `query_select` keeps sentences
+related to a marked question, and `token_prune` can use a local classifier
+sidecar to make that text shorter. `summary_buffer` compacts eligible older
+history into external state. `window_fit` can keep the legacy model-window
+behavior or enforce a positive `input_budget_tokens` target with the
+target-model counter. Levers run in declaration order, only strict token
+reductions commit, and a skip or runtime failure leaves the last committed
+messages in place while later levers continue.
 
 ### Context compression (shipped)
 
@@ -1426,6 +1528,13 @@ profile with precedence `X-Compression` header, governed key, CEL, then route
 default. Explicit-budget fitting preserves leading system and developer
 instructions, the newest complete turn, contiguous recent history, and
 OpenAI/Anthropic tool-call groupings.
+
+Marked retrieval blocks can run a quality-first fallback sequence:
+`query_select`, `token_prune`, then `window_fit`. The first lever is local and
+deterministic. The second calls an operator-supplied
+LLMLingua-2-compatible ONNX model through the OSS classifier sidecar. If the
+query has no usable sentence, the sidecar is down, or its response fails
+validation, later levers still receive the last valid message list.
 
 A stateful summary requires a captured session ID. A stateful pipeline with no
 explicit `state` block uses a process-owned Local redb file with a 24-hour TTL.
@@ -1445,6 +1554,116 @@ in [AI context compression](ai-context-compression.md).
 ### Context overflow (design stage)
 
 The overflow decision layer is design-stage: `crates/sbproxy-ai/src/context_overflow.rs` ships a registry of context windows for the OpenAI, Anthropic, Gemini, Mistral, and Llama families plus typed overflow actions (`Error`, `FallbackToLarger`, `Truncate`), but no dispatch code drives those actions and a `context_overflow:` block in the config is ignored. The one part of the module that does run is its window registry, which context compression consults to size a model's budget. The shipped way to handle overflow is `resilience.llm_aware.context_compress` above.
+
+## Stored prompts and offline optimization
+
+The prompt store keeps named, versioned prompts. A request can refer to
+`"prompt": "name@version"` or use a bare name. A bare name resolves to the
+pinned default, or to the highest numeric version label when no version is
+pinned. SBproxy renders that version, prepends it as a system message, removes
+the gateway-only `prompt` field, and records the resolved name and version in
+run metadata. Runtime versions are added, replaced, and pinned through the
+authenticated Admin API. Use a new version label when you need immutable
+history.
+
+`sbproxy ai prompt optimize` compiles a shorter static system prompt offline.
+It never changes live route state. The command first scores the source prompt,
+asks an OpenAI-compatible model for shorter instruction-only candidates, then
+scores each shorter candidate against the same customer-owned JSONL cases. It
+writes an artifact only after one candidate stays within the configured quality
+noise.
+
+Each nonblank JSONL line has this shape:
+
+```json
+{"id":"approved","input":"Access granted","expected":"approved"}
+```
+
+`id` must be unique and nonblank. `input` must be nonblank. `expected` must be
+a string for `exact-match` and `contains`, or any non-null JSON value for
+`json-exact`.
+
+| Metric | Match rule |
+|---|---|
+| `exact-match` | Trim the response and expected string, then require equality |
+| `contains` | Require the response to contain the expected string |
+| `json-exact` | Parse the complete trimmed response as JSON and require value equality |
+
+The aggregate score is matched cases divided by total cases. A candidate passes
+when its score is at least `baseline_score - noise_tolerance`. The default
+noise tolerance is `0.02`; accepted values range from 0 through 1.
+
+The runnable prompt fixture lives in
+[`examples/ai-hosted-prompts/`](../examples/ai-hosted-prompts/):
+
+```bash
+cargo run -p sbproxy -- ai prompt optimize \
+  --prompt examples/ai-hosted-prompts/source-prompt.txt \
+  --eval-set examples/ai-hosted-prompts/eval-set.jsonl \
+  --endpoint http://127.0.0.1:8080/v1 \
+  --host-header test.sbproxy.dev \
+  --task-model claude-haiku-4-5 \
+  --optimizer-model claude-haiku-4-5 \
+  --metric exact-match \
+  --noise-tolerance 0 \
+  --max-candidates 4 \
+  --max-requests 24 \
+  --timeout-secs 60 \
+  --name access-decision \
+  --prompt-version 2 \
+  --output /tmp/access-decision-v2.json
+```
+
+`--endpoint` accepts an HTTP or HTTPS base URL or a full
+`/chat/completions` URL. It rejects embedded credentials, query parameters, and
+fragments. `--host-header` keeps the dial address from `--endpoint` but
+overrides the HTTP `Host` header, which lets the local command reach the
+`test.sbproxy.dev` origin. Use `--api-key-env OPENAI_API_KEY` when the endpoint
+expects a Bearer key; the flag names an environment variable and does not
+accept the key itself. `--optimizer-model` defaults to `--task-model`.
+
+The source prompt is capped at 1 MiB and the eval set at 16 MiB. Each model
+response is capped at 1 MiB. `--max-candidates` accepts from 1 through 64.
+`--max-requests` covers the baseline cases, one candidate-generation request,
+and candidate evaluations. For `C` cases, the minimum useful budget is
+`2 * C + 1`: one baseline, one candidate, and the generation call. SBproxy
+sorts usable shorter candidates by token count, then evaluates only the number
+of complete `C`-request evaluations that fit. To evaluate up to `K` candidates,
+allow `C * (K + 1) + 1` requests. The command never crosses the cap. It fails
+without writing an artifact if no evaluated candidate passes or a model
+request fails.
+
+The source must be a static instruction without Minijinja markers. The
+optimizer response must be a JSON array of strings, with an optional JSON code
+fence. SBproxy discards blank, duplicate, unchanged, and non-shorter
+candidates. It also discards candidates with common few-shot markers such as
+`Example:`, paired `Input:` and `Output:`, or paired `User:` and `Assistant:`.
+Minijinja markers such as `{{`, `{%`, and `{#` are also rejected. These checks
+are conservative syntax guards, not a semantic proof that a candidate contains
+no demonstration. Optimize dynamic templates and few-shot prompts with a
+task-specific process that evaluates their rendered form.
+
+Among candidates that pass, SBproxy chooses the lowest target-model token
+estimate. A token-count tie prefers the higher quality score, then lexical
+order for determinism. The JSON artifact includes the source SHA-256, metric,
+both scores, noise tolerance, token counts, and an Admin-ready
+`prompt_version` object with an empty `variables` map.
+
+Install the selected version explicitly:
+
+```bash
+jq '.prompt_version' /tmp/access-decision-v2.json \
+  | curl -u admin:change-this \
+      http://127.0.0.1:9090/admin/prompts/test.sbproxy.dev/access-decision/versions \
+      -H 'Content-Type: application/json' \
+      --data-binary @-
+```
+
+Review the artifact before this call. The optimizer proves only the chosen
+metric on the supplied cases, and the Admin mutation changes the live prompt
+overlay. Pinning remains a separate Admin operation, which gives operators a
+clear review and rollback point. The full runnable flow is in
+[`examples/ai-hosted-prompts/`](../examples/ai-hosted-prompts/).
 
 ## Streaming analytics
 
@@ -1573,6 +1792,7 @@ The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpo
 | `sbproxy_ai_failovers_total` | Counter | `from_provider`, `to_provider`, `reason` | Provider failover events |
 | `sbproxy_ai_guardrail_blocks_total` | Counter | `category` | Guardrail block events (pii, injection, jailbreak, etc.) |
 | `sbproxy_ai_safety_guardrail_verdicts_total` | Counter | `guardrail`, `class`, `backend`, `verdict` | Toxicity, jailbreak, and content-safety evaluations, including whether keyword or classifier mode produced the verdict |
+| `sbproxy_ai_reasoning_policy_attempts_total` | Counter | `provider`, `outcome` | Per-provider concise-reasoning result: `native`, `prompt_fallback`, `off`, `tool_bypass`, or `code_bypass` |
 | `sbproxy_ai_cache_results_total` | Counter | `provider`, `cache_type`, `result` | AI response cache results (`cache_type` is `exact` or `semantic`, `result` is `hit` or `miss`) |
 | `sbproxy_ai_budget_utilization_ratio` | Gauge | `scope` | Current budget utilization as a 0 to 1 ratio |
 | `sbproxy_ai_realtime_sessions_active` | Gauge | | Currently open OpenAI Realtime API WebSocket sessions |
@@ -1807,6 +2027,10 @@ The process-wide AI budget tracker is deliberately left alone on reload. Budget 
 ## See also
 
 - [providers.md](providers.md) - full provider table and per-provider model lists.
+- [`examples/ai-hosted-prompts/`](../examples/ai-hosted-prompts/) - prompt
+  versioning and the offline optimizer with a runnable eval set.
+- [local-inference.md](local-inference.md) - classifier-sidecar models used by
+  token pruning, embeddings, and safety checks.
 - [scripting.md](scripting.md) - CEL and Lua reference, including AI selector and guardrail variables.
 - [configuration.md](configuration.md) - general configuration model, origin schema, and the full `sb.yml` field reference.
 - [features.md](features.md) - the capability tour across the whole proxy, AI and non-AI.

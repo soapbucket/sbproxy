@@ -31,7 +31,7 @@
   "token_counter": "sbproxy_target_model",
   "latency_mode": "omitted_for_deterministic_gate",
   "verified_provenance": {
-    "manifest_sha256": "f96e77cd1248de3c5d0dc9d528e0a21e768a4d335a599caa5d2084f94afbb5b3",
+    "manifest_sha256": "a9a08b96937b1f7b022d69806bf9b5a0ccbc18a036c7c3ffe225f8db30702542",
     "artifacts": [
       {
         "path": "fixtures/phase1-pipeline-smoke.jsonl",

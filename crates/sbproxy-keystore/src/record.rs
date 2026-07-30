@@ -290,6 +290,18 @@ pub enum CredentialMaterial {
     },
 }
 
+impl CredentialMaterial {
+    /// Whether this material carries a raw, unsealed secret.
+    ///
+    /// Callers use this to keep plaintext material out of shared or persistent
+    /// surfaces. [`Self::VaultRef`] holds only a reference and
+    /// [`Self::Envelope`] is already sealed, so both are safe to hand onward;
+    /// [`Self::Plaintext`] is the secret itself.
+    pub fn is_plaintext(&self) -> bool {
+        matches!(self, Self::Plaintext { .. })
+    }
+}
+
 /// An upstream provider credential record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CredentialRecord {

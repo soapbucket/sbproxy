@@ -1,0 +1,3 @@
+{"id":"grant-basic","input":"Decision: access granted.","expected":"approved"}
+{"id":"deny-basic","input":"Decision: access denied.","expected":"denied"}
+{"id":"grant-audit","input":"Audit result says access was granted to the service account.","expected":"approved"}

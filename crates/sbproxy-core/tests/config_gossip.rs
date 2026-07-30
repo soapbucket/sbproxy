@@ -618,8 +618,16 @@ async fn two_mesh_subscribers_beat_the_interval_and_a_non_mesh_one_converges_on_
     // The third node is in no cluster at all: no watcher, no cluster read,
     // and it still converges. This is the required path, and it is the one
     // every managed-service subscriber is on.
+    //
+    // This wait is the reason the test runs for about five seconds, and it is
+    // load-bearing. `MIN_CONFIG_AUTHORITY_POLL_SECS` is 5 and `upstream()`
+    // validates every fixture against the real schema, so a shorter interval
+    // would mean either weakening that fixture guard or lowering a shipped
+    // config bound to suit a test. Neither is worth under a second, so the test
+    // sits at the schema minimum and waits.
+    const OUTSIDER_INTERVAL_SECS: u64 = sbproxy_config::types::MIN_CONFIG_AUTHORITY_POLL_SECS;
     let dir = tempfile::tempdir().expect("temp dir");
-    let mut outsider = subscriber(dir.path(), &stub, 5);
+    let mut outsider = subscriber(dir.path(), &stub, OUTSIDER_INTERVAL_SECS);
     assert!(
         !outsider.is_gossip_accelerated(),
         "a non-mesh subscriber must hold no watcher",
@@ -628,8 +636,10 @@ async fn two_mesh_subscribers_beat_the_interval_and_a_non_mesh_one_converges_on_
     let started = Instant::now();
     assert_eq!(outsider.await_next_cycle().await, CycleTrigger::Interval);
     let waited = started.elapsed();
+    // Four fifths of the interval: the jitter subtracts up to a fifth, so this
+    // is the same relationship the 5s form asserted with its floor of 4s.
     assert!(
-        waited >= Duration::from_secs(4),
+        waited >= Duration::from_secs(OUTSIDER_INTERVAL_SECS) * 4 / 5,
         "the non-mesh subscriber waited only {waited:?}; it must sit out its jittered interval",
     );
     assert_eq!(outsider.poll_once().await, CycleResult::Applied);

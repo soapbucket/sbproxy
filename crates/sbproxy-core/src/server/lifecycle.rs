@@ -1874,22 +1874,32 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         // abort startup: an unreadable persistence file should not
         // brick the proxy. PR3-style ephemeral mutations keep
         // working on the failed path.
+        // At-rest sealing for the prompt file. Resolved before the open
+        // below, and a failure here is FATAL, unlike a failed open. The
+        // distinction matters: an unreadable file loses saved prompts and
+        // degrades to ephemeral mutations, but a key the operator asked for
+        // and we cannot supply would otherwise degrade to writing records in
+        // the clear, which is the one outcome the no-plaintext-fallback rule
+        // exists to prevent.
+        let prompt_sealer = build_prompt_sealer(server_config.admin.as_ref())?;
         let prompt_persistence = server_config
             .admin
             .as_ref()
             .and_then(|a| a.prompt_persistence_path.as_ref())
-            .and_then(|path| match crate::admin::PromptPersistence::open(path) {
-                Ok(p) => {
-                    tracing::info!(path = %path.display(), "opened prompt persistence");
-                    Some(std::sync::Arc::new(p))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "failed to open prompt persistence; mutations will be ephemeral"
-                    );
-                    None
+            .and_then(|path| {
+                match crate::admin::PromptPersistence::open(path, prompt_sealer.clone()) {
+                    Ok(p) => {
+                        tracing::info!(path = %path.display(), "opened prompt persistence");
+                        Some(std::sync::Arc::new(p))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "failed to open prompt persistence; mutations will be ephemeral"
+                        );
+                        None
+                    }
                 }
             });
         // Resolve the operator-password pepper before constructing
@@ -2818,6 +2828,64 @@ fn build_pii_from_rule_names(
 /// Per-tenant and per-origin sink scopes land alongside the
 /// WOR-1051 credentials epic; this helper covers only the proxy scope
 /// today.
+/// Build the prompt-persistence sealer from `admin.prompt_persistence_encryption`.
+///
+/// Returns `Ok(None)` when the block is absent or disabled, which keeps records
+/// as plaintext JSON and matches the behaviour before this existed.
+///
+/// Every failure is fatal by design. `enabled: true` with no key, an
+/// unresolvable reference, and material under the minimum length all abort
+/// startup rather than falling back to plaintext. An operator who asked for
+/// encryption and did not get it must not learn that from a file they read
+/// months later.
+fn build_prompt_sealer(
+    admin: Option<&sbproxy_config::AdminConfig>,
+) -> anyhow::Result<Option<std::sync::Arc<crate::admin::PromptSealer>>> {
+    use anyhow::Context as _;
+
+    let Some(enc) = admin
+        .and_then(|a| a.prompt_persistence_encryption.as_ref())
+        .filter(|enc| enc.enabled)
+    else {
+        return Ok(None);
+    };
+
+    let reference = enc.key.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "admin.prompt_persistence_encryption.enabled is true but no `key` is set; point \
+             `key` at a secret reference such as `secret://local/prompt-persistence` or set \
+             `enabled: false`"
+        )
+    })?;
+
+    let active =
+        crate::admin::PromptKeyMaterial::new(crate::pipeline::resolve_at_rest_key_material(
+            reference,
+            "admin.prompt_persistence_encryption",
+        )?)
+        .context("admin.prompt_persistence_encryption.key")?;
+    let mut previous = Vec::with_capacity(enc.previous_keys.len());
+    for (index, reference) in enc.previous_keys.iter().enumerate() {
+        previous.push(
+            crate::admin::PromptKeyMaterial::new(crate::pipeline::resolve_at_rest_key_material(
+                reference,
+                "admin.prompt_persistence_encryption",
+            )?)
+            .with_context(|| {
+                format!("admin.prompt_persistence_encryption.previous_keys[{index}]")
+            })?,
+        );
+    }
+
+    let sealer = crate::admin::PromptSealer::new(active, previous);
+    tracing::info!(
+        key_id = %sealer.active_key_id(),
+        retired_keys = enc.previous_keys.len(),
+        "prompt persistence will seal records at rest"
+    );
+    Ok(Some(std::sync::Arc::new(sealer)))
+}
+
 fn validate_sinks_config(server: &sbproxy_config::ProxyServerConfig) {
     let sinks = match server
         .observability

@@ -539,14 +539,36 @@ fn build_cache_reserve(
 /// as key material, because a literal `secret://...` silently becoming
 /// the AES key is exactly the failure this feature exists to prevent.
 fn resolve_cache_key_material(reference: &str) -> anyhow::Result<Vec<u8>> {
+    resolve_at_rest_key_material(reference, "proxy.response_cache_store.encryption")
+}
+
+/// Resolve an at-rest encryption key reference to raw key material.
+///
+/// One resolution path for every at-rest surface, so a new surface cannot
+/// quietly accept a different reference syntax or a different failure mode.
+/// `config_path` only shapes the error message, naming the block the operator
+/// has to fix.
+///
+/// Accepts a provider URI (`secret://backend/name`, `vault://...`) resolved
+/// through the process secret resolver, a `file:/path` reference, or a
+/// whole-value `${ENV_VAR}` (handled by the resolver). Anything else is taken
+/// as literal material.
+///
+/// There is no plaintext fallback anywhere on this path: a reference that looks
+/// like a secret URI with no backend to resolve it is an error rather than key
+/// material spelled `secret://...`.
+pub(crate) fn resolve_at_rest_key_material(
+    reference: &str,
+    config_path: &str,
+) -> anyhow::Result<Vec<u8>> {
     use anyhow::Context;
 
     if let Some(resolver) = sbproxy_vault::process_resolver() {
         return Ok(resolver.resolve(reference)?.into_bytes());
     }
     if let Some(path) = reference.strip_prefix("file:") {
-        let raw = std::fs::read(path)
-            .with_context(|| format!("read response-cache encryption key file '{path}'"))?;
+        let raw =
+            std::fs::read(path).with_context(|| format!("read {config_path} key file '{path}'"))?;
         // Trim so a trailing newline in the key file does not silently
         // change the derived key. Matches the resolver's `file:`
         // semantics, which also trim.
@@ -554,8 +576,8 @@ fn resolve_cache_key_material(reference: &str) -> anyhow::Result<Vec<u8>> {
     }
     if sbproxy_vault::looks_like_secret_reference_uri(reference) {
         anyhow::bail!(
-            "proxy.response_cache_store.encryption references the secret '{reference}' but no \
-             secret backend is configured to resolve it; declare one under proxy.secrets.backends"
+            "{config_path} references the secret '{reference}' but no secret backend is \
+             configured to resolve it; declare one under proxy.secrets.backends"
         );
     }
     Ok(reference.as_bytes().to_vec())

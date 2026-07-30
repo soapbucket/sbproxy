@@ -110,6 +110,11 @@ pub fn request_to_native(body: Value, path: &str) -> (Value, String) {
     if !inference.is_empty() {
         out.insert("inferenceConfig".to_string(), Value::Object(inference));
     }
+    // Converse exposes model-specific controls through this escape hatch.
+    // Preserve fields installed by per-attempt reasoning policy selection.
+    if let Some(fields) = obj.get("additionalModelRequestFields") {
+        out.insert("additionalModelRequestFields".to_string(), fields.clone());
+    }
 
     // 3. Tool config.
     if let Some(Value::Array(tools)) = obj.get("tools").cloned() {

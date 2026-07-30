@@ -54,6 +54,12 @@ pub enum HkdfPurpose {
     /// key and a per-entry random salt, so a fresh 96-bit nonce is
     /// only ever used once under any derived key.
     ResponseCacheAtRest,
+    /// AES-256-GCM key material for persisted prompt-overlay records at
+    /// rest. Deliberately distinct from [`Self::ResponseCacheAtRest`]:
+    /// the two surfaces may be configured from the same operator secret,
+    /// and purpose separation is what keeps one derived key from opening
+    /// the other's records.
+    PromptPersistenceAtRest,
 }
 
 impl HkdfPurpose {
@@ -71,6 +77,7 @@ impl HkdfPurpose {
             HkdfPurpose::OidcTxCookie => b"sbproxy.hkdf.oidc-tx-cookie.v1",
             HkdfPurpose::KeyEnvelope => b"sbproxy.hkdf.key-envelope.v1",
             HkdfPurpose::ResponseCacheAtRest => b"sbproxy.hkdf.response-cache-at-rest.v1",
+            HkdfPurpose::PromptPersistenceAtRest => b"sbproxy.hkdf.prompt-persistence-at-rest.v1",
         }
     }
 }

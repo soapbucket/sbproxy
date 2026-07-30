@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "profile": "token-prune-retain-recorded-smoke-v1",
+  "levers": [
+    {
+      "type": "token_prune",
+      "min_tokens": 32,
+      "endpoint": "recorded://token-prune-v1",
+      "model": "llmlingua-2-recorded-smoke-v1",
+      "timeout_ms": 25,
+      "max_chunks": 8,
+      "target": {
+        "mode": "retain_ratio",
+        "retain_percent": 45
+      }
+    }
+  ]
+}

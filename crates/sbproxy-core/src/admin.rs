@@ -27,7 +27,7 @@ use sbproxy_config::types::AdminRole;
 use serde::Serialize;
 
 pub mod prompt_persistence;
-pub use prompt_persistence::PromptPersistence;
+pub use prompt_persistence::{PromptKeyMaterial, PromptPersistence, PromptSealer};
 
 // --- Config ---
 

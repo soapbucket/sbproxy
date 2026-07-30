@@ -18,7 +18,7 @@ fn committed_fixtures_have_verified_provenance_checksums_and_privacy() {
     verify_fixture_set(root, &manifest).expect("fixture provenance and privacy verify");
 
     assert_eq!(manifest.schema_version, 1);
-    assert_eq!(manifest.artifacts.len(), 6);
+    assert_eq!(manifest.artifacts.len(), 8);
     assert!(manifest
         .artifacts
         .iter()
@@ -32,6 +32,7 @@ fn committed_fixtures_have_verified_provenance_checksums_and_privacy() {
         "compact_serialization_smoke",
         "position_reorder_smoke",
         "phase1_pipeline_smoke",
+        "query_select_smoke",
     ] {
         let artifact = manifest
             .artifacts
