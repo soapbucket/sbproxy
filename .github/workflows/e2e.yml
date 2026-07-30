@@ -97,6 +97,7 @@ jobs:
     # Serialize the issue lookup/create critical section across runs.
     concurrency:
       group: sbproxy-e2e-failure-notification
+      queue: max
       cancel-in-progress: false
     # Keep write authority out of the job that builds and executes the
     # repository. This job needs only enough access to report a failure.
@@ -108,6 +109,7 @@ jobs:
         with:
           script: |
             const marker = '<!-- sbproxy-e2e-workflow-failure -->';
+            const incidentTitle = 'Debug e2e workflow is failing';
             const runId = process.env.GITHUB_RUN_ID;
             const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${runId}`;
             const report = [
@@ -136,7 +138,11 @@ jobs:
               }
             );
             const existing = openIssues.find(
-              issue => !issue.pull_request && issue.body?.includes(marker)
+              issue =>
+                !issue.pull_request &&
+                issue.user?.login === 'github-actions[bot]' &&
+                issue.title === incidentTitle &&
+                issue.body?.startsWith(marker)
             );
 
             if (existing) {
@@ -150,7 +156,7 @@ jobs:
               await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                title: 'Debug e2e workflow is failing',
+                title: incidentTitle,
                 body: report
               });
             }
