@@ -850,6 +850,13 @@ impl RateLimitPolicy {
         let peers = cluster.merged_peers(&bucket, window_start);
         let count = local.saturating_add(peers);
 
+        // The merged view changed the outcome: this node alone would have
+        // admitted. Counting it is what makes the approximation observable
+        // instead of something an operator has to infer.
+        if count > limit && local <= limit {
+            sbproxy_observe::metrics::record_rate_limit_cluster_peer_denial();
+        }
+
         RateLimitInfo {
             allowed: count <= limit,
             limit,
