@@ -14,11 +14,9 @@ on:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-*'
-  # Nightly run so this lane cannot rot silently between releases:
-  # tag-only triggers mean a breakage introduced mid-cycle only
-  # surfaces during the release itself. Failures do not page anyone;
-  # GitHub emails the scheduled run's actor on failure, which is the
-  # intended default.
+  # Scheduled runs use the default branch (main). Manual dispatch keeps
+  # the branch selector, so a deliberate break can prove this lane from
+  # a test branch without moving main.
   schedule:
     - cron: '30 9 * * *' # 09:30 UTC daily
   workflow_dispatch: {}
@@ -36,12 +34,31 @@ jobs:
     name: e2e (workspace)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # Pin the harness to the binaries built in this job. The harness
+      # otherwise prefers a release binary when one is present.
+      SBPROXY_E2E_BIN: ${{ github.workspace }}/target/debug/sbproxy
+      SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN: ${{ github.workspace }}/target/no-default-features/debug/sbproxy
+      # Dependency-complete CI must never turn governance_strict into a
+      # successful skip merely because redis-server disappeared.
+      SBPROXY_E2E_REQUIRE_REDIS: '1'
     steps:
       - uses: actions/checkout@v5
 
       - uses: ./.github/actions/rust-setup
         with:
           cache-key: e2e
+
+      # governance_strict starts its own isolated redis-server on an
+      # ephemeral port and waits for that exact process to accept TCP
+      # connections. Install and verify the packaged executable here;
+      # the test provides the readiness check without relying on init.
+      - name: install Redis test dependency
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y redis-server
+          redis-server --version
 
       # The e2e harness spawns the proxy binary at runtime; cargo
       # cannot infer the ordering between the e2e crate and the
@@ -64,3 +81,66 @@ jobs:
       # release-checks.yml runs the same suite green; match it here.
       - name: e2e
         run: cargo test -p sbproxy-e2e --locked -- --test-threads=1
+
+  notify-failure:
+    name: failure notification (GitHub issue)
+    needs: e2e
+    if: ${{ always() && needs.e2e.result == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Keep write authority out of the job that builds and executes the
+    # repository. This job needs only enough access to report a failure.
+    permissions:
+      issues: write
+    steps:
+      - name: open or update the e2e failure issue
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const marker = '<!-- sbproxy-e2e-workflow-failure -->';
+            const runId = process.env.GITHUB_RUN_ID;
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${runId}`;
+            const report = [
+              marker,
+              'The non-required debug e2e workflow failed.',
+              '',
+              `- Run: [${runId}](${runUrl})`,
+              `- Trigger: \`${process.env.GITHUB_EVENT_NAME}\``,
+              `- Ref: \`${process.env.GITHUB_REF}\``,
+              `- Commit: \`${process.env.GITHUB_SHA}\``,
+              '',
+              '### Next steps',
+              '',
+              '1. Inspect the failed step and its logs in the linked run.',
+              `2. Re-run failed jobs after a transient runner failure: \`gh run rerun ${runId} --failed\`.`,
+              '3. Reproduce a named e2e target with Redis installed and `SBPROXY_E2E_REQUIRE_REDIS=1`.'
+            ].join('\n');
+
+            const openIssues = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                per_page: 100
+              }
+            );
+            const existing = openIssues.find(
+              issue => !issue.pull_request && issue.body?.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: report.replace(`${marker}\n`, '')
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'Debug e2e workflow is failing',
+                body: report
+              });
+            }

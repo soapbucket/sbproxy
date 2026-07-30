@@ -9,10 +9,11 @@
 //! neither gateway can see the other's in-memory state.
 //!
 //! Requires `redis-server` on PATH (the test spawns and owns its own
-//! instance; no external Redis is touched) and a prebuilt release
-//! `sbproxy` binary. Skips with a message instead of failing when
-//! `redis-server` is not installed, mirroring `e2e/tests/key_replicas.rs`.
-//! Local only; never added to the required CI gate (project e2e policy).
+//! instance; no external Redis is touched) and a prebuilt `sbproxy`
+//! binary. Ordinary local runs skip with a message when `redis-server`
+//! is unavailable. Set `SBPROXY_E2E_REQUIRE_REDIS=1` in CI or other
+//! dependency-complete environments to make a missing Redis executable
+//! fail instead. This test is not part of the required PR CI gate.
 
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -64,7 +65,17 @@ impl RedisGuard {
             .spawn()
         {
             Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if std::env::var_os("SBPROXY_E2E_REQUIRE_REDIS").as_deref()
+                    == Some(std::ffi::OsStr::new("1"))
+                {
+                    panic!(
+                        "SBPROXY_E2E_REQUIRE_REDIS=1 but redis-server was not found on PATH; \
+                         install redis-server before running governance_strict"
+                    );
+                }
+                return None;
+            }
             Err(e) => panic!("spawn redis-server: {e}"),
         };
         let guard = Self { child, port };
@@ -199,11 +210,40 @@ fn admin_usage(admin_port: u16, key_id: &str) -> Value {
 }
 
 #[test]
+fn required_redis_mode_fails_when_redis_server_is_unavailable() {
+    let test_binary = std::env::current_exe().expect("current governance_strict test binary");
+    let output = Command::new(test_binary)
+        .args([
+            "--exact",
+            "two_gateways_never_admit_more_than_the_shared_strict_request_limit",
+            "--nocapture",
+        ])
+        .env("PATH", "/sbproxy-e2e-intentionally-missing")
+        .env("SBPROXY_E2E_REQUIRE_REDIS", "1")
+        .output()
+        .expect("run governance_strict in Redis-required mode");
+
+    assert!(
+        !output.status.success(),
+        "Redis-required mode must fail instead of reporting a successful skip; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("SBPROXY_E2E_REQUIRE_REDIS=1 but redis-server was not found on PATH"),
+        "failure must explain how to satisfy the Redis dependency; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn two_gateways_never_admit_more_than_the_shared_strict_request_limit() {
     let Some(redis) = RedisGuard::spawn() else {
         eprintln!(
             "SKIP governance_strict::two_gateways_never_admit_more_than_the_shared_strict_request_limit: \
-             redis-server not found on PATH"
+             redis-server not found on PATH (optional for local runs; set \
+             SBPROXY_E2E_REQUIRE_REDIS=1 to require it)"
         );
         return;
     };
