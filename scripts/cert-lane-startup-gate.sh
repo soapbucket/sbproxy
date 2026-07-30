@@ -27,7 +27,9 @@ fail=0
 ok()  { echo "  PASS $1"; pass=$((pass + 1)); }
 bad() { echo "  FAIL $1"; fail=$((fail + 1)); }
 
-CHECK_IDS="driver visible_devices cuda_compatibility shared_memory cache_mount model_plane_identity"
+CHECK_IDS="driver visible_devices cuda_compatibility shared_memory cache_mount model_plane_identity unpinned_weights"
+# Derived, so adding a check does not silently weaken this lane.
+EXPECTED_CHECKS="$(printf '%s\n' $CHECK_IDS | wc -l | tr -d ' ')"
 
 echo "== startup gate lane =="
 echo "   binary: $("$SBPROXY_BIN" --version 2>/dev/null | head -1)"
@@ -116,6 +118,7 @@ expected = {
     "shared_memory",
     "cache_mount",
     "model_plane_identity",
+    "unpinned_weights",
 }
 missing = expected - ids
 assert not missing, f"JSON report omits checks: {sorted(missing)}"
@@ -147,22 +150,22 @@ else
   cat "$WORK/gateway.txt"
 fi
 
-# Nothing may be silently dropped: all six checks report, and on a
+# Nothing may be silently dropped: every check reports, and on a
 # gateway-only config every one of them is a skip, not a hollow pass.
 missing_ids=""
 for id in $CHECK_IDS; do
   grep -qE "^  ${id} " "$WORK/gateway.txt" || missing_ids="$missing_ids $id"
 done
 if [ -z "${missing_ids// /}" ]; then
-  ok "all six checks report a status even when none applies"
+  ok "all ${EXPECTED_CHECKS} checks report a status even when none applies"
 else
   bad "checks absent from the report:${missing_ids}"
 fi
 skips="$(grep -cE "^  [a-z_]+ +skip" "$WORK/gateway.txt" || true)"
-if [ "${skips:-0}" -eq 6 ]; then
-  ok "a gateway-only config skips all six checks rather than claiming a pass"
+if [ "${skips:-0}" -eq "$EXPECTED_CHECKS" ]; then
+  ok "a gateway-only config skips every check rather than claiming a pass"
 else
-  bad "expected 6 skips on a gateway-only config, found ${skips:-0}"
+  bad "expected ${EXPECTED_CHECKS} skips on a gateway-only config, found ${skips:-0}"
 fi
 
 echo

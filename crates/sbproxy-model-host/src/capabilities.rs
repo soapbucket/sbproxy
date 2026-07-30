@@ -1027,6 +1027,7 @@ fn field_is_active(path: &str, config: &ModelHostConfig) -> bool {
     match path {
         "serve.catalog_file" => config.catalog_file.is_some(),
         "serve.cache_budget_gib" => config.cache_budget_gib.is_some(),
+        "serve.allow_unpinned_refs" => config.allow_unpinned_refs,
         "serve.engines" => !config.engines.is_empty(),
         "serve.queue_timeout_ms" => config.queue_timeout_ms.is_some(),
         "serve.models[].engine" => config
@@ -1400,6 +1401,15 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
         status: SupportLevel::Preview,
         capability_id: "artifact.cache_budget",
         consumer: Some(ConsumerContract::CacheBudgetProtectsActiveArtifacts),
+    },
+    // WOR-2070: the startup gate reads this to decide whether a
+    // worker-role node may serve weights it never verified, so the field
+    // has a real consumer rather than being config-only.
+    ConfigFieldCapability {
+        path: "serve.allow_unpinned_refs",
+        status: SupportLevel::Preview,
+        capability_id: "artifact.verified_acquisition",
+        consumer: None,
     },
     ConfigFieldCapability {
         path: "serve.eviction",

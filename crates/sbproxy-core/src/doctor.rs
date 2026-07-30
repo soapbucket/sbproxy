@@ -316,6 +316,13 @@ pub struct ServeDemand {
     /// multiprocess tensor handles, so a `/dev/shm` smaller than this is
     /// a launch failure the operator can be told about at boot.
     pub required_shm_bytes: Option<u64>,
+    /// Serve entries naming an unpinned raw reference, which the engine
+    /// self-downloads in repo mode rather than loading from a verified
+    /// local snapshot. Empty when every entry names a catalog artifact.
+    pub unpinned_refs: Vec<String>,
+    /// The config set `serve.allow_unpinned_refs`, accepting repo mode on
+    /// a worker.
+    pub allow_unpinned_refs: bool,
 }
 
 /// Peer identity a node needs before it can join the private model
@@ -955,6 +962,9 @@ impl DoctorReport {
         //    identity joins gossip and then refuses every dispatch, which
         //    reads as a routing bug from the gateway side.
         checks.push(strict_model_plane_check(plane));
+
+        // 7. Unpinned weights on a fleet worker.
+        checks.push(strict_unpinned_refs_check(demand, plane));
 
         checks
     }
@@ -1662,7 +1672,87 @@ fn serve_demand(serve: &ModelHostConfig) -> ServeDemand {
             demand.required_shm_bytes = Some(demand.required_shm_bytes.unwrap_or(0).max(bytes));
         }
     }
+    demand.allow_unpinned_refs = serve.allow_unpinned_refs;
+    // A scheme prefix is what makes a reference raw: a catalog id is a
+    // bare name, and anything with `hf:` or `file:` in front of it
+    // bypasses the catalog's per-file digests entirely.
+    demand.unpinned_refs = serve
+        .models
+        .iter()
+        .filter(|entry| is_unpinned_reference(&entry.model))
+        .map(|entry| entry.model.clone())
+        .collect();
     demand
+}
+
+/// Whether a serve entry's `model` is an unpinned raw reference rather
+/// than a catalog id with certified per-file digests.
+fn is_unpinned_reference(model: &str) -> bool {
+    model.starts_with("hf:") || model.starts_with("file:")
+}
+
+/// Refuse unpinned raw references on a node that holds the `worker`
+/// cluster role, unless the operator opted in.
+///
+/// Repo mode is not a lesser version of the pinned path, it is a
+/// different security posture: the engine container gets DNS and external
+/// egress instead of an `--internal` network, a writable cache mount
+/// instead of a read-only one, and no digest verification at all, because
+/// sbproxy never sees the download. That is the right trade for
+/// `sbproxy run <model>` on a workstation and for evaluating a model with
+/// no catalog entry. It is the wrong trade for a long-lived node holding
+/// cluster identity that a certification lane makes claims about.
+///
+/// Scoped to the worker role deliberately. A workstation, a gateway-only
+/// node, and `sbproxy run` all pass unchanged; only the fleet worker has
+/// to say so explicitly.
+fn strict_unpinned_refs_check(
+    demand: &ServeDemand,
+    plane: Option<&ModelPlaneIdentity>,
+) -> StrictCheck {
+    if demand.unpinned_refs.is_empty() {
+        return StrictCheck {
+            check: "unpinned_weights",
+            status: "skip",
+            detail: "every configured serve entry names a catalog artifact with verified digests"
+                .to_string(),
+        };
+    }
+    let worker = plane.is_some_and(|plane| plane.worker_role);
+    if !worker {
+        return StrictCheck {
+            check: "unpinned_weights",
+            status: "skip",
+            detail: format!(
+                "{} unpinned reference(s) configured, allowed because this node holds no worker \
+                 role; the engine will self-download and no digest will be verified",
+                demand.unpinned_refs.len()
+            ),
+        };
+    }
+    if demand.allow_unpinned_refs {
+        return StrictCheck {
+            check: "unpinned_weights",
+            status: "pass",
+            detail: format!(
+                "worker node accepts {} unpinned reference(s) because \
+                 serve.allow_unpinned_refs is set: {}",
+                demand.unpinned_refs.len(),
+                demand.unpinned_refs.join(", ")
+            ),
+        };
+    }
+    StrictCheck {
+        check: "unpinned_weights",
+        status: "fail",
+        detail: format!(
+            "this node holds the worker role and configures unpinned reference(s) ({}). The \
+             engine self-downloads these, so the container runs with external egress and a \
+             writable cache and no digest is verified. Give the model a catalog entry with \
+             per-file digests, or set serve.allow_unpinned_refs to accept that on this worker",
+            demand.unpinned_refs.join(", ")
+        ),
+    }
 }
 
 /// Evaluate the model-plane identity a node was told to present.
@@ -1789,7 +1879,7 @@ mod tests {
         // must say so explicitly rather than reporting a hollow pass.
         let report = DoctorReport::collect();
         let checks = report.strict_checks(None);
-        assert_eq!(checks.len(), 6, "every check reports, none are dropped");
+        assert_eq!(checks.len(), 7, "every check reports, none are dropped");
         for check in &checks {
             assert_eq!(
                 check.status, "skip",
@@ -1806,7 +1896,7 @@ mod tests {
         report.serve_demand = ServeDemand {
             requires_cuda: true,
             cuda_engines: vec!["engines.vllm".to_string()],
-            required_shm_bytes: None,
+            ..ServeDemand::default()
         };
         report.drivers.nvidia_driver = None;
         report.gpus = Vec::new();
@@ -1830,7 +1920,7 @@ mod tests {
         report.serve_demand = ServeDemand {
             requires_cuda: true,
             cuda_engines: vec!["engines.vllm".to_string()],
-            required_shm_bytes: None,
+            ..ServeDemand::default()
         };
         report.drivers.nvidia_driver = Some("550.54.15".to_string());
         report.gpus = Vec::new();
@@ -1852,7 +1942,7 @@ mod tests {
         report.serve_demand = ServeDemand {
             requires_cuda: true,
             cuda_engines: vec!["engines.vllm".to_string()],
-            required_shm_bytes: None,
+            ..ServeDemand::default()
         };
         report.drivers.nvidia_driver = Some("550.54.15".to_string());
         report.gpus = vec![sbproxy_model_host::GpuDescriptor::t4()];
@@ -1865,9 +1955,8 @@ mod tests {
     fn strict_fails_when_dev_shm_is_smaller_than_the_engine_asked_for() {
         let mut report = DoctorReport::collect();
         report.serve_demand = ServeDemand {
-            requires_cuda: false,
-            cuda_engines: Vec::new(),
             required_shm_bytes: Some(8 * 1024 * 1024 * 1024),
+            ..ServeDemand::default()
         };
         report.shared_memory = SharedMemoryInfo {
             path: Some(PathBuf::from("/dev/shm")),
@@ -1979,6 +2068,127 @@ mod tests {
         assert_eq!(check.status, "pass", "{}", check.detail);
         assert!(check.detail.contains("worker"), "{}", check.detail);
         assert_eq!(report.strict_exit_code(&checks), 0);
+    }
+
+    /// A cluster identity carrying only the worker-role bit, which is the
+    /// only field the unpinned-weights check reads.
+    fn plane_with_worker_role(worker_role: bool) -> ModelPlaneIdentity {
+        ModelPlaneIdentity {
+            worker_role,
+            mtls: false,
+            files: Vec::new(),
+            missing_keys: Vec::new(),
+            shared_key_present: Some(true),
+        }
+    }
+
+    #[test]
+    fn strict_refuses_unpinned_refs_on_a_worker_node() {
+        let mut report = DoctorReport::collect();
+        report.serve_demand = ServeDemand {
+            unpinned_refs: vec!["hf:Qwen/Qwen3-0.6B".to_string()],
+            ..ServeDemand::default()
+        };
+
+        let checks = report.strict_checks(Some(&plane_with_worker_role(true)));
+        let check = strict_check(&checks, "unpinned_weights");
+        assert_eq!(check.status, "fail", "{}", check.detail);
+        assert!(
+            check.detail.contains("hf:Qwen/Qwen3-0.6B"),
+            "the failure names the offending entry: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("allow_unpinned_refs"),
+            "the failure names the opt-out: {}",
+            check.detail
+        );
+        assert_eq!(report.strict_exit_code(&checks), 3);
+    }
+
+    #[test]
+    fn strict_allows_unpinned_refs_on_a_worker_that_opted_in() {
+        // A default change, not a removal. An operator who wants repo mode
+        // on a worker says so and owns it.
+        let mut report = DoctorReport::collect();
+        report.serve_demand = ServeDemand {
+            unpinned_refs: vec!["hf:Qwen/Qwen3-0.6B".to_string()],
+            allow_unpinned_refs: true,
+            ..ServeDemand::default()
+        };
+
+        let checks = report.strict_checks(Some(&plane_with_worker_role(true)));
+        let check = strict_check(&checks, "unpinned_weights");
+        assert_eq!(check.status, "pass", "{}", check.detail);
+        assert_eq!(report.strict_exit_code(&checks), 0);
+    }
+
+    #[test]
+    fn strict_leaves_non_worker_nodes_alone() {
+        // `sbproxy run` on a workstation, and a gateway-only node, are the
+        // cases repo mode exists for. Neither may be broken by this gate.
+        let mut report = DoctorReport::collect();
+        report.serve_demand = ServeDemand {
+            unpinned_refs: vec!["hf:Qwen/Qwen3-0.6B".to_string()],
+            ..ServeDemand::default()
+        };
+
+        // No cluster block at all: a workstation.
+        let checks = report.strict_checks(None);
+        let check = strict_check(&checks, "unpinned_weights");
+        assert_eq!(check.status, "skip", "{}", check.detail);
+        assert_eq!(report.strict_exit_code(&checks), 0);
+
+        // A cluster node without the worker role: a gateway.
+        let checks = report.strict_checks(Some(&plane_with_worker_role(false)));
+        let check = strict_check(&checks, "unpinned_weights");
+        assert_eq!(check.status, "skip", "{}", check.detail);
+        assert!(
+            check.detail.contains("no worker role"),
+            "the skip says why it did not apply: {}",
+            check.detail
+        );
+        assert_eq!(report.strict_exit_code(&checks), 0);
+    }
+
+    #[test]
+    fn strict_skips_unpinned_weights_when_every_entry_is_a_catalog_id() {
+        let report = DoctorReport::collect();
+        let checks = report.strict_checks(Some(&plane_with_worker_role(true)));
+        let check = strict_check(&checks, "unpinned_weights");
+        assert_eq!(check.status, "skip", "{}", check.detail);
+    }
+
+    #[test]
+    fn serve_demand_collects_raw_references_and_leaves_catalog_ids_alone() {
+        // Parsed from YAML rather than built field by field, so the test
+        // exercises the same deserialization an operator's config takes.
+        let serve: ModelHostConfig = serde_yaml::from_str(
+            "models:\n  \
+               - model: qwen2.5-0.5b-instruct\n  \
+               - model: hf:Qwen/Qwen3-0.6B\n    name: raw-hf\n  \
+               - model: file:/models/local.gguf\n    name: raw-file\n",
+        )
+        .expect("serve block parses");
+
+        let demand = serve_demand(&serve);
+        assert_eq!(
+            demand.unpinned_refs,
+            vec!["hf:Qwen/Qwen3-0.6B", "file:/models/local.gguf"],
+            "a bare catalog id is pinned; a scheme prefix is not"
+        );
+        assert!(!demand.allow_unpinned_refs, "the default is refuse");
+    }
+
+    #[test]
+    fn serve_demand_reads_the_allow_unpinned_refs_opt_in() {
+        let serve: ModelHostConfig = serde_yaml::from_str(
+            "allow_unpinned_refs: true\nmodels:\n  - model: hf:Qwen/Qwen3-0.6B\n    name: raw\n",
+        )
+        .expect("serve block parses");
+        let demand = serve_demand(&serve);
+        assert!(demand.allow_unpinned_refs);
+        assert_eq!(demand.unpinned_refs.len(), 1);
     }
 
     #[test]

@@ -705,6 +705,7 @@ Six checks, each named so a script can grep for one:
 | `shared_memory` | `/dev/shm` is smaller than the largest `engines.*.shm_size_gib` the config asks for |
 | `cache_mount` | the weight-cache mount cannot hold `cache_budget_gib` |
 | `model_plane_identity` | `proxy.cluster` names mTLS or shared-key material that is not readable |
+| `unpinned_weights` | a node holding the `worker` role serves an unpinned raw `hf:` or `file:` reference without `serve.allow_unpinned_refs` |
 
 Each check compares the config's own demands against the host, so a
 config that asks for nothing local is not penalised: a check that does
@@ -720,6 +721,16 @@ not be read.
 A missing engine *binary* is deliberately not a blocker. Acquisition
 fetches it at the first request, so failing the boot over it would be
 wrong.
+
+`unpinned_weights` is scoped to the `worker` role on purpose. A raw
+reference runs the engine in repo mode, where the container gets DNS and
+external egress instead of an isolated network, the weight cache is
+mounted writable instead of read-only, and no digest is verified because
+sbproxy never sees the download. That is the right trade for
+`sbproxy run <model>` on a workstation and for evaluating a model with no
+catalog entry, so neither is affected. It is the wrong trade for a
+long-lived fleet worker, which now has to say `serve.allow_unpinned_refs:
+true` to accept it. See [security-model-host.md](security-model-host.md).
 
 The same host state is checked at startup and on every hot reload. When a
 managed deployment is missing a prerequisite, candidate preparation reports

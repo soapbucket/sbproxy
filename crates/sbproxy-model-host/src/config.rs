@@ -605,6 +605,26 @@ pub struct ModelHostConfig {
     /// `POST /admin/model-host/gc` route.
     #[serde(default)]
     pub cache_budget_gib: Option<f64>,
+    /// Support: preview.
+    /// Permit unpinned raw `hf:` references on a node that holds the
+    /// `worker` cluster role. Defaults to `false`.
+    ///
+    /// A raw reference runs the engine in repo mode, which gives up three
+    /// protections a pinned catalog artifact gets: the container runs on
+    /// the default bridge with DNS and external egress instead of an
+    /// `--internal` network, the Hugging Face cache is mounted writable
+    /// instead of read-only, and the launch-time trust and file-map checks
+    /// are skipped because there are no local bytes to verify. No digest
+    /// is ever computed for those weights, so the pull policy, offline
+    /// mode, and digest-failure contract cover nothing on that path.
+    ///
+    /// That trade is right for `sbproxy run <model>` on a workstation and
+    /// for evaluating a model with no catalog entry yet. It is a poor fit
+    /// for a long-lived fleet worker holding cluster identity, so the
+    /// startup gate refuses it there unless this is set. Nodes without the
+    /// worker role are unaffected either way.
+    #[serde(default)]
+    pub allow_unpinned_refs: bool,
     /// What to do under VRAM pressure. Defaults to LRU eviction.
     #[serde(default)]
     pub eviction: EvictionPolicy,
