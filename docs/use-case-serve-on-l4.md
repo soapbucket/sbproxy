@@ -13,9 +13,10 @@ that routes to hosted providers. The runnable section uses llama.cpp and a
 GGUF model on CPU or Apple Silicon. A later section gives the procedure for
 certifying vLLM or SGLang on an NVIDIA L4.
 
-Apple Silicon Metal passed on 2026-07-11. NVIDIA CUDA, multi-GPU, and live
-GCP certification remain pending. The current NVIDIA evidence covers
-deterministic driver, capacity, plan, and container-isolation tests. See
+NVIDIA single-GPU serving is certified on a real L4 as of 2026-07-30: a live
+completion through the gateway on a digest-pinned vLLM container, truthful
+status, and a stop that returned the device to 0 MiB. Multi-GPU and live
+multi-node GCP certification remain open. See
 [model-host-certification.md](model-host-certification.md) for the evidence
 ledger and [model-host.md](model-host.md#managed-engines) for engine policy.
 
@@ -24,9 +25,9 @@ ledger and [model-host.md](model-host.md#managed-engines) for engine policy.
 - **Runnable today:** Check the `serve:` config with `sbproxy validate`,
   `plan`, and `doctor`. If `llama-server` is available, send a real
   completion on CPU or Apple Metal.
-- **Pending certification:** Create a `g2-standard-8` VM with one 24 GB L4
-  and record completion, status, stop, and cache-reuse evidence through
-  vLLM or SGLang.
+- **Certified on real hardware:** Create a `g2-standard-8` VM with one 24 GB
+  L4 and reproduce the recorded completion, status, and stop evidence through
+  a digest-pinned vLLM container.
 
 The same routing, guardrail, budget, and ledger planes that govern hosted providers apply to a local deployment either way.
 
@@ -187,20 +188,32 @@ Send the same request a second time. It answers in normal API time, because the 
 - `sbproxy doctor` gives a clear, actionable verdict for this host: `ready` with `llama_cpp` resolved, or `not available` with the exact blocker and a suggested fix. Either outcome is a legitimate result for this stand-in.
 - Optional, only if `llama-server` was actually available on this box: the completion above returns `HTTP 200` with an OpenAI-shaped body whose `model` field names the served GGUF file, and a second identical request completes in a small fraction of the first call's time because the model stayed resident.
 
-## NVIDIA L4 (planned)
+## NVIDIA L4
 
-This is a certification procedure, not a completed result. No live
-completion, status, or cache-reuse evidence from an L4 has been recorded.
-The target engine is vLLM or SGLang, using a digest-pinned container or
-pinned uv environment.
+This procedure has been run. A `g2-standard-8` with one L4 served a live
+completion through the gateway on 2026-07-30, with a digest-pinned vLLM
+container: 163 seconds cold including the weight pull, 0.109 seconds warm, and
+a stop that returned the device from 9126 MiB to 0 MiB. The full record is in
+[model-host-certification.md](model-host-certification.md). The steps below
+reproduce it.
 
-When you want to work through the planned procedure yourself:
+Prefer the digest-pinned container over a host `uv` or `pip` install. The
+container packages the whole CUDA and Python environment; a host install
+resolves to whatever vLLM is newest, then needs Python headers and a C
+toolchain for the Triton JIT, and the cascade does not end.
 
-- A GCP project with `gcloud` authenticated (`gcloud auth login`) and L4 quota (`NVIDIA_L4_GPUS`) in your target region. Check before you create anything:
+What you need:
+
+- A GCP project with `gcloud` authenticated (`gcloud auth login`) and L4 quota
+  in your target region. Read **both** numbers: the per-region-per-type quota
+  and the global one. Booting N devices needs both at N or above, and the
+  global cap is set on the billing account rather than the project.
 
   ```bash
   gcloud compute regions describe us-central1 \
     --format="value(quotas)" | tr ',' '\n' | grep -i l4
+  gcloud compute project-info describe \
+    --format="value(quotas)" | tr ',' '\n' | grep -i GPUS_ALL_REGIONS
   ```
 
 - A cost expectation. Google listed `g2-standard-8` at about $0.85 per hour

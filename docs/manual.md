@@ -583,6 +583,32 @@ sbproxy service uninstall
 - Logs: `~/Library/Logs/sbproxy/service.log` (stdout) and
   `service.err.log` (stderr), where `launchd` redirects the child
   process's output.
+- The environment file:
+  `~/Library/Application Support/sbproxy/service/env`, mode 0600. A
+  `launchd` agent inherits almost nothing from the shell that installed
+  it, so an `HF_TOKEN` exported in a terminal is invisible to the agent
+  and a gated model fails to pull with no obvious cause. Put it here
+  instead, one `KEY=value` per line. The file is created once with a
+  commented template and never rewritten, so a token set here survives
+  reinstalling to change the model or the port.
+
+The agent's program is `/bin/sh -c '... exec sbproxy serve <config>'`
+rather than the binary directly, which is how the environment file gets
+sourced. The `exec` means `launchd` still supervises the proxy's own
+pid, so `KeepAlive` restarts and signal delivery behave exactly as if
+the binary were the program. The plist also raises `ExitTimeOut` above
+the proxy's default shutdown grace, so `launchd` cannot SIGKILL a drain
+that is still in progress.
+
+**Stop the deployment before removing the agent.** A gateway that goes
+away without a prior `sbproxy models stop` leaves its engine process
+running; see the open defect recorded on the Apple Silicon lane in
+[model-host-certification.md](model-host-certification.md).
+
+```bash
+sbproxy models stop local
+sbproxy service uninstall
+```
 
 `--dry-run` (inherited from `run`'s flags) prints the plist and the
 generated config without installing or loading anything. `service
@@ -648,15 +674,52 @@ every blocker listed when it could not.
 ```bash
 sbproxy doctor
 sbproxy doctor --format json
+sbproxy doctor --strict /etc/sbproxy/sb.yml
 ```
 
 Collection is read-only: no engine starts, nothing is written. The
 released binary ships with GPU discovery compiled in and loads the
 NVIDIA driver library at runtime (falling back to `nvidia-smi`), so
 the same artifact reports "ready" on a GPU host and lists what is
-missing everywhere else. Always exits 0 once the report is produced;
-"this host cannot serve local models" is a finding, not an error. See
-[model-host.md](model-host.md) for canonical managed configuration.
+missing everywhere else. Without `--strict` it always exits 0 once the
+report is produced; "this host cannot serve local models" is a finding,
+not an error. See [model-host.md](model-host.md) for canonical managed
+configuration.
+
+#### `--strict`: the managed-worker startup gate
+
+`--strict` adds a `startup gate` block and exits 3 if any check blocks.
+It is meant for a VM bootstrap or a container entrypoint that should
+refuse to come up rather than fail at the first customer request. A
+worker that boots into a broken GPU configuration joins the cluster,
+advertises itself as eligible, and then fails every dispatch, which
+reads as a routing bug from the gateway side.
+
+Six checks, each named so a script can grep for one:
+
+| Check | Blocks when |
+|---|---|
+| `driver` | the config asks for CUDA and no NVIDIA driver is installed |
+| `visible_devices` | CUDA is asked for and the probe sees no accelerator, the usual sign a container was not given the devices |
+| `cuda_compatibility` | a configured model has no viable engine on this host |
+| `shared_memory` | `/dev/shm` is smaller than the largest `engines.*.shm_size_gib` the config asks for |
+| `cache_mount` | the weight-cache mount cannot hold `cache_budget_gib` |
+| `model_plane_identity` | `proxy.cluster` names mTLS or shared-key material that is not readable |
+
+Each check compares the config's own demands against the host, so a
+config that asks for nothing local is not penalised: a check that does
+not apply reports `skip`, never a hollow `pass`. Both config forms are
+read, the inline provider-level `serve:` block and the canonical
+`proxy.model_host` block.
+
+Exit codes are distinct so a bootstrap can tell a hardware refusal from
+a config mistake without parsing output: `3` for a startup blocker, `1`
+when a configured model has no viable engine, `2` when the config could
+not be read.
+
+A missing engine *binary* is deliberately not a blocker. Acquisition
+fetches it at the first request, so failing the boot over it would be
+wrong.
 
 The same host state is checked at startup and on every hot reload. When a
 managed deployment is missing a prerequisite, candidate preparation reports
@@ -677,10 +740,14 @@ The managed runtime resolves an engine in this order:
   private container.
 
 GPU drivers are never installed by sbproxy; a missing driver is reported with
-guidance only. The pending NVIDIA certification procedure targets vLLM or
-SGLang, not the llama.cpp CUDA path. See [model-host.md](model-host.md) for
-canonical fields, per-engine details, and host prerequisites. Live NVIDIA
-certification has not been recorded, so those paths remain preview.
+guidance only. The NVIDIA certification procedure targets vLLM or SGLang, not
+the llama.cpp CUDA path. See [model-host.md](model-host.md) for canonical
+fields, per-engine details, and host prerequisites.
+
+Live single-GPU NVIDIA serving is recorded on an L4 as of 2026-07-30. Multi-GPU
+is not, so `platform.nvidia_cuda` stays at `preview` in the capability matrix.
+[model-host-certification.md](model-host-certification.md) has the evidence and
+what is still missing.
 
 ### `update` - keep the binary, engines, and models current
 

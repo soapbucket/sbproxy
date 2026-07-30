@@ -571,6 +571,51 @@ impl DoctorReport {
         self
     }
 
+    /// Record what the canonical `proxy.model_host` block demands of this
+    /// host, for the strict gate.
+    ///
+    /// Two config forms reach the model host: the inline provider-level
+    /// `serve:` block, which [`with_serve_config`](Self::with_serve_config)
+    /// covers, and `proxy.model_host`, which the examples and the
+    /// self-host docs lead with. The strict gate has to see both, or it
+    /// reports six cheerful `skip`s for a worker config it cannot serve,
+    /// which is precisely the hollow pass the gate exists to prevent.
+    ///
+    /// Takes pre-extracted values rather than the config type so this
+    /// crate keeps its current dependency direction; the caller reads
+    /// them off the parsed config.
+    pub fn with_control_plane_demand(
+        mut self,
+        demand: ServeDemand,
+        cache_budget_gib: Option<f64>,
+    ) -> Self {
+        // Whichever form asks for more wins: a config can legitimately
+        // carry both, and the host has to satisfy the union.
+        self.serve_demand.requires_cuda |= demand.requires_cuda;
+        self.serve_demand.cuda_engines.extend(demand.cuda_engines);
+        self.serve_demand.cuda_engines.sort();
+        self.serve_demand.cuda_engines.dedup();
+        self.serve_demand.required_shm_bytes = match (
+            self.serve_demand.required_shm_bytes,
+            demand.required_shm_bytes,
+        ) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        if cache_budget_gib.is_some() {
+            let existing = self
+                .cache_budget_check
+                .as_ref()
+                .and_then(|check| check.budget_gib);
+            let budget = match (existing, cache_budget_gib) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            self.cache_budget_check = Some(cache_budget_check(budget, self.model_cache_free_bytes));
+        }
+        self
+    }
+
     /// The per-entry resolution + fit for a `serve:` block, without
     /// mutating the report (see [`with_serve_config`](Self::with_serve_config)).
     pub fn evaluate_serve(
@@ -757,8 +802,7 @@ impl DoctorReport {
             .gpus
             .iter()
             .filter(|gpu| {
-                gpu.total_vram_bytes > 0
-                    && gpu.vendor == sbproxy_model_host::GpuVendor::Nvidia
+                gpu.total_vram_bytes > 0 && gpu.vendor == sbproxy_model_host::GpuVendor::Nvidia
             })
             .count();
         checks.push(if !demand.requires_cuda {
@@ -824,42 +868,45 @@ impl DoctorReport {
 
         // 4. IPC / shared memory. Compared against the size the config
         //    asked the container runtime for, not an invented floor.
-        checks.push(match (demand.required_shm_bytes, self.shared_memory.total_bytes) {
-            (None, _) => StrictCheck {
-                check: "shared_memory",
-                status: "skip",
-                detail: "no engine declares shm_size_gib, so there is no requested size to check"
-                    .to_string(),
-            },
-            (Some(required), None) => StrictCheck {
-                check: "shared_memory",
-                status: "fail",
-                detail: format!(
-                    "the config asks for {:.1} GiB of shared memory but this host exposes no \
+        checks.push(
+            match (demand.required_shm_bytes, self.shared_memory.total_bytes) {
+                (None, _) => StrictCheck {
+                    check: "shared_memory",
+                    status: "skip",
+                    detail:
+                        "no engine declares shm_size_gib, so there is no requested size to check"
+                            .to_string(),
+                },
+                (Some(required), None) => StrictCheck {
+                    check: "shared_memory",
+                    status: "fail",
+                    detail: format!(
+                        "the config asks for {:.1} GiB of shared memory but this host exposes no \
                      readable /dev/shm to satisfy it",
-                    required as f64 / GIB
-                ),
-            },
-            (Some(required), Some(total)) if total >= required => StrictCheck {
-                check: "shared_memory",
-                status: "pass",
-                detail: format!(
-                    "/dev/shm is {:.1} GiB, at or above the {:.1} GiB the config asks for",
-                    total as f64 / GIB,
-                    required as f64 / GIB
-                ),
-            },
-            (Some(required), Some(total)) => StrictCheck {
-                check: "shared_memory",
-                status: "fail",
-                detail: format!(
-                    "/dev/shm is {:.1} GiB but the config asks for {:.1} GiB; a multiprocess \
+                        required as f64 / GIB
+                    ),
+                },
+                (Some(required), Some(total)) if total >= required => StrictCheck {
+                    check: "shared_memory",
+                    status: "pass",
+                    detail: format!(
+                        "/dev/shm is {:.1} GiB, at or above the {:.1} GiB the config asks for",
+                        total as f64 / GIB,
+                        required as f64 / GIB
+                    ),
+                },
+                (Some(required), Some(total)) => StrictCheck {
+                    check: "shared_memory",
+                    status: "fail",
+                    detail: format!(
+                        "/dev/shm is {:.1} GiB but the config asks for {:.1} GiB; a multiprocess \
                      engine launch will fail allocating cross-process tensor handles",
-                    total as f64 / GIB,
-                    required as f64 / GIB
-                ),
+                        total as f64 / GIB,
+                        required as f64 / GIB
+                    ),
+                },
             },
-        });
+        );
 
         // 5. Cache mount. A mount that cannot hold the configured budget
         //    is a disk-full failure mid-pull, which is worse than a
@@ -1606,7 +1653,9 @@ fn serve_demand(serve: &ModelHostConfig) -> ServeDemand {
             .is_some_and(|acquire| acquire.accel == EngineAccel::Cuda);
         if cuda_engine || cuda_accel {
             demand.requires_cuda = true;
-            demand.cuda_engines.push(format!("engines.{kind:?}").to_lowercase());
+            demand
+                .cuda_engines
+                .push(format!("engines.{kind:?}").to_lowercase());
         }
         if let Some(gib) = provisioning.shm_size_gib {
             let bytes = gib.saturating_mul(1024 * 1024 * 1024);
@@ -1632,7 +1681,9 @@ fn strict_model_plane_check(plane: Option<&ModelPlaneIdentity>) -> StrictCheck {
     };
     let mut problems = Vec::new();
     for key in &plane.missing_keys {
-        problems.push(format!("proxy.cluster.security.{key} is unset but mTLS requires it"));
+        problems.push(format!(
+            "proxy.cluster.security.{key} is unset but mTLS requires it"
+        ));
     }
     for (key, path) in &plane.files {
         match std::fs::File::open(path) {

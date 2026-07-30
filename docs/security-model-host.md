@@ -304,9 +304,12 @@ contract:
 - strict distributed budget reservation and lease recovery across gateways;
 - complete server-derived key introspection for every managed route decision.
 
-Live NVIDIA and multi-node GCP certification has not been recorded. Until that
-evidence exists, the NVIDIA uv and container paths remain preview even though
-their deterministic process and isolation contracts run in CI.
+The NVIDIA container path has live single-GPU evidence recorded on 2026-07-30:
+a digest-pinned vLLM container served through the gateway on an L4 and released
+the device on stop. Multi-GPU and multi-node GCP certification have not been
+recorded, so `platform.nvidia_cuda` stays preview rather than being promoted on
+single-device evidence. The managed uv path has no live evidence either way;
+the container path is the certified one.
 
 ## Related
 

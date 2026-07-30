@@ -59,9 +59,24 @@ cleanup() {
     done
     kill -9 "$PROXY_PID" 2>/dev/null || true
   fi
+  # Signalling the pid this script launched is not sufficient: a proxy
+  # process can outlive it still holding the listener (see the
+  # `public_port_released` check below). Sweep by argv so a stray from
+  # this lane cannot poison the next one.
+  pkill -f "sbproxy run $MODEL" 2>/dev/null || true
+  sleep 1
+  pkill -9 -f "sbproxy run $MODEL" 2>/dev/null || true
   pkill -f "$CERT_ENGINE_PROC" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# Whether anything still holds a TCP port. `lsof` is the portable-enough
+# answer on both macOS and Linux; a missing lsof reports "free" rather
+# than failing the lane on a tooling gap.
+port_held() {
+  command -v lsof >/dev/null 2>&1 || return 1
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
 
 cache_args=()
 [ -n "${CERT_CACHE_DIR:-}" ] && cache_args=(--cache-dir "$CERT_CACHE_DIR")
@@ -69,12 +84,12 @@ cache_args=()
 # Start a managed run and block until the ready banner appears. Echoes
 # the seconds it took, so the caller can compare cold against warm.
 start_run() {
-  local log="$1" deadline="$2" start
+  local log="$1" deadline="$2" port="${3:-$CERT_PORT}" admin="${4:-$CERT_ADMIN_PORT}" start
   start="$(date +%s)"
   "$SBPROXY_BIN" run "$MODEL" \
     --variant "$VARIANT" \
-    --port "$CERT_PORT" \
-    --admin-port "$CERT_ADMIN_PORT" \
+    --port "$port" \
+    --admin-port "$admin" \
     "${cache_args[@]}" >"$log" 2>&1 &
   PROXY_PID=$!
   while [ "$(( $(date +%s) - start ))" -lt "$deadline" ]; do
@@ -93,9 +108,9 @@ start_run() {
 }
 
 admin_env() {
-  local log="$1" password
+  local log="$1" admin="${2:-$CERT_ADMIN_PORT}" password
   password="$(grep -m1 'Admin password:' "$log" | awk '{print $3}')"
-  export SB_ADMIN_URL="http://127.0.0.1:$CERT_ADMIN_PORT"
+  export SB_ADMIN_URL="http://127.0.0.1:$admin"
   export SB_ADMIN_USERNAME=admin
   export SB_ADMIN_PASSWORD="$password"
   [ -n "$password" ]
@@ -263,24 +278,52 @@ else
 fi
 PROXY_PID=""
 
+# --- 6b. the port is actually free again -------------------------------
+#
+# Signalling the pid this script launched is not the same as stopping the
+# server: a proxy process can outlive it and keep the listener bound, so
+# the operator's obvious next move (restart on the same port) fails. The
+# port is the observable that matters, so assert on it directly.
+port_free=false
+for _ in $(seq 1 60); do
+  if ! port_held "$CERT_PORT"; then
+    port_free=true
+    break
+  fi
+  sleep 1
+done
+if [ "$port_free" = true ]; then
+  ok "the public port $CERT_PORT was released after shutdown"
+else
+  holder="$(lsof -nP -iTCP:"$CERT_PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR==2 {print $1" pid "$2}')"
+  bad "port $CERT_PORT is still bound 60s after shutdown by ${holder:-an unknown process}; a restart on this port cannot bind"
+fi
+
 # --- 7. cache reuse ----------------------------------------------------
-warm_secs="$(start_run "$WORK/warm.log" 600)"
+#
+# On its own port pair. The claim under test is that the artifact cache is
+# reused, and reusing the first run's port would couple this to whether
+# the port was released, which the check above already owns.
+WARM_PORT=$((CERT_PORT + 10))
+WARM_ADMIN_PORT=$((CERT_ADMIN_PORT + 10))
+warm_secs="$(start_run "$WORK/warm.log" 600 "$WARM_PORT" "$WARM_ADMIN_PORT")"
 if [ "$warm_secs" = "-1" ]; then
   bad "the second run never reached ready"
 else
   ok "second run reached ready in ${warm_secs}s"
-  if [ "$warm_secs" -lt "$cold_secs" ]; then
-    ok "warm start is faster than cold (${warm_secs}s < ${cold_secs}s)"
-  else
-    bad "warm start (${warm_secs}s) is not faster than cold (${cold_secs}s); the cache may not be reused"
-  fi
+  # Timings are recorded, not asserted on. Wall clock only separates warm
+  # from cold when the first run actually downloaded the weights, and a
+  # lane that forced a cold cache would re-pull hundreds of megabytes on
+  # every certification run. Cache reuse is proven below by the absence of
+  # a download and by digest identity, which hold either way.
+  echo "  INFO cold ${cold_secs}s, second run ${warm_secs}s (informational; the cache state of the first run is not controlled)"
   downloads="$(grep -ci "downloading\|download started" "$WORK/warm.log" 2>/dev/null || true)"
   if [ "${downloads:-0}" -eq 0 ]; then
     ok "no weight download on the second run"
   else
     bad "the second run logged $downloads download line(s); the cache was not reused"
   fi
-  if admin_env "$WORK/warm.log" \
+  if admin_env "$WORK/warm.log" "$WARM_ADMIN_PORT" \
     && "$SBPROXY_BIN" models ps --format json >"$WORK/ps-warm.json" 2>&1; then
     warm_digest="$(python3 -c "
 import json

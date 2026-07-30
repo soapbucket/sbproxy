@@ -149,8 +149,11 @@ origins:
 ```
 
 Check the [model host boundary](model-host.md#current-boundary) before choosing
-hardware. Apple Silicon Metal passed on 2026-07-11. NVIDIA CUDA and live GCP
-certification remain pending, with deterministic and local test evidence only.
+hardware. Apple Silicon Metal and NVIDIA single-GPU CUDA both have live
+evidence recorded on 2026-07-30. Multi-GPU and live multi-node GCP
+certification remain open, with deterministic and local test evidence only.
+The [certification ledger](model-host-certification.md) has the per-lane
+detail, including one open defect on the Apple lane.
 
 ## Spill to cloud, with policy attached
 
