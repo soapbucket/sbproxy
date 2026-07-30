@@ -1532,6 +1532,19 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         }
     }
 
+    // A clustered node whose keystore is node-local would mint keys its peers
+    // cannot resolve. Fail at boot rather than at first cross-node request.
+    if let Some(cluster) = &config_file.proxy.cluster {
+        let km = config_file.proxy.key_management.as_ref();
+        if let Err(message) = crate::cluster::validate_clustered_keystore_is_shareable(
+            &cluster.seeds,
+            km.map(|k| k.enabled).unwrap_or(false),
+            km.map(|k| k.store.backend).unwrap_or_default(),
+        ) {
+            anyhow::bail!("config compile: {message}");
+        }
+    }
+
     Ok(CompiledConfig {
         origins,
         host_map,

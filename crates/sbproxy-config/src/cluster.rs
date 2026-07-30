@@ -1091,3 +1091,81 @@ fn compare<T: PartialEq + std::fmt::Debug>(
     }
     Ok(())
 }
+
+/// Reject a clustered deployment whose keystore cannot be shared between nodes.
+///
+/// `MeshCacheTier` caches in front of the keystore; it is not a system of
+/// record. With the embedded redb backend a key minted on one node is written
+/// only to that node's file, so peers cannot resolve it whether or not it is
+/// cached. Minting keys that silently do not work on the rest of the cluster is
+/// worse than refusing to start, so this fails at boot.
+///
+/// Gated on `seeds` being non-empty rather than on the cluster block merely
+/// being present. A node with seeds is explicitly joining other nodes, which is
+/// unambiguous; a seedless node may legitimately be a single-node deployment
+/// that happens to declare a cluster block. A node others join without itself
+/// having seeds is not caught here, but every node that joins it is, so the
+/// misconfiguration still surfaces.
+pub fn validate_clustered_keystore_is_shareable(
+    seeds: &[String],
+    key_management_enabled: bool,
+    backend: crate::types::KeyStoreBackend,
+) -> Result<(), String> {
+    if seeds.is_empty() || !key_management_enabled {
+        return Ok(());
+    }
+    if backend == crate::types::KeyStoreBackend::Embedded {
+        return Err(
+            "proxy.cluster declares seeds, so this node is joining a cluster, but \
+             proxy.key_management.store.backend is 'embedded'. The embedded redb store is \
+             node-local, so a key minted on one node cannot be resolved by its peers and a \
+             revocation on one node will not deny on the rest. Set the backend to 'redis' or \
+             'secrets_manager' so the keystore is shared, or remove proxy.cluster.seeds if \
+             per-node keys are intended."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod keystore_sharing_tests {
+    use super::validate_clustered_keystore_is_shareable as check;
+    use crate::types::KeyStoreBackend;
+
+    fn seeds() -> Vec<String> {
+        vec!["10.0.0.1:7946".to_string()]
+    }
+
+    #[test]
+    fn a_clustered_node_rejects_the_node_local_embedded_keystore() {
+        let err = check(&seeds(), true, KeyStoreBackend::Embedded)
+            .expect_err("embedded redb cannot be shared across nodes");
+        assert!(
+            err.contains("embedded"),
+            "names the offending backend: {err}"
+        );
+        assert!(
+            err.contains("redis") && err.contains("secrets_manager"),
+            "names an actionable fix: {err}"
+        );
+    }
+
+    #[test]
+    fn a_clustered_node_accepts_a_shared_keystore() {
+        assert!(check(&seeds(), true, KeyStoreBackend::Redis).is_ok());
+        assert!(check(&seeds(), true, KeyStoreBackend::SecretsManager).is_ok());
+    }
+
+    #[test]
+    fn a_single_node_deployment_keeps_the_embedded_default() {
+        // No seeds means nothing to share with, so the default must keep working.
+        assert!(check(&[], true, KeyStoreBackend::Embedded).is_ok());
+    }
+
+    #[test]
+    fn key_management_off_is_not_this_checks_business() {
+        // Without a key plane there is nothing to mint, so the backend is moot.
+        assert!(check(&seeds(), false, KeyStoreBackend::Embedded).is_ok());
+    }
+}
