@@ -500,11 +500,21 @@ impl RateLimitPolicy {
     /// the default 3 second cadence, each additional node can admit about
     /// `rate * 3` requests before this node hears about them. Pass `None` to
     /// clear a previously attached tier.
+    ///
+    /// `origin_id` is baked into the counter-key prefix the same way
+    /// [`Self::with_store`] does it, so origins sharing one process-wide tier
+    /// cannot collide on a common client id. The prefix is set only if a
+    /// store setter has not already set it, so the setters chain in any
+    /// order.
     pub fn with_cluster(
         mut self,
         cluster: Option<Arc<rate_limit_cluster::RateLimitClusterTier>>,
+        origin_id: &str,
     ) -> Self {
         self.cluster = cluster;
+        if self.key_prefix.is_empty() {
+            self.key_prefix = format!("sbproxy:rl:{}:", origin_id);
+        }
         self
     }
 
@@ -877,7 +887,7 @@ mod tests {
         let policy =
             RateLimitPolicy::from_config(serde_json::json!({ "requests_per_minute": 10.0 }))
                 .expect("valid rpm policy")
-                .with_cluster(Some(tier.clone()));
+                .with_cluster(Some(tier.clone()), "test-origin");
 
         assert!(policy.converges_on_mesh(), "a 60s window converges");
 
@@ -917,7 +927,7 @@ mod tests {
         let policy =
             RateLimitPolicy::from_config(serde_json::json!({ "requests_per_minute": 3.0 }))
                 .expect("valid rpm policy")
-                .with_cluster(Some(tier.clone()));
+                .with_cluster(Some(tier.clone()), "test-origin");
 
         // With no peer contributions the node enforces on its own count, so a
         // single-node mesh behaves exactly like the configured limit.
@@ -933,7 +943,7 @@ mod tests {
         let policy =
             RateLimitPolicy::from_config(serde_json::json!({ "requests_per_second": 5.0 }))
                 .expect("valid rps policy")
-                .with_cluster(Some(tier.clone()));
+                .with_cluster(Some(tier.clone()), "test-origin");
 
         assert!(!policy.converges_on_mesh(), "a 1s window cannot converge");
         assert!(policy.allow_with_info_async("c1").await.allowed);
@@ -951,7 +961,7 @@ mod tests {
         let policy =
             RateLimitPolicy::from_config(serde_json::json!({ "requests_per_minute": 10.0 }))
                 .expect("valid rpm policy")
-                .with_cluster(Some(tier.clone()));
+                .with_cluster(Some(tier.clone()), "test-origin");
         assert!(policy.cluster.is_some());
         assert!(policy.store.is_none() && policy.async_store.is_none());
         // Sanity: with no store the cluster path is the one that runs.

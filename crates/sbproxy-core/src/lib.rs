@@ -144,6 +144,7 @@ pub mod policy_dispatch;
 /// Re-exported here for admin/runtime compatibility; the implementation
 /// lives beside its policy config in `sbproxy-modules`.
 pub use sbproxy_modules::policy::rate_limit_budget;
+pub(crate) mod rate_limit_cluster;
 pub mod reload;
 pub mod router;
 /// Phase 1: per-request feature-flag parsing.

@@ -1749,6 +1749,32 @@ fn compile_origin_policy_chain(
                 _ => {}
             }
         }
+    } else if let Some(tier) = crate::rate_limit_cluster::tier_if_clustered() {
+        // No shared counter, but this node is on a mesh. Attach the cluster
+        // tier so the limit is enforced across the cluster instead of N times
+        // over. A shared counter is exact and always wins, which is why this
+        // is the `else` branch.
+        for p in chain.iter_mut() {
+            if let Policy::RateLimit(rl) = p {
+                let taken = std::mem::replace(
+                    rl,
+                    sbproxy_modules::RateLimitPolicy::from_config(serde_json::json!({
+                        "requests_per_second": 10.0
+                    }))?,
+                );
+                if !taken.converges_on_mesh() {
+                    tracing::warn!(
+                        origin = %origin_id,
+                        "requests_per_second is enforced per node on a mesh cluster: a one \
+                         second window closes before a peer contribution can arrive, so the \
+                         cluster admits up to N times this limit. Configure an L2 store for an \
+                         exact cluster-wide per-second limit, or express the limit as \
+                         requests_per_minute, which does converge."
+                    );
+                }
+                *rl = taken.with_cluster(Some(tier.clone()), origin_id);
+            }
+        }
     }
     Ok(chain)
 }
