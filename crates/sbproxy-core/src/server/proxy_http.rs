@@ -4531,7 +4531,18 @@ impl ProxyHttp for SbProxy {
                             .unwrap_or(300)
                     };
                     let pipeline_for_write = ctx.pipeline.clone();
-                    if let Some(cache_store) = pipeline_for_write.cache_store.clone() {
+                    // The write-back must seal under the same origin the
+                    // lookup opened under, so resolve the per-origin
+                    // handle rather than the shared one.
+                    let write_origin_id = ctx
+                        .origin_idx
+                        .and_then(|idx| pipeline_for_write.config.origins.get(idx))
+                        .map(|o| o.origin_id.to_string())
+                        .unwrap_or_default();
+                    if let Some(cache_store) = pipeline_for_write
+                        .cache_store_for(&write_origin_id)
+                        .cloned()
+                    {
                         let entry = sbproxy_cache::CachedResponse {
                             generation: sbproxy_cache::new_cache_generation(),
                             status,
@@ -4553,11 +4564,7 @@ impl ProxyHttp for SbProxy {
                             pipeline_for_write.cache_reserve.clone(),
                             pipeline_for_write.cache_reserve_admission,
                         ) {
-                            let origin_id_for_reserve = ctx
-                                .origin_idx
-                                .and_then(|idx| pipeline_for_write.config.origins.get(idx))
-                                .map(|o| o.origin_id.to_string())
-                                .unwrap_or_default();
+                            let origin_id_for_reserve = write_origin_id.clone();
                             maybe_admit_to_reserve(
                                 reserve,
                                 admission,

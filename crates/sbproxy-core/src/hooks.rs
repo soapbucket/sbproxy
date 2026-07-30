@@ -13,6 +13,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use sbproxy_cache::AtRestPosture;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -486,6 +487,18 @@ pub trait SemanticLookupHook: Send + Sync {
     /// Purge entries matching `scope`. Returns the number of entries
     /// evicted. Used by the admin API for manual cache invalidation.
     async fn purge(&self, scope: PurgeScope) -> anyhow::Result<u64>;
+
+    /// Where this cache keeps entries, and whether it seals them.
+    ///
+    /// The default is memory-only, which is what the in-tree prompt
+    /// cache is. An implementation that adds a persistent or replicated
+    /// backend must say so: boot refuses a cache that would write
+    /// prompts and responses in the clear to disk or to a shared server.
+    /// See [`sbproxy_cache::at_rest`] for why the check is shaped this
+    /// way and what it does not claim to catch.
+    fn at_rest_posture(&self) -> AtRestPosture {
+        AtRestPosture::memory_only()
+    }
 }
 
 // ============================================================================
@@ -700,6 +713,15 @@ pub trait StreamCacheRecorderHook: Send + Sync {
     /// stream. The proxy guarantees exactly one terminal
     /// [`StreamCacheEvent::End`] per accepted session.
     async fn start_session(&self, ctx: StreamCacheCtx) -> Option<StreamCacheChannel>;
+
+    /// Where this recorder keeps captured chunks, and whether it seals
+    /// them. Same contract as [`SemanticLookupHook::at_rest_posture`]:
+    /// recorded SSE chunks are response bodies, so a recorder that
+    /// writes them somewhere durable in the clear is the same exposure
+    /// as an unencrypted response cache.
+    fn at_rest_posture(&self) -> AtRestPosture {
+        AtRestPosture::memory_only()
+    }
 }
 
 // ============================================================================
@@ -732,6 +754,25 @@ pub struct Hooks {
     /// decides what to do with the recorded chunks; it just forwards
     /// them.
     pub stream_cache_recorder: Option<Arc<dyn StreamCacheRecorderHook>>,
+}
+
+impl Hooks {
+    /// Every installed cache surface with its declared at-rest posture,
+    /// paired with the config path an operator would edit to fix it.
+    ///
+    /// Read by the boot-time check in
+    /// the server lifecycle module. Surfaces that are not caches are
+    /// not listed: a classifier or a router holds no entries to leak.
+    pub fn cache_surfaces(&self) -> Vec<(&'static str, AtRestPosture)> {
+        let mut surfaces = Vec::new();
+        if let Some(hook) = self.semantic_lookup.as_ref() {
+            surfaces.push(("semantic response cache", hook.at_rest_posture()));
+        }
+        if let Some(hook) = self.stream_cache_recorder.as_ref() {
+            surfaces.push(("streaming cache recorder", hook.at_rest_posture()));
+        }
+        surfaces
+    }
 }
 
 #[cfg(test)]

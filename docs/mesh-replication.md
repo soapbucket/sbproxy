@@ -229,6 +229,50 @@ datastore. Strict atomic semantics (reservations, compare-and-swap
 budgets) remain the job of a shared backend; see
 [key-management.md](key-management.md) for that split.
 
+## The wire key
+
+`shared_key` seals gossip heartbeats and transport RPCs with
+AES-256-GCM. `key_derivation` selects how that string becomes the
+32-byte key:
+
+| Value | Derivation | When to use |
+|---|---|---|
+| `sha256` (default) | `SHA-256(secret)` | What every cluster runs today. |
+| `hkdf` | HKDF-SHA256 under a mesh-specific purpose | Puts the mesh key in the same purpose-separated keyspace as every other key sbproxy derives. |
+
+```yaml
+proxy:
+  cluster:
+    security:
+      mode: shared_key
+      development: true
+      shared_key: "secret://primary/cluster-gossip"
+      key_derivation: hkdf
+```
+
+The two derivations produce different keys, and a cluster whose nodes
+disagree about the key partitions rather than degrading: gossip is UDP
+and drops silently, and the transport tears the connection down. So the
+change is staged, and a node opens under **both** derivations regardless
+of which one it seals under:
+
+1. Upgrade every node. Each one now opens either derivation and still
+   seals `sha256`, so a half-upgraded cluster is fully connected.
+2. Set `key_derivation: hkdf` one node at a time. Flipped and unflipped
+   nodes read each other throughout.
+3. A later major release drops `sha256`.
+
+Neither derivation makes a weak secret strong. Both are a single round,
+so a passphrase somebody thought up loses to either. Use 32 random bytes:
+
+```bash
+head -c 32 /dev/urandom | base64
+```
+
+`key_derivation` is part of the cluster restart fingerprint, so changing
+it needs a restart. A hot reload cannot swap the wire key under a running
+node without dropping it out of its own cluster.
+
 ## Wire compatibility
 
 The replica operations extend the mesh transport protocol. The mesh

@@ -23,6 +23,9 @@
 use anyhow::{anyhow, Context, Result};
 use sbproxy_ai::prompts::{NamedPrompt, PromptStore, RuntimePromptOverlay};
 use sbproxy_platform::storage::{KVStore, RedbKVStore};
+use sbproxy_security::sealed_record::{
+    OpenOutcome, SealKey, SealKeyRing, SealScheme, SealedEnvelope,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -32,97 +35,54 @@ use std::sync::Arc;
 /// just prompts in the future.
 const KEY_PREFIX: &str = "prompts:";
 
-/// Magic prefix on a sealed prompt record.
+/// The prompt store's envelope: magic `SBPP`, short for SBproxy Prompt
+/// Persistence.
 ///
-/// Doubles as the discriminator that lets [`open_record`] tell a sealed
-/// value from a plaintext JSON one, so a file written before encryption
-/// was enabled still hydrates. JSON values always begin with `{`, which
-/// this cannot collide with.
-const SEAL_MAGIC: &[u8; 4] = b"SBPP";
+/// Deliberately its own [`HkdfPurpose`], not a reuse of the response
+/// cache's. An operator may point both surfaces at one secret, and
+/// purpose separation is what keeps one derived key from opening the
+/// other's records.
+///
+/// [`HkdfPurpose`]: sbproxy_security::HkdfPurpose
+const SBPP_SCHEME: SealScheme = SealScheme::new(
+    *b"SBPP",
+    1,
+    sbproxy_security::HkdfPurpose::PromptPersistenceAtRest,
+    b"sbproxy.prompt-persistence.key-id.v1",
+);
 
-/// Envelope format version.
-const SEAL_VERSION: u8 = 1;
-
-/// Bytes of key fingerprint carried in the envelope, so an opener can pick
-/// among candidate keys without trial decryption.
-const KEY_FP_LEN: usize = 4;
-
-/// Per-record HKDF salt length.
-const SALT_LEN: usize = 16;
-
-/// AES-GCM nonce length.
-const NONCE_LEN: usize = 12;
-
-/// Refuse key material too short to be a real key rather than stretching
-/// it, matching the response-cache rule. A short passphrase silently
+/// Build a prompt-persistence key ring from resolved key material.
+///
+/// `active` seals and opens; each entry of `previous` opens only.
+/// Material shorter than 16 bytes is refused rather than stretched,
+/// matching the response-cache rule: a short passphrase silently
 /// accepted is how a store ends up encrypted with something guessable.
-const MIN_KEY_MATERIAL_BYTES: usize = 16;
-
-/// Resolved key material for sealing prompt records, plus its fingerprint.
-pub struct PromptKeyMaterial {
-    material: zeroize::Zeroizing<Vec<u8>>,
-    fingerprint: [u8; KEY_FP_LEN],
-}
-
-impl std::fmt::Debug for PromptKeyMaterial {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PromptKeyMaterial")
-            .field("key_id", &hex::encode(self.fingerprint))
-            .field("material", &"[redacted]")
-            .finish()
-    }
-}
-
-impl PromptKeyMaterial {
-    /// Accept resolved key material, refusing anything shorter than 16
-    /// bytes rather than stretching it.
-    pub fn new(material: Vec<u8>) -> Result<Self> {
-        // Wrapped before the length check so rejected material is scrubbed
-        // too; a passphrase short enough to refuse is still a secret.
-        let material = zeroize::Zeroizing::new(material);
-        if material.len() < MIN_KEY_MATERIAL_BYTES {
-            return Err(anyhow!(
-                "prompt-persistence encryption key must contain at least \
-                 {MIN_KEY_MATERIAL_BYTES} bytes of material, got {}",
-                material.len()
-            ));
-        }
-        let digest = <sha2::Sha256 as sha2::Digest>::digest(&*material);
-        let mut fingerprint = [0u8; KEY_FP_LEN];
-        fingerprint.copy_from_slice(&digest[..KEY_FP_LEN]);
-        Ok(Self {
-            material,
-            fingerprint,
-        })
-    }
-
-    /// Hex key id, safe to log.
-    pub fn fingerprint_hex(&self) -> String {
-        hex::encode(self.fingerprint)
-    }
+pub fn prompt_key_ring(active: Vec<u8>, previous: Vec<Vec<u8>>) -> Result<PromptSealer> {
+    let active = SealKey::new(SBPP_SCHEME, active)?;
+    let previous = previous
+        .into_iter()
+        .map(|material| SealKey::new(SBPP_SCHEME, material))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PromptSealer {
+        ring: SealKeyRing::new(SBPP_SCHEME, active, previous)?,
+    })
 }
 
 /// The active key plus any retired keys kept only to open older records.
 #[derive(Debug)]
 pub struct PromptSealer {
-    active: PromptKeyMaterial,
-    previous: Vec<PromptKeyMaterial>,
+    ring: SealKeyRing,
 }
 
 impl PromptSealer {
-    /// Build a sealer from an active key and its retired predecessors.
-    pub fn new(active: PromptKeyMaterial, previous: Vec<PromptKeyMaterial>) -> Self {
-        Self { active, previous }
-    }
-
     /// The active key's id, safe to log.
     pub fn active_key_id(&self) -> String {
-        self.active.fingerprint_hex()
+        self.ring.active_key_id()
     }
 
-    /// Every candidate key, active first.
-    fn candidates(&self) -> impl Iterator<Item = &PromptKeyMaterial> {
-        std::iter::once(&self.active).chain(self.previous.iter())
+    /// How many retired keys can still open records.
+    pub fn retired_key_count(&self) -> usize {
+        self.ring.retired_key_count()
     }
 }
 
@@ -131,68 +91,36 @@ impl PromptSealer {
 ///
 /// Without this a sealed value could be copied from one
 /// `prompts:<host>:<name>` slot to another and would still open, silently
-/// serving one host's prompt as another's. The AEAD tag covers it, so a
-/// moved record fails to open instead.
+/// serving one host's prompt as another's. The envelope header is
+/// prepended by the sealing helper, so salt, nonce, and key fingerprint
+/// are authenticated as well; this is only the tail.
 fn seal_aad(store_key: &[u8]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(SEAL_MAGIC.len() + 1 + store_key.len());
-    aad.extend_from_slice(SEAL_MAGIC);
-    aad.push(SEAL_VERSION);
-    aad.extend_from_slice(store_key);
-    aad
+    store_key.to_vec()
 }
 
 /// Seal one serialized record under the sealer's active key.
-///
-/// Layout: `SBPP | version | key fingerprint | salt | nonce | ciphertext`.
-/// Shaped to match the response cache's `SBRC` envelope so the two can be
-/// expressed through one helper when that extraction happens, rather than
-/// needing a format migration.
 fn seal_record(sealer: &PromptSealer, store_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-    let salt = {
-        let mut salt = [0u8; SALT_LEN];
-        let random = sbproxy_security::crypto::random_aes256_key();
-        salt.copy_from_slice(&random[..SALT_LEN]);
-        salt
-    };
-    let nonce = sbproxy_security::crypto::random_aes_gcm_nonce();
-    let derived = sbproxy_security::crypto::hkdf_derive_purpose(
-        &sealer.active.material,
-        &salt,
-        sbproxy_security::crypto::HkdfPurpose::PromptPersistenceAtRest,
-        32,
-    );
-    let key: [u8; 32] = derived
-        .try_into()
-        .map_err(|_| anyhow!("derived prompt-persistence key was not 32 bytes"))?;
-    let ciphertext =
-        sbproxy_security::crypto::aes256gcm_encrypt(&key, &nonce, plaintext, &seal_aad(store_key))
-            .context("seal prompt record")?;
-
-    let mut out = Vec::with_capacity(
-        SEAL_MAGIC.len() + 1 + KEY_FP_LEN + SALT_LEN + NONCE_LEN + ciphertext.len(),
-    );
-    out.extend_from_slice(SEAL_MAGIC);
-    out.push(SEAL_VERSION);
-    out.extend_from_slice(&sealer.active.fingerprint);
-    out.extend_from_slice(&salt);
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&ciphertext);
-    Ok(out)
+    sealer
+        .ring
+        .seal(plaintext, &seal_aad(store_key))
+        .context("seal prompt record")
 }
 
 /// Return the plaintext bytes for a stored value.
 ///
-/// A value without the [`SEAL_MAGIC`] prefix is returned unchanged, so a
+/// A value that is not an `SBPP` envelope is returned unchanged, so a
 /// file written before encryption was enabled keeps hydrating. Enabling
 /// encryption therefore does not orphan existing prompts; each one reseals
-/// the next time it is written.
+/// the next time it is written. JSON values always begin with `{`, which
+/// the magic cannot collide with.
 ///
 /// A value that *is* sealed must open. Returning it verbatim on failure
 /// would hand undecryptable ciphertext to `serde_json` and report a
 /// confusing parse error instead of the real one.
 fn open_record(sealer: Option<&PromptSealer>, store_key: &[u8], stored: &[u8]) -> Result<Vec<u8>> {
-    let header_len = SEAL_MAGIC.len() + 1 + KEY_FP_LEN + SALT_LEN + NONCE_LEN;
-    if !stored.starts_with(SEAL_MAGIC) {
+    // Probe the magic before demanding a sealer, so an unsealed file
+    // still hydrates when no key is configured.
+    if !stored.starts_with(&SBPP_SCHEME.magic()) {
         return Ok(stored.to_vec());
     }
     let sealer = sealer.ok_or_else(|| {
@@ -201,49 +129,23 @@ fn open_record(sealer: Option<&PromptSealer>, store_key: &[u8], stored: &[u8]) -
              restore the key under admin.prompt_persistence_encryption"
         )
     })?;
-    if stored.len() < header_len {
-        return Err(anyhow!("sealed prompt record is truncated"));
+    let envelope = SealedEnvelope::parse(SBPP_SCHEME, stored, |v| v == SBPP_SCHEME.version())
+        .ok_or_else(|| {
+            anyhow!("sealed prompt record is truncated or declares an unsupported envelope version")
+        })?;
+    match sealer.ring.open(&envelope, &seal_aad(store_key)) {
+        OpenOutcome::Opened(plaintext) => Ok(plaintext),
+        OpenOutcome::NoMatchingKey => Err(anyhow!(
+            "sealed prompt record was written under key {}, which is not the active key and is \
+             not listed in previous_keys",
+            envelope.fingerprint_hex()
+        )),
+        OpenOutcome::AuthFailed => Err(anyhow!(
+            "sealed prompt record under key {} failed authentication; it is corrupt, or it was \
+             moved here from another key",
+            envelope.fingerprint_hex()
+        )),
     }
-    let version = stored[SEAL_MAGIC.len()];
-    if version != SEAL_VERSION {
-        return Err(anyhow!(
-            "sealed prompt record declares unsupported version {version}"
-        ));
-    }
-    let fp_start = SEAL_MAGIC.len() + 1;
-    let fingerprint = &stored[fp_start..fp_start + KEY_FP_LEN];
-    let salt_start = fp_start + KEY_FP_LEN;
-    let salt = &stored[salt_start..salt_start + SALT_LEN];
-    let nonce_start = salt_start + SALT_LEN;
-    let nonce: [u8; NONCE_LEN] = stored[nonce_start..nonce_start + NONCE_LEN]
-        .try_into()
-        .expect("nonce slice is NONCE_LEN bytes");
-    let ciphertext = &stored[header_len..];
-    let aad = seal_aad(store_key);
-
-    // The fingerprint selects the key, so a rotation costs one derivation
-    // rather than one trial decryption per candidate.
-    for candidate in sealer.candidates() {
-        if candidate.fingerprint != fingerprint {
-            continue;
-        }
-        let derived = sbproxy_security::crypto::hkdf_derive_purpose(
-            &candidate.material,
-            salt,
-            sbproxy_security::crypto::HkdfPurpose::PromptPersistenceAtRest,
-            32,
-        );
-        let key: [u8; 32] = derived
-            .try_into()
-            .map_err(|_| anyhow!("derived prompt-persistence key was not 32 bytes"))?;
-        return sbproxy_security::crypto::aes256gcm_decrypt(&key, &nonce, ciphertext, &aad)
-            .context("open sealed prompt record");
-    }
-    Err(anyhow!(
-        "sealed prompt record was written under key {}, which is not the active key and is not \
-         listed in previous_keys",
-        hex::encode(fingerprint)
-    ))
 }
 
 /// Persistence handle the admin mutators call after a successful
@@ -551,17 +453,23 @@ mod tests {
 
     // --- at-rest sealing ------------------------------------------------
 
-    fn key_material(byte: u8) -> PromptKeyMaterial {
-        PromptKeyMaterial::new(vec![byte; 32]).expect("32 bytes is enough material")
+    /// A sealer whose active key is `byte` repeated, with `previous`
+    /// as its retired keys.
+    fn ring(byte: u8, previous: &[u8]) -> PromptSealer {
+        prompt_key_ring(
+            vec![byte; 32],
+            previous.iter().map(|b| vec![*b; 32]).collect(),
+        )
+        .expect("32 bytes is enough material")
     }
 
     fn sealer(byte: u8) -> Arc<PromptSealer> {
-        Arc::new(PromptSealer::new(key_material(byte), Vec::new()))
+        Arc::new(ring(byte, &[]))
     }
 
     #[test]
     fn key_material_refuses_short_input_and_scrubs_it() {
-        let err = PromptKeyMaterial::new(b"short".to_vec()).unwrap_err();
+        let err = prompt_key_ring(b"short".to_vec(), Vec::new()).unwrap_err();
         assert!(
             err.to_string().contains("at least"),
             "a short key must be refused rather than stretched: {err}"
@@ -590,7 +498,7 @@ mod tests {
             .expect("get")
             .expect("present");
         assert!(
-            stored.starts_with(SEAL_MAGIC),
+            stored.starts_with(&SBPP_SCHEME.magic()),
             "value must carry the seal envelope"
         );
         assert!(
@@ -627,7 +535,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("open sealed prompt record"),
+            err.to_string().contains("failed authentication"),
             "moving a record between keys must fail the AEAD: {err}"
         );
 
@@ -649,14 +557,14 @@ mod tests {
 
         // Rotate: the old key moves into previous_keys and a new key becomes
         // active.
-        let rotated = PromptSealer::new(key_material(4), vec![key_material(3)]);
+        let rotated = ring(4, &[3]);
         let opened = open_record(Some(&rotated), store_key.as_bytes(), &sealed)
             .expect("a retired key must still open its records");
         assert_eq!(opened, br#"{"versions":{}}"#);
 
         // Drop the retired key and the record is no longer openable, which is
         // what retiring a key is supposed to mean.
-        let without = PromptSealer::new(key_material(4), Vec::new());
+        let without = ring(4, &[]);
         let err = open_record(Some(&without), store_key.as_bytes(), &sealed).unwrap_err();
         assert!(
             err.to_string().contains("not the active key"),

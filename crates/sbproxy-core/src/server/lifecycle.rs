@@ -719,6 +719,15 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
             outcome.degrade(DegradedSubsystem::PipelineLifecycleHook);
         }
     }
+    // Same check the boot path runs, but a reload cannot abort: refusing
+    // here would pin the operator on the old config until they fixed an
+    // extension, which is exactly what the reload contract avoids
+    // elsewhere. The violation is loud and shows up as a degraded
+    // subsystem in the /admin/reload response instead.
+    if let Err(e) = enforce_cache_at_rest_posture(&new_pipeline) {
+        tracing::error!(error = %e, "reloaded pipeline has a cache that stores plaintext at rest");
+        outcome.degrade(DegradedSubsystem::PipelineLifecycleHook);
+    }
     let config_dir = std::path::Path::new(config_path)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
@@ -1444,6 +1453,12 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
             );
         }
     }
+
+    // The lifecycle hook has now had its chance to install cache
+    // backends. Anything it wired that writes plaintext somewhere
+    // durable is refused here rather than discovered later by whoever
+    // reads the disk.
+    enforce_cache_at_rest_posture(&pipeline)?;
 
     // Prepare and publish the complete model desired state before the
     // pipeline becomes requestable. The permanent runtime exists even
@@ -2858,26 +2873,22 @@ fn build_prompt_sealer(
         )
     })?;
 
-    let active =
-        crate::admin::PromptKeyMaterial::new(crate::pipeline::resolve_at_rest_key_material(
+    let resolve = |reference: &str| {
+        crate::pipeline::resolve_at_rest_key_material(
             reference,
             "admin.prompt_persistence_encryption",
-        )?)
-        .context("admin.prompt_persistence_encryption.key")?;
+        )
+    };
+    let active = resolve(reference).context("admin.prompt_persistence_encryption.key")?;
     let mut previous = Vec::with_capacity(enc.previous_keys.len());
     for (index, reference) in enc.previous_keys.iter().enumerate() {
-        previous.push(
-            crate::admin::PromptKeyMaterial::new(crate::pipeline::resolve_at_rest_key_material(
-                reference,
-                "admin.prompt_persistence_encryption",
-            )?)
-            .with_context(|| {
-                format!("admin.prompt_persistence_encryption.previous_keys[{index}]")
-            })?,
-        );
+        previous.push(resolve(reference).with_context(|| {
+            format!("admin.prompt_persistence_encryption.previous_keys[{index}]")
+        })?);
     }
 
-    let sealer = crate::admin::PromptSealer::new(active, previous);
+    let sealer = crate::admin::prompt_key_ring(active, previous)
+        .context("admin.prompt_persistence_encryption")?;
     tracing::info!(
         key_id = %sealer.active_key_id(),
         retired_keys = enc.previous_keys.len(),
@@ -3739,5 +3750,185 @@ origins:
             resolve_or_default_admin_operator_pepper(Some(&cfg), true).unwrap(),
             b"pinned-pepper".to_vec()
         );
+    }
+}
+
+/// Refuse a pipeline whose caches write plaintext somewhere durable.
+///
+/// Runs after the lifecycle hook has installed its backends, because
+/// that is the only point at which the full set of cache surfaces is
+/// known. The in-tree defaults are all memory-only, so this is a no-op
+/// for every OSS build; it exists so that the day a persistent or
+/// replicated backend is wired in, an operator hears about it at boot
+/// instead of finding prompts on disk later.
+///
+/// # Why the response cache is not covered here
+///
+/// The response cache is checked, but only to warn. Running it
+/// unencrypted over a file or Redis backend is a shipped, documented,
+/// deliberately-chosen configuration that predates this check, and
+/// turning it fatal would break working deployments on upgrade for no
+/// new information: the operator already knows, because they wrote the
+/// backend and left `encryption.enabled` off. An operator who wants it
+/// fatal turns encryption on, which is the same edit either way.
+///
+/// The pluggable surfaces are different. None of them has ever had a
+/// non-ephemeral backend in this repository, so nothing can break, and
+/// the whole point is that the exposure must not be able to appear
+/// silently.
+fn enforce_cache_at_rest_posture(
+    pipeline: &crate::pipeline::CompiledPipeline,
+) -> anyhow::Result<()> {
+    let mut exposed = Vec::new();
+    for (name, posture) in pipeline.hooks.cache_surfaces() {
+        if posture.stores_plaintext_at_rest() {
+            exposed.push(format!(
+                "{name} (backend is {}, entries are not encrypted)",
+                posture.durability.as_str()
+            ));
+        }
+    }
+    if !exposed.is_empty() {
+        anyhow::bail!(
+            "these caches would store plaintext outside this process: {}. A cache whose \
+             backend survives a restart or is shared across replicas must encrypt what it \
+             writes. Configure encryption for the backend, or run it in memory.",
+            exposed.join("; ")
+        );
+    }
+
+    if let Some(store) = pipeline.cache_store.as_ref() {
+        let posture = store.at_rest_posture();
+        if posture.stores_plaintext_at_rest() {
+            tracing::warn!(
+                backend = store.backend_name(),
+                durability = posture.durability.as_str(),
+                "the response cache is storing response headers and bodies unencrypted on a \
+                 backend that outlives this process; set \
+                 proxy.response_cache_store.encryption.enabled to seal them"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod at_rest_posture_tests {
+    use super::*;
+    use crate::hooks::{
+        CachedResponse, LookupOutcome, LookupRequest, PurgeScope, SemanticLookupHook, StoreRequest,
+    };
+    use sbproxy_cache::{AtRestPosture, CacheDurability};
+    use std::sync::Arc;
+
+    /// A semantic cache that reports whatever posture the test asks for.
+    struct PostureCache(AtRestPosture);
+
+    #[async_trait::async_trait]
+    impl SemanticLookupHook for PostureCache {
+        async fn lookup(&self, _req: &LookupRequest) -> LookupOutcome {
+            LookupOutcome::default()
+        }
+        async fn store(&self, _req: StoreRequest, _resp: CachedResponse) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn purge(&self, _scope: PurgeScope) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+        fn at_rest_posture(&self) -> AtRestPosture {
+            self.0
+        }
+    }
+
+    fn pipeline_with(posture: Option<AtRestPosture>) -> crate::pipeline::CompiledPipeline {
+        let mut hooks = crate::hooks::Hooks::default();
+        if let Some(posture) = posture {
+            hooks.semantic_lookup = Some(Arc::new(PostureCache(posture)));
+        }
+        crate::pipeline::CompiledPipeline {
+            hooks,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_pipeline_with_no_cache_hooks_passes() {
+        assert!(enforce_cache_at_rest_posture(&pipeline_with(None)).is_ok());
+    }
+
+    #[test]
+    fn the_default_memory_only_posture_passes() {
+        // Every in-tree implementation inherits this, so the check must
+        // be a no-op for an OSS build.
+        assert!(
+            enforce_cache_at_rest_posture(&pipeline_with(Some(AtRestPosture::memory_only())))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_persistent_unencrypted_semantic_cache_aborts_boot() {
+        // The whole point of the guard: a backend swap that starts
+        // writing prompts to disk must not go unnoticed.
+        let err = enforce_cache_at_rest_posture(&pipeline_with(Some(AtRestPosture::new(
+            CacheDurability::Persistent,
+            false,
+        ))))
+        .expect_err("an unencrypted persistent cache must fail loud");
+        let message = err.to_string();
+        assert!(message.contains("semantic response cache"), "{message}");
+        assert!(message.contains("persistent"), "{message}");
+    }
+
+    #[test]
+    fn a_replicated_unencrypted_semantic_cache_aborts_boot() {
+        let err = enforce_cache_at_rest_posture(&pipeline_with(Some(AtRestPosture::new(
+            CacheDurability::Replicated,
+            false,
+        ))))
+        .expect_err("an unencrypted replicated cache must fail loud");
+        assert!(err.to_string().contains("replicated"), "{err}");
+    }
+
+    #[test]
+    fn a_persistent_encrypted_semantic_cache_passes() {
+        // Encryption is the fix the error message asks for, so applying
+        // it has to actually clear the check.
+        assert!(
+            enforce_cache_at_rest_posture(&pipeline_with(Some(AtRestPosture::new(
+                CacheDurability::Persistent,
+                true,
+            ))))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_unencrypted_persistent_response_cache_warns_but_does_not_abort() {
+        // Deliberately asymmetric with the hook surfaces above: running
+        // the response cache unencrypted on a file backend is a shipped
+        // configuration, and breaking it on upgrade would tell the
+        // operator nothing they did not already choose.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let pipeline = crate::pipeline::CompiledPipeline {
+            cache_store: Some(Arc::new(
+                sbproxy_cache::FileCacheStore::new(sbproxy_cache::FileCacheConfig {
+                    directory: dir.path().to_string_lossy().into_owned(),
+                    max_size_mb: 0,
+                })
+                .expect("file store"),
+            )),
+            ..Default::default()
+        };
+        assert!(enforce_cache_at_rest_posture(&pipeline).is_ok());
+    }
+
+    #[test]
+    fn an_in_memory_response_cache_is_not_flagged() {
+        let pipeline = crate::pipeline::CompiledPipeline {
+            cache_store: Some(Arc::new(sbproxy_cache::MemoryCacheStore::new(10))),
+            ..Default::default()
+        };
+        assert!(enforce_cache_at_rest_posture(&pipeline).is_ok());
     }
 }

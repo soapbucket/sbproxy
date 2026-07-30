@@ -3280,7 +3280,10 @@ pub(super) async fn request_filter(
     // the upstream.
     if let (Some(cache_cfg), Some(cache_store)) = (
         origin.response_cache.as_ref(),
-        pipeline.cache_store.as_ref(),
+        // Per-origin handle, not the shared one: with at-rest
+        // encryption on it is the only handle that can seal or open
+        // this origin's entries.
+        pipeline.cache_store_for(&origin.origin_id),
     ) {
         // WOR-114: `x-sb-flags: no-cache` (or `?_sb.no-cache`)
         // bypasses both lookup and write for this request. The

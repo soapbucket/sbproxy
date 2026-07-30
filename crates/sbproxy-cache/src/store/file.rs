@@ -301,6 +301,11 @@ impl CacheStore for FileCacheStore {
     fn backend_name(&self) -> &'static str {
         "file"
     }
+
+    fn durability(&self) -> crate::at_rest::CacheDurability {
+        // Entries are files on disk and outlive the process.
+        crate::at_rest::CacheDurability::Persistent
+    }
 }
 
 #[cfg(test)]

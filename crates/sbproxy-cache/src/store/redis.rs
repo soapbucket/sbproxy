@@ -122,6 +122,11 @@ impl CacheStore for RedisCacheStore {
     fn backend_name(&self) -> &'static str {
         "redis"
     }
+
+    fn durability(&self) -> crate::at_rest::CacheDurability {
+        // Entries live on a shared server that other replicas read.
+        crate::at_rest::CacheDurability::Replicated
+    }
 }
 
 #[cfg(test)]

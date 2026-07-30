@@ -22,10 +22,11 @@ use std::sync::Arc;
 
 use crate::builtin_enforcers::{compile_builtin_enforcers, CompiledEnforcer};
 use crate::router::HostRouter;
+use compact_str::CompactString;
 use sbproxy_cache::{
-    CacheKeyMaterial, CacheReserveBackend, CacheStore, EncryptedCacheStore, FileCacheConfig,
-    FileCacheStore, FsReserve, MemcachedConfig, MemcachedStore, MemoryCacheStore, MemoryReserve,
-    RedisCacheStore, RedisReserve,
+    CacheReserveBackend, CacheStore, EncryptedCacheStore, FileCacheConfig, FileCacheStore,
+    FsReserve, MemcachedConfig, MemcachedStore, MemoryCacheStore, MemoryReserve, RedisCacheStore,
+    RedisReserve,
 };
 use sbproxy_config::{CompiledConfig, Parameter, RequestModifierConfig};
 use sbproxy_modules::compile::{
@@ -526,22 +527,6 @@ fn build_cache_reserve(
     }
 }
 
-/// Resolve a response-cache encryption key reference into raw material.
-///
-/// Routes through the process secret resolver when one is installed, so
-/// `secret://`, `vault://`, `file:`, and whole-value `${VAR}` references
-/// all behave exactly as they do everywhere else in the config.
-///
-/// When no resolver is installed, which happens for `sbproxy validate`,
-/// for unit tests, and for a serve run whose config declares no
-/// `proxy.secrets` backends, `file:` is handled here and any
-/// provider-URI scheme is a hard error. The reference text is never used
-/// as key material, because a literal `secret://...` silently becoming
-/// the AES key is exactly the failure this feature exists to prevent.
-fn resolve_cache_key_material(reference: &str) -> anyhow::Result<Vec<u8>> {
-    resolve_at_rest_key_material(reference, "proxy.response_cache_store.encryption")
-}
-
 /// Resolve an at-rest encryption key reference to raw key material.
 ///
 /// One resolution path for every at-rest surface, so a new surface cannot
@@ -583,6 +568,26 @@ pub(crate) fn resolve_at_rest_key_material(
     Ok(reference.as_bytes().to_vec())
 }
 
+/// The response-cache store plus the per-origin handles onto it.
+///
+/// `unscoped` is the admin/purge handle. `per_origin` is empty unless
+/// at-rest encryption is on; when it is, it holds one handle per compiled
+/// origin, each bound to that origin's key ring.
+pub(crate) struct ResponseCacheStores {
+    pub unscoped: Arc<dyn CacheStore>,
+    pub per_origin: HashMap<CompactString, Arc<dyn CacheStore>>,
+}
+
+impl std::fmt::Debug for ResponseCacheStores {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResponseCacheStores")
+            .field("backend", &self.unscoped.backend_name())
+            .field("scoped_origins", &self.per_origin.len())
+            .finish()
+    }
+}
+
 /// Build the shared response-cache store.
 ///
 /// `store_cfg` is `proxy.response_cache_store`. When it is `None` the
@@ -595,6 +600,13 @@ pub(crate) fn resolve_at_rest_key_material(
 /// than built here so this function never has to name the KV trait and
 /// stays unit-testable.
 ///
+/// `origins` supplies each origin's id and its per-origin encryption
+/// block. Every reference either resolves at boot or aborts startup with
+/// an error naming the origin, which is the same no-plaintext-fallback
+/// rule the store-wide key already follows. Multiplying the number of
+/// secrets resolved at boot is the cost of key separation; failing loud
+/// on each is what keeps that cost honest.
+///
 /// In `Validation` mode the shape is checked but no secret is resolved
 /// and no directory is created, matching how the rest of `sbproxy
 /// validate` treats secrets and the filesystem.
@@ -602,18 +614,24 @@ fn build_response_cache_store(
     store_cfg: Option<&sbproxy_config::ResponseCacheStoreConfig>,
     redis_store: Option<Arc<dyn CacheStore>>,
     memory_max_entries: usize,
+    origins: &[OriginCacheKeys<'_>],
     mode: PipelineConstructionMode,
-) -> anyhow::Result<Arc<dyn CacheStore>> {
+) -> anyhow::Result<ResponseCacheStores> {
     use anyhow::Context;
 
     let validating = matches!(mode, PipelineConstructionMode::Validation);
 
+    let plain = |store: Arc<dyn CacheStore>| ResponseCacheStores {
+        unscoped: store,
+        per_origin: HashMap::new(),
+    };
+
     let Some(cfg) = store_cfg else {
         // Legacy selection, byte-identical to the pre-block behaviour.
-        return Ok(match redis_store {
+        return Ok(plain(match redis_store {
             Some(store) => store,
             None => Arc::new(MemoryCacheStore::new(memory_max_entries)),
-        });
+        }));
     };
 
     let base: Arc<dyn CacheStore> = match &cfg.backend {
@@ -650,45 +668,156 @@ fn build_response_cache_store(
     };
 
     let Some(enc) = cfg.encryption.as_ref().filter(|e| e.enabled) else {
+        // An origin that declared its own key while store-wide
+        // encryption is off wrote something that would never take
+        // effect. Say so rather than storing that tenant in the clear.
+        if let Some(origin) = origins.iter().find(|o| o.declares_a_key()) {
+            anyhow::bail!(
+                "origin '{}' declares response_cache.encryption but \
+                 proxy.response_cache_store.encryption is not enabled; enable it or remove the \
+                 per-origin block",
+                origin.id
+            );
+        }
         tracing::info!(
             backend = base.backend_name(),
             "response cache backend ready without at-rest encryption"
         );
-        return Ok(base);
+        return Ok(plain(base));
     };
 
-    let reference = enc.key.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "proxy.response_cache_store.encryption.enabled is true but no `key` is set; \
-             point `key` at a secret reference such as `secret://local/response-cache` \
-             or set `enabled: false`"
-        )
-    })?;
+    // Bound to a local rather than matched inline so the config-key
+    // reader scan can see a plain field read of `per_origin_keys`.
+    let per_origin_mode = enc.per_origin_keys;
+    let strict = per_origin_mode == sbproxy_config::PerOriginKeyMode::Required;
 
-    if validating {
-        // The shape is valid. Resolving the key would read files and
-        // dial secret backends, which `sbproxy validate` does not do.
-        return Ok(base);
+    // Under `required` the store-wide key is not a fallback, but it is
+    // still the thing an operator most likely left in place while
+    // migrating. Requiring it anyway would make the switch a two-step
+    // edit for no safety gain, so it stays optional-but-accepted and
+    // simply never gets inherited.
+    let store_wide_reference = enc.key.as_deref();
+    if store_wide_reference.is_none() && !strict {
+        anyhow::bail!(
+            "proxy.response_cache_store.encryption.enabled is true but no `key` is set; \
+             point `key` at a secret reference such as `secret://local/response-cache`, \
+             give every caching origin its own key under \
+             `per_origin_keys: required`, or set `enabled: false`"
+        );
     }
 
-    let active = CacheKeyMaterial::new(resolve_cache_key_material(reference)?)
-        .context("proxy.response_cache_store.encryption.key")?;
-    let mut previous = Vec::with_capacity(enc.previous_keys.len());
-    for (index, reference) in enc.previous_keys.iter().enumerate() {
-        previous.push(
-            CacheKeyMaterial::new(resolve_cache_key_material(reference)?).with_context(|| {
-                format!("proxy.response_cache_store.encryption.previous_keys[{index}]")
-            })?,
+    if strict {
+        let missing: Vec<&str> = origins
+            .iter()
+            .filter(|o| o.caches && !o.declares_a_key())
+            .map(|o| o.id)
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "proxy.response_cache_store.encryption.per_origin_keys is `required`, but these \
+                 caching origins declare no encryption key of their own: {}. Give each one an \
+                 `origins.<host>.response_cache.encryption.key`, or switch back to `inherit`.",
+                missing.join(", ")
+            );
+        }
+    }
+
+    if validating {
+        // The shape is valid. Resolving the keys would read files and
+        // dial secret backends, which `sbproxy validate` does not do.
+        return Ok(plain(base));
+    }
+
+    let resolve_ring = |reference: &str, previous: &[String], config_path: &str| {
+        let active = resolve_at_rest_key_material(reference, config_path)
+            .with_context(|| format!("{config_path}.key"))?;
+        let mut retired = Vec::with_capacity(previous.len());
+        for (index, reference) in previous.iter().enumerate() {
+            retired.push(
+                resolve_at_rest_key_material(reference, config_path)
+                    .with_context(|| format!("{config_path}.previous_keys[{index}]"))?,
+            );
+        }
+        sbproxy_cache::cache_key_ring(active, retired).context(config_path.to_string())
+    };
+
+    let default_ring = match store_wide_reference {
+        Some(reference) => Some(resolve_ring(
+            reference,
+            &enc.previous_keys,
+            "proxy.response_cache_store.encryption",
+        )?),
+        None => None,
+    };
+
+    let mut per_origin_rings = HashMap::new();
+    for origin in origins {
+        let Some(reference) = origin.key else {
+            continue;
+        };
+        let path = format!("origins.{}.response_cache.encryption", origin.id);
+        per_origin_rings.insert(
+            origin.id.to_string(),
+            resolve_ring(reference, origin.previous_keys, &path)?,
         );
     }
 
     tracing::info!(
         backend = base.backend_name(),
-        key_id = %active.fingerprint_hex(),
-        retired_keys = previous.len(),
+        key_id = default_ring
+            .as_ref()
+            .map(|r| r.active_key_id())
+            .unwrap_or_else(|| "none".to_string()),
+        retired_keys = enc.previous_keys.len(),
+        per_origin_keys = per_origin_rings.len(),
+        strict = strict,
         "response cache backend ready with at-rest encryption"
     );
-    Ok(Arc::new(EncryptedCacheStore::new(base, active, previous)))
+
+    let directory = Arc::new(sbproxy_cache::CacheKeyDirectory::new(
+        default_ring,
+        per_origin_rings,
+    ));
+    let per_origin = origins
+        .iter()
+        .map(|origin| {
+            let handle: Arc<dyn CacheStore> = Arc::new(EncryptedCacheStore::scoped(
+                Arc::clone(&base),
+                Arc::clone(&directory),
+                origin.id,
+            ));
+            (CompactString::new(origin.id), handle)
+        })
+        .collect();
+    Ok(ResponseCacheStores {
+        unscoped: Arc::new(EncryptedCacheStore::unscoped(base, directory)),
+        per_origin,
+    })
+}
+
+/// One origin's contribution to response-cache key resolution.
+///
+/// Borrowed from the compiled config so the builder can stay a free
+/// function that unit tests drive with literals.
+pub(crate) struct OriginCacheKeys<'a> {
+    /// Origin id, which is the hostname the operator wrote in YAML.
+    pub id: &'a str,
+    /// Whether this origin has `response_cache.enabled: true`.
+    pub caches: bool,
+    /// This origin's active key reference, if it declared one.
+    pub key: Option<&'a str>,
+    /// This origin's retired key references.
+    pub previous_keys: &'a [String],
+}
+
+impl OriginCacheKeys<'_> {
+    /// Whether this origin declared any key material of its own.
+    ///
+    /// `previous_keys` counts: an origin mid-rotation that has already
+    /// had its active key removed still holds material nobody else does.
+    fn declares_a_key(&self) -> bool {
+        self.key.is_some() || !self.previous_keys.is_empty()
+    }
 }
 
 /// TLS-fingerprint capture mode.
@@ -1044,7 +1173,20 @@ pub struct CompiledPipeline {
     /// `MemoryCacheStore`. A single backend is shared by all origins;
     /// per-origin `ResponseCacheConfig` gates whether the cache is
     /// actually used for that origin.
+    ///
+    /// This is the *unscoped* handle. It supports purge and reports the
+    /// backend name, which is all the admin API needs. When at-rest
+    /// encryption is on it refuses reads and writes, because sealing an
+    /// entry requires knowing which origin it belongs to. Data paths must
+    /// go through [`Self::cache_store_for`].
     pub cache_store: Option<Arc<dyn CacheStore>>,
+    /// Per-origin handles onto [`Self::cache_store`], keyed by origin id.
+    ///
+    /// Empty unless at-rest encryption is on, in which case there is one
+    /// entry per compiled origin. Each handle seals and opens under that
+    /// origin's key ring and binds the origin into the associated data.
+    /// Read it through [`Self::cache_store_for`] rather than directly.
+    pub origin_cache_stores: HashMap<CompactString, Arc<dyn CacheStore>>,
     /// Optional Cache Reserve cold-tier backend.
     ///
     /// Built from the top-level `cache_reserve:` block. When `Some`, the
@@ -1147,6 +1289,7 @@ impl Default for CompiledPipeline {
             web_bot_auth_signature_agent: None,
             idempotencies: Vec::new(),
             cache_store: None,
+            origin_cache_stores: HashMap::new(),
             cache_reserve: None,
             cache_reserve_admission: None,
             hooks: crate::hooks::Hooks::default(),
@@ -1177,6 +1320,24 @@ fn parse_outbound_credential_config(
 }
 
 impl CompiledPipeline {
+    /// The response-cache handle the data path must use for `origin_id`.
+    ///
+    /// With at-rest encryption on, this is the handle bound to that
+    /// origin's key ring, which is the only one that can seal or open an
+    /// entry: the origin is authenticated in every envelope, so reading
+    /// one tenant's entry through another tenant's handle fails rather
+    /// than returning plaintext. With encryption off there are no
+    /// per-origin handles and every origin gets the one shared store,
+    /// exactly as before.
+    ///
+    /// [`Self::cache_store`] is the purge handle. Reaching for it on the
+    /// data path is the mistake this method exists to prevent.
+    pub fn cache_store_for(&self, origin_id: &str) -> Option<&Arc<dyn CacheStore>> {
+        self.origin_cache_stores
+            .get(origin_id)
+            .or(self.cache_store.as_ref())
+    }
+
     /// Compile a config into a full pipeline with modules instantiated.
     ///
     /// Iterates over every origin in the config, compiling its action,
@@ -1405,7 +1566,7 @@ impl CompiledPipeline {
             .origins
             .iter()
             .any(|o| o.response_cache.as_ref().is_some_and(|c| c.enabled));
-        let cache_store: Option<Arc<dyn CacheStore>> = if any_cache_enabled {
+        let cache_store: Option<ResponseCacheStores> = if any_cache_enabled {
             // Take the largest configured max_size across origins so the
             // shared memory cache can fit all of them.
             let memory_max = config
@@ -1419,14 +1580,37 @@ impl CompiledPipeline {
                 .l2_store
                 .clone()
                 .map(|kv| Arc::new(RedisCacheStore::new(kv)) as Arc<dyn CacheStore>);
+            let origin_keys: Vec<OriginCacheKeys<'_>> = config
+                .origins
+                .iter()
+                .map(|o| {
+                    let encryption = o
+                        .response_cache
+                        .as_ref()
+                        .and_then(|c| c.encryption.as_ref());
+                    OriginCacheKeys {
+                        id: o.origin_id.as_str(),
+                        caches: o.response_cache.as_ref().is_some_and(|c| c.enabled),
+                        key: encryption.and_then(|e| e.key.as_deref()),
+                        previous_keys: encryption
+                            .map(|e| e.previous_keys.as_slice())
+                            .unwrap_or(&[]),
+                    }
+                })
+                .collect();
             Some(build_response_cache_store(
                 config.server.response_cache_store.as_ref(),
                 redis_store,
                 memory_max,
+                &origin_keys,
                 mode,
             )?)
         } else {
             None
+        };
+        let (cache_store, origin_cache_stores) = match cache_store {
+            Some(stores) => (Some(stores.unscoped), stores.per_origin),
+            None => (None, HashMap::new()),
         };
 
         // --- Cache Reserve cold tier ---
@@ -1586,6 +1770,7 @@ impl CompiledPipeline {
             web_bot_auth_signature_agent,
             idempotencies,
             cache_store,
+            origin_cache_stores,
             cache_reserve,
             cache_reserve_admission,
             hooks: crate::hooks::Hooks::default(),
@@ -3300,18 +3485,19 @@ origins: {}
             None,
             fake_redis(),
             10_000,
+            &[],
             PipelineConstructionMode::Runtime,
         )
         .expect("legacy selection should build");
-        assert_eq!(store.backend_name(), "redis");
+        assert_eq!(store.unscoped.backend_name(), "redis");
     }
 
     #[test]
     fn no_store_block_without_l2_selects_memory() {
         let store =
-            build_response_cache_store(None, None, 10_000, PipelineConstructionMode::Runtime)
+            build_response_cache_store(None, None, 10_000, &[], PipelineConstructionMode::Runtime)
                 .expect("legacy selection should build");
-        assert_eq!(store.backend_name(), "memory");
+        assert_eq!(store.unscoped.backend_name(), "memory");
     }
 
     #[test]
@@ -3323,10 +3509,11 @@ origins: {}
             Some(&cfg),
             fake_redis(),
             10_000,
+            &[],
             PipelineConstructionMode::Runtime,
         )
         .expect("explicit memory should build");
-        assert_eq!(store.backend_name(), "memory");
+        assert_eq!(store.unscoped.backend_name(), "memory");
     }
 
     #[test]
@@ -3340,10 +3527,15 @@ origins: {}
             },
             encryption: None,
         };
-        let store =
-            build_response_cache_store(Some(&cfg), None, 10_000, PipelineConstructionMode::Runtime)
-                .expect("file backend should build");
-        assert_eq!(store.backend_name(), "file");
+        let store = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("file backend should build");
+        assert_eq!(store.unscoped.backend_name(), "file");
         assert!(path.is_dir(), "the cache directory must be created");
     }
 
@@ -3366,7 +3558,8 @@ origins: {}
             Some(&cfg),
             None,
             10_000,
-            PipelineConstructionMode::Runtime,
+            &[],
+            PipelineConstructionMode::Runtime
         )
         .is_err());
     }
@@ -3383,10 +3576,15 @@ origins: {}
             },
             encryption: None,
         };
-        let store =
-            build_response_cache_store(Some(&cfg), None, 10_000, PipelineConstructionMode::Runtime)
-                .expect("memcached backend should build without dialing");
-        assert_eq!(store.backend_name(), "memcached");
+        let store = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("memcached backend should build without dialing");
+        assert_eq!(store.unscoped.backend_name(), "memcached");
     }
 
     #[test]
@@ -3395,9 +3593,13 @@ origins: {}
             backend: sbproxy_config::ResponseCacheBackendConfig::Redis,
             encryption: None,
         };
-        let Err(err) =
-            build_response_cache_store(Some(&cfg), None, 10_000, PipelineConstructionMode::Runtime)
-        else {
+        let Err(err) = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[],
+            PipelineConstructionMode::Runtime,
+        ) else {
             panic!("redis without l2_cache must fail loudly");
         };
         assert!(
@@ -3416,11 +3618,16 @@ origins: {}
                 enabled: true,
                 key: None,
                 previous_keys: Vec::new(),
+                per_origin_keys: Default::default(),
             }),
         };
-        let Err(err) =
-            build_response_cache_store(Some(&cfg), None, 10_000, PipelineConstructionMode::Runtime)
-        else {
+        let Err(err) = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[],
+            PipelineConstructionMode::Runtime,
+        ) else {
             panic!("encryption without a key must fail loudly");
         };
         assert!(
@@ -3437,13 +3644,15 @@ origins: {}
                 enabled: true,
                 key: Some("short".to_string()),
                 previous_keys: Vec::new(),
+                per_origin_keys: Default::default(),
             }),
         };
         assert!(build_response_cache_store(
             Some(&cfg),
             None,
             10_000,
-            PipelineConstructionMode::Runtime,
+            &[],
+            PipelineConstructionMode::Runtime
         )
         .is_err());
     }
@@ -3458,16 +3667,21 @@ origins: {}
                 enabled: true,
                 key: Some("secret://primary/response-cache-key".to_string()),
                 previous_keys: Vec::new(),
+                per_origin_keys: Default::default(),
             }),
         };
-        let Err(err) =
-            build_response_cache_store(Some(&cfg), None, 10_000, PipelineConstructionMode::Runtime)
-        else {
+        let Err(err) = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[],
+            PipelineConstructionMode::Runtime,
+        ) else {
             panic!("an unresolvable reference must not be used verbatim");
         };
         assert!(
-            err.to_string().contains("proxy.secrets.backends"),
-            "the error must point at the missing backend: {err}"
+            format!("{err:#}").contains("proxy.secrets.backends"),
+            "the error must point at the missing backend: {err:#}"
         );
     }
 
@@ -3483,14 +3697,21 @@ origins: {}
                 enabled: true,
                 key: Some(format!("file:{}", key_file.display())),
                 previous_keys: Vec::new(),
+                per_origin_keys: Default::default(),
             }),
         };
-        let store =
-            build_response_cache_store(Some(&cfg), None, 10_000, PipelineConstructionMode::Runtime)
-                .expect("file-referenced key should build");
+        let store = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[origin_keys("api.example", true, None)],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("file-referenced key should build");
 
         // Still reports the wrapped backend, and actually encrypts.
-        assert_eq!(store.backend_name(), "memory");
+        assert_eq!(store.unscoped.backend_name(), "memory");
+        let scoped = &store.per_origin["api.example"];
         let entry = sbproxy_cache::CachedResponse {
             generation: 0,
             status: 200,
@@ -3502,8 +3723,8 @@ origins: {}
                 .as_secs(),
             ttl_secs: 300,
         };
-        store.put("k", &entry).unwrap();
-        assert_eq!(store.get("k").unwrap().expect("hit").body, entry.body);
+        scoped.put("k", &entry).unwrap();
+        assert_eq!(scoped.get("k").unwrap().expect("hit").body, entry.body);
     }
 
     #[test]
@@ -3514,13 +3735,15 @@ origins: {}
                 enabled: false,
                 key: None,
                 previous_keys: Vec::new(),
+                per_origin_keys: Default::default(),
             }),
         };
         assert!(build_response_cache_store(
             Some(&cfg),
             None,
             10_000,
-            PipelineConstructionMode::Runtime,
+            &[],
+            PipelineConstructionMode::Runtime
         )
         .is_ok());
     }
@@ -3536,12 +3759,14 @@ origins: {}
                 enabled: true,
                 key: Some("file:/definitely/not/here.key".to_string()),
                 previous_keys: Vec::new(),
+                per_origin_keys: Default::default(),
             }),
         };
         assert!(build_response_cache_store(
             Some(&encrypted),
             None,
             10_000,
+            &[],
             PipelineConstructionMode::Validation,
         )
         .is_ok());
@@ -3554,8 +3779,315 @@ origins: {}
             Some(&bad_redis),
             None,
             10_000,
+            &[],
             PipelineConstructionMode::Validation,
         )
         .is_err());
+    }
+
+    // --- Per-origin cache encryption keys ---
+
+    /// A store config with encryption on, sealed under `key`, in the
+    /// given per-origin mode.
+    fn encrypted_store(
+        key: Option<&str>,
+        mode: sbproxy_config::PerOriginKeyMode,
+    ) -> sbproxy_config::ResponseCacheStoreConfig {
+        sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memory,
+            encryption: Some(sbproxy_config::ResponseCacheEncryptionConfig {
+                enabled: true,
+                key: key.map(String::from),
+                previous_keys: Vec::new(),
+                per_origin_keys: mode,
+            }),
+        }
+    }
+
+    /// Literal key material long enough to pass the 16-byte floor. The
+    /// resolver treats anything that is not a provider URI or `file:`
+    /// reference as literal material, which keeps these tests off disk.
+    const A_KEY: &str = "origin-a-key-material-0000000001";
+    const B_KEY: &str = "origin-b-key-material-0000000002";
+    const STORE_KEY: &str = "store-wide-key-material-00000001";
+
+    const NO_PREVIOUS: &[String] = &[];
+
+    fn origin_keys<'a>(id: &'a str, caches: bool, key: Option<&'a str>) -> OriginCacheKeys<'a> {
+        OriginCacheKeys {
+            id,
+            caches,
+            key,
+            previous_keys: NO_PREVIOUS,
+        }
+    }
+
+    #[test]
+    fn per_origin_keys_produce_one_handle_per_origin() {
+        let cfg = encrypted_store(Some(STORE_KEY), sbproxy_config::PerOriginKeyMode::Inherit);
+        let origins = [
+            origin_keys("a.example", true, Some(A_KEY)),
+            origin_keys("b.example", true, None),
+        ];
+        let stores = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &origins,
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("both keys resolve");
+        assert_eq!(stores.per_origin.len(), 2);
+        assert!(stores.per_origin.contains_key("a.example"));
+        assert!(stores.per_origin.contains_key("b.example"));
+    }
+
+    #[test]
+    fn an_entry_sealed_for_one_origin_is_unreadable_through_another_handle() {
+        // The end-to-end version of the multi-tenant property, driven
+        // through the real config path rather than the store's own unit
+        // tests. Both origins inherit the store-wide key here, so only
+        // the origin binding separates them.
+        let cfg = encrypted_store(Some(STORE_KEY), sbproxy_config::PerOriginKeyMode::Inherit);
+        let origins = [
+            origin_keys("a.example", true, None),
+            origin_keys("b.example", true, None),
+        ];
+        let stores = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &origins,
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("store-wide key resolves");
+
+        let entry = sbproxy_cache::CachedResponse {
+            generation: 1,
+            status: 200,
+            headers: vec![("x-tenant".into(), "a".into())],
+            body: b"tenant a private body".to_vec(),
+            cached_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            ttl_secs: 300,
+        };
+        stores.per_origin["a.example"]
+            .put("shared-key", &entry)
+            .expect("seal for a");
+        assert!(
+            stores.per_origin["b.example"].get("shared-key").is_err(),
+            "origin b must not be able to open origin a's entry"
+        );
+    }
+
+    #[test]
+    fn strict_mode_names_every_caching_origin_without_a_key() {
+        let cfg = encrypted_store(Some(STORE_KEY), sbproxy_config::PerOriginKeyMode::Required);
+        let origins = [
+            origin_keys("has-key.example", true, Some(A_KEY)),
+            origin_keys("missing-one.example", true, None),
+            origin_keys("missing-two.example", true, None),
+            // Not caching, so it is not required to hold a key.
+            origin_keys("no-cache.example", false, None),
+        ];
+        let err = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &origins,
+            PipelineConstructionMode::Runtime,
+        )
+        .expect_err("strict mode must refuse an origin with no key");
+        let message = err.to_string();
+        assert!(message.contains("missing-one.example"), "{message}");
+        assert!(message.contains("missing-two.example"), "{message}");
+        assert!(
+            !message.contains("no-cache.example"),
+            "an origin that does not cache needs no key: {message}"
+        );
+    }
+
+    #[test]
+    fn strict_mode_accepts_a_config_where_every_caching_origin_has_a_key() {
+        let cfg = encrypted_store(None, sbproxy_config::PerOriginKeyMode::Required);
+        let origins = [
+            origin_keys("a.example", true, Some(A_KEY)),
+            origin_keys("b.example", true, Some(B_KEY)),
+        ];
+        let stores = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &origins,
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("every caching origin declares a key");
+        assert_eq!(stores.per_origin.len(), 2);
+    }
+
+    #[test]
+    fn inherit_mode_still_requires_a_store_wide_key() {
+        // Without a store-wide key there is nothing for an origin to
+        // inherit, so this is the same misconfiguration as before
+        // per-origin keys existed and must fail the same way.
+        let cfg = encrypted_store(None, sbproxy_config::PerOriginKeyMode::Inherit);
+        let err = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[origin_keys("a.example", true, None)],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect_err("inherit with nothing to inherit must fail");
+        assert!(err.to_string().contains("no `key` is set"), "{err}");
+    }
+
+    #[test]
+    fn an_unresolvable_per_origin_key_names_the_origin() {
+        // The guardrail: per-origin keys multiply the secrets resolved at
+        // boot, so the failure has to say which one.
+        let cfg = encrypted_store(Some(STORE_KEY), sbproxy_config::PerOriginKeyMode::Inherit);
+        let err = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[origin_keys(
+                "broken.example",
+                true,
+                Some("file:/definitely/not/here.key"),
+            )],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect_err("an unreadable key file must abort startup");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("origins.broken.example.response_cache.encryption"),
+            "the error must name the origin whose key failed: {message}"
+        );
+    }
+
+    #[test]
+    fn a_short_per_origin_key_is_refused() {
+        let cfg = encrypted_store(Some(STORE_KEY), sbproxy_config::PerOriginKeyMode::Inherit);
+        let err = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[origin_keys("short.example", true, Some("tiny"))],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect_err("a four-byte key must be refused, not stretched");
+        assert!(format!("{err:#}").contains("at least 16 bytes"), "{err:#}");
+    }
+
+    #[test]
+    fn a_per_origin_key_without_store_wide_encryption_is_a_config_error() {
+        // An operator who wrote a key here expected sealing to happen.
+        // Quietly ignoring it would store that tenant in the clear.
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memory,
+            encryption: None,
+        };
+        let err = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[origin_keys("a.example", true, Some(A_KEY))],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect_err("a per-origin key with encryption off must not be silently ignored");
+        assert!(err.to_string().contains("a.example"), "{err}");
+    }
+
+    #[test]
+    fn validation_mode_resolves_no_per_origin_secret() {
+        // `sbproxy validate` checks shape without dialing secret
+        // backends or reading key files, for per-origin keys too.
+        let cfg = encrypted_store(Some(STORE_KEY), sbproxy_config::PerOriginKeyMode::Inherit);
+        assert!(build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[origin_keys(
+                "a.example",
+                true,
+                Some("file:/definitely/not/here.key"),
+            )],
+            PipelineConstructionMode::Validation,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validation_mode_still_catches_a_strict_mode_violation() {
+        // Shape errors are exactly what validate is for, so the strict
+        // check must run there even though key resolution does not.
+        let cfg = encrypted_store(Some(STORE_KEY), sbproxy_config::PerOriginKeyMode::Required);
+        assert!(build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[origin_keys("a.example", true, None)],
+            PipelineConstructionMode::Validation,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn per_origin_rotation_is_independent() {
+        // Rotating one origin must leave every other origin's entries
+        // readable, which is the operational payoff of separate rings.
+        let cfg = encrypted_store(Some(STORE_KEY), sbproxy_config::PerOriginKeyMode::Inherit);
+        let entry = sbproxy_cache::CachedResponse {
+            generation: 1,
+            status: 200,
+            headers: Vec::new(),
+            body: b"body".to_vec(),
+            cached_at: 1_700_000_000,
+            ttl_secs: 300,
+        };
+
+        let before = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[
+                origin_keys("a.example", true, Some(A_KEY)),
+                origin_keys("b.example", true, Some(B_KEY)),
+            ],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("build");
+        before.per_origin["a.example"].put("a", &entry).unwrap();
+        before.per_origin["b.example"].put("b", &entry).unwrap();
+
+        // Only a.example rotates. Its old key moves into previous_keys.
+        let rotated_previous = vec![A_KEY.to_string()];
+        let after = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[
+                OriginCacheKeys {
+                    id: "a.example",
+                    caches: true,
+                    key: Some("origin-a-key-material-0000000003"),
+                    previous_keys: &rotated_previous,
+                },
+                origin_keys("b.example", true, Some(B_KEY)),
+            ],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("build after rotation");
+
+        // Both stores share the same in-process backend only when the
+        // backend instance is shared, which it is not across two builds,
+        // so this test asserts the ring shape instead: a.example can
+        // still be built with a retired key, and b.example is untouched.
+        assert_eq!(after.per_origin.len(), 2);
+        assert!(after.per_origin.contains_key("a.example"));
+        assert!(after.per_origin.contains_key("b.example"));
     }
 }

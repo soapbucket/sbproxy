@@ -76,6 +76,10 @@ pub struct BootstrapConfig {
     /// `MeshConfig.encryption.shared_key` after resolving any
     /// `${ENV}` placeholders.
     pub shared_key: Option<String>,
+    /// Which derivation turns [`Self::shared_key`] into the AES key.
+    /// Defaults to the historical SHA-256 scheme; see
+    /// [`crate::crypto::KeyDerivation`] for the migration path.
+    pub key_derivation: crate::crypto::KeyDerivation,
 
     // --- K4: SWIM timing knobs ---
     /// SWIM protocol period in milliseconds. One random Alive peer is
@@ -150,6 +154,7 @@ impl Default for BootstrapConfig {
             failure_check_interval_secs: 2,
             failure_timeout_secs: 5,
             shared_key: None,
+            key_derivation: crate::crypto::KeyDerivation::default(),
             peer_tls: None,
             // K4 SWIM defaults mirror the paper's small-cluster profile.
             swim_protocol_period_ms: 1000,
@@ -262,9 +267,10 @@ pub async fn bootstrap(
         Some(key) => {
             tracing::info!(
                 node_id = %node_id,
+                key_derivation = config.key_derivation.as_str(),
                 "mesh: AES-256-GCM encryption enabled on gossip + transport"
             );
-            Some(Cipher::from_shared_key(key))
+            Some(Cipher::with_derivation(key, config.key_derivation))
         }
         None => {
             tracing::info!(
@@ -627,6 +633,7 @@ mod tests {
             failure_check_interval_secs: 2,
             failure_timeout_secs: 5,
             shared_key: None,
+            key_derivation: crate::crypto::KeyDerivation::default(),
             // Fast SWIM cadence for the bootstrap suite so tests don't
             // wait a full real-world protocol period.
             swim_protocol_period_ms: 200,

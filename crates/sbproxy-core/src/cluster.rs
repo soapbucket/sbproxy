@@ -1265,6 +1265,14 @@ impl ClusterBootstrap for SystemClusterBootstrap {
             transport_advertise_addr: config.transport_advertise_addr.clone(),
             dead_peer_gc_secs: config.dead_peer_gc_secs,
             shared_key,
+            key_derivation: match config.key_derivation {
+                sbproxy_config::MeshKeyDerivation::Sha256 => {
+                    sbproxy_mesh::crypto::KeyDerivation::Sha256
+                }
+                sbproxy_config::MeshKeyDerivation::Hkdf => {
+                    sbproxy_mesh::crypto::KeyDerivation::Hkdf
+                }
+            },
             peer_tls,
             replication: config
                 .replication

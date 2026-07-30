@@ -92,6 +92,14 @@ pub struct ClusterSecurityConfig {
     /// Cluster SAN bound into every enrolled peer identity.
     #[serde(default = "default_tls_server_name")]
     pub server_name: String,
+    /// How `shared_key` becomes the AES-256-GCM wire key.
+    ///
+    /// Defaults to `sha256`, which is what every existing cluster runs,
+    /// so an upgrade never changes the key a node seals under. Nodes open
+    /// under both derivations, so a cluster can be flipped one node at a
+    /// time. See `docs/mesh-replication.md`.
+    #[serde(default)]
+    pub key_derivation: crate::types::MeshKeyDerivation,
 }
 
 /// Optional one-time enrollment authority configuration.
@@ -713,6 +721,8 @@ pub struct EffectiveClusterConfig {
     pub state_dir: Option<String>,
     /// Peer-security source material.
     pub security: EffectiveClusterSecurity,
+    /// How the shared secret becomes the AES-256-GCM wire key.
+    pub key_derivation: crate::types::MeshKeyDerivation,
     /// Snapshot lifetime.
     pub snapshot_ttl_secs: u64,
     /// Snapshot cadence.
@@ -760,6 +770,8 @@ pub struct ClusterRestartFingerprint {
     pub dead_peer_gc_secs: u64,
     /// Peer-security source material.
     pub security: EffectiveClusterSecurity,
+    /// How the shared secret becomes the AES-256-GCM wire key.
+    pub key_derivation: crate::types::MeshKeyDerivation,
     /// Enrollment authority loaded at startup.
     pub enrollment: Option<ClusterEnrollmentConfig>,
     /// Deployment signing authority loaded at startup.
@@ -886,6 +898,9 @@ impl EffectiveClusterConfig {
             state_dir: self.state_dir.clone(),
             dead_peer_gc_secs: self.dead_peer_gc_secs,
             security: self.security.clone(),
+            // Changing the derivation changes the wire key, so it cannot
+            // be swapped under a running node without a restart.
+            key_derivation: self.key_derivation,
             enrollment: self.enrollment.clone(),
             deployment_authority: self.deployment_authority.clone(),
             replication: self.replication.clone(),
@@ -963,6 +978,7 @@ fn lower_canonical(config: &ClusterConfig, source: ClusterConfigSource) -> Effec
         model_endpoint: config.model_endpoint.clone(),
         state_dir: config.state_dir.clone(),
         security: lower_canonical_security(&config.security),
+        key_derivation: config.security.key_derivation,
         snapshot_ttl_secs: config.snapshot_ttl_secs,
         publish_interval_secs: config.publish_interval_secs,
         dead_peer_gc_secs: config.dead_peer_gc_secs,
@@ -1005,6 +1021,7 @@ fn lower_legacy(node_id: Option<&str>, mesh: &MeshClusterConfig) -> EffectiveClu
         model_endpoint: None,
         state_dir: None,
         security: lower_legacy_security(mesh),
+        key_derivation: mesh.key_derivation,
         snapshot_ttl_secs: DEFAULT_SNAPSHOT_TTL_SECS,
         publish_interval_secs: DEFAULT_PUBLISH_INTERVAL_SECS,
         dead_peer_gc_secs: DEFAULT_DEAD_PEER_GC_SECS,

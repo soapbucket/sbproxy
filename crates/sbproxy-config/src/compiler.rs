@@ -1794,10 +1794,23 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
     // Deserialize the raw `response_cache` JSON (if any) into a typed struct.
     // Parse errors are downgraded to "no cache" with a warning so that a
     // malformed block does not break the whole pipeline.
+    //
+    // The one exception is a block that mentions `encryption`. Silently
+    // dropping that would disable caching for the origin, which fails
+    // safe, but it would also swallow a directive the operator wrote
+    // specifically to protect data. An operator who typo'd a key
+    // reference deserves an error, not a cache that quietly stopped
+    // existing.
     let response_cache: Option<crate::types::ResponseCacheConfig> = match &config.response_cache {
         Some(v) => match serde_json::from_value::<crate::types::ResponseCacheConfig>(v.clone()) {
             Ok(cfg) => Some(cfg),
             Err(e) => {
+                if v.get("encryption").is_some() {
+                    anyhow::bail!(
+                        "origin '{hostname}': response_cache declares an `encryption` block but \
+                         the block failed to parse: {e}"
+                    );
+                }
                 tracing::warn!(
                     hostname = %hostname,
                     error = %e,

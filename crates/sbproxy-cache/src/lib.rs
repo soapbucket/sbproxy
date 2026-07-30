@@ -3,11 +3,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod at_rest;
 pub mod reserve;
 pub mod response;
 pub mod store;
 pub mod two_tier;
 
+pub use at_rest::{AtRestPosture, CacheDurability};
 pub use reserve::{
     CacheReserveBackend, FsReserve, MemoryReserve, RedisReserve, ReserveCacheStore, ReserveConfig,
     ReserveMetadata, ReserveStats,
@@ -18,7 +20,7 @@ pub use response::{
     CachedPrecondition, QueryMode, ResponseCacheConfig,
 };
 pub use store::{
-    new_cache_generation, CacheKeyMaterial, CacheStore, CachedResponse, EncryptedCacheStore,
-    FileCacheConfig, FileCacheStore, MemcachedConfig, MemcachedStore, MemoryCacheStore,
-    RedisCacheStore,
+    cache_key_ring, new_cache_generation, CacheKeyDirectory, CacheStore, CachedResponse,
+    EncryptedCacheStore, FileCacheConfig, FileCacheStore, MemcachedConfig, MemcachedStore,
+    MemoryCacheStore, RedisCacheStore,
 };

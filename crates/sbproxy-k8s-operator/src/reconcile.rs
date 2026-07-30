@@ -638,6 +638,10 @@ fn desired_cluster_block(
             key_file: None,
             ca_file: None,
             server_name: "sbproxy-mesh".to_string(),
+            // The historical derivation. A rendered manifest must not
+            // change an existing cluster's wire key on upgrade; see
+            // docs/mesh-replication.md for the staged flip.
+            key_derivation: sbproxy_config::types::MeshKeyDerivation::Sha256,
         },
         // Mirror the schema defaults in sbproxy-config/src/cluster.rs so
         // the rendered document is explicit and deterministic.

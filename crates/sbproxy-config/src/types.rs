@@ -2286,12 +2286,43 @@ pub struct MeshClusterConfig {
     /// unset.
     #[serde(default)]
     pub shared_key: Option<String>,
+    /// How `shared_key` becomes the AES-256-GCM wire key.
+    ///
+    /// Defaults to `sha256`, which is what every cluster runs today, so
+    /// an upgrade never changes the key a node seals under. `hkdf` moves
+    /// the mesh onto the same purpose-separated derivation every other
+    /// key in this workspace uses.
+    ///
+    /// Nodes open under both derivations regardless of this setting, so
+    /// a cluster can be flipped one node at a time without partitioning.
+    /// See `docs/mesh-replication.md`.
+    #[serde(default)]
+    pub key_derivation: MeshKeyDerivation,
     /// Optional peer mTLS (mutually-authenticated TLS) for the mesh transport.
     /// When set, inbound connections must present a CA-signed client
     /// certificate and outbound connections present this node's certificate,
     /// all verified against the configured CA. Plaintext when unset.
     #[serde(default)]
     pub peer_tls: Option<MeshPeerTlsConfig>,
+}
+
+/// How the mesh derives its AES-256-GCM wire key from the shared secret.
+///
+/// Both derivations are always accepted on the receive side, so this only
+/// selects what a node seals under and a cluster can be migrated one node
+/// at a time.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshKeyDerivation {
+    /// `SHA-256(secret)`. The original scheme and the default, so an
+    /// upgrade never changes an existing cluster's key.
+    #[default]
+    Sha256,
+    /// HKDF-SHA256 under a mesh-specific purpose, matching how every
+    /// other key in this workspace is derived.
+    Hkdf,
 }
 
 /// `key_management.cache.mesh.peer_tls:` mutual-TLS material (file paths) for
@@ -2324,6 +2355,7 @@ impl Default for MeshClusterConfig {
             advertise_addr: None,
             transport_advertise_addr: None,
             shared_key: None,
+            key_derivation: MeshKeyDerivation::default(),
             peer_tls: None,
         }
     }
@@ -3099,6 +3131,15 @@ pub struct ResponseCacheConfig {
     /// hostname + path, across every Vary fingerprint.
     #[serde(default = "default_invalidate_on_mutation")]
     pub invalidate_on_mutation: bool,
+
+    /// Key material sealing this origin's entries in the shared store.
+    ///
+    /// Absent means "follow `proxy.response_cache_store.encryption`",
+    /// which under the default [`PerOriginKeyMode::Inherit`] is the
+    /// store-wide key and under [`PerOriginKeyMode::Required`] is a
+    /// startup failure naming this origin.
+    #[serde(default)]
+    pub encryption: Option<OriginCacheEncryptionConfig>,
 }
 
 /// Query-string normalization policy applied when computing the cache key.
@@ -3147,6 +3188,7 @@ impl Default for ResponseCacheConfig {
             query_normalize: QueryNormalize::default(),
             stale_while_revalidate: None,
             invalidate_on_mutation: default_invalidate_on_mutation(),
+            encryption: None,
         }
     }
 }
@@ -3463,6 +3505,71 @@ pub struct ResponseCacheEncryptionConfig {
     /// new one as `key`. Entries reseal under the active key as they
     /// are rewritten. Removing a reference from this list retires its
     /// entries; they are evicted the next time they are read.
+    #[serde(default)]
+    pub previous_keys: Vec<String>,
+
+    /// What happens when an origin that caches does not declare its own
+    /// key under `origins.<host>.response_cache.encryption`.
+    ///
+    /// Defaults to [`PerOriginKeyMode::Inherit`], which is the
+    /// backwards-compatible behaviour and is safe on its own terms: the
+    /// origin is bound into the associated data either way, so an entry
+    /// sealed for one origin never opens as another even when both
+    /// inherit this key. Set [`PerOriginKeyMode::Required`] when the
+    /// deployment's threat model needs every tenant to hold key material
+    /// nobody else holds.
+    #[serde(default)]
+    pub per_origin_keys: PerOriginKeyMode,
+}
+
+/// How the response cache treats an origin that declares no key of its own.
+///
+/// Both modes bind the origin into the AEAD associated data, so
+/// cross-origin isolation is cryptographic in both. The difference is
+/// whether tenants share master key material.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PerOriginKeyMode {
+    /// An origin with no key of its own uses the store-wide key. The
+    /// default, and what every config written before per-origin keys
+    /// existed gets.
+    ///
+    /// Cross-origin isolation still holds, because the origin id is
+    /// authenticated in every envelope. What an operator does *not* get
+    /// is key separation: one leaked store-wide key opens every tenant's
+    /// entries.
+    #[default]
+    Inherit,
+    /// Every origin with `response_cache.enabled: true` must declare its
+    /// own `encryption.key`. Startup fails, naming each origin that does
+    /// not, rather than quietly sealing that tenant under shared
+    /// material.
+    Required,
+}
+
+/// Per-origin at-rest encryption keys for the shared response cache.
+///
+/// Lives at `origins.<host>.response_cache.encryption`. The backing store
+/// and its `enabled` switch stay global at
+/// `proxy.response_cache_store.encryption`; this block only says which key
+/// material seals *this* origin's entries. Declaring it while store-wide
+/// encryption is off is a config error rather than a silent no-op, because
+/// an operator who wrote a key here plainly expected sealing to happen.
+///
+/// Reference syntax and the no-plaintext-fallback rule are identical to
+/// [`ResponseCacheEncryptionConfig`]: an unresolvable reference aborts
+/// startup with an error naming this origin.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct OriginCacheEncryptionConfig {
+    /// Secret reference for this origin's active key. When absent, the
+    /// behaviour follows [`ResponseCacheEncryptionConfig::per_origin_keys`].
+    #[serde(default)]
+    pub key: Option<String>,
+
+    /// This origin's retired keys, used only to open entries sealed
+    /// before a rotation. Rotating one origin does not touch any other.
     #[serde(default)]
     pub previous_keys: Vec<String>,
 }

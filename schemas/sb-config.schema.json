@@ -2449,6 +2449,15 @@
           "description": "Cluster SAN bound into every enrolled peer identity.",
           "default": "sbproxy-mesh",
           "type": "string"
+        },
+        "key_derivation": {
+          "description": "How `shared_key` becomes the AES-256-GCM wire key.\n\nDefaults to `sha256`, which is what every existing cluster runs, so an upgrade never changes the key a node seals under. Nodes open under both derivations, so a cluster can be flipped one node at a time. See `docs/mesh-replication.md`.",
+          "default": "sha256",
+          "allOf": [
+            {
+              "$ref": "#/definitions/MeshKeyDerivation"
+            }
+          ]
         }
       }
     },
@@ -2467,6 +2476,25 @@
           "type": "string",
           "enum": [
             "shared_key"
+          ]
+        }
+      ]
+    },
+    "MeshKeyDerivation": {
+      "description": "How the mesh derives its AES-256-GCM wire key from the shared secret.\n\nBoth derivations are always accepted on the receive side, so this only selects what a node seals under and a cluster can be migrated one node at a time.",
+      "oneOf": [
+        {
+          "description": "`SHA-256(secret)`. The original scheme and the default, so an upgrade never changes an existing cluster's key.",
+          "type": "string",
+          "enum": [
+            "sha256"
+          ]
+        },
+        {
+          "description": "HKDF-SHA256 under a mesh-specific purpose, matching how every other key in this workspace is derived.",
+          "type": "string",
+          "enum": [
+            "hkdf"
           ]
         }
       ]
@@ -4153,6 +4181,15 @@
             "null"
           ]
         },
+        "key_derivation": {
+          "description": "How `shared_key` becomes the AES-256-GCM wire key.\n\nDefaults to `sha256`, which is what every cluster runs today, so an upgrade never changes the key a node seals under. `hkdf` moves the mesh onto the same purpose-separated derivation every other key in this workspace uses.\n\nNodes open under both derivations regardless of this setting, so a cluster can be flipped one node at a time without partitioning. See `docs/mesh-replication.md`.",
+          "default": "sha256",
+          "allOf": [
+            {
+              "$ref": "#/definitions/MeshKeyDerivation"
+            }
+          ]
+        },
         "peer_tls": {
           "description": "Optional peer mTLS (mutually-authenticated TLS) for the mesh transport. When set, inbound connections must present a CA-signed client certificate and outbound connections present this node's certificate, all verified against the configured CA. Plaintext when unset.",
           "default": null,
@@ -5160,8 +5197,36 @@
           "items": {
             "type": "string"
           }
+        },
+        "per_origin_keys": {
+          "description": "What happens when an origin that caches does not declare its own key under `origins.<host>.response_cache.encryption`.\n\nDefaults to [`PerOriginKeyMode::Inherit`], which is the backwards-compatible behaviour and is safe on its own terms: the origin is bound into the associated data either way, so an entry sealed for one origin never opens as another even when both inherit this key. Set [`PerOriginKeyMode::Required`] when the deployment's threat model needs every tenant to hold key material nobody else holds.",
+          "default": "inherit",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PerOriginKeyMode"
+            }
+          ]
         }
       }
+    },
+    "PerOriginKeyMode": {
+      "description": "How the response cache treats an origin that declares no key of its own.\n\nBoth modes bind the origin into the AEAD associated data, so cross-origin isolation is cryptographic in both. The difference is whether tenants share master key material.",
+      "oneOf": [
+        {
+          "description": "An origin with no key of its own uses the store-wide key. The default, and what every config written before per-origin keys existed gets.\n\nCross-origin isolation still holds, because the origin id is authenticated in every envelope. What an operator does *not* get is key separation: one leaked store-wide key opens every tenant's entries.",
+          "type": "string",
+          "enum": [
+            "inherit"
+          ]
+        },
+        {
+          "description": "Every origin with `response_cache.enabled: true` must declare its own `encryption.key`. Startup fails, naming each origin that does not, rather than quietly sealing that tenant under shared material.",
+          "type": "string",
+          "enum": [
+            "required"
+          ]
+        }
+      ]
     },
     "CompressionStateRuntimeConfig": {
       "description": "Process-owned settings for the embedded compression-state database.\n\nThis block controls where the process opens its durable Local backend. It is intentionally independent of route-level compression policy.",

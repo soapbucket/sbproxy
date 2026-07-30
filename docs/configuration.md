@@ -3474,6 +3474,49 @@ Move the current reference into `previous_keys` and name the new one as `key`. N
 
 Every entry carries a short identifier for the key that sealed it, so a read picks the right key directly rather than trying each one in turn.
 
+#### Per-origin keys
+
+One store serves every origin. By default one key seals every origin's entries too, which means the only thing separating two tenants in the cache is the cache key. `origins.<host>.response_cache.encryption` gives an origin its own key instead.
+
+```yaml
+proxy:
+  response_cache_store:
+    backend:
+      type: redis
+    encryption:
+      enabled: true
+      key: "secret://primary/response-cache"
+      per_origin_keys: inherit
+
+origins:
+  tenant-a.example.com:
+    response_cache:
+      enabled: true
+      encryption:
+        key: "secret://primary/cache-tenant-a"
+        previous_keys:
+          - "secret://primary/cache-tenant-a-2026-06"
+  tenant-b.example.com:
+    response_cache:
+      enabled: true
+      # No key, so this origin uses the store-wide one.
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `proxy.response_cache_store.encryption.per_origin_keys` | `inherit` \| `required` | `inherit` | What happens to an origin that caches and declares no key. `inherit` uses the store-wide key. `required` stops startup, naming every origin that is missing one. |
+| `origins.<host>.response_cache.encryption.key` | string | unset | Secret reference for this origin's active key. Same reference syntax as the store-wide `key`. |
+| `origins.<host>.response_cache.encryption.previous_keys` | list of strings | `[]` | This origin's retired keys. Rotating one origin does not touch any other. |
+
+The origin is authenticated into every entry regardless of which key sealed it. An entry sealed for one origin therefore fails to open when read as another, even when both inherit the store-wide key. That makes cross-tenant isolation a property of the record rather than of the routing table: a mis-scoped lookup fails the integrity check instead of returning another tenant's response body.
+
+What per-origin keys add on top is key separation. Under `inherit`, one leaked key opens every tenant's entries. Under `required`, it opens one tenant's.
+
+- Declaring a per-origin key while `proxy.response_cache_store.encryption` is off stops startup. An operator who wrote a key expected sealing to happen; ignoring it would store that tenant in the clear.
+- Every per-origin reference is resolved at boot. An unresolvable one stops startup with an error naming the origin, matching the store-wide rule.
+- Purge is unaffected. It matches on the cache key and never opens a value, so `POST /admin/cache/purge` with a prefix still clears entries sealed under keys the admin path does not hold.
+- Entries written by a build that predates per-origin keys keep opening, and reseal with the origin bound the next time they are written. Downgrading to such a build evicts the newer entries as unreadable and refetches them, which costs a cache miss each and no correctness.
+
 The runnable version of all of this is [`examples/response-cache-encrypted/`](../examples/response-cache-encrypted/).
 
 ### What is encrypted at rest, and what is not
@@ -3491,6 +3534,8 @@ Encryption is worth configuring where data outlives the request. This table says
 
 Memory-only caches are deliberately not encrypted. An attacker who can read the process heap can read the derived key out of the same heap, so sealing there buys close to nothing while adding another key to manage. Encrypt what persists or replicates.
 
+The prompt cache and the judge cache are memory-only because their in-tree implementations are, not because nothing could change that: both are structured so a backend can be swapped in. Startup therefore refuses a pipeline in which one of those caches reports a backend that survives a restart or is shared across replicas while storing entries unsealed. The response cache is checked too, but only warns: running it unencrypted on a `file` or `redis` backend is a documented configuration an operator chose, and the fix is the same `encryption` block either way.
+
 A credential whose material is stored as plaintext (`kind: plaintext`, only reachable for config-seeded credentials) is never published to a shared cache tier at all, neither the mesh tier nor Redis. Those resolves read through to the keystore instead. Prefer a vault reference or an envelope so the credential can be cached.
 
 #### What the mesh wire cipher does and does not cover
@@ -3502,6 +3547,8 @@ It is not at-rest encryption, and it is a different mechanism from the blocks ab
 - It covers bytes on the wire, not bytes in a backing store. A value the mesh replicates is sealed while it travels and plain in each node's memory once it arrives.
 - It does not extend to the response cache's backing store. A `redis` or `file` backend still needs `proxy.response_cache_store.encryption`; the wire cipher does nothing for a Redis server an attacker can read directly.
 - The mesh distributed cache is excluded from persisted cluster state, so its values do not reach Redis or disk through that path.
+
+The wire key is derived from `shared_key` by `key_derivation`, which is `sha256` by default and can be set to `hkdf` to put the mesh on the same derivation every other key in this workspace uses. Every node opens under both derivations, so a cluster is flipped one node at a time rather than all at once. See [mesh-replication.md](mesh-replication.md).
 
 ### Encrypting persisted prompts at rest
 

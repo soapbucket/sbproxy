@@ -6,7 +6,7 @@ mod memcached;
 mod memory;
 mod redis;
 
-pub use encrypted::{CacheKeyMaterial, EncryptedCacheStore};
+pub use encrypted::{cache_key_ring, CacheKeyDirectory, EncryptedCacheStore, SBRC_SCHEME};
 pub use file::{FileCacheConfig, FileCacheStore};
 pub use memcached::{MemcachedConfig, MemcachedStore};
 pub use memory::MemoryCacheStore;
@@ -14,6 +14,8 @@ pub use redis::RedisCacheStore;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+
+use crate::at_rest::{AtRestPosture, CacheDurability};
 
 /// A cached HTTP response with TTL metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +200,35 @@ pub trait CacheStore: Send + Sync + 'static {
     /// explain which purge operations the backend actually supports.
     fn backend_name(&self) -> &'static str {
         "unknown"
+    }
+
+    /// Where this backend keeps entries once written.
+    ///
+    /// Defaults to [`CacheDurability::Ephemeral`], which is the honest
+    /// answer only for an in-process map. Any backend that touches disk
+    /// or a network peer must override it, because this is what the
+    /// boot-time at-rest check reads to decide whether storing plaintext
+    /// here is an exposure. See [`crate::at_rest`].
+    fn durability(&self) -> CacheDurability {
+        CacheDurability::Ephemeral
+    }
+
+    /// Whether this store seals entries before they reach the backend.
+    ///
+    /// Only the encryption decorator answers `true`. A backend never
+    /// does, because a backend does not know whether something wrapped
+    /// it.
+    fn encrypts_at_rest(&self) -> bool {
+        false
+    }
+
+    /// This store's declared at-rest posture.
+    ///
+    /// Composed from the two methods above rather than overridden, so a
+    /// decorator that forwards `durability` and answers `encrypts_at_rest`
+    /// gets the right answer without restating it.
+    fn at_rest_posture(&self) -> AtRestPosture {
+        AtRestPosture::new(self.durability(), self.encrypts_at_rest())
     }
 }
 

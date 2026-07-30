@@ -54,6 +54,18 @@ pub enum HkdfPurpose {
     /// key and a per-entry random salt, so a fresh 96-bit nonce is
     /// only ever used once under any derived key.
     ResponseCacheAtRest,
+    /// AES-256-GCM key material for the mesh wire cipher (gossip
+    /// heartbeats and transport RPCs), derived from
+    /// `mesh.encryption.shared_key`.
+    ///
+    /// The mesh historically derived its key as a plain `SHA-256` of the
+    /// shared secret, which is the one derivation in this workspace that
+    /// sat outside this enum. Migrating changes the key, and a cluster
+    /// whose nodes disagree about the key cannot talk, so the move is
+    /// staged: `sbproxy_mesh::Cipher` opens under both derivations and
+    /// seals under whichever the operator selected. See that type's
+    /// module docs for the rollout.
+    MeshWire,
     /// AES-256-GCM key material for persisted prompt-overlay records at
     /// rest. Deliberately distinct from [`Self::ResponseCacheAtRest`]:
     /// the two surfaces may be configured from the same operator secret,
@@ -76,6 +88,7 @@ impl HkdfPurpose {
             HkdfPurpose::OidcSessionCookie => b"sbproxy.hkdf.oidc-session-cookie.v1",
             HkdfPurpose::OidcTxCookie => b"sbproxy.hkdf.oidc-tx-cookie.v1",
             HkdfPurpose::KeyEnvelope => b"sbproxy.hkdf.key-envelope.v1",
+            HkdfPurpose::MeshWire => b"sbproxy.hkdf.mesh-wire.v1",
             HkdfPurpose::ResponseCacheAtRest => b"sbproxy.hkdf.response-cache-at-rest.v1",
             HkdfPurpose::PromptPersistenceAtRest => b"sbproxy.hkdf.prompt-persistence-at-rest.v1",
         }

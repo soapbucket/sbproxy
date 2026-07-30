@@ -9106,6 +9106,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",
+ "sbproxy-security",
  "sbproxy-storage",
  "serde",
  "serde_json",
@@ -9394,6 +9395,7 @@ dependencies = [
  "tracing",
  "url",
  "yaml_serde",
+ "zeroize",
 ]
 
 [[package]]

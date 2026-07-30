@@ -412,6 +412,13 @@ pub struct EncryptionConfig {
     /// placeholder such as `"${SB_MESH_KEY}"`; resolution is the caller's
     /// responsibility (G2/G3).
     pub shared_key: Option<String>,
+
+    /// Which derivation turns [`Self::shared_key`] into the AES-256-GCM
+    /// wire key. Defaults to the historical SHA-256 scheme. Nodes open
+    /// under both derivations, so a cluster can be flipped one node at a
+    /// time. See [`crate::crypto::KeyDerivation`].
+    #[serde(default)]
+    pub key_derivation: crate::crypto::KeyDerivation,
 }
 
 impl Default for MeshConfig {
@@ -484,6 +491,11 @@ impl MeshConfig {
             failure_check_interval_secs: self.failure_check_interval_secs,
             failure_timeout_secs: self.failure_timeout_secs,
             shared_key: self.encryption.as_ref().and_then(|e| e.shared_key.clone()),
+            key_derivation: self
+                .encryption
+                .as_ref()
+                .map(|e| e.key_derivation)
+                .unwrap_or_default(),
             // K4: forward SWIM knobs to the bootstrap so the gossip loop
             // picks them up. The SWIM defaults mirror the paper's
             // small-cluster recommendation.

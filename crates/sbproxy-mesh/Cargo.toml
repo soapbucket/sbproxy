@@ -39,6 +39,7 @@ sbproxy-storage = { workspace = true, features = ["redis"] }
 # AES-256-GCM encryption for gossip + transport (opt-in via shared_key).
 aes-gcm = { workspace = true }
 sha2 = { workspace = true }
+sbproxy-security = { path = "../sbproxy-security" }
 rand = { workspace = true }
 # X.509 chain verification for peer mTLS. rustls-webpki is ISC-licensed (a
 # permissive, Apache-2.0-compatible license), so it ships in the default build.

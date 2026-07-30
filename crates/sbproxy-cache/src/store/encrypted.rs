@@ -7,6 +7,13 @@
 //! and `backend_name` still reports the real backend so the admin API
 //! keeps answering correctly about prefix-purge support.
 //!
+//! The envelope framing, key fingerprinting, per-entry salt and nonce,
+//! and active-plus-retired rotation all live in
+//! [`sbproxy_security::sealed_record`], which prompt persistence uses
+//! too. What stays here is what is specific to a response cache: which
+//! fields are sealed, what goes into the associated data, and how an
+//! unreadable record is handled.
+//!
 //! # What is sealed and what is not
 //!
 //! `headers` and `body` are sealed. `generation`, `status`, `cached_at`, and
@@ -19,25 +26,57 @@
 //! with write access to the backing store could extend the lifetime of
 //! a sealed entry indefinitely without ever touching the ciphertext.
 //!
-//! # Envelope layout (version 1)
+//! # Associated data, and the two envelope versions
+//!
+//! The AAD is the 37-byte envelope header (see
+//! [`sbproxy_security::sealed_record`]) followed by a tail this module
+//! builds. Version 2, which every new write uses, binds the origin:
 //!
 //! ```text
-//! offset  size  field
-//! 0       4     magic  b"SBRC"
-//! 4       1     version, currently 1
-//! 5       4     key fingerprint
-//! 9       16    per-entry salt
-//! 25      12    per-entry nonce
-//! 37      ..    ciphertext followed by the 16-byte GCM tag
+//! generation (8) | status (2) | cached_at (8) | ttl_secs (8)
+//!                | origin length (4) | origin | cache key
 //! ```
 //!
-//! The associated data is the 37-byte header, then a non-zero `generation`,
-//! `status`, `cached_at`, and `ttl_secs` as big-endian bytes, then the cache
-//! key. Legacy records with generation zero retain the pre-generation shape.
-//! Every field before the key is fixed-width, so the encoding is
-//! unambiguous and two different tuples cannot flatten to the same AAD.
-//! Binding the cache key means a stored record cannot be lifted from one
-//! key to another and replayed.
+//! Version 1, still read but no longer written, omits the origin and
+//! omits `generation` when it is zero:
+//!
+//! ```text
+//! [generation (8), when non-zero] | status (2) | cached_at (8)
+//!                                 | ttl_secs (8) | cache key
+//! ```
+//!
+//! Both are injective encodings: every field before the trailing
+//! variable-width one is fixed-width, so two distinct tuples cannot
+//! flatten to the same AAD. Binding the cache key means a stored record
+//! cannot be lifted from one key to another and replayed. Binding the
+//! origin means it cannot be lifted from one tenant to another either,
+//! which matters precisely because two origins may be sealed under the
+//! same master key.
+//!
+//! Entries written by a build that predates the origin binding keep
+//! opening, because version 1 is still accepted on read. They reseal as
+//! version 2 the next time they are written. Rolling *back* to a build
+//! that only knows version 1 is safe in the other direction too: an
+//! unknown version is treated as unreadable, so those entries are
+//! evicted and refetched rather than misinterpreted.
+//!
+//! # Per-origin keys
+//!
+//! [`CacheKeyDirectory`] maps an origin to the key ring that seals and
+//! opens its entries. An origin with no ring of its own uses the
+//! store-wide one, which is the default and matches every config written
+//! before per-origin keys existed. Cross-origin isolation does not depend
+//! on that choice: the origin is authenticated either way, so an entry
+//! sealed for one origin fails to open as another even when both inherit
+//! the same master key. What per-origin keys add is key separation, so
+//! one leaked key does not open every tenant's entries.
+//!
+//! A handle is bound to one origin at construction. The unbound handle
+//! returned for the admin API supports `delete`, `delete_prefix`,
+//! `clear`, and `backend_name` and refuses `get` / `put` /
+//! `compare_and_swap`, because sealing without knowing the origin would
+//! either omit the binding or guess at it. Purge therefore keeps working
+//! unchanged: it is prefix-driven and never touches a key ring.
 //!
 //! # Nonces
 //!
@@ -47,9 +86,6 @@
 //! the NIST SP 800-38D limit of roughly 2^32 seals per key is never
 //! approached regardless of cache write rate. A single long-lived key
 //! with random nonces would hit that limit in days on a busy gateway.
-//! Both draws come from the OS CSPRNG on every call, with no userspace
-//! buffer and no persisted counter, so neither a fork nor a restart nor
-//! a snapshot rollback can replay a nonce.
 //!
 //! # Key rotation
 //!
@@ -60,6 +96,8 @@
 //! `previous_keys` and naming the new one as `key`; entries reseal under
 //! the active key as they are rewritten. Dropping a reference out of
 //! `previous_keys` retires its entries, which are then evicted on read.
+//! Rotation is per ring, so one origin can rotate without touching any
+//! other.
 //!
 //! # Failure behaviour
 //!
@@ -79,136 +117,101 @@
 //! purged it. No path returns plaintext that the AEAD did not
 //! authenticate, and no path falls back to serving the record unsealed.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use sbproxy_security::{
-    aes256gcm_decrypt, aes256gcm_encrypt, hkdf_derive_purpose, random_aes256_key,
-    random_aes_gcm_nonce, HkdfPurpose, AES256_KEY_LEN, AES_GCM_NONCE_LEN,
+use sbproxy_security::sealed_record::{
+    OpenOutcome, SealKey, SealKeyRing, SealScheme, SealedEnvelope,
 };
-use zeroize::Zeroizing;
+use sbproxy_security::HkdfPurpose;
 
 use super::{CacheStore, CachedResponse};
 
-/// Envelope magic, short for SBproxy Response Cache.
-const MAGIC: [u8; 4] = *b"SBRC";
-/// Envelope format version.
-const VERSION: u8 = 1;
-/// Bytes of key fingerprint carried in the envelope.
-const KEY_FP_LEN: usize = 4;
-/// Bytes of per-entry HKDF salt carried in the envelope.
-const SALT_LEN: usize = 16;
-/// Total envelope header length, in bytes.
-const HEADER_LEN: usize = MAGIC.len() + 1 + KEY_FP_LEN + SALT_LEN + AES_GCM_NONCE_LEN;
-/// Shortest accepted master key material. Anything shorter is a
-/// passphrase too weak to be worth the operator's confidence.
-const MIN_KEY_MATERIAL_BYTES: usize = 16;
-/// Fixed HKDF salt used only for deriving a key's public fingerprint.
-/// Its length differs from [`SALT_LEN`], so it can never collide with a
-/// per-entry salt. That separation is what keeps the fingerprint we
-/// print in logs from being the leading bytes of a live per-entry key,
-/// and the assert below is what enforces it: shrink `KEY_ID_SALT` to 16
-/// bytes and the build stops rather than quietly leaking key bytes.
-const KEY_ID_SALT: &[u8] = b"sbproxy.response-cache.key-id.v1";
-const _: () = assert!(KEY_ID_SALT.len() != SALT_LEN);
+/// The response cache's envelope: magic `SBRC`, short for SBproxy
+/// Response Cache.
+///
+/// The declared version is what new writes carry. Reads accept every
+/// version this build knows, which today is 1 and 2.
+///
+/// `fingerprint_salt` is pinned to the exact bytes the pre-extraction
+/// implementation used, so key ids and therefore stored envelopes stay
+/// byte-identical across the refactor.
+pub const SBRC_SCHEME: SealScheme = SealScheme::new(
+    *b"SBRC",
+    2,
+    HkdfPurpose::ResponseCacheAtRest,
+    b"sbproxy.response-cache.key-id.v1",
+);
+
+/// Envelope versions this build can read. Version 1 predates the origin
+/// binding in the associated data; version 2 carries it.
+const ACCEPTED_VERSIONS: [u8; 2] = [1, 2];
+
+/// Origin binding used by a handle that is not scoped to any origin.
+///
+/// Never sealed with: an unscoped handle refuses to seal or open at all.
+/// The constant exists so the refusal message can name the situation.
+const UNSCOPED: &str = "<unscoped>";
 
 /// Emitted once per process when the decorator is asked to encrypt an
 /// in-process cache, so a config that moves between backends does not
 /// leave an operator believing memory entries are protected at rest.
 static MEMORY_BACKEND_ADVISORY: std::sync::Once = std::sync::Once::new();
 
-/// Operator-supplied master key material for response-cache encryption.
+/// Build a key ring for the response cache from resolved key material.
 ///
-/// Holds the raw material plus a short public fingerprint used to tag
-/// envelopes. The `Debug` impl prints only the fingerprint, so the
-/// material never reaches a log line. The type is deliberately neither
-/// `Clone` nor `Serialize`: every copy is another place the secret can
-/// escape from, and there is no reason to make one. The material sits
-/// in a [`Zeroizing`] wrapper so the heap allocation is scrubbed when
-/// the key is dropped, rather than being left for the next allocation
-/// or a core dump to pick up.
-pub struct CacheKeyMaterial {
-    material: Zeroizing<Vec<u8>>,
-    fingerprint: [u8; KEY_FP_LEN],
+/// `active` seals and opens; each entry of `previous` opens only.
+/// Material shorter than 16 bytes is refused rather than stretched.
+pub fn cache_key_ring(active: Vec<u8>, previous: Vec<Vec<u8>>) -> Result<SealKeyRing> {
+    let active = SealKey::new(SBRC_SCHEME, active)?;
+    let previous = previous
+        .into_iter()
+        .map(|material| SealKey::new(SBRC_SCHEME, material))
+        .collect::<Result<Vec<_>>>()?;
+    SealKeyRing::new(SBRC_SCHEME, active, previous)
 }
 
-impl std::fmt::Debug for CacheKeyMaterial {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("CacheKeyMaterial")
-            .field("key_id", &self.fingerprint_hex())
-            .field("material", &"[redacted]")
-            .finish()
-    }
+/// Which key ring seals and opens each origin's entries.
+///
+/// The store-wide ring is the fallback. An origin listed in `per_origin`
+/// uses its own instead, which is what turns cross-tenant cache
+/// isolation from a key-namespacing property into a key-separation one.
+#[derive(Debug)]
+pub struct CacheKeyDirectory {
+    /// Ring for origins with none of their own. `None` when the operator
+    /// set `per_origin_keys: required`, in which case every caching
+    /// origin was made to declare a key at boot and there is nothing to
+    /// fall back to.
+    default: Option<Arc<SealKeyRing>>,
+    per_origin: HashMap<String, Arc<SealKeyRing>>,
 }
 
-impl CacheKeyMaterial {
-    /// Accept resolved key material.
-    ///
-    /// Returns an error for material shorter than 16 bytes rather than
-    /// stretching it, because a short passphrase silently accepted is
-    /// how a cache ends up encrypted with something guessable. There is
-    /// no other constructor, so an [`EncryptedCacheStore`] cannot be
-    /// built without material that passed this check.
-    pub fn new(material: Vec<u8>) -> Result<Self> {
-        // Wrap before the length check so material we reject is scrubbed
-        // too. A passphrase short enough to refuse is still a secret.
-        let material = Zeroizing::new(material);
-        if material.len() < MIN_KEY_MATERIAL_BYTES {
-            return Err(anyhow!(
-                "response-cache encryption key must contain at least {MIN_KEY_MATERIAL_BYTES} bytes of material, got {}",
-                material.len()
-            ));
+impl CacheKeyDirectory {
+    /// A directory with one store-wide ring and no per-origin overrides.
+    pub fn single(ring: SealKeyRing) -> Self {
+        Self {
+            default: Some(Arc::new(ring)),
+            per_origin: HashMap::new(),
         }
-        let derived = hkdf_derive_purpose(
-            &material,
-            KEY_ID_SALT,
-            HkdfPurpose::ResponseCacheAtRest,
-            KEY_FP_LEN,
-        );
-        let mut fingerprint = [0u8; KEY_FP_LEN];
-        fingerprint.copy_from_slice(&derived);
-        Ok(Self {
-            material,
-            fingerprint,
-        })
     }
 
-    /// Short hex identifier for this key, safe to log. Derived through
-    /// HKDF rather than hashed directly, so it reveals nothing usable
-    /// about the material.
-    pub fn fingerprint_hex(&self) -> String {
-        hex::encode(self.fingerprint)
+    /// A directory with an optional store-wide ring plus per-origin
+    /// overrides keyed by origin id.
+    pub fn new(default: Option<SealKeyRing>, per_origin: HashMap<String, SealKeyRing>) -> Self {
+        Self {
+            default: default.map(Arc::new),
+            per_origin: per_origin
+                .into_iter()
+                .map(|(origin, ring)| (origin, Arc::new(ring)))
+                .collect(),
+        }
     }
 
-    /// Derive the single-use AES-256 key for an entry with this salt.
-    ///
-    /// Both the HKDF output buffer and the returned key are wrapped so
-    /// they are scrubbed on drop. This runs on every cache read and
-    /// every cache write, so without it a busy gateway leaves a trail of
-    /// freed 32-byte keys across the heap at request rate.
-    fn entry_key(&self, salt: &[u8]) -> Zeroizing<[u8; AES256_KEY_LEN]> {
-        let derived = Zeroizing::new(hkdf_derive_purpose(
-            &self.material,
-            salt,
-            HkdfPurpose::ResponseCacheAtRest,
-            AES256_KEY_LEN,
-        ));
-        let mut key = Zeroizing::new([0u8; AES256_KEY_LEN]);
-        key.copy_from_slice(&derived);
-        key
+    /// The ring that seals and opens `origin`'s entries.
+    fn ring_for(&self, origin: &str) -> Option<&Arc<SealKeyRing>> {
+        self.per_origin.get(origin).or(self.default.as_ref())
     }
-}
-
-/// Draw a 16-byte per-entry salt.
-///
-/// Reuses the audited 32-byte CSPRNG helper and truncates, so this file
-/// does not open a second path to the random number generator.
-fn random_salt() -> [u8; SALT_LEN] {
-    let full = random_aes256_key();
-    let mut salt = [0u8; SALT_LEN];
-    salt.copy_from_slice(&full[..SALT_LEN]);
-    salt
 }
 
 /// Append a big-endian `u32` length prefix followed by `bytes`.
@@ -295,41 +298,52 @@ fn unframe_payload(bytes: &[u8]) -> Result<UnframedPayload> {
     Ok((headers, bytes[cursor..].to_vec()))
 }
 
-/// Associated data for one entry: envelope header, the clear-text TTL
-/// metadata, then the cache key.
+/// The associated-data tail for one entry, for the given envelope
+/// version. The envelope header is prepended by the sealing helper.
 ///
-/// Everything before the key is fixed-width, so the concatenation is an
-/// injective encoding and no two distinct tuples share an AAD.
-fn associated_data(
-    header: &[u8],
+/// Version 2 always binds the generation and the origin. Version 1,
+/// which this build reads but never writes, reproduces the historical
+/// shape exactly, including omitting a zero generation: envelopes
+/// written before cache generations existed deserialize with generation
+/// zero and used the shorter tail.
+fn aad_tail(
+    version: u8,
+    origin: &str,
     generation: u64,
     status: u16,
     cached_at: u64,
     ttl_secs: u64,
     key: &str,
 ) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(header.len() + 8 + 2 + 8 + 8 + key.len());
-    aad.extend_from_slice(header);
-    // Version-1 envelopes written before cache generations existed deserialize
-    // with generation zero and used the older AAD shape. Keep them readable;
-    // every new write uses a non-zero generation and binds it here.
-    if generation != 0 {
-        aad.extend_from_slice(&generation.to_be_bytes());
+    let mut tail = Vec::with_capacity(8 + 2 + 8 + 8 + 4 + origin.len() + key.len());
+    if version >= 2 || generation != 0 {
+        tail.extend_from_slice(&generation.to_be_bytes());
     }
-    aad.extend_from_slice(&status.to_be_bytes());
-    aad.extend_from_slice(&cached_at.to_be_bytes());
-    aad.extend_from_slice(&ttl_secs.to_be_bytes());
-    aad.extend_from_slice(key.as_bytes());
-    aad
+    tail.extend_from_slice(&status.to_be_bytes());
+    tail.extend_from_slice(&cached_at.to_be_bytes());
+    tail.extend_from_slice(&ttl_secs.to_be_bytes());
+    if version >= 2 {
+        // Length-prefixed so the origin and the cache key that follows
+        // it cannot be re-split at a different boundary.
+        let len = u32::try_from(origin.len()).unwrap_or(u32::MAX);
+        tail.extend_from_slice(&len.to_be_bytes());
+        tail.extend_from_slice(origin.as_bytes());
+    }
+    tail.extend_from_slice(key.as_bytes());
+    tail
 }
 
 /// A [`CacheStore`] that seals every payload before it reaches the
 /// wrapped store.
+///
+/// A handle is bound to one origin, or to none. Use
+/// [`EncryptedCacheStore::scoped`] on the data path and
+/// [`EncryptedCacheStore::unscoped`] for the admin purge path.
 pub struct EncryptedCacheStore {
     inner: Arc<dyn CacheStore>,
-    active: CacheKeyMaterial,
-    /// Retired keys, used for opening only. Ordered as configured.
-    previous: Vec<CacheKeyMaterial>,
+    keys: Arc<CacheKeyDirectory>,
+    /// `None` on the admin handle, which never seals or opens.
+    origin: Option<Arc<str>>,
 }
 
 impl std::fmt::Debug for EncryptedCacheStore {
@@ -337,14 +351,16 @@ impl std::fmt::Debug for EncryptedCacheStore {
         formatter
             .debug_struct("EncryptedCacheStore")
             .field("backend", &self.inner.backend_name())
-            .field("key_id", &self.active.fingerprint_hex())
             .field(
-                "previous_key_ids",
+                "origin",
+                &self.origin.as_deref().unwrap_or(UNSCOPED).to_string(),
+            )
+            .field(
+                "key_id",
                 &self
-                    .previous
-                    .iter()
-                    .map(CacheKeyMaterial::fingerprint_hex)
-                    .collect::<Vec<_>>(),
+                    .ring()
+                    .map(|ring| ring.active_key_id())
+                    .unwrap_or_else(|| "none".to_string()),
             )
             .field("key_material", &"[redacted]")
             .finish()
@@ -352,64 +368,81 @@ impl std::fmt::Debug for EncryptedCacheStore {
 }
 
 impl EncryptedCacheStore {
-    /// Wrap `inner`, sealing with `active` and opening with `active`
-    /// first and then each entry in `previous`.
+    /// Wrap `inner` with a handle bound to `origin`.
     ///
-    /// Infallible by construction: a [`CacheKeyMaterial`] cannot exist
-    /// without having passed [`CacheKeyMaterial::new`], so there is no
-    /// state in which this store comes up without a usable key. It has
-    /// no unencrypted mode to fall back to.
-    pub fn new(
-        inner: Arc<dyn CacheStore>,
-        active: CacheKeyMaterial,
-        previous: Vec<CacheKeyMaterial>,
-    ) -> Self {
-        if inner.backend_name() == "memory" {
-            // Allowed on purpose so a config can move between backends
-            // without editing the encryption block, but say plainly that
-            // it buys nothing: the plaintext lives in this process
-            // either way, and there is no disk or wire to protect.
-            MEMORY_BACKEND_ADVISORY.call_once(|| {
-                tracing::warn!(
-                    backend = "memory",
-                    "response-cache encryption is enabled over the in-process memory backend; \
-                     entries never leave this process, so this protects nothing at rest"
-                );
-            });
-        }
+    /// Infallible by construction: a [`SealKeyRing`] cannot exist without
+    /// key material that passed the length check, so there is no state in
+    /// which this store comes up without a usable key. It has no
+    /// unencrypted mode to fall back to.
+    pub fn scoped(inner: Arc<dyn CacheStore>, keys: Arc<CacheKeyDirectory>, origin: &str) -> Self {
+        advise_if_memory(&inner);
         Self {
             inner,
-            active,
-            previous,
+            keys,
+            origin: Some(Arc::from(origin)),
         }
     }
 
-    /// Seal an entry under the active key.
+    /// Wrap `inner` with a handle that can purge but not read or write.
+    ///
+    /// This is what the admin cache API holds. Purge is prefix-driven and
+    /// independent of which key sealed a value, so it needs no origin;
+    /// sealing without one would either omit the origin binding or invent
+    /// a value for it, and both are worse than refusing.
+    pub fn unscoped(inner: Arc<dyn CacheStore>, keys: Arc<CacheKeyDirectory>) -> Self {
+        advise_if_memory(&inner);
+        Self {
+            inner,
+            keys,
+            origin: None,
+        }
+    }
+
+    /// The origin this handle is bound to, or an error naming the misuse.
+    fn origin(&self) -> Result<&str> {
+        self.origin.as_deref().ok_or_else(|| {
+            anyhow!(
+                "response-cache read/write attempted through the unscoped store handle; \
+                 the data path must use the per-origin handle so the entry is bound to \
+                 its origin"
+            )
+        })
+    }
+
+    /// The key ring for this handle's origin.
+    fn ring(&self) -> Option<&Arc<SealKeyRing>> {
+        self.keys
+            .ring_for(self.origin.as_deref().unwrap_or(UNSCOPED))
+    }
+
+    /// The key ring for this handle's origin, or an error naming the
+    /// origin that has none.
+    fn require_ring(&self, origin: &str) -> Result<&Arc<SealKeyRing>> {
+        self.keys.ring_for(origin).ok_or_else(|| {
+            anyhow!(
+                "no response-cache encryption key is configured for origin '{origin}'; \
+                 declare one under origins.{origin}.response_cache.encryption.key or set \
+                 proxy.response_cache_store.encryption.per_origin_keys to inherit"
+            )
+        })
+    }
+
+    /// Seal an entry under the active key of this origin's ring.
     fn seal(&self, key: &str, entry: &CachedResponse) -> Result<CachedResponse> {
-        let salt = random_salt();
-        let nonce = random_aes_gcm_nonce();
-
-        let mut header = Vec::with_capacity(HEADER_LEN);
-        header.extend_from_slice(&MAGIC);
-        header.push(VERSION);
-        header.extend_from_slice(&self.active.fingerprint);
-        header.extend_from_slice(&salt);
-        header.extend_from_slice(&nonce);
-
-        let aad = associated_data(
-            &header,
+        let origin = self.origin()?;
+        let ring = self.require_ring(origin)?;
+        let tail = aad_tail(
+            SBRC_SCHEME.version(),
+            origin,
             entry.generation,
             entry.status,
             entry.cached_at,
             entry.ttl_secs,
             key,
         );
-        let entry_key = self.active.entry_key(&salt);
-        let ciphertext = aes256gcm_encrypt(&entry_key, &nonce, &frame_payload(entry)?, &aad)
+        let body = ring
+            .seal(&frame_payload(entry)?, &tail)
             .context("seal response-cache entry")?;
-
-        let mut body = header;
-        body.extend_from_slice(&ciphertext);
         Ok(CachedResponse {
             generation: entry.generation,
             status: entry.status,
@@ -429,24 +462,18 @@ impl EncryptedCacheStore {
     /// record is evicted here before the error is returned, so a forged
     /// entry cannot pin itself in the cache behind a cleartext TTL.
     fn open(&self, key: &str, stored: &CachedResponse) -> Result<Option<CachedResponse>> {
-        let body = &stored.body;
-        if body.len() < HEADER_LEN || body[..MAGIC.len()] != MAGIC {
+        let origin = self.origin()?;
+        let Some(envelope) = SealedEnvelope::parse(SBRC_SCHEME, &stored.body, |v| {
+            ACCEPTED_VERSIONS.contains(&v)
+        }) else {
+            // No envelope, or a version this build does not know. Not a
+            // decryption failure, so the caller evicts and reports a miss.
             return Ok(None);
-        }
-        if body[MAGIC.len()] != VERSION {
-            return Ok(None);
-        }
-        let fp_start = MAGIC.len() + 1;
-        let salt_start = fp_start + KEY_FP_LEN;
-        let nonce_start = salt_start + SALT_LEN;
-
-        let mut salt = [0u8; SALT_LEN];
-        salt.copy_from_slice(&body[salt_start..nonce_start]);
-        let mut nonce = [0u8; AES_GCM_NONCE_LEN];
-        nonce.copy_from_slice(&body[nonce_start..HEADER_LEN]);
-
-        let aad = associated_data(
-            &body[..HEADER_LEN],
+        };
+        let ring = self.require_ring(origin)?;
+        let tail = aad_tail(
+            envelope.version,
+            origin,
             stored.generation,
             stored.status,
             stored.cached_at,
@@ -454,53 +481,35 @@ impl EncryptedCacheStore {
             key,
         );
 
-        // Try every configured key whose fingerprint matches, active
-        // first. A 4-byte fingerprint can in principle collide across
-        // two masters; trying each match keeps a collision from turning
-        // a perfectly readable entry into a spurious auth failure.
-        let fp = &body[fp_start..salt_start];
-        let mut matched_a_key = false;
-        let mut opened: Option<Vec<u8>> = None;
-        for material in std::iter::once(&self.active).chain(self.previous.iter()) {
-            if material.fingerprint != fp {
-                continue;
+        let plaintext = match ring.open(&envelope, &tail) {
+            OpenOutcome::Opened(plaintext) => plaintext,
+            OpenOutcome::NoMatchingKey => return Ok(None),
+            OpenOutcome::AuthFailed => {
+                // Evict before reporting. `ttl_secs` rides in the clear,
+                // so a forged record can name a lifetime measured in
+                // years and the backing store will honour it: the entry
+                // never ages out, and the read path logs the error and
+                // bypasses the cache without recording a key to
+                // repopulate, so the response phase never overwrites it
+                // either. One tampered write per hot key would otherwise
+                // buy indefinite origin load until an operator purges by
+                // hand. Deleting concedes nothing, because whoever forged
+                // the record already holds the write access needed to
+                // delete it. Note the asymmetry this closes: the
+                // `Ok(None)` arms above self-heal only because the caller
+                // evicts, and the stronger failure signal should not be
+                // the one that persists. The `Err` still surfaces, so the
+                // security event is not swallowed.
+                //
+                // The message names only the public fingerprint, never
+                // the material behind it.
+                let fingerprint = envelope.fingerprint_hex();
+                let _ = self.inner.delete(key);
+                return Err(anyhow!(
+                    "response-cache entry for origin '{origin}' sealed under key {fingerprint} \
+                     failed authentication; entry evicted"
+                ));
             }
-            matched_a_key = true;
-            let entry_key = material.entry_key(&salt);
-            if let Ok(plaintext) = aes256gcm_decrypt(&entry_key, &nonce, &body[HEADER_LEN..], &aad)
-            {
-                opened = Some(plaintext);
-                break;
-            }
-        }
-        if !matched_a_key {
-            // No configured key claims this envelope. Not a decryption
-            // failure, so the caller evicts and reports a miss.
-            return Ok(None);
-        }
-        // A fingerprint we hold that will not authenticate is tampering
-        // or corruption, never a miss. The message names only the public
-        // fingerprint, never the material behind it.
-        let Some(plaintext) = opened else {
-            // Evict before reporting. `ttl_secs` rides in the clear, so
-            // a forged record can name a lifetime measured in years and
-            // the backing store will honour it: the entry never ages
-            // out, and the read path logs the error and bypasses the
-            // cache without recording a key to repopulate, so the
-            // response phase never overwrites it either. One tampered
-            // write per hot key would otherwise buy indefinite origin
-            // load until an operator purges by hand. Deleting concedes
-            // nothing, because whoever forged the record already holds
-            // the write access needed to delete it. Note the asymmetry
-            // this closes: the `Ok(None)` arm below self-heals only
-            // because it evicts, and the stronger failure signal should
-            // not be the one that persists. The `Err` still surfaces,
-            // so the security event is not swallowed.
-            let _ = self.inner.delete(key);
-            return Err(anyhow!(
-                "response-cache entry sealed under key {} failed authentication; entry evicted",
-                hex::encode(fp)
-            ));
         };
 
         let (headers, plain_body) = unframe_payload(&plaintext)?;
@@ -517,27 +526,51 @@ impl EncryptedCacheStore {
     /// Turn a raw lookup result into a decrypted one, evicting anything
     /// this store cannot open.
     fn decode(&self, key: &str, stored: Option<CachedResponse>) -> Result<Option<CachedResponse>> {
+        // Check the binding before the miss short-circuit, so an unscoped
+        // read reports the misuse whether or not the key happens to be
+        // populated. A misuse that only surfaces on a hit is a misuse
+        // that ships.
+        self.origin()?;
         let Some(stored) = stored else {
             return Ok(None);
         };
         match self.open(key, &stored)? {
             Some(entry) => Ok(Some(entry)),
             None => {
-                // Written before encryption was turned on, or under a
-                // key that is no longer listed. Dropping it is the only
-                // honest move: this store cannot vouch for the bytes, and
-                // leaving it means the same warning on every read until
-                // the TTL runs out. The next write reseals under the
-                // active key.
+                // Written before encryption was turned on, under a key
+                // that is no longer listed, or by a newer build using an
+                // envelope version this one does not know. Dropping it is
+                // the only honest move: this store cannot vouch for the
+                // bytes, and leaving it means the same warning on every
+                // read until the TTL runs out. The next write reseals
+                // under the active key.
                 let _ = self.inner.delete(key);
                 tracing::warn!(
                     backend = self.inner.backend_name(),
-                    key_id = %self.active.fingerprint_hex(),
+                    origin = self.origin.as_deref().unwrap_or(UNSCOPED),
                     "response-cache entry is not readable under any configured encryption key; evicted"
                 );
                 Ok(None)
             }
         }
+    }
+}
+
+/// Warn once when encryption is layered over the in-process backend.
+///
+/// Allowed on purpose so a config can move between backends without
+/// editing the encryption block, but say plainly that it buys nothing:
+/// the plaintext lives in this process either way, and there is no disk
+/// or wire to protect.
+fn advise_if_memory(inner: &Arc<dyn CacheStore>) {
+    if inner.backend_name() == "memory" {
+        MEMORY_BACKEND_ADVISORY.call_once(|| {
+            tracing::warn!(
+                backend = "memory",
+                "response-cache encryption is enabled over the in-process memory backend; \
+                 entries never leave this process, so this protects nothing at rest"
+            );
+        });
     }
 }
 
@@ -581,7 +614,9 @@ impl CacheStore for EncryptedCacheStore {
 
     fn delete_prefix(&self, prefix: &str) -> Result<usize> {
         // Cache keys are not encrypted, so prefix semantics are
-        // unchanged and this delegates directly.
+        // unchanged and this delegates directly. This is what keeps
+        // origin-scoped purge working regardless of which key sealed
+        // each value.
         self.inner.delete_prefix(prefix)
     }
 
@@ -595,13 +630,29 @@ impl CacheStore for EncryptedCacheStore {
         // that answer belongs to the real backend.
         self.inner.backend_name()
     }
+
+    fn durability(&self) -> crate::at_rest::CacheDurability {
+        // The decorator changes what the backend stores, not where.
+        self.inner.durability()
+    }
+
+    fn encrypts_at_rest(&self) -> bool {
+        // Unconditionally true: there is no plaintext write path, and a
+        // handle cannot exist without a key directory behind it.
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::MemoryCacheStore;
+    use sbproxy_security::sealed_record::HEADER_LEN;
     use std::sync::Arc;
+
+    /// Origin every single-tenant test seals under. Any non-empty string
+    /// works; naming it keeps the per-origin tests below legible.
+    const ORIGIN: &str = "api.example.com";
 
     fn now_secs() -> u64 {
         std::time::SystemTime::now()
@@ -629,22 +680,27 @@ mod tests {
         }
     }
 
-    fn material(seed: u8) -> CacheKeyMaterial {
-        CacheKeyMaterial::new(vec![seed; 32]).expect("32 bytes is enough key material")
+    fn ring(seed: u8, previous: &[u8]) -> SealKeyRing {
+        cache_key_ring(
+            vec![seed; 32],
+            previous.iter().map(|s| vec![*s; 32]).collect(),
+        )
+        .expect("32 bytes is enough key material")
     }
 
-    fn wrap(
-        inner: Arc<dyn CacheStore>,
-        active: CacheKeyMaterial,
-        previous: Vec<CacheKeyMaterial>,
-    ) -> EncryptedCacheStore {
-        EncryptedCacheStore::new(inner, active, previous)
+    /// A store scoped to [`ORIGIN`] with one store-wide ring.
+    fn wrap(inner: Arc<dyn CacheStore>, active: u8, previous: &[u8]) -> EncryptedCacheStore {
+        EncryptedCacheStore::scoped(
+            inner,
+            Arc::new(CacheKeyDirectory::single(ring(active, previous))),
+            ORIGIN,
+        )
     }
 
     #[test]
     fn roundtrips_status_headers_and_body() {
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(1), Vec::new());
+        let store = wrap(Arc::clone(&inner), 1, &[]);
 
         let original = entry();
         store.put("k", &original).unwrap();
@@ -665,7 +721,7 @@ mod tests {
         // The whole point: what lands in the backing store must not
         // carry the response body or the response headers verbatim.
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(2), Vec::new());
+        let store = wrap(Arc::clone(&inner), 2, &[]);
         store.put("k", &entry()).unwrap();
 
         let raw = inner.get("k").unwrap().expect("inner should hold a record");
@@ -688,6 +744,19 @@ mod tests {
             "headers must be sealed into the payload, not stored alongside it"
         );
         assert_eq!(raw.body[..4], *b"SBRC", "envelope magic missing");
+        assert_eq!(raw.body[4], 2, "new writes must carry envelope version 2");
+    }
+
+    #[test]
+    fn the_origin_is_not_written_in_the_clear() {
+        // The origin is authenticated, not encrypted, but it still lives
+        // only in the AAD: it must not be appended to the stored bytes.
+        let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
+        let store = wrap(Arc::clone(&inner), 30, &[]);
+        store.put("k", &entry()).unwrap();
+        let raw = inner.get("k").unwrap().unwrap();
+        let needle = ORIGIN.as_bytes();
+        assert!(!raw.body.windows(needle.len()).any(|w| w == needle));
     }
 
     #[test]
@@ -695,7 +764,7 @@ mod tests {
         // The file and memcached backends compute expiry from
         // cached_at and ttl_secs, so those must not be sealed.
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(3), Vec::new());
+        let store = wrap(Arc::clone(&inner), 3, &[]);
         let original = entry();
         store.put("k", &original).unwrap();
 
@@ -711,7 +780,7 @@ mod tests {
         // not produce identical bytes, otherwise the store leaks which
         // two URLs returned the same response.
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(4), Vec::new());
+        let store = wrap(Arc::clone(&inner), 4, &[]);
         let original = entry();
 
         store.put("a", &original).unwrap();
@@ -725,7 +794,7 @@ mod tests {
     #[test]
     fn conditional_replace_preserves_a_newer_encrypted_entry() {
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(12), Vec::new());
+        let store = wrap(Arc::clone(&inner), 12, &[]);
         let mut stale = entry();
         stale.generation = 1;
         store.put("k", &stale).unwrap();
@@ -751,7 +820,7 @@ mod tests {
         // survive, so pin the two random fields directly rather than
         // inferring them from the ciphertext differing.
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(23), Vec::new());
+        let store = wrap(Arc::clone(&inner), 23, &[]);
         let original = entry();
 
         let mut salts = std::collections::HashSet::new();
@@ -774,7 +843,7 @@ mod tests {
         // record from one key to another must fail authentication
         // rather than serve the wrong response.
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(5), Vec::new());
+        let store = wrap(Arc::clone(&inner), 5, &[]);
         store.put("victim", &entry()).unwrap();
 
         let lifted = inner.get("victim").unwrap().unwrap();
@@ -789,7 +858,7 @@ mod tests {
     #[test]
     fn a_tampered_status_fails_authentication() {
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(6), Vec::new());
+        let store = wrap(Arc::clone(&inner), 6, &[]);
         store.put("k", &entry()).unwrap();
 
         let mut stored = inner.get("k").unwrap().unwrap();
@@ -805,7 +874,7 @@ mod tests {
     #[test]
     fn a_tampered_generation_fails_authentication() {
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(31), Vec::new());
+        let store = wrap(Arc::clone(&inner), 31, &[]);
         store.put("k", &entry()).unwrap();
 
         let mut stored = inner.get("k").unwrap().unwrap();
@@ -824,7 +893,7 @@ mod tests {
         // but it is AAD-bound: an attacker with write access to the
         // store must not be able to keep a sealed entry alive forever.
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(24), Vec::new());
+        let store = wrap(Arc::clone(&inner), 24, &[]);
         store.put("k", &entry()).unwrap();
 
         let mut stored = inner.get("k").unwrap().unwrap();
@@ -837,7 +906,7 @@ mod tests {
     #[test]
     fn a_tampered_cached_at_fails_authentication() {
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(25), Vec::new());
+        let store = wrap(Arc::clone(&inner), 25, &[]);
         store.put("k", &entry()).unwrap();
 
         let mut stored = inner.get("k").unwrap().unwrap();
@@ -850,7 +919,7 @@ mod tests {
     #[test]
     fn a_tampered_body_fails_authentication() {
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(7), Vec::new());
+        let store = wrap(Arc::clone(&inner), 7, &[]);
         store.put("k", &entry()).unwrap();
 
         let mut stored = inner.get("k").unwrap().unwrap();
@@ -873,7 +942,7 @@ mod tests {
         // read evicts, one forged write pins that key on origin fetches
         // until an operator purges by hand.
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(27), Vec::new());
+        let store = wrap(Arc::clone(&inner), 27, &[]);
         store.put("k", &entry()).unwrap();
 
         let mut poisoned = inner.get("k").unwrap().unwrap();
@@ -904,16 +973,16 @@ mod tests {
     #[test]
     fn an_unknown_envelope_version_is_a_miss_and_evicts() {
         // The version byte is the forward-compatibility hinge: a future
-        // sbproxy writes version 2, an older binary reads it back and
+        // sbproxy writes version 3, an older binary reads it back and
         // must treat it as unreadable rather than guessing at the
         // layout. Same handling as any other envelope this store cannot
         // vouch for, eviction included.
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(28), Vec::new());
+        let store = wrap(Arc::clone(&inner), 28, &[]);
         store.put("k", &entry()).unwrap();
 
         let mut stored = inner.get("k").unwrap().unwrap();
-        stored.body[MAGIC.len()] = VERSION + 1;
+        stored.body[4] = SBRC_SCHEME.version() + 1;
         inner.put("k", &stored).unwrap();
 
         assert!(
@@ -933,7 +1002,7 @@ mod tests {
         // ciphertext (parses, cannot authenticate). Neither may produce
         // a usable entry.
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(26), Vec::new());
+        let store = wrap(Arc::clone(&inner), 26, &[]);
 
         store.put("stub", &entry()).unwrap();
         let mut stub = inner.get("stub").unwrap().unwrap();
@@ -963,7 +1032,7 @@ mod tests {
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
         inner.put("legacy", &entry()).unwrap();
 
-        let store = wrap(Arc::clone(&inner), material(8), Vec::new());
+        let store = wrap(Arc::clone(&inner), 8, &[]);
         assert!(store.get("legacy").unwrap().is_none());
         assert!(
             inner.get("legacy").unwrap().is_none(),
@@ -974,11 +1043,11 @@ mod tests {
     #[test]
     fn a_retired_key_still_opens_entries_it_sealed() {
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let old = wrap(Arc::clone(&inner), material(9), Vec::new());
+        let old = wrap(Arc::clone(&inner), 9, &[]);
         old.put("k", &entry()).unwrap();
 
         // Rotate: the old key moves to previous_keys.
-        let rotated = wrap(Arc::clone(&inner), material(10), vec![material(9)]);
+        let rotated = wrap(Arc::clone(&inner), 10, &[9]);
         let got = rotated
             .get("k")
             .unwrap()
@@ -989,11 +1058,11 @@ mod tests {
     #[test]
     fn dropping_a_key_from_the_rotation_list_retires_its_entries() {
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let old = wrap(Arc::clone(&inner), material(11), Vec::new());
+        let old = wrap(Arc::clone(&inner), 11, &[]);
         old.put("k", &entry()).unwrap();
 
         // Second rotation: key 11 is no longer listed at all.
-        let current = wrap(Arc::clone(&inner), material(12), vec![material(13)]);
+        let current = wrap(Arc::clone(&inner), 12, &[13]);
         assert!(current.get("k").unwrap().is_none());
         assert!(
             inner.get("k").unwrap().is_none(),
@@ -1004,21 +1073,21 @@ mod tests {
     #[test]
     fn a_write_reseals_under_the_active_key() {
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let old = wrap(Arc::clone(&inner), material(14), Vec::new());
+        let old = wrap(Arc::clone(&inner), 14, &[]);
         old.put("k", &entry()).unwrap();
 
-        let rotated = wrap(Arc::clone(&inner), material(15), vec![material(14)]);
+        let rotated = wrap(Arc::clone(&inner), 15, &[14]);
         rotated.put("k", &entry()).unwrap();
 
         // Drop key 14 entirely: the resealed entry must still open.
-        let narrowed = wrap(Arc::clone(&inner), material(15), Vec::new());
+        let narrowed = wrap(Arc::clone(&inner), 15, &[]);
         assert!(narrowed.get("k").unwrap().is_some());
     }
 
     #[test]
     fn get_including_expired_decrypts_too() {
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(16), Vec::new());
+        let store = wrap(Arc::clone(&inner), 16, &[]);
         let stale = CachedResponse {
             generation: 0,
             status: 200,
@@ -1039,7 +1108,7 @@ mod tests {
     #[test]
     fn an_empty_body_and_no_headers_roundtrip() {
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(17), Vec::new());
+        let store = wrap(Arc::clone(&inner), 17, &[]);
         let empty = CachedResponse {
             generation: 0,
             status: 204,
@@ -1060,14 +1129,14 @@ mod tests {
         // The admin API decides whether prefix purge is supported from
         // this string, so the decorator must be transparent here.
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(inner, material(18), Vec::new());
+        let store = wrap(inner, 18, &[]);
         assert_eq!(store.backend_name(), "memory");
     }
 
     #[test]
     fn delete_and_clear_pass_through() {
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(19), Vec::new());
+        let store = wrap(Arc::clone(&inner), 19, &[]);
         store.put("a", &entry()).unwrap();
         store.put("b", &entry()).unwrap();
 
@@ -1081,7 +1150,7 @@ mod tests {
     #[test]
     fn delete_prefix_passes_through_and_reports_the_count() {
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(Arc::clone(&inner), material(20), Vec::new());
+        let store = wrap(Arc::clone(&inner), 20, &[]);
         store.put("ws:host:GET:/x:a:fp", &entry()).unwrap();
         store.put("ws:host:GET:/x::fp2", &entry()).unwrap();
         store.put("ws:host:GET:/y::fp", &entry()).unwrap();
@@ -1092,8 +1161,8 @@ mod tests {
 
     #[test]
     fn short_key_material_is_rejected() {
-        let err = CacheKeyMaterial::new(b"too-short".to_vec())
-            .expect_err("15 bytes or fewer must be refused");
+        let err = cache_key_ring(b"too-short".to_vec(), Vec::new())
+            .expect_err("15 bytes must be refused");
         assert!(
             err.to_string().contains("at least 16 bytes"),
             "unexpected error: {err}"
@@ -1102,11 +1171,8 @@ mod tests {
 
     #[test]
     fn distinct_material_yields_distinct_fingerprints() {
-        assert_ne!(
-            material(21).fingerprint_hex(),
-            material(22).fingerprint_hex()
-        );
-        assert_eq!(material(21).fingerprint_hex().len(), 8);
+        assert_ne!(ring(21, &[]).active_key_id(), ring(22, &[]).active_key_id());
+        assert_eq!(ring(21, &[]).active_key_id().len(), 8);
     }
 
     /// How a `#[derive(Debug)]` regression would actually render key
@@ -1119,31 +1185,17 @@ mod tests {
 
     #[test]
     fn debug_output_never_carries_key_material() {
-        // Key material must not reach a log line through Debug, on the
-        // material itself or on the store that holds it. Both encodings
-        // are checked: hex is how this file would leak it deliberately,
-        // decimal is how a lost manual impl would leak it by accident.
-        let raw = vec![0xABu8; 32];
-        let raw_hex = hex::encode(&raw);
-        let raw_decimal = decimal_bytes(&raw);
-        let key = CacheKeyMaterial::new(raw).expect("32 bytes is enough");
-        let rendered = format!("{key:?}");
-        assert!(
-            !rendered.contains(&raw_hex),
-            "material leaked through Debug as hex: {rendered}"
-        );
-        assert!(
-            !rendered.contains(&raw_decimal),
-            "material leaked through Debug as bytes: {rendered}"
-        );
-        assert!(rendered.contains("[redacted]"), "unexpected: {rendered}");
-        assert!(rendered.contains(&key.fingerprint_hex()));
-
+        // Key material must not reach a log line through Debug on the
+        // store that holds it. Both encodings are checked: hex is how
+        // this file would leak it deliberately, decimal is how a lost
+        // manual impl would leak it by accident.
         let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
-        let store = wrap(
+        let store = EncryptedCacheStore::scoped(
             inner,
-            CacheKeyMaterial::new(vec![0xCDu8; 32]).expect("32 bytes is enough"),
-            vec![CacheKeyMaterial::new(vec![0xEFu8; 32]).expect("32 bytes is enough")],
+            Arc::new(CacheKeyDirectory::single(
+                cache_key_ring(vec![0xCDu8; 32], vec![vec![0xEFu8; 32]]).unwrap(),
+            )),
+            ORIGIN,
         );
         let rendered = format!("{store:?}");
         assert!(!rendered.contains(&hex::encode([0xCDu8; 32])));
@@ -1151,5 +1203,285 @@ mod tests {
         assert!(!rendered.contains(&decimal_bytes(&[0xCDu8; 32])));
         assert!(!rendered.contains(&decimal_bytes(&[0xEFu8; 32])));
         assert!(rendered.contains("[redacted]"), "unexpected: {rendered}");
+    }
+
+    // --- Per-origin keys ---
+
+    fn directory(default: Option<u8>, per_origin: &[(&str, u8, &[u8])]) -> Arc<CacheKeyDirectory> {
+        Arc::new(CacheKeyDirectory::new(
+            default.map(|seed| ring(seed, &[])),
+            per_origin
+                .iter()
+                .map(|(origin, seed, prev)| ((*origin).to_string(), ring(*seed, prev)))
+                .collect(),
+        ))
+    }
+
+    #[test]
+    fn an_entry_sealed_for_one_origin_does_not_open_as_another() {
+        // The multi-tenant property the whole per-origin story exists
+        // for. Both origins hold their own key here, so the failure is
+        // over-determined; the inherit case below is the sharper test.
+        let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
+        let keys = directory(None, &[("tenant-a", 40, &[]), ("tenant-b", 41, &[])]);
+        let a = EncryptedCacheStore::scoped(Arc::clone(&inner), Arc::clone(&keys), "tenant-a");
+        let b = EncryptedCacheStore::scoped(Arc::clone(&inner), Arc::clone(&keys), "tenant-b");
+
+        a.put("shared-key", &entry()).unwrap();
+        // B holds a different master, so it cannot even claim the
+        // envelope: a miss, and the record is evicted.
+        assert!(b.get("shared-key").unwrap().is_none());
+    }
+
+    #[test]
+    fn two_origins_inheriting_one_key_still_cannot_read_each_other() {
+        // This is the property that makes `inherit` a safe default. Both
+        // origins derive from the same master, so the fingerprint matches
+        // and the ring does attempt the open. Only the origin binding in
+        // the AAD stops it, which is why the outcome is an authentication
+        // failure rather than a miss.
+        let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
+        let keys = directory(Some(42), &[]);
+        let a = EncryptedCacheStore::scoped(Arc::clone(&inner), Arc::clone(&keys), "tenant-a");
+        let b = EncryptedCacheStore::scoped(Arc::clone(&inner), Arc::clone(&keys), "tenant-b");
+
+        a.put("shared-key", &entry()).unwrap();
+        let err = b
+            .get("shared-key")
+            .expect_err("a cross-origin read must not return plaintext");
+        assert!(
+            err.to_string().contains("tenant-b"),
+            "the error should name the origin that tried to read: {err}"
+        );
+        // And A's own read still works before the eviction fires... which
+        // it does not, because the failed read evicted. That is the
+        // documented trade: an unauthenticated record is always dropped.
+        assert!(inner.get("shared-key").unwrap().is_none());
+    }
+
+    #[test]
+    fn an_origin_key_overrides_the_store_wide_one() {
+        let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
+        let keys = directory(Some(43), &[("tenant-a", 44, &[])]);
+        let scoped = EncryptedCacheStore::scoped(Arc::clone(&inner), Arc::clone(&keys), "tenant-a");
+        scoped.put("k", &entry()).unwrap();
+
+        let raw = inner.get("k").unwrap().unwrap();
+        let fingerprint = hex::encode(&raw.body[5..9]);
+        assert_eq!(fingerprint, ring(44, &[]).active_key_id());
+        assert_ne!(fingerprint, ring(43, &[]).active_key_id());
+    }
+
+    #[test]
+    fn an_origin_without_its_own_key_inherits_the_store_wide_one() {
+        let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
+        let keys = directory(Some(45), &[("tenant-a", 46, &[])]);
+        let other = EncryptedCacheStore::scoped(Arc::clone(&inner), Arc::clone(&keys), "tenant-z");
+        other.put("k", &entry()).unwrap();
+
+        let raw = inner.get("k").unwrap().unwrap();
+        assert_eq!(hex::encode(&raw.body[5..9]), ring(45, &[]).active_key_id());
+        assert_eq!(other.get("k").unwrap().unwrap().body, entry().body);
+    }
+
+    #[test]
+    fn an_origin_with_no_key_and_no_store_wide_key_fails_loud() {
+        let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
+        let keys = directory(None, &[("tenant-a", 47, &[])]);
+        let orphan = EncryptedCacheStore::scoped(inner, keys, "tenant-z");
+        let err = orphan
+            .put("k", &entry())
+            .expect_err("there is no key that could seal this");
+        assert!(err.to_string().contains("tenant-z"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn per_origin_rotation_opens_entries_sealed_under_that_origins_previous_key() {
+        // Rotating one origin must not disturb any other, and the
+        // origin's own retired key must keep opening what it sealed.
+        let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
+        let before = directory(Some(50), &[("tenant-a", 51, &[]), ("tenant-b", 52, &[])]);
+        let a_before =
+            EncryptedCacheStore::scoped(Arc::clone(&inner), Arc::clone(&before), "tenant-a");
+        let b_before =
+            EncryptedCacheStore::scoped(Arc::clone(&inner), Arc::clone(&before), "tenant-b");
+        a_before.put("a-key", &entry()).unwrap();
+        b_before.put("b-key", &entry()).unwrap();
+
+        // Only tenant-a rotates: 53 becomes active, 51 retires.
+        let after = directory(Some(50), &[("tenant-a", 53, &[51]), ("tenant-b", 52, &[])]);
+        let a_after =
+            EncryptedCacheStore::scoped(Arc::clone(&inner), Arc::clone(&after), "tenant-a");
+        let b_after =
+            EncryptedCacheStore::scoped(Arc::clone(&inner), Arc::clone(&after), "tenant-b");
+
+        assert_eq!(
+            a_after
+                .get("a-key")
+                .unwrap()
+                .expect("retired key opens")
+                .body,
+            entry().body,
+        );
+        assert_eq!(
+            b_after.get("b-key").unwrap().expect("untouched").body,
+            entry().body,
+        );
+
+        // New writes for tenant-a carry the new fingerprint.
+        a_after.put("a-key", &entry()).unwrap();
+        let raw = inner.get("a-key").unwrap().unwrap();
+        assert_eq!(hex::encode(&raw.body[5..9]), ring(53, &[]).active_key_id());
+    }
+
+    #[test]
+    fn purge_works_across_origins_without_any_key() {
+        // Purge is prefix-driven and never opens a value, so the admin
+        // handle can clear entries sealed under keys it holds and keys
+        // it does not.
+        let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
+        let keys = directory(None, &[("tenant-a", 60, &[]), ("tenant-b", 61, &[])]);
+        let a = EncryptedCacheStore::scoped(Arc::clone(&inner), Arc::clone(&keys), "tenant-a");
+        let b = EncryptedCacheStore::scoped(Arc::clone(&inner), Arc::clone(&keys), "tenant-b");
+        a.put(":a.example:GET:/x::fp", &entry()).unwrap();
+        b.put(":b.example:GET:/x::fp", &entry()).unwrap();
+
+        let admin = EncryptedCacheStore::unscoped(Arc::clone(&inner), Arc::clone(&keys));
+        assert_eq!(admin.delete_prefix(":a.example:").unwrap(), 1);
+        assert!(inner.get(":a.example:GET:/x::fp").unwrap().is_none());
+        assert!(inner.get(":b.example:GET:/x::fp").unwrap().is_some());
+
+        admin.clear().unwrap();
+        assert!(inner.get(":b.example:GET:/x::fp").unwrap().is_none());
+    }
+
+    #[test]
+    fn the_unscoped_handle_refuses_to_read_or_write() {
+        // Sealing without an origin would either omit the binding or
+        // invent a value for it. Both are worse than an error naming the
+        // misuse, because either would produce entries that the scoped
+        // handles cannot read.
+        let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
+        let keys = directory(Some(62), &[]);
+        let admin = EncryptedCacheStore::unscoped(inner, keys);
+
+        for err in [
+            admin.put("k", &entry()).unwrap_err(),
+            admin.get("k").unwrap_err(),
+            admin.get_including_expired("k").unwrap_err(),
+        ] {
+            assert!(
+                err.to_string().contains("per-origin handle"),
+                "unexpected: {err}"
+            );
+        }
+    }
+
+    // --- Wire-format compatibility ---
+
+    /// Master key material behind the fixtures below. The fixtures were
+    /// produced by the pre-extraction implementation, before the
+    /// sealed-record helper existed and before the origin was bound into
+    /// the associated data.
+    const FIXTURE_MATERIAL: &[u8] = b"sbproxy-fixture-master-key-0001";
+
+    fn fixture_entry() -> CachedResponse {
+        CachedResponse {
+            generation: 7,
+            status: 200,
+            headers: vec![
+                ("content-type".into(), "application/json".into()),
+                ("x-fixture".into(), "sbrc-v1".into()),
+            ],
+            body: br#"{"fixture":"sbrc-v1","ok":true}"#.to_vec(),
+            cached_at: 1_700_000_000,
+            ttl_secs: 300,
+        }
+    }
+
+    fn fixture_store(inner: Arc<dyn CacheStore>) -> EncryptedCacheStore {
+        EncryptedCacheStore::scoped(
+            inner,
+            Arc::new(CacheKeyDirectory::single(
+                cache_key_ring(FIXTURE_MATERIAL.to_vec(), Vec::new()).unwrap(),
+            )),
+            ORIGIN,
+        )
+    }
+
+    /// Load a hex fixture into the backing store under `key` and read it
+    /// back through the decorator.
+    fn open_fixture(
+        hex_bytes: &str,
+        key: &str,
+        mut stored: CachedResponse,
+    ) -> Option<CachedResponse> {
+        let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
+        stored.body = hex::decode(hex_bytes).expect("fixture is valid hex");
+        stored.headers = Vec::new();
+        inner.put(key, &stored).unwrap();
+        fixture_store(inner).get_including_expired(key).unwrap()
+    }
+
+    #[test]
+    fn a_version_1_entry_written_before_the_refactor_still_opens() {
+        // The compatibility promise in one test. These bytes were sealed
+        // by the implementation that predates both the sealed-record
+        // extraction and the origin binding; they must still open, and
+        // must yield exactly the headers and body that went in.
+        const SBRC_V1: &str = "5342524301def11a206cefff729c160b221b122c7e468648a18686e7a364e291\
+                               25a11ff770f1253f2048b770fc05f435fce4f789c98da113e0279c07b9046b2a\
+                               7f35f552e004333330e2c0a3b0703de86a8e5f1206aaee450bbdfb65f7bd7a46\
+                               2901c43bad16a53802b5700f7209440dd2f31033df4c484208314b3bad6ed670\
+                               c123f17ce2c4a0d043bc71902c6a3f21b825b9d9";
+        let opened = open_fixture(
+            SBRC_V1,
+            ":fixture.example:GET:/v1/thing::deadbeef",
+            fixture_entry(),
+        )
+        .expect("a version-1 entry must still open");
+        assert_eq!(opened.headers, fixture_entry().headers);
+        assert_eq!(opened.body, fixture_entry().body);
+        assert_eq!(opened.status, 200);
+        assert_eq!(opened.generation, 7);
+    }
+
+    #[test]
+    fn a_version_1_entry_with_generation_zero_still_opens() {
+        // Envelopes written before cache generations existed use a
+        // shorter associated-data tail that omits the generation
+        // entirely. That shape has to survive the refactor too.
+        const SBRC_V1_GEN0: &str =
+            "5342524301def11a20d13b2e2bc17b16f44a55255ec2806ce50fb713292c42fe\
+                                    7f14442cd838163e93dae7ade487684e470dcf0c1faca7a1bf5aafd8fec8108\
+                                    e622944e70ef94042e64e12b112da5388365ccf1a407e44e9d5e254e5115d36\
+                                    ba203907c96eda6867877b4c1b1504ec34b6f34162b6aa3f7df1ab920fbff50\
+                                    c396e0e43f81e57f82d841258e0b1569715ea8eb6f4";
+        let mut stored = fixture_entry();
+        stored.generation = 0;
+        let opened = open_fixture(SBRC_V1_GEN0, ":legacy.example:GET:/old::cafe", stored)
+            .expect("a generation-zero version-1 entry must still open");
+        assert_eq!(opened.headers, fixture_entry().headers);
+        assert_eq!(opened.body, fixture_entry().body);
+        assert_eq!(opened.generation, 0);
+    }
+
+    #[test]
+    fn the_fixture_key_fingerprint_is_unchanged_by_the_refactor() {
+        // The fingerprint is derived from the master material and is
+        // written into every envelope. If the extraction had changed how
+        // it is derived, every stored entry would stop being claimable
+        // by its own key. The four bytes at offset 5 of the fixture are
+        // the assertion.
+        let ring = cache_key_ring(FIXTURE_MATERIAL.to_vec(), Vec::new()).unwrap();
+        assert_eq!(ring.active_key_id(), "def11a20");
+    }
+
+    #[test]
+    fn a_version_1_entry_reseals_as_version_2_on_the_next_write() {
+        let inner: Arc<dyn CacheStore> = Arc::new(MemoryCacheStore::new(0));
+        let store = fixture_store(Arc::clone(&inner));
+        store.put("k", &entry()).unwrap();
+        assert_eq!(inner.get("k").unwrap().unwrap().body[4], 2);
     }
 }
