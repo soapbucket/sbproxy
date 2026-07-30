@@ -600,15 +600,11 @@ the binary were the program. The plist also raises `ExitTimeOut` above
 the proxy's default shutdown grace, so `launchd` cannot SIGKILL a drain
 that is still in progress.
 
-**Stop the deployment before removing the agent.** A gateway that goes
-away without a prior `sbproxy models stop` leaves its engine process
-running; see the open defect recorded on the Apple Silicon lane in
-[model-host-certification.md](model-host-certification.md).
-
-```bash
-sbproxy models stop local
-sbproxy service uninstall
-```
+Managed engine ownership is durable across gateway death. Each engine record
+contains the owner and engine PID plus their process-start fingerprints;
+`service uninstall` waits for the exact launchd-owned gateway to exit, then
+reaps only its exact recorded engine. A reused PID or another live sbproxy
+owner is never signalled, and no process-name sweep is used.
 
 `--dry-run` (inherited from `run`'s flags) prints the plist and the
 generated config without installing or loading anything. `service
@@ -616,10 +612,10 @@ status` asks `launchctl list` whether the agent is registered and
 running, and exits 0 when it is running, 1 otherwise (registered-but-
 stopped and never-installed alike), so it composes with
 `sbproxy service status || <restart it>` in a script. `service
-uninstall` unloads the agent and removes its plist; it is idempotent,
-reporting nothing removed rather than failing when no agent was
-installed. All three subcommands refuse to run on a non-macOS host,
-since `launchd` is macOS-only; use `run` or `serve` elsewhere.
+uninstall` unloads the agent, verifies/reaps its managed engines, and removes
+its plist; it is idempotent, reporting nothing removed rather than failing
+when no agent was installed. All three subcommands refuse to run on a
+non-macOS host, since `launchd` is macOS-only; use `run` or `serve` elsewhere.
 
 ### `models` - artifact and runtime lifecycle
 

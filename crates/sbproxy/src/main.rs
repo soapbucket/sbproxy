@@ -3128,11 +3128,9 @@ const SERVICE_LABEL: &str = "dev.sbproxy.agent";
 /// shutdown path. 45 leaves the full drain room to finish; raise it
 /// alongside any increase to the default grace.
 ///
-/// This is hardening, not a fix for the engine-orphan defect the Mac
-/// certification lane found: an agent with no in-flight requests exits
-/// in about two seconds, well inside even launchd's default, and the
-/// managed engine is orphaned anyway. See the "known gap" note on the
-/// Apple Silicon lane in `docs/model-host-certification.md`.
+/// Durable managed-engine ownership separately covers a forced gateway
+/// death; this timeout preserves the preferred graceful path so a normal
+/// `service uninstall` can drain before verifying and clearing ownership.
 const SERVICE_EXIT_TIMEOUT_SECS: u32 = 45;
 
 /// The proxy's default shutdown grace in seconds, which
@@ -3440,28 +3438,66 @@ fn handle_service_uninstall(args: &ServiceUninstallArgs) -> anyhow::Result<i32> 
 
     let paths = service_paths()?;
     let existed = paths.plist.exists();
+    let service_pid = existed
+        .then(|| {
+            std::process::Command::new("launchctl")
+                .arg("list")
+                .arg(SERVICE_LABEL)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| {
+                    parse_launchctl_list_pid(&String::from_utf8_lossy(&output.stdout))
+                })
+        })
+        .flatten();
     if existed {
-        let _ = std::process::Command::new("launchctl")
+        let output = std::process::Command::new("launchctl")
             .arg("unload")
             .arg(&paths.plist)
-            .output();
+            .output()
+            .map_err(|error| anyhow::anyhow!("launchctl unload: {error}"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "launchctl unload '{}' failed: {}",
+                paths.plist.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
         std::fs::remove_file(&paths.plist)
             .map_err(|error| anyhow::anyhow!("remove '{}': {error}", paths.plist.display()))?;
     }
+    let engines_reaped = match service_pid {
+        Some(owner_pid) => sbproxy_model_host::reap_managed_engines_owned_by(
+            owner_pid,
+            std::time::Duration::from_secs(u64::from(SERVICE_EXIT_TIMEOUT_SECS)),
+            std::time::Duration::from_secs(5),
+        ),
+        None => sbproxy_model_host::reap_stale_managed_engines(std::time::Duration::from_secs(5)),
+    }
+    .map_err(|error| anyhow::anyhow!("reap managed engines after service unload: {error}"))?;
 
     match args.format {
         OutputFormat::Text => {
             if existed {
-                println!("Uninstalled launchd agent '{SERVICE_LABEL}'.");
+                println!(
+                    "Uninstalled launchd agent '{SERVICE_LABEL}' (reaped {engines_reaped} managed engine(s))."
+                );
             } else {
-                println!("No launchd agent '{SERVICE_LABEL}' was installed.");
+                println!(
+                    "No launchd agent '{SERVICE_LABEL}' was installed (reaped {engines_reaped} stale managed engine(s))."
+                );
             }
         }
         OutputFormat::Json => println!(
             "{}",
             serde_json::to_string_pretty(&cli_command_envelope(
                 "service.uninstall",
-                serde_json::json!({ "label": SERVICE_LABEL, "removed": existed }),
+                serde_json::json!({
+                    "label": SERVICE_LABEL,
+                    "removed": existed,
+                    "engines_reaped": engines_reaped,
+                }),
             ))?
         ),
     }

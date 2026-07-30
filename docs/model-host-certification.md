@@ -44,7 +44,7 @@ billed.
 |---|---|---|
 | Deterministic model-host suites | passed 2026-07-30 | Artifact, driver, fit, admission, reconcile, reload, capability, and CLI suites. |
 | CPU admission | passed 2026-07-30 | Local admission and cold-start policy on an accelerator-free path. |
-| Apple Silicon Metal | **failing** 2026-07-30 | 11 of 12 checks pass on Apple M4 Max: live managed GGUF completion, truthful status, stop, clean shutdown, cache reuse. The port-release check fails on an open defect, below. |
+| Apple Silicon Metal | **rerun required** | The 2026-07-30 M4 Max run passed 11 of 12 checks. The listener/engine lifecycle defect behind the failed check now has deterministic real-process coverage and a blocking Apple-lane assertion, but the updated lane has not yet run on live Apple hardware. |
 | NVIDIA CUDA single GPU | passed 2026-07-30 | Live vLLM container completion on an NVIDIA L4: NVML probe, fit plan, public model echo, full status, and a stop that returned the device to 0 MiB. |
 | NVIDIA multi-GPU | unsupported | Needs two visible devices. The billing account this project runs under is capped at one GPU, so the lane has never had hardware to run on. Detail below. |
 | Air-gapped | passed 2026-07-30 | Offline, manual, and file pull policies short-circuit transport; a digest mismatch fails closed. |
@@ -68,8 +68,9 @@ binary `sbproxy 1.9.0` at revision `2ef06ad0`.
 scripts/certify-selfhost.sh run apple_metal
 ```
 
-Eleven of twelve checks pass. The failing one is recorded below, and the lane
-stays red until it is fixed.
+Eleven of twelve checks passed at that revision. The failed lifecycle behavior
+has since been fixed in code; this historical evidence is not promoted to a
+pass until the updated lane reruns on Apple hardware.
 
 - Model: `qwen2.5-0.5b-instruct:q4_k_m`
 - Managed engine: llama.cpp b9905 on Metal, selected device `[0]`
@@ -90,41 +91,30 @@ stays red until it is fixed.
 - **Failing check:** the public port was still bound 60 seconds after
   shutdown, by a surviving `sbproxy` process
 
-### Open defect: a process survives shutdown holding the listener
+### Lifecycle fix awaiting live Apple rerun
 
-Found by this lane, reproduced four times, not yet fixed.
+The four failures from the 2026-07-30 run now have explicit contracts:
 
-`sbproxy models stop` reaps the engine, and SIGINT after a stop exits clean.
-But a gateway that goes away *without* a prior stop leaves its engine running:
+- Pingora binds and retains the actual public sockets before `Server::run`.
+  Address collisions return a startup error containing the address and OS
+  cause; they no longer panic only a background listener task.
+- SIGTERM returns through the gateway shutdown guards, verifies the managed
+  engine exited, removes its durable ownership record, and releases the public
+  listener.
+- `service uninstall` waits for the exact launchd owner identity to exit and
+  then reaps its exact recorded engines.
+- Every managed subprocess is recorded atomically with owner PID/start
+  fingerprint and engine PID/start fingerprint (plus executable evidence).
+  After SIGKILL, the next owner reaps only that exact stale process before
+  spawning a replacement. A live owner or reused PID is preserved. Linux's
+  parent-death signal remains the first line of defense.
 
-- `sbproxy serve <config>` sent SIGTERM exits in about two seconds and leaves
-  the `llama-server` child alive.
-- `sbproxy service uninstall` leaves the engine alive; it was still running 181
-  seconds later.
-- SIGKILL on the gateway leaves the engine alive, and the `KeepAlive` restart
-  then launches a *second* engine beside the first, so two engines hold
-  unified memory at once.
-- A process can also outlive the pid the launcher signalled while still holding
-  the public listener, so the obvious next move (restart on the same port)
-  cannot bind. When that bind finally fails, the panic takes out only the
-  Pingora listener thread: the process stays alive with no listener and stops
-  responding to SIGTERM, so it has to be SIGKILLed.
-
-The engine reap runs from a shutdown guard on the graceful path. Any exit that
-does not reach it leaks the engine. The launchd plist now sets `ExitTimeOut`
-above the default shutdown grace so launchd cannot SIGKILL a drain in progress,
-but that is hardening, not the fix: an idle agent exits well inside even
-launchd's default and still leaks.
-
-Until this is fixed, stop the deployment before stopping the gateway:
-
-```bash
-sbproxy models stop local          # reaps the engine
-sbproxy service uninstall          # then remove the agent
-```
-
-The certification lane asserts the port is released after shutdown, so a
-regression here fails the Apple lane rather than passing quietly.
+Focused real-process tests cover collision failure, SIGTERM plus same-port
+rebind, exact stale-engine reap, live-owner preservation, PID-reuse
+preservation, killed-owner recovery, and record removal after verified normal
+shutdown. The release Apple lane now derives engine PIDs from those ownership
+records, exercises gateway SIGKILL/restart, and requires final SIGTERM engine
+reap plus listener release. That lane still needs a live Apple runner result.
 
 ### Sleep and wake
 
@@ -132,8 +122,8 @@ Not automated: suspending the certification host would end the run that is
 recording the evidence. Documented expectation instead. `KeepAlive` restarts
 the agent if the process dies across a sleep cycle, and the artifact cache is
 content-addressed on disk, so a wake reuses verified weights with no
-re-download. The engine-orphan gap above applies to any restart, so an agent
-that has cycled may be holding more than one engine.
+re-download. Durable ownership recovery runs before a replacement engine
+starts.
 
 ## NVIDIA CUDA single-GPU evidence from 2026-07-30
 
