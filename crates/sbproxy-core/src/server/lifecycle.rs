@@ -2730,20 +2730,17 @@ fn install_op_redact_state(compiled: &sbproxy_config::CompiledConfig) {
         origin_pii,
     });
 
-    // Teach both redaction paths which headers the inbound key sweep reads.
-    // A configured sweep header carries a live minted key, and a custom name
-    // matches none of the built-in `-key` / `-secret` / `-token` rules, so
-    // without this it would reach the access log and a `capture_headers: ["*"]`
-    // glob in plaintext. Driven from config so adding a header cannot silently
-    // open that hole.
-    let swept = compiled
+    // Teach every redaction path which primary headers can carry inbound
+    // credentials. This union covers minted/configured carriers and native
+    // provider-hint carriers; match-only `also_header` values are excluded.
+    let credential_carriers = compiled
         .server
         .key_management
         .as_ref()
-        .map(|km| km.inbound.header_names())
+        .map(|km| km.inbound.credential_carrier_names())
         .unwrap_or_default();
-    sbproxy_observe::logging::set_swept_header_names(swept.clone());
-    sbproxy_config::types::set_extra_sensitive_headers(swept);
+    sbproxy_observe::logging::set_swept_header_names(credential_carriers.clone());
+    sbproxy_config::types::set_extra_sensitive_headers(credential_carriers);
 }
 
 /// Compose a child scope's `(enabled, rules)` from the parent's

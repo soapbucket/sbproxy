@@ -21,6 +21,8 @@ use sbproxy_e2e::ProxyHarness;
 struct MockProvider {
     port: u16,
     chat_calls: Arc<AtomicUsize>,
+    embedding_authorizations: Arc<Mutex<Vec<String>>>,
+    chat_authorizations: Arc<Mutex<Vec<String>>>,
     shutdown: Arc<Mutex<bool>>,
 }
 
@@ -29,8 +31,12 @@ impl MockProvider {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
         let port = listener.local_addr().unwrap().port();
         let chat_calls = Arc::new(AtomicUsize::new(0));
+        let embedding_authorizations = Arc::new(Mutex::new(Vec::new()));
+        let chat_authorizations = Arc::new(Mutex::new(Vec::new()));
         let shutdown = Arc::new(Mutex::new(false));
         let chat_clone = chat_calls.clone();
+        let embedding_auth_clone = embedding_authorizations.clone();
+        let chat_auth_clone = chat_authorizations.clone();
         let shutdown_clone = shutdown.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -42,14 +48,18 @@ impl MockProvider {
                     Err(_) => continue,
                 };
                 let chat = chat_clone.clone();
+                let embedding_auth = embedding_auth_clone.clone();
+                let chat_auth = chat_auth_clone.clone();
                 std::thread::spawn(move || {
-                    let _ = handle_conn(&mut stream, chat);
+                    let _ = handle_conn(&mut stream, chat, embedding_auth, chat_auth);
                 });
             }
         });
         Self {
             port,
             chat_calls,
+            embedding_authorizations,
+            chat_authorizations,
             shutdown,
         }
     }
@@ -60,6 +70,14 @@ impl MockProvider {
 
     fn chat_calls(&self) -> usize {
         self.chat_calls.load(Ordering::SeqCst)
+    }
+
+    fn embedding_authorizations(&self) -> Vec<String> {
+        self.embedding_authorizations.lock().unwrap().clone()
+    }
+
+    fn chat_authorizations(&self) -> Vec<String> {
+        self.chat_authorizations.lock().unwrap().clone()
     }
 }
 
@@ -74,6 +92,8 @@ impl Drop for MockProvider {
 fn handle_conn(
     stream: &mut std::net::TcpStream,
     chat_calls: Arc<AtomicUsize>,
+    embedding_authorizations: Arc<Mutex<Vec<String>>>,
+    chat_authorizations: Arc<Mutex<Vec<String>>>,
 ) -> std::io::Result<()> {
     // Read the full request (headers + body by Content-Length).
     let mut buf = Vec::new();
@@ -97,8 +117,16 @@ fn handle_conn(
     let request_line = text.lines().next().unwrap_or("");
     let body_start = find_headers_end(&buf).map(|e| e + 4).unwrap_or(buf.len());
     let body = String::from_utf8_lossy(&buf[body_start.min(buf.len())..]).to_lowercase();
+    let authorization = text.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("authorization")
+            .then(|| value.trim().to_string())
+    });
 
     let json_body = if request_line.contains("/v1/embeddings") {
+        if let Some(authorization) = authorization {
+            embedding_authorizations.lock().unwrap().push(authorization);
+        }
         // Vector keyed on the prompt mentioning "france": both France
         // prompts collide (cosine 1.0); the math prompt is orthogonal.
         let vec = if body.contains("france") {
@@ -110,6 +138,9 @@ fn handle_conn(
             r#"{{"object":"list","model":"text-embedding-3-small","data":[{{"object":"embedding","index":0,"embedding":{vec}}}],"usage":{{"prompt_tokens":1,"completion_tokens":0,"total_tokens":1}}}}"#
         )
     } else {
+        if let Some(authorization) = authorization {
+            chat_authorizations.lock().unwrap().push(authorization);
+        }
         // Chat: unique content per call so a cache hit is observable.
         let n = chat_calls.fetch_add(1, Ordering::SeqCst) + 1;
         format!(
@@ -169,11 +200,86 @@ origins:
     )
 }
 
+fn native_config_for(upstream: &str, store_path: &std::path::Path) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: "{}"
+    crypto:
+      pepper: semantic-native-e2e-pepper
+      master_key: semantic-native-e2e-master
+    inbound:
+      native_key_policy:
+        allowed_providers: [openai]
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          provider_type: openai
+          accept_native_credentials_for: openai
+          api_key: "operator-embedding-key"
+          base_url: "{upstream}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+      routing:
+        strategy: round_robin
+      semantic_cache:
+        enabled: true
+        threshold: 0.9
+        ttl_secs: 60
+        max_entries: 64
+        embedding:
+          provider: openai
+          model: text-embedding-3-small
+"#,
+        store_path.display()
+    )
+}
+
 fn chat(prompt: &str) -> serde_json::Value {
     serde_json::json!({
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": prompt}]
     })
+}
+
+#[test]
+fn native_semantic_embedding_keeps_operator_auth_while_primary_uses_caller_auth() {
+    let upstream = MockProvider::start();
+    let temp = tempfile::tempdir().expect("native semantic store tempdir");
+    let proxy = ProxyHarness::start_with_yaml(&native_config_for(
+        &upstream.base_url(),
+        &temp.path().join("keys.redb"),
+    ))
+    .expect("start native semantic proxy");
+    let caller_key = "sk-caller-native-semantic-canary";
+
+    let response = proxy
+        .post_json(
+            "/v1/chat/completions",
+            "ai.localhost",
+            &chat("What is the capital of France?"),
+            &[("authorization", &format!("Bearer {caller_key}"))],
+        )
+        .expect("native semantic request");
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        upstream.embedding_authorizations(),
+        ["Bearer operator-embedding-key"],
+        "semantic embedding is a separate call and must stay on operator auth"
+    );
+    assert_eq!(
+        upstream.chat_authorizations(),
+        [format!("Bearer {caller_key}")],
+        "the selected primary destination receives the caller-owned credential"
+    );
 }
 
 #[test]

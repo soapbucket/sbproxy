@@ -25,13 +25,11 @@ use std::sync::Arc;
 /// header snapshots on hook surfaces (`ClassifyRequest::headers`,
 /// `LookupRequest::request_headers`).
 ///
-/// Redaction is enforced at the snapshot site so hook implementations
-/// never observe raw credential material. The set is deliberately
-/// minimal: it covers the three credential carriers that any HTTP
-/// request can plausibly carry. Hook implementations that need finer
-/// redaction (e.g. cookie-name allow-listing, custom bearer headers)
-/// should redact further on their side rather than asking the proxy to
-/// expand this set.
+/// Redaction is enforced at the snapshot site so hook implementations do not
+/// observe credential material from built-in carriers. Runtime snapshots also
+/// consult the config-aware sensitive-header set, which includes every
+/// `key_management.inbound.headers[].name` and
+/// `provider_hints[].header`.
 ///
 /// Names are matched case-insensitively against
 /// `pingora_http::HeaderName::as_str()`, which is already lower-cased on

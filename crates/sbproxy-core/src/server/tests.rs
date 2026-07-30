@@ -421,9 +421,8 @@ fn webhook_signature_is_stable_per_input() {
 // a TODO. They now carry a snapshot of the inbound request headers
 // produced by `snapshot_request_headers_from`. This test pins the
 // contract: representative headers round-trip lower-cased, and the
-// three credential carriers in `REDACTED_REQUEST_HEADERS`
-// (Authorization, Cookie, Proxy-Authorization) are dropped before
-// any classifier or semantic-cache hook sees them.
+// built-in and config-declared credential carriers are dropped before any
+// classifier or semantic-cache hook sees them.
 fn test_request_header(headers: &[(&str, &str)]) -> pingora_http::RequestHeader {
     let mut req = pingora_http::RequestHeader::build("GET", b"/v1/chat/completions", None)
         .expect("build request header");
@@ -492,6 +491,25 @@ fn snapshot_request_headers_drops_cookie_and_proxy_authorization() {
     assert!(!snap.contains_key("cookie"));
     assert!(!snap.contains_key("proxy-authorization"));
     assert_eq!(snap.get("x-trace-id").map(String::as_str), Some("trace-7"));
+}
+
+#[test]
+fn snapshot_request_headers_drops_configured_native_carrier() {
+    let req = test_request_header(&[
+        ("X-Opaque-Native-Carrier", "opaque-caller-secret"),
+        ("X-Trace-Id", "trace-8"),
+    ]);
+
+    let snap = snapshot_request_headers_from_with_sensitive(&req, |name| {
+        sbproxy_config::types::is_sensitive_header(name) || name == "x-opaque-native-carrier"
+    });
+
+    assert!(!snap.contains_key("x-opaque-native-carrier"));
+    assert_eq!(snap.get("x-trace-id").map(String::as_str), Some("trace-8"));
+    assert!(
+        !format!("{snap:?}").contains("opaque-caller-secret"),
+        "hook snapshot debug output must not contain the credential"
+    );
 }
 
 // --- BotAuth target-uri propagation tests ---

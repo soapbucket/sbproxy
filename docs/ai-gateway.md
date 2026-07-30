@@ -1969,8 +1969,9 @@ What runs before the upgrade:
 - Governed-key identity is resolved before dispatch. Its immutable public key
   id scopes any per-key budget; the plaintext key is never used as a budget
   key or stored on the realtime request context.
-- Provider allow/block policy and native-provider matching constrain the
-  selected Realtime provider. Model allow/block policy is applied to the
+- Provider allow/block policy and explicit native-credential destination
+  binding constrain the selected Realtime provider. `provider_type` alone
+  never authorizes caller-secret forwarding. Model allow/block policy is applied to the
   query model; a required model that is absent fails closed. A
   `route_to_model` override becomes the authoritative upstream query value.
 - Per-key RPM is charged once before upgrade. A credential requiring PII
@@ -1980,15 +1981,19 @@ What runs before the upgrade:
   budget. `block` returns the existing 402 `budget_exceeded` JSON response,
   `log` warns and continues, and `downgrade` makes the target model
   authoritative in the upstream query.
-- One trusted upstream credential is selected: a credential bound to the
-  governed key wins, otherwise the selected provider's nonblank `api_key` is
-  used. If neither exists, the request fails closed with 503 and no upstream
-  WebSocket handshake.
+- One trusted upstream credential is selected. A credential bound to a
+  governed key wins. For admitted native traffic, the caller credential is
+  used only when the selected provider sets a matching
+  `accept_native_credentials_for`; otherwise selection fails before upgrade.
+  All other traffic uses the selected provider's nonblank `api_key`. If no
+  authoritative credential exists, the request fails closed with 503 and no
+  upstream WebSocket handshake.
 
 Credential headers are finalized after ordinary header modifiers and Lua
 scripts. The proxy removes caller-controlled `Authorization`,
 `Proxy-Authorization`, `DPoP`, `x-api-key`, `api-key`, `x-goog-api-key`,
-`x-sb-api`, every resolved/configured inbound key header, the origin
+`x-sb-api`, every primary carrier from `inbound.headers` and
+`inbound.provider_hints`, the origin
 `outbound_credential` presentation header, and the selected credential's own
 header, then inserts exactly one trusted credential. This means a Lua script
 cannot replace the provider credential. Credential carriers cannot claim

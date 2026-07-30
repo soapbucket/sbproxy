@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! AI gateway rate limiting.
 //!
-//! The AI gateway enforces five independent caps per `(apikey, model)`
+//! The AI gateway enforces five independent caps per `(identity, model)`
 //! entity pair:
 //!
 //! - **RPM** - requests per minute
@@ -32,12 +32,10 @@
 //! reservation and releases the concurrency permit. This keeps the
 //! limiter honest in error and panic paths.
 //!
-//! Keying is `(apikey, model)`. The apikey is normally the hashed
-//! identifier the AI auth layer threads through, never the raw key.
-//! An empty apikey falls back to a per-model bucket so unauthenticated
-//! traffic shares one bucket per model. An empty model falls back to
-//! a per-apikey aggregate so callers that omit the model field share
-//! one bucket per key.
+//! Keying is `(identity, model)`. `identity` is an immutable, secret-free
+//! resolved policy/key id. Callers must use an opaque structural fingerprint
+//! for genuinely ungoverned traffic; raw credential text is never a valid
+//! limiter identity.
 
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -47,7 +45,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Default cap on the number of distinct `(apikey, model)` buckets
+/// Default cap on the number of distinct `(identity, model)` buckets
 /// kept in memory. When the LRU is full, the least-recently-used
 /// pair is evicted. Mirrors the WOR-66 rate-limit middleware default.
 pub const DEFAULT_MAX_KEYS: usize = 100_000;
@@ -78,7 +76,7 @@ pub struct ModelRateConfig {
     pub requests_per_day: Option<u64>,
     /// Maximum tokens (input + output) per rolling one-day window.
     pub tokens_per_day: Option<u64>,
-    /// Maximum concurrent in-flight requests for this `(apikey, model)` pair.
+    /// Maximum concurrent in-flight requests for this `(identity, model)` pair.
     pub concurrent: Option<u32>,
 }
 
@@ -204,7 +202,7 @@ impl Drop for Admission {
     }
 }
 
-/// Per-`(apikey, model)` bucket state. Shared by `Arc` so the
+/// Per-`(identity, model)` bucket state. Shared by `Arc` so the
 /// `Admission` handle can refund without holding the outer map lock.
 struct EntityBuckets {
     rpm: Mutex<TokenBucket>,
@@ -347,7 +345,7 @@ impl TokenBucket {
     }
 }
 
-/// Per-`(apikey, model)` rate limiter for the AI gateway.
+/// Per-`(identity, model)` rate limiter for the AI gateway.
 ///
 /// Holds an LRU cap of [`DEFAULT_MAX_KEYS`] entity buckets by
 /// default. The limiter is cheap to clone (it is a single field
@@ -366,7 +364,7 @@ pub struct ModelRateLimiter {
 /// a colon-joined string on every check.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct EntityKey {
-    apikey: String,
+    identity: String,
     model: String,
 }
 
@@ -395,11 +393,11 @@ impl ModelRateLimiter {
         self.default_estimated_tokens = est;
     }
 
-    /// Look up the bucket-bundle for an `(apikey, model)` pair,
+    /// Look up the bucket-bundle for an `(identity, model)` pair,
     /// constructing it from `cfg` on first use.
-    fn entity(&self, apikey: &str, model: &str, cfg: &ModelRateConfig) -> Arc<EntityBuckets> {
+    fn entity(&self, identity: &str, model: &str, cfg: &ModelRateConfig) -> Arc<EntityBuckets> {
         let key = EntityKey {
-            apikey: apikey.to_string(),
+            identity: identity.to_string(),
             model: model.to_string(),
         };
         let mut map = self.inner.lock();
@@ -413,8 +411,8 @@ impl ModelRateLimiter {
 
     /// Admit a request against every configured axis.
     ///
-    /// `apikey` is the per-request identifier (hashed token, never
-    /// the raw key). `model` is the upstream model name. `cfg`
+    /// `identity` is the immutable, secret-free resolved policy/key id.
+    /// `model` is the upstream model name. `cfg`
     /// supplies the caps. `estimated_tokens` is the pre-flight
     /// token reservation charged against TPM / TPD; pass `None`
     /// to use the limiter's configured default reservation
@@ -427,14 +425,14 @@ impl ModelRateLimiter {
     /// value in seconds.
     pub fn admit(
         &self,
-        apikey: &str,
+        identity: &str,
         model: &str,
         cfg: &ModelRateConfig,
         estimated_tokens: Option<u64>,
     ) -> Result<Admission, Rejection> {
         // Tenant-blind entry point retained for existing callers and
         // tests; rejections roll up to the empty-tenant bucket.
-        self.admit_with_tenant(apikey, model, "", cfg, estimated_tokens)
+        self.admit_with_tenant(identity, model, "", cfg, estimated_tokens)
     }
 
     /// WOR-1096: tenant-attributed admission. Identical to
@@ -443,14 +441,14 @@ impl ModelRateLimiter {
     /// hits its TPM/RPM cap is distinguishable from global pressure.
     pub fn admit_with_tenant(
         &self,
-        apikey: &str,
+        identity: &str,
         model: &str,
         tenant: &str,
         cfg: &ModelRateConfig,
         estimated_tokens: Option<u64>,
     ) -> Result<Admission, Rejection> {
         let est = estimated_tokens.unwrap_or(self.default_estimated_tokens);
-        let bucket = self.entity(apikey, model, cfg);
+        let bucket = self.entity(identity, model, cfg);
         let now = Instant::now();
 
         // Acquire the concurrency permit first; it is the cheapest
@@ -460,14 +458,14 @@ impl ModelRateLimiter {
         let permit = match Arc::clone(&bucket.concurrent).try_acquire_owned() {
             Ok(p) => Some(p),
             Err(_) => {
-                return Err(self.reject(apikey, model, tenant, RejectReason::Concurrent, 1));
+                return Err(self.reject(identity, model, tenant, RejectReason::Concurrent, 1));
             }
         };
 
         // RPM
         if let Err(retry) = bucket.rpm.lock().try_acquire(1.0, now) {
             return Err(self.reject(
-                apikey,
+                identity,
                 model,
                 tenant,
                 RejectReason::RequestsPerMinute,
@@ -479,20 +477,26 @@ impl ModelRateLimiter {
             // Refund RPM so a daily reject does not eat a minute
             // slot we will never use.
             bucket.rpm.lock().refund(1.0);
-            return Err(self.reject(apikey, model, tenant, RejectReason::RequestsPerDay, retry));
+            return Err(self.reject(identity, model, tenant, RejectReason::RequestsPerDay, retry));
         }
         // TPM
         if let Err(retry) = bucket.tpm.lock().try_acquire(est as f64, now) {
             bucket.rpm.lock().refund(1.0);
             bucket.rpd.lock().refund(1.0);
-            return Err(self.reject(apikey, model, tenant, RejectReason::TokensPerMinute, retry));
+            return Err(self.reject(
+                identity,
+                model,
+                tenant,
+                RejectReason::TokensPerMinute,
+                retry,
+            ));
         }
         // TPD
         if let Err(retry) = bucket.tpd.lock().try_acquire(est as f64, now) {
             bucket.rpm.lock().refund(1.0);
             bucket.rpd.lock().refund(1.0);
             bucket.tpm.lock().refund(est as f64);
-            return Err(self.reject(apikey, model, tenant, RejectReason::TokensPerDay, retry));
+            return Err(self.reject(identity, model, tenant, RejectReason::TokensPerDay, retry));
         }
 
         Ok(Admission {
@@ -510,13 +514,13 @@ impl ModelRateLimiter {
     /// lockstep with the metric.
     fn reject(
         &self,
-        apikey: &str,
+        identity: &str,
         model: &str,
         tenant: &str,
         reason: RejectReason,
         retry: u64,
     ) -> Rejection {
-        crate::ai_metrics::record_ratelimit_rejected(reason.axis_label(), apikey, tenant, model);
+        crate::ai_metrics::record_ratelimit_rejected(reason.axis_label(), identity, tenant, model);
         Rejection {
             reason,
             retry_after_secs: retry,
@@ -538,7 +542,7 @@ impl ModelRateLimiter {
     pub fn check_rate(&self, provider: &str, model: &str, config: &ModelRateConfig) -> bool {
         // The legacy entry point keyed on `provider:model`; preserve
         // that shape under the new API by treating the provider as
-        // the apikey for backward compatibility with old callers.
+        // the identity for backward compatibility with old callers.
         match self.admit(provider, model, config, Some(0)) {
             Ok(admission) => {
                 // Reconcile to 0 so the bucket releases the permit
@@ -560,7 +564,7 @@ impl ModelRateLimiter {
     )]
     pub fn record_tokens(&self, provider: &str, model: &str, tokens: u64) {
         let key = EntityKey {
-            apikey: provider.to_string(),
+            identity: provider.to_string(),
             model: model.to_string(),
         };
         let map = self.inner.lock();
@@ -849,7 +853,7 @@ mod tests {
         use crate::ai_metrics::ratelimit_rejected_value;
         let limiter = ModelRateLimiter::new();
         let c = cfg(Some(1), None, None, None, None);
-        // Use a unique apikey + model so we don't collide with any
+        // Use a unique identity + model so we don't collide with any
         // other test that touches the same global counter.
         let key = "metric-test-key-rpm";
         let model = "metric-test-model";

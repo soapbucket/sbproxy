@@ -882,10 +882,27 @@ impl AiHandlerConfig {
         // WOR-603: validate each provider's base_url at config load so an
         // SSRF target (file://, link-local metadata, loopback, ...) fails
         // fast here rather than being dispatched at request time.
+        let mut provider_names = std::collections::HashSet::new();
+        for provider in &config.providers {
+            if !provider_names.insert(provider.name.as_str()) {
+                anyhow::bail!(
+                    "ai provider name {:?} is configured more than once",
+                    provider.name
+                );
+            }
+        }
         for provider in &config.providers {
             provider.validate_managed_model().map_err(|error| {
                 anyhow::anyhow!("ai provider {:?} managed model: {error}", provider.name)
             })?;
+            provider
+                .validate_native_credential_binding()
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "ai provider {:?} native credential binding: {error}",
+                        provider.name
+                    )
+                })?;
             provider
                 .validate_base_url()
                 .map_err(|e| anyhow::anyhow!("ai provider {:?} base_url: {e}", provider.name))?;
@@ -2087,6 +2104,44 @@ mod tests {
             err.contains("openai"),
             "error suggests the canonical name: {err}"
         );
+    }
+
+    #[test]
+    fn from_config_rejects_duplicate_provider_destination_names() {
+        let err = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "primary", "base_url": "https://one.example/v1"},
+                {"name": "primary", "base_url": "https://two.example/v1"}
+            ]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("configured more than once"), "{err}");
+    }
+
+    #[test]
+    fn from_config_validates_native_credential_destination_binding() {
+        let err = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "primary",
+                "provider_type": "openai",
+                "base_url": "https://8.8.8.8/v1",
+                "accept_native_credentials_for": "anthropic"
+            }]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("native credential binding"), "{err}");
+
+        assert!(AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "primary",
+                "provider_type": "openai",
+                "base_url": "https://8.8.8.8/v1",
+                "accept_native_credentials_for": "openai"
+            }]
+        }))
+        .is_ok());
     }
 
     #[test]

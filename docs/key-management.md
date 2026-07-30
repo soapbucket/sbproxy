@@ -43,7 +43,7 @@ proxy:
       pepper: env:SBPROXY_KEY_PEPPER       # HMAC key for inbound hashing
       master_key: env:SBPROXY_KEY_MASTER   # envelope key for upstream creds
     inbound:
-      headers:                             # swept in order; first match wins
+      headers:                             # one minted token resolves; conflicts deny
         - {name: authorization, scheme: "Bearer "}
         - {name: x-api-key,     scheme: ""}
         - {name: x-sb-api,      scheme: ""}
@@ -81,18 +81,19 @@ holds the key you would have to have resolved the key already. The default
 covers the three common shapes and you can add your own.
 
 A minted token looks like `sbp_<16 hex>_<64 hex>`, a fixed 85 characters over a
-fixed alphabet. That means a swept header is accepted or rejected on length and
-prefix alone, with no store lookup, so sweeping a header your origin already
-proxies cannot misfire. A caller presenting their own `sk-proj-...` or
-`sk-ant-...` provider key is governed by the native-key policy described below
-and, when allowed, passes through to the upstream that owns it.
+fixed alphabet. SBproxy recognizes that shape before store access, then looks
+up the public key id and verifies the secret. Shape recognition alone never
+authenticates a request. A caller presenting their own `sk-proj-...` or
+`sk-ant-...` provider key enters the native-key policy described below and,
+when allowed, passes through to the upstream that owns it.
 
 The configured carrier list is also the lookup surface for legacy stored
 `sk-<id>-<secret>` keys and exact `credentials: {type: ai_provider}` values on
-AI routes. Resolution order is canonical `sbp_...`, stored legacy key, exact
-configured credential, then provider-native policy. The winning governed
-carrier is removed before dispatch, so its caller secret cannot accompany the
-operator's provider credential upstream.
+AI routes. Resolution order is canonical `sbp_...`, stored legacy key, a
+verified OIDC/JWT claim mapped to a stored record, exact configured credential,
+then provider-native policy. The winning governed carrier is removed before
+dispatch, so that presented value does not accompany the operator's provider
+credential upstream.
 
 ### Two ways to use it
 
@@ -147,25 +148,41 @@ model. Multipart and non-POST responses do not yet settle token/cost counters,
 so those fields are admission signals rather than strict usage ceilings on
 those surfaces.
 
-Limits are bucketed by tenant, origin, and recognized provider; no credential
-bytes are hashed, retained, or used as an identifier.
+Limits are bucketed by tenant, origin, and recognized provider. The native
+policy identity is built from those labels and contains no credential bytes.
 
 On a generic proxy route, an allowed caller-owned credential passes upstream
 unchanged, even when that origin also configures `outbound_credential`: native
 mode represents an explicit caller-owned identity, so the origin credential
-must not replace it. On an AI route, it can select only configured providers whose
-`provider_type` (or provider name when no type is set) matches the recognized
-provider, and it replaces that provider's configured `api_key` for this request
-only. This precedence prevents native-key traffic from silently spending the
-operator credential. If the credential cannot be re-resolved or no matching AI
-provider exists, the request fails before any upstream call. Minted `sbp_...`
-keys always take precedence and never enter native-key policy resolution.
+must not replace it. An AI provider must opt in as an exact credential
+destination. Set `accept_native_credentials_for` to the canonical hint label,
+and make it match the provider's wire type:
 
-Confidence cascade routing is unavailable for native credentials and returns
-503 before request-body processing, cache or idempotency lookup, managed-model
-preparation, streaming dispatch, or the first upstream tier. A cascade can move
-between billable providers, but the caller authorized only the provider
-represented by their credential.
+```yaml
+action:
+  type: ai_proxy
+  providers:
+    - name: openai-primary
+      provider_type: openai
+      accept_native_credentials_for: openai
+      base_url: https://api.openai.com/v1
+      api_key: ${OPENAI_API_KEY} # used when the caller is not in native mode
+```
+
+The opt-in belongs to this provider entry and its effective `base_url`.
+`provider_type` selects the wire format; it does not grant a destination access
+to caller credentials. Without the opt-in, a custom endpoint that speaks the
+OpenAI protocol receives only its operator credential. If the native
+credential cannot be re-resolved or no opted-in provider exists, the request
+fails before an upstream call. Minted `sbp_...` keys take precedence and never
+enter native-key policy resolution.
+
+Confidence cascade and race routing are unavailable for native credentials.
+Cascade returns 503 and race returns 403 before request-body processing, cache
+or idempotency lookup, managed-model preparation, streaming dispatch, or the
+first upstream attempt. Sequential fallback can use another provider only when
+that provider entry has its own matching `accept_native_credentials_for`
+binding.
 For the same reason, configured shadow copies are suppressed for native
 traffic: the primary response proceeds normally, while neither the caller
 credential nor an operator credential is sent to the shadow target.

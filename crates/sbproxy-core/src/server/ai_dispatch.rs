@@ -15,11 +15,7 @@ fn provider_matches_native_key(
     provider: &sbproxy_ai::ProviderConfig,
     native_provider: &str,
 ) -> bool {
-    provider
-        .provider_type
-        .as_deref()
-        .unwrap_or(provider.name.as_str())
-        .eq_ignore_ascii_case(native_provider)
+    provider.accepts_native_credential_for(native_provider)
 }
 
 fn apply_native_provider_credential(
@@ -28,6 +24,51 @@ fn apply_native_provider_credential(
 ) {
     if let Some(api_key) = native_api_key {
         provider.api_key = Some(api_key.to_string());
+    }
+}
+
+#[cfg(test)]
+mod native_destination_tests {
+    use super::{model_rate_limit_identity, provider_matches_native_key};
+
+    #[test]
+    fn provider_wire_type_is_not_native_credential_authority() {
+        let unbound: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "custom-openai-wire",
+            "provider_type": "openai",
+            "base_url": "https://untrusted.example/v1"
+        }))
+        .unwrap();
+        assert!(!provider_matches_native_key(&unbound, "openai"));
+
+        let bound: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "trusted-openai-wire",
+            "provider_type": "openai",
+            "base_url": "https://trusted.example/v1",
+            "accept_native_credentials_for": "openai"
+        }))
+        .unwrap();
+        assert!(provider_matches_native_key(&bound, " OPENAI "));
+    }
+
+    #[test]
+    fn model_limiter_identity_is_carrier_independent_and_secret_free() {
+        let mut authorization = crate::context::RequestContext::new();
+        authorization.tenant_id = "tenant-a".into();
+        authorization.principal.attrs.key_id = Some("resolved-key-id".to_string());
+        authorization.inbound_key_header = Some("authorization".to_string());
+        authorization.request_id = "opaque-caller-secret-canary".into();
+
+        let mut custom = crate::context::RequestContext::new();
+        custom.tenant_id = "tenant-a".into();
+        custom.principal.attrs.key_id = Some("resolved-key-id".to_string());
+        custom.inbound_key_header = Some("x-opaque-carrier".to_string());
+
+        let first = model_rate_limit_identity(&authorization, "api.example");
+        let second = model_rate_limit_identity(&custom, "api.example");
+        assert_eq!(first, "resolved-key-id");
+        assert_eq!(first, second);
+        assert!(!first.contains("opaque-caller-secret-canary"));
     }
 }
 
@@ -766,6 +807,31 @@ fn immutable_budget_key_id(ctx: &RequestContext) -> Option<String> {
         })
 }
 
+/// Immutable, secret-free identity used by the per-model limiter.
+///
+/// Governed traffic uses the resolved policy/key id. Only genuinely
+/// ungoverned traffic falls back to an opaque fingerprint of structural
+/// request identity; wire credential text and carrier names are never inputs.
+fn model_rate_limit_identity(ctx: &RequestContext, hostname: &str) -> String {
+    if let Some(key_id) = immutable_budget_key_id(ctx) {
+        return key_id;
+    }
+
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    for component in [
+        ctx.tenant_id.as_ref(),
+        hostname,
+        ctx.principal.source.as_str(),
+        ctx.principal.sub.as_str(),
+    ] {
+        hasher.update(component.len().to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
+    let digest = hex::encode(hasher.finalize());
+    format!("ungoverned:{}", &digest[..32])
+}
+
 async fn ai_surface_budget_gate(
     session: &Session,
     config: &AiHandlerConfig,
@@ -871,7 +937,9 @@ pub(super) async fn realtime_budget_gate(
         .flatten();
     let provider = config.providers.iter().find(|provider| {
         provider.enabled
-            && sbproxy_ai::api_routes::provider_supports_realtime(&provider.name)
+            && sbproxy_ai::api_routes::provider_supports_realtime(
+                provider.effective_provider_type(),
+            )
             && sbproxy_ai::routing::provider_allowed_by_policy(
                 provider.name.as_str(),
                 allowed_providers,
@@ -2265,6 +2333,18 @@ pub(super) async fn handle_ai_proxy(
             session,
             503,
             "native provider keys are unavailable for confidence cascade routing",
+        )
+        .await?;
+        return Ok(());
+    }
+    if ctx.inbound_key_mode == crate::context::InboundKeyMode::Native && router.is_race() {
+        // Race deliberately fans one request out to multiple destinations.
+        // A caller-owned provider secret has one authoritative destination
+        // and must not be copied into concurrent attempts.
+        send_error(
+            session,
+            403,
+            "native provider keys are unavailable for race routing",
         )
         .await?;
         return Ok(());
@@ -4151,14 +4231,11 @@ pub(super) async fn handle_ai_proxy(
     // their byte-size budgets land at reconcile time the same way the
     // WOR-223 default path handles them.
     //
-    // The reservation is keyed on the hashed authorization value the
-    // budget block already extracted shape-for-shape (or an empty
-    // string when no header was sent). When `model_rate_limits` does
-    // not list the resolved model, the limiter still books a per-key
-    // reservation against a zero-cap bucket and admits the request
-    // without gating, so the cost of a miss is one HashMap lookup.
+    // The reservation is keyed on the immutable resolved policy/key identity.
+    // Genuinely ungoverned requests use an opaque structural fingerprint;
+    // credential header text is never read by this limiter.
     if let Some(rate_cfg) = config.model_rate_limits.get(&model) {
-        let apikey = req_header_value(session, "authorization").unwrap_or_default();
+        let rate_identity = model_rate_limit_identity(ctx, hostname);
         let parsed_messages = body
             .get("messages")
             .and_then(|v| v.as_array())
@@ -4170,7 +4247,7 @@ pub(super) async fn handle_ai_proxy(
             .unwrap_or_default();
         let estimated = sbproxy_ai::estimate_tokens(&model, &parsed_messages);
         match AI_MODEL_RATE_LIMITER.admit_with_tenant(
-            &apikey,
+            &rate_identity,
             &model,
             ctx.tenant_id.as_ref(),
             rate_cfg,
@@ -4962,11 +5039,10 @@ pub(super) async fn handle_ai_proxy(
                                 )
                         }) {
                             Some(provider) => {
-                                let mut resolved_provider = provider.clone();
-                                apply_native_provider_credential(
-                                    &mut resolved_provider,
-                                    native_api_key.as_deref(),
-                                );
+                                // Embedding is a separate provider call. Keep
+                                // it on the operator credential rather than
+                                // replaying a caller-owned native secret.
+                                let resolved_provider = provider.clone();
                                 let reservation_id =
                                     format!("{}:quota-pool:embedding:provider", ctx.request_id);
                                 let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
@@ -12060,6 +12136,55 @@ mod external_guardrail_context_tests {
             "refusal must precede model routing and managed-local preparation"
         );
         response
+    }
+
+    #[tokio::test]
+    async fn native_race_refuses_before_cache_or_upstream_side_effects() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "accept_native_credentials_for": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "routing": "race"
+        }))
+        .expect("race proxy config");
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.inbound_key_mode = crate::context::InboundKeyMode::Native;
+        context.native_key_provider = Some("openai".to_string());
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("native race refusal is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            response.contains("native provider keys are unavailable for race routing"),
+            "{response}"
+        );
+        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

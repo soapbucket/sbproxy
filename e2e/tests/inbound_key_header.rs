@@ -514,6 +514,8 @@ fn an_ai_route_uses_the_callers_native_key_instead_of_the_operator_key() {
       type: ai_proxy
       providers:
         - name: openai
+          provider_type: openai
+          accept_native_credentials_for: openai
           api_key: operator-key-must-not-be-billed
           base_url: http://127.0.0.1:{}
           allow_private_base_url: true
@@ -550,6 +552,38 @@ fn an_ai_route_uses_the_callers_native_key_instead_of_the_operator_key() {
     );
 }
 
+#[test]
+fn an_unbound_custom_ai_destination_never_receives_a_callers_native_key() {
+    let admin_port = free_port();
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let ai_origin = format!(
+        r#"  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: custom-openai-wire
+          provider_type: openai
+          api_key: operator-key
+          base_url: http://127.0.0.1:{}
+          allow_private_base_url: true
+          models: [gpt-test]
+"#,
+        upstream.port
+    );
+    let harness = ProxyHarness::start_with_yaml(&config(admin_port, upstream.port, &ai_origin))
+        .expect("proxy starts");
+
+    let response = native_ai_request(&harness, "gpt-test");
+    assert_eq!(response.status().as_u16(), 403);
+    assert!(
+        upstream
+            .seen
+            .recv_timeout(Duration::from_millis(200))
+            .is_err(),
+        "wire format and a custom base URL must not authorize caller-secret forwarding"
+    );
+}
+
 fn native_ai_request(harness: &ProxyHarness, model: &str) -> reqwest::blocking::Response {
     reqwest::blocking::Client::new()
         .post(format!("{}/v1/chat/completions", harness.base_url()))
@@ -571,6 +605,7 @@ fn openai_origin(upstream_port: u16, action_extra: &str) -> String {
       providers:
         - name: openai
           provider_type: openai
+          accept_native_credentials_for: openai
           api_key: operator-key-must-not-be-billed
           base_url: http://127.0.0.1:{upstream_port}
           allow_private_base_url: true
@@ -761,6 +796,48 @@ fn minted_denials_emit_secret_free_mode_metrics_and_audit() {
     );
 }
 
+#[test]
+fn wildcard_access_logs_exclude_custom_native_provider_carriers() {
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let admin_port = free_port();
+    let yaml = config(admin_port, upstream.port, "")
+        .replace(
+            "      require: false\n",
+            "      require: false\n      provider_hints:\n        - provider: custom\n          header: x-opaque-native-carrier\n          value_prefix: opaque-\n",
+        )
+        .replace(
+            "          - openai\n",
+            "          - openai\n          - custom\n",
+        );
+    let yaml = format!(
+        "{yaml}\naccess_log:\n  enabled: true\n  capture_headers:\n    request: [\"*\"]\nobservability:\n  log:\n    sinks:\n      - name: stdout\n        format: json\n        profile: internal\n"
+    );
+    let harness =
+        ProxyHarness::start_with_workspace(&yaml, &[]).expect("proxy with captured logs starts");
+    let canary = "opaque-caller-secret-canary";
+
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{}/native", harness.base_url()))
+        .header("Host", "tools.local")
+        .header("x-opaque-native-carrier", canary)
+        .send()
+        .expect("native request");
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        upstream.next_request().get("x-opaque-native-carrier"),
+        Some(canary),
+        "generic proxying preserves caller-owned provider credentials"
+    );
+
+    std::thread::sleep(Duration::from_millis(100));
+    let logs = harness.stdout_contents();
+    assert!(logs.contains("request_headers"), "{logs}");
+    assert!(
+        !logs.contains(canary),
+        "wildcard header capture leaked the custom native credential: {logs}"
+    );
+}
+
 fn openai_origin_with_configured_key(upstream_port: u16) -> String {
     format!(
         r#"  ai.local:
@@ -948,6 +1025,67 @@ fn native_policy_enforces_rate_and_budget_limits() {
 }
 
 #[test]
+fn model_limiter_shares_resolved_identity_across_native_carriers_without_leaking_secrets() {
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let admin_port = free_port();
+    let model = "gpt-model-limiter-carrier-regression";
+    let action_extra =
+        format!("      model_rate_limits:\n        {model}:\n          requests_per_minute: 1\n");
+    let origin = openai_origin(upstream.port, &action_extra)
+        .replace("models: [gpt-test]", &format!("models: [{model}]"));
+    let yaml = config(admin_port, upstream.port, &origin)
+        .replace(
+            "      require: false\n",
+            "      require: false\n      provider_hints:\n        - provider: openai\n          header: authorization\n          scheme: \"Bearer \"\n          value_prefix: \"sk-\"\n        - provider: openai\n          header: x-opaque-native-carrier\n          value_prefix: \"opaque-\"\n",
+        );
+    let yaml = format!("{yaml}\nobservability:\n  metrics:\n    enabled: true\n");
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("proxy starts");
+
+    assert_eq!(native_ai_request(&harness, model).status().as_u16(), 200);
+    let _ = upstream.next_request();
+
+    let canary = "opaque-caller-secret-canary";
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{}/v1/chat/completions", harness.base_url()))
+        .header("Host", "ai.local")
+        .header("x-opaque-native-carrier", canary)
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .expect("AI proxy response");
+    assert_eq!(
+        response.status().as_u16(),
+        429,
+        "one resolved native identity must share its model bucket across carriers"
+    );
+    upstream.assert_no_request("the shared model RPM bucket must block the second dispatch");
+
+    let metrics = harness
+        .get("/metrics", "tools.local")
+        .expect("metrics response")
+        .text()
+        .expect("metrics UTF-8");
+    assert!(
+        metrics.contains("sbproxy_ai_ratelimit_rejected_total"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("native:") && metrics.contains(":ai.local:openai"),
+        "the rendered metric must expose only the immutable native key id: {metrics}"
+    );
+    assert!(
+        !metrics.contains(canary),
+        "metrics leaked {canary}: {metrics}"
+    );
+    assert!(
+        !metrics.contains("sk-caller-owned-ai"),
+        "metrics leaked the authorization credential: {metrics}"
+    );
+}
+
+#[test]
 fn native_policy_enforces_rpm_on_generic_proxy_traffic() {
     let upstream = StubUpstream::start().expect("stub upstream");
     let admin_port = free_port();
@@ -1118,6 +1256,7 @@ fn native_keys_suppress_shadow_copies_without_affecting_primary() {
       providers:
         - name: openai
           provider_type: openai
+          accept_native_credentials_for: openai
           api_key: operator-primary-key
           base_url: http://127.0.0.1:{}
           allow_private_base_url: true

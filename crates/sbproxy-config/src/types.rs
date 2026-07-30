@@ -1919,9 +1919,10 @@ impl NativeKeyPolicyConfig {
 /// already. So extraction is configured per route here rather than per key.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct KeyInboundConfig {
-    /// Ordered candidate headers. The first value whose shape parses wins.
-    /// An empty list disables the sweep and leaves the legacy `authorization`
-    /// path as the only front door.
+    /// Ordered candidate headers. One well-shaped minted token resolves; two
+    /// distinct tokens are ambiguous and fail closed. An empty list disables
+    /// the sweep and leaves the legacy `authorization` path as the only front
+    /// door.
     #[serde(default = "default_inbound_headers")]
     pub headers: Vec<InboundHeaderConfig>,
     /// Deny with 401 when no minted key resolved. Off by default, so an
@@ -1930,9 +1931,9 @@ pub struct KeyInboundConfig {
     #[serde(default)]
     pub require: bool,
     /// Ordered rules attributing a native (non-minted) inbound credential to
-    /// a provider. First match wins, so more specific value prefixes belong
-    /// before general ones. Attribution never refuses a request: a credential
-    /// matching no rule is admitted unattributed.
+    /// a provider. First matching hint wins, so more specific value prefixes
+    /// belong before general ones. A matching hint then enters native-key
+    /// policy admission; a credential matching no hint remains unattributed.
     #[serde(default = "default_provider_hints")]
     pub provider_hints: Vec<ProviderHintConfig>,
     /// Explicit default policy for recognized caller-owned native provider
@@ -2011,6 +2012,8 @@ pub fn credential_header_is_reserved(header: &str) -> bool {
             lower.as_str(),
             "upgrade"
                 | "openai-beta"
+                | "proxy-authorization"
+                | "proxy-authenticate"
                 | "traceparent"
                 | "tracestate"
                 | "signature-input"
@@ -2083,6 +2086,12 @@ impl KeyInboundConfig {
                     ));
                 }
             }
+            if credential_header_is_reserved(&hint.header) {
+                return Err(format!(
+                    "key_management.inbound.provider_hints: {:?} may not carry a key",
+                    hint.header
+                ));
+            }
         }
         if let Some(policy) = &self.native_key_policy {
             if policy.allowed_providers.is_empty() {
@@ -2136,6 +2145,28 @@ impl KeyInboundConfig {
             .iter()
             .map(|entry| entry.name.trim().to_ascii_lowercase())
             .collect()
+    }
+
+    /// Lowercased union of every primary header that may carry an inbound
+    /// credential.
+    ///
+    /// This includes minted/configured carriers and provider-hint carriers.
+    /// `provider_hints[].also_header` is deliberately excluded: it is only
+    /// match metadata and never contains the credential value.
+    pub fn credential_carrier_names(&self) -> Vec<String> {
+        let mut names = Vec::with_capacity(self.headers.len() + self.provider_hints.len());
+        for name in self
+            .headers
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .chain(self.provider_hints.iter().map(|hint| hint.header.as_str()))
+        {
+            let canonical = name.trim().to_ascii_lowercase();
+            if !canonical.is_empty() && !names.contains(&canonical) {
+                names.push(canonical);
+            }
+        }
+        names
     }
 }
 
@@ -4270,10 +4301,10 @@ pub const SENSITIVE_HEADER_DENYLIST: &[&str] = &[
 /// Extra header names excluded from `*` and glob capture, on top of
 /// [`SENSITIVE_HEADER_DENYLIST`].
 ///
-/// Holds whatever `key_management.inbound.headers` names, set at load and on
-/// every reload. Without it an operator who sweeps a custom header would have
-/// that header captured by a `capture_headers: ["*"]` glob, and the value it
-/// carries is a live minted key.
+/// Holds every primary carrier named by `key_management.inbound.headers` and
+/// `key_management.inbound.provider_hints`, set at load and on every reload.
+/// Without it a custom carrier could be captured by a
+/// `capture_headers: ["*"]` glob.
 static EXTRA_SENSITIVE_HEADERS: std::sync::OnceLock<
     std::sync::RwLock<std::sync::Arc<Vec<String>>>,
 > = std::sync::OnceLock::new();
@@ -4283,7 +4314,7 @@ fn extra_sensitive_slot() -> &'static std::sync::RwLock<std::sync::Arc<Vec<Strin
 }
 
 /// Replace the operator-configured set of key-bearing headers that globs must
-/// never capture. Pass [`KeyInboundConfig::header_names`].
+/// never capture. Pass [`KeyInboundConfig::credential_carrier_names`].
 pub fn set_extra_sensitive_headers(names: Vec<String>) {
     let lowered: Vec<String> = names
         .into_iter()
@@ -4296,7 +4327,7 @@ pub fn set_extra_sensitive_headers(names: Vec<String>) {
 }
 
 /// Whether `header_name` is sensitive: on the built-in denylist, or named by
-/// the operator's inbound key sweep.
+/// the operator's inbound credential configuration.
 pub fn is_sensitive_header(header_name: &str) -> bool {
     if SENSITIVE_HEADER_DENYLIST.contains(&header_name) {
         return true;
@@ -9335,6 +9366,96 @@ native_key_policy:
             native_key_policy: None,
         };
         assert_eq!(cfg.header_names(), ["x-tool-auth"]);
+    }
+
+    #[test]
+    fn credential_carrier_names_include_provider_hint_headers_only() {
+        let cfg = KeyInboundConfig {
+            headers: vec![
+                InboundHeaderConfig {
+                    name: "  X-Tool-Auth  ".into(),
+                    scheme: String::new(),
+                },
+                InboundHeaderConfig {
+                    name: "Authorization".into(),
+                    scheme: "Bearer ".into(),
+                },
+            ],
+            require: false,
+            provider_hints: vec![
+                ProviderHintConfig {
+                    provider: "openai".into(),
+                    header: "X-Native-Provider-Key".into(),
+                    scheme: String::new(),
+                    value_prefix: "native-".into(),
+                    also_header: Some("X-Provider-Version".into()),
+                },
+                ProviderHintConfig {
+                    provider: "openai".into(),
+                    header: "authorization".into(),
+                    scheme: "Bearer ".into(),
+                    value_prefix: "sk-".into(),
+                    also_header: None,
+                },
+            ],
+            native_key_policy: None,
+        };
+
+        assert_eq!(
+            cfg.credential_carrier_names(),
+            ["x-tool-auth", "authorization", "x-native-provider-key"]
+        );
+        assert!(
+            !cfg.credential_carrier_names()
+                .contains(&"x-provider-version".to_string()),
+            "also_header is match metadata, not a credential carrier"
+        );
+    }
+
+    #[test]
+    fn provider_hint_primary_carriers_reuse_reserved_header_rules() {
+        for reserved in [
+            "cookie",
+            "host",
+            "traceparent",
+            "proxy-authorization",
+            "sec-websocket-protocol",
+        ] {
+            let cfg = KeyInboundConfig {
+                headers: Vec::new(),
+                require: false,
+                provider_hints: vec![ProviderHintConfig {
+                    provider: "openai".into(),
+                    header: reserved.into(),
+                    scheme: String::new(),
+                    value_prefix: String::new(),
+                    also_header: None,
+                }],
+                native_key_policy: None,
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "{reserved} must not be a provider-hint credential carrier"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_hint_match_metadata_may_use_reserved_headers() {
+        let cfg = KeyInboundConfig {
+            headers: Vec::new(),
+            require: false,
+            provider_hints: vec![ProviderHintConfig {
+                provider: "openai".into(),
+                header: "x-provider-key".into(),
+                scheme: String::new(),
+                value_prefix: String::new(),
+                also_header: Some("traceparent".into()),
+            }],
+            native_key_policy: None,
+        };
+
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

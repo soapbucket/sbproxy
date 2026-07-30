@@ -195,6 +195,7 @@ origins:
       providers:
         - name: anthropic
           provider_type: anthropic
+          accept_native_credentials_for: anthropic
           api_key: "operator-key-must-not-be-used"
           base_url: "{upstream_base}"
           allow_private_base_url: true

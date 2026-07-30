@@ -1370,6 +1370,7 @@ Peak EWMA accepts the object form:
 | `provider_type` | string | inferred from `name` | Provider type (`openai`, `anthropic`, `google`, etc.). |
 | `deployment` | string | required for `managed_model` | Canonical `proxy.model_host.deployments` ID. Valid only when `provider_type: managed_model`. |
 | `api_key` | string | | API key used to authenticate with the upstream. |
+| `accept_native_credentials_for` | string | unset | Explicitly allow this provider entry and its effective `base_url` to receive caller-owned native credentials for the named canonical provider, such as `openai`. Must match `provider_type` (or `name` when no type is set). Rejected for managed and locally served providers. |
 | `base_url` | string | provider default | Override the upstream base URL. Validated at config load: non-`http(s)` schemes and private/loopback targets are rejected as SSRF risks unless `allow_private_base_url` is set. |
 | `allow_private_base_url` | bool | `false` | Allow `base_url` to point at a loopback/private address (a local model server). The scheme check still applies. |
 | `models` | list | `[]` | Models served by this provider; empty defers to the provider catalog. |

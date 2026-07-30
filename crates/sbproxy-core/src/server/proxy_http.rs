@@ -633,11 +633,7 @@ fn realtime_native_provider_credential(
     hints: &[sbproxy_config::types::ProviderHintConfig],
     native_provider: &str,
 ) -> Option<RealtimeCredential> {
-    let effective_provider = provider
-        .provider_type
-        .as_deref()
-        .unwrap_or(provider.name.as_str());
-    if !effective_provider.eq_ignore_ascii_case(native_provider) {
+    if !provider.accepts_native_credential_for(native_provider) {
         return None;
     }
     let api_key =
@@ -1320,7 +1316,7 @@ impl ProxyHttp for SbProxy {
                 realtime_inbound_key_headers.push(header.clone());
             }
             if let Some(plane) = crate::key_plane::current_key_plane() {
-                realtime_inbound_key_headers.extend(plane.inbound().header_names());
+                realtime_inbound_key_headers.extend(plane.inbound().credential_carrier_names());
             }
         }
 
@@ -6028,8 +6024,8 @@ mod tests {
     }
 
     #[test]
-    fn realtime_native_credential_replaces_operator_key_for_matching_provider_only() {
-        let provider: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
+    fn realtime_native_credential_requires_exact_destination_binding() {
+        let unbound: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
             "name": "primary",
             "provider_type": "openai",
             "api_key": "operator-key-must-not-be-billed"
@@ -6042,8 +6038,26 @@ mod tests {
         );
         let inbound = sbproxy_config::types::KeyInboundConfig::default();
 
+        assert!(
+            realtime_native_provider_credential(
+                &unbound,
+                &headers,
+                &inbound.provider_hints,
+                "openai",
+            )
+            .is_none(),
+            "wire format alone must not authorize caller-secret forwarding"
+        );
+
+        let bound: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "primary",
+            "provider_type": "openai",
+            "api_key": "operator-key-must-not-be-billed",
+            "accept_native_credentials_for": "openai"
+        }))
+        .unwrap();
         let credential = realtime_native_provider_credential(
-            &provider,
+            &bound,
             &headers,
             &inbound.provider_hints,
             "openai",
@@ -6053,7 +6067,7 @@ mod tests {
         assert_eq!(credential.value, "Bearer sk-caller-owned-canary");
         assert!(!credential.value.contains("operator-key-must-not-be-billed"));
         assert!(realtime_native_provider_credential(
-            &provider,
+            &bound,
             &headers,
             &inbound.provider_hints,
             "anthropic",

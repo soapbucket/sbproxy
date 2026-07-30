@@ -4413,7 +4413,7 @@
       "type": "object",
       "properties": {
         "headers": {
-          "description": "Ordered candidate headers. The first value whose shape parses wins. An empty list disables the sweep and leaves the legacy `authorization` path as the only front door.",
+          "description": "Ordered candidate headers. One well-shaped minted token resolves; two distinct tokens are ambiguous and fail closed. An empty list disables the sweep and leaves the legacy `authorization` path as the only front door.",
           "default": [
             {
               "name": "authorization",
@@ -4439,7 +4439,7 @@
           "type": "boolean"
         },
         "provider_hints": {
-          "description": "Ordered rules attributing a native (non-minted) inbound credential to a provider. First match wins, so more specific value prefixes belong before general ones. Attribution never refuses a request: a credential matching no rule is admitted unattributed.",
+          "description": "Ordered rules attributing a native (non-minted) inbound credential to a provider. First matching hint wins, so more specific value prefixes belong before general ones. A matching hint then enters native-key policy admission; a credential matching no hint remains unattributed.",
           "default": [
             {
               "also_header": null,

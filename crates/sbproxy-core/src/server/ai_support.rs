@@ -2175,10 +2175,9 @@ pub(super) fn req_header_value(session: &Session, name: &str) -> Option<String> 
 /// are dropped silently because the hook contract is `String:String`
 /// and lossy decoding would obscure the real wire bytes from any
 /// implementation that wants to reason about them. Headers whose
-/// lower-cased name appears in [`crate::hooks::REDACTED_REQUEST_HEADERS`]
-/// are dropped before the snapshot is returned so credential carriers
-/// (Authorization, Cookie, Proxy-Authorization) never reach the
-/// classifier or semantic cache.
+/// lower-cased name is sensitive according to the built-in denylist or the
+/// active config's primary inbound credential-carrier union are dropped before
+/// the snapshot is returned.
 ///
 /// The returned map is fresh per call. Callers that fan a single
 /// request out across multiple hooks should build the snapshot once
@@ -2195,11 +2194,21 @@ pub(super) fn snapshot_request_headers(
 pub(super) fn snapshot_request_headers_from(
     req: &pingora_http::RequestHeader,
 ) -> std::collections::HashMap<String, String> {
+    snapshot_request_headers_from_with_sensitive(req, sbproxy_config::types::is_sensitive_header)
+}
+
+/// Testable inner snapshot seam. Production passes the active config-aware
+/// sensitive-header predicate; tests can supply a local predicate without
+/// mutating process-global reload state.
+pub(super) fn snapshot_request_headers_from_with_sensitive(
+    req: &pingora_http::RequestHeader,
+    is_sensitive: impl Fn(&str) -> bool,
+) -> std::collections::HashMap<String, String> {
     let raw = &req.headers;
     let mut out = std::collections::HashMap::with_capacity(raw.len());
     for (name, value) in raw.iter() {
         let lname = name.as_str().to_ascii_lowercase();
-        if crate::hooks::REDACTED_REQUEST_HEADERS.contains(&lname.as_str()) {
+        if is_sensitive(&lname) {
             continue;
         }
         if let Ok(v) = value.to_str() {

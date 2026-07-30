@@ -137,7 +137,7 @@ providers:
 
 Three options, roughly in order of preference:
 
-1. **Point any provider at a custom `base_url`.** Most upstreams speak the OpenAI wire format, so a `provider_type: openai` entry with your own `base_url` reaches anything OpenAI-compatible: a self-hosted vLLM or SGLang pool, an internal gateway, or a proprietary endpoint.
+1. **Point any provider at a custom `base_url`.** Most upstreams speak the OpenAI wire format, so a `provider_type: openai` entry with your own `base_url` reaches anything OpenAI-compatible: a self-hosted vLLM or SGLang pool, an internal gateway, or a proprietary endpoint. Wire compatibility does not authorize caller-owned OpenAI credentials. Leave `accept_native_credentials_for` unset unless you intend to trust this exact endpoint with those credentials.
 2. **Add the provider to the catalog yourself.** It is plain YAML and ships uncompiled. See [Extending the provider catalog](#extending-the-provider-catalog).
 3. **Use `openrouter` as a single-key aggregator** when you want many vendors without holding a direct account with each. It is one of the native providers, no different from the rest:
 
@@ -159,6 +159,11 @@ Local and self-hosted OpenAI-compatible runtimes are first-class providers in th
 An overridden `base_url` is validated at config load to keep it from becoming an SSRF vector. Non-`http(s)` schemes (`file://`, ...) are always rejected, and by default a URL that targets a loopback, link-local, or private (RFC 1918) address is rejected too, so a stray `http://169.254.169.254/` or `http://127.0.0.1/` fails fast instead of being dispatched at request time.
 
 A local model server is the legitimate exception: it lives on `127.0.0.1` or a LAN address. Set `allow_private_base_url: true` on that provider to permit its private `base_url`. The scheme check still applies. Providers that use a registry default (no `base_url` override) are unaffected.
+
+`allow_private_base_url` controls network reachability. It does not authorize
+native credential forwarding. That requires the separate
+`accept_native_credentials_for` destination binding, and locally served or
+managed providers cannot enable it.
 
 ```yaml
 providers:
@@ -186,6 +191,11 @@ providers:
     api_key: ${INTERNAL_LLM_KEY}
     default_model: my-finetune
 ```
+
+This endpoint uses its configured `api_key`. If it is also the intended
+destination for caller-owned OpenAI keys, add
+`accept_native_credentials_for: openai` after reviewing that endpoint's trust
+boundary.
 
 ### 2. Replace the catalog at runtime with `proxy.ai_providers_file`
 

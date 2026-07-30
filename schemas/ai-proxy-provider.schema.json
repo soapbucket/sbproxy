@@ -34,6 +34,14 @@
         "null"
       ]
     },
+    "accept_native_credentials_for": {
+      "description": "Canonical native-provider label whose caller-owned credential this exact provider destination may receive.\n\nThis is an explicit destination trust decision. It defaults to disabled and must match `provider_type` (or `name` when no type is configured). For example, `openai` permits an OpenAI-shaped native key to replace `api_key` only for this provider entry and its effective `base_url`.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "base_url": {
       "description": "Override the upstream base URL (defaults to the provider's well-known URL).",
       "default": null,

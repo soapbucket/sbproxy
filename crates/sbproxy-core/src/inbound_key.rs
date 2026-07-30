@@ -152,11 +152,10 @@ pub fn requires_minted_key(cfg: &KeyInboundConfig) -> bool {
 
 /// Attribute a native (non-minted) inbound credential to a provider.
 ///
-/// Runs only when [`sweep_headers`] found no minted key, so it can never
-/// shadow the governed path. First matching rule wins, mirroring the sweep's
-/// ordering semantics. Returns `None` for a request whose credentials match
-/// no rule, and the caller admits it unattributed: refusing here would break
-/// the pass-through this attribution exists to observe.
+/// Runs only when [`sweep_headers`] found no minted key, so it cannot shadow
+/// the governed path. The first matching hint wins. Returns `None` when no
+/// hint recognizes the presented credential; admission policy is applied by
+/// the caller after a hint resolves.
 pub fn resolve_provider_hint(
     headers: &http::HeaderMap,
     hints: &[sbproxy_config::types::ProviderHintConfig],
@@ -183,7 +182,10 @@ fn matching_provider_credential<'a>(
     expected_provider: Option<&str>,
 ) -> Option<(String, &'a str)> {
     for hint in hints {
-        if expected_provider.is_some_and(|expected| !hint.provider.eq_ignore_ascii_case(expected)) {
+        let canonical_provider = hint.provider.trim().to_ascii_lowercase();
+        if expected_provider
+            .is_some_and(|expected| canonical_provider != expected.trim().to_ascii_lowercase())
+        {
             continue;
         }
         let lower = hint.header.trim().to_ascii_lowercase();
@@ -222,7 +224,7 @@ fn matching_provider_credential<'a>(
                 continue;
             }
             if candidate.starts_with(&hint.value_prefix) {
-                return Some((hint.provider.clone(), candidate));
+                return Some((canonical_provider, candidate));
             }
         }
     }
@@ -579,6 +581,24 @@ mod tests {
         assert_eq!(
             resolve_native_provider_credential(&h, &defaults.provider_hints, "anthropic"),
             None
+        );
+    }
+
+    #[test]
+    fn provider_hint_labels_are_canonicalized_once_for_policy_and_attribution() {
+        let hints = vec![sbproxy_config::types::ProviderHintConfig {
+            provider: "  OpEnAI  ".to_string(),
+            header: "x-native-key".to_string(),
+            scheme: String::new(),
+            value_prefix: "opaque-".to_string(),
+            also_header: None,
+        }];
+        let h = headers(&[("x-native-key", "opaque-caller-owned")]);
+
+        assert_eq!(resolve_provider_hint(&h, &hints).as_deref(), Some("openai"));
+        assert_eq!(
+            resolve_native_provider_credential(&h, &hints, " OPENAI "),
+            Some("opaque-caller-owned")
         );
     }
 

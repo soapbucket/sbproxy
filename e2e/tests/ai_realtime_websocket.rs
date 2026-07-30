@@ -60,6 +60,7 @@ proxy:
       providers:
         - name: openai
           provider_type: openai
+          accept_native_credentials_for: openai
           api_key: {provider_api_key}
           base_url: "{upstream_http_url}"
           allow_private_base_url: true
@@ -111,6 +112,14 @@ fn native_key_management_fields(store_path: &Path, policy_fields: &str) -> Strin
       master_key: realtime-native-e2e-master
     inbound:
       require: false
+      provider_hints:
+        - provider: openai
+          header: authorization
+          scheme: "Bearer "
+          value_prefix: "sk-"
+        - provider: openai
+          header: x-native-provider-credential
+          value_prefix: "opaque-"
       native_key_policy:
         allowed_providers: [openai]
 {policy_fields}"#
@@ -479,6 +488,65 @@ fn realtime_budget_block_log_and_downgrade_are_enforced_before_upgrade() {
         );
 
         assert_clean_close(&mut downgrade_websocket).await;
+    });
+}
+
+#[test]
+fn native_realtime_custom_carrier_becomes_the_only_upstream_credential() {
+    let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+    runtime.block_on(async {
+        let upstream = spawn_echo_ws_server().await;
+        let temp = tempfile::tempdir().expect("native key store tempdir");
+        let proxy_fields = native_key_management_fields(&temp.path().join("keys.redb"), "");
+        let config = realtime_config(
+            upstream.http_url(),
+            "operator-secret-must-not-be-used",
+            &proxy_fields,
+            "",
+            "",
+        );
+        let harness = ProxyHarness::start_with_yaml(&config).expect("start native realtime proxy");
+        let canary = "opaque-caller-native-canary";
+
+        let (mut websocket, response) = dial_websocket(
+            &harness,
+            REALTIME_HOST,
+            "/v1/realtime?model=gpt-realtime",
+            &[
+                (
+                    "authorization",
+                    "Bearer caller-controlled-non-provider-value",
+                ),
+                ("x-native-provider-credential", canary),
+                ("x-api-key", "competing-caller-key"),
+            ],
+        )
+        .await
+        .expect("native realtime upgrade");
+        assert_eq!(response.status().as_u16(), 101);
+        assert_text_echo(&mut websocket, "native-auth-echo").await;
+
+        let captures = upstream.captured();
+        let capture = one_capture(&captures);
+        let expected = format!("Bearer {canary}");
+        assert_eq!(
+            capture.header_values("authorization"),
+            [expected.as_str()],
+            "the caller-owned native credential must be authoritative"
+        );
+        assert!(
+            capture
+                .header_values("x-native-provider-credential")
+                .is_empty(),
+            "the original custom carrier must be scrubbed"
+        );
+        assert!(capture.header_values("x-api-key").is_empty());
+        assert!(
+            !format!("{capture:?}").contains("operator-secret-must-not-be-used"),
+            "operator and caller credentials must not coexist"
+        );
+
+        assert_clean_close(&mut websocket).await;
     });
 }
 
