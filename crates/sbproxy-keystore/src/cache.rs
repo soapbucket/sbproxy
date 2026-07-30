@@ -166,7 +166,33 @@ impl TtlCache {
         let loaded = self.store.get_credential(id).await?;
         self.insert_credential(id, loaded.clone(), now);
         if let (Some(tier), Some(rec)) = (&self.tier, loaded.as_ref()) {
-            tier.put_credential(rec, self.cfg.ttl).await;
+            // Never publish a raw secret to the second tier. Every tier is a
+            // shared surface: the mesh tier replicates into a node-wide
+            // distributed cache that every peer can hold a copy of, and the
+            // Redis tier writes to an external server outside this process
+            // entirely. Serialising a `CredentialMaterial::Plaintext` record
+            // would put the secret in both, in the clear, which is not
+            // something the keystore ever agreed to.
+            //
+            // Skipping the publish needs no fallback: this tier is best-effort
+            // by contract and a miss falls through to the store, which is the
+            // system of record. The only cost is one store read per resolve for
+            // config-seeded plaintext credentials, which are the discouraged
+            // path anyway.
+            //
+            // L1 above is deliberately still populated. It is process-local
+            // heap, and an attacker who can read it can already read whatever
+            // key would have sealed it, so sealing it would buy nothing. See
+            // the guardrail about not encrypting memory-only caches.
+            if rec.material.is_plaintext() {
+                tracing::debug!(
+                    credential_id = %rec.id,
+                    "not publishing a plaintext credential to the second cache tier; \
+                     resolves will read through to the keystore"
+                );
+            } else {
+                tier.put_credential(rec, self.cfg.ttl).await;
+            }
         }
         Ok(loaded)
     }
@@ -441,6 +467,111 @@ mod tests {
         assert!(
             cache.resolve_key("k1").await.is_err(),
             "store error surfaces so the caller can deny"
+        );
+    }
+
+    /// A tier that records every credential published to it, so a test can
+    /// assert on what would have left the process.
+    #[derive(Default)]
+    struct RecordingTier {
+        published: Mutex<Vec<CredentialRecord>>,
+    }
+
+    impl RecordingTier {
+        fn published_ids(&self) -> Vec<String> {
+            self.published
+                .lock()
+                .iter()
+                .map(|record| record.id.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl CacheTier for RecordingTier {
+        async fn get_key(&self, _: &str) -> Option<KeyRecord> {
+            None
+        }
+        async fn put_key(&self, _: &KeyRecord, _: Duration) {}
+        async fn get_credential(&self, _: &str) -> Option<CredentialRecord> {
+            None
+        }
+        async fn put_credential(&self, record: &CredentialRecord, _: Duration) {
+            self.published.lock().push(record.clone());
+        }
+        async fn invalidate(&self, _: &str) {}
+        async fn invalidate_all(&self) {}
+    }
+
+    fn credential(id: &str, material: serde_json::Value) -> CredentialRecord {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": id,
+            "material": material,
+            "created_at": "2023-11-14T22:13:20Z",
+            "updated_at": "2023-11-14T22:13:20Z"
+        }))
+        .expect("credential fixture")
+    }
+
+    /// A plaintext secret must never reach the second tier.
+    ///
+    /// The tier is a shared surface: the mesh tier replicates into a node-wide
+    /// distributed cache and the Redis tier writes to an external server. A
+    /// `CredentialMaterial::Plaintext` record serialised into either puts the
+    /// raw secret somewhere the keystore never agreed to put it.
+    #[tokio::test]
+    async fn plaintext_credentials_are_never_published_to_the_second_tier() {
+        let store = MemoryKeyStore::new();
+        store
+            .put_credential(credential(
+                "sealed",
+                serde_json::json!({"kind": "vault_ref", "reference": "vault://x"}),
+            ))
+            .await
+            .expect("put vault_ref credential");
+        store
+            .put_credential(credential(
+                "raw",
+                serde_json::json!({"kind": "plaintext", "value": "sk-super-secret"}),
+            ))
+            .await
+            .expect("put plaintext credential");
+
+        let tier = Arc::new(RecordingTier::default());
+        let cache = TtlCache::new(Arc::new(store), TtlCacheConfig::default())
+            .with_tier(tier.clone() as Arc<dyn CacheTier>);
+
+        // Both resolve correctly. Skipping the publish must not change what the
+        // caller gets back, only where the record is allowed to travel.
+        let sealed = cache
+            .resolve_credential("sealed")
+            .await
+            .expect("resolve sealed")
+            .expect("sealed present");
+        assert!(!sealed.material.is_plaintext());
+        let raw = cache
+            .resolve_credential("raw")
+            .await
+            .expect("resolve raw")
+            .expect("raw present");
+        assert!(
+            raw.material.is_plaintext(),
+            "the caller still receives usable plaintext material"
+        );
+
+        assert_eq!(
+            tier.published_ids(),
+            vec!["sealed".to_string()],
+            "only the non-plaintext credential may be published to the tier"
+        );
+
+        // And nothing resembling the secret was serialised into the tier.
+        let published = tier.published.lock();
+        let encoded = serde_json::to_string(&*published).expect("encode published records");
+        assert!(
+            !encoded.contains("sk-super-secret"),
+            "the raw secret must not appear anywhere in what reached the tier: {encoded}"
         );
     }
 }
