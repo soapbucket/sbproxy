@@ -588,30 +588,48 @@ sbproxy service uninstall
   `launchd` agent inherits almost nothing from the shell that installed
   it, so an `HF_TOKEN` exported in a terminal is invisible to the agent
   and a gated model fails to pull with no obvious cause. Put it here
-  instead, one `KEY=value` per line. The file is created once with a
-  commented template and never rewritten, so a token set here survives
+  instead, one `KEY=value` per line. This is a declarative file, not a shell
+  script: values are literal, and `export`, quotes, expansion, commands, and
+  inline comments are rejected. Duplicate keys are rejected too, so startup
+  and cleanup cannot choose different values. The file is created once with
+  a commented template and never rewritten, so a token set here survives
   reinstalling to change the model or the port. If you set
   `SBPROXY_ENGINE_OWNERSHIP_DIR`, use an absolute path. Both the service and
   `service uninstall` read that value from this file.
 
-The agent's program is `/bin/sh -c '... exec sbproxy serve <config>'`
-rather than the binary directly, which is how the environment file gets
-sourced. The `exec` means `launchd` still supervises the proxy's own
-pid, so `KeepAlive` restarts and signal delivery behave exactly as if
-the binary were the program. The plist also raises `ExitTimeOut` above
-the proxy's default shutdown grace, so `launchd` cannot SIGKILL a drain
-that is still in progress.
+The agent starts a small built-in bootstrap that parses this file as data,
+sets the validated values, and then replaces itself with `sbproxy serve`.
+Before that replacement, it takes the private
+`~/Library/Application Support/sbproxy/service/lifecycle.lock` and durably
+registers its exact process generation in `uninstall-state.json`. Nothing in
+the environment file is evaluated by a shell, credentials stay out of the
+plist, and `launchd` supervises the proxy at the same pid. The plist also
+raises `ExitTimeOut` above the proxy's default shutdown grace, so `launchd`
+cannot SIGKILL a drain that is still in progress.
 
 Managed engine ownership is durable across gateway death. Each engine record
 contains the owner and engine PID plus their process-start fingerprints;
 the record reaches durable storage before the engine can execute.
-`service uninstall` waits for the exact launchd-owned gateway to exit, then
-reaps only that gateway's recorded process groups. It reads
+`service uninstall` takes the same lifecycle lock, waits for the exact
+launchd-owned gateway to exit, then reaps only the process groups owned by
+registered gateway generations. It reads
 `SBPROXY_ENGINE_OWNERSHIP_DIR` from the service environment file, not from the
-shell running the uninstall command. Before unload, it saves the gateway's PID
-and process-start fingerprint in
-`~/Library/Application Support/sbproxy/service/uninstall-state.json`. The plist
-and retry record stay in place until exact-owner cleanup succeeds.
+shell running the uninstall command. The lock stays held while uninstall reads
+the registry, records the launchd PID it sees, unloads the job, and confirms
+that the job is gone. A `KeepAlive` replacement therefore either registered
+before uninstall took the lock, or cannot execute while unload is in progress.
+The plist and retry record stay in place until exact-owner cleanup succeeds.
+A loaded job with no PID, an owner-registry overflow, or an unload that makes
+no bounded progress fails closed and leaves both retry handles in place. The
+stable lock file is deliberately retained after success; unlinking a lock path
+could let future processes lock different file objects.
+
+An agent installed by an older release uses a shell command and never ran this
+registration bootstrap. If that legacy job is still loaded, the current CLI
+will not guess that it saw every `KeepAlive` generation: uninstall stops before
+calling `launchctl` and keeps the plist. Reinstall the intended model with the
+current `sbproxy service install <model>`, wait for `sbproxy service status` to
+report it running, then retry `service uninstall`.
 
 The reaper signals a process group only while the recorded engine PID still has
 the recorded start fingerprint. If the PID changed and the group is empty, the

@@ -1202,6 +1202,9 @@ enum ServiceSub {
     Uninstall(ServiceUninstallArgs),
     /// Report whether the agent is registered with launchd and running.
     Status(ServiceStatusArgs),
+    /// Internal launchd bootstrap that loads the declarative environment.
+    #[command(hide = true)]
+    Launch(ServiceLaunchArgs),
 }
 
 /// `sbproxy service install`: the exact same model/engine/accel/port/
@@ -1230,6 +1233,22 @@ struct ServiceStatusArgs {
     /// Output format.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct ServiceLaunchArgs {
+    /// Strict KEY=value environment file loaded before the proxy starts.
+    #[arg(long = "environment", value_name = "PATH")]
+    environment: PathBuf,
+    /// Stable lock shared with transactional service uninstall.
+    #[arg(long = "lifecycle-lock", value_name = "PATH")]
+    lifecycle_lock: PathBuf,
+    /// Durable registry of exact service process generations.
+    #[arg(long = "uninstall-state", value_name = "PATH")]
+    uninstall_state: PathBuf,
+    /// Persisted proxy configuration to serve.
+    #[arg(value_name = "CONFIG")]
+    config: PathBuf,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
@@ -3157,6 +3176,7 @@ struct ServicePaths {
     stderr_log: PathBuf,
     env_file: PathBuf,
     uninstall_state: PathBuf,
+    lifecycle_lock: PathBuf,
 }
 
 fn service_paths() -> anyhow::Result<ServicePaths> {
@@ -3173,7 +3193,17 @@ fn service_paths() -> anyhow::Result<ServicePaths> {
         stderr_log: home.join("Library/Logs/sbproxy/service.err.log"),
         env_file: service_dir.join("env"),
         uninstall_state: service_dir.join("uninstall-state.json"),
+        lifecycle_lock: service_dir.join("lifecycle.lock"),
     })
+}
+
+const SERVICE_ENGINE_OWNERSHIP_ENV: &str = "SBPROXY_ENGINE_OWNERSHIP_DIR";
+const MAX_SERVICE_ENVIRONMENT_BYTES: usize = 1024 * 1024;
+const MAX_SERVICE_PLIST_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct ServiceEnvironment {
+    variables: BTreeMap<String, String>,
 }
 
 /// Header written into a freshly created service environment file.
@@ -3187,15 +3217,130 @@ fn service_paths() -> anyhow::Result<ServicePaths> {
 const SERVICE_ENV_TEMPLATE: &str = "\
 # sbproxy launchd agent environment.
 #
-# Sourced before the agent starts, so anything set here is visible to
-# the served process. One KEY=value per line; no shell expansion, no
-# quotes needed. `sbproxy service install` creates this file once and
-# never overwrites it, so a token set here survives a reinstall.
+# Read as data before the agent starts, so anything set here is visible
+# to the served process. Use one KEY=value per line. Values are literal:
+# do not use export, quotes, shell expansion, commands, or inline comments.
+# `sbproxy service install` creates this file once and never overwrites it,
+# so a token set here survives a reinstall.
 #
-# HF_TOKEN=hf_...        # required to pull a gated model
-# RUST_LOG=info          # raise or lower the agent's log level
+# Hugging Face token required to pull a gated model:
+# HF_TOKEN=hf_...
+# Raise or lower the agent's log level:
+# RUST_LOG=info
+# Optional absolute directory for durable managed-engine ownership:
 # SBPROXY_ENGINE_OWNERSHIP_DIR=/absolute/path
 ";
+
+fn read_service_environment(path: &std::path::Path) -> anyhow::Result<ServiceEnvironment> {
+    use std::io::Read as _;
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ServiceEnvironment::default());
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!("read '{}': {error}", path.display()));
+        }
+    };
+    let length = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("inspect '{}': {error}", path.display()))?
+        .len();
+    if length > MAX_SERVICE_ENVIRONMENT_BYTES as u64 {
+        anyhow::bail!(
+            "read '{}': service environment exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_SERVICE_ENVIRONMENT_BYTES
+        );
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take((MAX_SERVICE_ENVIRONMENT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("read '{}': {error}", path.display()))?;
+    if bytes.len() > MAX_SERVICE_ENVIRONMENT_BYTES {
+        anyhow::bail!(
+            "read '{}': service environment exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_SERVICE_ENVIRONMENT_BYTES
+        );
+    }
+    let contents = String::from_utf8(bytes)
+        .map_err(|error| anyhow::anyhow!("read '{}': {error}", path.display()))?;
+    parse_service_environment(path, &contents)
+}
+
+fn parse_service_environment(
+    path: &std::path::Path,
+    contents: &str,
+) -> anyhow::Result<ServiceEnvironment> {
+    let mut variables = BTreeMap::new();
+    for (index, line) in contents.lines().enumerate() {
+        let line_number = index + 1;
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            anyhow::bail!(
+                "parse '{}', line {line_number}: expected KEY=value; shell syntax is not supported",
+                path.display()
+            );
+        };
+        let key_is_valid = !key.is_empty()
+            && key
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        if !key_is_valid {
+            anyhow::bail!(
+                "parse '{}', line {line_number}: invalid environment key '{key}'; \
+                 use strict KEY=value syntax without export",
+                path.display()
+            );
+        }
+        if value.trim() != value {
+            anyhow::bail!(
+                "parse '{}', line {line_number}: leading or trailing value whitespace is ambiguous",
+                path.display()
+            );
+        }
+        let quoted = value.starts_with('\'')
+            || value.starts_with('"')
+            || value.ends_with('\'')
+            || value.ends_with('"');
+        let shell_syntax = quoted
+            || value.contains('$')
+            || value.contains('`')
+            || value.contains('\\')
+            || value.contains(';')
+            || value.contains("&&")
+            || value.contains("||")
+            || value.contains("<(")
+            || value.contains(">(")
+            || value.contains(" #")
+            || value.starts_with('~');
+        if shell_syntax {
+            anyhow::bail!(
+                "parse '{}', line {line_number}: shell syntax is not supported; \
+                 provide the literal value without quotes, expansion, commands, or comments",
+                path.display()
+            );
+        }
+        if variables
+            .insert(key.to_string(), value.to_string())
+            .is_some()
+        {
+            anyhow::bail!(
+                "parse '{}', line {line_number}: duplicate environment key '{key}'",
+                path.display()
+            );
+        }
+    }
+    Ok(ServiceEnvironment { variables })
+}
 
 /// Create the environment file if it is absent, leaving an existing one
 /// untouched. Mode 0600: it is the documented home for a Hugging Face
@@ -3222,12 +3367,120 @@ fn ensure_service_env_file(path: &std::path::Path) -> anyhow::Result<()> {
 }
 
 const SERVICE_UNINSTALL_STATE_SCHEMA_VERSION: u32 = 1;
+const MAX_SERVICE_OWNER_GENERATIONS: usize = 4_096;
+const MAX_SERVICE_UNINSTALL_STATE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SERVICE_UNLOAD_ATTEMPTS: usize = 8;
+const MAX_SERVICE_UNLOAD_NO_PROGRESS: usize = 2;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ServiceUninstallState {
     schema_version: u32,
     ownership_directory: PathBuf,
     owners: Vec<sbproxy_model_host::ManagedEngineOwner>,
+}
+
+#[derive(Debug)]
+struct ServiceLifecycleLock {
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+fn acquire_service_lifecycle_lock(path: &std::path::Path) -> anyhow::Result<ServiceLifecycleLock> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("'{}' has no parent", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| anyhow::anyhow!("create '{}': {error}", parent.display()))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).mode(0o600);
+    #[cfg(target_os = "macos")]
+    options.custom_flags(0x0000_0100); // O_NOFOLLOW
+    #[cfg(target_os = "linux")]
+    options.custom_flags(0x0002_0000); // O_NOFOLLOW
+    let file = options
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("open lifecycle lock '{}': {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("inspect lifecycle lock '{}': {error}", path.display()))?;
+    let parent_metadata = std::fs::metadata(parent)
+        .map_err(|error| anyhow::anyhow!("inspect '{}': {error}", parent.display()))?;
+    if !metadata.file_type().is_file() || metadata.uid() != parent_metadata.uid() {
+        anyhow::bail!(
+            "lifecycle lock '{}' must be a regular file owned by the service directory owner",
+            path.display()
+        );
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| anyhow::anyhow!("secure lifecycle lock '{}': {error}", path.display()))?;
+    fs2::FileExt::lock_exclusive(&file)
+        .map_err(|error| anyhow::anyhow!("lock lifecycle '{}': {error}", path.display()))?;
+    file.sync_all()
+        .map_err(|error| anyhow::anyhow!("sync lifecycle lock '{}': {error}", path.display()))?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| anyhow::anyhow!("sync '{}': {error}", parent.display()))?;
+    Ok(ServiceLifecycleLock { _file: file })
+}
+
+#[cfg(not(unix))]
+fn acquire_service_lifecycle_lock(path: &std::path::Path) -> anyhow::Result<ServiceLifecycleLock> {
+    anyhow::bail!(
+        "service lifecycle lock '{}' is only supported on Unix",
+        path.display()
+    )
+}
+
+fn append_service_owner(
+    state: &mut ServiceUninstallState,
+    owner: &sbproxy_model_host::ManagedEngineOwner,
+) -> anyhow::Result<bool> {
+    if state.owners.contains(owner) {
+        return Ok(false);
+    }
+    if state.owners.len() >= MAX_SERVICE_OWNER_GENERATIONS {
+        anyhow::bail!(
+            "service owner generation limit ({MAX_SERVICE_OWNER_GENERATIONS}) reached; \
+             uninstall and inspect the durable lifecycle state before restarting"
+        );
+    }
+    state.owners.push(owner.clone());
+    Ok(true)
+}
+
+fn register_service_owner_locked(
+    _lock: &ServiceLifecycleLock,
+    state_path: &std::path::Path,
+    ownership_directory: &std::path::Path,
+    owner: &sbproxy_model_host::ManagedEngineOwner,
+) -> anyhow::Result<()> {
+    if !ownership_directory.is_absolute() {
+        anyhow::bail!(
+            "managed-engine ownership directory '{}' must be absolute",
+            ownership_directory.display()
+        );
+    }
+    let existing = read_service_uninstall_state(state_path)?;
+    let mut state = existing.unwrap_or_else(|| ServiceUninstallState {
+        schema_version: SERVICE_UNINSTALL_STATE_SCHEMA_VERSION,
+        ownership_directory: ownership_directory.to_path_buf(),
+        owners: Vec::new(),
+    });
+    if state.ownership_directory != ownership_directory {
+        anyhow::bail!(
+            "service lifecycle state '{}' uses ownership directory '{}', not '{}'; \
+             uninstall the prior service generation before changing directories",
+            state_path.display(),
+            state.ownership_directory.display(),
+            ownership_directory.display()
+        );
+    }
+    if append_service_owner(&mut state, owner)? {
+        persist_service_uninstall_state(state_path, &state)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3243,6 +3496,41 @@ trait LaunchdController {
 
 struct SystemLaunchdController;
 
+fn classify_launchctl_list_status(
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> anyhow::Result<LaunchdJobStatus> {
+    if success {
+        return Ok(LaunchdJobStatus::Loaded {
+            pid: parse_launchctl_list_pid(stdout),
+        });
+    }
+
+    let normalized_stderr = stderr.to_ascii_lowercase();
+    let service_is_missing = normalized_stderr.contains("could not find service")
+        || normalized_stderr.contains("could not find specified service")
+        || normalized_stderr.contains("service cannot be found");
+    if service_is_missing {
+        return Ok(LaunchdJobStatus::NotLoaded);
+    }
+
+    let status = exit_code.map_or_else(
+        || "terminated by signal".to_string(),
+        |code| format!("exit code {code}"),
+    );
+    let detail = stderr.trim();
+    anyhow::bail!(
+        "launchctl list '{SERVICE_LABEL}' failed ({status}): {}",
+        if detail.is_empty() {
+            "no error output"
+        } else {
+            detail
+        }
+    );
+}
+
 impl LaunchdController for SystemLaunchdController {
     fn status(&mut self) -> anyhow::Result<LaunchdJobStatus> {
         let output = std::process::Command::new("launchctl")
@@ -3250,12 +3538,12 @@ impl LaunchdController for SystemLaunchdController {
             .arg(SERVICE_LABEL)
             .output()
             .map_err(|error| anyhow::anyhow!("launchctl list: {error}"))?;
-        if !output.status.success() {
-            return Ok(LaunchdJobStatus::NotLoaded);
-        }
-        Ok(LaunchdJobStatus::Loaded {
-            pid: parse_launchctl_list_pid(&String::from_utf8_lossy(&output.stdout)),
-        })
+        classify_launchctl_list_status(
+            output.status.success(),
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
     }
 
     fn unload(&mut self, plist: &std::path::Path) -> anyhow::Result<()> {
@@ -3321,46 +3609,36 @@ struct ServiceUninstallOutcome {
 }
 
 fn service_engine_ownership_directory(paths: &ServicePaths) -> anyhow::Result<PathBuf> {
-    if paths.env_file.exists() {
-        let contents = std::fs::read_to_string(&paths.env_file)
-            .map_err(|error| anyhow::anyhow!("read '{}': {error}", paths.env_file.display()))?;
-        for line in contents.lines() {
-            let assignment = line.trim();
-            if assignment.is_empty() || assignment.starts_with('#') {
-                continue;
-            }
-            let assignment = assignment.strip_prefix("export ").unwrap_or(assignment);
-            let Some((key, value)) = assignment.split_once('=') else {
-                continue;
-            };
-            if key.trim() != "SBPROXY_ENGINE_OWNERSHIP_DIR" {
-                continue;
-            }
-            let mut value = value.trim();
-            if value.len() >= 2
-                && ((value.starts_with('"') && value.ends_with('"'))
-                    || (value.starts_with('\'') && value.ends_with('\'')))
-            {
-                value = &value[1..value.len() - 1];
-            }
-            if value.is_empty() {
-                anyhow::bail!(
-                    "SBPROXY_ENGINE_OWNERSHIP_DIR in '{}' is empty",
-                    paths.env_file.display()
-                );
-            }
-            let directory = PathBuf::from(value);
-            if !directory.is_absolute() {
-                anyhow::bail!(
-                    "SBPROXY_ENGINE_OWNERSHIP_DIR in '{}' must be absolute",
-                    paths.env_file.display()
-                );
-            }
-            return Ok(directory);
+    let environment = read_service_environment(&paths.env_file)?;
+    service_engine_ownership_directory_from_environment(
+        &environment,
+        &paths.env_file,
+        &paths.config,
+    )
+}
+
+fn service_engine_ownership_directory_from_environment(
+    environment: &ServiceEnvironment,
+    env_file: &std::path::Path,
+    config: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    if let Some(value) = environment.variables.get(SERVICE_ENGINE_OWNERSHIP_ENV) {
+        if value.is_empty() {
+            anyhow::bail!(
+                "{SERVICE_ENGINE_OWNERSHIP_ENV} in '{}' is empty",
+                env_file.display()
+            );
         }
+        let directory = PathBuf::from(value);
+        if !directory.is_absolute() {
+            anyhow::bail!(
+                "{SERVICE_ENGINE_OWNERSHIP_ENV} in '{}' must be absolute",
+                env_file.display()
+            );
+        }
+        return Ok(directory);
     }
-    paths
-        .config
+    config
         .parent()
         .and_then(std::path::Path::parent)
         .map(|application_dir| application_dir.join("managed-engines"))
@@ -3370,17 +3648,43 @@ fn service_engine_ownership_directory(paths: &ServicePaths) -> anyhow::Result<Pa
 fn read_service_uninstall_state(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<ServiceUninstallState>> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    use std::io::Read as _;
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(anyhow::anyhow!("read '{}': {error}", path.display()));
         }
     };
+    let length = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("inspect '{}': {error}", path.display()))?
+        .len();
+    if length > MAX_SERVICE_UNINSTALL_STATE_BYTES as u64 {
+        anyhow::bail!(
+            "read '{}': lifecycle state exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_SERVICE_UNINSTALL_STATE_BYTES
+        );
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    let mut limited = file.take((MAX_SERVICE_UNINSTALL_STATE_BYTES + 1) as u64);
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("read '{}': {error}", path.display()))?;
+    if bytes.len() > MAX_SERVICE_UNINSTALL_STATE_BYTES {
+        anyhow::bail!(
+            "read '{}': lifecycle state exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_SERVICE_UNINSTALL_STATE_BYTES
+        );
+    }
     let state: ServiceUninstallState = serde_json::from_slice(&bytes)
         .map_err(|error| anyhow::anyhow!("parse '{}': {error}", path.display()))?;
     if state.schema_version != SERVICE_UNINSTALL_STATE_SCHEMA_VERSION
         || !state.ownership_directory.is_absolute()
+        || state.owners.len() > MAX_SERVICE_OWNER_GENERATIONS
     {
         anyhow::bail!("validate '{}': unsupported or unsafe state", path.display());
     }
@@ -3410,6 +3714,13 @@ fn persist_service_uninstall_state(
     ));
     let bytes = serde_json::to_vec_pretty(state)
         .map_err(|error| anyhow::anyhow!("encode uninstall state: {error}"))?;
+    if bytes.len() + 1 > MAX_SERVICE_UNINSTALL_STATE_BYTES {
+        anyhow::bail!(
+            "persist '{}': lifecycle state exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_SERVICE_UNINSTALL_STATE_BYTES
+        );
+    }
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -3446,14 +3757,86 @@ fn remove_service_file(path: &std::path::Path) -> anyhow::Result<()> {
     }
 }
 
+fn service_plist_uses_registered_bootstrap(paths: &ServicePaths) -> anyhow::Result<bool> {
+    use std::io::Read as _;
+
+    let file = match std::fs::File::open(&paths.plist) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "read service plist '{}': {error}",
+                paths.plist.display()
+            ));
+        }
+    };
+    let length = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("inspect '{}': {error}", paths.plist.display()))?
+        .len();
+    if length > MAX_SERVICE_PLIST_BYTES as u64 {
+        anyhow::bail!(
+            "read '{}': service plist exceeds maximum size of {} bytes",
+            paths.plist.display(),
+            MAX_SERVICE_PLIST_BYTES
+        );
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take((MAX_SERVICE_PLIST_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("read '{}': {error}", paths.plist.display()))?;
+    if bytes.len() > MAX_SERVICE_PLIST_BYTES {
+        anyhow::bail!(
+            "read '{}': service plist exceeds maximum size of {} bytes",
+            paths.plist.display(),
+            MAX_SERVICE_PLIST_BYTES
+        );
+    }
+    let plist = String::from_utf8(bytes)
+        .map_err(|error| anyhow::anyhow!("read '{}': {error}", paths.plist.display()))?;
+    Ok([
+        "<string>service</string>",
+        "<string>launch</string>",
+        "<string>--environment</string>",
+        "<string>--lifecycle-lock</string>",
+        "<string>--uninstall-state</string>",
+        &format!(
+            "<string>{}</string>",
+            xml_escape(&paths.lifecycle_lock.to_string_lossy())
+        ),
+        &format!(
+            "<string>{}</string>",
+            xml_escape(&paths.uninstall_state.to_string_lossy())
+        ),
+    ]
+    .into_iter()
+    .all(|marker| plist.contains(marker)))
+}
+
 fn perform_service_uninstall(
     paths: &ServicePaths,
     launchd: &mut dyn LaunchdController,
     cleanup: &mut dyn ServiceEngineCleanup,
 ) -> anyhow::Result<ServiceUninstallOutcome> {
+    // A launchd replacement must register under this same lock before it
+    // can exec the gateway. Holding it through unload makes the registry
+    // and launchd transition one cooperative transaction.
+    let _lifecycle_lock = acquire_service_lifecycle_lock(&paths.lifecycle_lock)?;
     let removed = paths.plist.exists();
     let mut state = read_service_uninstall_state(&paths.uninstall_state)?;
-    let status = launchd.status()?;
+    let mut status = launchd.status()?;
+
+    if matches!(status, LaunchdJobStatus::Loaded { .. })
+        && !service_plist_uses_registered_bootstrap(paths)?
+    {
+        anyhow::bail!(
+            "launchd job '{SERVICE_LABEL}' uses a legacy plist without exact generation \
+             registration; unloading it cannot close the KeepAlive replacement race. \
+             Reinstall the intended model with this sbproxy version (`sbproxy service install \
+             <model>`), wait for `sbproxy service status` to report running, then retry uninstall. \
+             The existing plist and lifecycle state were retained."
+        );
+    }
 
     if state.is_none() && status == LaunchdJobStatus::NotLoaded {
         remove_service_file(&paths.plist)?;
@@ -3471,18 +3854,79 @@ fn perform_service_uninstall(
         });
     }
     let state = state.as_mut().expect("uninstall state initialized");
-    if let LaunchdJobStatus::Loaded { pid: Some(pid) } = status {
-        let owner = cleanup.capture_owner(pid)?;
-        if !state.owners.contains(&owner) {
-            state.owners.push(owner);
-        }
-    }
+    // Persist the transaction before touching launchd. In particular, a
+    // loaded job without a PID cannot be tied to an exact owner yet and
+    // must leave both retry handles intact.
     persist_service_uninstall_state(&paths.uninstall_state, state)?;
 
-    if matches!(status, LaunchdJobStatus::Loaded { .. }) {
-        if let Err(unload_error) = launchd.unload(&paths.plist) {
-            if launchd.status()? != LaunchdJobStatus::NotLoaded {
-                return Err(unload_error);
+    let mut unload_attempts = 0usize;
+    let mut no_progress = 0usize;
+    let mut prior_owner: Option<sbproxy_model_host::ManagedEngineOwner> = None;
+    loop {
+        let pid = match status {
+            LaunchdJobStatus::NotLoaded => break,
+            LaunchdJobStatus::Loaded { pid: Some(pid) } => pid,
+            LaunchdJobStatus::Loaded { pid: None } => {
+                anyhow::bail!(
+                    "launchd job '{SERVICE_LABEL}' is loaded but has no PID; \
+                     exact managed-engine ownership cannot be captured yet"
+                );
+            }
+        };
+
+        let owner = cleanup.capture_owner(pid)?;
+        let owner_was_added = append_service_owner(state, &owner)?;
+        if owner_was_added {
+            persist_service_uninstall_state(&paths.uninstall_state, state)?;
+        }
+        if prior_owner.as_ref() == Some(&owner) && !owner_was_added {
+            no_progress += 1;
+            if no_progress >= MAX_SERVICE_UNLOAD_NO_PROGRESS {
+                anyhow::bail!(
+                    "launchd unload made no progress after {no_progress} repeated observations \
+                     of pid {pid}; retry handles were retained"
+                );
+            }
+        } else {
+            no_progress = 0;
+        }
+        prior_owner = Some(owner);
+        if unload_attempts >= MAX_SERVICE_UNLOAD_ATTEMPTS {
+            anyhow::bail!(
+                "launchd job '{SERVICE_LABEL}' remained loaded after \
+                 {MAX_SERVICE_UNLOAD_ATTEMPTS} unload attempts; retry handles were retained"
+            );
+        }
+        unload_attempts += 1;
+
+        match launchd.unload(&paths.plist) {
+            Ok(()) => {
+                // KeepAlive can replace the process generation between the
+                // first status call and unload. Re-query until launchd
+                // confirms the job is gone, capturing and durably recording
+                // every replacement generation it reports.
+                status = launchd.status()?;
+            }
+            Err(unload_error) => {
+                status = launchd.status()?;
+                match status {
+                    LaunchdJobStatus::NotLoaded => break,
+                    LaunchdJobStatus::Loaded {
+                        pid: Some(replacement_pid),
+                    } => {
+                        let replacement_owner = cleanup.capture_owner(replacement_pid)?;
+                        if append_service_owner(state, &replacement_owner)? {
+                            persist_service_uninstall_state(&paths.uninstall_state, state)?;
+                        }
+                        return Err(unload_error);
+                    }
+                    LaunchdJobStatus::Loaded { pid: None } => {
+                        return Err(anyhow::anyhow!(
+                            "launchd job '{SERVICE_LABEL}' remains loaded without a PID: \
+                             {unload_error:#}"
+                        ));
+                    }
+                }
             }
         }
     }
@@ -3495,6 +3939,9 @@ fn perform_service_uninstall(
     // and every one of its durable engine records has been resolved.
     remove_service_file(&paths.plist)?;
     remove_service_file(&paths.uninstall_state)?;
+    // Keep lifecycle_lock permanently. Unlinking a cooperative lock path can
+    // split future lockers across different inodes while one still holds the
+    // old file descriptor.
     Ok(ServiceUninstallOutcome {
         removed,
         engines_reaped,
@@ -3514,32 +3961,15 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// Wrap a path in single quotes for a POSIX shell, escaping any single
-/// quote it contains the standard way (`'\''`).
-///
-/// The plist below interpolates paths into a `/bin/sh -c` string, and
-/// [`xml_escape`] turns `'` into `&apos;`, which the plist parser hands
-/// back to the shell as a literal `'`. Without this the shell quoting in
-/// a home directory containing an apostrophe would break, so quote for
-/// the shell first and let XML escaping wrap the result.
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
-}
-
 /// Render the launchd property list that runs `binary serve <config>`
 /// at load and restarts it if it exits. Pure string building: no
 /// filesystem or `launchctl` access, so it is covered by a plain unit
 /// test.
 ///
-/// The program is `/bin/sh -c '... exec sbproxy serve config'` rather
-/// than the binary directly, because launchd has no way to source an
-/// environment file and a launchd agent inherits nothing from the shell
-/// that installed it: without this, an `HF_TOKEN` the operator exported
-/// in a terminal is invisible to the agent and a gated model fails to
-/// pull for no visible reason. The `exec` matters. It replaces the shell
-/// with the proxy, so the pid launchd supervises is the proxy's, and
-/// `KeepAlive` restarts plus signal delivery behave exactly as they did
-/// when the binary was the program.
+/// The hidden `service launch` bootstrap reads the strict environment file
+/// as data and then execs `binary serve <config>`. This keeps credentials
+/// out of the world-readable plist, prevents shell evaluation, and leaves
+/// launchd supervising the proxy at the same PID.
 fn render_service_plist(binary: &std::path::Path, paths: &ServicePaths) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -3550,9 +3980,16 @@ fn render_service_plist(binary: &std::path::Path, paths: &ServicePaths) -> Strin
 	<string>{label}</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/bin/sh</string>
-		<string>-c</string>
-		<string>set -a; [ -f {env_file} ] &amp;&amp; . {env_file}; set +a; exec {binary} serve {config}</string>
+		<string>{binary}</string>
+		<string>service</string>
+		<string>launch</string>
+		<string>--environment</string>
+		<string>{env_file}</string>
+		<string>--lifecycle-lock</string>
+		<string>{lifecycle_lock}</string>
+		<string>--uninstall-state</string>
+		<string>{uninstall_state}</string>
+		<string>{config}</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -3569,14 +4006,13 @@ fn render_service_plist(binary: &std::path::Path, paths: &ServicePaths) -> Strin
 "#,
         label = SERVICE_LABEL,
         exit_timeout = SERVICE_EXIT_TIMEOUT_SECS,
-        // The three shell-interpolated paths are quoted for the shell
-        // first, then XML-escaped; the two log paths are plain plist
-        // strings and only need XML escaping.
-        binary = xml_escape(&shell_single_quote(&binary.to_string_lossy())),
-        config = xml_escape(&shell_single_quote(&paths.config.to_string_lossy())),
+        binary = xml_escape(&binary.to_string_lossy()),
+        config = xml_escape(&paths.config.to_string_lossy()),
         stdout = xml_escape(&paths.stdout_log.to_string_lossy()),
         stderr = xml_escape(&paths.stderr_log.to_string_lossy()),
-        env_file = xml_escape(&shell_single_quote(&paths.env_file.to_string_lossy())),
+        env_file = xml_escape(&paths.env_file.to_string_lossy()),
+        lifecycle_lock = xml_escape(&paths.lifecycle_lock.to_string_lossy()),
+        uninstall_state = xml_escape(&paths.uninstall_state.to_string_lossy()),
     )
 }
 
@@ -3585,6 +4021,62 @@ fn handle_service_subcommand(cmd: &ServiceCmd) -> anyhow::Result<i32> {
         ServiceSub::Install(args) => handle_service_install(args),
         ServiceSub::Uninstall(args) => handle_service_uninstall(args),
         ServiceSub::Status(args) => handle_service_status(args),
+        ServiceSub::Launch(args) => handle_service_launch(args),
+    }
+}
+
+fn handle_service_launch(args: &ServiceLaunchArgs) -> anyhow::Result<i32> {
+    if args.lifecycle_lock.parent() != args.uninstall_state.parent() {
+        anyhow::bail!(
+            "service lifecycle lock '{}' and state '{}' must share a directory",
+            args.lifecycle_lock.display(),
+            args.uninstall_state.display()
+        );
+    }
+    let lifecycle_lock = acquire_service_lifecycle_lock(&args.lifecycle_lock)?;
+    let environment = read_service_environment(&args.environment)?;
+    let ownership_directory = service_engine_ownership_directory_from_environment(
+        &environment,
+        &args.environment,
+        &args.config,
+    )?;
+    let owner = sbproxy_model_host::capture_managed_engine_owner(std::process::id())
+        .ok_or_else(|| anyhow::anyhow!("capture exact service bootstrap process identity"))?;
+    register_service_owner_locked(
+        &lifecycle_lock,
+        &args.uninstall_state,
+        &ownership_directory,
+        &owner,
+    )?;
+
+    let binary = std::env::current_exe()
+        .map_err(|error| anyhow::anyhow!("resolve current executable: {error}"))?;
+    let mut command = std::process::Command::new(binary);
+    command.arg("serve").arg(&args.config);
+    // An inherited caller value must not mask the declarative file or its
+    // documented default. Always pass the resolved absolute path so process
+    // recovery and uninstall cannot diverge if launchd omits HOME.
+    command.env_remove(SERVICE_ENGINE_OWNERSHIP_ENV);
+    command.envs(environment.variables);
+    command.env(SERVICE_ENGINE_OWNERSHIP_ENV, &ownership_directory);
+    // Registration is durable before this release. If uninstall owns the
+    // lock, this bootstrap cannot reach exec; if it already registered,
+    // uninstall will reap its exact generation even if launchd hides it.
+    drop(lifecycle_lock);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let error = command.exec();
+        Err(anyhow::anyhow!(
+            "exec service proxy for '{}': {error}",
+            args.config.display()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+        anyhow::bail!("launchd services are macOS-only")
     }
 }
 
@@ -3604,6 +4096,7 @@ fn handle_service_install(args: &ServiceInstallArgs) -> anyhow::Result<i32> {
     let paths = service_paths()?;
 
     if args.run.dry_run {
+        let _ = read_service_environment(&paths.env_file)?;
         let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("sbproxy"));
         println!(
             "# would install launchd agent '{}' for {}:{} at {}\n{}\n{}",
@@ -3651,6 +4144,7 @@ fn handle_service_install(args: &ServiceInstallArgs) -> anyhow::Result<i32> {
     // Created once, never rewritten: reinstalling to change the model or
     // the port must not throw away a token the operator put here.
     ensure_service_env_file(&paths.env_file)?;
+    let _ = read_service_environment(&paths.env_file)?;
 
     let binary = std::env::current_exe()
         .map_err(|error| anyhow::anyhow!("resolve current executable: {error}"))?;
@@ -3765,16 +4259,10 @@ fn handle_service_status(args: &ServiceStatusArgs) -> anyhow::Result<i32> {
         anyhow::bail!("launchd services are macOS-only");
     }
 
-    let output = std::process::Command::new("launchctl")
-        .arg("list")
-        .arg(SERVICE_LABEL)
-        .output()
-        .map_err(|error| anyhow::anyhow!("launchctl list: {error}"))?;
-    let registered = output.status.success();
-    let pid = if registered {
-        parse_launchctl_list_pid(&String::from_utf8_lossy(&output.stdout))
-    } else {
-        None
+    let mut launchd = SystemLaunchdController;
+    let (registered, pid) = match launchd.status()? {
+        LaunchdJobStatus::NotLoaded => (false, None),
+        LaunchdJobStatus::Loaded { pid } => (true, pid),
     };
     let running = pid.is_some();
     // Report the paths a running agent is actually using, so recovering
@@ -9189,61 +9677,67 @@ mod tests {
             uninstall_state: PathBuf::from(format!(
                 "{home}/Library/Application Support/sbproxy/service/uninstall-state.json"
             )),
+            lifecycle_lock: PathBuf::from(format!(
+                "{home}/Library/Application Support/sbproxy/service/lifecycle.lock"
+            )),
         }
     }
 
     #[test]
-    fn service_plist_contains_program_arguments_and_serve() {
+    fn service_plist_contains_program_arguments_and_bootstrap() {
         let paths = service_paths_fixture("/Users/test");
         let plist = render_service_plist(std::path::Path::new("/usr/local/bin/sbproxy"), &paths);
         assert!(plist.contains("<key>ProgramArguments</key>"));
-        assert!(plist.contains("serve"));
+        assert!(plist.contains("<string>service</string>"));
+        assert!(plist.contains("<string>launch</string>"));
         assert!(plist.contains("/usr/local/bin/sbproxy"));
         assert!(plist.contains(&format!("<string>{SERVICE_LABEL}</string>")));
         assert!(plist.contains("/Users/test/Library/Application Support/sbproxy/service/sb.yml"));
     }
 
     #[test]
-    fn service_plist_sources_the_environment_file_and_execs_the_proxy() {
+    fn service_plist_bootstraps_with_the_declarative_environment_file() {
         let paths = service_paths_fixture("/Users/test");
         let plist = render_service_plist(std::path::Path::new("/usr/local/bin/sbproxy"), &paths);
 
-        // The env file is sourced with auto-export on, so a bare
-        // `HF_TOKEN=...` line reaches the served process.
-        assert!(plist.contains("set -a;"), "{plist}");
+        assert!(plist.contains("<string>service</string>"), "{plist}");
+        assert!(plist.contains("<string>launch</string>"), "{plist}");
+        assert!(plist.contains("<string>--environment</string>"), "{plist}");
+        assert!(
+            plist.contains("<string>--lifecycle-lock</string>"),
+            "{plist}"
+        );
+        assert!(
+            plist.contains("<string>--uninstall-state</string>"),
+            "{plist}"
+        );
         assert!(
             plist.contains("/Users/test/Library/Application Support/sbproxy/service/env"),
             "the plist does not reference the environment file: {plist}"
         );
-        // `exec` is load-bearing: without it launchd supervises the shell,
-        // so KeepAlive restarts and signals target the wrong process.
         assert!(
-            plist.contains("exec "),
-            "the shell must exec the proxy so launchd supervises the proxy's pid: {plist}"
+            plist
+                .contains("/Users/test/Library/Application Support/sbproxy/service/lifecycle.lock"),
+            "the plist does not pass the cooperative lifecycle lock: {plist}"
         );
-        // The guard keeps a missing env file from failing the boot.
-        assert!(plist.contains("[ -f "), "{plist}");
+        assert!(
+            !plist.contains("/bin/sh") && !plist.contains("set -a;"),
+            "launchd must not interpret the declarative environment as shell code: {plist}"
+        );
     }
 
     #[test]
-    fn service_plist_quotes_a_home_directory_containing_an_apostrophe() {
-        // XML-escaping alone would turn the apostrophe into `&apos;`, which
-        // the plist parser hands back to the shell as a bare quote that
-        // ends the string early. Shell-quote first, then XML-escape, so
-        // the shell receives `'a'\''b'`.
+    fn service_plist_xml_escapes_a_home_directory_containing_an_apostrophe() {
         let paths = service_paths_fixture("/Users/o'brien");
         let plist = render_service_plist(std::path::Path::new("/usr/local/bin/sbproxy"), &paths);
 
-        // What the plist parser hands the shell, with XML entities resolved.
-        let shell_sees = plist.replace("&apos;", "'").replace("&amp;", "&");
         assert!(
-            shell_sees
-                .contains(r"'/Users/o'\''brien/Library/Application Support/sbproxy/service/env'"),
-            "the shell must see a correctly escaped single-quoted path: {shell_sees}"
+            plist.contains("/Users/o&apos;brien/Library/Application Support/sbproxy/service/env"),
+            "the direct ProgramArguments value must be valid XML: {plist}"
         );
         assert!(
-            !shell_sees.contains("'/Users/o'brien"),
-            "a bare apostrophe would terminate the shell string early: {shell_sees}"
+            !plist.contains(r"\&apos;"),
+            "direct ProgramArguments must not contain shell-quoting artifacts: {plist}"
         );
     }
 
@@ -9265,12 +9759,6 @@ mod tests {
             plist.contains(&format!("<integer>{SERVICE_EXIT_TIMEOUT_SECS}</integer>")),
             "{plist}"
         );
-    }
-
-    #[test]
-    fn shell_single_quote_wraps_and_escapes() {
-        assert_eq!(shell_single_quote("/plain/path"), "'/plain/path'");
-        assert_eq!(shell_single_quote("a'b"), r"'a'\''b'");
     }
 
     /// A unique scratch path for the env-file tests. Mirrors
@@ -9310,6 +9798,35 @@ mod tests {
         let _ = std::fs::remove_file(&env_file);
     }
 
+    #[test]
+    fn service_env_template_examples_are_valid_when_uncommented() {
+        let examples = SERVICE_ENV_TEMPLATE
+            .lines()
+            .filter_map(|line| line.strip_prefix("# "))
+            .filter(|line| {
+                line.starts_with("HF_TOKEN=")
+                    || line.starts_with("RUST_LOG=")
+                    || line.starts_with("SBPROXY_ENGINE_OWNERSHIP_DIR=")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let environment = parse_service_environment(std::path::Path::new("service-env"), &examples)
+            .expect("every commented assignment should work when uncommented");
+
+        assert_eq!(
+            environment.variables.get("HF_TOKEN").map(String::as_str),
+            Some("hf_...")
+        );
+        assert_eq!(
+            environment
+                .variables
+                .get(SERVICE_ENGINE_OWNERSHIP_ENV)
+                .map(String::as_str),
+            Some("/absolute/path")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn service_env_file_is_owner_only() {
@@ -9338,6 +9855,34 @@ mod tests {
         assert_eq!(parse_launchctl_list_pid(loaded_not_running), None);
     }
 
+    #[test]
+    fn launchctl_list_classifies_only_known_missing_service_as_not_loaded() {
+        let status = classify_launchctl_list_status(
+            false,
+            Some(113),
+            "",
+            "Could not find service \"dev.sbproxy.agent\" in domain for user gui: 501",
+        )
+        .expect("known launchd absence");
+
+        assert_eq!(status, LaunchdJobStatus::NotLoaded);
+    }
+
+    #[test]
+    fn launchctl_list_propagates_real_status_errors() {
+        let error = classify_launchctl_list_status(
+            false,
+            Some(1),
+            "",
+            "Operation not permitted while contacting launchd",
+        )
+        .expect_err("permission errors must not look like an absent service");
+
+        let message = error.to_string();
+        assert!(message.contains("exit code 1"), "{message}");
+        assert!(message.contains("Operation not permitted"), "{message}");
+    }
+
     fn service_temp_paths(tag: &str) -> ServicePaths {
         let root = temp_env_path(tag);
         let service = root.join("service");
@@ -9349,7 +9894,16 @@ mod tests {
             stderr_log: root.join("service.err.log"),
             env_file: service.join("env"),
             uninstall_state: service.join("uninstall-state.json"),
+            lifecycle_lock: service.join("lifecycle.lock"),
         }
+    }
+
+    fn write_registered_service_plist(paths: &ServicePaths) {
+        std::fs::write(
+            &paths.plist,
+            render_service_plist(std::path::Path::new("/usr/local/bin/sbproxy"), paths),
+        )
+        .unwrap();
     }
 
     struct FakeLaunchd {
@@ -9376,18 +9930,22 @@ mod tests {
 
     struct FakeServiceEngineCleanup {
         owner: sbproxy_model_host::ManagedEngineOwner,
+        owners_by_pid: std::collections::HashMap<u32, sbproxy_model_host::ManagedEngineOwner>,
         fail_reap: bool,
         capture_calls: usize,
+        captured_pids: Vec<u32>,
         reaped_directories: Vec<PathBuf>,
+        reaped_owners: Vec<sbproxy_model_host::ManagedEngineOwner>,
     }
 
     impl ServiceEngineCleanup for FakeServiceEngineCleanup {
         fn capture_owner(
             &mut self,
-            _pid: u32,
+            pid: u32,
         ) -> anyhow::Result<sbproxy_model_host::ManagedEngineOwner> {
             self.capture_calls += 1;
-            Ok(self.owner.clone())
+            self.captured_pids.push(pid);
+            Ok(self.owners_by_pid.get(&pid).unwrap_or(&self.owner).clone())
         }
 
         fn reap_owner(
@@ -9395,8 +9953,8 @@ mod tests {
             directory: &std::path::Path,
             owner: &sbproxy_model_host::ManagedEngineOwner,
         ) -> anyhow::Result<usize> {
-            assert_eq!(owner, &self.owner);
             self.reaped_directories.push(directory.to_path_buf());
+            self.reaped_owners.push(owner.clone());
             if self.fail_reap {
                 anyhow::bail!("injected exact-owner reap failure");
             }
@@ -9408,10 +9966,127 @@ mod tests {
         FakeServiceEngineCleanup {
             owner: sbproxy_model_host::capture_managed_engine_owner(std::process::id())
                 .expect("capture test process identity"),
+            owners_by_pid: std::collections::HashMap::new(),
             fail_reap,
             capture_calls: 0,
+            captured_pids: Vec::new(),
             reaped_directories: Vec::new(),
+            reaped_owners: Vec::new(),
         }
+    }
+
+    fn fake_managed_engine_owner(
+        pid: u32,
+        start_fingerprint: u64,
+    ) -> sbproxy_model_host::ManagedEngineOwner {
+        serde_json::from_value(serde_json::json!({
+            "pid": pid,
+            "start_fingerprint": start_fingerprint,
+            "executable": null,
+        }))
+        .expect("construct a distinct opaque owner token")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_launch_registration_persists_exact_owner_before_exec() {
+        let paths = service_temp_paths("launch-registration");
+        let ownership_directory = paths.config.parent().unwrap().join("managed-engines");
+        let owner = fake_managed_engine_owner(5101, 61);
+        let lifecycle_lock =
+            acquire_service_lifecycle_lock(&paths.lifecycle_lock).expect("lock lifecycle");
+
+        register_service_owner_locked(
+            &lifecycle_lock,
+            &paths.uninstall_state,
+            &ownership_directory,
+            &owner,
+        )
+        .expect("register exact bootstrap generation");
+
+        let state = read_service_uninstall_state(&paths.uninstall_state)
+            .unwrap()
+            .expect("durable lifecycle state");
+        assert_eq!(state.ownership_directory, ownership_directory);
+        assert_eq!(state.owners, vec![owner]);
+        assert!(paths.lifecycle_lock.exists());
+        drop(lifecycle_lock);
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_launch_registration_rejects_owner_generation_overflow() {
+        let paths = service_temp_paths("owner-overflow");
+        let ownership_directory = paths.config.parent().unwrap().join("managed-engines");
+        let owners = (0..MAX_SERVICE_OWNER_GENERATIONS)
+            .map(|index| fake_managed_engine_owner(20_000 + index as u32, 10_000 + index as u64))
+            .collect::<Vec<_>>();
+        persist_service_uninstall_state(
+            &paths.uninstall_state,
+            &ServiceUninstallState {
+                schema_version: SERVICE_UNINSTALL_STATE_SCHEMA_VERSION,
+                ownership_directory: ownership_directory.clone(),
+                owners: owners.clone(),
+            },
+        )
+        .unwrap();
+        let lifecycle_lock =
+            acquire_service_lifecycle_lock(&paths.lifecycle_lock).expect("lock lifecycle");
+
+        let error = register_service_owner_locked(
+            &lifecycle_lock,
+            &paths.uninstall_state,
+            &ownership_directory,
+            &fake_managed_engine_owner(99_999, 99_999),
+        )
+        .expect_err("the lifecycle registry must have a hard owner cap");
+
+        assert!(
+            error.to_string().contains("owner generation limit"),
+            "{error:#}"
+        );
+        let state = read_service_uninstall_state(&paths.uninstall_state)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.owners, owners);
+        drop(lifecycle_lock);
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_state_rejects_oversized_file_before_read() {
+        let paths = service_temp_paths("oversized-state");
+        let file = std::fs::File::create(&paths.uninstall_state).unwrap();
+        file.set_len((MAX_SERVICE_UNINSTALL_STATE_BYTES + 1) as u64)
+            .unwrap();
+
+        let error = read_service_uninstall_state(&paths.uninstall_state)
+            .expect_err("oversized lifecycle state must be rejected before allocation");
+
+        assert!(error.to_string().contains("maximum size"), "{error:#}");
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn service_lifecycle_lock_does_not_follow_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let paths = service_temp_paths("lock-symlink");
+        let target = paths.config.parent().unwrap().join("lock-target");
+        std::fs::write(&target, "do not lock through this path").unwrap();
+        symlink(&target, &paths.lifecycle_lock).unwrap();
+
+        let error = acquire_service_lifecycle_lock(&paths.lifecycle_lock)
+            .expect_err("a lifecycle lock symlink must fail closed");
+
+        assert!(error.to_string().contains("lifecycle lock"), "{error:#}");
+        assert_eq!(
+            std::fs::read_to_string(target).unwrap(),
+            "do not lock through this path"
+        );
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
     }
 
     #[test]
@@ -9440,6 +10115,54 @@ mod tests {
     }
 
     #[test]
+    fn service_environment_rejects_duplicate_assignments() {
+        let paths = service_temp_paths("duplicate-environment");
+        std::fs::write(
+            &paths.env_file,
+            "SBPROXY_ENGINE_OWNERSHIP_DIR=/first\n\
+             SBPROXY_ENGINE_OWNERSHIP_DIR=/second\n",
+        )
+        .unwrap();
+
+        let error = service_engine_ownership_directory(&paths)
+            .expect_err("duplicate keys could select different startup and cleanup values");
+
+        assert!(error.to_string().contains("duplicate"), "{error:#}");
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_environment_rejects_shell_syntax() {
+        let paths = service_temp_paths("shell-environment");
+        std::fs::write(
+            &paths.env_file,
+            "HF_TOKEN=$(cat /tmp/token)\n\
+             SBPROXY_ENGINE_OWNERSHIP_DIR=/managed-engines\n",
+        )
+        .unwrap();
+
+        let error = service_engine_ownership_directory(&paths)
+            .expect_err("the service environment is declarative, not a shell program");
+
+        assert!(error.to_string().contains("shell syntax"), "{error:#}");
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_environment_rejects_an_oversized_file_before_reading_it() {
+        let paths = service_temp_paths("oversized-environment");
+        let file = std::fs::File::create(&paths.env_file).unwrap();
+        file.set_len((MAX_SERVICE_ENVIRONMENT_BYTES + 1) as u64)
+            .unwrap();
+
+        let error = read_service_environment(&paths.env_file)
+            .expect_err("service bootstrap must bound environment-file allocation");
+
+        assert!(error.to_string().contains("maximum size"), "{error:#}");
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
     fn service_uninstall_accepts_an_already_unloaded_job_without_calling_unload() {
         let paths = service_temp_paths("already-unloaded");
         std::fs::write(&paths.plist, "plist").unwrap();
@@ -9461,10 +10184,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn service_uninstall_fails_closed_for_a_loaded_legacy_plist() {
+        let paths = service_temp_paths("loaded-legacy-plist");
+        std::fs::write(
+            &paths.plist,
+            "<string>/bin/sh</string><string>-c</string><string>exec sbproxy serve</string>",
+        )
+        .unwrap();
+        let mut launchd = FakeLaunchd {
+            statuses: [LaunchdJobStatus::Loaded {
+                pid: Some(std::process::id()),
+            }]
+            .into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+
+        let error = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect_err("a legacy KeepAlive job has no complete owner-generation registry");
+
+        assert!(error.to_string().contains("legacy plist"), "{error:#}");
+        assert!(error.to_string().contains("service install"), "{error:#}");
+        assert_eq!(launchd.unload_calls, 0);
+        assert_eq!(cleanup.capture_calls, 0);
+        assert!(paths.plist.exists(), "legacy retry handle must remain");
+        assert!(!paths.uninstall_state.exists());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
     #[test]
     fn service_uninstall_retains_exact_retry_state_and_plist_until_reap_succeeds() {
         let paths = service_temp_paths("transaction");
-        std::fs::write(&paths.plist, "plist").unwrap();
+        write_registered_service_plist(&paths);
         let ownership_directory = paths
             .env_file
             .parent()
@@ -9479,9 +10233,12 @@ mod tests {
         )
         .unwrap();
         let mut first_launchd = FakeLaunchd {
-            statuses: [LaunchdJobStatus::Loaded {
-                pid: Some(std::process::id()),
-            }]
+            statuses: [
+                LaunchdJobStatus::Loaded {
+                    pid: Some(std::process::id()),
+                },
+                LaunchdJobStatus::NotLoaded,
+            ]
             .into(),
             unload_fails: false,
             unload_calls: 0,
@@ -9524,7 +10281,7 @@ mod tests {
     #[test]
     fn service_uninstall_accepts_unload_failure_when_launchd_reports_not_loaded() {
         let paths = service_temp_paths("unload-race");
-        std::fs::write(&paths.plist, "plist").unwrap();
+        write_registered_service_plist(&paths);
         let mut launchd = FakeLaunchd {
             statuses: [
                 LaunchdJobStatus::Loaded {
@@ -9551,7 +10308,7 @@ mod tests {
     #[test]
     fn service_uninstall_keeps_transaction_when_unload_fails_and_job_is_still_loaded() {
         let paths = service_temp_paths("unload-failure");
-        std::fs::write(&paths.plist, "plist").unwrap();
+        write_registered_service_plist(&paths);
         let running = LaunchdJobStatus::Loaded {
             pid: Some(std::process::id()),
         };
@@ -9569,6 +10326,158 @@ mod tests {
         assert!(paths.plist.exists());
         assert!(paths.uninstall_state.exists());
         assert!(cleanup.reaped_directories.is_empty());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_records_every_keepalive_generation_before_cleanup() {
+        let paths = service_temp_paths("keepalive-generations");
+        write_registered_service_plist(&paths);
+        let first_pid = 4101;
+        let replacement_pid = 4102;
+        let first_owner = fake_managed_engine_owner(first_pid, 51);
+        let replacement_owner = fake_managed_engine_owner(replacement_pid, 52);
+        let mut launchd = FakeLaunchd {
+            statuses: [
+                LaunchdJobStatus::Loaded {
+                    pid: Some(first_pid),
+                },
+                LaunchdJobStatus::Loaded {
+                    pid: Some(replacement_pid),
+                },
+                LaunchdJobStatus::NotLoaded,
+            ]
+            .into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+        cleanup.owners_by_pid.insert(first_pid, first_owner.clone());
+        cleanup
+            .owners_by_pid
+            .insert(replacement_pid, replacement_owner.clone());
+
+        let outcome = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect("every observed KeepAlive generation is captured");
+
+        assert_eq!(launchd.unload_calls, 2);
+        assert_eq!(cleanup.captured_pids, vec![first_pid, replacement_pid]);
+        assert_eq!(cleanup.reaped_owners, vec![first_owner, replacement_owner]);
+        assert_eq!(outcome.engines_reaped, 2);
+        assert!(!paths.plist.exists());
+        assert!(!paths.uninstall_state.exists());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_uninstall_reaps_pre_registered_replacement_when_unload_hides_it() {
+        let paths = service_temp_paths("pre-registered-replacement");
+        write_registered_service_plist(&paths);
+        let ownership_directory = paths.config.parent().unwrap().join("managed-engines");
+        let first_pid = 6101;
+        let first_owner = fake_managed_engine_owner(first_pid, 71);
+        let replacement_owner = fake_managed_engine_owner(6102, 72);
+        {
+            let lifecycle_lock =
+                acquire_service_lifecycle_lock(&paths.lifecycle_lock).expect("lock lifecycle");
+            register_service_owner_locked(
+                &lifecycle_lock,
+                &paths.uninstall_state,
+                &ownership_directory,
+                &first_owner,
+            )
+            .unwrap();
+            register_service_owner_locked(
+                &lifecycle_lock,
+                &paths.uninstall_state,
+                &ownership_directory,
+                &replacement_owner,
+            )
+            .unwrap();
+        }
+        let mut launchd = FakeLaunchd {
+            statuses: [
+                LaunchdJobStatus::Loaded {
+                    pid: Some(first_pid),
+                },
+                LaunchdJobStatus::NotLoaded,
+            ]
+            .into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+        cleanup.owners_by_pid.insert(first_pid, first_owner.clone());
+
+        let outcome = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect("the registry covers a replacement hidden by unload");
+
+        assert_eq!(launchd.unload_calls, 1);
+        assert_eq!(cleanup.captured_pids, vec![first_pid]);
+        assert_eq!(cleanup.reaped_owners, vec![first_owner, replacement_owner]);
+        assert_eq!(outcome.engines_reaped, 2);
+        assert!(!paths.plist.exists());
+        assert!(!paths.uninstall_state.exists());
+        assert!(
+            paths.lifecycle_lock.exists(),
+            "never unlink a cooperative lock path"
+        );
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_uninstall_bounds_same_pid_no_progress_and_retains_handles() {
+        let paths = service_temp_paths("bounded-no-progress");
+        write_registered_service_plist(&paths);
+        let pid = 7101;
+        let running = LaunchdJobStatus::Loaded { pid: Some(pid) };
+        let mut launchd = FakeLaunchd {
+            statuses: vec![running; MAX_SERVICE_UNLOAD_ATTEMPTS + 2].into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+        cleanup
+            .owners_by_pid
+            .insert(pid, fake_managed_engine_owner(pid, 81));
+
+        let error = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect_err("a launchd job that never changes must fail in bounded time");
+
+        assert!(error.to_string().contains("no progress"), "{error:#}");
+        assert!(launchd.unload_calls <= MAX_SERVICE_UNLOAD_ATTEMPTS);
+        assert!(paths.plist.exists());
+        assert!(paths.uninstall_state.exists());
+        assert!(paths.lifecycle_lock.exists());
+        assert!(cleanup.reaped_owners.is_empty());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_preserves_retry_handles_when_loaded_job_has_no_pid() {
+        let paths = service_temp_paths("loaded-without-pid");
+        write_registered_service_plist(&paths);
+        let mut launchd = FakeLaunchd {
+            statuses: [LaunchdJobStatus::Loaded { pid: None }].into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+
+        let error = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect_err("an ownerless loaded generation cannot be cleaned exactly");
+
+        assert!(error.to_string().contains("has no PID"), "{error:#}");
+        assert_eq!(launchd.unload_calls, 0);
+        assert!(cleanup.captured_pids.is_empty());
+        assert!(cleanup.reaped_owners.is_empty());
+        assert!(paths.plist.exists());
+        assert!(
+            paths.uninstall_state.exists(),
+            "the durable retry transaction must survive"
+        );
         let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
     }
 

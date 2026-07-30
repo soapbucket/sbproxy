@@ -101,9 +101,11 @@ The four failures from the 2026-07-30 run now have explicit contracts:
 - SIGTERM returns through the gateway shutdown guards, verifies the managed
   engine exited, removes its durable ownership record, and releases the public
   listener.
-- `service uninstall` saves the exact launchd owner identity before unload,
-  reads its ownership directory from the service environment file, and keeps
-  the plist plus retry state until that owner's engine cleanup succeeds.
+- The launchd bootstrap registers every exact gateway generation before it can
+  execute. `service uninstall` holds the same lifecycle lock across unload,
+  reads the ownership directory from the service environment file, and keeps
+  the plist plus retry state until every registered owner's engine cleanup
+  succeeds. A loaded legacy plist without registration fails closed.
 - A managed child blocks before `exec` until its owner and engine
   fingerprints are on durable storage. Persistence failure stops the child
   before it can execute. An `exec` failure is reported through the normal
@@ -111,17 +113,19 @@ The four failures from the 2026-07-30 run now have explicit contracts:
   the next boot reaps an exact stale process group before binding listeners or
   spawning a replacement. A live owner is preserved. A reused engine PID is
   never signalled; when its process group is still occupied, the record stays
-  in place because ownership cannot be proved. Linux's parent-death signal
-  remains the first line of defense.
+  in place because ownership cannot be proved. Linux uses a parent-death
+  signal. macOS uses `posix_spawn` plus private atomically close-on-exec gate
+  endpoints, so parent exit closes the gate without a concurrent-fork fd leak.
 
 Focused real-process tests cover collision failure, SIGTERM plus same-port
 rebind, blocked startup until durable ownership, persistence and exec failure,
-process-group reap, live-owner preservation, PID-reuse preservation,
-killed-owner recovery, fast-exit diagnostics, and record removal after normal
-shutdown. The release Apple lane now derives engine PIDs from those ownership
-records, exercises gateway SIGKILL/restart and the real `service uninstall`,
-then requires engine cleanup and a same-port bind. That lane still needs a live
-Apple runner result.
+process-group reap, live-owner preservation, PID-reuse preservation, safe
+concurrent spawn gates, exact launchd generation registration, legacy-plist
+refusal, killed-owner recovery, fast-exit diagnostics, and record removal after
+normal shutdown. The release Apple lane now derives engine PIDs from those
+ownership records, exercises gateway SIGKILL/restart and the real
+`service uninstall`, then requires engine cleanup and a same-port bind. That
+lane still needs a live Apple runner result.
 
 ### Sleep and wake
 

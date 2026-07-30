@@ -25,6 +25,10 @@ use crate::{EngineDriverError, EngineFailureReason};
 const MAX_STDERR_TAIL_BYTES: usize = 64 * 1024;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const PROCESS_OWNERSHIP_SCHEMA_VERSION: u32 = 1;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_PROCESS_OWNERSHIP_RECORD_BYTES: usize = 64 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_PROCESS_OWNERSHIP_RECORDS: usize = 4_096;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -348,7 +352,6 @@ impl OwnershipDirectory {
     fn open(path: &Path, create: bool) -> Result<Option<Self>, EngineDriverError> {
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
         use std::os::unix::ffi::OsStrExt as _;
-        use std::os::unix::fs::DirBuilderExt as _;
 
         let path = if path.is_absolute() {
             path.to_path_buf()
@@ -362,13 +365,28 @@ impl OwnershipDirectory {
                 })?
                 .join(path)
         };
-        let parent = path.parent().ok_or_else(|| {
-            process_ownership_error(
-                "validate managed-engine ownership directory",
-                format!("'{}' has no parent directory", path.display()),
-            )
-        })?;
-        let name = path.file_name().ok_or_else(|| {
+        #[cfg(target_os = "macos")]
+        let path = normalize_macos_root_alias(path);
+        let mut components = Vec::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::RootDir | std::path::Component::CurDir => {}
+                std::path::Component::Normal(name) => components.push(name.to_os_string()),
+                std::path::Component::ParentDir => {
+                    return Err(process_ownership_error(
+                        "validate managed-engine ownership directory",
+                        format!("'{}' contains a parent-directory component", path.display()),
+                    ));
+                }
+                std::path::Component::Prefix(_) => {
+                    return Err(process_ownership_error(
+                        "validate managed-engine ownership directory",
+                        format!("'{}' has an unsupported path prefix", path.display()),
+                    ));
+                }
+            }
+        }
+        let name = components.pop().ok_or_else(|| {
             process_ownership_error(
                 "validate managed-engine ownership directory",
                 format!(
@@ -377,41 +395,88 @@ impl OwnershipDirectory {
                 ),
             )
         })?;
-
-        if create && !parent.exists() {
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder.create(parent).map_err(|error| {
-                process_ownership_error(
-                    "create managed-engine ownership parent directory",
-                    error.to_string(),
-                )
-            })?;
-        }
-        let parent_path = CString::new(parent.as_os_str().as_bytes()).map_err(|_| {
-            process_ownership_error(
-                "open managed-engine ownership parent directory",
-                "path contains a NUL byte",
-            )
-        })?;
-        let parent_fd = unsafe {
+        let root = CString::new("/").expect("root path contains no NUL");
+        let descriptor = unsafe {
             libc::open(
-                parent_path.as_ptr(),
+                root.as_ptr(),
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             )
         };
-        if parent_fd < 0 {
-            let error = std::io::Error::last_os_error();
-            if !create && error.kind() == std::io::ErrorKind::NotFound {
-                return Ok(None);
-            }
+        if descriptor < 0 {
             return Err(process_ownership_error(
-                "open managed-engine ownership parent directory",
-                error.to_string(),
+                "open managed-engine ownership path root",
+                std::io::Error::last_os_error().to_string(),
             ));
         }
-        let parent_file = unsafe { std::fs::File::from_raw_fd(parent_fd) };
-        validate_ownership_parent(&parent_file, parent)?;
+        let mut parent_file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        let mut parent_path = PathBuf::from("/");
+
+        for component in components {
+            validate_ownership_parent(&parent_file, &parent_path)?;
+            let component_c = CString::new(component.as_bytes()).map_err(|_| {
+                process_ownership_error(
+                    "open managed-engine ownership ancestor directory",
+                    "path contains a NUL byte",
+                )
+            })?;
+            let mut descriptor = unsafe {
+                libc::openat(
+                    parent_file.as_raw_fd(),
+                    component_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if descriptor < 0 {
+                let error = std::io::Error::last_os_error();
+                if !create && error.kind() == std::io::ErrorKind::NotFound {
+                    return Ok(None);
+                }
+                if !create || error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(process_ownership_error(
+                        "open managed-engine ownership ancestor directory",
+                        format!("'{}': {error}", parent_path.join(&component).display()),
+                    ));
+                }
+                if unsafe { libc::mkdirat(parent_file.as_raw_fd(), component_c.as_ptr(), 0o700) }
+                    != 0
+                {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(process_ownership_error(
+                            "create managed-engine ownership ancestor directory",
+                            format!("'{}': {error}", parent_path.join(&component).display()),
+                        ));
+                    }
+                } else {
+                    parent_file.sync_all().map_err(|error| {
+                        process_ownership_error(
+                            "sync managed-engine ownership ancestor directory",
+                            error.to_string(),
+                        )
+                    })?;
+                }
+                descriptor = unsafe {
+                    libc::openat(
+                        parent_file.as_raw_fd(),
+                        component_c.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    )
+                };
+                if descriptor < 0 {
+                    return Err(process_ownership_error(
+                        "open created managed-engine ownership ancestor directory",
+                        format!(
+                            "'{}': {}",
+                            parent_path.join(&component).display(),
+                            std::io::Error::last_os_error()
+                        ),
+                    ));
+                }
+            }
+            parent_file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+            parent_path.push(component);
+        }
+        validate_ownership_parent(&parent_file, &parent_path)?;
 
         let name_c = CString::new(name.as_bytes()).map_err(|_| {
             process_ownership_error(
@@ -429,6 +494,13 @@ impl OwnershipDirectory {
                         error.to_string(),
                     ));
                 }
+            } else {
+                parent_file.sync_all().map_err(|error| {
+                    process_ownership_error(
+                        "sync managed-engine ownership parent directory",
+                        error.to_string(),
+                    )
+                })?;
             }
         }
         let descriptor = unsafe {
@@ -561,16 +633,46 @@ impl OwnershipDirectory {
                 "record is not a private regular file owned by the effective user",
             ));
         }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(|error| {
-            process_ownership_error(
+        if metadata.st_size < 0
+            || u64::try_from(metadata.st_size).unwrap_or(u64::MAX)
+                > MAX_PROCESS_OWNERSHIP_RECORD_BYTES as u64
+        {
+            return Err(process_ownership_error(
                 format!(
-                    "read managed-engine ownership '{}'",
+                    "validate managed-engine ownership '{}'",
                     self.path.join(name).display()
                 ),
-                error.to_string(),
-            )
-        })?;
+                format!(
+                    "record exceeds the {}-byte size limit",
+                    MAX_PROCESS_OWNERSHIP_RECORD_BYTES
+                ),
+            ));
+        }
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take((MAX_PROCESS_OWNERSHIP_RECORD_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                process_ownership_error(
+                    format!(
+                        "read managed-engine ownership '{}'",
+                        self.path.join(name).display()
+                    ),
+                    error.to_string(),
+                )
+            })?;
+        if bytes.len() > MAX_PROCESS_OWNERSHIP_RECORD_BYTES {
+            return Err(process_ownership_error(
+                format!(
+                    "validate managed-engine ownership '{}'",
+                    self.path.join(name).display()
+                ),
+                format!(
+                    "record exceeds the {}-byte size limit",
+                    MAX_PROCESS_OWNERSHIP_RECORD_BYTES
+                ),
+            ));
+        }
         validate_ownership_record(&self.path.join(name), &bytes)
     }
 
@@ -615,7 +717,7 @@ impl OwnershipDirectory {
             if bytes == b"." || bytes == b".." || !bytes.ends_with(b".json") {
                 continue;
             }
-            names.push(OsString::from_vec(bytes.to_vec()));
+            push_bounded_record_name(&mut names, OsString::from_vec(bytes.to_vec()))?;
         }
         names.sort();
         Ok(names)
@@ -671,6 +773,117 @@ impl OwnershipDirectory {
     fn sync(&self) -> std::io::Result<()> {
         self.file.sync_all()
     }
+
+    #[cfg(target_os = "macos")]
+    fn create_cloexec_fifo_pair(
+        &self,
+        label: &str,
+    ) -> std::io::Result<(std::fs::File, std::fs::File)> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        static NEXT_GATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let mut selected = None;
+        for _ in 0..32 {
+            let sequence = NEXT_GATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let name = OsString::from(format!(
+                ".gate-{label}-{}-{sequence}.fifo",
+                std::process::id()
+            ));
+            let name_c = record_name_io_cstring(&name)?;
+            if unsafe { libc::mkfifoat(self.file.as_raw_fd(), name_c.as_ptr(), 0o600) } == 0 {
+                selected = Some((name, name_c));
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        }
+        let (name, name_c) = selected.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate a unique managed-engine gate FIFO",
+            )
+        })?;
+        let reader = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name_c.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if reader < 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = self.unlink(&name);
+            return Err(error);
+        }
+        let reader = unsafe { std::fs::File::from_raw_fd(reader) };
+        let writer = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name_c.as_ptr(),
+                libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if writer < 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = self.unlink(&name);
+            return Err(error);
+        }
+        let writer = unsafe { std::fs::File::from_raw_fd(writer) };
+        self.unlink(&name)?;
+        set_file_blocking(reader.as_raw_fd())?;
+        set_file_blocking(writer.as_raw_fd())?;
+        Ok((reader, writer))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_file_blocking(descriptor: libc::c_int) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_macos_root_alias(path: PathBuf) -> PathBuf {
+    // macOS installs these root entries as root-owned aliases into /private.
+    // Resolve only those fixed operating-system aliases before the fd-relative
+    // walk; arbitrary user-selected symlinks remain rejected at every level.
+    for (alias, target) in [
+        (Path::new("/var"), Path::new("/private/var")),
+        (Path::new("/tmp"), Path::new("/private/tmp")),
+        (Path::new("/etc"), Path::new("/private/etc")),
+    ] {
+        if let Ok(suffix) = path.strip_prefix(alias) {
+            return target.join(suffix);
+        }
+    }
+    path
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn push_bounded_record_name(
+    names: &mut Vec<OsString>,
+    name: OsString,
+) -> Result<(), EngineDriverError> {
+    if names.len() >= MAX_PROCESS_OWNERSHIP_RECORDS {
+        return Err(process_ownership_error(
+            "read managed-engine ownership directory",
+            format!(
+                "record limit of {} was exceeded",
+                MAX_PROCESS_OWNERSHIP_RECORDS
+            ),
+        ));
+    }
+    names.push(name);
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1424,15 +1637,23 @@ impl TokioCommandExecutor {
     ) -> Result<Arc<dyn EngineProcess>, EngineDriverError> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let ownership_directory = store.open_or_create()?;
-        let mut child =
-            spawn_engine_child(executable, arguments, environment).map_err(|error| {
-                EngineDriverError::new(
-                    EngineFailureReason::EngineSpawnFailed,
-                    format!("spawn engine {:?}: {error}", executable),
-                    "run model-host doctor and provision a compatible engine",
-                    true,
-                )
-            })?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let spawn_result = spawn_engine_child(
+            ownership_directory.as_ref(),
+            executable,
+            arguments,
+            environment,
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let spawn_result = spawn_engine_child(executable, arguments, environment);
+        let mut child = spawn_result.map_err(|error| {
+            EngineDriverError::new(
+                EngineFailureReason::EngineSpawnFailed,
+                format!("spawn engine {:?}: {error}", executable),
+                "run model-host doctor and provision a compatible engine",
+                true,
+            )
+        })?;
         let stderr = match child.take_stderr() {
             Some(stderr) => stderr,
             None => {
@@ -1478,9 +1699,10 @@ impl TokioCommandExecutor {
         };
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let ownership = {
-            let record = process_identity(child.id())
+            let record = child
+                .exact_identity()
+                .cloned()
                 .zip(process_identity(std::process::id()))
-                .filter(|(engine, _)| process_group_for(engine.pid) == Some(engine.pid))
                 .map(|(mut engine, owner)| {
                     engine.executable = Some(executable.to_path_buf());
                     ManagedProcessOwnership {
@@ -1500,9 +1722,7 @@ impl TokioCommandExecutor {
             match record {
                 Ok(ownership) => ownership,
                 Err(error) => {
-                    if process_group_for(child.id()) == Some(child.id()) {
-                        signal_isolated_process_group(child.id(), libc::SIGKILL);
-                    }
+                    child.signal_group_if_exact(libc::SIGKILL);
                     let _ = child.kill();
                     let _ = child.wait();
                     let _ = stderr_drain.join();
@@ -1615,19 +1835,96 @@ impl CommandExecutor for TokioCommandExecutor {
 }
 
 fn spawn_engine_child(
+    #[cfg(any(target_os = "linux", target_os = "macos"))] ownership_directory: &OwnershipDirectory,
     executable: &Path,
     arguments: &[String],
     environment: &BTreeMap<String, String>,
 ) -> Result<SpawnedEngineChild, String> {
-    spawn_engine_command(executable, arguments, environment).map_err(|error| error.to_string())
+    spawn_engine_command(
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        ownership_directory,
+        executable,
+        arguments,
+        environment,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+type NativeChild = std::process::Child;
+#[cfg(target_os = "macos")]
+type NativeChild = MacProcessChild;
+#[cfg(target_os = "linux")]
+type NativeReleaseWriter = std::process::ChildStdin;
+#[cfg(target_os = "macos")]
+type NativeReleaseWriter = std::fs::File;
+#[cfg(target_os = "linux")]
+type NativeStderrReader = std::process::ChildStderr;
+#[cfg(target_os = "macos")]
+type NativeStderrReader = std::fs::File;
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct MacProcessChild {
+    pid: libc::pid_t,
+}
+
+#[cfg(target_os = "macos")]
+impl MacProcessChild {
+    fn id(&self) -> u32 {
+        u32::try_from(self.pid).expect("posix_spawn returned a positive process ID")
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.wait_with_options(libc::WNOHANG)
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        loop {
+            if let Some(status) = self.wait_with_options(0)? {
+                return Ok(status);
+            }
+        }
+    }
+
+    fn wait_with_options(
+        &mut self,
+        options: libc::c_int,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        loop {
+            let mut status = 0;
+            let result = unsafe { libc::waitpid(self.pid, &mut status, options) };
+            if result == self.pid {
+                return Ok(Some(std::process::ExitStatus::from_raw(status)));
+            }
+            if result == 0 {
+                return Ok(None);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        if unsafe { libc::kill(self.pid, libc::SIGKILL) } == 0 {
+            return Ok(());
+        }
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug)]
 struct SpawnedEngineChild {
-    child: std::process::Child,
-    release: Option<std::process::ChildStdin>,
+    child: NativeChild,
+    release: Option<NativeReleaseWriter>,
+    stderr: Option<NativeStderrReader>,
     status: Option<std::process::ExitStatus>,
+    exact_identity: Option<ProcessIdentity>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1636,8 +1933,23 @@ impl SpawnedEngineChild {
         self.child.id()
     }
 
-    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
-        self.child.stderr.take()
+    fn take_stderr(&mut self) -> Option<NativeStderrReader> {
+        self.stderr.take()
+    }
+
+    fn exact_identity(&self) -> Option<&ProcessIdentity> {
+        self.exact_identity.as_ref()
+    }
+
+    fn signal_group_if_exact(&self, signal: i32) {
+        if self.exact_identity.as_ref().is_some_and(|expected| {
+            process_identity(self.id())
+                .as_ref()
+                .is_some_and(|actual| identity_matches(expected, actual))
+                && process_group_for(self.id()) == Some(self.id())
+        }) {
+            signal_isolated_process_group(self.id(), signal);
+        }
     }
 
     fn release_after_durable_record(&mut self) -> std::io::Result<()> {
@@ -1689,9 +2001,7 @@ impl Drop for SpawnedEngineChild {
         // check and the signal. Once wait reports exit, fail closed and
         // leave any surviving group member to durable recovery.
         if matches!(self.try_wait(), Ok(None)) {
-            if process_group_for(self.id()) == Some(self.id()) {
-                signal_isolated_process_group(self.id(), libc::SIGKILL);
-            }
+            self.signal_group_if_exact(libc::SIGKILL);
             let _ = self.kill();
             let _ = self.wait();
         }
@@ -1731,8 +2041,9 @@ impl SpawnedEngineChild {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn spawn_engine_command(
+    _ownership_directory: &OwnershipDirectory,
     executable: &Path,
     arguments: &[String],
     environment: &BTreeMap<String, String>,
@@ -1771,6 +2082,14 @@ fn spawn_engine_command(
     let spawn_result = command.spawn();
     signal_mask.restore()?;
     let mut child = spawn_result?;
+    let exact_identity = process_identity(child.id())
+        .filter(|identity| process_group_for(identity.pid) == Some(identity.pid));
+    let stderr = child.stderr.take().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "engine startup gate did not provide stderr",
+        )
+    })?;
     let release = child.stdin.take().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
@@ -1780,17 +2099,271 @@ fn spawn_engine_command(
     Ok(SpawnedEngineChild {
         child,
         release: Some(release),
+        stderr: Some(stderr),
         status: None,
+        exact_identity,
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "macos")]
+fn spawn_engine_command(
+    ownership_directory: &OwnershipDirectory,
+    executable: &Path,
+    arguments: &[String],
+    environment: &BTreeMap<String, String>,
+) -> std::io::Result<SpawnedEngineChild> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    const EXEC_GATE: &str = "IFS= read -r release || exit 125\n\
+        [ \"$release\" = 1 ] || exit 125\n\
+        exec </dev/null\n\
+        exec \"$@\"";
+
+    // Darwin has no pipe2(2). Its ordinary pipe()+FIOCLEX sequence can leak
+    // one gate endpoint into a concurrent fork. Build the two channels as
+    // FIFOs inside the pinned 0700 ownership directory instead: each endpoint
+    // is opened atomically with O_CLOEXEC, then the names are unlinked before
+    // posix_spawn. CLOEXEC_DEFAULT closes every unrelated descriptor in the
+    // child, while spawn attributes install the safe signal state and group
+    // without running application code after fork.
+    let (release_reader, release_writer) =
+        ownership_directory.create_cloexec_fifo_pair("release")?;
+    let (stderr_reader, stderr_writer) = ownership_directory.create_cloexec_fifo_pair("stderr")?;
+    let null_path = CString::new("/dev/null").expect("/dev/null contains no NUL");
+    let null_descriptor =
+        unsafe { libc::open(null_path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if null_descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let null_file = unsafe { std::fs::File::from_raw_fd(null_descriptor) };
+
+    let mut actions = MacSpawnFileActions::new()?;
+    actions.dup2(release_reader.as_raw_fd(), libc::STDIN_FILENO)?;
+    actions.dup2(null_file.as_raw_fd(), libc::STDOUT_FILENO)?;
+    actions.dup2(stderr_writer.as_raw_fd(), libc::STDERR_FILENO)?;
+    actions.close(release_reader.as_raw_fd())?;
+    actions.close(null_file.as_raw_fd())?;
+    actions.close(stderr_writer.as_raw_fd())?;
+
+    let mut attributes = MacSpawnAttributes::new()?;
+    let mut default_signals = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    if unsafe { libc::sigfillset(&mut default_signals) } != 0
+        || unsafe { libc::sigdelset(&mut default_signals, libc::SIGKILL) } != 0
+        || unsafe { libc::sigdelset(&mut default_signals, libc::SIGSTOP) } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut empty_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    if unsafe { libc::sigemptyset(&mut empty_mask) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    attributes.set_signal_defaults(&default_signals)?;
+    attributes.set_signal_mask(&empty_mask)?;
+    attributes.set_process_group(0)?;
+    attributes.set_flags(
+        libc::POSIX_SPAWN_CLOEXEC_DEFAULT
+            | libc::POSIX_SPAWN_SETPGROUP
+            | libc::POSIX_SPAWN_SETSIGDEF
+            | libc::POSIX_SPAWN_SETSIGMASK,
+    )?;
+
+    let mut argument_values = vec![
+        CString::new("/bin/sh").expect("/bin/sh contains no NUL"),
+        CString::new("-c").expect("-c contains no NUL"),
+        CString::new(EXEC_GATE).expect("fixed gate contains no NUL"),
+        CString::new("sbproxy-engine-gate").expect("fixed argv0 contains no NUL"),
+        CString::new(executable.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "engine executable contains a NUL byte",
+            )
+        })?,
+    ];
+    for argument in arguments {
+        argument_values.push(CString::new(argument.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "engine argument contains a NUL byte",
+            )
+        })?);
+    }
+    let mut argument_pointers = argument_values
+        .iter()
+        .map(|value| value.as_ptr().cast_mut())
+        .collect::<Vec<_>>();
+    argument_pointers.push(std::ptr::null_mut());
+
+    let environment_values = macos_engine_environment(environment)?;
+    let mut environment_pointers = environment_values
+        .iter()
+        .map(|value| value.as_ptr().cast_mut())
+        .collect::<Vec<_>>();
+    environment_pointers.push(std::ptr::null_mut());
+
+    let shell = CString::new("/bin/sh").expect("/bin/sh contains no NUL");
+    let mut pid = 0;
+    let result = unsafe {
+        libc::posix_spawn(
+            &mut pid,
+            shell.as_ptr(),
+            &actions.0,
+            &attributes.0,
+            argument_pointers.as_ptr(),
+            environment_pointers.as_ptr(),
+        )
+    };
+    posix_spawn_check(result)?;
+    drop(release_reader);
+    drop(stderr_writer);
+    drop(null_file);
+
+    let child = MacProcessChild { pid };
+    let exact_identity = process_identity(child.id())
+        .filter(|identity| process_group_for(identity.pid) == Some(identity.pid));
+    Ok(SpawnedEngineChild {
+        child,
+        release: Some(release_writer),
+        stderr: Some(stderr_reader),
+        status: None,
+        exact_identity,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_engine_environment(overrides: &BTreeMap<String, String>) -> std::io::Result<Vec<CString>> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut values = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+    for key in ENGINE_ENVIRONMENT_BASELINE {
+        if let Some(value) = std::env::var_os(key) {
+            values.insert(
+                key.as_bytes().to_vec(),
+                value.as_os_str().as_bytes().to_vec(),
+            );
+        }
+    }
+    for (key, value) in overrides {
+        if key.is_empty()
+            || key.as_bytes().contains(&0)
+            || key.as_bytes().contains(&b'=')
+            || value.as_bytes().contains(&0)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "engine environment contains an invalid key or value",
+            ));
+        }
+        values.insert(key.as_bytes().to_vec(), value.as_bytes().to_vec());
+    }
+    values
+        .into_iter()
+        .map(|(key, value)| {
+            let mut assignment = key;
+            assignment.push(b'=');
+            assignment.extend(value);
+            CString::new(assignment).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "engine environment contains a NUL byte",
+                )
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+struct MacSpawnFileActions(libc::posix_spawn_file_actions_t);
+
+#[cfg(target_os = "macos")]
+impl MacSpawnFileActions {
+    fn new() -> std::io::Result<Self> {
+        let mut actions = std::ptr::null_mut();
+        posix_spawn_check(unsafe { libc::posix_spawn_file_actions_init(&mut actions) })?;
+        Ok(Self(actions))
+    }
+
+    fn dup2(&mut self, source: libc::c_int, target: libc::c_int) -> std::io::Result<()> {
+        posix_spawn_check(unsafe {
+            libc::posix_spawn_file_actions_adddup2(&mut self.0, source, target)
+        })
+    }
+
+    fn close(&mut self, descriptor: libc::c_int) -> std::io::Result<()> {
+        posix_spawn_check(unsafe {
+            libc::posix_spawn_file_actions_addclose(&mut self.0, descriptor)
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacSpawnFileActions {
+    fn drop(&mut self) {
+        unsafe {
+            libc::posix_spawn_file_actions_destroy(&mut self.0);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct MacSpawnAttributes(libc::posix_spawnattr_t);
+
+#[cfg(target_os = "macos")]
+impl MacSpawnAttributes {
+    fn new() -> std::io::Result<Self> {
+        let mut attributes = std::ptr::null_mut();
+        posix_spawn_check(unsafe { libc::posix_spawnattr_init(&mut attributes) })?;
+        Ok(Self(attributes))
+    }
+
+    fn set_signal_defaults(&mut self, signals: &libc::sigset_t) -> std::io::Result<()> {
+        posix_spawn_check(unsafe { libc::posix_spawnattr_setsigdefault(&mut self.0, signals) })
+    }
+
+    fn set_signal_mask(&mut self, signals: &libc::sigset_t) -> std::io::Result<()> {
+        posix_spawn_check(unsafe { libc::posix_spawnattr_setsigmask(&mut self.0, signals) })
+    }
+
+    fn set_process_group(&mut self, process_group: libc::pid_t) -> std::io::Result<()> {
+        posix_spawn_check(unsafe { libc::posix_spawnattr_setpgroup(&mut self.0, process_group) })
+    }
+
+    fn set_flags(&mut self, flags: libc::c_int) -> std::io::Result<()> {
+        let flags = libc::c_short::try_from(flags).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "posix_spawn flags exceeded c_short",
+            )
+        })?;
+        posix_spawn_check(unsafe { libc::posix_spawnattr_setflags(&mut self.0, flags) })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacSpawnAttributes {
+    fn drop(&mut self) {
+        unsafe {
+            libc::posix_spawnattr_destroy(&mut self.0);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn posix_spawn_check(result: libc::c_int) -> std::io::Result<()> {
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(result))
+    }
+}
+
+#[cfg(target_os = "linux")]
 struct ParentSignalMask {
     previous: libc::sigset_t,
     restored: bool,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 impl ParentSignalMask {
     fn block_all() -> std::io::Result<Self> {
         let mut all = unsafe { std::mem::zeroed::<libc::sigset_t>() };
@@ -1820,7 +2393,7 @@ impl ParentSignalMask {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 impl Drop for ParentSignalMask {
     fn drop(&mut self) {
         if !self.restored {
@@ -1831,8 +2404,8 @@ impl Drop for ParentSignalMask {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-unsafe fn prepare_engine_child_signal_state(_parent_pid: libc::pid_t) -> std::io::Result<()> {
+#[cfg(target_os = "linux")]
+unsafe fn prepare_engine_child_signal_state(parent_pid: libc::pid_t) -> std::io::Result<()> {
     let mut blocked = std::mem::zeroed::<libc::sigset_t>();
     if libc::sigfillset(&mut blocked) != 0
         || libc::sigprocmask(libc::SIG_SETMASK, &blocked, std::ptr::null_mut()) != 0
@@ -1860,14 +2433,11 @@ unsafe fn prepare_engine_child_signal_state(_parent_pid: libc::pid_t) -> std::io
         }
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if libc::getppid() != _parent_pid {
-            libc::_exit(125);
-        }
+    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if libc::getppid() != parent_pid {
+        libc::_exit(125);
     }
 
     let mut empty = std::mem::zeroed::<libc::sigset_t>();
@@ -2363,6 +2933,26 @@ mod tests {
     }
 
     #[test]
+    fn ownership_store_rejects_a_symlink_in_an_ancestor_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let real_ancestor = root.path().join("real-ancestor");
+        let selected_ancestor = root.path().join("selected-ancestor");
+        std::fs::create_dir(&real_ancestor).unwrap();
+        std::os::unix::fs::symlink(&real_ancestor, &selected_ancestor).unwrap();
+        let store = ProcessOwnershipStore::at(selected_ancestor.join("nested/managed-engines"));
+
+        let error = store
+            .ensure_private_directory()
+            .expect_err("every ownership-path component must be opened without following links");
+
+        assert!(error.to_string().contains("ownership directory"), "{error}");
+        assert!(
+            !real_ancestor.join("nested").exists(),
+            "recursive creation must not cross an ancestor symlink"
+        );
+    }
+
+    #[test]
     fn ownership_store_rejects_a_writable_non_sticky_parent_directory() {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -2373,6 +2963,25 @@ mod tests {
             .expect_err("untrusted writers must not replace the ownership directory");
 
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(error.to_string().contains("ownership directory"), "{error}");
+    }
+
+    #[test]
+    fn ownership_store_rejects_a_writable_non_sticky_ancestor_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let unsafe_ancestor = root.path().join("unsafe-ancestor");
+        let safe_parent = unsafe_ancestor.join("safe-parent");
+        std::fs::create_dir(&unsafe_ancestor).unwrap();
+        std::fs::create_dir(&safe_parent).unwrap();
+        std::fs::set_permissions(&unsafe_ancestor, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&safe_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = ProcessOwnershipStore::at(safe_parent.join("managed-engines"));
+
+        let error = store
+            .ensure_private_directory()
+            .expect_err("an unsafe ancestor must not be hidden by a private immediate parent");
+
+        std::fs::set_permissions(&unsafe_ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(error.to_string().contains("ownership directory"), "{error}");
     }
 
@@ -2422,6 +3031,35 @@ mod tests {
             .record_paths()
             .expect_err("wrong-owner ownership directory must fail closed");
         assert!(error.to_string().contains("ownership directory"), "{error}");
+    }
+
+    #[test]
+    fn ownership_store_rejects_an_oversized_record_before_reading_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProcessOwnershipStore::at(directory.path().join("ownership"));
+        store.ensure_private_directory().unwrap();
+        let record = store.directory.join("oversized.json");
+        let file = std::fs::File::create(&record).unwrap();
+        file.set_len((MAX_PROCESS_OWNERSHIP_RECORD_BYTES + 1) as u64)
+            .unwrap();
+
+        let error = store
+            .records()
+            .expect_err("boot recovery must bound ownership-record allocation");
+
+        assert!(error.to_string().contains("size limit"), "{error}");
+    }
+
+    #[test]
+    fn ownership_store_bounds_the_number_of_records() {
+        let mut names = (0..MAX_PROCESS_OWNERSHIP_RECORDS)
+            .map(|index| OsString::from(format!("{index}.json")))
+            .collect::<Vec<_>>();
+
+        let error = push_bounded_record_name(&mut names, OsString::from("overflow.json"))
+            .expect_err("boot recovery must bound record enumeration");
+
+        assert!(error.to_string().contains("record limit"), "{error}");
     }
 
     #[test]
@@ -2899,11 +3537,19 @@ mod tests {
         ));
     }
 
+    fn test_gate_directory(directory: &tempfile::TempDir) -> Arc<OwnershipDirectory> {
+        ProcessOwnershipStore::at(directory.path().join("gate-ownership"))
+            .open_or_create()
+            .expect("open private gate directory")
+    }
+
     #[test]
     fn engine_cannot_exec_before_ownership_can_be_made_durable() {
         let directory = tempfile::tempdir().unwrap();
+        let gate_directory = test_gate_directory(&directory);
         let marker = directory.path().join("engine-executed");
         let mut child = spawn_engine_child(
+            gate_directory.as_ref(),
             Path::new("/bin/sh"),
             &[
                 "-c".to_string(),
@@ -2929,8 +3575,10 @@ mod tests {
     #[test]
     fn startup_control_eof_exits_without_executing_the_engine() {
         let directory = tempfile::tempdir().unwrap();
+        let gate_directory = test_gate_directory(&directory);
         let marker = directory.path().join("engine-executed");
         let mut child = spawn_engine_child(
+            gate_directory.as_ref(),
             Path::new("/bin/sh"),
             &[
                 "-c".to_string(),
@@ -2953,15 +3601,50 @@ mod tests {
     }
 
     #[test]
+    fn unreleased_child_group_signal_requires_the_captured_start_fingerprint() {
+        let directory = tempfile::tempdir().unwrap();
+        let gate_directory = test_gate_directory(&directory);
+        let mut child = spawn_engine_child(
+            gate_directory.as_ref(),
+            Path::new("/bin/sleep"),
+            &["60".to_string()],
+            &BTreeMap::new(),
+        )
+        .expect("prepare managed child");
+        let captured_start = child
+            .exact_identity
+            .as_ref()
+            .expect("capture gated child identity")
+            .start_fingerprint;
+        child
+            .exact_identity
+            .as_mut()
+            .expect("capture gated child identity")
+            .start_fingerprint = captured_start.wrapping_add(1);
+
+        child.signal_group_if_exact(libc::SIGKILL);
+
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "group signalling must fail closed after an identity mismatch"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
     fn concurrent_spawn_gates_keep_release_handles_isolated() {
         let directory = tempfile::tempdir().unwrap();
+        let gate_directory = test_gate_directory(&directory);
         let mut workers = Vec::new();
         for index in 0..8 {
             let marker = directory.path().join(format!("engine-{index}-executed"));
+            let gate_directory = Arc::clone(&gate_directory);
             workers.push((
                 marker.clone(),
                 std::thread::spawn(move || {
                     spawn_engine_child(
+                        gate_directory.as_ref(),
                         Path::new("/bin/sh"),
                         &[
                             "-c".to_string(),
@@ -2997,6 +3680,7 @@ mod tests {
     #[test]
     fn spawn_gate_resets_an_inherited_blocked_signal_mask() {
         let directory = tempfile::tempdir().unwrap();
+        let gate_directory = test_gate_directory(&directory);
         let marker = directory.path().join("survived-sigterm");
         let status = std::thread::spawn(move || {
             let mut blocked = unsafe { std::mem::zeroed::<libc::sigset_t>() };
@@ -3007,6 +3691,7 @@ mod tests {
                 0
             );
             let mut child = spawn_engine_child(
+                gate_directory.as_ref(),
                 Path::new("/bin/sh"),
                 &[
                     "-c".to_string(),
