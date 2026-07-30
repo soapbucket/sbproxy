@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "profile": "query-select-smoke-v1",
+  "levers": [
+    {
+      "type": "query_select",
+      "max_sentences": 4
+    },
+    {
+      "type": "window_fit",
+      "completion_reserve_tokens": 8000,
+      "input_budget_tokens": 192
+    }
+  ]
+}

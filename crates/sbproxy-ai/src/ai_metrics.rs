@@ -198,6 +198,21 @@ static AI_FAILOVERS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Route reasoning-policy outcomes for each provider attempt.
+///
+/// `provider` is bounded by configured provider names and `outcome` comes
+/// from [`crate::reasoning::ReasoningOutcome`]'s closed label set.
+static AI_REASONING_POLICY_ATTEMPTS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_reasoning_policy_attempts_total",
+            "AI provider attempts by concise-reasoning policy outcome"
+        ),
+        &["provider", "outcome"]
+    )
+    .unwrap()
+});
+
 /// WOR-798: every provider selection by the AI router. `strategy`
 /// is the active `RoutingStrategy` variant name (snake_case); the
 /// `provider` label is the picked provider's configured name.
@@ -730,6 +745,13 @@ impl Drop for AiSurfaceLatencyGuard {
 /// Record a failover event.
 pub fn record_failover(from: &str, to: &str, reason: &str) {
     AI_FAILOVERS.with_label_values(&[from, to, reason]).inc();
+}
+
+/// Record one closed reasoning-policy outcome for a provider attempt.
+pub fn record_reasoning_policy_attempt(provider: &str, outcome: &'static str) {
+    AI_REASONING_POLICY_ATTEMPTS
+        .with_label_values(&[provider, outcome])
+        .inc();
 }
 
 /// WOR-798: record one AI router selection. `strategy` is the

@@ -111,6 +111,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_ai_provider_attempts_total` | Counter | `stable` | `beta` | `provider`, `outcome` | AI provider attempts during failover/selection, by provider and outcome. |
 | `sbproxy_ai_provider_errors_total` | Counter | `stable` | `stable` | `provider`, `error_kind` | Per-provider AI error events. |
 | `sbproxy_ai_ratelimit_rejected_total` | Counter | `stable` | `beta` | `axis`, `key_hash`, `tenant`, `model` | AI gateway rate-limit rejections, partitioned by axis. |
+| `sbproxy_ai_reasoning_policy_attempts_total` | Counter | `stable` | `beta` | `provider`, `outcome` | AI provider attempts by concise-reasoning policy outcome. |
 | `sbproxy_ai_realtime_audio_seconds_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `provider`, `direction` | Cumulative audio seconds forwarded over Realtime sessions. |
 | `sbproxy_ai_realtime_frames_forwarded_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `provider`, `direction`, `kind` | Cumulative frames forwarded over Realtime sessions. |
 | `sbproxy_ai_realtime_session_duration_seconds` | Histogram | `stable` | `stable` | `provider`, `close_reason` | Wall-clock duration of a Realtime WebSocket session, recorded on close. |

@@ -54,6 +54,24 @@
       "contains_customer_data": false,
       "official_benchmark_score": false,
       "sha256": "fb175128fb4acd655b69bbc983ca21db5e9019708a05a257dbd1f8f0e320bc91"
+    },
+    {
+      "path": "fixtures/query-select-smoke.jsonl",
+      "corpus": "query_select_smoke",
+      "provenance": "independently_authored_sanitized_shape",
+      "license": "Apache-2.0",
+      "contains_customer_data": false,
+      "official_benchmark_score": false,
+      "sha256": "13807fd82f05ee93912eaadb12e53540666dc0f39071bee296bc70c2237877a6"
+    },
+    {
+      "path": "fixtures/token-prune-smoke.jsonl",
+      "corpus": "token_prune_smoke",
+      "provenance": "independently_authored_recorded_token_prune_smoke",
+      "license": "Apache-2.0",
+      "contains_customer_data": false,
+      "official_benchmark_score": false,
+      "sha256": "ad5adc58804edc19b0c14f681a2594f8e6ce764c598109d4203c77bacea917f9"
     }
   ]
 }

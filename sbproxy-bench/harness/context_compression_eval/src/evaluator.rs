@@ -2,16 +2,76 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
+use async_trait::async_trait;
 use sbproxy_ai::compression::{
     decode_sbproxy_table_v1, inspect_marked_context, CompactSerializationLever, CompressionLever,
     CompressionLeverConfig, CompressionRequest, CompressionRunner, LeverOutcome,
-    PositionReorderLever, RagSelectLever, RequestOutcome, WindowFitLever,
+    PositionReorderLever, QuerySelectConfig, QuerySelectLever, RagSelectLever, RequestOutcome,
+    TokenPruneBackend, TokenPruneBackendError, TokenPruneLever, TokenPruneOutput, TokenPruneTarget,
+    WindowFitLever,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::provenance::VerifiedProvenanceSummary;
 use crate::{AcceptanceSpec, EvalCase, QualitySpec};
+
+const RECORDED_TOKEN_PRUNE_ENDPOINT: &str = "recorded://token-prune-v1";
+const RECORDED_TOKEN_PRUNE_MODEL: &str = "llmlingua-2-recorded-smoke-v1";
+const RECORDED_TOKEN_PRUNE_INPUTS: &[&str] = &[
+    "4410bce80794bc80ff4d95f2cf42ef92b9c61331f975629f1d9a71017e0d99a1",
+    "81bc9a4e5e591b51568621e89829535f95f2bf33aa5415b8d8c93ad7f825b5d0",
+    "d9dfa1e210f57ea62b5f12b4844cff4019ea6f260c8c30b4fb8286da51a6e00a",
+    "dd72d78e46f664680bb1b25ec0ca7ff435942d76c7a904042b7211cb496b3f7c",
+];
+
+#[derive(Debug, Default)]
+struct RecordedTokenPruneBackend;
+
+#[async_trait]
+impl TokenPruneBackend for RecordedTokenPruneBackend {
+    async fn compress(
+        &self,
+        model: &str,
+        text: &str,
+        target: TokenPruneTarget,
+    ) -> Result<TokenPruneOutput, TokenPruneBackendError> {
+        if model != RECORDED_TOKEN_PRUNE_MODEL {
+            return Err(TokenPruneBackendError::InvalidOutput);
+        }
+        let digest = Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if !RECORDED_TOKEN_PRUNE_INPUTS.contains(&digest.as_str()) {
+            return Err(TokenPruneBackendError::InvalidOutput);
+        }
+        let tokens = text.split_whitespace().collect::<Vec<_>>();
+        let original_tokens =
+            u32::try_from(tokens.len()).map_err(|_| TokenPruneBackendError::InvalidOutput)?;
+        if original_tokens == 0 {
+            return Err(TokenPruneBackendError::InvalidOutput);
+        }
+        let budget = match target {
+            TokenPruneTarget::RetainRatio { retain_percent } => original_tokens
+                .saturating_mul(u32::from(retain_percent))
+                .div_ceil(100)
+                .div_ceil(2),
+            TokenPruneTarget::TargetTokens { target_tokens } => target_tokens.div_ceil(3),
+        }
+        .clamp(1, original_tokens);
+        let retained =
+            usize::try_from(budget).map_err(|_| TokenPruneBackendError::InvalidOutput)?;
+
+        Ok(TokenPruneOutput {
+            text: tokens[..retained].join(" "),
+            original_tokens,
+            compressed_tokens: budget,
+            latency_us: 0,
+        })
+    }
+}
 
 /// Immutable settings shared by every case in one evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,11 +117,63 @@ pub fn build_stateless_levers(
                 Ok(Arc::new(PositionReorderLever::new(config.clone()))
                     as Arc<dyn CompressionLever>)
             }
+            CompressionLeverConfig::QuerySelect(config) => {
+                match config {
+                    QuerySelectConfig::Sentences { max_sentences } if *max_sentences == 0 => {
+                        bail!("query_select max_sentences must be greater than zero");
+                    }
+                    QuerySelectConfig::TargetTokens { target_tokens } if *target_tokens == 0 => {
+                        bail!("query_select target_tokens must be greater than zero");
+                    }
+                    QuerySelectConfig::Sentences { .. }
+                    | QuerySelectConfig::TargetTokens { .. } => {}
+                }
+                Ok(Arc::new(QuerySelectLever::new(*config)) as Arc<dyn CompressionLever>)
+            }
             CompressionLeverConfig::WindowFit(config) => {
                 if config.input_budget_tokens == Some(0) {
                     bail!("evaluation input budget must be greater than zero");
                 }
                 Ok(Arc::new(WindowFitLever::new(config.clone())) as Arc<dyn CompressionLever>)
+            }
+            CompressionLeverConfig::TokenPrune(config) => {
+                if config.min_tokens == 0 {
+                    bail!("token_prune min_tokens must be greater than zero");
+                }
+                if config.endpoint != RECORDED_TOKEN_PRUNE_ENDPOINT {
+                    bail!(
+                        "deterministic token_prune evaluation requires endpoint `{RECORDED_TOKEN_PRUNE_ENDPOINT}`; live sidecars are never dialed"
+                    );
+                }
+                if config.model != RECORDED_TOKEN_PRUNE_MODEL {
+                    bail!(
+                        "deterministic token_prune evaluation requires model `{RECORDED_TOKEN_PRUNE_MODEL}`"
+                    );
+                }
+                if config.timeout_ms == 0 || config.timeout_ms > 60_000 {
+                    bail!("token_prune timeout_ms must be from 1 through 60000");
+                }
+                if config.max_chunks == 0 || config.max_chunks > 256 {
+                    bail!("token_prune max_chunks must be from 1 through 256");
+                }
+                match config.target {
+                    TokenPruneTarget::RetainRatio { retain_percent }
+                        if !(1..=99).contains(&retain_percent) =>
+                    {
+                        bail!("token_prune retain_percent must be from 1 through 99");
+                    }
+                    TokenPruneTarget::TargetTokens { target_tokens }
+                        if !(1..=1_000_000).contains(&target_tokens) =>
+                    {
+                        bail!("token_prune target_tokens must be from 1 through 1000000");
+                    }
+                    TokenPruneTarget::RetainRatio { .. }
+                    | TokenPruneTarget::TargetTokens { .. } => {}
+                }
+                Ok(Arc::new(TokenPruneLever::new(
+                    config.clone(),
+                    Arc::new(RecordedTokenPruneBackend),
+                )) as Arc<dyn CompressionLever>)
             }
             CompressionLeverConfig::SummaryBuffer(_) => {
                 bail!("stateful levers are not supported by the deterministic harness")
@@ -202,6 +314,9 @@ pub struct EvalReport {
     pub token_counter: String,
     /// Whether latency values are observed or intentionally omitted.
     pub latency_mode: String,
+    /// Token-pruning certification boundary, present only for token-prune reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_prune_certification: Option<TokenPruneCertification>,
     /// Verified input provenance when attached by the detached-report CLI.
     pub verified_provenance: Option<VerifiedProvenanceSummary>,
     /// Stable case rows sorted by corpus and identifier.
@@ -210,6 +325,18 @@ pub struct EvalReport {
     pub corpora: BTreeMap<String, AggregateReport>,
     /// Summary across all corpora.
     pub overall: AggregateReport,
+}
+
+/// Fixed trust boundary for deterministic token-pruning certification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenPruneCertification {
+    /// Credential-free backend used to produce the committed report.
+    pub evaluation_backend: String,
+    /// Production backend that the gateway uses for real requests.
+    pub production_backend: String,
+    /// Whether the committed evaluation can access the network.
+    pub network_access: bool,
 }
 
 /// Evaluate every case with identical input through control and typed treatment arms.
@@ -334,6 +461,15 @@ pub async fn evaluate_cases(cases: &[EvalCase], config: &EvalConfig) -> Result<E
             "omitted_for_deterministic_gate"
         }
         .to_string(),
+        token_prune_certification: config
+            .levers
+            .iter()
+            .any(|lever| matches!(lever, CompressionLeverConfig::TokenPrune(_)))
+            .then(|| TokenPruneCertification {
+                evaluation_backend: "deterministic_recorded_v1".to_string(),
+                production_backend: "llmlingua_2_sidecar".to_string(),
+                network_access: false,
+            }),
         verified_provenance: None,
         cases: rows,
         corpora,

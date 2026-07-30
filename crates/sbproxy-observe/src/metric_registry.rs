@@ -993,6 +993,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_reasoning_policy_attempts_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_reasoning_policy_attempt"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["provider", "outcome"],
+        description: "AI provider attempts by concise-reasoning policy outcome.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_realtime_audio_seconds_total",
         kind: MetricKind::Counter,
         writer: Writer::Nothing,

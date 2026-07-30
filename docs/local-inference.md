@@ -1,7 +1,7 @@
-# Local inference (embeddings and prompt-injection classify)
-*Last modified: 2026-07-27*
+# Local inference for gateway helper models
+*Last modified: 2026-07-29*
 
-SBproxy can run three AI-gateway features on local ONNX models instead of paid
+SBproxy can run four AI-gateway features on local ONNX models instead of paid
 APIs:
 
 - The **embedding semantic cache** vectorizes prompts to serve near-duplicate
@@ -9,10 +9,12 @@ APIs:
 - **Prompt-injection v2** classifies prompts for injection attempts.
 - The **embedding classifier guardrail** maps prompts onto operator-defined
   classes that can feed model-routing policy.
+- **Context token pruning** removes lower-value source tokens from explicitly
+  marked retrieval text through the classifier sidecar.
 
 For running a full **LLM** locally (the gateway pulls weights, fits an engine
 to the GPU, and supervises it), see [model-host.md](model-host.md). This page
-covers the three ONNX auxiliary features; the model host covers chat/completion
+covers the four ONNX auxiliary features; the model host covers chat/completion
 serving.
 
 Running these locally means no per-call API cost, no prompt egress (the prompt
@@ -23,7 +25,7 @@ ONNX Runtime install.
 There are two ways to run local inference:
 
 - **Sidecar (recommended).** A small co-located process holds the model. A bad
-  or oversized model can only OOM the sidecar, which the proxy restarts; it
+  model can only crash the sidecar, which your service manager can restart; it
   never takes the proxy down.
 - **In-process.** The model loads inside the proxy for a true single binary.
   Prompt-injection can select it automatically from a complete verified
@@ -36,9 +38,11 @@ There are two ways to run local inference:
 |---|---|---|---|
 | Embeddings | `all-MiniLM-L6-v2` (384-dim) | Apache-2.0 | ~90 MB |
 | Prompt-injection classify | No built-in default | Operator-reviewed; Apache-2.0 or MIT recommended | 200 MiB default maximum |
+| Context token pruning | No built-in default | Operator-reviewed; Apache-2.0 or MIT recommended | 200 MiB default maximum |
 
-Both are operator-supplied runtime data, not bundled with the binary. Download
-them once and point the sidecar (or the in-process config) at the files.
+These model files are operator-supplied runtime data, not bundled with the
+binary. Download them once and point the sidecar, or the in-process config
+where supported, at the files.
 
 ### Download the models
 
@@ -68,9 +72,9 @@ trusted merely because it exists.
 
 ## Run the sidecar
 
-The sidecar binary is `sbproxy-classifier-sidecar`. It serves both `Classify`
-and `Embed` over gRPC (TCP or a Unix domain socket). Load whichever models you
-need:
+The sidecar binary is `sbproxy-classifier-sidecar`. It serves `Classify`,
+`Embed`, and `Compress` over gRPC on TCP or a Unix domain socket. Load whichever
+models you need:
 
 ```bash
 sbproxy-classifier-sidecar \
@@ -83,6 +87,82 @@ Health and readiness are on the same host; the proxy connects lazily, so the
 sidecar does not have to be up before the proxy starts. For a co-located
 deployment, use `--listen-uds /run/sbproxy/classifier.sock` instead of
 `--listen` to skip the loopback TCP round trip.
+
+### Run token pruning
+
+Token pruning needs an operator-supplied LLMLingua-2-compatible ONNX token
+classifier and its matching Hugging Face tokenizer. The runtime submits one
+item at a time. The model's batch axis may therefore be a fixed `1`, a
+symbolic dynamic dimension, or an unspecified dynamic dimension. Its output
+must be `f32` logits with a final dimension of `2`; class index 1 is the
+probability that the source token should remain. Review the artifact license
+and provenance, pin its digest in your deployment manifest, and stage it
+before starting the sidecar.
+
+The tokenizer must use one of the two official LLMLingua-2 layouts:
+
+- mBERT: cased `BertNormalizer`, `BertPreTokenizer`, and `WordPiece`.
+- XLM-R: `Precompiled`, then `WhitespaceSplit` and always-prepended
+  `Metaspace`, with a `Unigram` model.
+
+Both layouts must add exactly two model special tokens for a single input.
+The sidecar rejects other tokenizer layouts and non-special added tokens at
+load time. This boundary-separable contract is what lets it enforce a token
+target with bounded work.
+
+```bash
+sbproxy-classifier-sidecar \
+  --listen 127.0.0.1:9440 \
+  --token-model llmlingua-2=/var/lib/sbproxy/models/llmlingua-2/model.onnx:/var/lib/sbproxy/models/llmlingua-2/tokenizer.json:512 \
+  --default-token-model llmlingua-2 \
+  --token-model-max-bytes 750000000 \
+  --token-max-request-bytes 1048576 \
+  --token-max-request-tokens 131072 \
+  --token-max-windows 256 \
+  --token-max-model-window 512 \
+  --token-max-concurrent 2 \
+  --token-max-queued 8
+```
+
+The last value in `--token-model` is the classifier's total token window,
+including two special tokens. It must be at least 3. Repeat `--token-model` to
+serve more than one reviewed model. `--default-token-model` is optional when
+only one token model is loaded, and an explicit `compression.levers[].model`
+still selects the requested ID. Model IDs are limited to 256 UTF-8 bytes.
+
+The standard model-file limit is 209,715,200 bytes. A typical float32 mBERT
+LLMLingua-2 ONNX export is about 709 MB, so the command raises only that limit
+to 750,000,000 bytes. Set the smallest value that admits your pinned artifact.
+The remaining flags spell out the defaults so the deployment's resource
+envelope is visible:
+
+| Flag | Default | Hard ceiling | What it limits |
+|---|---:|---:|---|
+| `--token-model-max-bytes` | 209,715,200 | 4 GiB | Each token-model ONNX file at load time |
+| `--token-max-request-bytes` | 1,048,576 | 16 MiB | Exact encoded protobuf size of one `Compress` request, including model ID, text, target, and framing |
+| `--token-max-request-tokens` | 131,072 | 1,000,000 | Tokenizer output for one request |
+| `--token-max-windows` | 256 | 4,096 | Model windows evaluated for one request |
+| `--token-max-model-window` | 512 | 4,096 | Window declared by a `--token-model` entry |
+| `--token-max-concurrent` | 2 | 64 | Token-compression inferences running at once |
+| `--token-max-queued` | 8 | 1,024 | Requests waiting behind active inference |
+
+`--token-max-queued 0` disables waiting. Requests beyond the active and queued
+limits fail at this lever instead of growing sidecar memory without a bound.
+The shared gRPC decoder keeps the existing 4 MiB envelope used by `Classify`
+and `Embed`; raising the `Compress` byte limit above 4 MiB raises that decoder
+envelope to match. The sidecar still enforces the exact `Compress` size shown
+in the table after decoding.
+
+The sidecar divides longer text into punctuation-aware windows, scores
+subtokens, averages their scores for each source word, and reconstructs output
+from source spans. If reconstructed punctuation changes the tokenizer count,
+the sidecar performs at most 24 tokenizer measurements and returns only a
+result within the requested token target. The proxy sends only marked
+`format="text"` chunk bodies. JSON and tabular chunks do not reach the model.
+Configure the route's `token_prune` lever as shown in
+[AI context compression](ai-context-compression.md#sidecar-token-pruning).
+If the sidecar is unavailable or returns an invalid extractive result, that
+lever fails open and the next compression lever runs.
 
 ## Enable the local semantic cache
 

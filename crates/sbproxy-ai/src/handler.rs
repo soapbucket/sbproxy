@@ -11,6 +11,7 @@ use crate::identity::VirtualKeyConfig;
 use crate::ids::ModelId;
 use crate::provider::ProviderConfig;
 use crate::ratelimit::{ModelRateConfig, SurfaceRateConfig};
+use crate::reasoning::ReasoningPolicy;
 use crate::routing::RoutingStrategy;
 
 fn value_ledger_for_sink(
@@ -106,6 +107,12 @@ pub struct AiHandlerConfig {
     /// setting is adapted by [`Self::effective_compression_policy`].
     #[serde(default)]
     pub compression: Option<CompressionPolicy>,
+    /// Optional concise-reasoning policy applied after per-provider model mapping.
+    ///
+    /// The default is [`ReasoningPolicy::Off`], which preserves existing
+    /// request behavior.
+    #[serde(default)]
+    pub reasoning: ReasoningPolicy,
     /// Optional shadow / side-by-side eval for sampled non-streaming
     /// requests. The primary response is served unchanged; an admitted
     /// copy goes to the shadow provider in a bounded background task.
@@ -840,6 +847,10 @@ impl AiHandlerConfig {
     /// Build from a generic JSON value.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
         let mut config: Self = serde_json::from_value(value)?;
+        config
+            .reasoning
+            .validate()
+            .map_err(|error| anyhow::anyhow!("ai reasoning: {error}"))?;
         if let Some(guardrails) = &config.guardrails {
             crate::guardrails::validate_pipeline_config(guardrails)
                 .map_err(|error| anyhow::anyhow!("ai guardrails: {error}"))?;
@@ -1176,6 +1187,17 @@ impl AiSurface {
             AiSurface::ChatCompletions | AiSurface::Messages | AiSurface::Responses
         )
     }
+
+    /// Whether a route reasoning policy may transform this request surface.
+    ///
+    /// Only prompt-completion surfaces carry the canonical message body and
+    /// completion semantics required by provider reasoning controls.
+    pub fn supports_reasoning_policy(&self) -> bool {
+        matches!(
+            self,
+            AiSurface::ChatCompletions | AiSurface::Messages | AiSurface::Responses
+        )
+    }
 }
 
 /// Extract the surface-specific input-text field from a parsed JSON
@@ -1278,6 +1300,7 @@ pub fn classify_surface(_method: &str, path: &str) -> AiSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reasoning::ReasoningPolicy;
 
     #[test]
     fn usage_sinks_parse_and_build_from_config() {
@@ -1344,6 +1367,7 @@ mod tests {
             max_concurrent: None,
             resilience: None,
             compression: None,
+            reasoning: ReasoningPolicy::Off,
             shadow: None,
             pii: None,
             trace_content: false,
@@ -1384,6 +1408,7 @@ mod tests {
             max_concurrent: None,
             resilience: None,
             compression: None,
+            reasoning: ReasoningPolicy::Off,
             shadow: None,
             pii: None,
             trace_content: false,
@@ -1424,6 +1449,7 @@ mod tests {
             max_concurrent: None,
             resilience: None,
             compression: None,
+            reasoning: ReasoningPolicy::Off,
             shadow: None,
             pii: None,
             trace_content: false,
@@ -1465,6 +1491,7 @@ mod tests {
             max_concurrent: None,
             resilience: None,
             compression: None,
+            reasoning: ReasoningPolicy::Off,
             shadow: None,
             pii: None,
             trace_content: false,
@@ -1556,6 +1583,41 @@ mod tests {
         assert!(config.max_body_size.is_none());
         assert!(!config.require_governed_key);
         assert!(config.quota_pool.is_none());
+        assert_eq!(config.reasoning, ReasoningPolicy::Off);
+    }
+
+    #[test]
+    fn reasoning_policy_accepts_closed_config_shapes() {
+        for (value, expected) in [
+            (serde_json::json!("off"), ReasoningPolicy::Off),
+            (serde_json::json!("concise"), ReasoningPolicy::Concise),
+            (
+                serde_json::json!({"budget": 2048}),
+                ReasoningPolicy::Budget(2048),
+            ),
+        ] {
+            let config = AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [{"name": "openai"}],
+                "reasoning": value,
+            }))
+            .expect("valid reasoning policy");
+            assert_eq!(config.reasoning, expected);
+        }
+    }
+
+    #[test]
+    fn reasoning_policy_rejects_zero_budget() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai"}],
+            "reasoning": {"budget": 0},
+        }))
+        .expect_err("zero reasoning budget must fail validation")
+        .to_string();
+
+        assert!(
+            error.contains("reasoning budget must be greater than zero"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2653,5 +2715,43 @@ mod tests {
         assert_eq!(AiSurface::FineTuning.label(), "fine_tuning");
         assert_eq!(AiSurface::AudioTranscription.label(), "audio_transcription");
         assert_eq!(AiSurface::Unknown.label(), "unknown");
+    }
+
+    #[test]
+    fn reasoning_policy_is_limited_to_prompt_completion_surfaces() {
+        let all_surfaces = [
+            AiSurface::ChatCompletions,
+            AiSurface::Models,
+            AiSurface::Embeddings,
+            AiSurface::Assistants,
+            AiSurface::Threads,
+            AiSurface::Batches,
+            AiSurface::FineTuning,
+            AiSurface::Files,
+            AiSurface::Realtime,
+            AiSurface::ImageGeneration,
+            AiSurface::ImageEdits,
+            AiSurface::ImageVariations,
+            AiSurface::AudioTranscription,
+            AiSurface::AudioSpeech,
+            AiSurface::Moderations,
+            AiSurface::Reranking,
+            AiSurface::Messages,
+            AiSurface::Responses,
+            AiSurface::Unknown,
+        ];
+
+        for surface in all_surfaces {
+            let expected = matches!(
+                surface,
+                AiSurface::ChatCompletions | AiSurface::Messages | AiSurface::Responses
+            );
+            assert_eq!(
+                surface.supports_reasoning_policy(),
+                expected,
+                "{} eligibility",
+                surface.label()
+            );
+        }
     }
 }

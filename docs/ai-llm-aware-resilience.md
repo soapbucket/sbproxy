@@ -1,6 +1,6 @@
 # LLM-aware resilience
 
-*Last modified: 2026-07-18*
+*Last modified: 2026-07-29*
 
 Status-code retries treat every `5xx` the same and ignore the LLM-specific
 failure modes a provider signals in the response: a context-window
@@ -77,9 +77,10 @@ models and prompts that already fit that heuristic. This compatibility behavior
 is not an exact tokenizer or hard provider-window guarantee. An explicit
 compression policy is authoritative, including an empty lever list.
 
-For the ordered `summary_buffer` and `window_fit` pipeline, captured-session
-requirements, Redis state, structured-content protection, failure
-semantics, and telemetry, see
+For the ordered compression pipeline, including `query_select`,
+sidecar-backed `token_prune`, `summary_buffer`, and `window_fit`, see the
+captured-session requirements, structured-content protection, failure
+semantics, and telemetry in
 [AI context compression](ai-context-compression.md).
 
 ## Hedged (raced) requests

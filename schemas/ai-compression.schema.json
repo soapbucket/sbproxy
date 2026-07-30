@@ -186,6 +186,107 @@
           "additionalProperties": false
         },
         {
+          "description": "Sidecar-backed LLMLingua-2 token pruning over marked text chunks.",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "min_tokens",
+            "model",
+            "target",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "token_prune"
+              ]
+            },
+            "min_tokens": {
+              "description": "Minimum target-model tokens across marked text bodies before pruning.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 1.0
+            },
+            "endpoint": {
+              "description": "Classifier gRPC URI or absolute `unix://` socket path.",
+              "type": "string",
+              "minLength": 1
+            },
+            "model": {
+              "description": "Sidecar token-classification model id.",
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            "timeout_ms": {
+              "description": "Per-RPC timeout in milliseconds.",
+              "default": 250,
+              "type": "integer",
+              "format": "uint64",
+              "maximum": 60000.0,
+              "minimum": 1.0
+            },
+            "max_chunks": {
+              "description": "Maximum marked chunks sent to the sidecar in one request.",
+              "default": 64,
+              "type": "integer",
+              "format": "uint",
+              "maximum": 256.0,
+              "minimum": 1.0
+            },
+            "target": {
+              "description": "Compression target interpreted by the sidecar and rechecked by the gateway.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TokenPruneTarget"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Query-aware sentence selection from marked text chunks.",
+          "type": "object",
+          "oneOf": [
+            {
+              "required": [
+                "max_sentences"
+              ]
+            },
+            {
+              "required": [
+                "target_tokens"
+              ]
+            }
+          ],
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "query_select"
+              ]
+            },
+            "max_sentences": {
+              "type": "integer",
+              "format": "uint",
+              "maximum": 4096.0,
+              "minimum": 1.0
+            },
+            "target_tokens": {
+              "type": "integer",
+              "format": "uint64",
+              "maximum": 1000000.0,
+              "minimum": 1.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
           "description": "Retrieval-aware selection of marked context chunks.",
           "type": "object",
           "required": [
@@ -343,6 +444,59 @@
         }
       },
       "additionalProperties": false
+    },
+    "TokenPruneTarget": {
+      "description": "Exactly one explicit token-pruning target mode.",
+      "oneOf": [
+        {
+          "description": "Retain a percentage of pruning-tokenizer tokens in each marked chunk.",
+          "type": "object",
+          "required": [
+            "mode",
+            "retain_percent"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "retain_ratio"
+              ]
+            },
+            "retain_percent": {
+              "description": "Percentage retained, from 1 through 99.",
+              "type": "integer",
+              "format": "uint8",
+              "maximum": 99.0,
+              "minimum": 1.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Retain marked bodies within one target-model token budget.",
+          "type": "object",
+          "required": [
+            "mode",
+            "target_tokens"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "target_tokens"
+              ]
+            },
+            "target_tokens": {
+              "description": "Aggregate target-model token budget for marked bodies.",
+              "type": "integer",
+              "format": "uint32",
+              "maximum": 1000000.0,
+              "minimum": 1.0
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "RetrievalRanking": {
       "description": "Ranking source used by retrieval-aware compression levers.",

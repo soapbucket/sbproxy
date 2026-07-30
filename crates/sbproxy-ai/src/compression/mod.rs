@@ -11,6 +11,8 @@ mod marked_context;
 pub mod outcome;
 /// Lost-in-the-middle mitigation through relevance-based position reordering.
 pub mod position_reorder;
+/// Query-aware sentence selection from explicitly marked context.
+pub mod query_select;
 /// Retrieval-aware selection for explicitly marked context.
 pub mod rag_select;
 /// Versioned external summary-state records and canonical message digests.
@@ -23,6 +25,8 @@ pub mod store;
 pub mod summary_buffer;
 /// Stable behavior identity for summary-buffer state lineages.
 mod summary_policy;
+/// Sidecar-backed LLMLingua-2 extractive token pruning.
+pub mod token_prune;
 /// Compatibility adapter for deterministic model-window fitting.
 pub mod window_fit;
 
@@ -30,8 +34,9 @@ pub use compact_serialization::CompactSerializationLever;
 pub use config::{
     CompactSerializationConfig, CompressionBackend, CompressionLeverConfig, CompressionPolicy,
     CompressionProfile, CompressionSelector, CompressionStateBackend, CompressionStateConfig,
-    PositionReorderConfig, RagSelectConfig, RetrievalRanking, SummarizerConfig,
-    SummaryBufferConfig, TabularSerializationConfig, WindowFitConfig,
+    PositionReorderConfig, QuerySelectConfig, RagSelectConfig, RetrievalRanking, SummarizerConfig,
+    SummaryBufferConfig, TabularSerializationConfig, TokenPruneConfig, TokenPruneTarget,
+    WindowFitConfig,
 };
 pub use identity::CompressionRecordId;
 pub use marked_context::table::{decode_sbproxy_table_v1, TableDecodeError};
@@ -43,6 +48,7 @@ pub use outcome::{
     FailureReason, LeverKind, LeverOutcome, LeverResult, RequestOutcome, SkipReason,
 };
 pub use position_reorder::PositionReorderLever;
+pub use query_select::QuerySelectLever;
 pub use rag_select::RagSelectLever;
 pub use record::{CompressionSessionRecord, MessageDigest, RecordKind, RECORD_SCHEMA_VERSION};
 pub use runner::{
@@ -58,4 +64,8 @@ pub use summary_buffer::{
     SummaryBufferLever,
 };
 pub use summary_policy::SummaryPolicyFingerprint;
+pub use token_prune::{
+    SidecarTokenPruneBackend, TokenPruneBackend, TokenPruneBackendError, TokenPruneLever,
+    TokenPruneOutput,
+};
 pub use window_fit::WindowFitLever;

@@ -12,8 +12,9 @@ use sbproxy_ai::compression::{
     CompressionRequest, CompressionRequestControls, CompressionRun, CompressionRunner,
     CompressionSelector, CompressionSessionRecord, CompressionSessionStore,
     CompressionStateBackend, CompressionStateConfig, DeleteResult, InternalSummarizer, ListPage,
-    ListRequest, PositionReorderLever, PurgePage, PurgeRequest, RagSelectLever, StoreError,
-    SummarizationOutput, SummarizationRequest, SummarizerError, SummaryBufferLever, UpdatePermit,
+    ListRequest, PositionReorderLever, PurgePage, PurgeRequest, QuerySelectLever, RagSelectLever,
+    SidecarTokenPruneBackend, StoreError, SummarizationOutput, SummarizationRequest,
+    SummarizerError, SummaryBufferLever, TokenPruneBackend, TokenPruneLever, UpdatePermit,
     WindowFitLever,
 };
 use sbproxy_ai::{AiClient, AiHandlerConfig, ProviderConfig};
@@ -502,6 +503,7 @@ impl CompressionSessionStore for ValidationOnlyMeshStore {
 pub struct CompressionRuntime {
     policy: CompressionPolicy,
     store: Option<Arc<dyn CompressionSessionStore>>,
+    token_prune_backends: BTreeMap<usize, Arc<dyn TokenPruneBackend>>,
     providers: Vec<ProviderConfig>,
     ai_client: Arc<AiClient>,
     writer_node: String,
@@ -821,7 +823,9 @@ fn compile_pipeline(
     let behavior_fingerprint = Arc::<str>::from(policy_behavior_fingerprint(&policy)?);
     let requires_semantic_cache_bypass = policy.levers.iter().any(|lever| match lever {
         CompressionLeverConfig::WindowFit(config) => config.input_budget_tokens.is_some(),
-        CompressionLeverConfig::RagSelect(_)
+        CompressionLeverConfig::TokenPrune(_)
+        | CompressionLeverConfig::QuerySelect(_)
+        | CompressionLeverConfig::RagSelect(_)
         | CompressionLeverConfig::CompactSerialization(_)
         | CompressionLeverConfig::PositionReorder(_) => true,
         CompressionLeverConfig::SummaryBuffer(_) => false,
@@ -865,6 +869,10 @@ impl fmt::Debug for CompressionRuntime {
             .debug_struct("CompressionRuntime")
             .field("lever_count", &self.policy.levers.len())
             .field("has_state", &self.store.is_some())
+            .field(
+                "token_prune_backend_count",
+                &self.token_prune_backends.len(),
+            )
             .field("provider_count", &self.providers.len())
             .field("writer_node", &self.writer_node)
             .finish()
@@ -883,6 +891,8 @@ impl CompressionRuntime {
             .filter_map(|lever| match lever {
                 CompressionLeverConfig::SummaryBuffer(summary) => Some(summary),
                 CompressionLeverConfig::WindowFit(_)
+                | CompressionLeverConfig::TokenPrune(_)
+                | CompressionLeverConfig::QuerySelect(_)
                 | CompressionLeverConfig::RagSelect(_)
                 | CompressionLeverConfig::CompactSerialization(_)
                 | CompressionLeverConfig::PositionReorder(_) => None,
@@ -974,9 +984,27 @@ impl CompressionRuntime {
             }
         };
 
+        let token_prune_backends = policy
+            .levers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, lever)| match lever {
+                CompressionLeverConfig::TokenPrune(config) => Some((index, config)),
+                _ => None,
+            })
+            .map(|(index, config)| {
+                SidecarTokenPruneBackend::new(
+                    &config.endpoint,
+                    Duration::from_millis(config.timeout_ms),
+                )
+                .map(|backend| (index, Arc::new(backend) as Arc<dyn TokenPruneBackend>))
+            })
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+
         Ok(Self {
             policy,
             store,
+            token_prune_backends,
             providers: handler.providers.clone(),
             ai_client: dependencies.ai_client,
             writer_node: dependencies.writer_node,
@@ -1041,7 +1069,7 @@ impl CompressionRuntime {
         let mut levers: Vec<Arc<dyn CompressionLever>> =
             Vec::with_capacity(self.policy.levers.len());
 
-        for configured in &self.policy.levers {
+        for (index, configured) in self.policy.levers.iter().enumerate() {
             match configured {
                 CompressionLeverConfig::WindowFit(config) => {
                     levers.push(Arc::new(WindowFitLever::new(config.clone())));
@@ -1080,6 +1108,17 @@ impl CompressionRuntime {
                         store,
                         Arc::new(summarizer),
                     )));
+                }
+                CompressionLeverConfig::TokenPrune(config) => {
+                    let backend = self
+                        .token_prune_backends
+                        .get(&index)
+                        .expect("validated token-prune backend remains in pipeline")
+                        .clone();
+                    levers.push(Arc::new(TokenPruneLever::new(config.clone(), backend)));
+                }
+                CompressionLeverConfig::QuerySelect(config) => {
+                    levers.push(Arc::new(QuerySelectLever::new(*config)));
                 }
                 CompressionLeverConfig::RagSelect(config) => {
                     levers.push(Arc::new(RagSelectLever::new(config.clone())));
@@ -1259,7 +1298,7 @@ mod tests {
         PurgeRequest, SkipReason, StoreError, UpdatePermit,
     };
     use sbproxy_ai::{AiHandlerConfig, BudgetConfig, OnExceedAction};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::TempDir;
@@ -1413,6 +1452,7 @@ mod tests {
                 .expect("compression policy")
                 .into_owned(),
             store: Some(store),
+            token_prune_backends: BTreeMap::new(),
             providers: handler.providers.clone(),
             ai_client: Arc::new(sbproxy_ai::AiClient::new()),
             writer_node: "test-node".to_string(),
@@ -2270,6 +2310,15 @@ origins:
             "compact this result",
             &[marked_chunk("json", 1.0, "json", &pretty_json)],
         );
+        let query_messages = marked_message(
+            "which service is ready",
+            &[marked_chunk(
+                "mixed",
+                1.0,
+                "text",
+                "Catalog is ready. Gardening needs water.",
+            )],
+        );
         let reorder_messages = marked_message(
             "put useful evidence at the edges",
             &[
@@ -2279,6 +2328,14 @@ origins:
             ],
         );
         let cases = [
+            (
+                serde_json::json!({
+                    "type": "query_select",
+                    "max_sentences": 1
+                }),
+                query_messages,
+                LeverKind::QuerySelect,
+            ),
             (
                 serde_json::json!({
                     "type": "rag_select",
@@ -2406,6 +2463,14 @@ origins:
     fn summary_discovery_ignores_all_stateless_levers() {
         let stateless = stateless_handler(vec![
             serde_json::json!({
+                "type": "token_prune",
+                "min_tokens": 512,
+                "endpoint": "unix:///run/sbproxy/classifier.sock",
+                "model": "llmlingua-2",
+                "target": {"mode": "retain_ratio", "retain_percent": 50}
+            }),
+            serde_json::json!({"type": "query_select", "max_sentences": 8}),
+            serde_json::json!({
                 "type": "rag_select",
                 "min_tokens": 512,
                 "max_chunks": 8
@@ -2432,6 +2497,10 @@ origins:
     fn every_new_config_field_changes_the_behavior_fingerprint_one_at_a_time() {
         let base_levers = vec![
             serde_json::json!({
+                "type": "query_select",
+                "max_sentences": 8
+            }),
+            serde_json::json!({
                 "type": "rag_select",
                 "min_tokens": 512,
                 "ranking": "auto",
@@ -2445,6 +2514,15 @@ origins:
                 "tabular": {"enabled": true, "min_rows": 8}
             }),
             serde_json::json!({"type": "position_reorder", "ranking": "auto"}),
+            serde_json::json!({
+                "type": "token_prune",
+                "min_tokens": 512,
+                "endpoint": "unix:///run/sbproxy/classifier.sock",
+                "model": "llmlingua-2",
+                "timeout_ms": 250,
+                "max_chunks": 64,
+                "target": {"mode": "retain_ratio", "retain_percent": 50}
+            }),
         ];
         let fingerprint = |levers: Vec<serde_json::Value>| {
             let handler = stateless_handler(levers);
@@ -2457,58 +2535,100 @@ origins:
         let baseline = fingerprint(base_levers.clone());
         let mutations = [
             (
-                "rag_select.min_tokens",
+                "query_select.max_sentences",
                 0,
+                "/max_sentences",
+                serde_json::json!(7),
+            ),
+            (
+                "rag_select.min_tokens",
+                1,
                 "/min_tokens",
                 serde_json::json!(513),
             ),
             (
                 "rag_select.ranking",
-                0,
+                1,
                 "/ranking",
                 serde_json::json!("lexical"),
             ),
             (
                 "rag_select.max_chunks",
-                0,
+                1,
                 "/max_chunks",
                 serde_json::json!(7),
             ),
             (
                 "rag_select.min_relevance_percent",
-                0,
+                1,
                 "/min_relevance_percent",
                 serde_json::json!(16),
             ),
             (
                 "rag_select.drop_empty",
-                0,
+                1,
                 "/drop_empty",
                 serde_json::json!(false),
             ),
             (
                 "compact_serialization.min_tokens",
-                1,
+                2,
                 "/min_tokens",
                 serde_json::json!(129),
             ),
             (
                 "compact_serialization.tabular.enabled",
-                1,
+                2,
                 "/tabular/enabled",
                 serde_json::json!(false),
             ),
             (
                 "compact_serialization.tabular.min_rows",
-                1,
+                2,
                 "/tabular/min_rows",
                 serde_json::json!(9),
             ),
             (
                 "position_reorder.ranking",
-                2,
+                3,
                 "/ranking",
                 serde_json::json!("lexical"),
+            ),
+            (
+                "token_prune.min_tokens",
+                4,
+                "/min_tokens",
+                serde_json::json!(513),
+            ),
+            (
+                "token_prune.endpoint",
+                4,
+                "/endpoint",
+                serde_json::json!("http://127.0.0.1:9440"),
+            ),
+            (
+                "token_prune.model",
+                4,
+                "/model",
+                serde_json::json!("llmlingua-2-xlm-roberta"),
+            ),
+            (
+                "token_prune.timeout_ms",
+                4,
+                "/timeout_ms",
+                serde_json::json!(251),
+            ),
+            (
+                "token_prune.max_chunks",
+                4,
+                "/max_chunks",
+                serde_json::json!(63),
+            ),
+            (
+                "token_prune.target.retain_percent",
+                4,
+                "/target/retain_percent",
+                serde_json::json!(49),
             ),
         ];
 
@@ -2519,6 +2639,15 @@ origins:
                 .unwrap_or_else(|| panic!("missing fixture field {field}")) = value;
             assert_ne!(baseline, fingerprint(changed), "field {field}");
         }
+
+        let mut target_tokens = base_levers;
+        target_tokens[4]["target"] =
+            serde_json::json!({"mode": "target_tokens", "target_tokens": 2_048});
+        assert_ne!(
+            baseline,
+            fingerprint(target_tokens),
+            "token_prune target mode"
+        );
     }
 
     #[test]
@@ -2618,6 +2747,17 @@ origins:
     fn request_specific_default_levers_bypass_unpartitioned_semantic_caches() {
         let cases = [
             serde_json::json!({
+                "type": "token_prune",
+                "min_tokens": 512,
+                "endpoint": "unix:///run/sbproxy/classifier.sock",
+                "model": "llmlingua-2",
+                "target": {"mode": "retain_ratio", "retain_percent": 50}
+            }),
+            serde_json::json!({
+                "type": "query_select",
+                "max_sentences": 8
+            }),
+            serde_json::json!({
                 "type": "rag_select",
                 "min_tokens": 512,
                 "max_chunks": 8
@@ -2705,6 +2845,7 @@ origins:
                 .expect("explicit policy")
                 .into_owned(),
             store: None,
+            token_prune_backends: BTreeMap::new(),
             providers: handler.providers.clone(),
             ai_client: std::sync::Arc::new(sbproxy_ai::AiClient::new()),
             writer_node: "test-node".to_string(),
@@ -2724,6 +2865,7 @@ origins:
                 .expect("explicit policy")
                 .into_owned(),
             store: None,
+            token_prune_backends: BTreeMap::new(),
             providers: window_handler.providers.clone(),
             ai_client: std::sync::Arc::new(sbproxy_ai::AiClient::new()),
             writer_node: "test-node".to_string(),

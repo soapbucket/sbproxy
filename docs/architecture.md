@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-07-29*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -392,14 +392,18 @@ Each compiled AI origin owns an immutable default compression pipeline, an
 immutable `off` pipeline, and immutable named pipelines. Request dispatch pins
 one of them with precedence header, governed key, CEL, then route default. The
 selector is resolved before either semantic-cache implementation can read or
-arm write-back state. Routes with named profiles or an explicit-budget default,
-and requests with an explicit selector, bypass caches that cannot partition by
-compression behavior. This keeps a cache hit from crossing profile boundaries.
-The legacy default-only compatibility pipeline retains its old cache scope.
+arm write-back state. Routes with named profiles, an explicit-budget default,
+or a marked-context lever, and requests with an explicit selector, bypass
+caches that cannot partition by compression behavior. This keeps a cache hit
+from crossing profile boundaries. The legacy default-only compatibility
+pipeline retains its old cache scope.
 
 `window_fit` is stateless. Explicit-budget fitting preserves the leading
 instruction prefix, newest protocol unit, contiguous recent suffix, and tool
-call/result groups. `summary_buffer` defaults to a process-owned Local redb
+call/result groups. `query_select` ranks marked text sentences against the
+marked query without external state. `token_prune` uses a shared lazy client to
+an OSS classifier sidecar, validates its extractive result, and fails open at
+the lever boundary. `summary_buffer` defaults to a process-owned Local redb
 store and accepts explicit Redis or mesh state. Redis serializes updates across
 processes; mesh uses the replicated substrate's eventual last-writer-wins
 contract. Admin deletion and purge operate on the same selected store. There is

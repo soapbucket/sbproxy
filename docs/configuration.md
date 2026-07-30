@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-07-29*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -1328,6 +1328,7 @@ origins:
 | `max_concurrent` | map | | Maximum concurrent in-flight requests per provider. |
 | `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `llm_aware`, `content_policy_fallback`); see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
 | `compression` | object | unset | Ordered AI context-compression policy. See [AI context compression](#ai-context-compression) and [ai-context-compression.md](ai-context-compression.md). |
+| `reasoning` | string or object | `off` | Route policy for concise reasoning. Use `concise`, `off`, or `{budget: N}` with `N` greater than zero. |
 | `shadow` | object | | Side-by-side eval: mirror each request to a second provider and log metrics. |
 | `ai_policy` | object | | One sandboxed CEL expression over the AI decision pipeline (`expression`, `on_error`). See [ai-policy-cel.md](ai-policy-cel.md). |
 | `usage_sinks` | list | `[]` | Destinations for completed-call usage records. The `ledger` sink (`path`, optional `signing_seed_hex`) writes a hash-chained, signable record. See [ai-usage-ledger.md](ai-usage-ledger.md). |
@@ -1369,6 +1370,47 @@ A `managed_model` provider must set a non-empty `deployment` and must not set
 `api_key`, `base_url`, or the legacy `serve` block. Conversely, `deployment` is
 rejected for every other provider type. Managed traffic resolves through the
 deployment runtime rather than an operator-supplied upstream URL.
+
+#### AI reasoning policy
+
+`reasoning` controls reasoning effort for each provider attempt after
+`model_map` resolves the upstream model. It is disabled by default:
+
+```yaml
+action:
+  type: ai_proxy
+  providers:
+    - name: openai
+      api_key: ${OPENAI_API_KEY}
+      models: [gpt-5-mini]
+  reasoning: concise
+```
+
+Use an explicit positive budget when the provider supports one:
+
+```yaml
+reasoning:
+  budget: 2048
+```
+
+`concise` asks a supported model for its lowest native reasoning effort.
+For Anthropic and Gemini, `budget` is a native thinking-token budget when the
+mapped model accepts it. Anthropic keeps a separate visible-output allowance in
+`max_tokens`. OpenAI uses low reasoning effort and treats `budget` as a cap on
+`max_completion_tokens`, or `max_output_tokens` for a direct Responses-shaped
+call. An unsupported provider-model pair or native range receives one fixed
+concise instruction instead. Chat Completions and Messages receive a system
+message; Responses receives `instructions`. A budget fallback also caps the
+request shape's completion or output field. Requests declaring `tools` or
+legacy `functions`, and code-shaped prompts, including requests that name
+common source-file paths, bypass the policy. The safety facts are captured
+before context compression. Only Chat Completions, Anthropic Messages, and
+OpenAI Responses requests are eligible. A non-`off` policy on one of those
+surfaces bypasses semantic-cache reads and writes so an older cached response
+cannot skip the current reasoning or output budget.
+
+See [Reasoning policy](ai-gateway.md#reasoning-policy) for the exact provider
+mapping, fallback behavior, and metric outcomes.
 
 #### AI context compression
 
@@ -1416,6 +1458,27 @@ origins:
                 input_budget_tokens: 4096
 ```
 
+For stateless marked retrieval text, select sentences first, prune source
+tokens through the classifier sidecar, then apply the final input bound:
+
+```yaml
+compression:
+  levers:
+    - type: query_select
+      max_sentences: 12
+    - type: token_prune
+      min_tokens: 512
+      endpoint: http://127.0.0.1:9440
+      model: llmlingua-2
+      timeout_ms: 250
+      max_chunks: 32
+      target:
+        mode: retain_ratio
+        retain_percent: 60
+    - type: window_fit
+      input_budget_tokens: 8192
+```
+
 Levers execute in declaration order. Each lever sees the message list accepted
 from the preceding lever, and a candidate replacement is used only when it
 strictly reduces the resolved target model's token estimate.
@@ -1444,6 +1507,44 @@ Policy fields:
 | `summarizer.provider` | string | required | Exact `providers[].name` from the same AI handler. The provider must be enabled. |
 | `summarizer.model` | string | required | Non-empty model sent to the selected provider. It must be declared by that provider, mapped by `model_map`, selected as its `default_model`, or allowed by an empty provider model list, and it must pass the handler's model allow and block lists. |
 | `summarizer.timeout` | duration | required | Positive hard deadline for the internal summarization request. Accepts the same seconds or humanized duration syntax as `state.ttl`. |
+
+`query_select` fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | string | required | Must be `query_select`. |
+| `max_sentences` | int | exclusive | Keep at most this many positive-scoring sentences in each marked retrieval block. From 1 through 4,096. |
+| `target_tokens` | int | exclusive | Keep positive-scoring sentence bodies within this target-model estimate in each marked block. From 1 through 1,000,000. |
+
+Configure exactly one of `max_sentences` and `target_tokens`. The lever accepts
+only marked `format="text"` chunks. It preserves source order within each
+retained chunk, then places the strongest retained chunks at the block edges.
+A block may contain at most 4,096 source sentences in either mode. A larger
+block skips the whole lever as `marked_context_too_large` before ranking. A
+missing query, no positive lexical overlap, malformed markers, or structured
+chunk also causes a safe skip.
+
+`token_prune` fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | string | required | Must be `token_prune`. |
+| `min_tokens` | int | required | Positive target-model estimate across all marked bodies before any sidecar call. |
+| `endpoint` | string | required | Classifier gRPC URI or `unix://` with an absolute socket path. |
+| `model` | string | required | Non-empty token-classification model ID loaded by the sidecar. The sidecar accepts at most 256 UTF-8 bytes. |
+| `timeout_ms` | int | `250` | Per-chunk RPC timeout, from 1 through 60,000. |
+| `max_chunks` | int | `64` | Maximum marked chunks sent during one request, from 1 through 256. |
+| `target.mode` | enum | required | `retain_ratio` or `target_tokens`. |
+| `target.retain_percent` | int | ratio mode | Per-chunk percentage limit, from 1 through 99, enforced with both the pruning tokenizer and the request's target-model estimator. |
+| `target.target_tokens` | int | token mode | Aggregate target-model budget across returned marked bodies, from 1 through 1,000,000. It must be at least the marked chunk count for that request to be eligible. |
+
+The route connects lazily and shares its client. Only marked
+`format="text"` bodies are sent. In ratio mode, SBproxy rechecks each returned
+chunk against the same percentage using the request model. In target-token
+mode, it allocates the budget across chunks and rechecks the combined output
+with that model. A token target smaller than the marked chunk count skips
+without a sidecar call. Sidecar transport errors and invalid output fail open
+at this lever; later entries still run.
 
 `window_fit` fields:
 
@@ -1475,7 +1576,10 @@ timeout, or explicit input budget, zero
 `summary_buffer` numeric fields, a summary target greater than or equal to its
 minimum threshold, an empty summarizer model, an unknown summarizer provider,
 a disabled summarizer provider, and a summarizer model not available through
-that provider or denied by the handler policy. A stateful backend that is not
+that provider or denied by the handler policy. It also rejects a
+`query_select` block with both or neither bound, out-of-range query or pruning
+targets, an empty token-prune model or endpoint, a relative Unix socket path,
+and out-of-range sidecar timeout or fanout. A stateful backend that is not
 available also fails pipeline construction instead of silently falling back:
 
 - `backend: local` opens one process-owned database selected through
@@ -1485,9 +1589,10 @@ available also fails pipeline construction instead of silently falling back:
   feature, `params.dsn` must be a `redis://` or `rediss://` URL with a host.
 - `backend: mesh` requires `proxy.cluster.replication` on every node and binds
   to that live replicated substrate.
-- `rag_select`, `compact_serialization`, `position_reorder`, and `window_fit`
-  are stateless. A policy containing only these levers creates no Local
-  database and needs no Redis or mesh dependency.
+- `token_prune`, `query_select`, `rag_select`, `compact_serialization`,
+  `position_reorder`, and `window_fit` are stateless. `token_prune` still
+  requires its configured sidecar at request time. A policy containing only
+  these levers creates no Local database and needs no Redis or mesh dependency.
 
 Request workers retain no memory-only conversational state between requests.
 The stateful lever stores its canonical running-summary record in the selected

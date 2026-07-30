@@ -35,6 +35,7 @@ pub mod model_alias;
 pub mod model_directory;
 pub mod multimodal;
 pub mod prompt_fingerprint;
+pub mod prompt_optimizer;
 pub mod prompts;
 pub mod provider;
 pub mod provider_ratelimit;
@@ -42,6 +43,7 @@ pub mod providers;
 pub mod quota_pool;
 pub mod ratelimit;
 pub mod realtime;
+pub mod reasoning;
 pub mod routing;
 pub mod routing_feedback;
 pub mod routing_state;
@@ -96,6 +98,10 @@ pub use quota_pool::{
 pub use ratelimit::{
     Admission, ModelRateConfig, ModelRateLimiter, RejectReason, Rejection, SurfaceRateConfig,
     SurfaceRateLimiter, DEFAULT_ESTIMATED_TOKENS, DEFAULT_MAX_KEYS,
+};
+pub use reasoning::{
+    apply_reasoning_policy, apply_reasoning_policy_with_eligibility, reasoning_eligibility,
+    ReasoningEligibility, ReasoningOutcome, ReasoningPolicy, ReasoningTransform,
 };
 pub use routing::{FilteredSelectionFallback, PeakEwmaConfig, Router, RoutingStrategy};
 pub use routing_state::{

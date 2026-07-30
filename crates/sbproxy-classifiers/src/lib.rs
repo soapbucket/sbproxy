@@ -68,6 +68,7 @@ pub mod known_models;
 
 mod default_centroids;
 mod embedder;
+mod token_classifier;
 pub use default_centroids::{
     default_centroid_artifact, default_safety_centroids, DefaultCentroid, DefaultCentroidArtifact,
     DefaultCentroidTaxonomyArtifact, DEFAULT_CENTROID_DIMENSION, DEFAULT_CENTROID_MODEL_ID,
@@ -75,6 +76,10 @@ pub use default_centroids::{
     DEFAULT_CENTROID_TOKENIZER_SHA256,
 };
 pub use embedder::{EmbeddingOutput, OnnxEmbedder};
+pub use token_classifier::{
+    OnnxTokenClassifier, TokenCompressionLimitError, TokenCompressionLimits,
+    TokenCompressionOutput, TokenCompressionTarget,
+};
 
 pub use agent_class::{
     AgentClass, AgentClassCatalog, AgentId, AgentIdSource, AgentPurpose, DEFAULT_CATALOG_YAML,

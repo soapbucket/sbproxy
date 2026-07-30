@@ -92,7 +92,13 @@ pub fn request_to_native(body: Value, path: &str) -> (Value, String) {
     obj.insert("contents".to_string(), Value::Array(contents));
 
     // 2. Move sampling knobs under generationConfig.
-    let mut gen_cfg: Map<String, Value> = Map::new();
+    // Preserve provider-native extensions installed on the canonical
+    // per-attempt body (for example reasoning `thinkingConfig`) while
+    // layering translated OpenAI sampling knobs into the same object.
+    let mut gen_cfg: Map<String, Value> = match obj.remove("generationConfig") {
+        Some(Value::Object(config)) => config,
+        _ => Map::new(),
+    };
     if let Some(v) = obj.remove("temperature") {
         gen_cfg.insert("temperature".to_string(), v);
     }
