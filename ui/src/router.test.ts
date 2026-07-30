@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+
 import { api } from "./api";
 import { useAuth } from "./composables/useAuth";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -22,6 +24,24 @@ describe("documentation routes", () => {
       .sort();
 
     expect(unaccounted).toEqual([]);
+  });
+
+  it("maps every documentation slug to a shipped source page", () => {
+    const missingDocs = [
+      ...new Set(
+        router
+          .getRoutes()
+          .map((route) => route.meta.documentation)
+          .filter((slug): slug is string => typeof slug === "string"),
+      ),
+    ]
+      .filter(
+        (slug) =>
+          !existsSync(new URL(`../../docs/${slug}.md`, import.meta.url)),
+      )
+      .sort();
+
+    expect(missingDocs).toEqual([]);
   });
 
   it("intentionally maps the unauthenticated login view", () => {
