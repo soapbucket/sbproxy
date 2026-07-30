@@ -102,19 +102,22 @@ The four failures from the 2026-07-30 run now have explicit contracts:
   engine exited, removes its durable ownership record, and releases the public
   listener.
 - `service uninstall` waits for the exact launchd owner identity to exit and
-  then reaps its exact recorded engines.
-- Every managed subprocess is recorded atomically with owner PID/start
-  fingerprint and engine PID/start fingerprint (plus executable evidence).
-  After SIGKILL, the next owner reaps only that exact stale process before
-  spawning a replacement. A live owner or reused PID is preserved. Linux's
-  parent-death signal remains the first line of defense.
+  then reaps its recorded process groups.
+- A managed child blocks before `exec` until its owner and engine
+  fingerprints are on durable storage. Persistence or exec failure reaps the
+  child before returning an error. After SIGKILL, the next boot reaps that
+  exact stale process group before binding listeners or spawning a
+  replacement. A live owner or reused PID is preserved. Linux's parent-death
+  signal remains the first line of defense.
 
 Focused real-process tests cover collision failure, SIGTERM plus same-port
-rebind, exact stale-engine reap, live-owner preservation, PID-reuse
-preservation, killed-owner recovery, and record removal after verified normal
+rebind, blocked startup until durable ownership, persistence and exec failure,
+process-group reap, live-owner preservation, PID-reuse preservation,
+killed-owner recovery, fast-exit diagnostics, and record removal after normal
 shutdown. The release Apple lane now derives engine PIDs from those ownership
-records, exercises gateway SIGKILL/restart, and requires final SIGTERM engine
-reap plus listener release. That lane still needs a live Apple runner result.
+records, exercises gateway SIGKILL/restart and the real `service uninstall`,
+then requires engine cleanup and a same-port bind. That lane still needs a live
+Apple runner result.
 
 ### Sleep and wake
 

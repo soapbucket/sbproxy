@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-07-30*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -602,9 +602,10 @@ that is still in progress.
 
 Managed engine ownership is durable across gateway death. Each engine record
 contains the owner and engine PID plus their process-start fingerprints;
+the record reaches durable storage before the engine can execute.
 `service uninstall` waits for the exact launchd-owned gateway to exit, then
-reaps only its exact recorded engine. A reused PID or another live sbproxy
-owner is never signalled, and no process-name sweep is used.
+reaps its recorded process group. A reused PID or another live sbproxy owner
+is never signalled, and no process-name sweep is used.
 
 `--dry-run` (inherited from `run`'s flags) prints the plist and the
 generated config without installing or loading anything. `service

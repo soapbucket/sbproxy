@@ -1179,6 +1179,20 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     use pingora_core::server::Server;
     use pingora_proxy::http_proxy_service;
 
+    // Recover exact engines left by a prior forced gateway exit before
+    // reading desired state. This also cleans up when the replacement
+    // configuration no longer contains a model host, and keeps recovery
+    // ahead of listener bind and any replacement-engine spawn.
+    let recovered_engines =
+        sbproxy_model_host::reap_stale_managed_engines(std::time::Duration::from_secs(5))
+            .map_err(|error| anyhow::anyhow!("recover stale managed engines at boot: {error}"))?;
+    if recovered_engines > 0 {
+        tracing::info!(
+            recovered_engines,
+            "recovered stale managed engines before gateway boot"
+        );
+    }
+
     // Load and compile the config.
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {}", config_path, e))?;
