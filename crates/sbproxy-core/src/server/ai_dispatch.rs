@@ -2237,13 +2237,6 @@ pub(super) async fn handle_ai_proxy(
                 ));
             }
         };
-        record_ai_provider_response_failure(
-            &ai_span,
-            provider.name.as_str(),
-            resp.status().as_u16(),
-            None,
-        );
-
         // GET endpoints (e.g. /v1/models) aren't translated yet:
         // Anthropic's models listing has a different shape and most
         // OpenAI clients don't depend on it for routing decisions.
@@ -2268,6 +2261,8 @@ pub(super) async fn handle_ai_proxy(
             format,
             config.max_body_size,
             ctx.ai_inbound_format.as_deref(),
+            &ai_span,
+            provider.name.as_str(),
         )
         .await;
     }
@@ -2423,13 +2418,6 @@ pub(super) async fn handle_ai_proxy(
                 ));
             }
         };
-        record_ai_provider_response_failure(
-            &ai_span,
-            provider.name.as_str(),
-            resp.status().as_u16(),
-            None,
-        );
-
         let format = sbproxy_ai::client::provider_format(provider);
         emit_ai_billing_event(
             hostname,
@@ -2459,6 +2447,8 @@ pub(super) async fn handle_ai_proxy(
             ctx.ai_inbound_format.as_deref(),
             Vec::new(),
             Vec::new(),
+            &ai_span,
+            provider.name.as_str(),
         )
         .await;
     }
@@ -2892,16 +2882,18 @@ pub(super) async fn handle_ai_proxy(
         let raw_response = read_capped_response_body(resp, config.max_body_size).await?;
         let response_body =
             sbproxy_ai::translators::translate_response_bytes(format, raw_response.as_ref());
-        let response_body = bytes::Bytes::from(sbproxy_ai::format::rewrap_response_for_inbound(
-            ctx.ai_inbound_format.as_deref(),
-            &response_body,
-        ));
         record_ai_provider_response_failure(
             &ai_span,
             provider.name.as_str(),
             status,
             Some(response_body.as_ref()),
         );
+        let response_body =
+            bytes::Bytes::from(sbproxy_ai::format::rewrap_success_response_for_inbound(
+                status,
+                ctx.ai_inbound_format.as_deref(),
+                &response_body,
+            ));
 
         // For audio_transcription requests, peek at the response body
         // to extract `duration` (present when the operator requests
@@ -5057,9 +5049,16 @@ pub(super) async fn handle_ai_proxy(
                             .await;
                         }
                     }
-                    let translated = sbproxy_ai::format::rewrap_response_for_inbound(
+                    record_ai_provider_response_failure(
+                        &ai_span,
+                        &o.provider_name,
+                        o.status,
+                        Some(o.body.as_ref()),
+                    );
+                    let translated = sbproxy_ai::format::rewrap_success_response_for_inbound(
+                        o.status,
                         ctx.ai_inbound_format.as_deref(),
-                        &o.body,
+                        o.body.as_ref(),
                     );
                     // Drop any idempotency capture: cascade does not
                     // engage the idempotency cache write in v1
@@ -5733,6 +5732,12 @@ pub(super) async fn handle_ai_proxy(
                         );
                         continue;
                     }
+                    record_ai_provider_response_failure(
+                        &ai_span,
+                        provider.name.as_str(),
+                        status,
+                        Some(body_bytes.as_ref()),
+                    );
                     sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
                     try_spawn_governed_shadow_after_primary(
                         config,
@@ -6151,7 +6156,7 @@ fn ai_transport_error_type(error: &anyhow::Error) -> &'static str {
     }
 }
 
-fn record_ai_provider_response_failure(
+pub(super) fn record_ai_provider_response_failure(
     span: &tracing::Span,
     provider: &str,
     status: u16,
@@ -6167,9 +6172,9 @@ fn record_ai_provider_response_failure(
         provider = %provider,
         status,
         error_type = kind,
-        upstream_error_code = %diagnostic.code.as_deref().unwrap_or("unavailable"),
-        upstream_error_status = %diagnostic.status.as_deref().unwrap_or("unavailable"),
-        upstream_error_reason = %diagnostic.reason.as_deref().unwrap_or("unavailable"),
+        upstream_error_code = %diagnostic.code.unwrap_or("unavailable"),
+        upstream_error_status = %diagnostic.status.unwrap_or("unavailable"),
+        upstream_error_reason = %diagnostic.reason.unwrap_or("unavailable"),
         "AI proxy: provider returned error response"
     );
     if !provider.is_empty() {
@@ -6182,15 +6187,14 @@ fn record_ai_provider_response_failure(
 
 #[derive(Default)]
 struct AiProviderErrorDiagnostic {
-    code: Option<String>,
-    status: Option<String>,
-    reason: Option<String>,
+    code: Option<&'static str>,
+    status: Option<&'static str>,
+    reason: Option<&'static str>,
 }
 
 /// Extract low-cardinality provider error labels without retaining an
-/// arbitrary upstream message or body. Values must fit the same conservative
-/// character set used by provider error enums, so credentials and free-form
-/// content cannot enter the diagnostic event.
+/// arbitrary upstream message or body. Only values mapped to the fixed
+/// vocabulary in [`safe_provider_error_label`] can enter the event.
 fn ai_provider_error_diagnostic(body: Option<&[u8]>) -> AiProviderErrorDiagnostic {
     let Some(value) = body.and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
     else {
@@ -6219,34 +6223,97 @@ fn ai_provider_error_diagnostic(body: Option<&[u8]>) -> AiProviderErrorDiagnosti
     }
 }
 
-fn safe_provider_error_label(value: &serde_json::Value) -> Option<String> {
-    let label = match value {
-        serde_json::Value::String(value) => value.trim().to_string(),
-        serde_json::Value::Number(value) => value.to_string(),
-        _ => return None,
-    };
-    let has_ascii_lowercase = label.bytes().any(|byte| byte.is_ascii_lowercase());
-    let has_ascii_uppercase = label.bytes().any(|byte| byte.is_ascii_uppercase());
-    if label.is_empty()
-        || label.len() > 64
-        || sbproxy_observe::redact::contains_secret(&label)
-        || looks_like_google_api_key(&label)
-        || (has_ascii_lowercase && has_ascii_uppercase)
-        || !label
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-    {
-        return None;
-    }
-    Some(label)
-}
+fn safe_provider_error_label(value: &serde_json::Value) -> Option<&'static str> {
+    // These are deliberately exact, finite provider taxonomies rather than
+    // syntactic validators. A UUID, tenant id, credential, or newly invented
+    // enum therefore maps to `unavailable` at the log site until an operator
+    // intentionally adds a canonical label here.
+    const CANONICAL_LABELS: &[&str] = &[
+        "CANCELLED",
+        "UNKNOWN",
+        "INVALID_ARGUMENT",
+        "DEADLINE_EXCEEDED",
+        "NOT_FOUND",
+        "ALREADY_EXISTS",
+        "PERMISSION_DENIED",
+        "RESOURCE_EXHAUSTED",
+        "FAILED_PRECONDITION",
+        "ABORTED",
+        "OUT_OF_RANGE",
+        "UNIMPLEMENTED",
+        "INTERNAL",
+        "UNAVAILABLE",
+        "DATA_LOSS",
+        "UNAUTHENTICATED",
+        "API_KEY_INVALID",
+        "API_KEY_EXPIRED",
+        "RATE_LIMIT_EXCEEDED",
+        "QUOTA_EXCEEDED",
+        "BILLING_DISABLED",
+        "ACCESS_TOKEN_EXPIRED",
+        "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+        "IP_REFERER_BLOCKED",
+        "PROJECT_DENIED",
+        "USER_PROJECT_DENIED",
+        "CONSUMER_INVALID",
+        "CONSUMER_SUSPENDED",
+        "SERVICE_DISABLED",
+        "content_filter",
+        "content_policy",
+        "context_length_exceeded",
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "not_found_error",
+        "rate_limit_error",
+        "api_error",
+        "overloaded_error",
+    ];
 
-fn looks_like_google_api_key(value: &str) -> bool {
-    value.starts_with("AIza")
-        && value.len() >= 35
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    match value {
+        serde_json::Value::Number(value) => match value.as_u64()? {
+            400 => Some("400"),
+            401 => Some("401"),
+            403 => Some("403"),
+            404 => Some("404"),
+            408 => Some("408"),
+            409 => Some("409"),
+            413 => Some("413"),
+            422 => Some("422"),
+            429 => Some("429"),
+            500 => Some("500"),
+            502 => Some("502"),
+            503 => Some("503"),
+            504 => Some("504"),
+            _ => None,
+        },
+        serde_json::Value::String(value) => {
+            let label = value.trim();
+            if let Ok(numeric) = label.parse::<u64>() {
+                return match numeric {
+                    400 => Some("400"),
+                    401 => Some("401"),
+                    403 => Some("403"),
+                    404 => Some("404"),
+                    408 => Some("408"),
+                    409 => Some("409"),
+                    413 => Some("413"),
+                    422 => Some("422"),
+                    429 => Some("429"),
+                    500 => Some("500"),
+                    502 => Some("502"),
+                    503 => Some("503"),
+                    504 => Some("504"),
+                    _ => None,
+                };
+            }
+            CANONICAL_LABELS
+                .iter()
+                .copied()
+                .find(|canonical| label.eq_ignore_ascii_case(canonical))
+        }
+        _ => None,
+    }
 }
 
 fn ai_provider_response_error_type(status: u16, body: Option<&[u8]>) -> Option<&'static str> {
@@ -6375,6 +6442,8 @@ pub(super) async fn relay_ai_response(
     format: sbproxy_ai::providers::ProviderFormat,
     max_body_size: Option<usize>,
     inbound_format: Option<&str>,
+    ai_span: &tracing::Span,
+    provider_name: &str,
 ) -> Result<()> {
     let status = resp.status().as_u16();
 
@@ -6394,7 +6463,12 @@ pub(super) async fn relay_ai_response(
     let resp_body = read_capped_response_body(resp, max_body_size).await?;
 
     let translated = sbproxy_ai::translators::translate_response_bytes(format, &resp_body);
-    let translated = sbproxy_ai::format::rewrap_response_for_inbound(inbound_format, &translated);
+    record_ai_provider_response_failure(ai_span, provider_name, status, Some(&translated));
+    let translated = sbproxy_ai::format::rewrap_success_response_for_inbound(
+        status,
+        inbound_format,
+        &translated,
+    );
     let extras = retry_after
         .map(|value| vec![("retry-after".to_string(), value)])
         .unwrap_or_default();
@@ -6663,6 +6737,13 @@ pub(super) async fn relay_ai_response_with_cache(
         None => resp_body,
     };
 
+    record_ai_provider_response_failure(
+        &ai_span,
+        router_sink.provider_name,
+        status,
+        Some(resp_body.as_ref()),
+    );
+
     // Native-format inbound rewrap. When the client entered
     // on a `/v1/messages` or `/v1/responses` path the cached body stays
     // in OpenAI Chat shape (so cross-format cache hits remain cheap)
@@ -6688,7 +6769,8 @@ pub(super) async fn relay_ai_response_with_cache(
     } else {
         match inbound_format.as_deref() {
             Some("anthropic") | Some("responses") => {
-                bytes::Bytes::from(sbproxy_ai::format::rewrap_response_for_inbound(
+                bytes::Bytes::from(sbproxy_ai::format::rewrap_success_response_for_inbound(
+                    status,
                     inbound_format.as_deref(),
                     &resp_body,
                 ))
@@ -6696,13 +6778,6 @@ pub(super) async fn relay_ai_response_with_cache(
             _ => resp_body,
         }
     };
-
-    record_ai_provider_response_failure(
-        &ai_span,
-        router_sink.provider_name,
-        status,
-        Some(resp_body.as_ref()),
-    );
 
     if (200..300).contains(&status) {
         record_ai_response_span_metadata(&ai_span, &resp_body);
@@ -9478,6 +9553,79 @@ mod external_guardrail_context_tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[derive(Clone)]
+    struct WarningCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct WarningCaptureGuard(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for WarningCapture {
+        type Writer = WarningCaptureGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            WarningCaptureGuard(Arc::clone(&self.0))
+        }
+    }
+
+    impl std::io::Write for WarningCaptureGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("warning capture")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn handle_with_captured_warnings(
+        session: &mut Session,
+        config: &sbproxy_ai::AiHandlerConfig,
+        pipeline: &crate::pipeline::CompiledPipeline,
+        context: &mut crate::context::RequestContext,
+        origin_idx: Option<usize>,
+    ) -> String {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(WarningCapture(Arc::clone(&captured)))
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            super::handle_ai_proxy(session, config, pipeline, "ai.test", context, origin_idx)
+                .await
+                .expect("AI provider error is handled");
+        }
+        let bytes = captured.lock().expect("warning capture").clone();
+        String::from_utf8(bytes).expect("UTF-8 warnings")
+    }
+
+    fn assert_single_body_aware_provider_diagnostic(output: &str, provider: &str, status: u16) {
+        assert_eq!(
+            output
+                .matches("AI proxy: provider returned error response")
+                .count(),
+            1,
+            "{output}"
+        );
+        assert!(output.contains(&format!("provider={provider}")), "{output}");
+        assert!(output.contains(&format!("status={status}")), "{output}");
+        assert!(output.contains("upstream_error_code=400"), "{output}");
+        assert!(
+            output.contains("upstream_error_status=INVALID_ARGUMENT"),
+            "{output}"
+        );
+        assert!(
+            output.contains("upstream_error_reason=API_KEY_INVALID"),
+            "{output}"
+        );
+        assert!(!output.contains("provider-private-sentinel"), "{output}");
+    }
+
     #[derive(Default)]
     struct RecordingSemanticCache {
         lookups: AtomicUsize,
@@ -9693,10 +9841,20 @@ mod external_guardrail_context_tests {
         content_type: &str,
         body: Vec<u8>,
     ) -> (Session, DownstreamClient) {
+        downstream_method_bytes_session("POST", path, content_type, body).await
+    }
+
+    async fn downstream_method_bytes_session(
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (Session, DownstreamClient) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind downstream fixture");
         let address = listener.local_addr().expect("downstream address");
+        let method = method.to_string();
         let path = path.to_string();
         let content_type = content_type.to_string();
         let mut client = DownstreamClient::new(tokio::spawn(async move {
@@ -9704,7 +9862,7 @@ mod external_guardrail_context_tests {
                 .await
                 .expect("connect downstream fixture");
             let request = format!(
-                "POST {path} HTTP/1.1\r\nHost: ai.test\r\ncontent-type: {content_type}\r\nIdempotency-Key: guardrail-test\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                "{method} {path} HTTP/1.1\r\nHost: ai.test\r\ncontent-type: {content_type}\r\nIdempotency-Key: guardrail-test\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()
             );
             stream
@@ -9801,6 +9959,14 @@ mod external_guardrail_context_tests {
         body: Vec<u8>,
         content_type: Option<&'static str>,
     ) -> (String, Arc<AtomicUsize>) {
+        upstream_bytes_fixture_with_status(body, content_type, 200).await
+    }
+
+    async fn upstream_bytes_fixture_with_status(
+        body: Vec<u8>,
+        content_type: Option<&'static str>,
+        status: u16,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind upstream fixture");
@@ -9819,7 +9985,7 @@ mod external_guardrail_context_tests {
                 .map(|content_type| format!("content-type: {content_type}\r\n"))
                 .unwrap_or_default();
             let response = format!(
-                "HTTP/1.1 200 OK\r\n{content_type_header}content-length: {}\r\nconnection: close\r\n\r\n",
+                "HTTP/1.1 {status} Fixture\r\n{content_type_header}content-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()
             );
             stream
@@ -9832,6 +9998,89 @@ mod external_guardrail_context_tests {
                 .expect("write upstream response body");
         });
         (format!("http://{address}/v1"), hits)
+    }
+
+    fn gemini_proxy_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "gemini-fixture",
+                "provider_type": "gemini",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "model_map": {"requested-model": "gemini-2.5-flash"}
+            }]
+        }))
+        .expect("Gemini proxy config")
+    }
+
+    fn openai_proxy_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }]
+        }))
+        .expect("OpenAI proxy config")
+    }
+
+    fn cascade_error_proxy_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [{
+                    "provider_id": "openai",
+                    "model": "selected-model",
+                    "quality_threshold": 0.5
+                }]
+            }
+        }))
+        .expect("cascade error proxy config")
+    }
+
+    fn content_policy_fallback_proxy_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "resilience": {
+                "content_policy_fallback": true
+            }
+        }))
+        .expect("content-policy fallback proxy config")
+    }
+
+    fn response_json(response: &[u8]) -> serde_json::Value {
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("HTTP response header terminator");
+        serde_json::from_slice(&response[header_end + 4..]).expect("JSON response body")
+    }
+
+    fn provider_error_body() -> serde_json::Value {
+        serde_json::json!({
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": "provider-private-sentinel content policy violation",
+                "details": [{"reason": "API_KEY_INVALID"}]
+            }
+        })
     }
 
     fn multipart_audio_request() -> (&'static str, Vec<u8>) {
@@ -9926,6 +10175,235 @@ mod external_guardrail_context_tests {
                 "phase": "output"
             })
         );
+    }
+
+    #[tokio::test]
+    async fn gemini_error_to_anthropic_path_preserves_error_envelope() {
+        let upstream_error = serde_json::json!({
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "details": [{"reason": "API_KEY_INVALID"}]
+            }
+        });
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_status(
+            serde_json::to_vec(&upstream_error).expect("upstream JSON"),
+            Some("application/json"),
+            400,
+        )
+        .await;
+        let config = gemini_proxy_config(&upstream_url);
+        let request = serde_json::json!({
+            "model": "requested-model",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/messages",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("Gemini provider error is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        assert_eq!(response_json(&response), upstream_error);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn gemini_error_to_responses_path_preserves_error_envelope() {
+        let upstream_error = serde_json::json!({
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "details": [{"reason": "API_KEY_INVALID"}]
+            }
+        });
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_status(
+            serde_json::to_vec(&upstream_error).expect("upstream JSON"),
+            Some("application/json"),
+            400,
+        )
+        .await;
+        let config = gemini_proxy_config(&upstream_url);
+        let request = serde_json::json!({
+            "model": "requested-model",
+            "input": "fixture prompt"
+        });
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/responses",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("Gemini provider error is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        assert_eq!(response_json(&response), upstream_error);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffered_get_error_logs_one_body_aware_diagnostic() {
+        let upstream_error = provider_error_body();
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_status(
+            serde_json::to_vec(&upstream_error).expect("upstream JSON"),
+            Some("application/json"),
+            400,
+        )
+        .await;
+        let config = openai_proxy_config(&upstream_url);
+        let (mut session, client) =
+            downstream_method_bytes_session("GET", "/v1/files/file-1", "application/json", vec![])
+                .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let warnings = handle_with_captured_warnings(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            &mut context,
+            None,
+        )
+        .await;
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        assert_eq!(response_json(&response), upstream_error);
+        assert_single_body_aware_provider_diagnostic(&warnings, "openai", 400);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffered_method_idempotency_error_logs_one_body_aware_diagnostic() {
+        let upstream_error = provider_error_body();
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_status(
+            serde_json::to_vec(&upstream_error).expect("upstream JSON"),
+            Some("application/json"),
+            400,
+        )
+        .await;
+        let config = openai_proxy_config(&upstream_url);
+        let (mut session, client) = downstream_method_bytes_session(
+            "PUT",
+            "/v1/files/file-1",
+            "application/json",
+            br#"{"value":1}"#.to_vec(),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let warnings = handle_with_captured_warnings(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            &mut context,
+            None,
+        )
+        .await;
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        assert_eq!(response_json(&response), upstream_error);
+        assert_single_body_aware_provider_diagnostic(&warnings, "openai", 400);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffered_cascade_error_logs_one_body_aware_diagnostic() {
+        let upstream_error = provider_error_body();
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_status(
+            serde_json::to_vec(&upstream_error).expect("upstream JSON"),
+            Some("application/json"),
+            400,
+        )
+        .await;
+        let config = cascade_error_proxy_config(&upstream_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let warnings = handle_with_captured_warnings(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            &mut context,
+            None,
+        )
+        .await;
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        assert_eq!(response_json(&response), upstream_error);
+        assert_single_body_aware_provider_diagnostic(&warnings, "openai", 400);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffered_content_policy_fallback_error_logs_one_body_aware_diagnostic() {
+        let upstream_error = provider_error_body();
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_status(
+            serde_json::to_vec(&upstream_error).expect("upstream JSON"),
+            Some("application/json"),
+            400,
+        )
+        .await;
+        let config = content_policy_fallback_proxy_config(&upstream_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let warnings = handle_with_captured_warnings(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            &mut context,
+            None,
+        )
+        .await;
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        assert_eq!(response_json(&response), upstream_error);
+        assert_single_body_aware_provider_diagnostic(&warnings, "openai", 400);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -11236,17 +11714,31 @@ mod ai_error_classification_tests {
     }
 
     #[test]
-    fn provider_error_metadata_rejects_credential_shaped_labels() {
-        for secret in [
+    fn provider_error_metadata_rejects_unmapped_provider_values() {
+        let arbitrary_lowercase =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_eq!(arbitrary_lowercase.len(), 64);
+        for provider_controlled_value in [
             "AIzaSyA123456789012345678901234567890123",
             "sk-abcdefghijklmnopqrstu1234567890",
+            arbitrary_lowercase,
+            "550e8400-e29b-41d4-a716-446655440000",
+            "tenant_123456789",
+            "UNKNOWN_PROVIDER_ENUM_VALUE",
         ] {
             assert_eq!(
-                safe_provider_error_label(&serde_json::Value::String(secret.to_string())),
+                safe_provider_error_label(&serde_json::Value::String(
+                    provider_controlled_value.to_string()
+                )),
                 None,
-                "{secret}"
+                "{provider_controlled_value}"
             );
         }
+        assert_eq!(
+            safe_provider_error_label(&serde_json::json!(123456789)),
+            None,
+            "arbitrary numeric identifiers must not become labels"
+        );
     }
 
     #[test]

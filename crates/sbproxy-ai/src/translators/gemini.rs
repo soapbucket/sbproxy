@@ -276,6 +276,16 @@ fn message_to_content(m: &Value) -> Value {
 ///     `completion_tokens`.
 ///   * `modelVersion` (when present) -> OpenAI `model`.
 pub fn response_to_openai(body: Value) -> Value {
+    // WOR-2054: Gemini failures use a top-level `error` envelope. Check
+    // this before shape-based embedding dispatch because an upstream can
+    // include partial result fields alongside the error.
+    if body
+        .as_object()
+        .is_some_and(|object| object.contains_key("error"))
+    {
+        return body;
+    }
+
     // WOR-824 item 2: shape-based dispatch. A Gemini embeddings
     // response carries `embedding` or `embeddings` at the top
     // level (no `candidates`); send it to the embeddings sub-
@@ -290,14 +300,6 @@ pub fn response_to_openai(body: Value) -> Value {
         Value::Object(m) => m,
         other => return other,
     };
-
-    // WOR-2054: Gemini failures use a top-level `error` envelope rather
-    // than a generation shape. Preserve it for the status-aware dispatch
-    // path instead of fabricating an empty successful completion from
-    // missing candidates.
-    if m.contains_key("error") {
-        return Value::Object(m);
-    }
 
     let model = m
         .get("modelVersion")
@@ -615,6 +617,20 @@ mod tests {
                 "status": "INVALID_ARGUMENT",
                 "details": [{"reason": "API_KEY_INVALID"}]
             }
+        });
+
+        assert_eq!(response_to_openai(body.clone()), body);
+    }
+
+    #[test]
+    fn response_error_envelope_takes_precedence_over_embedding_shape() {
+        let body = json!({
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "details": [{"reason": "API_KEY_INVALID"}]
+            },
+            "embedding": {"values": [0.1, 0.2]}
         });
 
         assert_eq!(response_to_openai(body.clone()), body);

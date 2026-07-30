@@ -2488,6 +2488,8 @@ pub(super) async fn relay_ai_response_with_idempotency(
     // the body to the client AND before recording it into the
     // idempotency cache.
     reversible_pairs: Vec<(String, String, String)>,
+    ai_span: &tracing::Span,
+    provider_name: &str,
 ) -> Result<()> {
     let status = resp.status().as_u16();
     let content_type = resp
@@ -2503,7 +2505,17 @@ pub(super) async fn relay_ai_response_with_idempotency(
         .map(str::to_string);
     let resp_body = read_capped_response_body(resp, max_body_size).await?;
     let translated = sbproxy_ai::translators::translate_response_bytes(format, &resp_body);
-    let translated = sbproxy_ai::format::rewrap_response_for_inbound(inbound_format, &translated);
+    crate::server::ai_dispatch::record_ai_provider_response_failure(
+        ai_span,
+        provider_name,
+        status,
+        Some(&translated),
+    );
+    let translated = sbproxy_ai::format::rewrap_success_response_for_inbound(
+        status,
+        inbound_format,
+        &translated,
+    );
 
     // WOR-1044 PR3: restore reversible PII placeholders before both
     // the cache write and the response send. See
