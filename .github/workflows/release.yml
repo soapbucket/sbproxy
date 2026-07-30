@@ -507,6 +507,10 @@ jobs:
           mkdir -p "$(dirname "${SERVICE_ENV}")"
           printf 'SBPROXY_ENGINE_OWNERSHIP_DIR=%s\n' "${OWNERSHIP_DIR}" > "${SERVICE_ENV}"
           chmod 600 "${SERVICE_ENV}"
+          # From this point on, neither the launchd service nor the uninstall
+          # command may inherit the direct-run override from this shell. The
+          # service env file is the only source of the ownership directory.
+          unset SBPROXY_ENGINE_OWNERSHIP_DIR
           SERVICE_ATTEMPTED=1
           ./target/release/sbproxy service install "${MODEL}" \
             --variant q4_k_m \

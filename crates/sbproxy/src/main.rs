@@ -3156,6 +3156,7 @@ struct ServicePaths {
     stdout_log: PathBuf,
     stderr_log: PathBuf,
     env_file: PathBuf,
+    uninstall_state: PathBuf,
 }
 
 fn service_paths() -> anyhow::Result<ServicePaths> {
@@ -3171,6 +3172,7 @@ fn service_paths() -> anyhow::Result<ServicePaths> {
         stdout_log: home.join("Library/Logs/sbproxy/service.log"),
         stderr_log: home.join("Library/Logs/sbproxy/service.err.log"),
         env_file: service_dir.join("env"),
+        uninstall_state: service_dir.join("uninstall-state.json"),
     })
 }
 
@@ -3192,6 +3194,7 @@ const SERVICE_ENV_TEMPLATE: &str = "\
 #
 # HF_TOKEN=hf_...        # required to pull a gated model
 # RUST_LOG=info          # raise or lower the agent's log level
+# SBPROXY_ENGINE_OWNERSHIP_DIR=/absolute/path
 ";
 
 /// Create the environment file if it is absent, leaving an existing one
@@ -3216,6 +3219,286 @@ fn ensure_service_env_file(path: &std::path::Path) -> anyhow::Result<()> {
     file.write_all(SERVICE_ENV_TEMPLATE.as_bytes())
         .map_err(|error| anyhow::anyhow!("write '{}': {error}", path.display()))?;
     Ok(())
+}
+
+const SERVICE_UNINSTALL_STATE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ServiceUninstallState {
+    schema_version: u32,
+    ownership_directory: PathBuf,
+    owners: Vec<sbproxy_model_host::ManagedEngineOwner>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchdJobStatus {
+    NotLoaded,
+    Loaded { pid: Option<u32> },
+}
+
+trait LaunchdController {
+    fn status(&mut self) -> anyhow::Result<LaunchdJobStatus>;
+    fn unload(&mut self, plist: &std::path::Path) -> anyhow::Result<()>;
+}
+
+struct SystemLaunchdController;
+
+impl LaunchdController for SystemLaunchdController {
+    fn status(&mut self) -> anyhow::Result<LaunchdJobStatus> {
+        let output = std::process::Command::new("launchctl")
+            .arg("list")
+            .arg(SERVICE_LABEL)
+            .output()
+            .map_err(|error| anyhow::anyhow!("launchctl list: {error}"))?;
+        if !output.status.success() {
+            return Ok(LaunchdJobStatus::NotLoaded);
+        }
+        Ok(LaunchdJobStatus::Loaded {
+            pid: parse_launchctl_list_pid(&String::from_utf8_lossy(&output.stdout)),
+        })
+    }
+
+    fn unload(&mut self, plist: &std::path::Path) -> anyhow::Result<()> {
+        let output = std::process::Command::new("launchctl")
+            .arg("unload")
+            .arg(plist)
+            .output()
+            .map_err(|error| anyhow::anyhow!("launchctl unload: {error}"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "launchctl unload '{}' failed: {}",
+                plist.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+}
+
+trait ServiceEngineCleanup {
+    fn capture_owner(&mut self, pid: u32)
+        -> anyhow::Result<sbproxy_model_host::ManagedEngineOwner>;
+    fn reap_owner(
+        &mut self,
+        directory: &std::path::Path,
+        owner: &sbproxy_model_host::ManagedEngineOwner,
+    ) -> anyhow::Result<usize>;
+}
+
+struct SystemServiceEngineCleanup;
+
+impl ServiceEngineCleanup for SystemServiceEngineCleanup {
+    fn capture_owner(
+        &mut self,
+        pid: u32,
+    ) -> anyhow::Result<sbproxy_model_host::ManagedEngineOwner> {
+        sbproxy_model_host::capture_managed_engine_owner(pid).ok_or_else(|| {
+            anyhow::anyhow!(
+                "capture exact launchd owner pid {pid}: process identity is no longer available"
+            )
+        })
+    }
+
+    fn reap_owner(
+        &mut self,
+        directory: &std::path::Path,
+        owner: &sbproxy_model_host::ManagedEngineOwner,
+    ) -> anyhow::Result<usize> {
+        sbproxy_model_host::reap_managed_engines_owned_by_identity_at(
+            directory,
+            owner,
+            std::time::Duration::from_secs(u64::from(SERVICE_EXIT_TIMEOUT_SECS)),
+            std::time::Duration::from_secs(5),
+        )
+        .map_err(|error| anyhow::anyhow!("reap managed engines after service unload: {error}"))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ServiceUninstallOutcome {
+    removed: bool,
+    engines_reaped: usize,
+}
+
+fn service_engine_ownership_directory(paths: &ServicePaths) -> anyhow::Result<PathBuf> {
+    if paths.env_file.exists() {
+        let contents = std::fs::read_to_string(&paths.env_file)
+            .map_err(|error| anyhow::anyhow!("read '{}': {error}", paths.env_file.display()))?;
+        for line in contents.lines() {
+            let assignment = line.trim();
+            if assignment.is_empty() || assignment.starts_with('#') {
+                continue;
+            }
+            let assignment = assignment.strip_prefix("export ").unwrap_or(assignment);
+            let Some((key, value)) = assignment.split_once('=') else {
+                continue;
+            };
+            if key.trim() != "SBPROXY_ENGINE_OWNERSHIP_DIR" {
+                continue;
+            }
+            let mut value = value.trim();
+            if value.len() >= 2
+                && ((value.starts_with('"') && value.ends_with('"'))
+                    || (value.starts_with('\'') && value.ends_with('\'')))
+            {
+                value = &value[1..value.len() - 1];
+            }
+            if value.is_empty() {
+                anyhow::bail!(
+                    "SBPROXY_ENGINE_OWNERSHIP_DIR in '{}' is empty",
+                    paths.env_file.display()
+                );
+            }
+            let directory = PathBuf::from(value);
+            if !directory.is_absolute() {
+                anyhow::bail!(
+                    "SBPROXY_ENGINE_OWNERSHIP_DIR in '{}' must be absolute",
+                    paths.env_file.display()
+                );
+            }
+            return Ok(directory);
+        }
+    }
+    paths
+        .config
+        .parent()
+        .and_then(std::path::Path::parent)
+        .map(|application_dir| application_dir.join("managed-engines"))
+        .ok_or_else(|| anyhow::anyhow!("resolve default managed-engine ownership directory"))
+}
+
+fn read_service_uninstall_state(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<ServiceUninstallState>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::anyhow!("read '{}': {error}", path.display()));
+        }
+    };
+    let state: ServiceUninstallState = serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("parse '{}': {error}", path.display()))?;
+    if state.schema_version != SERVICE_UNINSTALL_STATE_SCHEMA_VERSION
+        || !state.ownership_directory.is_absolute()
+    {
+        anyhow::bail!("validate '{}': unsupported or unsafe state", path.display());
+    }
+    Ok(Some(state))
+}
+
+fn persist_service_uninstall_state(
+    path: &std::path::Path,
+    state: &ServiceUninstallState,
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("'{}' has no parent", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| anyhow::anyhow!("create '{}': {error}", parent.display()))?;
+    let temporary = parent.join(format!(
+        ".uninstall-state-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let bytes = serde_json::to_vec_pretty(state)
+        .map_err(|error| anyhow::anyhow!("encode uninstall state: {error}"))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| anyhow::anyhow!("create '{}': {error}", temporary.display()))?;
+    let result = (|| -> std::io::Result<()> {
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(anyhow::anyhow!("persist '{}': {error}", path.display()));
+    }
+    Ok(())
+}
+
+fn remove_service_file(path: &std::path::Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|error| anyhow::anyhow!("sync '{}': {error}", parent.display()))?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow::anyhow!("remove '{}': {error}", path.display())),
+    }
+}
+
+fn perform_service_uninstall(
+    paths: &ServicePaths,
+    launchd: &mut dyn LaunchdController,
+    cleanup: &mut dyn ServiceEngineCleanup,
+) -> anyhow::Result<ServiceUninstallOutcome> {
+    let removed = paths.plist.exists();
+    let mut state = read_service_uninstall_state(&paths.uninstall_state)?;
+    let status = launchd.status()?;
+
+    if state.is_none() && status == LaunchdJobStatus::NotLoaded {
+        remove_service_file(&paths.plist)?;
+        return Ok(ServiceUninstallOutcome {
+            removed,
+            engines_reaped: 0,
+        });
+    }
+
+    if state.is_none() {
+        state = Some(ServiceUninstallState {
+            schema_version: SERVICE_UNINSTALL_STATE_SCHEMA_VERSION,
+            ownership_directory: service_engine_ownership_directory(paths)?,
+            owners: Vec::new(),
+        });
+    }
+    let state = state.as_mut().expect("uninstall state initialized");
+    if let LaunchdJobStatus::Loaded { pid: Some(pid) } = status {
+        let owner = cleanup.capture_owner(pid)?;
+        if !state.owners.contains(&owner) {
+            state.owners.push(owner);
+        }
+    }
+    persist_service_uninstall_state(&paths.uninstall_state, state)?;
+
+    if matches!(status, LaunchdJobStatus::Loaded { .. }) {
+        if let Err(unload_error) = launchd.unload(&paths.plist) {
+            if launchd.status()? != LaunchdJobStatus::NotLoaded {
+                return Err(unload_error);
+            }
+        }
+    }
+
+    let mut engines_reaped = 0;
+    for owner in &state.owners {
+        engines_reaped += cleanup.reap_owner(&state.ownership_directory, owner)?;
+    }
+    // The plist remains the retry handle until every exact owner has exited
+    // and every one of its durable engine records has been resolved.
+    remove_service_file(&paths.plist)?;
+    remove_service_file(&paths.uninstall_state)?;
+    Ok(ServiceUninstallOutcome {
+        removed,
+        engines_reaped,
+    })
 }
 
 /// Escape the five XML predefined entities. Every value interpolated
@@ -3437,55 +3720,23 @@ fn handle_service_uninstall(args: &ServiceUninstallArgs) -> anyhow::Result<i32> 
     }
 
     let paths = service_paths()?;
-    let existed = paths.plist.exists();
-    let service_pid = existed
-        .then(|| {
-            std::process::Command::new("launchctl")
-                .arg("list")
-                .arg(SERVICE_LABEL)
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .and_then(|output| {
-                    parse_launchctl_list_pid(&String::from_utf8_lossy(&output.stdout))
-                })
-        })
-        .flatten();
-    if existed {
-        let output = std::process::Command::new("launchctl")
-            .arg("unload")
-            .arg(&paths.plist)
-            .output()
-            .map_err(|error| anyhow::anyhow!("launchctl unload: {error}"))?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "launchctl unload '{}' failed: {}",
-                paths.plist.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        std::fs::remove_file(&paths.plist)
-            .map_err(|error| anyhow::anyhow!("remove '{}': {error}", paths.plist.display()))?;
-    }
-    let engines_reaped = match service_pid {
-        Some(owner_pid) => sbproxy_model_host::reap_managed_engines_owned_by(
-            owner_pid,
-            std::time::Duration::from_secs(u64::from(SERVICE_EXIT_TIMEOUT_SECS)),
-            std::time::Duration::from_secs(5),
-        ),
-        None => sbproxy_model_host::reap_stale_managed_engines(std::time::Duration::from_secs(5)),
-    }
-    .map_err(|error| anyhow::anyhow!("reap managed engines after service unload: {error}"))?;
+    let outcome = perform_service_uninstall(
+        &paths,
+        &mut SystemLaunchdController,
+        &mut SystemServiceEngineCleanup,
+    )?;
 
     match args.format {
         OutputFormat::Text => {
-            if existed {
+            if outcome.removed {
                 println!(
-                    "Uninstalled launchd agent '{SERVICE_LABEL}' (reaped {engines_reaped} managed engine(s))."
+                    "Uninstalled launchd agent '{SERVICE_LABEL}' (reaped {} managed engine(s)).",
+                    outcome.engines_reaped
                 );
             } else {
                 println!(
-                    "No launchd agent '{SERVICE_LABEL}' was installed (reaped {engines_reaped} stale managed engine(s))."
+                    "No launchd agent '{SERVICE_LABEL}' was installed (reaped {} managed engine(s) from a prior retry, if any).",
+                    outcome.engines_reaped
                 );
             }
         }
@@ -3495,8 +3746,8 @@ fn handle_service_uninstall(args: &ServiceUninstallArgs) -> anyhow::Result<i32> 
                 "service.uninstall",
                 serde_json::json!({
                     "label": SERVICE_LABEL,
-                    "removed": existed,
-                    "engines_reaped": engines_reaped,
+                    "removed": outcome.removed,
+                    "engines_reaped": outcome.engines_reaped,
                 }),
             ))?
         ),
@@ -8935,6 +9186,9 @@ mod tests {
             env_file: PathBuf::from(format!(
                 "{home}/Library/Application Support/sbproxy/service/env"
             )),
+            uninstall_state: PathBuf::from(format!(
+                "{home}/Library/Application Support/sbproxy/service/uninstall-state.json"
+            )),
         }
     }
 
@@ -9082,6 +9336,240 @@ mod tests {
         let loaded_not_running =
             "{\n\t\"Label\" = \"dev.sbproxy.agent\";\n\t\"LastExitStatus\" = 0;\n};\n";
         assert_eq!(parse_launchctl_list_pid(loaded_not_running), None);
+    }
+
+    fn service_temp_paths(tag: &str) -> ServicePaths {
+        let root = temp_env_path(tag);
+        let service = root.join("service");
+        std::fs::create_dir_all(&service).unwrap();
+        ServicePaths {
+            config: service.join("sb.yml"),
+            plist: root.join("dev.sbproxy.agent.plist"),
+            stdout_log: root.join("service.log"),
+            stderr_log: root.join("service.err.log"),
+            env_file: service.join("env"),
+            uninstall_state: service.join("uninstall-state.json"),
+        }
+    }
+
+    struct FakeLaunchd {
+        statuses: std::collections::VecDeque<LaunchdJobStatus>,
+        unload_fails: bool,
+        unload_calls: usize,
+    }
+
+    impl LaunchdController for FakeLaunchd {
+        fn status(&mut self) -> anyhow::Result<LaunchdJobStatus> {
+            self.statuses
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("unexpected fake launchd status call"))
+        }
+
+        fn unload(&mut self, _plist: &std::path::Path) -> anyhow::Result<()> {
+            self.unload_calls += 1;
+            if self.unload_fails {
+                anyhow::bail!("injected launchctl unload failure");
+            }
+            Ok(())
+        }
+    }
+
+    struct FakeServiceEngineCleanup {
+        owner: sbproxy_model_host::ManagedEngineOwner,
+        fail_reap: bool,
+        capture_calls: usize,
+        reaped_directories: Vec<PathBuf>,
+    }
+
+    impl ServiceEngineCleanup for FakeServiceEngineCleanup {
+        fn capture_owner(
+            &mut self,
+            _pid: u32,
+        ) -> anyhow::Result<sbproxy_model_host::ManagedEngineOwner> {
+            self.capture_calls += 1;
+            Ok(self.owner.clone())
+        }
+
+        fn reap_owner(
+            &mut self,
+            directory: &std::path::Path,
+            owner: &sbproxy_model_host::ManagedEngineOwner,
+        ) -> anyhow::Result<usize> {
+            assert_eq!(owner, &self.owner);
+            self.reaped_directories.push(directory.to_path_buf());
+            if self.fail_reap {
+                anyhow::bail!("injected exact-owner reap failure");
+            }
+            Ok(1)
+        }
+    }
+
+    fn fake_service_cleanup(fail_reap: bool) -> FakeServiceEngineCleanup {
+        FakeServiceEngineCleanup {
+            owner: sbproxy_model_host::capture_managed_engine_owner(std::process::id())
+                .expect("capture test process identity"),
+            fail_reap,
+            capture_calls: 0,
+            reaped_directories: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn service_uninstall_uses_the_service_env_ownership_directory() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let paths = service_temp_paths("ownership-env");
+        let service_directory = paths.env_file.parent().unwrap().join("from-service-env");
+        std::fs::write(
+            &paths.env_file,
+            format!(
+                "SBPROXY_ENGINE_OWNERSHIP_DIR={}\n",
+                service_directory.display()
+            ),
+        )
+        .unwrap();
+        std::env::set_var(
+            "SBPROXY_ENGINE_OWNERSHIP_DIR",
+            paths.env_file.parent().unwrap().join("from-caller-shell"),
+        );
+
+        let selected = service_engine_ownership_directory(&paths).unwrap();
+
+        std::env::remove_var("SBPROXY_ENGINE_OWNERSHIP_DIR");
+        assert_eq!(selected, service_directory);
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_accepts_an_already_unloaded_job_without_calling_unload() {
+        let paths = service_temp_paths("already-unloaded");
+        std::fs::write(&paths.plist, "plist").unwrap();
+        let mut launchd = FakeLaunchd {
+            statuses: [LaunchdJobStatus::NotLoaded].into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+
+        let outcome = perform_service_uninstall(&paths, &mut launchd, &mut cleanup).unwrap();
+
+        assert!(outcome.removed);
+        assert_eq!(outcome.engines_reaped, 0);
+        assert_eq!(launchd.unload_calls, 0);
+        assert_eq!(cleanup.capture_calls, 0);
+        assert!(!paths.plist.exists());
+        assert!(!paths.uninstall_state.exists());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_retains_exact_retry_state_and_plist_until_reap_succeeds() {
+        let paths = service_temp_paths("transaction");
+        std::fs::write(&paths.plist, "plist").unwrap();
+        let ownership_directory = paths
+            .env_file
+            .parent()
+            .unwrap()
+            .join("service-only-ownership");
+        std::fs::write(
+            &paths.env_file,
+            format!(
+                "SBPROXY_ENGINE_OWNERSHIP_DIR={}\n",
+                ownership_directory.display()
+            ),
+        )
+        .unwrap();
+        let mut first_launchd = FakeLaunchd {
+            statuses: [LaunchdJobStatus::Loaded {
+                pid: Some(std::process::id()),
+            }]
+            .into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut failing_cleanup = fake_service_cleanup(true);
+
+        let error = perform_service_uninstall(&paths, &mut first_launchd, &mut failing_cleanup)
+            .expect_err("reap failure must leave a retry transaction");
+
+        assert!(error.to_string().contains("exact-owner reap failure"));
+        assert!(paths.plist.exists(), "plist is the durable retry handle");
+        assert!(paths.uninstall_state.exists());
+        let state = read_service_uninstall_state(&paths.uninstall_state)
+            .unwrap()
+            .expect("retry state");
+        assert_eq!(state.ownership_directory, ownership_directory);
+        assert_eq!(state.owners, vec![failing_cleanup.owner.clone()]);
+
+        let mut retry_launchd = FakeLaunchd {
+            statuses: [LaunchdJobStatus::NotLoaded].into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut succeeding_cleanup = fake_service_cleanup(false);
+        let outcome =
+            perform_service_uninstall(&paths, &mut retry_launchd, &mut succeeding_cleanup)
+                .expect("retry exact persisted owner");
+
+        assert_eq!(outcome.engines_reaped, 1);
+        assert_eq!(succeeding_cleanup.capture_calls, 0);
+        assert_eq!(
+            succeeding_cleanup.reaped_directories,
+            vec![ownership_directory]
+        );
+        assert!(!paths.plist.exists());
+        assert!(!paths.uninstall_state.exists());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_accepts_unload_failure_when_launchd_reports_not_loaded() {
+        let paths = service_temp_paths("unload-race");
+        std::fs::write(&paths.plist, "plist").unwrap();
+        let mut launchd = FakeLaunchd {
+            statuses: [
+                LaunchdJobStatus::Loaded {
+                    pid: Some(std::process::id()),
+                },
+                LaunchdJobStatus::NotLoaded,
+            ]
+            .into(),
+            unload_fails: true,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+
+        let outcome = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect("a concurrently unloaded job already reached the requested state");
+
+        assert_eq!(outcome.engines_reaped, 1);
+        assert_eq!(launchd.unload_calls, 1);
+        assert!(!paths.plist.exists());
+        assert!(!paths.uninstall_state.exists());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_keeps_transaction_when_unload_fails_and_job_is_still_loaded() {
+        let paths = service_temp_paths("unload-failure");
+        std::fs::write(&paths.plist, "plist").unwrap();
+        let running = LaunchdJobStatus::Loaded {
+            pid: Some(std::process::id()),
+        };
+        let mut launchd = FakeLaunchd {
+            statuses: [running, running].into(),
+            unload_fails: true,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+
+        let error = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect_err("a still-loaded job must preserve its transaction");
+
+        assert!(error.to_string().contains("unload failure"));
+        assert!(paths.plist.exists());
+        assert!(paths.uninstall_state.exists());
+        assert!(cleanup.reaped_directories.is_empty());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
     }
 
     #[test]

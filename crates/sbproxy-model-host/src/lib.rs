@@ -193,9 +193,10 @@ pub use probe_metal::MetalGpuProbe;
 #[cfg(feature = "gpu-nvidia")]
 pub use probe_nvidia::NvmlGpuProbe;
 pub use process::{
-    reap_managed_engines_owned_by, reap_stale_managed_engines, CommandExecutor, CommandOutput,
-    EngineCommand, EngineProcess, EngineProcessRunner, EngineReadinessProbe,
-    LoopbackReadinessProbe, TokioCommandExecutor,
+    capture_managed_engine_owner, reap_managed_engines_owned_by,
+    reap_managed_engines_owned_by_identity_at, reap_stale_managed_engines, CommandExecutor,
+    CommandOutput, EngineCommand, EngineProcess, EngineProcessRunner, EngineReadinessProbe,
+    LoopbackReadinessProbe, ManagedEngineOwner, TokioCommandExecutor,
 };
 pub use pull::{pull_plan, PullItem, PullMode};
 pub use report::{ModelCompressionValue, ModelValue, ValueReport};

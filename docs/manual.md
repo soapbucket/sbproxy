@@ -568,7 +568,7 @@ sbproxy service status
 sbproxy service uninstall
 ```
 
-`install` writes three things under `$HOME`:
+`install` writes four things under `$HOME`:
 
 - The config: `~/Library/Application Support/sbproxy/service/sb.yml`.
   Unlike `run`'s private temporary config, this one is not removed on
@@ -590,7 +590,9 @@ sbproxy service uninstall
   and a gated model fails to pull with no obvious cause. Put it here
   instead, one `KEY=value` per line. The file is created once with a
   commented template and never rewritten, so a token set here survives
-  reinstalling to change the model or the port.
+  reinstalling to change the model or the port. If you set
+  `SBPROXY_ENGINE_OWNERSHIP_DIR`, use an absolute path. Both the service and
+  `service uninstall` read that value from this file.
 
 The agent's program is `/bin/sh -c '... exec sbproxy serve <config>'`
 rather than the binary directly, which is how the environment file gets
@@ -604,19 +606,28 @@ Managed engine ownership is durable across gateway death. Each engine record
 contains the owner and engine PID plus their process-start fingerprints;
 the record reaches durable storage before the engine can execute.
 `service uninstall` waits for the exact launchd-owned gateway to exit, then
-reaps its recorded process group. A reused PID or another live sbproxy owner
-is never signalled, and no process-name sweep is used.
+reaps only that gateway's recorded process groups. It reads
+`SBPROXY_ENGINE_OWNERSHIP_DIR` from the service environment file, not from the
+shell running the uninstall command. Before unload, it saves the gateway's PID
+and process-start fingerprint in
+`~/Library/Application Support/sbproxy/service/uninstall-state.json`. The plist
+and retry record stay in place until exact-owner cleanup succeeds.
+
+The reaper signals a process group only while the recorded engine PID still has
+the recorded start fingerprint. If the PID changed and the group is empty, the
+obsolete record can be removed. If the group is still occupied but the exact
+leader cannot be proved, cleanup fails closed and keeps the record for an
+operator to inspect. It never uses a process-name sweep.
 
 `--dry-run` (inherited from `run`'s flags) prints the plist and the
 generated config without installing or loading anything. `service
 status` asks `launchctl list` whether the agent is registered and
 running, and exits 0 when it is running, 1 otherwise (registered-but-
 stopped and never-installed alike), so it composes with
-`sbproxy service status || <restart it>` in a script. `service
-uninstall` unloads the agent, verifies/reaps its managed engines, and removes
-its plist; it is idempotent, reporting nothing removed rather than failing
-when no agent was installed. All three subcommands refuse to run on a
-non-macOS host, since `launchd` is macOS-only; use `run` or `serve` elsewhere.
+`sbproxy service status || <restart it>` in a script. `service uninstall`
+accepts an agent that is already unloaded and resumes an interrupted cleanup
+from its retry record. All three subcommands refuse to run on a non-macOS host,
+since `launchd` is macOS-only; use `run` or `serve` elsewhere.
 
 ### `models` - artifact and runtime lifecycle
 

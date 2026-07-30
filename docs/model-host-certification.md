@@ -101,14 +101,18 @@ The four failures from the 2026-07-30 run now have explicit contracts:
 - SIGTERM returns through the gateway shutdown guards, verifies the managed
   engine exited, removes its durable ownership record, and releases the public
   listener.
-- `service uninstall` waits for the exact launchd owner identity to exit and
-  then reaps its recorded process groups.
+- `service uninstall` saves the exact launchd owner identity before unload,
+  reads its ownership directory from the service environment file, and keeps
+  the plist plus retry state until that owner's engine cleanup succeeds.
 - A managed child blocks before `exec` until its owner and engine
-  fingerprints are on durable storage. Persistence or exec failure reaps the
-  child before returning an error. After SIGKILL, the next boot reaps that
-  exact stale process group before binding listeners or spawning a
-  replacement. A live owner or reused PID is preserved. Linux's parent-death
-  signal remains the first line of defense.
+  fingerprints are on durable storage. Persistence failure stops the child
+  before it can execute. An `exec` failure is reported through the normal
+  bounded early-exit diagnostics and clears the durable record. After SIGKILL,
+  the next boot reaps an exact stale process group before binding listeners or
+  spawning a replacement. A live owner is preserved. A reused engine PID is
+  never signalled; when its process group is still occupied, the record stays
+  in place because ownership cannot be proved. Linux's parent-death signal
+  remains the first line of defense.
 
 Focused real-process tests cover collision failure, SIGTERM plus same-port
 rebind, blocked startup until durable ownership, persistence and exec failure,
