@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import DocumentationLink from "./DocumentationLink.vue";
+
 defineProps<{ title: string; subtitle?: string }>();
 </script>
 
@@ -10,6 +12,7 @@ defineProps<{ title: string; subtitle?: string }>();
     </div>
     <div class="ph__actions">
       <slot name="actions" />
+      <DocumentationLink />
     </div>
   </header>
 </template>
