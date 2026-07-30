@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-07-29*
+*Last modified: 2026-07-30*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -1242,8 +1242,13 @@ directly to the client with `x-sbproxy-idempotency: HIT` and
 never contacts the provider, so Stripe-style retries do not
 double-bill the upstream. On a body conflict the gateway returns
 409 `ledger.idempotency_conflict`. On a miss the gateway forwards
-and records the post-translation OpenAI-shape bytes the client
-saw so retries replay byte-identical.
+and records the final client-wire bytes after native-format wrapping
+and reversible PII restoration. Retries replay those bytes without
+running the format adapter again. Semantic-cache entries remain in
+the canonical hub shape. For native client formats, the conflict hash
+uses the original client request bytes. Changing a vendor-only field
+therefore produces a conflict instead of replaying a response for a
+different request.
 
 Per-origin caps (`max_request_body_bytes`,
 `max_response_body_bytes`, `max_concurrent_buffers`) bound memory
@@ -1256,8 +1261,9 @@ Configuration is identical to general HTTP origins: see the
 `idempotency:` block reference under
 [`configuration.md`](configuration.md). v1 limitations: multipart
 request bodies (audio transcription, image edit / variation, file
-upload) are not cached, and SSE streaming responses abandon the
-cache record above the response cap.
+upload) are not cached, and successful SSE event streams are not
+recorded. A `stream: true` request that receives buffered JSON still
+uses the normal idempotency path.
 
 ## Per-provider limits
 
@@ -1358,11 +1364,13 @@ In the library code, resolution returns `None` for unknown names so a caller can
 
 Every inbound request to an `action: ai_proxy` origin is classified into an `AiSurface` by `classify_surface(method, path)` in `crates/sbproxy-ai/src/handler.rs`. The classifier accepts canonical OpenAI paths with optional `/v1` or `/api/v1` prefix and any trailing slash. The surface label appears on the per-surface metrics, on the request tracing span, and on every per-surface decision (rate limit, guardrail extractor, 501 gate).
 
-Provider capability is the source of truth for which surfaces a configured provider can serve. The matrix lives in `crates/sbproxy-ai/src/api_routes.rs::provider_supports_surface`. When no configured provider supports the requested surface, the proxy returns **501 Not Implemented** before any upstream call. Universal surfaces (chat completions and models) bypass the gate. Unknown surfaces fall through to the existing dispatch and 404 at the upstream.
+Provider capability is the source of truth for which surfaces a configured provider can serve. The matrix lives in `crates/sbproxy-ai/src/api_routes.rs::provider_supports_surface`. When no configured provider supports the requested surface, the proxy returns **501 Not Implemented** before any upstream call. The universal surfaces are chat completions, Anthropic Messages, OpenAI Responses, and models. Unknown surfaces fall through to the existing dispatch and 404 at the upstream.
 
 | Surface label | Method(s) | Path(s) | Providers (today) |
 |---|---|---|---|
 | `chat_completions` | POST | `/v1/chat/completions` | All |
+| `messages` | POST | `/v1/messages` | All |
+| `responses` | POST | `/v1/responses` | All |
 | `models` | GET | `/v1/models`, `/v1/models/{id}` | All |
 | `embeddings` | POST | `/v1/embeddings` | OpenAI, Gemini, Cohere |
 | `assistants` | POST, GET, DELETE | `/v1/assistants[/{id}[/files[/{file_id}]]]` | OpenAI |
@@ -1386,7 +1394,7 @@ Provider capability is the source of truth for which surfaces a configured provi
 | Surface | Response shape |
 |---|---|
 | `chat_completions` | normalised to / from the OpenAI shape on Anthropic and Google (gemini) formats; passthrough on OpenAI-compatible upstreams |
-| `messages`, `responses` | native-format inbound shims that translate down to the same hub shape as chat completions |
+| `messages`, `responses` | accepted in their native client shapes and governed through the chat hub. Successful generations return in the shape the client used. Provider error envelopes keep the provider's status and body. A safe Anthropic-to-Anthropic request can use the native bypass described below. |
 | `models` | `GET /v1/models` and `GET /models` are served locally for every AI origin as an OpenAI `{"object": "list", "data": [...]}` logical listing. Other model endpoints use the ordinary GET dispatch path and have no unified response shape. |
 | everything else | passthrough on the providers listed in the table; clients see the upstream's native response shape |
 
@@ -1394,6 +1402,14 @@ The local list contract is deliberate: it gives clients one topology-free
 discovery shape across ordinary and managed providers without pretending to
 preserve provider-specific metadata. Call the provider directly when native
 model-list fields are required.
+
+#### Native Anthropic bypass
+
+An Anthropic client calling `/v1/messages` can bypass the internal format round trip when the selected upstream also uses Anthropic Messages. The gateway substitutes the resolved model and sends the original native request shape to the upstream `/v1/messages` path. After output governance and reversible PII restoration, the upstream response keeps its native shape and fields.
+
+The bypass is deliberately narrow. Every request content and control field must have a lossless representation in the governed canonical tree. Unknown extensions and unsupported blocks such as `document` and `search_result` use the normal hub path, so the gateway never forwards content its policies could not inspect. The bypass is also disabled for streaming requests and whenever request processing changes content, including request PII redaction, prompt or tool injection, policy redaction, compression, and reasoning controls.
+
+A request with `stream: true` enters the SSE relay only when the upstream returns a successful `text/event-stream` response. Provider errors keep their original status, content type, and body. A successful buffered JSON response uses the normal provider translation and returns in the client's inbound shape. Both buffered paths have a bounded body read and can be replayed by idempotency.
 
 ### Method coverage
 

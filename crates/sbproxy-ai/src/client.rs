@@ -1955,7 +1955,8 @@ impl AiClient {
             // confidence_score lookup runs uniformly. The translated
             // bytes are also what we hand back to the caller; the
             // gateway speaks OpenAI Chat to clients by default.
-            let translated_vec = translators::translate_response_bytes(format, &raw_bytes);
+            let translated_vec =
+                translators::translate_success_response_bytes(format, status.as_u16(), &raw_bytes);
             let translated = bytes::Bytes::from(translated_vec);
 
             // 5xx responses are treated as failure regardless of
@@ -2269,7 +2270,8 @@ async fn run_shadow_request(
     }
     // Translate non-OpenAI shadow responses into OpenAI shape so the
     // metadata parsing below works uniformly across providers.
-    let bytes_vec = translators::translate_response_bytes(format, &raw_bytes);
+    let bytes_vec =
+        translators::translate_success_response_bytes(format, status.as_u16(), &raw_bytes);
     let bytes: &[u8] = &bytes_vec;
     let elapsed = started.elapsed();
     let (prompt_tokens, completion_tokens, finish_reason) = parse_shadow_metadata(bytes);
@@ -2613,6 +2615,13 @@ mod tests {
     async fn serve_one_json_response(
         response_body: &'static str,
     ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        serve_one_json_response_with_status(response_body, 200).await
+    }
+
+    async fn serve_one_json_response_with_status(
+        response_body: &'static str,
+        status: u16,
+    ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2649,7 +2658,7 @@ mod tests {
             }
 
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                "HTTP/1.1 {status} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 response_body.len(),
                 response_body
             );
@@ -2851,6 +2860,56 @@ mod tests {
             }
         }))
         .expect("cascade fixture")
+    }
+
+    fn one_tier_anthropic_cascade_config(url: &str) -> AiHandlerConfig {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "anthropic",
+                "provider_type": "anthropic",
+                "api_key": "test-key",
+                "base_url": url,
+                "allow_private_base_url": true
+            }],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [{
+                    "provider_id": "anthropic",
+                    "model": "claude-3-5-sonnet",
+                    "quality_threshold": 0.5
+                }]
+            }
+        }))
+        .expect("Anthropic cascade fixture")
+    }
+
+    #[tokio::test]
+    async fn cascade_preserves_final_anthropic_error_envelope() {
+        let error = r#"{"type":"error","error":{"type":"overloaded_error","message":"try later"}}"#;
+        let (url, request) = serve_one_json_response_with_status(error, 503).await;
+        let config = one_tier_anthropic_cascade_config(&url);
+        let cascade = config.router().cascade_config().cloned().expect("cascade");
+
+        let outcome = AiClient::new()
+            .forward_cascade_with_policy(
+                &config,
+                &cascade,
+                &[],
+                &[],
+                "/v1/chat/completions",
+                &serde_json::json!({
+                    "model": "claude-3-5-sonnet",
+                    "messages": [{"role": "user", "content": "ping"}]
+                }),
+                &crate::attribution::AttributionTags::default(),
+                "messages",
+            )
+            .await
+            .expect("final cascade error is returned");
+
+        assert_eq!(outcome.status, 503);
+        assert_eq!(outcome.body.as_ref(), error.as_bytes());
+        request.await.expect("Anthropic request captured");
     }
 
     #[tokio::test]

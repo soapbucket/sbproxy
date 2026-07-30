@@ -14,8 +14,8 @@
 //! directly to the client with `x-sbproxy-idempotency: HIT` and
 //! never contacts the AI provider. On a body conflict the gateway
 //! returns 409 `ledger.idempotency_conflict`. On a miss the gateway
-//! forwards, then records the post-translation OpenAI-shape bytes
-//! the client saw so retries replay byte-identical.
+//! forwards, then records the final client-wire bytes. Retries
+//! receive the same bytes.
 
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;

@@ -203,6 +203,14 @@ fn chat(prompt: &str) -> serde_json::Value {
     })
 }
 
+fn anthropic_messages(prompt: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": "gpt-4o",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": prompt}]
+    })
+}
+
 #[test]
 fn near_duplicate_prompt_hits_openai_embedding_cache() {
     let upstream = ChatUpstream::start();
@@ -275,5 +283,49 @@ fn near_duplicate_prompt_hits_openai_embedding_cache() {
             .to_lowercase()
             .contains("authorization: bearer embed-secret-key"),
         "configured embedding auth header not sent: {embed_req}"
+    );
+}
+
+#[test]
+fn anthropic_messages_embedding_cache_hit_rewraps_canonical_response() {
+    let upstream = ChatUpstream::start();
+    let embed = MockServer::start(
+        r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3,0.4]}],"model":"text-embedding-3-small","usage":{"prompt_tokens":1,"completion_tokens":0,"total_tokens":1}}"#,
+    );
+    let proxy = ProxyHarness::start_with_yaml(&config_for(&upstream.base_url(), &embed.base_url()))
+        .expect("start proxy");
+
+    let first = proxy
+        .post_json(
+            "/v1/chat/completions",
+            "ai.localhost",
+            &chat("What is the capital city of France?"),
+            &[],
+        )
+        .expect("populate semantic cache");
+    assert_eq!(first.status, 200);
+
+    let replay = proxy
+        .post_json(
+            "/v1/messages",
+            "ai.localhost",
+            &anthropic_messages("What is France's capital city?"),
+            &[],
+        )
+        .expect("replay semantic cache through Anthropic Messages");
+
+    assert_eq!(replay.status, 200);
+    assert_eq!(
+        replay.headers.get("x-semcache").map(String::as_str),
+        Some("HIT")
+    );
+    let body = replay.json().expect("Anthropic response JSON");
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["content"][0]["text"], "reply-1");
+    assert!(body.get("choices").is_none(), "{body}");
+    assert_eq!(
+        upstream.calls(),
+        1,
+        "the Anthropic cache hit must not call the chat upstream"
     );
 }
