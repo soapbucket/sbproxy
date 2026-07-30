@@ -108,6 +108,32 @@ pub fn rewrap_response_for_inbound(inbound_format: Option<&str>, body: &[u8]) ->
     }
 }
 
+/// Rewrap only a successful generation response.
+///
+/// The native outbound shims consume the success-only OpenAI Chat shape.
+/// Provider failures must remain byte-for-byte error envelopes, including
+/// the defensive case where an upstream returns a top-level `error` in a
+/// nominally successful HTTP response.
+pub fn rewrap_success_response_for_inbound(
+    status: u16,
+    inbound_format: Option<&str>,
+    body: &[u8],
+) -> Vec<u8> {
+    if !matches!(inbound_format, Some("anthropic") | Some("responses"))
+        || !(200..300).contains(&status)
+    {
+        return body.to_vec();
+    }
+    let has_error_envelope = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.as_object().map(|object| object.contains_key("error")))
+        .unwrap_or(false);
+    if has_error_envelope {
+        return body.to_vec();
+    }
+    rewrap_response_for_inbound(inbound_format, body)
+}
+
 /// Native-format bypass classification.
 ///
 /// Returned by [`native_bypass_for`] when an inbound format and an
@@ -265,6 +291,24 @@ pub(crate) fn parse_role(
         other => Err(ChatError::bad_request(format!(
             "unsupported message role: {other}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod response_rewrap_tests {
+    use super::rewrap_success_response_for_inbound;
+
+    #[test]
+    fn top_level_error_envelope_bypasses_success_rewrap_even_on_2xx() {
+        let body = br#"{"error":{"code":400,"status":"INVALID_ARGUMENT"}}"#;
+
+        for inbound_format in ["anthropic", "responses"] {
+            assert_eq!(
+                rewrap_success_response_for_inbound(200, Some(inbound_format), body),
+                body,
+                "{inbound_format}"
+            );
+        }
     }
 }
 

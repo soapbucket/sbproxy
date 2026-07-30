@@ -276,6 +276,16 @@ fn message_to_content(m: &Value) -> Value {
 ///     `completion_tokens`.
 ///   * `modelVersion` (when present) -> OpenAI `model`.
 pub fn response_to_openai(body: Value) -> Value {
+    // WOR-2054: Gemini failures use a top-level `error` envelope. Check
+    // this before shape-based embedding dispatch because an upstream can
+    // include partial result fields alongside the error.
+    if body
+        .as_object()
+        .is_some_and(|object| object.contains_key("error"))
+    {
+        return body;
+    }
+
     // WOR-824 item 2: shape-based dispatch. A Gemini embeddings
     // response carries `embedding` or `embeddings` at the top
     // level (no `candidates`); send it to the embeddings sub-
@@ -596,6 +606,34 @@ mod tests {
         let parsed: Value =
             serde_json::from_str(tool_calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["city"], "SF");
+    }
+
+    #[test]
+    fn response_error_envelope_passes_through() {
+        let body = json!({
+            "error": {
+                "code": 400,
+                "message": "API key not valid. Please pass a valid API key.",
+                "status": "INVALID_ARGUMENT",
+                "details": [{"reason": "API_KEY_INVALID"}]
+            }
+        });
+
+        assert_eq!(response_to_openai(body.clone()), body);
+    }
+
+    #[test]
+    fn response_error_envelope_takes_precedence_over_embedding_shape() {
+        let body = json!({
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "details": [{"reason": "API_KEY_INVALID"}]
+            },
+            "embedding": {"values": [0.1, 0.2]}
+        });
+
+        assert_eq!(response_to_openai(body.clone()), body);
     }
 
     #[test]
