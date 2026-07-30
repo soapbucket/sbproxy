@@ -108,8 +108,9 @@ upstream <- x-api-key: <the real provider key>  (from the bound credential)
 ```
 
 **Sidecar.** The tool keeps sending its own credential, and the minted key
-rides alongside in `x-sb-api`. SBproxy governs the request without ever holding
-the upstream secret.
+rides alongside in `x-sb-api`. SBproxy governs the request without storing or
+managing the caller-owned upstream secret; it still receives and forwards that
+secret on the proxied request.
 
 ```
 client  ->  authorization: Bearer <the tool's own key>
