@@ -40,16 +40,12 @@ enum Backing {
         cache: Arc<DistributedCache<Bytes>>,
         pool: Arc<TransportClientPool>,
         peer_addr: PeerAddr,
+        /// Peer addresses captured at bootstrap, for operations that are
+        /// cluster-wide rather than consistent-hash-routed. Purge is the
+        /// only one: every node may hold a copy of any key-plane record, so
+        /// a bulk purge has to reach all of them rather than one owner.
+        peers: Vec<String>,
     },
-}
-
-impl Backing {
-    fn cache(&self) -> &Arc<DistributedCache<Bytes>> {
-        match self {
-            Backing::Local(c) => c,
-            Backing::Clustered { cache, .. } => cache,
-        }
-    }
 }
 
 /// A [`CacheTier`] backed by the mesh distributed cache.
@@ -87,6 +83,7 @@ impl MeshCacheTier {
                 cache: node.distributed_cache(),
                 pool: node.transport_pool(),
                 peer_addr: Arc::new(node.peer_addr_lookup()),
+                peers: node.peers().to_vec(),
             },
         }
     }
@@ -98,6 +95,7 @@ impl MeshCacheTier {
                 cache,
                 pool,
                 peer_addr,
+                ..
             } => {
                 cache
                     .get_routed(key, pool.as_ref(), peer_addr.as_ref())
@@ -113,6 +111,7 @@ impl MeshCacheTier {
                 cache,
                 pool,
                 peer_addr,
+                ..
             } => {
                 let _ = cache
                     .put_routed_with_ttl(key, value, ttl_secs, pool.as_ref(), peer_addr.as_ref())
@@ -130,6 +129,7 @@ impl MeshCacheTier {
                 cache,
                 pool,
                 peer_addr,
+                ..
             } => {
                 let _ = cache
                     .delete_routed(key, pool.as_ref(), peer_addr.as_ref())
@@ -178,9 +178,43 @@ impl CacheTier for MeshCacheTier {
         self.delete_raw(&format!("{CRED_PREFIX}{id}")).await;
     }
 
+    /// Purge every key-plane record, cluster-wide.
+    ///
+    /// Scoped to the key-plane prefixes rather than clearing everything. In
+    /// clustered mode the backing cache is the node's shared distributed
+    /// cache, so a blanket purge would also discard unrelated entries such as
+    /// compression sessions.
+    ///
+    /// Purge is cluster-wide rather than consistent-hash-routed, because any
+    /// node may hold a cached copy of any record. A peer that cannot be
+    /// reached keeps its stale entries until they expire, which is why the
+    /// failure is logged rather than swallowed: the caller asked for a
+    /// cluster-wide purge and did not fully get one.
     async fn invalidate_all(&self) {
-        // Clears the local shard. A cluster-wide purge is a separate purge RPC.
-        self.backing.cache().purge_all_local();
+        for prefix in [KEY_PREFIX, CRED_PREFIX] {
+            match &self.backing {
+                Backing::Local(c) => {
+                    c.purge_prefix_local(prefix);
+                }
+                Backing::Clustered {
+                    cache, pool, peers, ..
+                } => {
+                    cache.purge_prefix_local(prefix);
+                    for addr in peers.iter() {
+                        let client = pool.client_for(addr);
+                        if let Err(error) = client.purge_prefix(prefix.to_string()).await {
+                            tracing::warn!(
+                                peer = %addr,
+                                %prefix,
+                                %error,
+                                "mesh cache purge fan-out failed for a peer, which will serve \
+                                 stale key-plane records until they expire"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -188,6 +222,41 @@ impl CacheTier for MeshCacheTier {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[tokio::test]
+    async fn invalidate_all_purges_key_plane_prefixes_without_nuking_the_shared_cache() {
+        // In clustered mode the backing cache is the node-wide distributed
+        // cache, shared with compression sessions and anything else that uses
+        // it. A bulk credential purge must not take those with it.
+        let node = MeshNode::new("purge-a".into(), vec![], MESH_VNODES);
+        let cache = node.distributed_cache();
+        cache.put_local_with_ttl("compression:session:s1", Bytes::from("keep"), 60);
+
+        let tier = MeshCacheTier::clustered(&node);
+        let rec = KeyRecord::new("k1", "h1", Utc::now());
+        tier.put_key(&rec, Duration::from_secs(60)).await;
+        assert!(tier.get_key("k1").await.is_some(), "cached before purge");
+
+        tier.invalidate_all().await;
+
+        assert!(
+            tier.get_key("k1").await.is_none(),
+            "the key-plane record is purged"
+        );
+        assert!(
+            cache.get_local("compression:session:s1").is_some(),
+            "invalidate_all must not discard unrelated entries in the shared cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_invalidate_all_still_clears_key_plane_records() {
+        let tier = MeshCacheTier::standalone("purge-b");
+        let rec = KeyRecord::new("k2", "h2", Utc::now());
+        tier.put_key(&rec, Duration::from_secs(60)).await;
+        tier.invalidate_all().await;
+        assert!(tier.get_key("k2").await.is_none());
+    }
 
     #[tokio::test]
     async fn standalone_round_trips_a_key_record() {
