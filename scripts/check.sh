@@ -83,6 +83,11 @@ step "generated docs are current"
 bash "$ROOT/scripts/check-metrics-stability.sh"
 bash "$ROOT/scripts/check-model-host-capabilities.sh"
 
+step "documentation configs match canonical examples"
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+  scripts.tests.test_doc_generators.SyncDocConfigsTests
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/sync-doc-configs.py" --check
+
 step "install.sh verifies its download"
 sh "$ROOT/scripts/tests/install_verify.sh"
 

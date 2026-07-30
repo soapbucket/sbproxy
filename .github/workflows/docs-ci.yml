@@ -28,6 +28,7 @@ on:
       - 'examples/**'
       - 'Makefile'
       - 'scripts/docs-ci.sh'
+      - 'scripts/sync-doc-configs.py'
       - 'scripts/check-spec-citations.sh'
       - 'scripts/gen-example-tapes.py'
       - 'scripts/record-tapes.sh'
@@ -84,6 +85,9 @@ jobs:
       - name: install rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: install nextest
+        uses: taiki-e/install-action@nextest
+
       - name: install rust-script
         run: cargo install rust-script --locked
 
@@ -102,6 +106,12 @@ jobs:
             exit 1
           fi
           bash scripts/docs-ci.sh
+
+      - name: documentation configs match canonical examples
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/sync-doc-configs.py --check
+          cargo nextest run -p sbproxy-config --test validate_examples \
+            -E 'test(every_oss_example_compiles)' --locked
 
       - name: generated tapes and GIF wiring are current
         run: make tapes-check

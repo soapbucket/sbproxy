@@ -83,6 +83,22 @@ The config has two main sections: `proxy` (server-level settings) and `origins`
 (`l2_cache_settings`, `messenger_settings`) and process-owned
 `compression_state` live nested under `proxy`.
 
+The smallest runnable file is synced from
+[`examples/basic-proxy/sb.yml`](../examples/basic-proxy/sb.yml). CI compiles
+that canonical example and rejects this block if the two drift.
+
+<!-- sbproxy-config: examples/basic-proxy/sb.yml -->
+```yaml
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "myapp.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+```
+
 ---
 
 ## JSON Schema (editor autocomplete + validation)
@@ -130,6 +146,7 @@ The CI gate `scripts/check-config-schema.sh` runs the generator and `diff`s agai
 
 **Map, not a config.** Every `{ ... }` and `[ ... ]` below is a placeholder for a real block documented in its own section, not literal YAML. This shows which keys nest where; it does not validate or run. For a complete file, see [`examples/basic-proxy/sb.yml`](../examples/basic-proxy/sb.yml) for the smallest real one, or any [`examples/<name>/sb.yml`](../examples/) for a feature-specific full config.
 
+<!-- sbproxy-config-excerpt -->
 ```yaml
 # Optional external source descriptor
 source: { ... }
