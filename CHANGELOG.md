@@ -12,6 +12,18 @@ the next version cut.
 
 ### Added
 
+- **Rate limits converge across a gossip mesh with no Redis.** A clustered
+  deployment previously enforced `requests_per_minute` once per node, so 600 rpm
+  on three nodes admitted roughly 1800. Each node now admits against its own
+  count plus a view of its peers refreshed every 3 seconds, which bounds the
+  overshoot at `(nodes - 1) x rate_per_second x 3`: about 660 for that same
+  configuration. An L2 Redis store still enforces exactly and takes precedence
+  when configured. `requests_per_second` is unchanged and still per-node, since a
+  one second window closes before a peer count can arrive, and it now warns at
+  boot on a mesh cluster instead of silently enforcing N times the limit.
+  `sbproxy_rate_limit_cluster_peer_denials_total` makes the approximation
+  observable. See [`docs/configuration.md`](docs/configuration.md).
+
 - **External AI guardrails now use hardened vendor contracts.** Generic
   webhooks and Presidio remain compatible, while Lakera, Aporia, Azure AI
   Content Safety, Amazon Bedrock Guardrails, CrowdStrike AIDR, Mistral
@@ -30,6 +42,23 @@ the next version cut.
   provider attempt reserves independently and settles only at its outbound
   send boundary, with explicit closed or `allow_unreserved` backend failure
   behavior.
+
+### Fixed
+
+- **A bulk credential purge now reaches every node.** `invalidate_all` cleared
+  only the local shard, so peers kept serving stale resolved credentials until
+  TTL. It now fans out to every peer. The same change fixes the opposite problem
+  on the node running it: because a clustered node's key-plane cache is the
+  node-wide distributed cache, the old blanket purge also discarded unrelated
+  entries such as compression sessions. The purge is now scoped to the key-plane
+  prefixes.
+- **A clustered node with a node-local keystore no longer starts.** The
+  `embedded` redb store is per-node, so a key minted on one node could not be
+  resolved by its peers and a revocation on one did not deny on the rest.
+  Declaring `proxy.cluster.seeds` with `key_management.enabled: true` and
+  `store.backend: embedded` now fails at boot with an error naming the fix. A
+  single node with no seeds keeps the embedded default. See
+  [`docs/key-management.md`](docs/key-management.md).
 
 ## [1.9.0] - 2026-07-28
 

@@ -31,6 +31,8 @@ proxy:
     enabled: true
     store:
       backend: embedded              # embedded | redis | secrets_manager
+      # node-local: see "Clustered deployments" below before using this
+      # on more than one node
       path: /var/lib/sbproxy/keystore.redb
     cache:
       ttl_secs: 60                   # how long a resolved key stays cached
@@ -212,6 +214,36 @@ vault, which reads external secrets you do not own.
   from `token_env`), `aws` (default credential chain), or `local` (in-memory, for
   dev and tests). Only writable managers are supported; read-only backends are
   not offered here.
+
+### Clustered deployments
+
+A key minted on one node is resolvable on every node only when the store itself
+is shared, which `redis` and `secrets_manager` are. The `embedded` backend is a
+redb file on local disk, so a key minted on node A is written only to node A and
+node B cannot resolve it.
+
+The mesh cache tier does not change that. It is a cache in front of the system of
+record, not a system of record, so it can only serve records some node already
+holds.
+
+Because minting keys that silently do not work on the rest of the cluster is
+worse than refusing to start, a node that declares `proxy.cluster.seeds` with
+`key_management.enabled: true` and `store.backend: embedded` fails at boot with
+an error naming the fix. Choose one:
+
+- Set `store.backend` to `redis` or `secrets_manager` so the store is shared.
+- Remove `proxy.cluster.seeds` if per-node keys are genuinely what you want.
+
+A single node with no seeds keeps the embedded default and needs no change.
+
+One gap worth knowing: the check fires on nodes that declare seeds. A node others
+join, which has no seeds of its own, is not itself rejected, though every node
+that joins it is, so the misconfiguration still surfaces.
+
+A bulk credential purge on any node is cluster-wide. It fans out to every peer
+rather than clearing only the local cache, so peers do not keep serving stale
+resolved credentials until their TTL expires. A peer that cannot be reached is
+logged, because the purge did not fully take.
 
 ### Atomic policy mutation support
 

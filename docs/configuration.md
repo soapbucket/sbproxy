@@ -672,7 +672,11 @@ Alert webhook deliveries also include the standard `X-Sbproxy-*` identity header
 
 ### l2_cache_settings
 
-The `l2_cache_settings` block points the proxy at a shared key-value backend used for cluster-wide rate limit counters and (optionally) response cache entries. When unset, every replica keeps its own in-memory state. The deserializer also accepts `l2_cache:` as an alias.
+The `l2_cache_settings` block points the proxy at a shared key-value backend used for cluster-wide rate limit counters and (optionally) response cache entries. When it is set, rate limits are enforced exactly across replicas.
+
+When it is unset, what happens depends on whether the node is on a mesh. A standalone replica keeps its own in-memory state. A node with `proxy.cluster` configured converges its per-minute rate limit counters over gossip instead, which is approximate rather than exact; see the `rate_limit` policy for the overshoot bound. Response cache entries are per-replica either way.
+
+The deserializer also accepts `l2_cache:` as an alias.
 
 The `driver` field selects the backend; `params` is a flat string map whose keys depend on the driver. Only the `redis` driver is implemented in the Rust proxy today.
 
@@ -2351,7 +2355,9 @@ Clients exceeding the limit receive `429 Too Many Requests` with a `Retry-After`
 | `headers` | object | | `X-RateLimit-*` and `Retry-After` header configuration |
 | `whitelist` | list | | IPs/CIDRs exempt from rate limiting |
 
-Distributed rate limiting: a single-instance deployment tracks counters in memory. For multi-instance deployments, configure an L2 Redis cache so counters are shared across all proxy replicas:
+Distributed rate limiting: a single-instance deployment tracks counters in memory. Multi-instance deployments have two options, and they enforce differently.
+
+**An L2 Redis cache is exact.** Every replica increments one shared counter, so the cluster admits exactly the configured limit. This is the option to pick when the limit is a hard promise.
 
 ```yaml
 proxy:
@@ -2360,6 +2366,18 @@ proxy:
     params:
       dsn: redis://redis.internal:6379/0
 ```
+
+**A gossip mesh with no Redis is approximate.** When `proxy.cluster` is configured and no L2 store is, each node admits against its own count plus a view of its peers refreshed every 3 seconds. That view is up to one refresh stale, so the cluster over-admits by at most:
+
+```
+overshoot = (nodes - 1) x rate_per_second x 3
+```
+
+For 600 requests per minute across three nodes that is 60 extra requests, so the cluster admits about 660 rather than 600. Five nodes admit about 720. Before this converged, the same configuration admitted 1800 and 3000: each node enforced the full limit by itself.
+
+Watch `sbproxy_rate_limit_cluster_peer_denials_total` to confirm it is working. The counter rises when a node denied a request that its own count alone would have admitted, which means peer counts are arriving. Flat at zero while several nodes serve the same limited key means they are not, and each node is enforcing its own limit while believing it is enforcing a shared one.
+
+**`requests_per_second` does not converge on a mesh.** A one second window closes before a peer's count can arrive, so per-second limits are enforced per node and the proxy warns at boot. Use `requests_per_minute`, which converges, or configure an L2 store for an exact per-second limit.
 
 ### ip_filter
 
