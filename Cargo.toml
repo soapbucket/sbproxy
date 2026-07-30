@@ -347,6 +347,31 @@ x509-parser = "0.16"
 #   codegen-units = 1
 # These would add an additional 5-15% rps per RUST_OPTIMIZATIONS.md A1.
 # ----------------------------------------------------------------------------
+# WOR-2066: the two capability guards parse every production source file in the
+# workspace with `syn` (677 files, ~17.6MB). Those guards run as tests, so they
+# build under the dev/test profiles, where an unoptimised `syn` dominated their
+# runtime and set the floor for the whole suite. Optimising just these three
+# packages leaves every other crate at dev opt-level, so incremental rebuilds
+# stay fast, and it costs one extra optimised compile of dependencies that
+# rarely change. This also speeds up proc-macro expansion across the workspace.
+[profile.dev.package.syn]
+opt-level = 3
+
+[profile.dev.package.proc-macro2]
+opt-level = 3
+
+[profile.dev.package.unicode-ident]
+opt-level = 3
+
+[profile.test.package.syn]
+opt-level = 3
+
+[profile.test.package.proc-macro2]
+opt-level = 3
+
+[profile.test.package.unicode-ident]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 strip = "symbols"

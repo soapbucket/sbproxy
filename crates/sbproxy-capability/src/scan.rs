@@ -26,6 +26,7 @@
 //! the numerator equalled the denominator, and the availability SLO read a
 //! confident 1.0 through any outage you care to imagine.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -76,6 +77,19 @@ pub struct SourceFile {
     pub raw_text: String,
     /// File text with `#[cfg(test)]` items and `#[test]` functions stripped.
     pub text: String,
+    /// [`Self::raw_text`] parsed exactly once, when the file was collected.
+    ///
+    /// Every consumer that needs an AST borrows this rather than calling
+    /// `syn::parse_file` again. Before this field existed each production file
+    /// was parsed up to five times per guard invocation: once to walk its
+    /// `mod` declarations, then again by the parse-error check, the type
+    /// index, the field-read resolver, and every symbol lookup. Parsing the
+    /// workspace is the dominant cost in the two capability guards, so the
+    /// repeats were most of a 23s test.
+    ///
+    /// The error is rendered to `String` because `syn::Error` is not `Clone`
+    /// and its only consumer wants the formatted message.
+    pub ast: Result<syn::File, String>,
 }
 
 /// Whether an item's attributes make it unreachable in every production build.
@@ -576,7 +590,45 @@ pub struct ReferenceExemption {
 /// Integration tests, benches, examples, conventional `tests.rs` modules, and
 /// `e2e/` are excluded. A test driving a metric or reading a configuration
 /// field does not make that behavior live in production.
-pub fn rust_sources(root: &Path) -> Vec<SourceFile> {
+///
+/// The result is collected and parsed once per `root` per thread, then shared,
+/// so a caller that reaches several guards never rescans the workspace.
+///
+/// Keyed by `root` rather than held in a single slot on purpose: the
+/// `config_scan` tests call this against a temporary fixture directory, and a
+/// one-slot cache would hand them the real workspace tree instead.
+///
+/// The cache is thread-local because `syn::File` is not `Sync`: `proc_macro2`'s
+/// fallback token types hold `Rc`, so a parsed tree cannot be placed in a
+/// `static`. That is not the limitation it appears to be. `cargo nextest` runs
+/// every test in its own process, so "once per process" and "once per test"
+/// are the same thing under the runner this workspace gates on, and the
+/// expensive repeat was never across tests. It was five parses of the same file
+/// inside a single guard call. See [`SourceFile::ast`].
+///
+/// Entries are leaked to yield `&'static [SourceFile]`, which avoids cloning a
+/// tree of `syn::File` values. These guards only run inside short-lived test
+/// binaries, so the memory is reclaimed at process exit.
+pub fn rust_sources(root: &Path) -> &'static [SourceFile] {
+    thread_local! {
+        static CACHE: RefCell<BTreeMap<PathBuf, &'static [SourceFile]>> =
+            const { RefCell::new(BTreeMap::new()) };
+    }
+    CACHE.with(|cache| {
+        if let Some(hit) = cache.borrow().get(root).copied() {
+            return hit;
+        }
+        // Collected outside the borrow: `collect_rust_sources` walks the
+        // filesystem and must not run with the cache borrowed.
+        let leaked: &'static [SourceFile] =
+            Box::leak(collect_rust_sources(root).into_boxed_slice());
+        cache.borrow_mut().insert(root.to_path_buf(), leaked);
+        leaked
+    })
+}
+
+/// Do the actual filesystem walk. See [`rust_sources`], which caches this.
+fn collect_rust_sources(root: &Path) -> Vec<SourceFile> {
     let mut out = Vec::new();
     let mut visited = BTreeSet::new();
     let crates = root.join("crates");
@@ -628,17 +680,22 @@ fn collect_reachable_source(
     let Ok(text) = fs::read_to_string(path) else {
         return;
     };
+    // The single parse. The AST is walked here to discover child `mod` files
+    // and then handed to every downstream consumer via `SourceFile::ast`.
+    let parsed = syn::parse_file(&text);
+    if let Ok(file) = &parsed {
+        let module_dir = child_module_directory(path);
+        collect_external_modules(repo_root, &file.items, &module_dir, visited, out);
+    }
+    // Pushed after the recursive walk, because that walk needs `&mut out`.
+    // `rust_sources` sorts by path before returning, so the resulting order is
+    // unchanged by pushing the parent after its children.
     out.push(SourceFile {
         text: strip_test_regions(&text),
-        raw_text: text.clone(),
+        raw_text: text,
         path: path.strip_prefix(repo_root).unwrap_or(path).to_path_buf(),
+        ast: parsed.map_err(|error| error.to_string()),
     });
-
-    let Ok(file) = syn::parse_file(&text) else {
-        return;
-    };
-    let module_dir = child_module_directory(path);
-    collect_external_modules(repo_root, &file.items, &module_dir, visited, out);
 }
 
 fn collect_external_modules(
@@ -1203,6 +1260,37 @@ pub fn verify_writers(metrics: &[MetricCapability], root: &Path) -> Vec<Registry
     let sources = rust_sources(root);
     let mut errors = Vec::new();
 
+    // `blank_string_literals(strip_comments(..))` does not depend on the metric,
+    // so it is computed once per file rather than once per (metric, file) pair.
+    // The loop below is a metric table in the hundreds crossed with ~680 files,
+    // so recomputing it inside meant tens of thousands of full-text passes.
+    // Built only when some metric actually needs the blanked view.
+    let needs_static_view = metrics
+        .iter()
+        .any(|metric| matches!(metric.writer, Writer::Recorder(name) if is_metric_static(name)));
+    let static_views: Vec<String> = if needs_static_view {
+        sources
+            .iter()
+            .map(|source| blank_string_literals(&strip_comments(&source.text)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // One tokenisation pass per file, so the per-metric skip test below is a
+    // hash lookup instead of a full-text search. Without it the loop searches
+    // every file's whole text once per metric, which is the metric table
+    // multiplied by ~680 files of scanning.
+    //
+    // Built from `source.text`. The blanked static view is derived from that
+    // text by removing content, so its identifiers are a subset and this set
+    // stays a safe filter for both views: it can only ever over-approximate,
+    // which costs a wasted iteration rather than a missed match.
+    let identifiers: Vec<BTreeSet<&str>> = sources
+        .iter()
+        .map(|source| identifier_set(&source.text))
+        .collect();
+
     for metric in metrics {
         let is_static = matches!(metric.writer, Writer::Recorder(name) if is_metric_static(name));
         let (symbol, call, define) = match metric.writer {
@@ -1220,16 +1308,24 @@ pub fn verify_writers(metrics: &[MetricCapability], root: &Path) -> Vec<Registry
 
         let mut calls = 0usize;
         let mut defined = define.is_none();
-        for source in &sources {
-            let text = if is_static {
-                std::borrow::Cow::Owned(blank_string_literals(&strip_comments(&source.text)))
+        for (index, source) in sources.iter().enumerate() {
+            let text: &str = if is_static {
+                &static_views[index]
             } else {
-                std::borrow::Cow::Borrowed(source.text.as_str())
+                source.text.as_str()
             };
-            calls += count_tokens(&text, &call);
+            // Every needle below (`symbol(`, `.symbol`, `fn symbol(`,
+            // `static symbol:`) contains `symbol` as a whole identifier, and an
+            // alias can only be introduced by a `use` that names it. So a file
+            // whose identifier set lacks `symbol` cannot contribute a call, a
+            // definition, or an alias, and skipping it changes no outcome.
+            if !identifiers[index].contains(symbol) {
+                continue;
+            }
+            calls += count_tokens(text, &call);
             if follow_aliases {
-                for alias in recorder_aliases(&text, symbol) {
-                    calls += count_tokens(&text, &format!("{alias}("));
+                for alias in recorder_aliases(text, symbol) {
+                    calls += count_tokens(text, &format!("{alias}("));
                 }
             }
             if let Some(define) = &define {
@@ -1239,7 +1335,7 @@ pub fn verify_writers(metrics: &[MetricCapability], root: &Path) -> Vec<Registry
                     // (`fn name(` contains `name(`; `static NAME:` contains
                     // the bare `NAME`). Do not let a writer count as its own
                     // caller.
-                    calls -= count_tokens(&text, define);
+                    calls -= count_tokens(text, define);
                 }
             }
         }
@@ -1277,6 +1373,38 @@ pub fn verify_writers(metrics: &[MetricCapability], root: &Path) -> Vec<Registry
     }
 
     errors
+}
+
+/// Every Rust identifier appearing anywhere in `text`, as borrowed slices.
+///
+/// Used as a cheap rejection filter: a symbol that is not an identifier in a
+/// file cannot be called, defined, or aliased there. Deliberately ignores
+/// context, since a superset is safe for that use and a single pass is the
+/// point.
+///
+/// Byte-wise rather than char-wise. Identifier bytes are all ASCII, so a
+/// multi-byte character can never open or close a run, and every slice
+/// boundary lands on an ASCII byte.
+fn identifier_set(text: &str) -> BTreeSet<&str> {
+    fn is_identifier_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    let mut out = BTreeSet::new();
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !is_identifier_byte(bytes[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < bytes.len() && is_identifier_byte(bytes[index]) {
+            index += 1;
+        }
+        out.insert(&text[start..index]);
+    }
+    out
 }
 
 /// Every metric reference in every dashboard and alert-rule file.
