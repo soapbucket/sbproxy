@@ -204,13 +204,20 @@ pub(super) async fn resolve_inbound_key(
     let (header, token) = match crate::inbound_key::sweep_headers(headers, plane.inbound()) {
         crate::inbound_key::SweepOutcome::None => return InboundKeyPhase::NotPresent,
         crate::inbound_key::SweepOutcome::Ambiguous => {
+            // Observability describes the credential path the caller attempted,
+            // including denials. Keep provider empty: these are proxy-minted
+            // tokens, not caller-owned provider credentials.
+            ctx.inbound_key_mode = crate::context::InboundKeyMode::Minted;
             return InboundKeyPhase::Deny {
                 status: 400,
                 message: "conflicting api keys in more than one header".to_string(),
                 trust_outcome: AuthTrustOutcome::InvalidProof,
             };
         }
-        crate::inbound_key::SweepOutcome::Found { header, token } => (header, token),
+        crate::inbound_key::SweepOutcome::Found { header, token } => {
+            ctx.inbound_key_mode = crate::context::InboundKeyMode::Minted;
+            (header, token)
+        }
     };
 
     // Shape already proven by the sweep; this only re-splits the halves.
@@ -2385,6 +2392,13 @@ pub(super) async fn request_filter(
     // minted keys and its existing JWT / OIDC / mTLS auth. Running first, and
     // short-circuiting only on success, is what lets a minted key work in
     // parallel with credentials the proxy does not own.
+    //
+    // AI actions have two additional credential sources whose `sk-...` shape
+    // overlaps provider-native keys: legacy stored virtual keys and exact
+    // `ai_provider` credentials from origin config. Let the AI resolver check
+    // those sources before it falls back to native-key admission. Generic
+    // proxy actions have no later resolver and remain fully governed here.
+    let ai_action_resolves_overlapping_credentials = ai_proxy_owns_replay_paths;
     if let Some(plane) = crate::key_plane::current_key_plane() {
         let origin_label = ctx.hostname.to_string();
         // Bind the outcome before matching so the immutable borrow of
@@ -2398,50 +2412,84 @@ pub(super) async fn request_filter(
                 sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", true);
             }
             InboundKeyPhase::NotPresent => {
-                // No minted key: recognize and govern a caller-owned native
-                // provider credential. The explicit default policy is what
-                // prevents this path from silently spending an operator key.
-                match crate::inbound_key::resolve_native_key_policy(
-                    &session.req_header().headers,
-                    plane.inbound(),
-                ) {
-                    crate::inbound_key::NativeKeyPolicyDecision::NotPresent => {}
-                    crate::inbound_key::NativeKeyPolicyDecision::Allowed { provider } => {
-                        let policy = plane
-                            .inbound()
-                            .native_key_policy
-                            .as_ref()
-                            .expect("allowed native key decision requires a policy");
-                        ctx.native_key_policy_record =
-                            Some(Box::new(crate::inbound_key::native_policy_record(
+                if !ai_action_resolves_overlapping_credentials {
+                    // No minted key: recognize and govern a caller-owned native
+                    // provider credential. The explicit default policy is what
+                    // prevents this path from silently spending an operator key.
+                    match crate::inbound_key::resolve_native_key_policy(
+                        &session.req_header().headers,
+                        plane.inbound(),
+                    ) {
+                        crate::inbound_key::NativeKeyPolicyDecision::NotPresent => {}
+                        crate::inbound_key::NativeKeyPolicyDecision::Allowed { provider } => {
+                            let policy = plane
+                                .inbound()
+                                .native_key_policy
+                                .as_ref()
+                                .expect("allowed native key decision requires a policy");
+                            let record = crate::inbound_key::native_policy_record(
                                 policy,
                                 ctx.tenant_id.as_str(),
                                 ctx.hostname.as_str(),
                                 &provider,
-                            )));
-                        ctx.native_key_provider = Some(provider);
-                        ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
-                    }
-                    crate::inbound_key::NativeKeyPolicyDecision::PolicyMissing { provider }
-                    | crate::inbound_key::NativeKeyPolicyDecision::ProviderDenied { provider } => {
-                        ctx.native_key_provider = Some(provider);
-                        ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
-                        finalize_inbound_key_trust(ctx, AuthTrustOutcome::Missing);
-                        sbproxy_observe::metrics::record_auth(
-                            &origin_label,
-                            "native_provider_key",
-                            false,
-                        );
-                        emit_auth_audit(
-                            "auth_denied",
-                            "native_provider_key",
-                            403,
-                            &origin_label,
-                            ctx,
-                            session,
-                        );
-                        send_error(session, 403, "native provider key is not allowed").await?;
-                        return Ok(true);
+                            );
+                            ctx.native_key_provider = Some(provider);
+                            ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
+                            let within_rpm = record.max_requests_per_minute.is_none()
+                                || super::ai_dispatch::key_rate_limiter().check_request_rate(
+                                    &record.key_id,
+                                    record.max_requests_per_minute,
+                                );
+                            ctx.native_key_policy_record = Some(Box::new(record));
+                            if !within_rpm {
+                                sbproxy_observe::metrics::record_policy(
+                                    &origin_label,
+                                    "rate_limit",
+                                    "deny",
+                                );
+                                sbproxy_observe::SecurityAuditEntry::policy_violation(
+                                    "rate_limit",
+                                    "native provider key request rate exceeded",
+                                    429,
+                                    Some(origin_label.clone()),
+                                    ctx.client_ip,
+                                    Some(ctx.request_id.to_string()),
+                                    Some(session.req_header().method.as_str().to_string()),
+                                )
+                                .with_tenant_id(ctx.tenant_id.to_string())
+                                .with_key_context(
+                                    ctx.native_key_provider.clone(),
+                                    ctx.inbound_key_mode.as_str(),
+                                )
+                                .emit();
+                                send_error(session, 429, "rate limit exceeded for this key")
+                                    .await?;
+                                return Ok(true);
+                            }
+                        }
+                        crate::inbound_key::NativeKeyPolicyDecision::PolicyMissing { provider }
+                        | crate::inbound_key::NativeKeyPolicyDecision::ProviderDenied {
+                            provider,
+                        } => {
+                            ctx.native_key_provider = Some(provider);
+                            ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
+                            finalize_inbound_key_trust(ctx, AuthTrustOutcome::Missing);
+                            sbproxy_observe::metrics::record_auth(
+                                &origin_label,
+                                "native_provider_key",
+                                false,
+                            );
+                            emit_auth_audit(
+                                "auth_denied",
+                                "native_provider_key",
+                                403,
+                                &origin_label,
+                                ctx,
+                                session,
+                            );
+                            send_error(session, 403, "native provider key is not allowed").await?;
+                            return Ok(true);
+                        }
                     }
                 }
                 if crate::inbound_key::requires_minted_key(plane.inbound()) {
@@ -5670,6 +5718,15 @@ mod inbound_key_phase_tests {
         let outcome =
             resolve_inbound_key(&plane, &headers(&[("x-api-key", &revoked)]), None, &mut c).await;
         assert_denial(outcome, 403, AuthTrustOutcome::InvalidProof);
+        assert_eq!(
+            c.inbound_key_mode,
+            crate::context::InboundKeyMode::Minted,
+            "a recognized minted attempt must retain its mode on denial"
+        );
+        assert!(
+            c.native_key_provider.is_none(),
+            "a minted denial must not invent provider attribution"
+        );
         assert!(
             c.resolved_inbound_key.is_none(),
             "a denied key is not stamped"
@@ -5684,6 +5741,12 @@ mod inbound_key_phase_tests {
         let outcome =
             resolve_inbound_key(&plane, &headers(&[("x-api-key", &unknown)]), None, &mut c).await;
         assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
+        assert_eq!(
+            c.inbound_key_mode,
+            crate::context::InboundKeyMode::Minted,
+            "an unknown minted-shaped key must still be observable as minted"
+        );
+        assert!(c.native_key_provider.is_none());
     }
 
     #[tokio::test]
@@ -5696,6 +5759,12 @@ mod inbound_key_phase_tests {
         let outcome =
             resolve_inbound_key(&plane, &headers(&[("x-api-key", &wrong)]), None, &mut c).await;
         assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
+        assert_eq!(
+            c.inbound_key_mode,
+            crate::context::InboundKeyMode::Minted,
+            "a wrong minted secret must still be observable as minted"
+        );
+        assert!(c.native_key_provider.is_none());
     }
 
     #[tokio::test]
@@ -5705,6 +5774,12 @@ mod inbound_key_phase_tests {
         let h = headers(&[("x-api-key", &token), ("x-sb-api", &revoked)]);
         let outcome = resolve_inbound_key(&plane, &h, None, &mut c).await;
         assert_denial(outcome, 400, AuthTrustOutcome::InvalidProof);
+        assert_eq!(
+            c.inbound_key_mode,
+            crate::context::InboundKeyMode::Minted,
+            "conflicting minted-shaped credentials are still a minted attempt"
+        );
+        assert!(c.native_key_provider.is_none());
     }
 
     #[tokio::test]

@@ -593,6 +593,38 @@ impl ResolvedRequestKey {
     }
 }
 
+fn credential_requires_interpreted_model(resolved: &ResolvedRequestKey) -> bool {
+    resolved.route_to_model().is_some()
+        || !resolved.allowed_models().is_empty()
+        || !resolved.blocked_models().is_empty()
+}
+
+fn governed_effective_model(
+    resolved: Option<&ResolvedRequestKey>,
+    requested_model: Option<&str>,
+) -> std::result::Result<Option<String>, &'static str> {
+    let requested_model = requested_model.filter(|model| !model.trim().is_empty());
+    let Some(resolved) = resolved else {
+        return Ok(requested_model.map(str::to_string));
+    };
+    let effective = resolved.route_to_model().or(requested_model);
+    let Some(effective) = effective else {
+        return if credential_requires_interpreted_model(resolved) {
+            Err("model is required by this credential policy")
+        } else {
+            Ok(None)
+        };
+    };
+    if !resolved.is_model_allowed(effective) {
+        return Err("model is not allowed for this credential");
+    }
+    Ok(Some(effective.to_string()))
+}
+
+fn credential_requires_pii_redaction(resolved: Option<&ResolvedRequestKey>) -> bool {
+    resolved.is_some_and(|resolved| !resolved.require_pii_redaction().is_empty())
+}
+
 fn governed_key_requirement(
     required: bool,
     resolved: Option<&ResolvedRequestKey>,
@@ -734,22 +766,17 @@ fn immutable_budget_key_id(ctx: &RequestContext) -> Option<String> {
         })
 }
 
-pub(super) async fn realtime_budget_gate(
+async fn ai_surface_budget_gate(
     session: &Session,
     config: &AiHandlerConfig,
-    pipeline: &CompiledPipeline,
     hostname: &str,
-    ctx: &mut RequestContext,
+    ctx: &RequestContext,
     model: Option<&str>,
-) -> std::result::Result<BudgetGate, (u16, String)> {
-    let key_plane = crate::key_plane::current_key_plane();
-    let _prepared =
-        prepare_ai_request_identity(session, config, pipeline, ctx, key_plane.as_deref()).await?;
-
+) -> BudgetGate {
     let Some(effective_budget) =
         merged_request_budget(config.budget.as_ref(), ctx.effective_key_policy.as_ref())
     else {
-        return Ok(BudgetGate::Allow);
+        return BudgetGate::Allow;
     };
     let api_key_id = immutable_budget_key_id(ctx);
     let user =
@@ -766,7 +793,107 @@ pub(super) async fn realtime_budget_gate(
         tag.as_deref(),
     )
     .await;
-    Ok(gate)
+    gate
+}
+
+pub(super) struct RealtimeAdmission {
+    pub(super) budget_gate: BudgetGate,
+    pub(super) provider_name: String,
+}
+
+pub(super) async fn realtime_budget_gate(
+    session: &Session,
+    config: &AiHandlerConfig,
+    pipeline: &CompiledPipeline,
+    hostname: &str,
+    ctx: &mut RequestContext,
+    model: Option<&str>,
+) -> std::result::Result<RealtimeAdmission, (u16, String)> {
+    let key_plane = crate::key_plane::current_key_plane();
+    let prepared =
+        prepare_ai_request_identity(session, config, pipeline, ctx, key_plane.as_deref()).await?;
+
+    if credential_requires_pii_redaction(prepared.resolved_request_key.as_ref()) {
+        return Err((
+            403,
+            "required PII redaction is unsupported for realtime AI sessions".to_string(),
+        ));
+    }
+    let effective_model = governed_effective_model(prepared.resolved_request_key.as_ref(), model)
+        .map_err(|message| (403, message.to_string()))?;
+    if effective_model
+        .as_deref()
+        .is_some_and(|model| !config.is_model_allowed(model))
+    {
+        return Err((403, "model is not allowed".to_string()));
+    }
+
+    let mut budget_gate =
+        ai_surface_budget_gate(session, config, hostname, ctx, effective_model.as_deref()).await;
+    let final_model = match &budget_gate {
+        BudgetGate::Allow => effective_model.clone(),
+        BudgetGate::Block { .. } => effective_model.clone(),
+        BudgetGate::Downgrade { model } => {
+            if !config.is_model_allowed(model)
+                || prepared
+                    .resolved_request_key
+                    .as_ref()
+                    .is_some_and(|key| !key.is_model_allowed(model))
+            {
+                return Err((
+                    403,
+                    "budget downgrade model is not allowed for this credential".to_string(),
+                ));
+            }
+            Some(model.clone())
+        }
+    };
+    if matches!(budget_gate, BudgetGate::Allow)
+        && effective_model.as_deref() != model.filter(|model| !model.is_empty())
+    {
+        if let Some(model) = effective_model.clone() {
+            budget_gate = BudgetGate::Downgrade { model };
+        }
+    }
+
+    let allowed_providers = prepared
+        .resolved_request_key
+        .as_ref()
+        .map(ResolvedRequestKey::allowed_providers)
+        .unwrap_or(&[]);
+    let blocked_providers = prepared
+        .resolved_request_key
+        .as_ref()
+        .map(ResolvedRequestKey::blocked_providers)
+        .unwrap_or(&[]);
+    let native_provider = (ctx.inbound_key_mode == crate::context::InboundKeyMode::Native)
+        .then(|| ctx.native_key_provider.as_deref())
+        .flatten();
+    let provider = config.providers.iter().find(|provider| {
+        provider.enabled
+            && sbproxy_ai::api_routes::provider_supports_realtime(&provider.name)
+            && sbproxy_ai::routing::provider_allowed_by_policy(
+                provider.name.as_str(),
+                allowed_providers,
+                blocked_providers,
+            )
+            && native_provider.is_none_or(|native| provider_matches_native_key(provider, native))
+            && final_model.as_deref().is_none_or(|model| {
+                provider.models.is_empty()
+                    || provider.models.iter().any(|candidate| *candidate == model)
+            })
+    });
+    let Some(provider) = provider else {
+        return Err((
+            403,
+            "no realtime AI provider satisfies this credential policy".to_string(),
+        ));
+    };
+
+    Ok(RealtimeAdmission {
+        budget_gate,
+        provider_name: provider.name.to_string(),
+    })
 }
 
 /// Translate a resolved effective key policy into governance limits.
@@ -1419,49 +1546,153 @@ async fn resolve_request_virtual_key(
     // fall through to the configured keys, find nothing there either, and
     // dispatch UNGOVERNED: no model allowlist, no budget, no rate limit, no
     // tool injection, no PII requirement, and no error or log to say so.
-    if let Some(record) = ctx.resolved_inbound_key.as_deref() {
+    if ctx.resolved_inbound_key.is_some() {
+        stamp_minted_key_mode(ctx);
+        let record = ctx
+            .resolved_inbound_key
+            .as_deref()
+            .expect("resolved key checked above");
         return lower_stored_request_key(record, origin_tenant_id).map(Some);
     }
-    if let Some(record) = ctx.native_key_policy_record.as_deref() {
-        return lower_stored_request_key(record, origin_tenant_id).map(Some);
-    }
-    let auth_value = req_header_value(session, "authorization");
-    let raw_key = auth_value.as_deref().map(|header| {
-        header
-            .strip_prefix("Bearer ")
-            .or_else(|| header.strip_prefix("bearer "))
-            .unwrap_or(header)
-            .trim()
-            .to_string()
-    });
+    let presented_credentials: Vec<(String, std::borrow::Cow<'_, str>)> = if let Some(plane) = plane
+    {
+        crate::inbound_key::presented_credentials(&session.req_header().headers, plane.inbound())
+            .into_iter()
+            .map(|credential| {
+                (
+                    credential.header,
+                    std::borrow::Cow::Borrowed(credential.value),
+                )
+            })
+            .collect()
+    } else {
+        req_header_value(session, "authorization")
+            .map(|header| {
+                let key = header
+                    .strip_prefix("Bearer ")
+                    .or_else(|| header.strip_prefix("bearer "))
+                    .unwrap_or(header.as_str())
+                    .trim()
+                    .to_string();
+                vec![("authorization".to_string(), std::borrow::Cow::Owned(key))]
+            })
+            .unwrap_or_default()
+    };
     if let Some(plane) = plane {
-        match resolve_dynamic_virtual_key(plane, raw_key.as_deref()).await {
+        for (header, credential) in &presented_credentials {
+            match resolve_dynamic_virtual_key(plane, Some(credential.as_ref())).await {
+                DynamicKeyOutcome::Resolved(record) => {
+                    stamp_minted_key_mode(ctx);
+                    ctx.inbound_key_header = Some(header.clone());
+                    sbproxy_observe::metrics::record_auth(
+                        ctx.hostname.as_str(),
+                        "virtual_key",
+                        true,
+                    );
+                    return lower_and_preserve_stored_request_key(ctx, record, origin_tenant_id)
+                        .map(Some);
+                }
+                DynamicKeyOutcome::NotApplicable => {}
+                DynamicKeyOutcome::Deny(status, message) => {
+                    stamp_minted_key_mode(ctx);
+                    ctx.inbound_key_header = Some(header.clone());
+                    crate::trust_tier::finalize(
+                        ctx,
+                        AuthTrustOutcome::InvalidProof.is_suspicious(),
+                    );
+                    sbproxy_observe::metrics::record_auth(
+                        ctx.hostname.as_str(),
+                        "virtual_key",
+                        false,
+                    );
+                    emit_auth_audit(
+                        "auth_denied",
+                        "virtual_key",
+                        status,
+                        ctx.hostname.as_str(),
+                        ctx,
+                        session,
+                    );
+                    return Err((status, message));
+                }
+            }
+        }
+        match resolve_oidc_mapped_key(plane, &ctx.principal).await {
             DynamicKeyOutcome::Resolved(record) => {
+                stamp_minted_key_mode(ctx);
                 return lower_and_preserve_stored_request_key(ctx, record, origin_tenant_id)
                     .map(Some);
             }
-            DynamicKeyOutcome::NotApplicable => {
-                match resolve_oidc_mapped_key(plane, &ctx.principal).await {
-                    DynamicKeyOutcome::Resolved(record) => {
-                        return lower_and_preserve_stored_request_key(
-                            ctx,
-                            record,
-                            origin_tenant_id,
-                        )
-                        .map(Some);
-                    }
-                    DynamicKeyOutcome::NotApplicable => {}
-                    DynamicKeyOutcome::Deny(status, message) => return Err((status, message)),
-                }
-            }
+            DynamicKeyOutcome::NotApplicable => {}
             DynamicKeyOutcome::Deny(status, message) => return Err((status, message)),
         }
     }
-    Ok(resolve_configured_virtual_key(
-        &config.virtual_keys,
-        raw_key.as_deref(),
-        origin_tenant_id,
-    ))
+
+    for (header, credential) in &presented_credentials {
+        if let Some(resolved) = resolve_configured_virtual_key(
+            &config.virtual_keys,
+            Some(credential.as_ref()),
+            origin_tenant_id,
+        ) {
+            stamp_minted_key_mode(ctx);
+            ctx.inbound_key_header = Some(header.clone());
+            return Ok(Some(resolved));
+        }
+    }
+
+    let Some(plane) = plane else {
+        return Ok(None);
+    };
+    match crate::inbound_key::resolve_native_key_policy(
+        &session.req_header().headers,
+        plane.inbound(),
+    ) {
+        crate::inbound_key::NativeKeyPolicyDecision::NotPresent => Ok(None),
+        crate::inbound_key::NativeKeyPolicyDecision::Allowed { provider } => {
+            let policy = plane
+                .inbound()
+                .native_key_policy
+                .as_ref()
+                .expect("allowed native key decision requires a policy");
+            let record = Box::new(crate::inbound_key::native_policy_record(
+                policy,
+                ctx.tenant_id.as_str(),
+                ctx.hostname.as_str(),
+                &provider,
+            ));
+            let resolved = lower_stored_request_key(&record, origin_tenant_id)?;
+            ctx.native_key_policy_record = Some(record);
+            ctx.native_key_provider = Some(provider);
+            ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
+            Ok(Some(resolved))
+        }
+        crate::inbound_key::NativeKeyPolicyDecision::PolicyMissing { provider }
+        | crate::inbound_key::NativeKeyPolicyDecision::ProviderDenied { provider } => {
+            ctx.native_key_provider = Some(provider);
+            ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
+            crate::trust_tier::finalize(ctx, AuthTrustOutcome::Missing.is_suspicious());
+            sbproxy_observe::metrics::record_auth(
+                ctx.hostname.as_str(),
+                "native_provider_key",
+                false,
+            );
+            emit_auth_audit(
+                "auth_denied",
+                "native_provider_key",
+                403,
+                ctx.hostname.as_str(),
+                ctx,
+                session,
+            );
+            Err((403, "native provider key is not allowed".to_string()))
+        }
+    }
+}
+
+fn stamp_minted_key_mode(ctx: &mut RequestContext) {
+    ctx.inbound_key_mode = crate::context::InboundKeyMode::Minted;
+    ctx.native_key_provider = None;
+    ctx.native_key_policy_record = None;
 }
 
 fn resolve_configured_virtual_key(
@@ -1630,6 +1861,32 @@ fn apply_resolved_virtual_key_context(
     apply_resolved_key_lane(ctx, resolved);
 
     Ok(())
+}
+
+fn apply_json_request_pii_redaction(
+    config: &AiHandlerConfig,
+    ctx: &mut RequestContext,
+    body: &mut serde_json::Value,
+) -> bool {
+    if !config
+        .pii
+        .as_ref()
+        .is_some_and(|pii| pii.enabled && pii.redact_request)
+    {
+        return false;
+    }
+    let Some(redactor) = config.pii_redactor() else {
+        return false;
+    };
+
+    let body_before_redaction = body.clone();
+    let mut capture = sbproxy_security::pii::ReversibleCapture::new();
+    redactor.redact_json_with_capture(body, &mut capture);
+    if !capture.is_empty() {
+        ctx.ai_reversible_redactions = capture.pairs;
+    }
+    tracing::debug!("AI proxy: applied request-body PII redaction");
+    *body != body_before_redaction
 }
 
 struct AiBodyPromptBlock {
@@ -1995,6 +2252,23 @@ pub(super) async fn handle_ai_proxy(
     let resolved_request_vk = prepared_identity.resolved_request_key;
     let peer_policy_revision = prepared_identity.policy_revision;
     ai_span.record("sbproxy.policy_version", peer_policy_revision.as_str());
+    let router = config.router();
+    if ctx.inbound_key_mode == crate::context::InboundKeyMode::Native
+        && router.cascade_config().is_some()
+    {
+        // Confidence cascade may select more than one provider/tier. A single
+        // caller-owned provider credential cannot be safely replayed across
+        // that boundary. Refuse before reading the request body or consulting
+        // idempotency/semantic/embedding caches so no local or upstream side
+        // effect can precede the denial.
+        send_error(
+            session,
+            503,
+            "native provider keys are unavailable for confidence cascade routing",
+        )
+        .await?;
+        return Ok(());
+    }
     let effective_policy = ctx.effective_key_policy.as_ref();
     let trace_key_id = effective_policy
         .map(|policy| policy.key_id.as_str())
@@ -2020,20 +2294,21 @@ pub(super) async fn handle_ai_proxy(
     if let Some(user) = trace_user {
         ai_span.record("sbproxy.user", user);
     }
-    let policy_allowed_providers = resolved_request_vk
+    let policy_allowed_providers: Vec<String> = resolved_request_vk
         .as_ref()
-        .map(ResolvedRequestKey::allowed_providers)
+        .map(|key| key.allowed_providers().to_vec())
         .or_else(|| {
             ctx.principal
                 .virtual_key
                 .as_ref()
-                .map(|key| key.allowed_providers.as_slice())
+                .map(|key| key.allowed_providers.clone())
         })
-        .unwrap_or(&[]);
-    let blocked_providers = resolved_request_vk
+        .unwrap_or_default();
+    let blocked_provider_policy: Vec<String> = resolved_request_vk
         .as_ref()
-        .map(ResolvedRequestKey::blocked_providers)
-        .unwrap_or(&[]);
+        .map(|key| key.blocked_providers().to_vec())
+        .unwrap_or_default();
+    let blocked_providers = blocked_provider_policy.as_slice();
     let native_provider = (ctx.inbound_key_mode == crate::context::InboundKeyMode::Native)
         .then(|| ctx.native_key_provider.as_deref())
         .flatten();
@@ -2074,7 +2349,7 @@ pub(super) async fn handle_ai_proxy(
                         && provider_matches_native_key(provider, native_provider)
                         && sbproxy_ai::routing::provider_allowed_by_policy(
                             provider.name.as_str(),
-                            policy_allowed_providers,
+                            &policy_allowed_providers,
                             blocked_providers,
                         )
                 })
@@ -2094,7 +2369,7 @@ pub(super) async fn handle_ai_proxy(
     let allowed_providers = if native_provider.is_some() {
         native_allowed_providers.as_slice()
     } else {
-        policy_allowed_providers
+        policy_allowed_providers.as_slice()
     };
     let allowed_models = resolved_request_vk
         .as_ref()
@@ -2233,7 +2508,6 @@ pub(super) async fn handle_ai_proxy(
     // config), so its per-provider latency / token / connection state
     // survives across requests. A per-request router would reset that
     // state every call and make the latency/usage-aware strategies inert.
-    let router = config.router();
     let quota_pool_admission = sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
         config.quota_pool.clone(),
         config.quota_pool_store(
@@ -2285,6 +2559,22 @@ pub(super) async fn handle_ai_proxy(
         ) {
             let bytes = serde_json::to_vec(&body).unwrap_or_default();
             send_response(session, 200, "application/json", &bytes).await?;
+            return Ok(());
+        }
+        if resolved_request_vk
+            .as_ref()
+            .is_some_and(credential_requires_interpreted_model)
+        {
+            send_error(session, 403, "model is required by this credential policy").await?;
+            return Ok(());
+        }
+        if credential_requires_pii_redaction(resolved_request_vk.as_ref()) {
+            send_error(
+                session,
+                403,
+                "required PII redaction is unsupported for this AI request surface",
+            )
+            .await?;
             return Ok(());
         }
         let provider_idx = router
@@ -2407,12 +2697,11 @@ pub(super) async fn handle_ai_proxy(
         .await;
     }
 
-    // Methods other than GET/POST forward through the method-aware
-    // client without engaging the chat-completions body-parse pipeline
-    // (no body for DELETE/HEAD; body preserved as-is for PUT/PATCH).
-    // Per-surface guardrails, budget enforcement, and PII redaction for
-    // these methods are deferred to later phases; for Phase 1 the goal
-    // is to dispatch without misrouting DELETE as POST.
+    // Methods other than GET/POST forward through the method-aware client.
+    // DELETE/HEAD/OPTIONS have no interpretable body and fail closed when a
+    // credential requires model or PII enforcement. PUT/PATCH parse JSON so
+    // model policy, PII redaction, and budget admission run before replay or
+    // dispatch.
     if matches!(
         method,
         http::Method::DELETE
@@ -2421,23 +2710,11 @@ pub(super) async fn handle_ai_proxy(
             | http::Method::PATCH
             | http::Method::OPTIONS
     ) {
-        let provider_idx = router
-            .select_with_policy(&config.providers, allowed_providers, blocked_providers)
-            .ok_or_else(|| {
-                warn!("AI proxy: no enabled providers");
-                Error::new(ErrorType::HTTPStatus(502))
-            })?;
-        let mut resolved_provider = config.providers[provider_idx].clone();
-        apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
-        let provider = &resolved_provider;
-        ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
-        ctx.admin_load_balancer_target = Some(provider.name.to_string());
-
         // Read the body for methods that typically carry one. DELETE,
         // HEAD, OPTIONS go through without a body. For PUT / PATCH we
-        // keep the raw bytes alongside the parsed JSON so the
-        // idempotency middleware can hash the verbatim payload.
-        let (body_opt, body_raw): (Option<serde_json::Value>, Vec<u8>) = if matches!(
+        // serialize the governed JSON alongside the parsed value so the
+        // idempotency middleware hashes the exact payload sent upstream.
+        let (mut body_opt, mut body_raw): (Option<serde_json::Value>, Vec<u8>) = if matches!(
             method,
             http::Method::PUT | http::Method::PATCH
         ) {
@@ -2463,6 +2740,84 @@ pub(super) async fn handle_ai_proxy(
         } else {
             (None, Vec::new())
         };
+
+        if body_opt.is_none()
+            && resolved_request_vk
+                .as_ref()
+                .is_some_and(credential_requires_interpreted_model)
+        {
+            send_error(session, 403, "model is required by this credential policy").await?;
+            return Ok(());
+        }
+        if body_opt.is_none() && credential_requires_pii_redaction(resolved_request_vk.as_ref()) {
+            send_error(
+                session,
+                403,
+                "required PII redaction is unsupported for this AI request surface",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let mut effective_model = None;
+        if let Some(body) = body_opt.as_mut() {
+            apply_json_request_pii_redaction(config, ctx, body);
+            effective_model = match governed_effective_model(
+                resolved_request_vk.as_ref(),
+                body.get("model").and_then(serde_json::Value::as_str),
+            ) {
+                Ok(model) => model,
+                Err(message) => {
+                    send_error(session, 403, message).await?;
+                    return Ok(());
+                }
+            };
+            if let Some(model) = effective_model.as_deref() {
+                if !config.is_model_allowed(model) {
+                    send_error(session, 403, "model is not allowed").await?;
+                    return Ok(());
+                }
+                body["model"] = serde_json::Value::String(model.to_string());
+            }
+            body_raw = serde_json::to_vec(body).unwrap_or_default();
+        }
+
+        match ai_surface_budget_gate(session, config, hostname, ctx, effective_model.as_deref())
+            .await
+        {
+            BudgetGate::Allow => {}
+            BudgetGate::Block { status, body } => {
+                send_response(session, status, "application/json", &body).await?;
+                return Ok(());
+            }
+            BudgetGate::Downgrade { model } => {
+                if !config.is_model_allowed(&model)
+                    || resolved_request_vk
+                        .as_ref()
+                        .is_some_and(|key| !key.is_model_allowed(&model))
+                {
+                    send_error(
+                        session,
+                        403,
+                        "budget downgrade model is not allowed for this credential",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let Some(body) = body_opt.as_mut() else {
+                    send_error(
+                        session,
+                        403,
+                        "budget model override is unsupported for this AI request surface",
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                body["model"] = serde_json::Value::String(model.clone());
+                effective_model = Some(model);
+                body_raw = serde_json::to_vec(body).unwrap_or_default();
+            }
+        }
 
         // --- Idempotency middleware engagement (PUT / PATCH) ---
         //
@@ -2507,6 +2862,39 @@ pub(super) async fn handle_ai_proxy(
                     }),
                 ),
             };
+
+        let mut provider_candidates = config
+            .providers
+            .iter()
+            .enumerate()
+            .filter(|(_, provider)| {
+                provider.enabled
+                    && sbproxy_ai::routing::provider_allowed_by_policy(
+                        provider.name.as_str(),
+                        allowed_providers,
+                        blocked_providers,
+                    )
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if let Some(model) = effective_model.as_deref() {
+            if let Some(eligible) =
+                model_eligible_providers(&provider_candidates, &config.providers, model)
+            {
+                provider_candidates = eligible;
+            }
+        }
+        let provider_idx = router
+            .select_with_candidates(&config.providers, &provider_candidates)
+            .ok_or_else(|| {
+                warn!("AI proxy: no enabled provider satisfies method-aware policy");
+                Error::new(ErrorType::HTTPStatus(502))
+            })?;
+        let mut resolved_provider = config.providers[provider_idx].clone();
+        apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
+        let provider = &resolved_provider;
+        ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
+        ctx.admin_load_balancer_target = Some(provider.name.to_string());
 
         let reservation_id = format!("{}:quota-pool:method:0", ctx.request_id);
         let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
@@ -2575,10 +2963,6 @@ pub(super) async fn handle_ai_proxy(
             &ctx.rollup_properties,
             &ai_span,
         );
-        // WOR-1044 PR3: the GET-method-aware path runs before the
-        // request body is read, so there is no reversible PII
-        // capture yet. Pass an empty pairs vector; restore is a
-        // no-op short-circuit.
         return relay_ai_response_with_idempotency(
             session,
             resp,
@@ -2588,7 +2972,7 @@ pub(super) async fn handle_ai_proxy(
             idem_capture,
             ctx.ai_inbound_format.as_deref(),
             Vec::new(),
-            Vec::new(),
+            ctx.ai_reversible_redactions.clone(),
             &ai_span,
             provider.name.as_str(),
         )
@@ -2697,6 +3081,15 @@ pub(super) async fn handle_ai_proxy(
         .starts_with("multipart/");
 
     if is_multipart_request {
+        if credential_requires_pii_redaction(resolved_request_vk.as_ref()) {
+            send_error(
+                session,
+                403,
+                "required PII redaction is unsupported for multipart AI requests",
+            )
+            .await?;
+            return Ok(());
+        }
         let maximum = config
             .max_body_size
             .filter(|maximum| *maximum > 0)
@@ -2735,6 +3128,40 @@ pub(super) async fn handle_ai_proxy(
                 )
             })?;
             requested_model = Some(route_to.to_string());
+        }
+        if requested_model.is_none()
+            && resolved_request_vk
+                .as_ref()
+                .is_some_and(credential_requires_interpreted_model)
+        {
+            send_error(session, 403, "model is required by this credential policy").await?;
+            return Ok(());
+        }
+
+        match ai_surface_budget_gate(session, config, hostname, ctx, requested_model.as_deref())
+            .await
+        {
+            BudgetGate::Allow => {}
+            BudgetGate::Block { status, body } => {
+                send_response(session, status, "application/json", &body).await?;
+                return Ok(());
+            }
+            BudgetGate::Downgrade { model } => {
+                forwarded_body = crate::model_plane::rewrite_engine_model(
+                    forwarded_body.as_ref(),
+                    Some(&request_content_type),
+                    &model,
+                    maximum,
+                )
+                .map_err(|error| {
+                    Error::because(
+                        ErrorType::HTTPStatus(400),
+                        "invalid multipart budget model override",
+                        error,
+                    )
+                })?;
+                requested_model = Some(model);
+            }
         }
         if let Some(model) = requested_model.as_deref() {
             let key_allows_model = resolved_request_vk
@@ -3166,24 +3593,9 @@ pub(super) async fn handle_ai_proxy(
     // is false. Replaces email, SSN, credit-card-with-Luhn, phone,
     // IPv4, and common API-key shapes with `[REDACTED:<KIND>]`
     // markers; see `sbproxy_security::pii::PiiRedactor`.
-    if let Some(pii_cfg) = config.pii.as_ref() {
-        if pii_cfg.enabled && pii_cfg.redact_request {
-            if let Some(redactor) = config.pii_redactor() {
-                // WOR-1044: capture-aware path so reversible rules can be
-                // restored on the response. Capture lives on the request
-                // context; the response handler reads it via `ctx`.
-                // Non-reversible rules behave identically to the old
-                // `redact_json` (replace with the static replacement;
-                // capture is unused for them).
-                let mut capture = sbproxy_security::pii::ReversibleCapture::new();
-                redactor.redact_json_with_capture(&mut body, &mut capture);
-                if !capture.is_empty() {
-                    ctx.ai_reversible_redactions = capture.pairs;
-                }
-                tracing::debug!("AI proxy: applied request-body PII redaction");
-            }
-        }
-    }
+    // WOR-1044: the helper captures reversible replacements on `ctx`; every
+    // JSON-capable surface uses the same redaction seam.
+    apply_json_request_pii_redaction(config, ctx, &mut body);
 
     // Body-aware prompt injection runs only on parsed, PII-rewritten prompt
     // segments. Dynamic key resolution and request quota admission already
@@ -5160,20 +5572,6 @@ pub(super) async fn handle_ai_proxy(
     // skipping `relay_ai_response_with_cache` also means cascade
     // does not engage the semantic cache write or idempotency
     // capture in v1, which is documented in the example README.
-    if native_api_key.is_some()
-        && !is_stream
-        && !has_managed_local
-        && router.cascade_config().is_some()
-        && !disallow_training
-    {
-        send_error(
-            session,
-            503,
-            "native provider keys are unavailable for confidence cascade routing",
-        )
-        .await?;
-        return Ok(());
-    }
     if let Some(cascade_cfg) = router
         .cascade_config()
         .filter(|_| !disallow_training && !has_managed_local)
@@ -10225,10 +10623,24 @@ mod external_guardrail_context_tests {
                 .expect("write request headers");
             stream.write_all(&body).await.expect("write request body");
             let mut response = Vec::new();
-            stream
-                .read_to_end(&mut response)
-                .await
-                .expect("read downstream response");
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(read) => response.extend_from_slice(&chunk[..read]),
+                    // An early policy refusal deliberately leaves the request
+                    // body unread. The raw socket fixture may observe the
+                    // resulting close as ECONNRESET after receiving the full
+                    // response; retain those response bytes as EOF.
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::ConnectionReset
+                            && !response.is_empty() =>
+                    {
+                        break;
+                    }
+                    Err(error) => panic!("read downstream response: {error:?}"),
+                }
+            }
             response
         }));
         let (stream, _) =
@@ -11612,6 +12024,148 @@ mod external_guardrail_context_tests {
             .expect("guardrail request timed out")
             .expect("guardrail fixture dropped");
         assert_eq!(payload["phase"], "output");
+    }
+
+    async fn run_native_cascade_refusal(
+        config: &sbproxy_ai::AiHandlerConfig,
+        pipeline: &crate::pipeline::CompiledPipeline,
+        body: serde_json::Value,
+    ) -> String {
+        let (mut session, client) = downstream_session(body).await;
+        let mut context = crate::context::RequestContext::new();
+        context.inbound_key_mode = crate::context::InboundKeyMode::Native;
+        context.native_key_provider = Some("openai".to_string());
+
+        super::handle_ai_proxy(
+            &mut session,
+            config,
+            pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("native cascade refusal is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(
+            response.contains("native provider keys are unavailable for confidence cascade"),
+            "{response}"
+        );
+        assert!(
+            context.ai_model.is_none(),
+            "refusal must precede model routing and managed-local preparation"
+        );
+        response
+    }
+
+    #[tokio::test]
+    async fn native_cascade_refuses_before_stream_managed_cache_and_idempotency_side_effects() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = cascade_error_proxy_config(&upstream_url);
+
+        // Idempotency hit: the early refusal must not even ask the cache.
+        let (idempotency_pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        *idempotency.hit.lock().expect("idempotency hit lock") =
+            Some(sbproxy_middleware::idempotency::CachedResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: br#"{"cached":true}"#.to_vec(),
+                request_body_hash: [0; 32],
+                expires_at_unix: u64::MAX,
+            });
+        run_native_cascade_refusal(
+            &config,
+            &idempotency_pipeline,
+            serde_json::json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+        assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
+        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+
+        // Semantic hit and miss get independent passes with idempotency
+        // disabled, proving neither side of lookup runs.
+        for semantic_hit in [false, true] {
+            let (mut pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+            pipeline.idempotencies[0] = None;
+            if semantic_hit {
+                *semantic.hit.lock().expect("semantic hit lock") =
+                    Some(crate::hooks::CachedResponse {
+                        status: 200,
+                        headers: std::collections::HashMap::new(),
+                        body: bytes::Bytes::from_static(br#"{"cached":true}"#),
+                        cached_at: std::time::SystemTime::now(),
+                    });
+            }
+            run_native_cascade_refusal(
+                &config,
+                &pipeline,
+                serde_json::json!({
+                    "model": "requested-model",
+                    "messages": [{"role": "user", "content": "fixture prompt"}]
+                }),
+            )
+            .await;
+            assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+            assert_eq!(semantic.stores.load(Ordering::SeqCst), 0);
+            assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
+        }
+
+        // Streaming previously fell through to tier one; it now refuses at
+        // the same pre-body seam.
+        let (stream_pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        run_native_cascade_refusal(
+            &config,
+            &stream_pipeline,
+            serde_json::json!({
+                "model": "requested-model",
+                "stream": true,
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
+
+        // Managed-local routing must refuse before engine preparation.
+        let managed = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "local",
+                "serve": {"models": [{"model": "qwen3-14b"}]}
+            }],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [{
+                    "provider_id": "local",
+                    "model": "qwen3-14b",
+                    "quality_threshold": 0.5
+                }]
+            }
+        }))
+        .expect("managed cascade config");
+        let (managed_pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        run_native_cascade_refusal(
+            &managed,
+            &managed_pipeline,
+            serde_json::json!({
+                "model": "qwen3-14b",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "native cascade refusal must never contact an upstream"
+        );
     }
 
     #[tokio::test]

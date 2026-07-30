@@ -87,9 +87,12 @@ proxies cannot misfire. A caller presenting their own `sk-proj-...` or
 `sk-ant-...` provider key is governed by the native-key policy described below
 and, when allowed, passes through to the upstream that owns it.
 
-The header a key arrives in is always removed before the request goes upstream.
-Your key is not an upstream credential, and forwarding it would hand a governed
-secret to every origin the proxy talks to.
+The configured carrier list is also the lookup surface for legacy stored
+`sk-<id>-<secret>` keys and exact `credentials: {type: ai_provider}` values on
+AI routes. Resolution order is canonical `sbp_...`, stored legacy key, exact
+configured credential, then provider-native policy. The winning governed
+carrier is removed before dispatch, so its caller secret cannot accompany the
+operator's provider credential upstream.
 
 ### Two ways to use it
 
@@ -131,13 +134,21 @@ absent or the recognized provider is not listed, SBproxy returns 403 before
 dispatch. A credential matching no hint remains unattributed and follows the
 origin's ordinary auth behavior.
 
-The same block is the KeyRecord-shaped default for admitted native traffic.
-`max_requests_per_minute`, `max_tokens_per_minute`, `max_budget_tokens`,
-`max_budget_usd`, `allowed_models`, `blocked_models`, and
-`require_pii_redaction` enter the ordinary governed-key enforcement path.
+The same block is lowered to a secret-free KeyRecord-shaped default. Every
+traffic type gets provider admission, audit attribution, a stable
+tenant/origin/provider identity, and automatic
+`max_requests_per_minute` enforcement. AI routes additionally apply provider
+and model policy, token/cost budget preflight, and PII requirements wherever
+the request shape can be interpreted. JSON POST and PUT/PATCH bodies can be
+inspected and redacted. Multipart and Realtime cannot safely satisfy required
+PII redaction and fail closed when a credential requires it; bodyless or
+otherwise uninterpretable methods fail closed when model policy requires a
+model. Multipart and non-POST responses do not yet settle token/cost counters,
+so those fields are admission signals rather than strict usage ceilings on
+those surfaces.
+
 Limits are bucketed by tenant, origin, and recognized provider; no credential
-bytes are hashed, retained, or used as an identifier. Model, PII, exhausted
-rate, and exhausted budget decisions fail before upstream dispatch.
+bytes are hashed, retained, or used as an identifier.
 
 On a generic proxy route, an allowed caller-owned credential passes upstream
 unchanged, even when that origin also configures `outbound_credential`: native
@@ -151,8 +162,10 @@ provider exists, the request fails before any upstream call. Minted `sbp_...`
 keys always take precedence and never enter native-key policy resolution.
 
 Confidence cascade routing is unavailable for native credentials and returns
-503 before the first tier runs. A cascade can move between billable providers,
-but the caller authorized only the provider represented by their credential.
+503 before request-body processing, cache or idempotency lookup, managed-model
+preparation, streaming dispatch, or the first upstream tier. A cascade can move
+between billable providers, but the caller authorized only the provider
+represented by their credential.
 For the same reason, configured shadow copies are suppressed for native
 traffic: the primary response proceeds normally, while neither the caller
 credential nor an operator credential is sent to the shadow target.

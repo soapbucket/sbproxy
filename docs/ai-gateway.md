@@ -1090,6 +1090,13 @@ Refresh the vendored file out of band with `scripts/refresh-model-prices.sh /etc
 
 Issue per-team or per-app keys that the gateway validates locally. Each key can pin a provider, restrict models, set its own request rate, carry its own budget ceiling, and tag requests for downstream attribution. The shipped shape is a `credentials:` list of `type: ai_provider` entries next to the origin's `action:` block; the same block also lives at `tenants[].credentials` and `proxy.credentials` scope, with origin shadowing tenant shadowing proxy for entries that share a `name`. The legacy `virtual_keys:` key is rejected at config compile with a pointer to [migration-credentials.md](migration-credentials.md).
 
+With key management enabled, exact configured values are resolved from every
+carrier in `key_management.inbound.headers`, including its configured scheme;
+the defaults cover `Authorization: Bearer`, `x-api-key`, and `x-sb-api`.
+Canonical and stored legacy keys take precedence, and provider-native policy is
+the final fallback. Without key management, configured values retain the
+legacy `Authorization: Bearer` lookup.
+
 Set `action.require_governed_key: true` to reject requests that do not resolve
 to a governed public key identity on that origin. Dynamic mutation, the full
 policy field contract, effective-policy preview, and fail-closed behavior are
@@ -1413,11 +1420,36 @@ A request with `stream: true` enters the SSE relay only when the upstream return
 
 ### Method coverage
 
-The gateway accepts any standard HTTP method for any supported surface. GET, POST, PUT, DELETE, PATCH, HEAD, and OPTIONS all dispatch through the same provider-selection and observability surface. Non-POST methods do not engage the standard JSON POST inference pipeline, so they do not perform JSON body parsing or stored-key token and cost settlement. Method-aware dispatch is what makes `DELETE /v1/assistants/{id}`, `POST /v1/threads/{id}/runs/{id}/cancel`, and the other non-POST verbs work end-to-end. Strict settlement for these methods is deferred to WOR-1845.
+The gateway accepts any standard HTTP method for any supported surface. GET,
+POST, PUT, DELETE, PATCH, HEAD, and OPTIONS share credential resolution,
+provider policy, rate admission, and observability. PUT and PATCH JSON bodies
+also apply governed model routing, model allow/block policy, request PII
+redaction, and token/cost budget preflight before idempotency lookup or
+dispatch. Locally served discovery endpoints filter their results by provider
+and model policy. Other bodyless methods cannot interpret a model or redact a
+body, so a credential that requires either fails closed on those requests.
+
+Non-POST responses do not yet settle stored-key token and cost counters.
+Method-aware dispatch is what makes `DELETE /v1/assistants/{id}`,
+`POST /v1/threads/{id}/runs/{id}/cancel`, and the other non-POST verbs work
+end-to-end when their credential policy is satisfiable. Strict settlement for
+these methods is deferred to WOR-1845.
 
 ### Multipart bodies
 
-Image edits, image variations, audio transcription, and audio translation send multipart request bodies. The proxy detects multipart by inspecting the inbound `Content-Type` header; when it starts with `multipart/`, the body is forwarded via `AiClient::forward_bytes` with the original Content-Type preserved. A governed key's `route_to_model` rewrites only the bounded multipart `model` part before forwarding; every other part remains byte-for-byte. Provider format translation (Anthropic, etc.) does not run for multipart, since these surfaces are OpenAI-only. Multipart responses do not currently settle stored-key token-per-minute or lifetime token and cost counters; that work is deferred to WOR-1845.
+Image edits, image variations, audio transcription, and audio translation send
+multipart request bodies. The proxy detects multipart from the inbound
+`Content-Type`; when it starts with `multipart/`, the body is forwarded with
+that Content-Type preserved. A governed key's model policy is checked against
+the bounded `model` part, and `route_to_model` or a budget downgrade rewrites
+only that part. A required model with no interpretable model part fails closed.
+Because the gateway cannot safely apply JSON PII redaction to arbitrary
+multipart bytes, a credential with `require_pii_redaction` is rejected before
+idempotency, cache, or provider dispatch.
+
+Provider format translation does not run for multipart. Multipart responses do
+not currently settle stored-key token-per-minute or lifetime token and cost
+counters; that work is deferred to WOR-1845.
 
 ### Per-surface configuration
 
@@ -1708,7 +1740,13 @@ locally, and there are no per-surface emulation config blocks.
 
 ### `realtime`
 
-Realtime WebSocket proxying ships and is documented in the [Realtime](#realtime-1) section below: the gateway gates the upgrade on provider capability, applies `per_surface_rate_limits.realtime`, and forwards frames byte-transparently. There is no `realtime:` config key on the action; writing one is silently ignored. Realtime instead uses the action's shared provider, rate-limit, budget, and governed-key settings.
+Realtime WebSocket proxying ships and is documented in the
+[Realtime](#realtime-1) section below. The gateway resolves credential policy,
+checks provider and model eligibility, applies per-key and per-surface RPM plus
+budget preflight, and then forwards frames byte-transparently. A credential
+that requires PII redaction is rejected because opaque WebSocket frames cannot
+meet that requirement. There is no `realtime:` config key on the action;
+writing one is silently ignored.
 
 The action-level `budget` block and governed-key identity also participate in
 pre-upgrade admission. Provider and bound key-plane credentials are selected
@@ -1719,7 +1757,11 @@ The `realtime.rs` module itself is design-stage shape code with no serving-path 
 
 ## Per-request attribution
 
-The gateway records provider, model, token counts, and estimated cost for every AI request and exposes them through Prometheus metrics (see below). Direct response headers for these fields are not emitted today.
+The gateway records provider and model when they are resolved, and token counts
+or estimated cost when the surface and provider response make them
+interpretable. It does not invent token/cost values for opaque multipart,
+method-aware, or Realtime traffic. Available values are exposed through
+Prometheus metrics (see below); direct response headers are not emitted today.
 
 ### Authoritative identity: tenant and credential
 
@@ -1927,6 +1969,13 @@ What runs before the upgrade:
 - Governed-key identity is resolved before dispatch. Its immutable public key
   id scopes any per-key budget; the plaintext key is never used as a budget
   key or stored on the realtime request context.
+- Provider allow/block policy and native-provider matching constrain the
+  selected Realtime provider. Model allow/block policy is applied to the
+  query model; a required model that is absent fails closed. A
+  `route_to_model` override becomes the authoritative upstream query value.
+- Per-key RPM is charged once before upgrade. A credential requiring PII
+  redaction fails closed because frame-transparent proxying cannot inspect and
+  rewrite the session safely.
 - Hard budget admission uses the action budget merged with the governed key's
   budget. `block` returns the existing 402 `budget_exceeded` JSON response,
   `log` warns and continues, and `downgrade` makes the target model

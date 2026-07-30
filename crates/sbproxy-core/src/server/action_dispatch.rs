@@ -156,28 +156,24 @@ pub(super) async fn handle_action(
                     }
                 }
 
-                // 501 gate: pick the first provider that supports realtime.
-                let provider = ai
-                    .config
-                    .providers
-                    .iter()
-                    .find(|p| sbproxy_ai::api_routes::provider_supports_realtime(&p.name));
-                let provider = match provider {
-                    Some(p) => p,
-                    None => {
-                        warn!(
-                            ai.surface = surface_label,
-                            "AI realtime: no configured provider supports realtime; returning 501"
-                        );
-                        send_error(session, 501, "no configured AI provider supports realtime")
-                            .await?;
-                        return Ok(true);
-                    }
-                };
+                // 501 gate: at least one configured provider must support
+                // realtime. Identity-specific provider selection happens
+                // after credential policy is resolved below.
+                let any_realtime_provider = ai.config.providers.iter().any(|p| {
+                    p.enabled && sbproxy_ai::api_routes::provider_supports_realtime(&p.name)
+                });
+                if !any_realtime_provider {
+                    warn!(
+                        ai.surface = surface_label,
+                        "AI realtime: no configured provider supports realtime; returning 501"
+                    );
+                    send_error(session, 501, "no configured AI provider supports realtime").await?;
+                    return Ok(true);
+                }
 
                 let requested_model = realtime_model_from_uri(&session.req_header().uri);
                 let budget_model = requested_model.as_deref().filter(|model| !model.is_empty());
-                let model_override = match realtime_budget_gate(
+                let admission = match realtime_budget_gate(
                     session,
                     &ai.config,
                     pipeline,
@@ -187,17 +183,26 @@ pub(super) async fn handle_action(
                 )
                 .await
                 {
-                    Ok(BudgetGate::Allow) => None,
-                    Ok(BudgetGate::Block { status, body }) => {
-                        send_response(session, status, "application/json", &body).await?;
-                        return Ok(true);
-                    }
-                    Ok(BudgetGate::Downgrade { model }) => Some(model),
+                    Ok(admission) => admission,
                     Err((status, message)) => {
                         send_error(session, status, &message).await?;
                         return Ok(true);
                     }
                 };
+                let model_override = match admission.budget_gate {
+                    BudgetGate::Allow => None,
+                    BudgetGate::Block { status, body } => {
+                        send_response(session, status, "application/json", &body).await?;
+                        return Ok(true);
+                    }
+                    BudgetGate::Downgrade { model } => Some(model),
+                };
+                let provider = ai
+                    .config
+                    .providers
+                    .iter()
+                    .find(|provider| provider.name == admission.provider_name)
+                    .expect("realtime admission selected a configured provider");
                 if let Some(model) = model_override
                     .as_deref()
                     .or(requested_model.as_deref())

@@ -407,6 +407,29 @@ impl KeyRateLimiter {
 
     /// Check if a request is within rate limits for a key. Returns true if allowed.
     pub fn check_rate(&self, key: &str, config: &VirtualKeyConfig) -> bool {
+        self.check_limits(
+            key,
+            config.max_requests_per_minute,
+            config.max_tokens_per_minute,
+        )
+    }
+
+    /// Check only the request-count limit for a stable key id.
+    ///
+    /// Generic proxy routes do not have an AI [`VirtualKeyConfig`], but native
+    /// provider credentials still carry a request limit in their secret-free
+    /// policy record. Keeping this on the same limiter makes one RPM window
+    /// cover every traffic surface for that governed identity.
+    pub fn check_request_rate(&self, key: &str, max_requests_per_minute: Option<u64>) -> bool {
+        self.check_limits(key, max_requests_per_minute, None)
+    }
+
+    fn check_limits(
+        &self,
+        key: &str,
+        max_requests_per_minute: Option<u64>,
+        max_tokens_per_minute: Option<u64>,
+    ) -> bool {
         let mut state = self.state.lock();
         // WOR-1691: allocate the key only on the first-seen miss instead
         // of `entry(key.to_string())` cloning it on every request for a
@@ -429,7 +452,7 @@ impl KeyRateLimiter {
         }
 
         // Check requests per minute.
-        if let Some(max_rpm) = config.max_requests_per_minute {
+        if let Some(max_rpm) = max_requests_per_minute {
             if entry.requests_this_minute >= max_rpm {
                 return false;
             }
@@ -440,7 +463,7 @@ impl KeyRateLimiter {
         // once the cap is spent. Deliberately no pre-charge estimate:
         // the first request of a window always passes, and heavy usage
         // shuts the window for the remainder of the minute.
-        if let Some(max_tpm) = config.max_tokens_per_minute {
+        if let Some(max_tpm) = max_tokens_per_minute {
             if entry.tokens_this_minute >= max_tpm {
                 return false;
             }
@@ -737,6 +760,22 @@ mod tests {
         assert!(limiter.check_rate("sk-1", &config));
         // Third request should be blocked.
         assert!(!limiter.check_rate("sk-1", &config));
+    }
+
+    #[test]
+    fn generic_and_ai_requests_share_one_rpm_window() {
+        let limiter = KeyRateLimiter::new();
+        let config = VirtualKeyConfig {
+            max_requests_per_minute: Some(2),
+            ..make_key("native:tenant:origin:openai", true)
+        };
+
+        assert!(limiter.check_request_rate("native:tenant:origin:openai", Some(2)));
+        assert!(limiter.check_rate("native:tenant:origin:openai", &config));
+        assert!(
+            !limiter.check_request_rate("native:tenant:origin:openai", Some(2)),
+            "generic and AI traffic must not get independent RPM buckets"
+        );
     }
 
     #[test]

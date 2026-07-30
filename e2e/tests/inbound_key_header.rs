@@ -32,6 +32,10 @@ impl SeenHeaders {
     fn has(&self, name: &str) -> bool {
         self.get(name).is_some()
     }
+
+    fn contains_value(&self, needle: &str) -> bool {
+        self.headers.iter().any(|(_, value)| value.contains(needle))
+    }
 }
 
 /// A one-shot upstream that records the request it was given and answers 200.
@@ -583,6 +587,280 @@ fn add_native_policy_fields(yaml: String, fields: &str) -> String {
     )
 }
 
+fn without_native_key_policy(yaml: String) -> String {
+    yaml.replace(
+        "      native_key_policy:\n        allowed_providers:\n          - anthropic\n          - openai\n",
+        "",
+    )
+}
+
+fn legacy_token_from_minted(token: &str) -> String {
+    let rest = token
+        .strip_prefix("sbp_")
+        .expect("admin minted canonical token");
+    let (key_id, secret) = rest.split_once('_').expect("canonical token separator");
+    format!("sk-{key_id}-{secret}")
+}
+
+fn ai_request_with_bearer(
+    harness: &ProxyHarness,
+    bearer: &str,
+    model: &str,
+) -> reqwest::blocking::Response {
+    reqwest::blocking::Client::new()
+        .post(format!("{}/v1/chat/completions", harness.base_url()))
+        .header("Host", "ai.local")
+        .header("authorization", format!("Bearer {bearer}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .expect("AI proxy response")
+}
+
+fn ai_request_with_credential_header(
+    harness: &ProxyHarness,
+    header: &str,
+    value: &str,
+    model: &str,
+) -> reqwest::blocking::Response {
+    reqwest::blocking::Client::new()
+        .post(format!("{}/v1/chat/completions", harness.base_url()))
+        .header("Host", "ai.local")
+        .header(header, value)
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .expect("AI proxy response")
+}
+
+#[test]
+fn stored_legacy_key_beats_native_hint_with_policy_absent_or_permissive() {
+    for native_policy_present in [false, true] {
+        let upstream = StubUpstream::start().expect("stub upstream");
+        let admin_port = free_port();
+        let mut yaml = config(admin_port, upstream.port, &openai_origin(upstream.port, ""));
+        if !native_policy_present {
+            yaml = without_native_key_policy(yaml);
+        }
+        let harness = ProxyHarness::start_with_yaml(&yaml).expect("proxy starts");
+        let minted = mint(
+            admin_port,
+            serde_json::json!({
+                "name": "stored-legacy",
+                "allowed_models": ["gpt-test"]
+            }),
+        );
+        let legacy = legacy_token_from_minted(&minted);
+
+        let response = ai_request_with_bearer(&harness, &legacy, "gpt-test");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "stored legacy resolution must precede native admission"
+        );
+        let seen = upstream.next_request();
+        assert_eq!(
+            seen.get("authorization"),
+            Some("Bearer operator-key-must-not-be-billed"),
+            "the stored key governs the request while the configured provider credential is used"
+        );
+        assert!(
+            !seen
+                .get("authorization")
+                .is_some_and(|value| value.contains(&legacy)),
+            "the caller's legacy virtual-key secret must not reach the provider"
+        );
+    }
+}
+
+#[test]
+fn wrong_or_unknown_legacy_keys_deny_before_native_fallback() {
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let admin_port = free_port();
+    let harness = ProxyHarness::start_with_yaml(&config(
+        admin_port,
+        upstream.port,
+        &openai_origin(upstream.port, ""),
+    ))
+    .expect("proxy starts");
+    let minted = mint(admin_port, serde_json::json!({"name": "known-legacy"}));
+    let legacy = legacy_token_from_minted(&minted);
+    let (known_id, _) = legacy
+        .strip_prefix("sk-")
+        .and_then(|rest| rest.split_once('-'))
+        .expect("legacy token parts");
+    let attempts = [
+        format!("sk-{known_id}-{}", "0".repeat(64)),
+        format!("sk-{}-{}", "f".repeat(16), "e".repeat(64)),
+    ];
+
+    for attempt in attempts {
+        assert_eq!(
+            ai_request_with_bearer(&harness, &attempt, "gpt-test")
+                .status()
+                .as_u16(),
+            401,
+            "a conforming legacy virtual-key attempt must never degrade to native traffic"
+        );
+    }
+    upstream.assert_no_request("invalid legacy virtual keys must fail before provider dispatch");
+}
+
+#[test]
+fn minted_denials_emit_secret_free_mode_metrics_and_audit() {
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let admin_port = free_port();
+    let yaml = format!(
+        "{}\nobservability:\n  log:\n    sinks:\n      - name: stdout\n        format: json\n        profile: internal\n  metrics:\n    enabled: true\n",
+        config(admin_port, upstream.port, "")
+    );
+    let harness =
+        ProxyHarness::start_with_workspace(&yaml, &[]).expect("proxy with captured logs starts");
+    let denied_token = format!("sbp_{}_{}", "f".repeat(16), "deadbeef".repeat(8));
+    assert_eq!(denied_token.len(), 4 + 16 + 1 + 64);
+
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{}/denied", harness.base_url()))
+        .header("Host", "tools.local")
+        .header("authorization", format!("Bearer {denied_token}"))
+        .send()
+        .expect("denied response");
+    assert_eq!(response.status().as_u16(), 401);
+    upstream.assert_no_request("an unknown minted key must not reach the origin");
+
+    std::thread::sleep(Duration::from_millis(100));
+    let metrics = harness
+        .get("/metrics", "tools.local")
+        .expect("metrics response")
+        .text()
+        .expect("metrics UTF-8");
+    assert!(
+        metrics.contains(
+            "sbproxy_inbound_key_requests_total{api_key_id=\"\",key_mode=\"minted\",provider=\"\""
+        ),
+        "denied minted attempts must retain minted mode without provider attribution: {metrics}"
+    );
+    let logs = harness.stdout_contents();
+    assert!(logs.contains("\"event_type\":\"auth_denied\""), "{logs}");
+    assert!(logs.contains("\"key_mode\":\"minted\""), "{logs}");
+    assert!(
+        !logs.contains("\"key_provider\":"),
+        "minted denials must not invent provider attribution: {logs}"
+    );
+    assert!(
+        !logs.contains(&denied_token),
+        "audit leaked the bearer secret"
+    );
+    assert!(
+        !metrics.contains(&denied_token),
+        "metrics leaked the bearer secret"
+    );
+}
+
+fn openai_origin_with_configured_key(upstream_port: u16) -> String {
+    format!(
+        r#"  ai.local:
+    credentials:
+      - name: documented-configured-key
+        type: ai_provider
+        provider: openai
+        key: sk-your-virtual-key
+        models:
+          allow: [gpt-configured]
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: operator-configured-provider-key
+          base_url: http://127.0.0.1:{upstream_port}
+          allow_private_base_url: true
+          models: [gpt-configured, gpt-test]
+"#
+    )
+}
+
+#[test]
+fn exact_configured_ai_provider_key_beats_native_hint_without_forwarding_the_secret() {
+    for native_policy_present in [false, true] {
+        for (header, value) in [
+            ("authorization", "Bearer sk-your-virtual-key"),
+            ("x-api-key", "sk-your-virtual-key"),
+            ("x-sb-api", "sk-your-virtual-key"),
+        ] {
+            let upstream = StubUpstream::start().expect("stub upstream");
+            let admin_port = free_port();
+            let mut yaml = config(
+                admin_port,
+                upstream.port,
+                &openai_origin_with_configured_key(upstream.port),
+            );
+            if !native_policy_present {
+                yaml = without_native_key_policy(yaml);
+            }
+            let harness = ProxyHarness::start_with_yaml(&yaml).expect("proxy starts");
+
+            let response =
+                ai_request_with_credential_header(&harness, header, value, "gpt-configured");
+            assert_eq!(
+                response.status().as_u16(),
+                200,
+                "exact configured credentials on {header} must resolve before native admission"
+            );
+            let seen = upstream.next_request();
+            assert_eq!(
+                seen.get("authorization"),
+                Some("Bearer operator-configured-provider-key")
+            );
+            assert!(
+                !seen.contains_value("sk-your-virtual-key"),
+                "the configured caller secret from {header} must not be forwarded"
+            );
+            assert_eq!(
+                ai_request_with_credential_header(&harness, header, value, "gpt-test")
+                    .status()
+                    .as_u16(),
+                403,
+                "configured governance from {header} must be applied, not merely authenticated"
+            );
+            upstream.assert_no_request(
+                "a model denied by the configured credential must not reach the provider",
+            );
+        }
+    }
+}
+
+#[test]
+fn genuine_openai_project_key_falls_through_to_native_governance() {
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let admin_port = free_port();
+    let harness = ProxyHarness::start_with_yaml(&config(
+        admin_port,
+        upstream.port,
+        &openai_origin(upstream.port, ""),
+    ))
+    .expect("proxy starts");
+    let native = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
+
+    assert_eq!(
+        ai_request_with_bearer(&harness, native, "gpt-test")
+            .status()
+            .as_u16(),
+        200
+    );
+    let seen = upstream.next_request();
+    let expected_authorization = format!("Bearer {native}");
+    assert_eq!(
+        seen.get("authorization"),
+        Some(expected_authorization.as_str()),
+        "a genuine provider key must remain caller-owned native traffic"
+    );
+}
+
 #[test]
 fn native_policy_enforces_model_and_pii_requirements_before_dispatch() {
     let upstream = StubUpstream::start().expect("stub upstream");
@@ -667,6 +945,140 @@ fn native_policy_enforces_rate_and_budget_limits() {
         402
     );
     budget_upstream.assert_no_request("exhausted native token budget must block dispatch");
+}
+
+#[test]
+fn native_policy_enforces_rpm_on_generic_proxy_traffic() {
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let admin_port = free_port();
+    let yaml = add_native_policy_fields(
+        config(admin_port, upstream.port, ""),
+        "        max_requests_per_minute: 2\n",
+    );
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("proxy starts");
+    let client = reqwest::blocking::Client::new();
+    let send = || {
+        client
+            .get(format!("{}/resource", harness.base_url()))
+            .header("Host", "tools.local")
+            .header(
+                "authorization",
+                "Bearer sk-proj-generic-native-rate-test-0123456789",
+            )
+            .send()
+            .expect("generic proxy response")
+    };
+
+    assert_eq!(send().status().as_u16(), 200);
+    let _ = upstream.next_request();
+    assert_eq!(
+        send().status().as_u16(),
+        200,
+        "max_rpm=2 must admit two requests; native RPM may be charged only once per request"
+    );
+    let _ = upstream.next_request();
+    assert_eq!(
+        send().status().as_u16(),
+        429,
+        "native RPM must govern generic proxy traffic as well as AI traffic"
+    );
+    upstream.assert_no_request("exhausted native RPM must block generic dispatch");
+}
+
+#[test]
+fn native_model_policy_fails_closed_on_method_aware_requests() {
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let admin_port = free_port();
+    let yaml = add_native_policy_fields(
+        config(admin_port, upstream.port, &openai_origin(upstream.port, "")),
+        "        allowed_models: [gpt-allowed]\n",
+    );
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("proxy starts");
+    let client = reqwest::blocking::Client::new();
+    let native = "Bearer sk-proj-method-policy-test-0123456789";
+
+    let blocked_model = client
+        .put(format!("{}/v1/fine_tuning/jobs/job-1", harness.base_url()))
+        .header("Host", "ai.local")
+        .header("authorization", native)
+        .json(&serde_json::json!({"model": "gpt-denied", "metadata": {"owner": "team"}}))
+        .send()
+        .expect("method-aware response");
+    assert_eq!(
+        blocked_model.status().as_u16(),
+        403,
+        "an interpretable PUT model must be checked against native policy"
+    );
+
+    let missing_model = client
+        .delete(format!("{}/v1/files/file-1", harness.base_url()))
+        .header("Host", "ai.local")
+        .header("authorization", native)
+        .send()
+        .expect("method-aware response");
+    assert_eq!(
+        missing_model.status().as_u16(),
+        403,
+        "a method with no interpretable model must fail closed when model policy is required"
+    );
+
+    let missing_get_model = client
+        .get(format!("{}/v1/files/file-1", harness.base_url()))
+        .header("Host", "ai.local")
+        .header("authorization", native)
+        .send()
+        .expect("GET method-aware response");
+    assert_eq!(
+        missing_get_model.status().as_u16(),
+        403,
+        "a forwarded GET must fail closed when credential model policy cannot be interpreted"
+    );
+    upstream.assert_no_request("native method policy denials must happen before dispatch");
+}
+
+#[test]
+fn native_required_pii_redaction_fails_closed_for_multipart() {
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let admin_port = free_port();
+    let action_extra = r#"      pii:
+        enabled: true
+        defaults: true
+        redact_request: true
+"#;
+    let yaml = add_native_policy_fields(
+        config(
+            admin_port,
+            upstream.port,
+            &openai_origin(upstream.port, action_extra),
+        ),
+        "        require_pii_redaction: [email]\n",
+    );
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("proxy starts");
+    let boundary = "sbproxy-native-pii";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-test\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"alice@example.com.wav\"\r\nContent-Type: audio/wav\r\n\r\nfixture\r\n--{boundary}--\r\n"
+    );
+
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{}/v1/audio/transcriptions", harness.base_url()))
+        .header("Host", "ai.local")
+        .header(
+            "authorization",
+            "Bearer sk-proj-multipart-pii-test-0123456789",
+        )
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .expect("multipart response");
+    assert_eq!(
+        response.status().as_u16(),
+        403,
+        "required PII policy must not claim multipart redaction it cannot perform"
+    );
+    upstream.assert_no_request("unsupported required multipart PII must fail before dispatch");
 }
 
 #[test]

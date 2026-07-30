@@ -97,6 +97,26 @@ fn key_management_fields(admin_port: u16, store_path: &Path) -> String {
     )
 }
 
+fn native_key_management_fields(store_path: &Path, policy_fields: &str) -> String {
+    let store_path = serde_json::to_string(&store_path.display().to_string())
+        .expect("quote embedded store path");
+    format!(
+        r#"  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: {store_path}
+    crypto:
+      pepper: realtime-native-e2e-pepper
+      master_key: realtime-native-e2e-master
+    inbound:
+      require: false
+      native_key_policy:
+        allowed_providers: [openai]
+{policy_fields}"#
+    )
+}
+
 fn pick_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("ephemeral admin listener")
@@ -459,6 +479,88 @@ fn realtime_budget_block_log_and_downgrade_are_enforced_before_upgrade() {
         );
 
         assert_clean_close(&mut downgrade_websocket).await;
+    });
+}
+
+#[test]
+fn native_realtime_fails_closed_for_required_model_and_pii_policy() {
+    let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+    runtime.block_on(async {
+        let upstream = spawn_echo_ws_server().await;
+        let model_temp = tempfile::tempdir().expect("model key store tempdir");
+        let model_proxy_fields = native_key_management_fields(
+            &model_temp.path().join("keys.redb"),
+            "        allowed_models: [gpt-realtime]\n",
+        );
+        let model_config = realtime_config(
+            upstream.http_url(),
+            "operator-secret",
+            &model_proxy_fields,
+            "",
+            "",
+        );
+        let model_harness =
+            ProxyHarness::start_with_yaml(&model_config).expect("start model policy proxy");
+        for path in ["/v1/realtime?model=gpt-denied", "/v1/realtime"] {
+            let error = match dial_websocket(
+                &model_harness,
+                REALTIME_HOST,
+                path,
+                &[(
+                    "authorization",
+                    "Bearer sk-proj-realtime-model-policy-0123456789",
+                )],
+            )
+            .await
+            {
+                Ok(_) => panic!("required realtime model policy must refuse this upgrade"),
+                Err(error) => error,
+            };
+            assert_handshake_status(error, 403);
+        }
+        assert!(
+            upstream.captured().is_empty(),
+            "model-policy denials must not complete an upstream upgrade"
+        );
+        drop(model_harness);
+
+        let pii_temp = tempfile::tempdir().expect("PII key store tempdir");
+        let pii_proxy_fields = native_key_management_fields(
+            &pii_temp.path().join("keys.redb"),
+            "        require_pii_redaction: [email]\n",
+        );
+        let pii_config = realtime_config(
+            upstream.http_url(),
+            "operator-secret",
+            &pii_proxy_fields,
+            r#"      pii:
+        enabled: true
+        defaults: true
+        redact_request: true
+"#,
+            "",
+        );
+        let pii_harness =
+            ProxyHarness::start_with_yaml(&pii_config).expect("start PII policy proxy");
+        let error = match dial_websocket(
+            &pii_harness,
+            REALTIME_HOST,
+            "/v1/realtime?model=gpt-realtime",
+            &[(
+                "authorization",
+                "Bearer sk-proj-realtime-pii-policy-0123456789",
+            )],
+        )
+        .await
+        {
+            Ok(_) => panic!("required realtime PII policy must refuse the upgrade"),
+            Err(error) => error,
+        };
+        assert_handshake_status(error, 403);
+        assert!(
+            upstream.captured().is_empty(),
+            "PII-policy denial must not complete an upstream upgrade"
+        );
     });
 }
 

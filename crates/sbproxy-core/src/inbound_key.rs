@@ -39,6 +39,58 @@ pub enum SweepOutcome {
     Ambiguous,
 }
 
+/// One non-empty credential presented through a configured inbound carrier.
+///
+/// The value borrows the request header so callers can resolve overlapping
+/// legacy/configured/native credential shapes without copying secret material
+/// into another long-lived structure.
+pub struct PresentedCredential<'a> {
+    /// Lowercase configured header name.
+    pub header: String,
+    /// Scheme-stripped credential value.
+    pub value: &'a str,
+}
+
+/// Return every non-empty credential on the configured inbound carriers.
+///
+/// Unlike [`sweep_headers`], this does not filter by minted-token shape. AI
+/// dispatch uses it only after the canonical minted sweep has returned
+/// `NotPresent`, to resolve legacy stored and exact configured credentials
+/// before falling back to provider-native admission.
+pub fn presented_credentials<'a>(
+    headers: &'a http::HeaderMap,
+    cfg: &KeyInboundConfig,
+) -> Vec<PresentedCredential<'a>> {
+    let mut presented = Vec::new();
+    for entry in &cfg.headers {
+        let lower = entry.name.trim().to_ascii_lowercase();
+        let Ok(name) = http::header::HeaderName::from_bytes(lower.as_bytes()) else {
+            continue;
+        };
+        for raw in headers.get_all(&name).iter().take(MAX_VALUES_PER_HEADER) {
+            let Ok(value) = raw.to_str() else {
+                continue;
+            };
+            let value = value.trim();
+            let candidate = if entry.scheme.is_empty() {
+                value
+            } else {
+                match strip_scheme(value, &entry.scheme) {
+                    Some(rest) => rest,
+                    None => continue,
+                }
+            };
+            if !candidate.is_empty() {
+                presented.push(PresentedCredential {
+                    header: lower.clone(),
+                    value: candidate,
+                });
+            }
+        }
+    }
+    presented
+}
+
 /// Sweep `headers` for a minted token, in the order `cfg.headers` lists.
 ///
 /// The first well-shaped token wins. Scanning continues across the remaining
@@ -321,6 +373,44 @@ mod tests {
                 "{prefix:?} must be stripped"
             );
         }
+    }
+
+    #[test]
+    fn presents_non_minted_credentials_from_every_configured_carrier() {
+        let mut cfg = cfg();
+        cfg.headers = vec![
+            InboundHeaderConfig {
+                name: "Authorization".to_string(),
+                scheme: "Bearer ".to_string(),
+            },
+            InboundHeaderConfig {
+                name: "X-Api-Key".to_string(),
+                scheme: String::new(),
+            },
+            InboundHeaderConfig {
+                name: "X-Custom-Key".to_string(),
+                scheme: "Token ".to_string(),
+            },
+        ];
+        let headers = headers(&[
+            ("authorization", "Bearer configured-auth"),
+            ("x-api-key", "configured-api"),
+            ("x-custom-key", "tOkEn configured-custom"),
+        ]);
+
+        let presented = presented_credentials(&headers, &cfg);
+        let values: Vec<_> = presented
+            .iter()
+            .map(|credential| (credential.header.as_str(), credential.value))
+            .collect();
+        assert_eq!(
+            values,
+            [
+                ("authorization", "configured-auth"),
+                ("x-api-key", "configured-api"),
+                ("x-custom-key", "configured-custom"),
+            ]
+        );
     }
 
     #[test]
