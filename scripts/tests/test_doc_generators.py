@@ -595,6 +595,21 @@ class SyncDocConfigsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("compiler sweep", result.stderr)
 
+    def test_check_walks_nested_documentation_directories(self) -> None:
+        nested = self.root / "docs" / "guides"
+        nested.mkdir()
+        (nested / "reference.md").write_text(
+            "<!-- sbproxy-config: examples/basic-proxy/sb.yml -->\n"
+            "```yaml\n"
+            "stale: true\n"
+            "```\n"
+        )
+
+        result = self.run_guard("--check")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("docs/guides/reference.md", result.stderr)
+
     def test_sync_refreshes_strict_config_without_rewriting_excerpt(self) -> None:
         document = self.root / "docs" / "reference.md"
         excerpt = "action:\n  type: proxy\n"

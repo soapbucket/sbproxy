@@ -1,8 +1,8 @@
 # Docs CI (Wave 1, B1.10).
 #
 # Runs the documentation lint + executable-snippet harness on every PR
-# that touches docs (sbproxy-rust or sbproxy-enterprise) or the runner
-# script itself. The actual checks live in scripts/docs-ci.sh, owned by
+# that touches this repository's docs or the runner script itself. The
+# actual checks live in scripts/docs-ci.sh, owned by
 # the QA lane (Q1.10); this workflow only invokes it.
 #
 # Two passes happen inside scripts/docs-ci.sh:

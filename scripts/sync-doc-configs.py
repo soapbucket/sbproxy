@@ -187,7 +187,7 @@ def main() -> int:
 
     results: list[tuple[Path, DocumentResult]] = []
     errors: list[str] = []
-    for document in sorted(docs.glob("*.md")):
+    for document in sorted(docs.rglob("*.md")):
         try:
             results.append(
                 (document, render_document(root, document, check=args.check))

@@ -72,8 +72,9 @@ before it:
 The next fence must be a `yaml` fence. Run `scripts/sync-doc-configs.py` to
 refresh strict blocks, or `scripts/sync-doc-configs.py --check` to fail on
 drift without writing. Canonical paths must use a compiler-swept
-`examples/<name>/sb.yml` (or one of the explicitly swept enterprise gateway
-files), and each source exposes exactly one ordered begin/end pair.
+`examples/<name>/sb.yml` or one of the additional multi-file gateway configs
+explicitly included in that sweep. Each source exposes exactly one ordered
+begin/end pair.
 
 Partial topology maps and field fragments are intentional excerpts, not
 runnable files. Mark the immediately following YAML fence with
