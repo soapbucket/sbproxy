@@ -1315,8 +1315,20 @@ fn parse_outbound_credential_config(
     origin_id: &str,
     config: &serde_json::Value,
 ) -> anyhow::Result<sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig> {
-    serde_json::from_value(config.clone())
-        .map_err(|error| anyhow::anyhow!("origin {origin_id}: outbound_credential: {error}"))
+    let parsed: sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig =
+        serde_json::from_value(config.clone())
+            .map_err(|error| anyhow::anyhow!("origin {origin_id}: outbound_credential: {error}"))?;
+    if let sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig::VaultSecret(
+        vault,
+    ) = &parsed
+    {
+        if sbproxy_config::types::credential_header_is_reserved(&vault.header) {
+            anyhow::bail!(
+                "origin {origin_id}: outbound_credential: header may not carry a credential"
+            );
+        }
+    }
+    Ok(parsed)
 }
 
 impl CompiledPipeline {
@@ -3208,6 +3220,38 @@ origins:
         assert!(error
             .to_string()
             .contains("not supported with load-balanced actions"));
+    }
+
+    #[test]
+    fn validation_rejects_hop_by_hop_outbound_credential_headers() {
+        for header in ["keep-alive", "proxy-connection", "te", "trailer"] {
+            let yaml = format!(
+                r#"
+proxy:
+  http_bind_port: 18080
+origins:
+  "credential.test":
+    action:
+      type: proxy
+      url: https://upstream.example.test
+    outbound_credential:
+      type: vault_secret
+      secret: operator-secret
+      header: {header}
+"#
+            );
+            let config = sbproxy_config::compile_config(&yaml).unwrap();
+            let error = match CompiledPipeline::from_config_for_validation(config) {
+                Ok(_) => panic!("{header} must not be an outbound credential carrier"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("header may not carry a credential"),
+                "unexpected {header} validation error: {error}"
+            );
+        }
     }
 }
 

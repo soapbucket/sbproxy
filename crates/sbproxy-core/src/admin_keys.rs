@@ -2096,6 +2096,24 @@ mod tests {
     }
 
     #[test]
+    fn hop_by_hop_credential_headers_are_rejected_at_admin_creation() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        for (index, header) in ["keep-alive", "proxy-connection", "te", "trailer"]
+            .into_iter()
+            .enumerate()
+        {
+            let body = format!(r#"{{"id":"hop-{index}","secret":"s","header":"{header}"}}"#);
+            let resp = dispatch("POST", "/admin/credentials", Some(&body)).unwrap();
+            assert_eq!(
+                resp.0, 400,
+                "{header} must be rejected before storage: {}",
+                resp.2
+            );
+        }
+    }
+
+    #[test]
     fn a_credential_header_cannot_claim_realtime_protocol_or_proxy_owned_metadata() {
         let _g = crate::key_plane::test_plane_guard();
         install_test_plane();

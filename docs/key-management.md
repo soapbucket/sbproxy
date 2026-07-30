@@ -154,9 +154,10 @@ policy identity is built from those labels and contains no credential bytes.
 On a generic proxy route, an allowed caller-owned credential passes upstream
 unchanged, even when that origin also configures `outbound_credential`: native
 mode represents an explicit caller-owned identity, so the origin credential
-must not replace it. An AI provider must opt in as an exact credential
-destination. Set `accept_native_credentials_for` to the canonical hint label,
-and make it match the provider's wire type:
+must not replace it. SBproxy receives and forwards the caller-owned secret, but
+does not store, manage, or substitute it. An AI provider must opt in as an
+exact credential destination. Set `accept_native_credentials_for` to the
+canonical hint label, and make it match the provider's wire type:
 
 ```yaml
 action:

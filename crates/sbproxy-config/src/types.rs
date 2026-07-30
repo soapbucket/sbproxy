@@ -1988,11 +1988,16 @@ fn default_provider_hints() -> Vec<ProviderHintConfig> {
     ]
 }
 
-/// Header names that may never be swept: hop-by-hop and framing headers, plus
+/// Header names that may never be swept: standard hop-by-hop and framing
+/// headers, the widely used de-facto `proxy-connection` hop-by-hop header, plus
 /// `cookie`, which has its own redaction and capture rules.
 pub const FORBIDDEN_SWEEP_HEADERS: &[&str] = &[
     "host",
     "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
     "content-length",
     "transfer-encoding",
     "cookie",
@@ -9417,6 +9422,10 @@ native_key_policy:
         for reserved in [
             "cookie",
             "host",
+            "keep-alive",
+            "proxy-connection",
+            "te",
+            "trailer",
             "traceparent",
             "proxy-authorization",
             "sec-websocket-protocol",
