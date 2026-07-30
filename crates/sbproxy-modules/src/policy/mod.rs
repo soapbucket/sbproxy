@@ -32,6 +32,7 @@ pub mod prompt_injection_v2;
 pub mod quote_token;
 pub mod rate_limit;
 pub mod rate_limit_budget;
+pub mod rate_limit_cluster;
 pub mod request_limit;
 pub mod request_validator;
 pub mod sec_headers;
