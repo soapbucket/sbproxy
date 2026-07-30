@@ -124,14 +124,42 @@ pub fn rewrap_success_response_for_inbound(
     {
         return body.to_vec();
     }
-    let has_error_envelope = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| value.as_object().map(|object| object.contains_key("error")))
-        .unwrap_or(false);
-    if has_error_envelope {
+    let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let has_error_envelope = parsed
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|object| object.contains_key("error"));
+    if has_error_envelope
+        || parsed
+            .as_ref()
+            .is_some_and(|value| response_already_matches_inbound(inbound_format, value))
+    {
         return body.to_vec();
     }
     rewrap_response_for_inbound(inbound_format, body)
+}
+
+/// Identify cache entries that already contain the inbound client's native
+/// success envelope. Older idempotency and semantic-cache entries were stored
+/// at different points in the response pipeline, so an unversioned entry may
+/// be either canonical OpenAI Chat JSON or final client-wire JSON.
+fn response_already_matches_inbound(
+    inbound_format: Option<&str>,
+    value: &serde_json::Value,
+) -> bool {
+    match inbound_format {
+        Some("anthropic") => {
+            value.get("type").and_then(serde_json::Value::as_str) == Some("message")
+                && value
+                    .get("content")
+                    .is_some_and(serde_json::Value::is_array)
+        }
+        Some("responses") => {
+            value.get("object").and_then(serde_json::Value::as_str) == Some("response")
+                && value.get("output").is_some_and(serde_json::Value::is_array)
+        }
+        _ => false,
+    }
 }
 
 /// Native-format bypass classification.
@@ -309,6 +337,43 @@ mod response_rewrap_tests {
                 "{inbound_format}"
             );
         }
+    }
+
+    #[test]
+    fn already_native_anthropic_success_is_byte_stable() {
+        let body = br#"{ "id":"msg_legacy", "type":"message", "role":"assistant", "content":[{"type":"text","text":"cached"}], "model":"claude", "stop_reason":"end_turn", "usage":{"input_tokens":1,"output_tokens":1}, "native_only":{"tier":"standard"} }"#;
+
+        assert_eq!(
+            rewrap_success_response_for_inbound(200, Some("anthropic"), body),
+            body
+        );
+    }
+
+    #[test]
+    fn already_native_responses_success_is_byte_stable() {
+        let body = br#"{ "id":"resp_legacy", "object":"response", "status":"completed", "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"cached"}]}], "native_only":{"service_tier":"default"} }"#;
+
+        assert_eq!(
+            rewrap_success_response_for_inbound(200, Some("responses"), body),
+            body
+        );
+    }
+
+    #[test]
+    fn canonical_success_still_rewraps_for_native_clients() {
+        let body = br#"{"id":"chatcmpl-1","object":"chat.completion","model":"gpt","choices":[{"index":0,"message":{"role":"assistant","content":"canonical"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+
+        let anthropic = rewrap_success_response_for_inbound(200, Some("anthropic"), body);
+        let responses = rewrap_success_response_for_inbound(200, Some("responses"), body);
+        let anthropic: serde_json::Value =
+            serde_json::from_slice(&anthropic).expect("Anthropic response");
+        let responses: serde_json::Value =
+            serde_json::from_slice(&responses).expect("Responses response");
+
+        assert_eq!(anthropic["type"], "message");
+        assert_eq!(anthropic["content"][0]["text"], "canonical");
+        assert_eq!(responses["object"], "response");
+        assert_eq!(responses["output"][0]["content"][0]["text"], "canonical");
     }
 }
 
