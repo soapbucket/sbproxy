@@ -778,20 +778,30 @@ browser profiles or give each node its own loopback address
 
 ## Documentation coverage audit
 
-The 2026-07-30 audit accounts for all 25 named console routes. It checked
-the request ring's session links and custom properties, routing, retry,
-failover, load-balancer, cache, and guardrail decisions, spend grouping,
-the alert engine's burn-rate, certificate, rate-limit, budget, and
-circuit-breaker evaluations, and model-host deployments, jobs, and
-storage. Those shipped capabilities already have console surfaces from
-the observability work in PR #755 or the current model-host views.
+The 2026-07-30 audit compared all 25 named console routes with the
+shipped capability catalog and the data that the runtime already
+records. Sessions and custom properties; routing, retry, failover,
+load-balancer, cache, and guardrail decisions; spend; alert evaluation;
+and model-host deployments, jobs, and storage all have purpose-built
+console surfaces.
 
-The audit found three documentation-only gaps, Get started, Jobs, and
-Operators, which the sections above close. It found no shipped feature
-in this scope without a console surface, so no product follow-up issue
-is warranted. The remaining action is preventative: every new component
-route must declare a documentation slug, enforced by the focused router
-test.
+Several shipped capability families do not. Raw Config, Logs, and
+Metrics remain useful fallbacks, but they do not count as a dedicated
+operator workflow in this table.
+
+| Capability without a dedicated view | Available today | Disposition |
+|---|---|---|
+| MCP servers, tools, versions, risk, and quarantine | Config, Logs, Metrics, and session linkage | Fold server/tool inventory and bounded failure reasons into the OSS Agent and Tool Traffic follow-up, WOR-2079. |
+| A2A hops and denials; Agent Skills integrity | Config plus raw metrics and audit events | Fold runtime health into WOR-2079. Keep declarative Agent Skills authoring in Config. |
+| Agent identity and trust; AI crawler verification; RSL/CAP payment outcomes; Web Bot Auth | Overview health, Config, Logs, Metrics, Spend, and the bundled Grafana AI-traffic dashboard | Fold the embedded-console traffic and paid/blocked summaries into WOR-2079. Keep RSL terms and crawler policy authoring in Config. |
+| Outbound credentials and DPoP proofs | Credentials, Config, and redacted Logs | Keep proof policy declarative. Credential health remains a candidate under the broader console-coverage epic, WOR-1958. |
+| CEL, Lua, JavaScript, and WASM policy execution | Config, Audit, and Logs | Keep authoring in Config; the existing WOR-199 follow-up owns replay-diff visualization. |
+
+The same audit found three documentation-only gaps, Get started, Jobs,
+and Operators, which the sections above close. Every new component
+route must declare a documentation slug, and the router tests verify
+that the mapped Markdown page exists so a rename cannot silently break
+the console link.
 
 ## See also
 
