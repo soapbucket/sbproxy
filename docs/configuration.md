@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-29*
+*Last modified: 2026-07-30*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -371,6 +371,7 @@ HTTP/3 is not served by this build. The `http3` shape is retained for forward co
 | `operators` | list | empty | Login identities with roles: `{username, password, role}` where `role` is `admin` or `read_only` |
 | `tls` | object | unset | `{cert, key}` PEM paths; serve HTTPS instead of plaintext |
 | `prompt_persistence_path` | string | unset | redb file persisting prompt-version edits across restarts |
+| `prompt_persistence_encryption` | object | unset | Seals the records in `prompt_persistence_path` at rest with AES-256-GCM. See [Encrypting persisted prompts at rest](#encrypting-persisted-prompts-at-rest). Unset stores them as plaintext JSON. |
 
 When enabled, the admin server binds `bind:<port>` (loopback by
 default), authenticates every request (HTTP Basic or a browser session),
@@ -3474,6 +3475,58 @@ Move the current reference into `previous_keys` and name the new one as `key`. N
 Every entry carries a short identifier for the key that sealed it, so a read picks the right key directly rather than trying each one in turn.
 
 The runnable version of all of this is [`examples/response-cache-encrypted/`](../examples/response-cache-encrypted/).
+
+### What is encrypted at rest, and what is not
+
+Encryption is worth configuring where data outlives the request. This table says which surfaces those are, so the answer is not inferred from whichever block happens to have an `encryption` key.
+
+| Surface | What it holds | Persists or replicates | Encrypted at rest |
+| --- | --- | --- | --- |
+| Response cache | Upstream headers and bodies | Yes, with the `file`, `redis`, and `memcached` backends | Yes, via `proxy.response_cache_store.encryption` |
+| Prompt persistence | Runtime prompt-overlay records | Yes, a redb file on disk | Yes, via `admin.prompt_persistence_encryption` |
+| Upstream credentials | Provider secrets | Yes, in the keystore | Yes, as an AEAD envelope or a vault reference. See [key-management.md](key-management.md) |
+| Prompt cache | Normalised prompts and responses | No, in-process only | Not applicable |
+| Judge cache | Guardrail verdicts | No, in-process only | Not applicable |
+| Mesh distributed cache | Key-plane records, compression sessions | No, excluded from persisted cluster state | Not applicable. Peer traffic is sealed on the wire, see below |
+
+Memory-only caches are deliberately not encrypted. An attacker who can read the process heap can read the derived key out of the same heap, so sealing there buys close to nothing while adding another key to manage. Encrypt what persists or replicates.
+
+A credential whose material is stored as plaintext (`kind: plaintext`, only reachable for config-seeded credentials) is never published to a shared cache tier at all, neither the mesh tier nor Redis. Those resolves read through to the keystore instead. Prefer a vault reference or an envelope so the credential can be cached.
+
+#### What the mesh wire cipher does and does not cover
+
+`mesh.encryption.shared_key` seals traffic **between peers**. It protects cache and state RPCs in flight from anything watching the network between nodes.
+
+It is not at-rest encryption, and it is a different mechanism from the blocks above:
+
+- It covers bytes on the wire, not bytes in a backing store. A value the mesh replicates is sealed while it travels and plain in each node's memory once it arrives.
+- It does not extend to the response cache's backing store. A `redis` or `file` backend still needs `proxy.response_cache_store.encryption`; the wire cipher does nothing for a Redis server an attacker can read directly.
+- The mesh distributed cache is excluded from persisted cluster state, so its values do not reach Redis or disk through that path.
+
+### Encrypting persisted prompts at rest
+
+`admin.prompt_persistence_path` writes the runtime prompt overlay to a redb file so runtime prompt edits survive a restart. Prompt templates can carry business logic and, in some deployments, embedded context worth protecting. The optional `prompt_persistence_encryption` block seals each stored record with AES-256-GCM.
+
+```yaml
+admin:
+  prompt_persistence_path: /var/lib/sbproxy/prompts.redb
+  prompt_persistence_encryption:
+    enabled: true
+    key: "secret://primary/prompt-persistence"
+    previous_keys:
+      - "secret://primary/prompt-persistence-2026-06"
+```
+
+The same reference syntax as every other config secret: a provider URI against a backend declared under `proxy.secrets.backends`, a `file:/path` reference, or a whole-value `${ENV_VAR}`.
+
+Behaviour worth knowing before enabling it:
+
+- **No plaintext fallback.** `enabled: true` with no `key`, an unresolvable reference, or material shorter than 16 bytes aborts startup. This is stricter than the rest of prompt persistence, where an unreadable file only degrades to in-memory-only edits. Losing a file loses saved prompts; silently writing records in the clear after asking for encryption is worse.
+- **Turning it on does not orphan an existing file.** Records already written as plaintext keep hydrating, and each one seals the next time it is written.
+- **Records are bound to their slot.** The store key is authenticated, so a sealed record copied into another host's or another prompt's slot fails to open rather than being served as that prompt.
+- **Its key is separate from the response cache's.** Both derive through their own HKDF purpose, so pointing them at one operator secret still yields two unrelated keys, and neither can open the other's records.
+
+Rotation works as it does for the response cache: move the current reference into `previous_keys`, name the new one as `key`, and records reseal as they are rewritten. Each record carries a short identifier for the key that sealed it, so a read selects the right key directly. Drop a reference out of `previous_keys` and any record still sealed under it stops opening, which is what retiring a key means.
 
 ---
 

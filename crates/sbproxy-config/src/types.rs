@@ -3375,6 +3375,55 @@ pub enum ResponseCacheBackendConfig {
     Redis,
 }
 
+/// At-rest encryption settings for the prompt-persistence redb file.
+///
+/// Persisted `NamedPrompt` records are sealed with AES-256-GCM before
+/// they reach redb. Keys stay readable because hydration is a prefix
+/// scan over `prompts:<host>:<name>`, and the key is authenticated as
+/// associated data so a sealed value cannot be moved to another
+/// host or prompt name.
+///
+/// Same reference syntax and the same no-plaintext-fallback rule as
+/// [`ResponseCacheEncryptionConfig`]: a key that is missing,
+/// unresolvable, or shorter than 16 bytes aborts startup. That is
+/// deliberately stricter than the surrounding prompt-persistence
+/// behaviour, where an unreadable file only degrades to ephemeral
+/// mutations. An unreadable file loses saved prompts; a key the operator
+/// asked for and cannot supply would silently write secrets in the
+/// clear.
+///
+/// Derived under its own HKDF purpose, so pointing this and the response
+/// cache at one operator secret still yields two unrelated keys.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct PromptPersistenceEncryptionConfig {
+    /// Master switch. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Secret reference for the active key. Used to seal new records and
+    /// to open records sealed under it.
+    ///
+    /// Resolved through the same mechanism as every other config secret:
+    /// a provider URI (`secret://backend/name`, `vault://...`) against a
+    /// backend declared under `proxy.secrets.backends`, a `file:/path`
+    /// reference, or a whole-value `${ENV_VAR}`. Required when
+    /// [`Self::enabled`] is `true`.
+    ///
+    /// The resolved value should be 32 random bytes (base64 or hex
+    /// encoded) rather than a human-chosen passphrase.
+    #[serde(default)]
+    pub key: Option<String>,
+
+    /// Retired keys, used only to open records sealed before a rotation.
+    /// Same reference syntax as [`Self::key`].
+    ///
+    /// To rotate: move the current `key` into this list and name the new
+    /// one as `key`. Records reseal under the active key the next time
+    /// they are written.
+    #[serde(default)]
+    pub previous_keys: Vec<String>,
+}
+
 /// At-rest encryption settings for [`ResponseCacheStoreConfig`].
 ///
 /// Cached response headers and bodies are sealed with AES-256-GCM
@@ -3484,6 +3533,12 @@ pub struct AdminConfig {
     /// Absent means PR3-style ephemeral mutations.
     #[serde(default)]
     pub prompt_persistence_path: Option<std::path::PathBuf>,
+    /// At-rest encryption for [`Self::prompt_persistence_path`]. Absent
+    /// or disabled stores prompt records as plaintext JSON, which is the
+    /// pre-existing behaviour and stays the default so an upgrade cannot
+    /// orphan an existing file.
+    #[serde(default)]
+    pub prompt_persistence_encryption: Option<PromptPersistenceEncryptionConfig>,
     /// URL template for trace deep-links in the admin UI. The literal
     /// `{trace_id}` is replaced with the request's trace id, e.g.
     /// `https://jaeger.internal/trace/{trace_id}`. Unset renders trace

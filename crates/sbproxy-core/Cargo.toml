@@ -196,6 +196,9 @@ ulid.workspace = true
 # Identity / hashing for webhook envelope (instance_id tag, config_revision)
 rand.workspace = true
 sha2.workspace = true
+# Scrubs resolved prompt-persistence key material on drop, the same way the
+# response-cache key material is handled.
+zeroize.workspace = true
 hmac.workspace = true
 hex.workspace = true
 chrono.workspace = true

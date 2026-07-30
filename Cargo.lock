@@ -8935,6 +8935,7 @@ dependencies = [
  "url",
  "uuid 1.23.1",
  "yaml_serde",
+ "zeroize",
 ]
 
 [[package]]
