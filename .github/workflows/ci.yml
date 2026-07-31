@@ -1,22 +1,30 @@
 name: CI
-# --- Workflow shape (updated 2026-05-03) ---
-# 4 jobs run in parallel on every push/PR:
+# --- Workflow shape (updated 2026-07-31) ---
+# Every lane runs in parallel and `build / test` is a zero-cost aggregator
+# that fails if any lane failed. Branch protection keeps requiring the one
+# `build / test` check; the work underneath it fans out.
 #
-#   build / test  (≈9 min, 10 runner-mins)
-#     fmt -> clippy -> nextest -> doc.
-#     The standalone `cargo build --workspace` step was removed:
-#     `cargo clippy --all-targets` already builds all rlibs via the
-#     check machinery. The required test lane uses cargo-nextest for
-#     faster scheduling and runs doctests separately because nextest
-#     does not execute them.
+#   changes        (~10 s)  path filter, consumed by every other lane
+#   test           (~9 min) one workspace build -> nextest -> doctests ->
+#                           generated-artifact freshness checks
+#   lint           (~4 min) fmt, clippy, rustdoc
+#   obs-budgets    (~5 min) e2e cardinality + redaction, observability paths only
+#   ui             (~40 s)  node typecheck + vitest
+#   supply-chain   (~50 s)  cargo-deny
+#   build / test   (~5 s)   aggregator; the required status check
 #
-#   release-build  (≈8 min, 9 runner-mins) -- push to main only
-#     Release binary smoke test. Skipped on pull_request triggers so
-#     PRs don't burn 8-9 runner-minutes twice (PR run + merge push).
-#     Branch protection requires only `build / test`.
+# The dominant cost here is rustc, not test execution: 8763 tests run in
+# about 96 seconds. Two rules keep the rustc bill down.
 #
-#   supply-chain  (≈40 s, 1 runner-min)
-#     cargo-deny advisories + bans + licenses + sources.
+#   1. Every cargo invocation inside a job MUST use the same package
+#      selection. Under resolver = "2" the feature union is computed from
+#      the selected packages, so `-p some-crate` resolves a different
+#      feature set than `--workspace` and silently recompiles the whole
+#      dependency graph. A `cargo test -p sbproxy-e2e` step used to rebuild
+#      179 crates to run two tests.
+#   2. A lane that genuinely needs a different package selection (e2e) gets
+#      its own job and its own cache key rather than paying that rebuild
+#      inline on the critical path.
 #
 on:
   push:
@@ -41,18 +49,25 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
+  # Full debuginfo was roughly 30% of rustc wall time here and the bulk of a
+  # 3.4 GB target directory, which pushed the repo past the 10 GB Actions
+  # cache limit and made every restore a partial one. line-tables-only still
+  # gives file and line numbers in RUST_BACKTRACE output, which is all CI
+  # ever reads.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
-  build:
-    name: build / test
+  changes:
+    name: changes
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    # Per-job permissions in addition to the workflow root block,
-    # so the auth contract stays explicit if the root default ever
-    # widens. CodeQL (actions/missing-workflow-permissions) prefers
-    # this defense-in-depth shape.
+    timeout-minutes: 5
     permissions:
       contents: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      observability: ${{ steps.filter.outputs.observability }}
+      ui: ${{ steps.filter.outputs.ui }}
     steps:
       - uses: actions/checkout@v5
 
@@ -74,50 +89,138 @@ jobs:
             ui:
               - 'ui/**'
 
-      # The workspace's full target/ + ~/.cargo/registry/ tops 14 GB on
-      # GitHub-hosted runners (tract-onnx, tokenizers, kube, pingora,
-      # opentelemetry, etc), which crashes the rust-cache post-step on
-      # `No space left on device`. Reclaim ~25 GB by removing
-      # pre-installed tooling we don't use.
-      - name: free disk space
-        if: steps.filter.outputs.code == 'true'
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: false
-          swap-storage: false
+  test:
+    name: test
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
-        if: steps.filter.outputs.code == 'true'
+      # The workspace's target/ plus ~/.cargo/registry/ outgrows the runner's
+      # free space, which crashes the rust-cache post-step on `No space left
+      # on device`, so the composite reclaims disk first. libclang-dev is
+      # needed for rquickjs-sys's bindgen build script; without it clang's
+      # bundled stdbool.h is missing from the include path and the build
+      # fails with `'stdbool.h' file not found`. redis-server backs the live
+      # Redis tests below, each of which owns an isolated ephemeral-port
+      # process rather than sharing mutable CI state.
+      - uses: ./.github/actions/rust-setup
         with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-        if: steps.filter.outputs.code == 'true'
+          cache-key: test
+          install-redis: 'true'
 
       - uses: taiki-e/install-action@nextest
-        if: steps.filter.outputs.code == 'true'
 
-      - name: install protoc, libclang, and Redis
-        if: steps.filter.outputs.code == 'true'
-        # libclang-dev is needed for rquickjs-sys's bindgen build script.
-        # Without it, clang's bundled stdbool.h is missing from the include
-        # path and the build fails with `'stdbool.h' file not found`.
-        # redis-server backs the always-run compression-state Lua and
-        # reconnect integration tests below. Each test owns an isolated
-        # ephemeral-port process rather than sharing mutable CI state.
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang redis-server
+      # One build for the whole lane. `--workspace --exclude sbproxy-e2e` is
+      # the package selection every later cargo call in this job repeats
+      # verbatim, so they all resolve the same feature union and reuse these
+      # artifacts instead of recompiling the graph.
+      #
+      # This also produces target/debug/sbproxy and the generate-* binaries
+      # the freshness checks below exec directly.
+      - name: build workspace
+        run: cargo build --workspace --exclude sbproxy-e2e --locked
+
+      # E2E tests are intentionally OUT OF SCOPE for the PR-required CI
+      # lane. They spin up the full proxy binary, listen on real ports,
+      # and exercise the network stack; on shared CI runners this leads
+      # to startup-timeout flakiness (mesh gossip, websocket upgrade)
+      # that does not signal a real regression. Run them locally with
+      # `cargo test --workspace` after building the binary, or run them
+      # nightly via the release-checks lane. The cardinality and redaction
+      # canaries are the exception and run in the obs-budgets job.
+      - name: test (excludes e2e)
+        run: cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci
+
+      # These tests are #[ignore]d in the default lane because they require a
+      # redis-server executable. CI installs Redis above and runs them through
+      # the same invocation shape as the lane above so they reuse its
+      # artifacts. Running them as `cargo test -p sbproxy-platform` instead
+      # cost 2m07 of pure recompilation for a handful of assertions.
+      # -j1 replaces the old `--test-threads=1`.
+      - name: Redis live state (secure DSN + Lua fencing + recovery)
+        run: |
+          redis-server --version
+          tls_probe_output="$(redis-server --port 0 --tls-port 1 2>&1 || true)"
+          if ! grep -q 'No tls-cert-file configured' <<<"${tls_probe_output}"; then
+            echo "::error::redis-server lacks the TLS support required by secure Redis tests"
+            exit 1
+          fi
+          unset tls_probe_output
+          cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
+            --run-ignored only -j1 \
+            -E 'binary(redis_secure) + test(compression_store::redis::tests::live_redis_) + test(storage::async_redis::tests::redis_connection_recovers_after_server_restart)'
+
+      # nextest does not execute doctests, so they need their own pass.
+      - name: doctests
+        run: cargo test --workspace --exclude sbproxy-e2e --locked --doc
+
+      # These checks exec the binaries produced by the `build workspace` step.
+      # Left to themselves they run `cargo run -p <crate>`, which re-resolves
+      # features for a single package and rebuilds.
+      - name: generated artifacts are current
+        env:
+          SBPROXY_PREBUILT_BINS: '1'
+        run: |
+          bash scripts/check-config-schema.sh
+          bash scripts/check-config-readers.sh
+          bash scripts/check-model-host-capabilities.sh
+          bash scripts/check-metrics-stability.sh
+
+      # dead_code cannot see a `pub` item inside a `pub mod` of a library
+      # crate, so write-only code lands with a green build. This ratchet
+      # stops the count from growing while the existing backlog is worked
+      # down. Runs without the enterprise cross-check, which is fine: the
+      # count is the same either way, and the cross-check only matters
+      # before a deletion.
+      - name: no new pub items whose only consumer is a test (WOR-2065)
+        run: bash scripts/check-pub-item-ratchet.sh
+
+      - name: install.sh verifies its download (WOR-1914)
+        run: sh scripts/tests/install_verify.sh
+
+      - name: prometheus rules validate and the SLO burns (WOR-1894)
+        run: |
+          PROMTOOL_VERSION=2.53.1
+          curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROMTOOL_VERSION}/prometheus-${PROMTOOL_VERSION}.linux-amd64.tar.gz" \
+            | tar xz -C /tmp
+          sudo install "/tmp/prometheus-${PROMTOOL_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+          bash scripts/check-prometheus-rules.sh
+
+      # Only meaningful ahead of a cache save, which now happens on main only.
+      - name: cleanup build artifacts
+        if: always() && github.ref == 'refs/heads/main'
+        run: bash scripts/cleanup-build-artifacts.sh --ci
+
+  lint:
+    name: lint
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      # clippy-driver and rustdoc write artifacts the `test` lane cannot link
+      # against, so this job keeps its own cache entry rather than fighting
+      # the test lane over one key. That mutual uselessness is also why these
+      # steps are worth moving off the critical path: the 3m15 they spend is
+      # never reused by the build.
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: lint
+          components: rustfmt, clippy
 
       - name: fmt
-        if: steps.filter.outputs.code == 'true'
         run: cargo fmt --all -- --check
 
       - name: standalone workspace lockfiles are current
-        if: steps.filter.outputs.code == 'true'
         run: |
           for manifest in \
             bench-synthetic/Cargo.toml \
@@ -134,7 +237,6 @@ jobs:
       # work without making it trackable. If a tracker reference is needed,
       # use a full URL or replace it with a descriptive sentence.
       - name: no internal tracker placeholders
-        if: steps.filter.outputs.code == 'true'
         run: |
           if grep -rn 'WOR-XXX' crates/ --include='*.rs' --include='*.toml'; then
             echo "::error::WOR-XXX placeholders are not allowed; open a real ticket or rewrite as prose"
@@ -142,170 +244,70 @@ jobs:
           fi
 
       - name: clippy
-        if: steps.filter.outputs.code == 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # E2E tests are intentionally OUT OF SCOPE for the PR-required CI
-      # lane. They spin up the full proxy binary, listen on real ports,
-      # and exercise the network stack; on shared CI runners this leads
-      # to startup-timeout flakiness (mesh gossip, websocket upgrade)
-      # that does not signal a real regression. Run them locally with
-      # `cargo test --workspace` after building the binary, or run them
-      # nightly via the release-checks lane.
-      #
-      # The `--exclude sbproxy-e2e` flag keeps the rest of the
-      # workspace's unit and harness-free integration tests in the
-      # required lane so logic regressions still surface on every PR.
-      - name: test (excludes e2e)
-        if: steps.filter.outputs.code == 'true'
-        run: |
-          cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci
-          cargo test --workspace --exclude sbproxy-e2e --locked --doc
-
-      # These tests are ignored in the default local lane because they require
-      # a redis-server executable. CI installs Redis above and invokes them
-      # explicitly so secure DSN semantics, Lua scripts, delete fencing,
-      # NOSCRIPT reload, and connection recovery are verified against real
-      # server processes on every PR.
-      - name: Redis live state (secure DSN + Lua fencing + recovery)
-        if: steps.filter.outputs.code == 'true'
-        run: |
-          redis-server --version
-          tls_probe_output="$(redis-server --port 0 --tls-port 1 2>&1 || true)"
-          if ! grep -q 'No tls-cert-file configured' <<<"${tls_probe_output}"; then
-            echo "::error::redis-server lacks the TLS support required by secure Redis tests"
-            exit 1
-          fi
-          unset tls_probe_output
-          cargo test -p sbproxy-platform --test redis_secure -- \
-            --ignored --nocapture --test-threads=1
-          cargo test -p sbproxy-core --locked --lib \
-            'compression_store::redis::tests::live_redis_' -- \
-            --ignored --test-threads=1
-          cargo test -p sbproxy-platform --locked --lib \
-            'storage::async_redis::tests::redis_connection_recovers_after_server_restart' -- \
-            --ignored --test-threads=1
-
-      # Build the sbproxy binary so the e2e harness tests below can
-      # spawn it. cargo cannot infer the ordering between
-      # `cargo test -p sbproxy-e2e` and the binary crate.
-      - name: build sbproxy binary (for obs-budgets harness)
-        if: steps.filter.outputs.code == 'true' && steps.filter.outputs.observability == 'true'
-        run: cargo build -p sbproxy --locked
-
-      # Cardinality + redaction regressions are easy to break silently
-      # (a new label sneaks in, the limiter overflows into __other__,
-      # a redactor regex misses a new shape). This canary runs only
-      # when observability or policy code changed.
-      - name: observability budgets (cardinality + redaction)
-        if: steps.filter.outputs.code == 'true' && steps.filter.outputs.observability == 'true'
-        run: |
-          cargo test -p sbproxy-e2e --locked \
-            --test cardinality \
-            --test redaction
-
       - name: doc
-        if: steps.filter.outputs.code == 'true'
         env:
           RUSTDOCFLAGS: -D warnings -D missing_docs
         run: cargo doc --workspace --no-deps --locked
 
-      - name: config schema is current (WOR-1081)
-        if: steps.filter.outputs.code == 'true'
-        run: bash scripts/check-config-schema.sh
-
-      - name: every config key has a reader or reviewed exception (WOR-1976)
-        if: steps.filter.outputs.code == 'true'
-        run: bash scripts/check-config-readers.sh
-
-      - name: model-host capability matrix is current (WOR-1836)
-        if: steps.filter.outputs.code == 'true'
-        run: bash scripts/check-model-host-capabilities.sh
-
-      - name: metrics stability catalogue is current (WOR-1897)
-        if: steps.filter.outputs.code == 'true'
-        run: bash scripts/check-metrics-stability.sh
-
-      # dead_code cannot see a `pub` item inside a `pub mod` of a library
-      # crate, so write-only code lands with a green build. This ratchet
-      # stops the count from growing while the existing backlog is worked
-      # down. Runs without the enterprise cross-check, which is fine: the
-      # count is the same either way, and the cross-check only matters
-      # before a deletion.
-      - name: no new pub items whose only consumer is a test (WOR-2065)
-        if: steps.filter.outputs.code == 'true'
-        run: bash scripts/check-pub-item-ratchet.sh
-
-      - name: install.sh verifies its download (WOR-1914)
-        if: steps.filter.outputs.code == 'true'
-        run: sh scripts/tests/install_verify.sh
-
-      - name: prometheus rules validate and the SLO burns (WOR-1894)
-        if: steps.filter.outputs.code == 'true'
-        run: |
-          PROMTOOL_VERSION=2.53.1
-          curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROMTOOL_VERSION}/prometheus-${PROMTOOL_VERSION}.linux-amd64.tar.gz" \
-            | tar xz -C /tmp
-          sudo install "/tmp/prometheus-${PROMTOOL_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
-          bash scripts/check-prometheus-rules.sh
-
-      - uses: actions/setup-node@v4
-        if: steps.filter.outputs.ui == 'true'
-        with:
-          node-version: 22
-
-      - name: ui typecheck and test
-        if: steps.filter.outputs.ui == 'true'
-        working-directory: ui
-        run: |
-          npm ci
-          npm run typecheck
-          npm run test -- --run
-
-      - name: cleanup build artifacts
-        if: always() && steps.filter.outputs.code == 'true'
-        run: bash scripts/cleanup-build-artifacts.sh --ci
-
-  release-build:
-    name: release build
-    # Only run on pushes to main, not on pull_request events. Release
-    # builds take 8-9 runner-minutes; skipping them on PRs saves those
-    # minutes and avoids double-billing when a squash-merge PR lands
-    # (the merge commit re-triggers on push anyway).
-    if: github.event_name == 'push'
+  obs-budgets:
+    name: observability budgets
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.observability == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      # sbproxy-e2e widens the feature union past what the `test` lane
+      # selects, so its artifacts live behind their own key. Running these two
+      # tests inline on the test lane cost 3m12, of which 3m09 was recompiling
+      # 179 crates under the changed feature set.
+      - uses: ./.github/actions/rust-setup
         with:
-          shared-key: release
+          cache-key: e2e
 
-      # `sbproxy-classifiers` has a `build.rs` that runs `tonic-build`,
-      # which needs `protoc` on PATH (added by PR #156, Classifier Judge
-      # RPC). The main `build / test` job already installs it; the
-      # release-build job is a separate runner so it needs the same
-      # install.
-      - name: install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # `--workspace` rather than `-p sbproxy-e2e` so both calls in this job
+      # agree on the feature union and the build is paid once. cargo cannot
+      # infer that `cargo test -p sbproxy-e2e` needs the sbproxy binary
+      # first, so it is built explicitly.
+      - name: build sbproxy binary (for the e2e harness)
+        run: cargo build --workspace --locked
 
-      - name: build release binary
-        run: cargo build --release -p sbproxy --locked
+      # Cardinality + redaction regressions are easy to break silently
+      # (a new label sneaks in, the limiter overflows into __other__,
+      # a redactor regex misses a new shape). This canary runs only when
+      # observability or policy code changed. `--test <name>` selects these
+      # two targets out of the 170 under e2e/tests.
+      - name: observability budgets (cardinality + redaction)
+        run: cargo test --workspace --locked --test cardinality --test redaction
 
-      - name: smoke test the binary
+  ui:
+    name: ui
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: ui typecheck and test
+        working-directory: ui
         run: |
-          test -x target/release/sbproxy
-          file target/release/sbproxy
-          ls -lh target/release/sbproxy
-          # Binary exits 1 with a usage banner when no args. Capture stderr,
-          # confirm the banner is present, and treat exit 1 as success.
-          ./target/release/sbproxy 2>&1 | tee /tmp/sb.out || true
-          grep -q 'Usage: sbproxy' /tmp/sb.out
+          npm ci
+          npm run typecheck
+          npm run test -- --run
 
   supply-chain:
     name: supply chain (cargo-deny)
@@ -323,6 +325,74 @@ jobs:
           command: check
           arguments: --all-features
           log-level: warn
+
+  release-build:
+    name: release build
+    # Only run on pushes to main, not on pull_request events. Release builds
+    # take 16-17 runner-minutes (lto = "fat", codegen-units = 1); skipping
+    # them on PRs saves those minutes and avoids double-billing when a
+    # squash-merge PR lands (the merge commit re-triggers on push anyway).
+    # Deliberately kept on the true release profile: a smoke test built with
+    # a faster profile would not catch LTO-only breakage, and discovering
+    # that at tag time is the expensive failure.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      # `sbproxy-classifiers` has a `build.rs` that runs `tonic-build`,
+      # which needs `protoc` on PATH (added by PR #156, Classifier Judge
+      # RPC). The main `test` job already installs it; the release-build
+      # job is a separate runner so it needs the same install.
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: release
+          free-disk: 'false'
+
+      - name: build release binary
+        run: cargo build --release -p sbproxy --locked
+
+      - name: smoke test the binary
+        run: |
+          test -x target/release/sbproxy
+          file target/release/sbproxy
+          ls -lh target/release/sbproxy
+          # Binary exits 1 with a usage banner when no args. Capture stderr,
+          # confirm the banner is present, and treat exit 1 as success.
+          ./target/release/sbproxy 2>&1 | tee /tmp/sb.out || true
+          grep -q 'Usage: sbproxy' /tmp/sb.out
+
+  # The single required status check. Keeping the `build / test` name means
+  # branch protection needs no change while the work underneath it fans out
+  # across parallel jobs. A lane skipped by its path filter is not a failure;
+  # anything else is.
+  required:
+    name: build / test
+    if: always()
+    needs: [changes, test, lint, obs-budgets, ui, supply-chain]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: every lane passed
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "lane results: ${results}"
+          status=0
+          for result in ${results}; do
+            case "${result}" in
+              success | skipped) ;;
+              *)
+                echo "::error::a required lane concluded '${result}'"
+                status=1
+                ;;
+            esac
+          done
+          exit "${status}"
 
   # macOS regression coverage and single-threaded test-isolation runs
   # live in release-checks.yml and run on tag pushes plus
