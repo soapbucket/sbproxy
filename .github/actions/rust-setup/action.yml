@@ -27,7 +27,7 @@ inputs:
     required: false
     default: ci
   cache-save:
-    description: 'Whether this job writes the cache. Defaults to main-only. A ~3 GB entry per PR evicts the good main cache against the 10 GB per-repo limit, which makes every restore a partial one, so branches restore and do not save.'
+    description: 'Whether this job writes the cache. Defaults to every trigger except pull_request. A ~3 GB entry per PR evicts the good entry against the 10 GB per-repo limit, which makes every restore a partial one, so PRs restore and do not save. Tag, schedule, and dispatch runs still save; e2e.yml has no push-to-main trigger and would otherwise never refresh its cache.'
     required: false
     default: ''
   components:
@@ -74,7 +74,7 @@ runs:
       uses: Swatinem/rust-cache@v2
       with:
         shared-key: ${{ inputs.cache-key }}
-        save-if: ${{ inputs.cache-save != '' && inputs.cache-save || github.ref == 'refs/heads/main' }}
+        save-if: ${{ inputs.cache-save != '' && inputs.cache-save || github.event_name != 'pull_request' }}
 
     - name: install system deps
       if: inputs.install-system-deps == 'true'
