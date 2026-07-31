@@ -120,6 +120,14 @@ proxy:
       path: "{store_path}"
     cache:
       ttl_secs: 60
+      # The clustered-keystore guard (classify_clustered_keystore,
+      # WOR-2062) refuses to boot a seeded node whose embedded keystore
+      # has no shared cache tier. The mesh tier keeps this suite
+      # Redis-free and only affects key-record caching; the governance
+      # usage counting under test still runs on the process-local
+      # store plus CRDT dissemination, and both nodes seed the same
+      # key either way.
+      tier: mesh
     crypto:
       pepper: governance-approx-e2e-pepper
       master_key: governance-approx-e2e-master

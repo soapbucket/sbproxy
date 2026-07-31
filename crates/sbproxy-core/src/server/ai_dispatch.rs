@@ -456,11 +456,19 @@ fn native_bypass_is_safe(is_stream: bool, request_transform_selected: bool) -> b
     !is_stream && !request_transform_selected
 }
 
-fn upstream_response_is_successful_sse(status: u16, content_type: Option<&str>) -> bool {
+// A streaming request stays on the streaming relay only when the upstream
+// answered with a streaming body: SSE, or NDJSON (Ollama's framing, which
+// the usage-parser stack handles line-by-line). Anything else, JSON errors
+// and buffered JSON successes alike, takes the bounded buffered relay.
+fn upstream_response_is_successful_stream(status: u16, content_type: Option<&str>) -> bool {
     (200..300).contains(&status)
         && content_type
             .and_then(|value| value.split(';').next())
-            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
+            .map(str::trim)
+            .is_some_and(|media_type| {
+                media_type.eq_ignore_ascii_case("text/event-stream")
+                    || media_type.eq_ignore_ascii_case("application/x-ndjson")
+            })
 }
 
 const DEFAULT_BUFFERED_AI_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -6652,7 +6660,10 @@ pub(super) async fn handle_ai_proxy(
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok());
-            if !upstream_response_is_successful_sse(resp.status().as_u16(), response_content_type) {
+            if !upstream_response_is_successful_stream(
+                resp.status().as_u16(),
+                response_content_type,
+            ) {
                 // A provider may reject a streaming request with an ordinary
                 // JSON error, or may return a buffered JSON success. Both use
                 // the normal bounded relay, including idempotency capture.
@@ -6703,9 +6714,9 @@ pub(super) async fn handle_ai_proxy(
                 )
                 .await;
             }
-            // SSE streaming with idempotency engaged: drop the capture
+            // Streaming with idempotency engaged: drop the capture
             // (releases the per-origin pool permit) and abandon caching only
-            // after the response has been confirmed as successful SSE.
+            // after the response has been confirmed as a successful stream.
             if idem_capture.take().is_some() {
                 debug!(
                     "AI proxy: idempotency miss on streaming request; abandoning cache record (SSE framing-aware capture is out of scope for v1)"
@@ -13028,7 +13039,7 @@ mod compression_selection_tests {
         ai_policy_input_tokens_est, bind_compression_selection, buffered_ai_response_body_limit,
         compression_header_value, compression_selection_bypasses_cache,
         compression_selection_outcome, native_bypass_body_changed, native_bypass_is_safe,
-        resolve_compression_selection_intent, upstream_response_is_successful_sse,
+        resolve_compression_selection_intent, upstream_response_is_successful_stream,
         CompressionSelectionError, CompressionSelectionSource, ResolvedRequestKey,
     };
     use http::{HeaderMap, HeaderValue};
@@ -13204,20 +13215,30 @@ mod compression_selection_tests {
     }
 
     #[test]
-    fn only_successful_event_stream_responses_enter_sse_relay() {
-        assert!(upstream_response_is_successful_sse(
+    fn only_successful_streaming_responses_enter_stream_relay() {
+        assert!(upstream_response_is_successful_stream(
             200,
             Some("text/event-stream; charset=utf-8")
         ));
-        assert!(!upstream_response_is_successful_sse(
+        // Ollama streams NDJSON rather than SSE; it must stay on the
+        // streaming relay or its usage parser never sees the body.
+        assert!(upstream_response_is_successful_stream(
+            200,
+            Some("application/x-ndjson")
+        ));
+        assert!(!upstream_response_is_successful_stream(
             400,
             Some("text/event-stream")
         ));
-        assert!(!upstream_response_is_successful_sse(
+        assert!(!upstream_response_is_successful_stream(
+            400,
+            Some("application/x-ndjson")
+        ));
+        assert!(!upstream_response_is_successful_stream(
             200,
             Some("application/json")
         ));
-        assert!(!upstream_response_is_successful_sse(200, None));
+        assert!(!upstream_response_is_successful_stream(200, None));
     }
 
     #[test]
