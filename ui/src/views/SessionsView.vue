@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted } from "vue";
-import { api, type RequestLog } from "../api";
+import { useRoute } from "vue-router";
+import { api, type RequestFilters, type RequestLog } from "../api";
 import { useAsync } from "../composables/useAsync";
 import { formatMs, formatNumber, formatTime, formatUsd } from "../lib/format";
 import {
@@ -14,10 +15,23 @@ import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
 
-const req = useAsync(() => api.requests());
+// WOR-2093: a key drill-through arrives as ?api_key_id=, filtering the
+// session index to the sessions one key has had.
+const route = useRoute();
+const keyFilter = computed(() =>
+  typeof route.query.api_key_id === "string" ? route.query.api_key_id : "",
+);
+const filters = computed<RequestFilters>(() =>
+  keyFilter.value ? { apiKeyId: keyFilter.value } : {},
+);
+const req = useAsync(() => api.requests(filters.value));
 onMounted(req.run);
 
-const requests = computed<RequestLog[]>(() => req.data.value ?? []);
+const requests = computed<RequestLog[]>(() =>
+  (req.data.value ?? []).filter(
+    (request) => !keyFilter.value || request.api_key_id === keyFilter.value,
+  ),
+);
 const sessionRequests = computed(() =>
   requests.value.filter(
     (request) =>
@@ -55,6 +69,11 @@ function statusTone(
       <button class="sb-btn sb-btn--primary" @click="req.run">Refresh</button>
     </template>
   </PageHeader>
+
+  <aside v-if="keyFilter" class="key-filter-note">
+    Showing sessions for key <span class="sb-mono">{{ keyFilter }}</span>.
+    <RouterLink :to="{ name: 'sessions' }">Clear filter</RouterLink>
+  </aside>
 
   <aside class="retention-note">
     <strong>Recent view.</strong>

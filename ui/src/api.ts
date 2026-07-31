@@ -1831,6 +1831,18 @@ export interface RequestLog {
   guardrail_category?: string;
   guardrail_action?: string;
   origin?: string;
+  // WOR-2093 key accountability columns.
+  api_key_id?: string;
+  key_mode?: "none" | "minted" | "native" | string;
+  key_provider?: string;
+  tenant_id?: string;
+  user_id?: string;
+  // WOR-2094 explainability columns.
+  error_class?: string;
+  config_revision?: string;
+  policy_version?: string;
+  policy_decisions?: string[];
+  deny_reason?: string;
   [k: string]: unknown;
 }
 
@@ -1846,6 +1858,9 @@ export interface RequestFilters {
   retried?: boolean;
   propertyKey?: string;
   propertyValue?: string;
+  // WOR-2093: server-side key accountability filters.
+  apiKeyId?: string;
+  keyMode?: "none" | "minted" | "native";
 }
 
 export type AlertRuleState = "inactive" | "ok" | "firing";
@@ -1914,6 +1929,42 @@ export interface PromptEntry {
   active?: string;
   versions?: (string | { version?: string; created_at?: string })[];
   [k: string]: unknown;
+}
+
+// WOR-2094: one normalized audit event from the bounded runtime sample.
+export interface AuditEvent {
+  timestamp: string;
+  channel: "security" | "key" | "config" | "admin" | "policy" | string;
+  kind: string;
+  actor?: string;
+  tenant_id?: string;
+  api_key_id?: string;
+  request_id?: string;
+  detail?: string;
+}
+
+export interface AuditEventFilters {
+  limit?: number;
+  channel?: string;
+  kind?: string;
+  keyId?: string;
+}
+
+// WOR-2096: one redacted content sample for one request.
+export interface CapturedMessage {
+  role: string;
+  content: string;
+}
+
+export interface ContentSample {
+  request_id: string;
+  api_key_id?: string;
+  tenant_id: string;
+  origin: string;
+  model?: string;
+  captured_at: string;
+  input_messages: CapturedMessage[];
+  output_text?: string;
 }
 
 /* ---- Endpoint helpers ---- */
@@ -2083,6 +2134,11 @@ function requestsPath(filters: RequestFilters = {}): string {
       params.set("property_value", filters.propertyValue);
     }
   }
+  // WOR-2093: these three filter server-side now; the views still apply
+  // the same predicates client-side so live-tail rows stay consistent.
+  if (filters.sessionId) params.set("session_id", filters.sessionId);
+  if (filters.apiKeyId) params.set("api_key_id", filters.apiKeyId);
+  if (filters.keyMode) params.set("key_mode", filters.keyMode);
   const query = params.toString();
   return query ? `/api/requests?${query}` : "/api/requests";
 }
@@ -2234,6 +2290,25 @@ export const api = {
   // WOR-1870: SSE live tail of the request ring. EventSource sends the
   // session cookie same-origin; the server enforces auth on connect.
   requestsStreamUrl: () => "/api/requests/stream",
+
+  // WOR-2094: unified audit sample (security/key/config/admin/policy).
+  auditEvents: (filters: AuditEventFilters = {}) => {
+    const params = new URLSearchParams();
+    if (filters.limit) params.set("limit", String(filters.limit));
+    if (filters.channel) params.set("channel", filters.channel);
+    if (filters.kind) params.set("kind", filters.kind);
+    if (filters.keyId) params.set("key_id", filters.keyId);
+    const query = params.toString();
+    return getJson<AuditEvent[]>(
+      query ? `/api/audit/events?${query}` : "/api/audit/events",
+    );
+  },
+  // WOR-2096: one request's redacted content sample (admin role only;
+  // the server audits every read).
+  requestContent: (requestId: string) =>
+    getJson<ContentSample>(
+      `/api/requests/${encodeURIComponent(requestId)}/content`,
+    ),
 
   // File-authoritative alert runtime state and targeted channel probes.
   alerts: () => getJson<AlertSnapshot>("/api/alerts"),
