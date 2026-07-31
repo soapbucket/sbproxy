@@ -101,6 +101,28 @@ Two consequences worth remembering:
 - Do not conclude from a per-crate failure that `main` is red. Confirm
   with the documented workspace command before filing anything.
 
+### The same mechanism sets CI's build time
+
+Different feature unions mean different fingerprints, and different
+fingerprints mean cargo rebuilds. Inside one CI job that is expensive:
+adding a `cargo test -p sbproxy-e2e` step after a `--workspace` build
+recompiled 179 crates to run two tests, and a `cargo test -p
+sbproxy-platform` step cost another 2m07 the same way.
+
+So `.github/workflows/ci.yml` holds one invariant: **every cargo
+invocation in a job uses the same package selection.** The `test` lane
+is `--workspace --exclude sbproxy-e2e` throughout; the `obs-budgets`
+lane is `--workspace` throughout, in its own job with its own cache key
+because it needs e2e's wider union.
+
+When adding a check to CI, express it in the lane's existing selection.
+Narrow the *targets* (`--test <name>`) or the *tests*
+(nextest `-E 'test(...)'`), never the packages. If a check genuinely
+needs a different package set, give it its own job rather than paying
+the rebuild on the critical path. `scripts/lib/workspace-bin.sh` exists
+for the same reason: it execs the already-built generator binaries
+instead of re-entering cargo with a `-p` selection.
+
 ## Workspace layout
 
 ```
