@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-07-30*
+*Last modified: 2026-07-31*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -68,6 +68,13 @@ proxy:
 
 When `enabled` is false (the default) the block is inert and inbound auth keeps
 using the compiled `credentials:` blocks.
+
+In Docker, mount a volume at `/var/lib/sbproxy` so the keystore survives
+container replacement (`-v sbproxy-state:/var/lib/sbproxy`). Images up to
+v1.9.0 ship without that directory and the nonroot runtime user cannot create
+it, so on those versions the mount is required: without it the key plane
+fails to install at boot with `create keystore directory '/var/lib/sbproxy'`.
+A bind mount to a host directory works too.
 
 ## Which header carries the key
 
@@ -424,6 +431,12 @@ Set `pepper` and `master_key` to a stable secret in production. Both accept
 `env:NAME` or `file:PATH` so you can inject them from your secret manager. If you
 leave them unset, sbproxy generates an ephemeral value and warns: stored hashes
 and encrypted credentials will not survive a restart.
+
+Generate each value as 32 bytes of cryptographic randomness, hex-encoded
+(`openssl rand -hex 32`), and never reuse one value for both roles. See
+[Generating secret values](secrets.md#generating-secret-values) for the full
+guidance, including the PowerShell equivalent for Windows machines without
+`openssl`.
 
 By default the plane fails closed. If the store cannot be reached, a request
 carrying a virtual key is denied. Set `failure_mode_allow: true` only if you have
