@@ -170,6 +170,85 @@ pub fn envelope_from_headers(
     ctx
 }
 
+/// Walk the [RFC 8693] `act` (actor) delegation chain out of a set of
+/// already-verified token claims.
+///
+/// Returns the actor subjects **oldest first**, matching the ordering
+/// of [`A2AContext::chain`]. RFC 8693 nests the chain the other way
+/// round: the outermost `act` is the current actor and each nested
+/// `act` is a prior actor, so this reverses as it unwinds.
+///
+/// An actor level with no `sub` still counts as a hop. Skipping it
+/// would let a malformed token shorten its own apparent chain, which is
+/// the exact evasion the depth cap exists to stop.
+///
+/// The caller is responsible for having verified the token's signature;
+/// this reads claims and does not authenticate them.
+///
+/// [RFC 8693]: https://datatracker.ietf.org/doc/html/rfc8693#section-4.1
+pub fn chain_from_act_claims(claims: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    let mut newest_first = Vec::new();
+    let mut cur = claims.get("act");
+    while let Some(act) = cur {
+        newest_first.push(
+            act.get("sub")
+                .and_then(|s| s.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        );
+        cur = act.get("act");
+    }
+    newest_first.reverse();
+    newest_first
+}
+
+/// Overlay a verified [RFC 8693] `act` delegation chain onto an
+/// envelope, replacing whatever the transport claimed.
+///
+/// This is what makes `max_chain_depth` and cycle detection meaningful
+/// against a hostile caller. The header transport is forgeable in the
+/// shallow direction: a caller that asserts `x-a2a-chain-depth: 1`, or
+/// simply omits it, lands on depth 1 and clears any cap. A signed token
+/// cannot be flattened that way, so when the token carries a chain it
+/// overrides the envelope and marks the identity verified.
+///
+/// A token with no `act` chain is left alone rather than treated as an
+/// assertion of depth 1. "The token says nothing about delegation" and
+/// "the token says this is the first hop" are different facts, and
+/// collapsing them would reintroduce the evasion through the back door.
+///
+/// `claims` must already be signature-verified.
+///
+/// [RFC 8693]: https://datatracker.ietf.org/doc/html/rfc8693#section-4.1
+pub fn apply_verified_act_chain(
+    ctx: &mut A2AContext,
+    claims: &serde_json::Map<String, serde_json::Value>,
+) {
+    let actors = chain_from_act_claims(claims);
+    if actors.is_empty() {
+        return;
+    }
+
+    // The most recent actor is the agent making this call.
+    if let Some(current) = actors.last() {
+        ctx.caller_agent_id = current.clone();
+    }
+    // Depth counts the hops that led here plus this one, matching the
+    // `chain.len() + 1` convention the body parsers use.
+    ctx.chain_depth = (actors.len() as u32).saturating_add(1);
+    ctx.chain = actors
+        .into_iter()
+        .map(|agent_id| ChainHop {
+            agent_id,
+            // The token carries identity, not per-hop request ids or
+            // timestamps. Downstream reads empty / zero as unknown.
+            request_id: String::new(),
+            timestamp_ms: 0,
+        })
+        .collect();
+    ctx.identity_verified = true;
+}
+
 /// Detection signal: which spec a request appears to be A2A under.
 /// `None` means "not an A2A request, fall through to the regular
 /// HTTP path".
@@ -390,6 +469,111 @@ mod tests {
         assert_eq!(ctx.callee_agent_id, Some("payments-agent".to_string()));
         assert_eq!(ctx.task_id, "task-42");
         assert_eq!(ctx.chain.len(), 1);
+    }
+
+    /// Claims for a token delegated twice: `orchestrator` acted for the
+    /// original subject, then `worker` acted on top of that.
+    ///
+    /// Per RFC 8693 the OUTERMOST `act` is the current actor and nested
+    /// `act` claims are prior actors, so this reads worker-then-
+    /// orchestrator on the wire and must come back oldest-first.
+    fn delegated_claims() -> serde_json::Map<String, serde_json::Value> {
+        match serde_json::json!({
+            "sub": "user-1",
+            "act": {
+                "sub": "worker",
+                "act": { "sub": "orchestrator" }
+            }
+        }) {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn act_chain_is_returned_oldest_first() {
+        // Oldest-first matches `A2AContext::chain` ordering, where
+        // chain[0] is the root. Reversing this silently breaks cycle
+        // detection, so the order is pinned here deliberately.
+        assert_eq!(
+            chain_from_act_claims(&delegated_claims()),
+            vec!["orchestrator".to_string(), "worker".to_string()]
+        );
+    }
+
+    #[test]
+    fn act_chain_is_empty_for_an_undelegated_token() {
+        let claims = match serde_json::json!({ "sub": "user-1" }) {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!(),
+        };
+        assert!(chain_from_act_claims(&claims).is_empty());
+    }
+
+    #[test]
+    fn act_chain_skips_actor_levels_with_no_subject() {
+        // A malformed actor level must not silently shorten the chain
+        // into a passing depth; it still counts as a hop.
+        let claims = match serde_json::json!({
+            "sub": "user-1",
+            "act": { "act": { "sub": "orchestrator" } }
+        }) {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!(),
+        };
+        assert_eq!(chain_from_act_claims(&claims).len(), 2);
+    }
+
+    #[test]
+    fn verified_act_chain_overrides_a_forged_shallow_depth() {
+        // The evasion this closes: an untrusted caller asserts depth 1
+        // (or omits the header entirely, which lands on the same
+        // default) and sails past `max_chain_depth`. The token says
+        // otherwise, and the token wins.
+        let mut ctx = A2AContext::empty(A2ASpec::GoogleV0);
+        ctx.chain_depth = 1;
+
+        apply_verified_act_chain(&mut ctx, &delegated_claims());
+
+        assert_eq!(ctx.chain_depth, 3, "two actors plus this hop");
+        assert!(ctx.identity_verified);
+    }
+
+    #[test]
+    fn verified_act_chain_populates_chain_for_cycle_detection() {
+        let mut ctx = A2AContext::empty(A2ASpec::GoogleV0);
+
+        apply_verified_act_chain(&mut ctx, &delegated_claims());
+
+        let ids: Vec<&str> = ctx.chain.iter().map(|h| h.agent_id.as_str()).collect();
+        assert_eq!(ids, vec!["orchestrator", "worker"]);
+    }
+
+    #[test]
+    fn verified_act_chain_sets_caller_to_the_most_recent_actor() {
+        let mut ctx = A2AContext::empty(A2ASpec::GoogleV0);
+        ctx.caller_agent_id = "spoofed".to_string();
+
+        apply_verified_act_chain(&mut ctx, &delegated_claims());
+
+        assert_eq!(ctx.caller_agent_id, "worker");
+    }
+
+    #[test]
+    fn undelegated_token_leaves_the_envelope_alone() {
+        let claims = match serde_json::json!({ "sub": "user-1" }) {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!(),
+        };
+        let mut ctx = A2AContext::empty(A2ASpec::GoogleV0);
+        ctx.chain_depth = 4;
+
+        apply_verified_act_chain(&mut ctx, &claims);
+
+        // No `act` chain means the token says nothing about delegation.
+        // It must not be read as an assertion that depth is 1.
+        assert_eq!(ctx.chain_depth, 4);
+        assert!(!ctx.identity_verified);
     }
 
     #[test]

@@ -61,7 +61,7 @@ impl PolicyEnforcer for A2AEnforcer {
         // the caller sends nothing that looks like A2A. Without this the
         // policy is opt-in for the attacker: omit one header, skip every
         // check.
-        let a2a_ctx = match ctx.a2a.clone() {
+        let mut a2a_ctx = match ctx.a2a.clone() {
             Some(c) => c,
             None => match policy.governs(req.headers(), req.uri().path()) {
                 // Operator-declared route, no envelope stamped upstream.
@@ -71,6 +71,17 @@ impl PolicyEnforcer for A2AEnforcer {
                 None => return Box::pin(async move { Ok(PolicyDecision::Allow) }),
             },
         };
+
+        // WOR-2120: a signed token outranks the transport. The header
+        // envelope is forgeable in the direction that matters, since a
+        // caller asserting depth 1 (or omitting the header) clears any
+        // cap. An `act` chain cannot be flattened that way, so when the
+        // verified principal carries one it replaces the claimed depth
+        // and chain before evaluation.
+        if let Some(claims) = ctx.principal.attrs.claims.as_ref() {
+            sbproxy_modules::apply_verified_act_chain(&mut a2a_ctx, claims);
+        }
+        let a2a_ctx = a2a_ctx;
         let route = ctx.hostname.to_string();
         let spec_label = a2a_ctx.spec.as_label();
         let callable_endpoint = req.uri().path().to_string();

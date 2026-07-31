@@ -23,7 +23,8 @@ pub use action::{
     TargetState, VersionSource,
 };
 pub use auth::a2a::{
-    detect as detect_a2a, envelope_from_headers, A2AContext, A2ASpec, ChainHop, DetectedSpec,
+    apply_verified_act_chain, chain_from_act_claims, detect as detect_a2a, envelope_from_headers,
+    A2AContext, A2ASpec, ChainHop, DetectedSpec,
 };
 pub use auth::{ApiKeyAuth, Auth};
 pub use compile::*;
