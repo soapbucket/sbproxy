@@ -1,23 +1,31 @@
 //! A2A protocol envelope.
 //!
 //! The module exposes the shared `A2AContext` populated by the
-//! request filter and the detection function that runs before
-//! either spec parser. Parsers live behind feature flags so the
-//! default OSS build compiles detection only and treats matched
-//! requests as plain POSTs.
+//! request filter and the detection function that runs before any
+//! spec parser.
+//!
+//! The two `v0` draft parsers live behind feature flags, and nothing
+//! in the workspace enables them, so for those specs the default build
+//! compiles detection only and treats matched requests as plain POSTs.
+//! The ratified [`v1`] parser is **not** gated: gating it would leave
+//! the current standard in the same position the drafts are in, which
+//! is a parser nobody compiles and therefore no governance at all.
 
 #[cfg(feature = "a2a-anthropic")]
 pub mod anthropic;
 #[cfg(feature = "a2a-google")]
 pub mod google;
+pub mod v1;
 
 use serde::{Deserialize, Serialize};
 
 /// Closed enum of the A2A specs the proxy understands.
 ///
-/// New variants extend the wire envelope (closed-enum
-/// amendment rules). Today both variants carry the `v0` designation
-/// because the upstream drafts are unstable.
+/// New variants extend the wire envelope (closed-enum amendment
+/// rules). The two `v0` variants predate the standard and carry that
+/// designation because the drafts they model were unstable; A2A has
+/// since ratified 1.0, which is [`A2ASpec::V1_0`]. Prefer that for new
+/// work and treat the drafts as compatibility surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum A2ASpec {
     /// Anthropic A2A draft (`draft-anthropic-a2a-v0`). Modeled as an
@@ -26,6 +34,15 @@ pub enum A2ASpec {
     /// Google A2A draft (`draft-google-a2a-v0`). Dedicated content
     /// type `application/a2a+json`.
     GoogleV0,
+    /// Ratified [A2A 1.0](https://a2a-protocol.org/latest/specification/),
+    /// governed by the Linux Foundation.
+    ///
+    /// Unlike the two drafts above this one carries no distinguishing
+    /// content type: its JSON-RPC binding rides plain
+    /// `application/json`. Detection keys on the `A2A-Version` header
+    /// instead. Both drafts predate it and are kept only for peers that
+    /// have not migrated.
+    V1_0,
 }
 
 impl A2ASpec {
@@ -34,6 +51,7 @@ impl A2ASpec {
         match self {
             Self::AnthropicV0 => "anthropic-v0",
             Self::GoogleV0 => "google-v0",
+            Self::V1_0 => "v1.0",
         }
     }
 }
@@ -261,6 +279,8 @@ pub enum DetectedSpec {
     /// Operator escape hatch (`a2a.route_glob`); the spec is
     /// indeterminate but the request is still A2A traffic.
     OperatorRoute,
+    /// Ratified A2A 1.0, matched on the `A2A-Version` header.
+    V1,
 }
 
 impl DetectedSpec {
@@ -271,6 +291,7 @@ impl DetectedSpec {
         match self {
             Self::Anthropic => A2ASpec::AnthropicV0,
             Self::Google | Self::OperatorRoute => A2ASpec::GoogleV0,
+            Self::V1 => A2ASpec::V1_0,
         }
     }
 }
@@ -293,6 +314,24 @@ pub fn detect(
     path: &str,
     route_glob: Option<&str>,
 ) -> Option<DetectedSpec> {
+    // Ratified 1.0 first. It rides plain `application/json`, so it has
+    // no distinguishing content type and would otherwise fall through
+    // every check below and go ungoverned. A peer that sends both this
+    // and a draft signal is speaking the standard and labelling itself
+    // for a legacy intermediary, so the standard wins.
+    if let Some(version) = headers.get("a2a-version").and_then(|v| v.to_str().ok()) {
+        // Match on the major component only. The spec's service
+        // parameter carries `1.0`, but patch revisions are additive
+        // within a major and a build that understands 1.x understands
+        // 1.x.y. An unrecognised major is deliberately NOT treated as
+        // A2A: claiming to reason about a wire format this build has
+        // never seen is worse than declining to.
+        if version.trim().split('.').next() == Some("1") {
+            return Some(DetectedSpec::V1);
+        }
+        return None;
+    }
+
     if let Some(ct) = headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -350,6 +389,46 @@ mod tests {
             );
         }
         h
+    }
+
+    #[test]
+    fn detect_ratified_v1_via_version_header() {
+        // A2A reached 1.0 under the Linux Foundation. Its JSON-RPC
+        // binding rides plain `application/json`, so neither v0 signal
+        // fires and real 1.0 traffic went completely ungoverned.
+        let h = headers(&[("content-type", "application/json"), ("a2a-version", "1.0")]);
+        assert_eq!(detect(&h, "/", None), Some(DetectedSpec::V1));
+    }
+
+    #[test]
+    fn detect_v1_ignores_the_patch_component() {
+        let h = headers(&[("a2a-version", "1.0.2")]);
+        assert_eq!(detect(&h, "/", None), Some(DetectedSpec::V1));
+    }
+
+    #[test]
+    fn detect_v1_takes_precedence_over_the_v0_drafts() {
+        // A peer that sends both is speaking the ratified spec and
+        // labelling it for a legacy intermediary. Prefer the standard.
+        let h = headers(&[
+            ("content-type", "application/a2a+json"),
+            ("a2a-version", "1.0"),
+        ]);
+        assert_eq!(detect(&h, "/", None), Some(DetectedSpec::V1));
+    }
+
+    #[test]
+    fn detect_rejects_an_unknown_major_version() {
+        // A future 2.x is not something this build can reason about.
+        // Claiming to understand it would be worse than declining.
+        let h = headers(&[("a2a-version", "2.0")]);
+        assert_eq!(detect(&h, "/", None), None);
+    }
+
+    #[test]
+    fn v1_spec_label_is_distinct_from_the_drafts() {
+        assert_eq!(A2ASpec::V1_0.as_label(), "v1.0");
+        assert_eq!(DetectedSpec::V1.to_spec(), A2ASpec::V1_0);
     }
 
     #[test]

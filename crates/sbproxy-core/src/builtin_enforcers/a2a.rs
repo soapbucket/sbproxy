@@ -75,7 +75,7 @@ impl PolicyEnforcer for A2AEnforcer {
                     // from a healthy one, which is how a bypass stays
                     // invisible on a dashboard.
                     sbproxy_observe::metrics::record_a2a_hop(
-                        &ctx.hostname.to_string(),
+                        ctx.hostname.as_ref(),
                         "none",
                         "skip:undetected",
                     );
@@ -97,6 +97,42 @@ impl PolicyEnforcer for A2AEnforcer {
         let route = ctx.hostname.to_string();
         let spec_label = a2a_ctx.spec.as_label();
         let callable_endpoint = req.uri().path().to_string();
+
+        // WOR-2116: on ratified 1.0, inspect the JSON-RPC body for a
+        // push-notification registration and validate its target before
+        // it reaches the upstream agent. A2A lets a caller hand the
+        // agent a URL to POST task artifacts to, so an unchecked
+        // registration turns an authenticated backend into a confused
+        // deputy aimed at whatever the caller names.
+        //
+        // Only parsed for the 1.0 spec: the v0 drafts have no
+        // push-notification surface, so there is nothing to check and no
+        // reason to spend a JSON parse on their bodies.
+        if a2a_ctx.spec == sbproxy_modules::A2ASpec::V1_0 && !req.body().is_empty() {
+            if let Some(parsed) = sbproxy_modules::a2a_v1::parse_request(req.body()) {
+                let push = policy.check_push_notification(&parsed);
+                if !push.is_allow() {
+                    let reason = push.reason_label();
+                    sbproxy_observe::metrics::record_a2a_hop(
+                        &route,
+                        spec_label,
+                        &push.metric_label(a2a_ctx.identity_verified),
+                    );
+                    sbproxy_observe::metrics::record_a2a_denied(&route, reason);
+                    let body = push.json_body();
+                    let status = push.http_status();
+                    ctx.a2a_denial_body = Some(body.clone());
+                    ctx.deny_policy_type = Some("a2a_push_target_blocked");
+                    return Box::pin(async move {
+                        Ok(PolicyDecision::Deny {
+                            status,
+                            message: body,
+                        })
+                    });
+                }
+            }
+        }
+
         let decision = policy.evaluate(&a2a_ctx, &callable_endpoint);
         sbproxy_observe::metrics::record_a2a_chain_depth(&route, spec_label, a2a_ctx.chain_depth);
         let decision_label = decision.metric_label(a2a_ctx.identity_verified);

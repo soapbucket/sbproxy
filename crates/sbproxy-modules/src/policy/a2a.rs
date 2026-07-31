@@ -79,6 +79,19 @@ pub struct A2APolicyConfig {
     /// alongside content-type and MCP-Method. Empty disables.
     #[serde(default)]
     pub route_glob: Option<String>,
+    /// Hosts permitted as A2A push-notification webhook targets even
+    /// when they resolve to private address space.
+    ///
+    /// A2A 1.0 lets a caller register a URL that the upstream agent
+    /// POSTs task status and artifacts to. Left unchecked that is
+    /// server-side request forgery by protocol design, aimed at cloud
+    /// metadata endpoints and internal admin planes, and the payload
+    /// carries task artifacts so a hit exfiltrates rather than merely
+    /// probes. The default posture blocks private targets; internal
+    /// callbacks are a legitimate deployment, so this exists, but the
+    /// operator has to name the host rather than get it implicitly.
+    #[serde(default)]
+    pub push_target_allowlist: Vec<String>,
 }
 
 fn default_max_chain_depth() -> u32 {
@@ -99,6 +112,7 @@ impl Default for A2APolicyConfig {
             caller_denylist: Vec::new(),
             bill_caller_only: true,
             route_glob: None,
+            push_target_allowlist: Vec::new(),
         }
     }
 }
@@ -133,6 +147,12 @@ pub enum A2APolicyDecision {
     CalleeNotAllowed {
         /// Callee identifier that did not match any allowlist entry.
         callee: String,
+    },
+    /// A push-notification webhook target failed egress validation.
+    PushTargetBlocked {
+        /// Why the target was refused. Never echoes a resolved address,
+        /// so the denial cannot be used as a network oracle.
+        reason: String,
     },
     /// Caller is on the configured denylist.
     CallerDenied {
@@ -179,6 +199,7 @@ impl A2APolicyDecision {
             Self::ChainDepthExceeded { .. } => "depth",
             Self::CycleDetected { .. } => "cycle",
             Self::CalleeNotAllowed { .. } => "callee_not_allowed",
+            Self::PushTargetBlocked { .. } => "push_target_blocked",
             Self::CallerDenied { .. } => "caller_denied",
         }
     }
@@ -190,6 +211,10 @@ impl A2APolicyDecision {
             Self::ChainDepthExceeded { .. } => 429,
             Self::CycleDetected { .. } => 409,
             Self::CalleeNotAllowed { .. } => 403,
+            // 403 rather than 400: the target is refused by policy, not
+            // malformed. A 400 would invite the caller to retry with a
+            // reshaped URL as if the syntax were the problem.
+            Self::PushTargetBlocked { .. } => 403,
             Self::CallerDenied { .. } => 403,
         }
     }
@@ -211,6 +236,10 @@ impl A2APolicyDecision {
             Self::CalleeNotAllowed { callee } => format!(
                 "{{\"error\":\"a2a_callee_not_allowed\",\"callee\":{}}}",
                 json_escape(callee)
+            ),
+            Self::PushTargetBlocked { reason } => format!(
+                "{{\"error\":\"a2a_push_target_blocked\",\"reason\":{}}}",
+                json_escape(reason)
             ),
             Self::CallerDenied { caller } => format!(
                 "{{\"error\":\"a2a_caller_denied\",\"caller\":{}}}",
@@ -284,6 +313,44 @@ impl A2APolicy {
     /// bare function cannot see the policy's configured glob.
     pub fn governs(&self, headers: &http::HeaderMap, path: &str) -> Option<DetectedSpec> {
         crate::auth::a2a::detect(headers, path, self.route_glob())
+    }
+
+    /// Validate the webhook target on an A2A 1.0
+    /// `CreateTaskPushNotificationConfig` request before it reaches the
+    /// upstream agent.
+    ///
+    /// A2A lets a client register a URL and have the agent POST task
+    /// status and artifacts to it. The URL is caller-supplied and the
+    /// dial is made by an authenticated backend, which is the textbook
+    /// confused-deputy shape. Because the payload carries artifacts, a
+    /// successful redirect into private space exfiltrates rather than
+    /// merely probes.
+    ///
+    /// Requests that register no webhook are allowed untouched.
+    ///
+    /// This is registration-time validation only, and the proxy is not
+    /// the party that later dials the URL: the upstream agent is. So
+    /// this cannot close the DNS-rebinding window between registration
+    /// and delivery, because it does not own the dial. It refuses the
+    /// obviously-hostile targets at the door. Closing the rebinding gap
+    /// needs the agent to pin the address it validated, which is a
+    /// contract with the upstream rather than something the gateway can
+    /// impose.
+    pub fn check_push_notification(
+        &self,
+        req: &crate::auth::a2a::v1::V1Request,
+    ) -> A2APolicyDecision {
+        let Some(url) = req.push_notification_url.as_deref() else {
+            return A2APolicyDecision::Allow;
+        };
+        match sbproxy_security::ssrf::validate_url_resolved(url, &self.config.push_target_allowlist)
+        {
+            Ok(_) => A2APolicyDecision::Allow,
+            // The guard's message names the class of block (scheme,
+            // private address) without echoing a resolved address, so
+            // the denial does not become a network-mapping oracle.
+            Err(reason) => A2APolicyDecision::PushTargetBlocked { reason },
+        }
     }
 
     /// Operator escape-hatch glob, if configured. Most callers want
@@ -416,6 +483,79 @@ mod tests {
             // `auth::a2a` trust-gate tests.
             identity_verified: true,
         }
+    }
+
+    fn push_registration(url: &str) -> crate::auth::a2a::v1::V1Request {
+        crate::auth::a2a::v1::V1Request {
+            method: Some(crate::auth::a2a::v1::V1Method::CreateTaskPushNotificationConfig),
+            push_notification_url: Some(url.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn push_webhook_to_cloud_metadata_is_blocked() {
+        // A2A lets a caller register a URL that the upstream agent then
+        // POSTs task artifacts to. That is server-side request forgery
+        // as a protocol feature, and the payload is not empty, so a
+        // successful hit is exfiltration rather than a probe.
+        let policy = A2APolicy::with_config(A2APolicyConfig::default());
+        let decision =
+            policy.check_push_notification(&push_registration("http://169.254.169.254/latest/"));
+        assert!(!decision.is_allow());
+        assert_eq!(decision.reason_label(), "push_target_blocked");
+    }
+
+    #[test]
+    fn push_webhook_to_loopback_is_blocked() {
+        let policy = A2APolicy::with_config(A2APolicyConfig::default());
+        assert!(!policy
+            .check_push_notification(&push_registration("http://127.0.0.1:8080/admin"))
+            .is_allow());
+    }
+
+    #[test]
+    fn push_webhook_with_a_non_http_scheme_is_blocked() {
+        let policy = A2APolicy::with_config(A2APolicyConfig::default());
+        assert!(!policy
+            .check_push_notification(&push_registration("file:///etc/passwd"))
+            .is_allow());
+    }
+
+    #[test]
+    fn a_request_that_registers_no_webhook_is_allowed() {
+        let policy = A2APolicy::with_config(A2APolicyConfig::default());
+        let plain = crate::auth::a2a::v1::V1Request {
+            method: Some(crate::auth::a2a::v1::V1Method::SendMessage),
+            ..Default::default()
+        };
+        assert!(policy.check_push_notification(&plain).is_allow());
+    }
+
+    #[test]
+    fn an_operator_allowlisted_private_target_is_permitted() {
+        // Internal callbacks are a legitimate deployment, so the escape
+        // hatch exists; it just has to be named explicitly rather than
+        // inferred. An IP literal keeps this hermetic: the hostname
+        // branch of the guard does a best-effort DNS resolve, which
+        // would put a resolver in the path of a unit test.
+        let policy = A2APolicy::with_config(A2APolicyConfig {
+            push_target_allowlist: vec!["10.0.0.5".to_string()],
+            ..A2APolicyConfig::default()
+        });
+        assert!(policy
+            .check_push_notification(&push_registration("http://10.0.0.5/hook"))
+            .is_allow());
+    }
+
+    #[test]
+    fn the_same_private_target_is_blocked_without_the_allowlist() {
+        // Pins that the previous test passes because of the allowlist
+        // and not because 10.0.0.0/8 was never blocked to begin with.
+        let policy = A2APolicy::with_config(A2APolicyConfig::default());
+        assert!(!policy
+            .check_push_notification(&push_registration("http://10.0.0.5/hook"))
+            .is_allow());
     }
 
     #[test]
