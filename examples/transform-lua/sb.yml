@@ -8,6 +8,9 @@
 #   - uppercases the title
 #   - adds a derived `word_count` field from the body
 #   - drops the original `body` field
+#   - stamps the caller's tenant from `ctx.principal` (the unified
+#     identity every script surface receives; "__default__" when no
+#     auth provider ran, as in this offline example)
 #   - returns the modified table, which is re-serialised to JSON
 #
 # Run:
@@ -47,6 +50,10 @@ origins:
                 data.body = nil
               end
               data.transformed_by = "lua"
+              -- ctx carries the same namespaces as CEL: principal.*,
+              -- request.tls.*, request.aipref.*. Fields render as empty
+              -- strings rather than nil, so no presence-probing needed.
+              data.tenant = ctx.principal.tenant_id
             end
             return data
           end

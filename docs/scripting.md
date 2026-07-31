@@ -431,9 +431,13 @@ req.method    -- "GET", "POST", ...
 req.path      -- "/api/users"
 req.headers   -- table, keys lowercase
 req.host      -- the origin hostname that routed the request
+req.tls.ja3   -- TLS fingerprints, empty strings on plain HTTP
+req.tls.ja4
+req.tls.ja4h
+req.tls.trustworthy  -- boolean, false when no fingerprint was captured
 ```
 
-That is the full request surface. Anything else you need (client IP, agent class, claims) has to arrive as a header or be handled in CEL, where the wider namespace lives.
+Anything else you need (client IP, agent class) has to arrive as a header or be handled in CEL, where the wider namespace lives. Caller identity is on `ctx.principal`, below.
 
 #### `resp` (response modifiers)
 
@@ -444,15 +448,30 @@ resp.headers      -- response headers table
 
 #### `ctx` (second argument)
 
-Response modifiers and JSON transforms receive a context table carrying the parsed aipref signal:
+Request modifiers, response modifiers, and the Lua / JavaScript JSON transforms all receive the same context table. It carries the parsed aipref signal, the TLS fingerprint, and the unified caller identity:
 
 ```lua
 ctx.request.aipref.train     -- boolean, default true
 ctx.request.aipref.search    -- boolean, default true
 ctx.request.aipref.ai_input  -- boolean, default true
+
+ctx.request.tls.ja4          -- same fields as req.tls above
+
+ctx.principal.tenant_id      -- tenant the request resolved to
+ctx.principal.sub            -- subject id, "" for anonymous callers
+ctx.principal.source         -- provider slug ("jwt", "virtual_key", ...)
+ctx.principal.virtual_key.name
+ctx.principal.virtual_key.allowed_providers  -- list
+ctx.principal.attrs.project  -- attribution fields, "" when unset
+ctx.principal.attrs.user
+ctx.principal.attrs.team
+ctx.principal.attrs.tags     -- list
+ctx.principal.attrs.metadata -- map
+ctx.principal.attrs.roles    -- list
+ctx.principal.claims         -- verbatim JWT/OIDC claims map, {} otherwise
 ```
 
-Request modifiers currently receive an empty `ctx` table.
+The `principal` shape is field-for-field the CEL `principal.*` namespace from section 3.1, so a policy written for CEL ports to Lua or JavaScript by swapping the dot paths. Empty and missing values render as empty strings, lists, and maps rather than being omitted, so a script can branch on `ctx.principal.attrs.team` without probing for presence first.
 
 ### 4.3 JSON helpers
 
@@ -649,7 +668,7 @@ transforms:
       }
 ```
 
-The `ctx` argument carries `ctx.request.aipref.train`, `ctx.request.aipref.search`, and `ctx.request.aipref.ai_input`, each defaulting to `true` when the request has no valid `aipref` header.
+The `ctx` argument carries the same context table as the Lua surfaces in section 4.2: `ctx.request.aipref.*` (each flag defaulting to `true` when the request has no valid `aipref` header), `ctx.request.tls.*` (JA3/JA4/JA4H fingerprints, empty strings on plain HTTP), and `ctx.principal.*` (the unified caller identity, mirroring the CEL `principal.*` namespace from section 3.1).
 
 QuickJS always runs with a sandbox: a 100 ms CPU budget, 16 MiB heap cap, and
 1 MiB native-stack cap. A script that exceeds the CPU budget is aborted by a
@@ -668,6 +687,8 @@ construct `JsEngine::with_sandbox` directly can supply different limits.
 WASM modules run in `wasmtime` against the WASI preview-1 ABI. The host pipes the response body in on the module's stdin and captures whatever the module writes to stdout. There is no custom calling convention to learn; any `wasm32-wasi` binary that reads stdin and writes stdout works.
 
 WASM is currently exposed as a body transform (`type: wasm`), not as a request/response modifier. Use it when you need to mutate the response body in a language that does not have a first-class engine here (Rust, TinyGo, AssemblyScript, Zig, etc.) or when you want stronger isolation than CEL or Lua provide.
+
+Because the contract is raw bytes on stdin, WASM modules do not receive the `ctx` context the Lua and JavaScript surfaces get: there is no JSON envelope to carry `principal` or `request.tls`, and inventing one would break every deployed module that parses its body off stdin. If a module needs caller identity or fingerprint data, gate the transform with a CEL policy or stamp the needed value into a header with a Lua/JS modifier ahead of it.
 
 ```yaml
 origins:

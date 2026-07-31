@@ -2283,7 +2283,9 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["host"],
-        description: "Age of the cached OCSP staple for the host, in seconds.",
+        description: "Age of the cached OCSP staple for the host, in seconds. Published once \
+             a minute by the refresh task; absent until the first successful fetch, so \
+             never-stapled is distinguishable from stale.",
         dead_reason: None,
     },
     MetricCapability {

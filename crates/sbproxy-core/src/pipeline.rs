@@ -1435,6 +1435,22 @@ impl CompiledPipeline {
         config: CompiledConfig,
         mode: PipelineConstructionMode,
     ) -> anyhow::Result<Self> {
+        // WOR-2084: async twin of the shared L2 store. The rate-limit
+        // policy's hot path awaits `AsyncKVStore::incr_with_ttl`
+        // directly when this is attached, instead of bridging every
+        // shared-counter decision through `spawn_blocking`. Built once
+        // and shared across origins; the sync handle stays attached too
+        // as the fallback and for callers that have not migrated.
+        let l2_async_store: Option<Arc<dyn sbproxy_platform::storage::AsyncKVStore>> = config
+            .l2_store
+            .as_deref()
+            .and_then(|kv| kv.validated_redis_connection())
+            .map(|connection| {
+                sbproxy_platform::storage::AsyncRedisKVStore::new(
+                    sbproxy_platform::storage::AsyncRedisConfig::from_connection(connection),
+                ) as Arc<dyn sbproxy_platform::storage::AsyncKVStore>
+            });
+
         let sensitive_header_names = compile_sensitive_header_names(&config);
         let mut actions = Vec::with_capacity(config.origins.len());
         let mut auths = Vec::with_capacity(config.origins.len());
@@ -1483,11 +1499,13 @@ impl CompiledPipeline {
             let origin_policies = compile_origin_policy_chain(
                 &origin.policy_configs,
                 config.l2_store.clone(),
+                l2_async_store.clone(),
                 origin.origin_id.as_str(),
             )?;
             let policies_for_enforcers = compile_origin_policy_chain(
                 &origin.policy_configs,
                 config.l2_store.clone(),
+                l2_async_store.clone(),
                 origin.origin_id.as_str(),
             )?;
             enforcers.push(compile_builtin_enforcers(
@@ -1997,6 +2015,7 @@ fn compile_origin_idempotency(
 fn compile_origin_policy_chain(
     policy_configs: &[serde_json::Value],
     l2_store: Option<Arc<dyn sbproxy_platform::storage::KVStore>>,
+    l2_async_store: Option<Arc<dyn sbproxy_platform::storage::AsyncKVStore>>,
     origin_id: &str,
 ) -> anyhow::Result<Vec<Policy>> {
     let mut chain: Vec<Policy> = policy_configs
@@ -2014,7 +2033,16 @@ fn compile_origin_policy_chain(
                             "requests_per_second": 10.0
                         }))?,
                     );
-                    *rl = taken.with_store(l2_store.clone(), origin_id);
+                    // WOR-2084: attach the async handle alongside the
+                    // sync one. `allow_with_info_async` prefers it and
+                    // skips the spawn_blocking bridge; the sync handle
+                    // remains the fallback. Both setters derive the same
+                    // counter-key prefix, so attach order cannot split
+                    // counters across keyspaces (pinned by a test in
+                    // sbproxy-modules).
+                    *rl = taken
+                        .with_store(l2_store.clone(), origin_id)
+                        .with_async_store(l2_async_store.clone(), origin_id);
                 }
                 Policy::Waf(waf) => {
                     // Attach the same shared L2 store to the WAF

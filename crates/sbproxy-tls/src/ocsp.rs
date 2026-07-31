@@ -45,6 +45,34 @@ impl OcspStapler {
             .map(|t| t.elapsed().as_secs_f64())
     }
 
+    /// Publish [`Self::staple_age_secs`] onto
+    /// `sbproxy_ocsp_staple_age_seconds{host}` (WOR-2086).
+    ///
+    /// A stapler that has never fetched publishes nothing, so the
+    /// series is *absent* rather than a misleading zero: for a
+    /// deployment that expects stapling, "no staple was ever fetched"
+    /// is a worse condition than "the staple is old", and an absent
+    /// series is what lets an alert tell the two apart.
+    ///
+    /// Called once a minute by the refresh task's age tick. Before this
+    /// existed the gauge was set to `0` on each successful fetch and
+    /// then never touched again, so a refresh loop that died left the
+    /// gauge frozen at zero: the exact quiet failure the metric was
+    /// added to expose.
+    pub fn publish_staple_age(&self, host: &str) {
+        if let Some(age) = self.staple_age_secs() {
+            sbproxy_observe::metrics::record_ocsp_staple_age(host, age);
+        }
+    }
+
+    /// Test hook: pretend the last successful fetch happened at
+    /// `fetched_at`, so age-derived behaviour is deterministic without
+    /// a live OCSP responder.
+    #[cfg(test)]
+    pub(crate) fn mark_fetched_at_for_test(&self, fetched_at: std::time::Instant) {
+        self.last_fetched_at.store(Arc::new(Some(fetched_at)));
+    }
+
     /// Fetch the OCSP response for `cert_pem` from the CA's responder URL.
     ///
     /// The responder URL is extracted from the certificate's Authority
@@ -171,36 +199,52 @@ impl OcspStapler {
                 }
             }
 
-            // --- 12h refresh loop ---
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(12 * 3600));
+            // Sibling handle over the same slots, so the age tick
+            // below reads through the public accessor rather than
+            // duplicating its arithmetic.
+            let view = OcspStapler {
+                response: response_slot.clone(),
+                last_fetched_at: last_fetched_slot.clone(),
+            };
+
+            // --- 12h refresh loop + 60s age tick ---
+            //
+            // WOR-2086: the age gauge is published every minute, not
+            // only at fetch time. Publishing only on fetch meant the
+            // gauge crawled forward in 12-hour steps at best, and froze
+            // at zero if this task died, which is the one failure the
+            // gauge exists to make visible. A minute of lag is nothing
+            // against a staple lifetime measured in days.
+            let mut refresh = tokio::time::interval(std::time::Duration::from_secs(12 * 3600));
             // The first tick fires immediately under tokio's default
-            // policy; consume it so the loop sleeps 12h on the next
-            // call.
-            interval.tick().await;
+            // policy; consume it so the loop sleeps 12h before the
+            // first refresh.
+            refresh.tick().await;
+            let mut age_tick = tokio::time::interval(std::time::Duration::from_secs(60));
 
             loop {
-                interval.tick().await;
-
-                match OcspStapler::fetch_ocsp_response(&cert_pem).await {
-                    Ok(bytes) => {
-                        info!(bytes = bytes.len(), "OCSP response refreshed");
-                        response_slot.store(Arc::new(Some(bytes.clone())));
-                        last_fetched_slot.store(Arc::new(Some(std::time::Instant::now())));
-                        sbproxy_observe::metrics::record_ocsp_staple_age(&host, 0.0);
-                        on_update(bytes);
-                    }
-                    Err(e) => {
-                        error!("failed to refresh OCSP response: {e:#}");
-                        // WOR-1024: surface the staleness via the
-                        // gauge so an alert fires before the staple
-                        // outlives its useful life. The host label
-                        // matches the initial fetch.
-                        if let Some(t) = last_fetched_slot.load().as_ref() {
-                            sbproxy_observe::metrics::record_ocsp_staple_age(
-                                &host,
-                                t.elapsed().as_secs_f64(),
-                            );
+                tokio::select! {
+                    _ = refresh.tick() => {
+                        match OcspStapler::fetch_ocsp_response(&cert_pem).await {
+                            Ok(bytes) => {
+                                info!(bytes = bytes.len(), "OCSP response refreshed");
+                                response_slot.store(Arc::new(Some(bytes.clone())));
+                                last_fetched_slot
+                                    .store(Arc::new(Some(std::time::Instant::now())));
+                                sbproxy_observe::metrics::record_ocsp_staple_age(&host, 0.0);
+                                on_update(bytes);
+                            }
+                            Err(e) => {
+                                // The age tick keeps the gauge moving,
+                                // so a failed refresh needs no manual
+                                // gauge write here; the staleness is
+                                // already visible.
+                                error!("failed to refresh OCSP response: {e:#}");
+                            }
                         }
+                    }
+                    _ = age_tick.tick() => {
+                        view.publish_staple_age(&host);
                     }
                 }
             }
@@ -246,6 +290,57 @@ fn extract_ocsp_url(cert: &x509_parser::certificate::X509Certificate<'_>) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staple_age_is_absent_until_fetch_then_tracks_elapsed_time() {
+        // WOR-2086, through the stapler rather than the recorder: a
+        // never-fetched stapler publishes no series at all, and a
+        // fetched one publishes its real elapsed age. Distinct hosts
+        // per assertion because the prometheus default registry is
+        // process-global across tests.
+        let stapler = OcspStapler::new();
+        assert!(stapler.staple_age_secs().is_none());
+        stapler.publish_staple_age("never-fetched.test");
+
+        let gauge_for = |host: &str| -> Option<f64> {
+            prometheus::default_registry()
+                .gather()
+                .iter()
+                .find(|f| f.name() == "sbproxy_ocsp_staple_age_seconds")
+                .and_then(|f| {
+                    f.get_metric()
+                        .iter()
+                        .find(|m| {
+                            m.get_label()
+                                .iter()
+                                .any(|l| l.name() == "host" && l.value() == host)
+                        })
+                        .map(|m| m.get_gauge().value())
+                })
+        };
+
+        assert!(
+            gauge_for("never-fetched.test").is_none(),
+            "a stapler that never fetched must leave the series absent, not zero"
+        );
+
+        let fetched_at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(90))
+            .expect("monotonic clock is older than 90s");
+        stapler.mark_fetched_at_for_test(fetched_at);
+        let age = stapler
+            .staple_age_secs()
+            .expect("fetched stapler has an age");
+        assert!(age >= 90.0, "age must track elapsed time, got {age}");
+
+        stapler.publish_staple_age("staple-age.test");
+        let published =
+            gauge_for("staple-age.test").expect("a fetched stapler must publish its age");
+        assert!(
+            published >= 90.0,
+            "the gauge must carry the real age, got {published}"
+        );
+    }
 
     #[test]
     fn new_stapler_has_no_response() {

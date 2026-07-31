@@ -2277,7 +2277,16 @@ pub(super) async fn handle_ai_proxy(
     // guard is `!Send` and `request_filter` is an async function that
     // must be `Send`. The surface field is carried by the explicit
     // `debug!` above and by the per-surface metrics below.
-    let ai_span = sbproxy_ai::tracing_spans::ai_request_span(surface_label, &method_str);
+    // WOR-2085: the surface label identifies the endpoint for metrics;
+    // the OTel GenAI operation name is a separate, coarser vocabulary
+    // (`chat` / `embeddings` / `image_generation` / `audio`) that trace
+    // backends filter on. Stamping the label into the operation slot
+    // misreported every chat and audio request.
+    let ai_span = sbproxy_ai::tracing_spans::ai_request_span(
+        surface_label,
+        surface.operation_name(),
+        &method_str,
+    );
     // Parent the exported span on the caller's trace when the inbound
     // request carried a genuine traceparent/B3 header (request_phase.rs
     // populated both trace_ctx and the is_remote flag). Explicit and
