@@ -933,7 +933,7 @@ pub(super) async fn realtime_budget_gate(
         .map(ResolvedRequestKey::blocked_providers)
         .unwrap_or(&[]);
     let native_provider = (ctx.inbound_key_mode == crate::context::InboundKeyMode::Native)
-        .then(|| ctx.native_key_provider.as_deref())
+        .then_some(ctx.native_key_provider.as_deref())
         .flatten();
     let provider = config.providers.iter().find(|provider| {
         provider.enabled
@@ -2390,7 +2390,7 @@ pub(super) async fn handle_ai_proxy(
         .unwrap_or_default();
     let blocked_providers = blocked_provider_policy.as_slice();
     let native_provider = (ctx.inbound_key_mode == crate::context::InboundKeyMode::Native)
-        .then(|| ctx.native_key_provider.as_deref())
+        .then_some(ctx.native_key_provider.as_deref())
         .flatten();
     let native_api_key = if let Some(provider) = native_provider {
         let Some(key_plane) = key_plane.as_deref() else {
