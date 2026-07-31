@@ -108,7 +108,7 @@ pub struct TlsFingerprintCatalog {
 /// Embedded default catalogue. Consumed at startup; operators can
 /// override via the `tls_fingerprint.catalog_path` config or replace
 /// at build time.
-pub const DEFAULT_TLS_FINGERPRINT_JSON: &str =
+pub(crate) const DEFAULT_TLS_FINGERPRINT_JSON: &str =
     include_str!("../../sbproxy-classifiers/data/tls-fingerprints.json");
 
 impl TlsFingerprintCatalog {
@@ -167,7 +167,7 @@ impl TlsFingerprintCatalog {
 
     /// Look up the agent class for a given JA4 fingerprint.
     /// Returns `None` if no entry has the JA4 in its `ja4` list.
-    pub fn lookup_ja4(&self, ja4: &str) -> Option<&TlsFingerprintEntry> {
+    pub(crate) fn lookup_ja4(&self, ja4: &str) -> Option<&TlsFingerprintEntry> {
         self.by_ja4.get(ja4).map(|idx| &self.entries[*idx])
     }
 

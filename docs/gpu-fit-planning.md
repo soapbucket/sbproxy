@@ -43,10 +43,25 @@ KV cache than their parameter count suggests. That is why the A3B-class
 mixture-of-experts models are the self-hosting sweet spot: total
 parameters set the VRAM, active parameters set the speed.
 
-KV-cache quantization is a lever here. Dropping the cache to int4
-roughly quarters the KV term, which can be the difference between
-fitting your context and not. It trades a little quality for capacity,
-so it is opt-in.
+KV-cache quantization is a lever here, but how much it buys depends on
+the engine, because not every engine has a kernel for every mode.
+
+| `kv_quant` | vLLM | SGLang | llama.cpp |
+|---|---|---|---|
+| `auto` | weight-quant default | weight-quant default | weight-quant default |
+| `f16` | 2 bytes | 2 bytes | 2 bytes |
+| `fp8` | 1 byte (`fp8`) | 1 byte (`fp8_e5m2`) | 1 byte (`q8_0`) |
+| `int8` | 1 byte, served as `fp8` | 1 byte, served as `fp8_e5m2` | 1 byte (`q8_0`) |
+| `int4` | **1 byte, served as `fp8`** | **1 byte, served as `fp8_e5m2`** | 0.5 bytes (`q4_0`) |
+
+So `int4` halves the KV term on llama.cpp and does nothing beyond `fp8`
+on the CUDA engines, which expose only fp8 KV variants. The planner
+sizes what the engine will really run, and the log says so when it
+substitutes, so a request for a mode an engine lacks costs you accuracy
+in the plan rather than an out-of-memory failure at first token.
+
+Quantizing the cache trades a little quality for capacity either way,
+so it stays opt-in.
 
 ## Capability tiers
 

@@ -391,8 +391,49 @@ fn ai_policy_input_tokens_est(model: &str, body: &serde_json::Value) -> i64 {
     i64::try_from(tokens).unwrap_or(i64::MAX)
 }
 
-fn native_bypass_is_safe(is_stream: bool, compression_runtime_selected: bool) -> bool {
-    !is_stream && !compression_runtime_selected
+fn native_bypass_is_safe(is_stream: bool, request_transform_selected: bool) -> bool {
+    !is_stream && !request_transform_selected
+}
+
+fn upstream_response_is_successful_sse(status: u16, content_type: Option<&str>) -> bool {
+    (200..300).contains(&status)
+        && content_type
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+const DEFAULT_BUFFERED_AI_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BUFFERED_AI_RESPONSE_BODY_BYTES: usize = 1024 * 1024 * 1024;
+
+fn buffered_ai_response_body_limit(configured: Option<usize>) -> usize {
+    configured
+        .filter(|maximum| *maximum > 0)
+        .unwrap_or(DEFAULT_BUFFERED_AI_RESPONSE_BODY_BYTES)
+        .min(MAX_BUFFERED_AI_RESPONSE_BODY_BYTES)
+}
+
+/// Compare the canonical request captured immediately after native inbound
+/// parsing with the body that is about to be dispatched. Provider model
+/// mapping is intentionally ignored because `make_native_bypass_body` applies
+/// the resolved model to the native body. Any other top-level change means a
+/// request transform would be lost by replaying the original native bytes.
+fn native_bypass_body_changed(
+    baseline: &serde_json::Value,
+    attempt_body: &serde_json::Value,
+) -> bool {
+    let (Some(baseline), Some(attempt)) = (baseline.as_object(), attempt_body.as_object()) else {
+        return baseline != attempt_body;
+    };
+    let baseline_len = baseline
+        .keys()
+        .filter(|key| key.as_str() != "model")
+        .count();
+    let attempt_len = attempt.keys().filter(|key| key.as_str() != "model").count();
+    baseline_len != attempt_len
+        || baseline
+            .iter()
+            .filter(|(key, _)| key.as_str() != "model")
+            .any(|(key, value)| attempt.get(key) != Some(value))
 }
 
 impl ResolvedRequestKey {
@@ -2481,6 +2522,11 @@ pub(super) async fn handle_ai_proxy(
     // rather than the inbound path so the bypass works even when the
     // proxy is fronting an idiosyncratic inbound URL.
     let native_request_bytes_for_bypass: bytes::Bytes = body_bytes.clone();
+    let native_request_is_losslessly_governable = surface
+        != sbproxy_ai::handler::AiSurface::Messages
+        || sbproxy_ai::format::anthropic_messages::native_request_is_losslessly_governable(
+            body_bytes.as_ref(),
+        );
 
     // --- Native-format inbound shim ---
     //
@@ -2884,8 +2930,11 @@ pub(super) async fn handle_ai_proxy(
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         let raw_response = read_capped_response_body(resp, config.max_body_size).await?;
-        let response_body =
-            sbproxy_ai::translators::translate_response_bytes(format, raw_response.as_ref());
+        let response_body = sbproxy_ai::translators::translate_success_response_bytes(
+            format,
+            status,
+            raw_response.as_ref(),
+        );
         record_ai_provider_response_failure(
             &ai_span,
             provider.name.as_str(),
@@ -3004,6 +3053,11 @@ pub(super) async fn handle_ai_proxy(
             return Ok(());
         }
     };
+    // Native bypass may only reuse the original client bytes while every
+    // content-bearing field still matches this post-parse baseline. Keep the
+    // snapshot only for the one native surface that can currently bypass.
+    let native_bypass_canonical_baseline =
+        (ctx.ai_inbound_format.as_deref() == Some("anthropic")).then(|| body.clone());
     let reasoning_eligibility = sbproxy_ai::reasoning_eligibility(&body);
 
     // PII redaction (request body): walk the parsed JSON in place so
@@ -4172,52 +4226,70 @@ pub(super) async fn handle_ai_proxy(
     // even if request transforms such as compression or reasoning changed
     // after a route reload. Replayed output is still evaluated against today's
     // output guardrails before any cached bytes leave.
-    let (idem_skip_reason, mut idem_capture) =
-        match engage_ai_idempotency(session, pipeline, origin_idx, body_bytes.as_ref(), false)
-            .await?
-        {
-            AiIdempotencyEngagement::Replayed { response } => {
-                if let Some(block) = ai_output_guardrail_block(
-                    response.status,
-                    guardrail_pipeline.as_deref(),
-                    output_external,
-                    &response.body,
-                    &model,
-                )
-                .await
-                {
-                    send_guardrail_block_response(session, ctx, &ai_span, 403, block).await?;
+    let idempotency_request_body = if ctx.ai_inbound_format.is_some() {
+        native_request_bytes_for_bypass.as_ref()
+    } else {
+        body_bytes.as_ref()
+    };
+    let (idem_skip_reason, mut idem_capture) = match engage_ai_idempotency(
+        session,
+        pipeline,
+        origin_idx,
+        idempotency_request_body,
+        false,
+    )
+    .await?
+    {
+        AiIdempotencyEngagement::Replayed { response } => {
+            if let Some(block) = ai_output_guardrail_block(
+                response.status,
+                guardrail_pipeline.as_deref(),
+                output_external,
+                &response.body,
+                &model,
+            )
+            .await
+            {
+                send_guardrail_block_response(session, ctx, &ai_span, 403, block).await?;
+            } else {
+                let replay_body = if ai_idempotency_body_is_wire(&response.headers) {
+                    response.body
                 } else {
-                    write_ai_cached_response(
-                        session,
+                    // Migration path for unversioned entries. Historical
+                    // caches may contain canonical or already-native bytes;
+                    // the rewrapper is shape-aware and byte-stable for the
+                    // latter.
+                    sbproxy_ai::format::rewrap_success_response_for_inbound(
                         response.status,
-                        &response.headers,
+                        ctx.ai_inbound_format.as_deref(),
                         &response.body,
                     )
+                };
+                write_ai_cached_response(session, response.status, &response.headers, &replay_body)
                     .await?;
-                }
-                return Ok(());
             }
-            AiIdempotencyEngagement::Conflict => return Ok(()),
-            AiIdempotencyEngagement::NotApplicable => (None, None),
-            AiIdempotencyEngagement::Skipped { reason } => (Some(reason), None),
-            AiIdempotencyEngagement::Miss {
+            return Ok(());
+        }
+        AiIdempotencyEngagement::Conflict => return Ok(()),
+        AiIdempotencyEngagement::NotApplicable => (None, None),
+        AiIdempotencyEngagement::Skipped { reason } => (Some(reason), None),
+        AiIdempotencyEngagement::Miss {
+            idem,
+            workspace_id,
+            key,
+            body_hash,
+            permit,
+        } => (
+            None,
+            Some(AiIdempotencyCapture {
                 idem,
                 workspace_id,
                 key,
                 body_hash,
-                permit,
-            } => (
-                None,
-                Some(AiIdempotencyCapture {
-                    idem,
-                    workspace_id,
-                    key,
-                    body_hash,
-                    _permit: permit,
-                }),
-            ),
-        };
+                _permit: permit,
+            }),
+        ),
+    };
 
     // --- Semantic lookup hook (A21/F3+F4, fail-open) ---
     //
@@ -4300,7 +4372,10 @@ pub(super) async fn handle_ai_proxy(
                         // recompute for us. We intentionally preserve content-type
                         // and any origin-provided response metadata.
                         let lname = name.to_ascii_lowercase();
-                        if lname == "transfer-encoding" || lname == "connection" {
+                        if matches!(
+                            lname.as_str(),
+                            "transfer-encoding" | "connection" | "content-length"
+                        ) {
                             continue;
                         }
                         let _ = header.insert_header(name.clone(), value.clone());
@@ -4310,12 +4385,17 @@ pub(super) async fn handle_ai_proxy(
                     // response. Matches OSS `x-sbproxy-cache: HIT` convention.
                     let _ = header.insert_header("x-semcache", "HIT");
 
+                    let replay_body = bytes::Bytes::from(
+                        sbproxy_ai::format::rewrap_success_response_for_inbound(
+                            cached.status,
+                            ctx.ai_inbound_format.as_deref(),
+                            cached.body.as_ref(),
+                        ),
+                    );
                     session
                         .write_response_header(Box::new(header), false)
                         .await?;
-                    session
-                        .write_response_body(Some(cached.body.clone()), true)
-                        .await?;
+                    session.write_response_body(Some(replay_body), true).await?;
                     return Ok(());
                 }
                 // MISS with a usable key: remember enough state to populate the
@@ -4534,7 +4614,11 @@ pub(super) async fn handle_ai_proxy(
                                 )
                             })?;
                             for (name, value) in &hit.response.headers {
-                                if name == "transfer-encoding" || name == "connection" {
+                                let lname = name.to_ascii_lowercase();
+                                if matches!(
+                                    lname.as_str(),
+                                    "transfer-encoding" | "connection" | "content-length"
+                                ) {
                                     continue;
                                 }
                                 let _ = header.insert_header(name.clone(), value.clone());
@@ -4555,10 +4639,17 @@ pub(super) async fn handle_ai_proxy(
                                 &body,
                                 &ctx.attribution_tags,
                             );
+                            let replay_body = bytes::Bytes::from(
+                                sbproxy_ai::format::rewrap_success_response_for_inbound(
+                                    hit.response.status,
+                                    ctx.ai_inbound_format.as_deref(),
+                                    body.as_ref(),
+                                ),
+                            );
                             session
                                 .write_response_header(Box::new(header), false)
                                 .await?;
-                            session.write_response_body(Some(body), true).await?;
+                            session.write_response_body(Some(replay_body), true).await?;
                             return Ok(());
                         }
                         sbproxy_ai::ai_metrics::record_cache_result(
@@ -5319,6 +5410,10 @@ pub(super) async fn handle_ai_proxy(
         if attempt >= effective_max_attempts {
             break;
         }
+        // Native bypass is an attempt-local transport decision. A retryable
+        // Anthropic failure must not make a later OpenAI fallback skip the
+        // Anthropic response adapter.
+        ctx.ai_native_bypass = false;
         // A failed prior managed attempt may still hold deployment capacity.
         // Release it before this attempt queues or dispatches.
         ctx.managed_model_permit = None;
@@ -5477,13 +5572,22 @@ pub(super) async fn handle_ai_proxy(
         // emit as-is, which is a separate code path. Track this as a
         // follow-up.
         let provider_format = sbproxy_ai::client::provider_format(provider);
-        // Anthropic native bypass reconstructs the original inbound body. If
-        // a compression runtime was selected, use the canonical translation
-        // path so the compressed message list in `attempt_body` is retained.
-        let bypass = if !native_bypass_is_safe(
-            is_stream,
-            compression_runtime.is_some() || reasoning.applied,
-        ) {
+        // Anthropic native bypass reconstructs the original inbound body.
+        // Disable it whenever a configured or already-applied request
+        // transform could make those original bytes differ from the governed
+        // body in `attempt_body`.
+        let request_pii_redaction_enabled = config
+            .pii
+            .as_ref()
+            .is_some_and(|pii| pii.enabled && pii.redact_request);
+        let request_transform_selected = request_pii_redaction_enabled
+            || compression_runtime.is_some()
+            || reasoning.applied
+            || !native_request_is_losslessly_governable
+            || native_bypass_canonical_baseline
+                .as_ref()
+                .is_some_and(|baseline| native_bypass_body_changed(baseline, &attempt_body));
+        let bypass = if !native_bypass_is_safe(is_stream, request_transform_selected) {
             None
         } else {
             sbproxy_ai::format::native_bypass_for(
@@ -5536,7 +5640,6 @@ pub(super) async fn handle_ai_proxy(
                     sbproxy_ai::format::NativeBypass::OpenAiChat.inbound_label(),
                     sbproxy_ai::format::NativeBypass::OpenAiChat.provider_label(),
                 );
-                ctx.ai_native_bypass = true;
                 None
             }
             None => None,
@@ -5943,22 +6046,69 @@ pub(super) async fn handle_ai_proxy(
             reasoning_eligibility,
         );
         if is_stream {
+            let response_content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok());
+            if !upstream_response_is_successful_sse(resp.status().as_u16(), response_content_type) {
+                // A provider may reject a streaming request with an ordinary
+                // JSON error, or may return a buffered JSON success. Both use
+                // the normal bounded relay, including idempotency capture.
+                // Success responses run canonical provider translation and
+                // inbound rewrapping; errors remain byte-exact.
+                let recorder = effective_budget.as_deref().map(|b| BudgetRecorderArgs {
+                    origin: hostname.to_string(),
+                    config: b,
+                    keys: &budget_keys,
+                    model: model.as_str(),
+                    surface_label,
+                    provider_name: last_provider_name.as_str(),
+                    image_resolution: image_resolution_for_billing.clone(),
+                    audio_speech_characters: audio_speech_characters_for_billing,
+                    rerank_documents: rerank_documents_for_billing,
+                    attribution_tags: ctx.attribution_tags.clone(),
+                    tenant_id: ctx.tenant_id.to_string(),
+                    api_key_id: ctx.principal.api_key_id().to_string(),
+                    rollup_properties: ctx.rollup_properties.clone(),
+                    estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
+                });
+                let router_sink = RouterTokenSink {
+                    router: &router,
+                    config_providers: &config.providers,
+                    provider_name: last_provider_name.as_str(),
+                };
+                return relay_ai_response_with_cache(
+                    session,
+                    resp,
+                    last_format,
+                    hostname,
+                    None,
+                    None,
+                    Some(buffered_ai_response_body_limit(config.max_body_size)),
+                    recorder,
+                    router_sink,
+                    Some(ctx),
+                    ai_span.clone(),
+                    trace_content,
+                    idem_skip_reason,
+                    idem_capture,
+                    config
+                        .guardrails
+                        .as_ref()
+                        .and(guardrail_pipeline.clone())
+                        .filter(|pipeline| pipeline.has_output()),
+                    output_external,
+                )
+                .await;
+            }
             // SSE streaming with idempotency engaged: drop the capture
-            // (releases the per-origin pool permit) and abandon
-            // caching for this request. v1 does not buffer SSE
-            // chunks into the idempotency cache because framing-aware
-            // capture is out of scope here; the response headers
-            // have already been written when the relay realizes
-            // we'd exceed the cap on a chunked body, so the
-            // skip marker is not visible to the client. The
-            // operator-visible signal is the absence of a cache hit
-            // on retry, plus the debug log line below.
+            // (releases the per-origin pool permit) and abandon caching only
+            // after the response has been confirmed as successful SSE.
             if idem_capture.take().is_some() {
                 debug!(
                     "AI proxy: idempotency miss on streaming request; abandoning cache record (SSE framing-aware capture is out of scope for v1)"
                 );
             }
-            let _ = idem_skip_reason;
             let model_id = if model.is_empty() {
                 None
             } else {
@@ -6528,7 +6678,8 @@ pub(super) async fn relay_ai_response(
 
     let resp_body = read_capped_response_body(resp, max_body_size).await?;
 
-    let translated = sbproxy_ai::translators::translate_response_bytes(format, &resp_body);
+    let translated =
+        sbproxy_ai::translators::translate_success_response_bytes(format, status, &resp_body);
     record_ai_provider_response_failure(ai_span, provider_name, status, Some(&translated));
     let translated = sbproxy_ai::format::rewrap_success_response_for_inbound(
         status,
@@ -6764,6 +6915,7 @@ pub(super) async fn relay_ai_response_with_cache(
                     | "keep-alive"
                     | "proxy-authenticate"
                     | "proxy-authorization"
+                    | "content-length"
                     | "te"
                     | "trailer"
                     | "upgrade"
@@ -6775,14 +6927,17 @@ pub(super) async fn relay_ai_response_with_cache(
     }
 
     let raw_body = read_capped_response_body(resp, max_body_size).await?;
+    let inbound_format: Option<String> = ctx.as_ref().and_then(|c| c.ai_inbound_format.clone());
+    let native_bypass = ctx.as_ref().map(|c| c.ai_native_bypass).unwrap_or(false);
+    let direct_response_body = native_bypass.then(|| raw_body.clone());
 
     // Translate the upstream body into OpenAI shape once, then both
     // cache and serve the translated form. Caching the translated body
     // means semantic-cache hits replay correctly to OpenAI clients
     // without re-running the translator on every hit.
     let resp_body: bytes::Bytes = if sbproxy_ai::translators::requires_translation(format) {
-        bytes::Bytes::from(sbproxy_ai::translators::translate_response_bytes(
-            format, &raw_body,
+        bytes::Bytes::from(sbproxy_ai::translators::translate_success_response_bytes(
+            format, status, &raw_body,
         ))
     } else {
         raw_body
@@ -6810,18 +6965,6 @@ pub(super) async fn relay_ai_response_with_cache(
         Some(resp_body.as_ref()),
     );
 
-    // Native-format inbound rewrap. When the client entered
-    // on a `/v1/messages` or `/v1/responses` path the cached body stays
-    // in OpenAI Chat shape (so cross-format cache hits remain cheap)
-    // and only the bytes leaving the gateway are re-emitted in the
-    // client-expected wire shape.
-    //
-    // WOR-229 native bypass: when the inbound format matched the
-    // upstream provider's wire format, the response is already in the
-    // client's expected shape (it came directly from the native
-    // upstream path), so the rewrap step is skipped.
-    let inbound_format: Option<String> = ctx.as_ref().and_then(|c| c.ai_inbound_format.clone());
-    let native_bypass = ctx.as_ref().map(|c| c.ai_native_bypass).unwrap_or(false);
     // WOR-1044: snapshot the reversible redaction pairs before any
     // later branch in this function moves `ctx`. The vec is small
     // (one entry per reversible match this request fired), so the
@@ -6830,21 +6973,9 @@ pub(super) async fn relay_ai_response_with_cache(
         .as_ref()
         .map(|c| c.ai_reversible_redactions.clone())
         .unwrap_or_default();
-    let resp_body: bytes::Bytes = if native_bypass {
-        resp_body
-    } else {
-        match inbound_format.as_deref() {
-            Some("anthropic") | Some("responses") => {
-                bytes::Bytes::from(sbproxy_ai::format::rewrap_success_response_for_inbound(
-                    status,
-                    inbound_format.as_deref(),
-                    &resp_body,
-                ))
-            }
-            _ => resp_body,
-        }
-    };
-
+    let direct_client_body = direct_response_body
+        .as_ref()
+        .map(|body| restore_reversible_pii(body, &reversible_pairs));
     if (200..300).contains(&status) {
         record_ai_response_span_metadata(&ai_span, &resp_body);
     }
@@ -6873,15 +7004,16 @@ pub(super) async fn relay_ai_response_with_cache(
     // cannot be represented as text.
     let output_block: Option<sbproxy_ai::guardrails::GuardrailBlock> =
         if (200..300).contains(&status) {
+            let governed_client_body = direct_client_body.as_ref().unwrap_or(&resp_body);
             let sync_block = output_guardrails
                 .as_ref()
-                .and_then(|g| g.check_output_bytes(&resp_body));
+                .and_then(|g| g.check_output_bytes(governed_client_body));
             if sync_block.is_some() {
                 sync_block
             } else {
                 external_output_guardrail_block(
                     output_external,
-                    &resp_body,
+                    governed_client_body,
                     ctx.as_ref()
                         .and_then(|context| context.ai_model.as_deref())
                         .unwrap_or(""),
@@ -7304,7 +7436,11 @@ pub(super) async fn relay_ai_response_with_cache(
     // `AiHandlerConfig::from_config`). So the masked body never
     // reaches the semantic cache even though it is written above
     // in the order-of-operations sense.
-    let resp_body = restore_reversible_pii(&resp_body, &reversible_pairs);
+    let resp_body = if direct_client_body.is_some() {
+        resp_body
+    } else {
+        restore_reversible_pii(&resp_body, &reversible_pairs)
+    };
     if (200..300).contains(&status) {
         // WOR-1877: tool-call span events. Names + ids always
         // (bounded); arguments only under the trace_content gate.
@@ -7315,6 +7451,19 @@ pub(super) async fn relay_ai_response_with_cache(
         record_ai_output_trace(&ai_span, trace_content, &completion);
     }
 
+    // Keep the internal response canonical through policy, accounting, and
+    // semantic-cache writes. Adapt the bytes crossing the client boundary
+    // exactly once. Native bypass relays the restored upstream wire body
+    // directly; every translated response is wrapped for the inbound client.
+    let client_body = match direct_client_body {
+        Some(body) => body,
+        None => bytes::Bytes::from(sbproxy_ai::format::rewrap_success_response_for_inbound(
+            status,
+            inbound_format.as_deref(),
+            &resp_body,
+        )),
+    };
+
     // --- Idempotency record on miss ---
     //
     // Honour the per-origin response body cap; bodies above the cap
@@ -7324,17 +7473,22 @@ pub(super) async fn relay_ai_response_with_cache(
     // point).
     let final_skip_reason = match idem_capture {
         Some(cap) => {
-            if resp_body.len() > cap.idem.max_response_body_bytes {
+            if client_body.len() > cap.idem.max_response_body_bytes {
                 debug!(
-                    body_len = resp_body.len(),
+                    body_len = client_body.len(),
                     max_bytes = cap.idem.max_response_body_bytes,
                     "AI proxy: idempotency response body exceeds cap; abandoning cache record"
                 );
                 Some("SKIPPED-OVERSIZE-RESPONSE")
             } else {
-                let recorded_headers: Vec<(String, String)> =
-                    vec![("content-type".to_string(), content_type.clone())];
-                cap.record(status, recorded_headers, resp_body.to_vec());
+                let recorded_headers: Vec<(String, String)> = vec![
+                    ("content-type".to_string(), content_type.clone()),
+                    (
+                        AI_IDEMPOTENCY_BODY_FORMAT_HEADER.to_string(),
+                        AI_IDEMPOTENCY_WIRE_BODY_FORMAT.to_string(),
+                    ),
+                ];
+                cap.record(status, recorded_headers, client_body.to_vec());
                 idem_skip_reason
             }
         }
@@ -7348,7 +7502,8 @@ pub(super) async fn relay_ai_response_with_cache(
     if let Some(retry_after) = retry_after {
         extras.push(("retry-after".to_string(), retry_after));
     }
-    send_response_with_extras(session, status, &content_type, &resp_body, &extras).await
+
+    send_response_with_extras(session, status, &content_type, &client_body, &extras).await
 }
 
 /// WOR-1044: restore reversible PII placeholders. Walks the body and
@@ -9612,6 +9767,7 @@ mod external_guardrail_context_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::server::{ai_idempotency_body_is_wire, AI_IDEMPOTENCY_BODY_FORMAT_HEADER};
     use pingora_core::protocols::l4::stream::Stream;
     use pingora_proxy::Session;
     use sbproxy_ai::external_guardrail::{
@@ -9697,6 +9853,7 @@ mod external_guardrail_context_tests {
         lookups: AtomicUsize,
         stores: AtomicUsize,
         hit: std::sync::Mutex<Option<crate::hooks::CachedResponse>>,
+        stored: std::sync::Mutex<Option<crate::hooks::CachedResponse>>,
     }
 
     #[derive(Default)]
@@ -9704,6 +9861,7 @@ mod external_guardrail_context_tests {
         gets: AtomicUsize,
         puts: AtomicUsize,
         hit: std::sync::Mutex<Option<sbproxy_middleware::idempotency::CachedResponse>>,
+        stored: std::sync::Mutex<Option<sbproxy_middleware::idempotency::CachedResponse>>,
     }
 
     impl sbproxy_middleware::idempotency::IdempotencyCache for RecordingIdempotencyCache {
@@ -9720,9 +9878,10 @@ mod external_guardrail_context_tests {
             &self,
             _workspace_id: &str,
             _key: &str,
-            _response: sbproxy_middleware::idempotency::CachedResponse,
+            response: sbproxy_middleware::idempotency::CachedResponse,
         ) {
             self.puts.fetch_add(1, Ordering::SeqCst);
+            *self.stored.lock().expect("idempotency stored lock") = Some(response);
         }
     }
 
@@ -9747,9 +9906,10 @@ mod external_guardrail_context_tests {
         async fn store(
             &self,
             _req: crate::hooks::StoreRequest,
-            _resp: crate::hooks::CachedResponse,
+            resp: crate::hooks::CachedResponse,
         ) -> anyhow::Result<()> {
             self.stores.fetch_add(1, Ordering::SeqCst);
+            *self.stored.lock().expect("semantic stored lock") = Some(resp);
             Ok(())
         }
 
@@ -10093,6 +10253,19 @@ mod external_guardrail_context_tests {
         .expect("OpenAI proxy config")
     }
 
+    fn anthropic_proxy_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "anthropic",
+                "provider_type": "anthropic",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }]
+        }))
+        .expect("Anthropic proxy config")
+    }
+
     fn cascade_error_proxy_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
         sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
             "providers": [{
@@ -10136,6 +10309,30 @@ mod external_guardrail_context_tests {
             .position(|window| window == b"\r\n\r\n")
             .expect("HTTP response header terminator");
         serde_json::from_slice(&response[header_end + 4..]).expect("JSON response body")
+    }
+
+    fn anthropic_messages_request() -> serde_json::Value {
+        serde_json::json!({
+            "model": "requested-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        })
+    }
+
+    fn canonical_chat_response(text: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "id": "chatcmpl-cache",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "selected-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        }))
+        .expect("canonical response JSON")
     }
 
     fn provider_error_body() -> serde_json::Value {
@@ -10657,6 +10854,537 @@ mod external_guardrail_context_tests {
         assert!(response.contains("fresh-under-budget"), "{response}");
         assert!(!response.contains("stale-over-budget"), "{response}");
         assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_semantic_hit_rewraps_canonical_success() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = openai_proxy_config(&upstream_url);
+        let request = anthropic_messages_request();
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/messages",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, _) = pipeline_with_recording_caches();
+        *semantic.hit.lock().expect("semantic hit lock") = Some(crate::hooks::CachedResponse {
+            status: 200,
+            headers: std::collections::HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("content-length".to_string(), "1".to_string()),
+            ]),
+            body: bytes::Bytes::from(canonical_chat_response("semantic replay")),
+            cached_at: std::time::SystemTime::now(),
+        });
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("semantic replay is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        let body = response_json(&response);
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["content"][0]["text"], "semantic replay");
+        assert!(body.get("choices").is_none(), "{body}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_idempotency_hit_rewraps_canonical_success() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = openai_proxy_config(&upstream_url);
+        let request = anthropic_messages_request();
+        let native_request = serde_json::to_vec(&request).expect("request JSON");
+        let request_hash = sbproxy_middleware::idempotency::hash_body(&native_request);
+        let (mut session, client) =
+            downstream_bytes_session("/v1/messages", "application/json", native_request).await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        *idempotency.hit.lock().expect("idempotency hit lock") =
+            Some(sbproxy_middleware::idempotency::CachedResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: canonical_chat_response("idempotency replay"),
+                request_body_hash: request_hash,
+                expires_at_unix: u64::MAX,
+            });
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("idempotency replay is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        let body = response_json(&response);
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["content"][0]["text"], "idempotency replay");
+        assert!(body.get("choices").is_none(), "{body}");
+        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_idempotency_hit_preserves_error_response() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = openai_proxy_config(&upstream_url);
+        let request = anthropic_messages_request();
+        let native_request = serde_json::to_vec(&request).expect("request JSON");
+        let request_hash = sbproxy_middleware::idempotency::hash_body(&native_request);
+        let (mut session, client) =
+            downstream_bytes_session("/v1/messages", "application/json", native_request).await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        let cached_error = br#"{"error":{"type":"rate_limit_error","message":"try later"}}"#;
+        *idempotency.hit.lock().expect("idempotency hit lock") =
+            Some(sbproxy_middleware::idempotency::CachedResponse {
+                status: 429,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: cached_error.to_vec(),
+                request_body_hash: request_hash,
+                expires_at_unix: u64::MAX,
+            });
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("idempotency error replay is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 429"), "{response:?}");
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("HTTP response header terminator");
+        assert_eq!(&response[header_end + 4..], cached_error);
+        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_error_miss_stores_and_replays_provider_envelope() {
+        let error =
+            br#"{"type":"error","error":{"type":"rate_limit_error","message":"try later"}}"#;
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture_with_status(error.to_vec(), Some("application/json"), 429).await;
+        let config = anthropic_proxy_config(&upstream_url);
+        let request = anthropic_messages_request();
+        let request_bytes = serde_json::to_vec(&request).expect("request JSON");
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+
+        let (mut first_session, first_client) =
+            downstream_bytes_session("/v1/messages", "application/json", request_bytes.clone())
+                .await;
+        let mut first_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut first_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut first_context,
+            Some(0),
+        )
+        .await
+        .expect("initial error response is handled");
+        drop(first_session);
+        let first_response = live_downstream_body(first_client).await;
+        let first_header_end = first_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("first HTTP response header terminator");
+        assert_eq!(&first_response[first_header_end + 4..], error);
+
+        let stored = idempotency
+            .stored
+            .lock()
+            .expect("idempotency stored lock")
+            .clone()
+            .expect("error response stored");
+        assert_eq!(stored.body, error);
+        let semantic_lookups_after_miss = semantic.lookups.load(Ordering::SeqCst);
+        assert_eq!(semantic_lookups_after_miss, 1);
+        *idempotency.hit.lock().expect("idempotency hit lock") = Some(stored);
+
+        let (mut replay_session, replay_client) =
+            downstream_bytes_session("/v1/messages", "application/json", request_bytes).await;
+        let mut replay_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut replay_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut replay_context,
+            Some(0),
+        )
+        .await
+        .expect("cached error response is handled");
+        drop(replay_session);
+        let replay_response = live_downstream_body(replay_client).await;
+        let replay_header_end = replay_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("replay HTTP response header terminator");
+        assert_eq!(&replay_response[replay_header_end + 4..], error);
+        assert_eq!(
+            semantic.lookups.load(Ordering::SeqCst),
+            semantic_lookups_after_miss
+        );
+        assert_eq!(idempotency.gets.load(Ordering::SeqCst), 2);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn buffered_stream_success_stores_and_replays_exact_client_wire_body() {
+        let canonical_response = canonical_chat_response("buffered stream response");
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(canonical_response, "application/json").await;
+        let config = openai_proxy_config(&upstream_url);
+        let mut request = anthropic_messages_request();
+        request["stream"] = serde_json::Value::Bool(true);
+        let request_bytes = serde_json::to_vec(&request).expect("request JSON");
+        let (pipeline, _, idempotency) = pipeline_with_recording_caches();
+
+        let (mut first_session, first_client) =
+            downstream_bytes_session("/v1/messages", "application/json", request_bytes.clone())
+                .await;
+        let mut first_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut first_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut first_context,
+            Some(0),
+        )
+        .await
+        .expect("buffered stream response is handled");
+        drop(first_session);
+        let first_response = live_downstream_body(first_client).await;
+        assert!(
+            first_response.starts_with(b"HTTP/1.1 200"),
+            "{first_response:?}"
+        );
+        let first_body = response_json(&first_response);
+        assert_eq!(first_body["type"], "message");
+        assert_eq!(first_body["content"][0]["text"], "buffered stream response");
+
+        let stored = idempotency
+            .stored
+            .lock()
+            .expect("idempotency stored lock")
+            .clone()
+            .expect("buffered stream response stored");
+        let first_header_end = first_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("first HTTP response header terminator");
+        assert_eq!(stored.body, first_response[first_header_end + 4..]);
+        assert!(ai_idempotency_body_is_wire(&stored.headers));
+        *idempotency.hit.lock().expect("idempotency hit lock") = Some(stored);
+
+        let (mut replay_session, replay_client) =
+            downstream_bytes_session("/v1/messages", "application/json", request_bytes).await;
+        let mut replay_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut replay_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut replay_context,
+            Some(0),
+        )
+        .await
+        .expect("buffered stream replay is handled");
+        drop(replay_session);
+        let replay_response = live_downstream_body(replay_client).await;
+        let replay_header_end = replay_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("replay HTTP response header terminator");
+        assert_eq!(
+            &replay_response[replay_header_end + 4..],
+            &first_response[first_header_end + 4..]
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn native_only_request_fields_participate_in_idempotency_conflicts() {
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            canonical_chat_response("first response"),
+            "application/json",
+        )
+        .await;
+        let config = openai_proxy_config(&upstream_url);
+        let request_with_document = |text: &str| {
+            serde_json::json!({
+                "model": "requested-model",
+                "max_tokens": 64,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "same canonical prompt"},
+                        {
+                            "type": "document",
+                            "source": {"type": "text", "data": text}
+                        }
+                    ]
+                }]
+            })
+        };
+        let first_request =
+            serde_json::to_vec(&request_with_document("first native document")).unwrap();
+        let conflicting_request =
+            serde_json::to_vec(&request_with_document("different native document")).unwrap();
+        assert_eq!(
+            sbproxy_ai::format::anthropic_messages::translate_anthropic_request_to_openai(
+                &first_request
+            )
+            .unwrap(),
+            sbproxy_ai::format::anthropic_messages::translate_anthropic_request_to_openai(
+                &conflicting_request
+            )
+            .unwrap(),
+            "the regression requires fields omitted by canonical translation"
+        );
+        let (pipeline, _, idempotency) = pipeline_with_recording_caches();
+
+        let (mut first_session, first_client) =
+            downstream_bytes_session("/v1/messages", "application/json", first_request).await;
+        let mut first_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut first_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut first_context,
+            Some(0),
+        )
+        .await
+        .expect("first native request is handled");
+        drop(first_session);
+        let first_response = live_downstream_body(first_client).await;
+        assert!(
+            first_response.starts_with(b"HTTP/1.1 200"),
+            "{first_response:?}"
+        );
+
+        let stored = idempotency
+            .stored
+            .lock()
+            .expect("idempotency stored lock")
+            .clone()
+            .expect("first response stored");
+        *idempotency.hit.lock().expect("idempotency hit lock") = Some(stored);
+
+        let (mut conflict_session, conflict_client) =
+            downstream_bytes_session("/v1/messages", "application/json", conflicting_request).await;
+        let mut conflict_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut conflict_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut conflict_context,
+            Some(0),
+        )
+        .await
+        .expect("native idempotency conflict is handled");
+        drop(conflict_session);
+        let conflict_response = live_downstream_body(conflict_client).await;
+        assert!(
+            conflict_response.starts_with(b"HTTP/1.1 409"),
+            "{conflict_response:?}"
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_miss_keeps_semantic_canonical_and_idempotency_wire_exact() {
+        let canonical_response = canonical_chat_response("fresh upstream");
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(canonical_response.clone(), "application/json").await;
+        let config = openai_proxy_config(&upstream_url);
+        let request = anthropic_messages_request();
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/messages",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("cache miss is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("HTTP response header terminator");
+        let client_wire_body = &response[header_end + 4..];
+        let client_body = response_json(&response);
+        assert_eq!(client_body["type"], "message");
+        assert_eq!(client_body["content"][0]["text"], "fresh upstream");
+
+        let semantic_body = semantic
+            .stored
+            .lock()
+            .expect("semantic stored lock")
+            .clone()
+            .expect("semantic response stored")
+            .body;
+        let idempotency_response = idempotency
+            .stored
+            .lock()
+            .expect("idempotency stored lock")
+            .clone()
+            .expect("idempotency response stored");
+        assert_eq!(semantic_body.as_ref(), canonical_response.as_slice());
+        assert_eq!(idempotency_response.body, client_wire_body);
+        assert!(ai_idempotency_body_is_wire(&idempotency_response.headers));
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn anthropic_native_idempotency_miss_and_replay_are_byte_identical() {
+        let native_response = br#"{ "id":"msg_exact", "type":"message", "role":"assistant", "content":[{"type":"text","text":"native response"}], "model":"claude-3-5-sonnet", "stop_reason":"end_turn", "usage":{"input_tokens":4,"output_tokens":2}, "native_only":{"service_tier":"priority"} }"#.to_vec();
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(native_response.clone(), "application/json").await;
+        let config = anthropic_proxy_config(&upstream_url);
+        let request_bytes =
+            serde_json::to_vec(&anthropic_messages_request()).expect("request JSON");
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+
+        let (mut first_session, first_client) =
+            downstream_bytes_session("/v1/messages", "application/json", request_bytes.clone())
+                .await;
+        let mut first_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut first_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut first_context,
+            Some(0),
+        )
+        .await
+        .expect("initial native response is handled");
+        drop(first_session);
+        let first_response = live_downstream_body(first_client).await;
+        let first_header_end = first_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("first HTTP response header terminator");
+        assert_eq!(&first_response[first_header_end + 4..], native_response);
+
+        let stored = idempotency
+            .stored
+            .lock()
+            .expect("idempotency stored lock")
+            .clone()
+            .expect("native response stored");
+        assert_eq!(stored.body, native_response);
+        assert!(ai_idempotency_body_is_wire(&stored.headers));
+        let semantic_lookups_after_miss = semantic.lookups.load(Ordering::SeqCst);
+        *idempotency.hit.lock().expect("idempotency hit lock") = Some(stored.clone());
+
+        let (mut replay_session, replay_client) =
+            downstream_bytes_session("/v1/messages", "application/json", request_bytes.clone())
+                .await;
+        let mut replay_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut replay_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut replay_context,
+            Some(0),
+        )
+        .await
+        .expect("cached native response is handled");
+        drop(replay_session);
+        let replay_response = live_downstream_body(replay_client).await;
+        let replay_header_end = replay_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("replay HTTP response header terminator");
+        assert_eq!(&replay_response[replay_header_end + 4..], native_response);
+        assert!(
+            !String::from_utf8_lossy(&replay_response[..replay_header_end])
+                .contains(AI_IDEMPOTENCY_BODY_FORMAT_HEADER),
+            "internal cache metadata leaked to the client"
+        );
+
+        // Migration coverage: entries written before the wire-format marker
+        // may already contain native bytes. The shape-aware legacy path must
+        // leave their formatting and native-only fields untouched.
+        let mut legacy_native = stored;
+        legacy_native
+            .headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case(AI_IDEMPOTENCY_BODY_FORMAT_HEADER));
+        *idempotency.hit.lock().expect("idempotency hit lock") = Some(legacy_native);
+        let (mut legacy_session, legacy_client) =
+            downstream_bytes_session("/v1/messages", "application/json", request_bytes).await;
+        let mut legacy_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut legacy_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut legacy_context,
+            Some(0),
+        )
+        .await
+        .expect("legacy native cache response is handled");
+        drop(legacy_session);
+        let legacy_response = live_downstream_body(legacy_client).await;
+        let legacy_header_end = legacy_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("legacy HTTP response header terminator");
+        assert_eq!(&legacy_response[legacy_header_end + 4..], native_response);
+        assert_eq!(
+            semantic.lookups.load(Ordering::SeqCst),
+            semantic_lookups_after_miss
+        );
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
     }
 
@@ -11490,10 +12218,11 @@ mod request_policy_tests {
 #[cfg(test)]
 mod compression_selection_tests {
     use super::{
-        ai_policy_input_tokens_est, bind_compression_selection, compression_header_value,
-        compression_selection_bypasses_cache, compression_selection_outcome, native_bypass_is_safe,
-        resolve_compression_selection_intent, CompressionSelectionError,
-        CompressionSelectionSource, ResolvedRequestKey,
+        ai_policy_input_tokens_est, bind_compression_selection, buffered_ai_response_body_limit,
+        compression_header_value, compression_selection_bypasses_cache,
+        compression_selection_outcome, native_bypass_body_changed, native_bypass_is_safe,
+        resolve_compression_selection_intent, upstream_response_is_successful_sse,
+        CompressionSelectionError, CompressionSelectionSource, ResolvedRequestKey,
     };
     use http::{HeaderMap, HeaderValue};
     use sbproxy_ai::compression::CompressionSelector;
@@ -11645,6 +12374,54 @@ mod compression_selection_tests {
         assert!(native_bypass_is_safe(false, false));
         assert!(!native_bypass_is_safe(true, false));
         assert!(!native_bypass_is_safe(false, true));
+    }
+
+    #[test]
+    fn native_body_comparison_ignores_only_provider_model_mapping() {
+        let baseline = serde_json::json!({
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "original"}],
+            "max_tokens": 64
+        });
+        let mut mapped = baseline.clone();
+        mapped["model"] = serde_json::Value::String("provider-model".to_string());
+        assert!(!native_bypass_body_changed(&baseline, &mapped));
+
+        let mut redacted = mapped.clone();
+        redacted["messages"][0]["content"] = serde_json::Value::String("[REDACTED]".to_string());
+        assert!(native_bypass_body_changed(&baseline, &redacted));
+
+        let mut injected = mapped;
+        injected["tools"] = serde_json::json!([{"name": "lookup"}]);
+        assert!(native_bypass_body_changed(&baseline, &injected));
+    }
+
+    #[test]
+    fn only_successful_event_stream_responses_enter_sse_relay() {
+        assert!(upstream_response_is_successful_sse(
+            200,
+            Some("text/event-stream; charset=utf-8")
+        ));
+        assert!(!upstream_response_is_successful_sse(
+            400,
+            Some("text/event-stream")
+        ));
+        assert!(!upstream_response_is_successful_sse(
+            200,
+            Some("application/json")
+        ));
+        assert!(!upstream_response_is_successful_sse(200, None));
+    }
+
+    #[test]
+    fn buffered_stream_fallback_always_has_a_bounded_body_limit() {
+        assert_eq!(buffered_ai_response_body_limit(None), 64 * 1024 * 1024);
+        assert_eq!(buffered_ai_response_body_limit(Some(0)), 64 * 1024 * 1024);
+        assert_eq!(buffered_ai_response_body_limit(Some(1024)), 1024);
+        assert_eq!(
+            buffered_ai_response_body_limit(Some(usize::MAX)),
+            1024 * 1024 * 1024
+        );
     }
 
     #[test]
