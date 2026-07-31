@@ -73,6 +73,34 @@ inprocess-embed = ["dep:sbproxy-classifiers"]
 # guardrail. Shares the ONNX runtime already pulled in by
 # `inprocess-embed`, so enabling it adds no new dependency.
 inprocess-classify = ["dep:sbproxy-classifiers"]
+# WOR-2098: route-scoped RAG retrieval. `rag` pulls in the runtime crate
+# and the per-pipeline registry in `rag_runtime`; the `rag-*` features
+# select individual embedding and vector-store adapters, and `rag-full`
+# turns on every documented provider (the `sbproxy` binary's default).
+# Off by default so library consumers keep RAG out of their graph.
+rag = ["dep:sbproxy-rag"]
+rag-embedding-openai = ["rag", "sbproxy-rag/embedding-openai"]
+rag-embedding-compatible = ["rag", "sbproxy-rag/embedding-compatible"]
+rag-embedding-cohere = ["rag", "sbproxy-rag/embedding-cohere"]
+rag-embedding-bedrock = ["rag", "sbproxy-rag/embedding-bedrock"]
+rag-embedding-vertex = ["rag", "sbproxy-rag/embedding-vertex"]
+rag-vector-chroma = ["rag", "sbproxy-rag/vector-chroma"]
+rag-vector-pinecone = ["rag", "sbproxy-rag/vector-pinecone"]
+rag-vector-qdrant = ["rag", "sbproxy-rag/vector-qdrant"]
+rag-vector-redis = ["rag", "sbproxy-rag/vector-redis"]
+rag-vector-weaviate = ["rag", "sbproxy-rag/vector-weaviate"]
+rag-full = [
+  "rag-embedding-openai",
+  "rag-embedding-compatible",
+  "rag-embedding-cohere",
+  "rag-embedding-bedrock",
+  "rag-embedding-vertex",
+  "rag-vector-chroma",
+  "rag-vector-pinecone",
+  "rag-vector-qdrant",
+  "rag-vector-redis",
+  "rag-vector-weaviate",
+]
 
 [dependencies]
 sbproxy-plugin.workspace = true
@@ -92,6 +120,10 @@ sbproxy-middleware.workspace = true
 sbproxy-observe.workspace = true
 sbproxy-extension.workspace = true
 sbproxy-ai.workspace = true
+# WOR-2098: route-scoped RAG runtime construction, pulled in only by the
+# `rag` feature. The workspace entry ships `default-features = false`, so
+# provider adapters activate solely through the `rag-*` forwards above.
+sbproxy-rag = { workspace = true, optional = true }
 # WOR-1680: own the local model-host runtime (spawn/supervise engines
 # for serve: providers) as a process-global built at dispatch time.
 sbproxy-model-host.workspace = true

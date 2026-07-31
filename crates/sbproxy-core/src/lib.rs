@@ -144,6 +144,10 @@ pub mod policy_dispatch;
 /// Re-exported here for admin/runtime compatibility; the implementation
 /// lives beside its policy config in `sbproxy-modules`.
 pub use sbproxy_modules::policy::rate_limit_budget;
+/// WOR-2098: route-scoped RAG runtimes built once per compiled pipeline,
+/// keyed by origin and optional forward rule. Feature-gated by `rag`.
+#[cfg(feature = "rag")]
+pub mod rag_runtime;
 pub(crate) mod rate_limit_cluster;
 pub mod reload;
 pub mod router;

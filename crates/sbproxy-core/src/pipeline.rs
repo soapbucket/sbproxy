@@ -1128,6 +1128,12 @@ pub struct CompiledPipeline {
     pub actions: Vec<Action>,
     /// Immutable per-origin AI compression dependencies and policies.
     pub compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry,
+    /// Immutable route-scoped RAG runtimes keyed by origin and optional
+    /// forward rule (WOR-2098). Populated only for `ai_proxy` actions that
+    /// configure `rag:`; a forward rule without its own `rag:` block has no
+    /// runtime and never falls back to the origin's.
+    #[cfg(feature = "rag")]
+    pub rag_runtimes: crate::rag_runtime::RagRuntimeRegistry,
     /// Compiled auth for each origin (None if no auth configured).
     pub auths: Vec<Option<Auth>>,
     /// Compiled policies for each origin (may be empty).
@@ -1301,6 +1307,8 @@ impl Default for CompiledPipeline {
             router,
             actions: Vec::new(),
             compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry::default(),
+            #[cfg(feature = "rag")]
+            rag_runtimes: crate::rag_runtime::RagRuntimeRegistry::default(),
             auths: Vec::new(),
             policies: Vec::new(),
             enforcers: Vec::new(),
@@ -1834,6 +1842,25 @@ impl CompiledPipeline {
             }
         };
 
+        // WOR-2098: build the route-scoped RAG runtimes after both the
+        // main actions and the forward rules are compiled. Validation
+        // construction maps to `RagBuildMode::Validation`, which checks
+        // every configured provider without dialing.
+        #[cfg(feature = "rag")]
+        let rag_runtimes = crate::rag_runtime::RagRuntimeRegistry::build(
+            &actions,
+            &forward_rules,
+            match mode {
+                PipelineConstructionMode::Runtime => sbproxy_rag::RagBuildMode::Runtime,
+                PipelineConstructionMode::Validation => sbproxy_rag::RagBuildMode::Validation,
+            },
+        )?;
+        // Without the `rag` feature a configured `rag:` block must fail
+        // loud at construction rather than silently proxying unaugmented
+        // traffic.
+        #[cfg(not(feature = "rag"))]
+        reject_configured_rag(&actions, &forward_rules)?;
+
         let key_plane = match mode {
             PipelineConstructionMode::Runtime => {
                 crate::key_plane::prepare_key_plane(config.server.key_management.as_ref())?
@@ -1848,6 +1875,8 @@ impl CompiledPipeline {
             router,
             actions,
             compression_runtimes,
+            #[cfg(feature = "rag")]
+            rag_runtimes,
             auths,
             policies,
             enforcers,
@@ -2371,6 +2400,41 @@ fn compile_fallback(
         add_debug_header,
         action,
     }))
+}
+
+/// Reject any main or forward-rule `ai_proxy` action that configures
+/// `rag:` when this binary was built without the `rag` feature (WOR-2098).
+///
+/// Dropping the block silently would proxy unaugmented traffic that the
+/// operator believes carries retrieved context, so the mismatch fails
+/// construction with a pointer at the rebuild flag instead.
+#[cfg(not(feature = "rag"))]
+fn reject_configured_rag(
+    actions: &[Action],
+    forward_rules: &[Vec<CompiledForwardRule>],
+) -> anyhow::Result<()> {
+    fn has_rag(action: &Action) -> bool {
+        matches!(action, Action::AiProxy(action) if action.config.rag.is_some())
+    }
+    for (origin_idx, action) in actions.iter().enumerate() {
+        if has_rag(action) {
+            anyhow::bail!(
+                "origin {origin_idx}: ai_proxy configures `rag:` but this build does not \
+                 include RAG support; rebuild with feature 'rag'"
+            );
+        }
+    }
+    for (origin_idx, rules) in forward_rules.iter().enumerate() {
+        for (rule_idx, rule) in rules.iter().enumerate() {
+            if has_rag(&rule.action) {
+                anyhow::bail!(
+                    "origin {origin_idx}: forward rule {rule_idx}: ai_proxy configures `rag:` \
+                     but this build does not include RAG support; rebuild with feature 'rag'"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Normalize a request modifier from either Go format or Rust format.
