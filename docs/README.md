@@ -143,4 +143,4 @@ Point a framework you already run at the gateway: chat completions through the O
 ## Machine-readable documentation
 
 - [llms.txt](llms.txt) - flat capability catalog (one line per shipped feature), per the [llmstxt.org](https://llmstxt.org/) convention. The small index AI tools fetch first.
-- [llms-full.txt](llms-full.txt) - the entire docs corpus (this directory + the top-level `README.md`, `MIGRATION.md`, `CHANGELOG.md`) flattened into one file so AI tools that want the full set get it in one HTTP request. Generated; do not hand-edit. Regenerate with `scripts/regen-llms-full.sh` after any docs change. Mirrored live at <https://sbproxy.dev/llms-full.txt>.
+- [llms-full.txt](llms-full.txt) - the entire docs corpus (this directory + the top-level `README.md`, `MIGRATION.md`, `CHANGELOG.md`) flattened into one file so AI tools that want the full set get it in one HTTP request. Generated; do not hand-edit and do not commit it on a branch. CI regenerates it on `main` after a docs change merges. Mirrored live at <https://sbproxy.dev/llms-full.txt>.

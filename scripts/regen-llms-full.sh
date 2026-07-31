@@ -11,8 +11,17 @@
 #   ./scripts/regen-llms-full.sh          # regenerate docs/llms-full.txt
 #   ./scripts/regen-llms-full.sh --check  # exit 1 if regen would diff
 #
-# The file is generated; do not hand-edit. Edit the source `docs/*.md`
-# and re-run this script.
+# The file is generated; do not hand-edit. Edit the source `docs/*.md`.
+#
+# CI owns the output (WOR-2119). `.github/workflows/llms-full-refresh.yml`
+# runs this script on `main` after a merge changes any source doc and
+# commits the result, so branches carry doc edits only. Two branches
+# that both regenerated a 2 MB generated file always conflicted on it,
+# and the resolution was never more than "run the generator again".
+#
+# Running it locally is still fine for inspecting the output. Just do
+# not commit the result on a branch: the docs lane rejects that and
+# tells you how to drop it.
 
 set -euo pipefail
 
