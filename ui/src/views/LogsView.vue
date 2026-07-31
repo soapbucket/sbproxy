@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
-import { api, type RequestFilters, type RequestLog } from "../api";
+import { api, type ContentSample, type RequestFilters, type RequestLog } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { useAuth } from "../composables/useAuth";
 import { toast } from "../composables/useToasts";
-import { formatMs, formatNumber, formatTime, formatUsd } from "../lib/format";
+import { formatMs, formatNumber, formatTime, formatUsd, shortId } from "../lib/format";
 import {
   discoverPropertyKeys,
   durationOf,
@@ -23,6 +24,33 @@ import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
 
 const route = useRoute();
+const { role } = useAuth();
+const isAdmin = computed(() => role.value === "admin");
+
+// WOR-2096: on-demand redacted content sample, admin only. Keyed by
+// request id; every fetch is audited server-side.
+const contentSamples = ref<Record<string, ContentSample>>({});
+const contentErrors = ref<Record<string, string>>({});
+const contentLoading = ref<Record<string, boolean>>({});
+
+async function loadContent(requestId: string) {
+  if (!requestId || contentLoading.value[requestId]) return;
+  contentLoading.value = { ...contentLoading.value, [requestId]: true };
+  try {
+    const sample = await api.requestContent(requestId);
+    contentSamples.value = { ...contentSamples.value, [requestId]: sample };
+    const { [requestId]: _drop, ...rest } = contentErrors.value;
+    contentErrors.value = rest;
+  } catch (e) {
+    contentErrors.value = {
+      ...contentErrors.value,
+      [requestId]: e instanceof Error ? e.message : "content unavailable",
+    };
+  } finally {
+    const { [requestId]: _drop, ...rest } = contentLoading.value;
+    contentLoading.value = rest;
+  }
+}
 
 // Snapshot and live rows use the same predicate. The server receives every
 // bounded filter it supports; origin, status classes, and session stay local.
@@ -36,6 +64,8 @@ const fRetried = ref<"" | "true" | "false">("");
 const fPropertyKey = ref("");
 const fPropertyValue = ref("");
 const fSession = ref("");
+const fApiKeyId = ref("");
+const fKeyMode = ref<"" | "none" | "minted" | "native">("");
 
 const filters = computed<RequestFilters>(() => ({
   ...(fMethod.value ? { method: fMethod.value } : {}),
@@ -50,6 +80,8 @@ const filters = computed<RequestFilters>(() => ({
     ? { propertyValue: fPropertyValue.value }
     : {}),
   ...(fSession.value ? { sessionId: fSession.value } : {}),
+  ...(fApiKeyId.value ? { apiKeyId: fApiKeyId.value } : {}),
+  ...(fKeyMode.value ? { keyMode: fKeyMode.value } : {}),
 }));
 
 const req = useAsync(() => api.requests(filters.value));
@@ -60,6 +92,13 @@ onMounted(() => {
   if (typeof guardrail === "string") fGuardrail.value = guardrail;
   const session = route.query.session_id;
   if (typeof session === "string") fSession.value = session;
+  // Arrived from a key row: pre-filter to that key's traffic.
+  const apiKeyId = route.query.api_key_id;
+  if (typeof apiKeyId === "string") fApiKeyId.value = apiKeyId;
+  const keyMode = route.query.key_mode;
+  if (keyMode === "none" || keyMode === "minted" || keyMode === "native") {
+    fKeyMode.value = keyMode;
+  }
   // Arrived from a spend row: pre-filter to the origin that produced it.
   const origin = route.query.origin;
   if (typeof origin === "string") fOrigin.value = origin;
@@ -215,6 +254,8 @@ function clearFilters() {
   fPropertyKey.value = "";
   fPropertyValue.value = "";
   fSession.value = "";
+  fApiKeyId.value = "";
+  fKeyMode.value = "";
   if (!live.value) req.run();
 }
 
@@ -275,7 +316,9 @@ function toggleSessionGrouping() {
 }
 
 const displayGroups = computed(() => logGroups(rows.value, groupBySession.value));
-const tableColumnCount = computed(() => 8 + selectedPropertyKeys.value.length);
+// 9 fixed columns: time, method, path, status, duration, gateway, key,
+// trace, upstream (WOR-2093 added the key column).
+const tableColumnCount = computed(() => 9 + selectedPropertyKeys.value.length);
 
 function statusTone(
   status: number | undefined,
@@ -329,6 +372,20 @@ function detailFields(request: RequestLog): DetailField[] {
   push("Selected target", request.load_balancer_target);
   push("Guardrail", request.guardrail_category);
   push("Guardrail action", request.guardrail_action);
+  // WOR-2093 key accountability.
+  push("Key id", request.api_key_id);
+  push("Key mode", request.key_mode);
+  push("Key provider", request.key_provider);
+  push("Tenant", request.tenant_id);
+  push("User", request.user_id);
+  // WOR-2094: what the gateway decided, and under which generations.
+  push("Error class", request.error_class);
+  push("Config revision", request.config_revision);
+  push("Policy version", request.policy_version);
+  if (request.policy_decisions?.length) {
+    push("Policy decisions", request.policy_decisions.join(", "));
+  }
+  push("Deny reason", request.deny_reason);
   Object.entries(request.properties ?? {})
     .sort(([a], [b]) => a.localeCompare(b))
     .forEach(([key, value]) => push(`Property: ${key}`, value));
@@ -462,6 +519,18 @@ function detailFields(request: RequestLog): DetailField[] {
         placeholder="Exact session ID"
         aria-label="Filter by session ID"
       />
+      <input
+        v-model="fApiKeyId"
+        class="sb-input"
+        placeholder="Exact key ID"
+        aria-label="Filter by key ID"
+      />
+      <select v-model="fKeyMode" class="sb-select" aria-label="Filter by key mode">
+        <option value="">any key mode</option>
+        <option value="minted">minted</option>
+        <option value="native">native</option>
+        <option value="none">none</option>
+      </select>
     </div>
     <div class="filter-actions">
       <button class="sb-btn sb-btn--sm" :disabled="live" @click="applyFilters">
@@ -510,6 +579,7 @@ function detailFields(request: RequestLog): DetailField[] {
           <th>Status</th>
           <th>Duration</th>
           <th>Gateway</th>
+          <th>Key</th>
           <th v-for="key in selectedPropertyKeys" :key="key" class="property-head">
             {{ key }}
           </th>
@@ -586,6 +656,21 @@ function detailFields(request: RequestLog): DetailField[] {
                   </template>
                 </div>
               </td>
+              <td class="nowrap">
+                <template v-if="request.api_key_id">
+                  <span class="sb-mono" :title="request.api_key_id">{{
+                    shortId(request.api_key_id)
+                  }}</span>
+                  <StatusBadge
+                    v-if="request.key_mode === 'native'"
+                    :label="request.key_provider ?? 'native'"
+                    tone="info"
+                  />
+                </template>
+                <span v-else class="sb-faint">{{
+                  request.key_mode === "native" ? "native" : "unkeyed"
+                }}</span>
+              </td>
               <td
                 v-for="key in selectedPropertyKeys"
                 :key="key"
@@ -624,6 +709,56 @@ function detailFields(request: RequestLog): DetailField[] {
                   <p v-if="!detailFields(request).length" class="sb-faint no-detail">
                     No additional fields on this legacy row.
                   </p>
+                </div>
+                <div
+                  v-if="isAdmin && request.request_id"
+                  class="content-capture"
+                >
+                  <button
+                    v-if="
+                      !contentSamples[request.request_id] &&
+                      !contentErrors[request.request_id]
+                    "
+                    class="sb-btn sb-btn--sm"
+                    :disabled="contentLoading[request.request_id]"
+                    @click.stop="loadContent(request.request_id)"
+                  >
+                    {{
+                      contentLoading[request.request_id]
+                        ? "Loading..."
+                        : "View captured content"
+                    }}
+                  </button>
+                  <p
+                    v-else-if="contentErrors[request.request_id]"
+                    class="sb-faint no-detail"
+                  >
+                    {{ contentErrors[request.request_id] }}
+                  </p>
+                  <div
+                    v-else-if="contentSamples[request.request_id]"
+                    class="content-sample"
+                  >
+                    <p class="sb-eyebrow">Captured content (redacted)</p>
+                    <div
+                      v-for="(msg, msgIndex) in contentSamples[request.request_id]
+                        .input_messages"
+                      :key="msgIndex"
+                      class="content-message"
+                    >
+                      <span class="content-role sb-mono">{{ msg.role }}</span>
+                      <span class="content-text">{{ msg.content }}</span>
+                    </div>
+                    <div
+                      v-if="contentSamples[request.request_id].output_text"
+                      class="content-message"
+                    >
+                      <span class="content-role sb-mono">assistant</span>
+                      <span class="content-text">{{
+                        contentSamples[request.request_id].output_text
+                      }}</span>
+                    </div>
+                  </div>
                 </div>
               </td>
             </tr>

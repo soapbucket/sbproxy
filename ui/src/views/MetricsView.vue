@@ -313,6 +313,46 @@ const activeConnections = computed(() => {
   return f ? sumSamples(f) : undefined;
 });
 
+// WOR-2094/2095: governance and enforcement families that were dark.
+const inboundKeyFamily = computed(() =>
+  findFamily(families.value, "sbproxy_inbound_key_requests_total"),
+);
+const trafficByKeyMode = computed(() => {
+  const f = scopeByOrigin(inboundKeyFamily.value, ["origin"]);
+  return f ? groupByLabel(f, "key_mode").slice(0, 4) : [];
+});
+const nativeByProvider = computed(() => {
+  const f = inboundKeyFamily.value;
+  if (!f) return [];
+  const native = {
+    name: "sbproxy_inbound_key_requests_total",
+    samples: f.samples.filter((sample) => sample.labels.key_mode === "native"),
+  };
+  return groupByLabel(native, "provider").slice(0, 8);
+});
+const policyTriggers = computed(() => {
+  const f = findFamily(families.value, "sbproxy_policy_triggers_total");
+  if (!f) return [];
+  const label = ["policy_type", "action"].find((l) =>
+    f.samples.some((sample) => l in sample.labels),
+  );
+  return label ? groupByLabel(f, label).slice(0, 8) : [];
+});
+const cacheReserve = computed(() => {
+  const items = [
+    ["hits", "sbproxy_cache_reserve_hits_total"],
+    ["misses", "sbproxy_cache_reserve_misses_total"],
+    ["writes", "sbproxy_cache_reserve_writes_total"],
+    ["evictions", "sbproxy_cache_reserve_evictions_total"],
+  ] as const;
+  return items
+    .map(([key, name]) => {
+      const f = findFamily(families.value, name);
+      return { key, value: f ? sumSamples(f) : 0 };
+    })
+    .filter((item) => item.value > 0);
+});
+
 // Token throughput (avg tok/s) per model, the standard local-model
 // measure. Populated by streaming completions (WOR-895).
 const throughputByModel = computed(() =>
@@ -538,7 +578,11 @@ const hasAnyPanel = computed(
     tokensByProvider.value.length ||
     providerErrors.value.length ||
     throughputByModel.value.length ||
-    modelHostGauges.value.length,
+    modelHostGauges.value.length ||
+    trafficByKeyMode.value.length ||
+    nativeByProvider.value.length ||
+    policyTriggers.value.length ||
+    cacheReserve.value.length,
 );
 
 function formatRate(v: number | undefined | null): string {
@@ -761,6 +805,22 @@ function formatPct(v: number): string {
         <div class="sb-card" v-if="providerErrors.length">
           <h3>Provider errors <span v-if="selectedOrigin" class="sb-eyebrow">all origins</span></h3>
           <MiniBars :items="providerErrors" color="var(--sb-err)" />
+        </div>
+        <div class="sb-card" v-if="trafficByKeyMode.length">
+          <h3>Traffic by key mode</h3>
+          <MiniBars :items="trafficByKeyMode" />
+        </div>
+        <div class="sb-card" v-if="nativeByProvider.length">
+          <h3>Native key traffic by provider <span v-if="selectedOrigin" class="sb-eyebrow">all origins</span></h3>
+          <MiniBars :items="nativeByProvider" />
+        </div>
+        <div class="sb-card" v-if="policyTriggers.length">
+          <h3>Policy enforcement <span v-if="selectedOrigin" class="sb-eyebrow">all origins</span></h3>
+          <MiniBars :items="policyTriggers" color="var(--sb-warn)" />
+        </div>
+        <div class="sb-card" v-if="cacheReserve.length">
+          <h3>Cache reserve <span v-if="selectedOrigin" class="sb-eyebrow">all origins</span></h3>
+          <MiniBars :items="cacheReserve" :format="formatNumber" />
         </div>
         <div class="sb-card" v-if="throughputByModel.length">
           <h3>Token throughput (avg tok/s) <span v-if="selectedOrigin" class="sb-eyebrow">all origins</span></h3>

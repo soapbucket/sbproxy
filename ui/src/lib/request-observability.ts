@@ -380,6 +380,12 @@ export function requestMatchesFilters(
   ) {
     return false;
   }
+  // WOR-2093: key accountability predicates, mirroring the server-side
+  // filters so live-tail rows obey the same view.
+  if (filters.apiKeyId && request.api_key_id !== filters.apiKeyId) return false;
+  if (filters.keyMode && (request.key_mode ?? "none") !== filters.keyMode) {
+    return false;
+  }
   return true;
 }
 

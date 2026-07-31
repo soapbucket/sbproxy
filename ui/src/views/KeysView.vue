@@ -834,6 +834,20 @@ function statusOf(k: AdminKey): string {
           <td>{{ budgetOf(k) !== undefined ? formatUsd(budgetOf(k)) : "n/a" }}</td>
           <td>{{ k.expires_at ? formatTime(k.expires_at) : "never" }}</td>
           <td class="actions">
+            <RouterLink
+              class="sb-btn sb-btn--sm"
+              :to="{ name: 'logs', query: { api_key_id: keyId(k) } }"
+              title="This key's requests in the log"
+            >
+              Traffic
+            </RouterLink>
+            <RouterLink
+              class="sb-btn sb-btn--sm"
+              :to="{ name: 'sessions', query: { api_key_id: keyId(k) } }"
+              title="Sessions this key has had"
+            >
+              Sessions
+            </RouterLink>
             <button
               class="sb-btn sb-btn--sm"
               :disabled="rowBusy !== null"
