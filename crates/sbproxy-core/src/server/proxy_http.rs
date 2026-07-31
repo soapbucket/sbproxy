@@ -1959,7 +1959,7 @@ impl ProxyHttp for SbProxy {
 
         let mut realtime_bound_auth: Option<RealtimeCredential> = None;
         if let Some(credential_id) = bound_credential_id {
-            let Some(plane) = crate::key_plane::current_key_plane() else {
+            let Some(plane) = ctx.pipeline.key_plane().cloned() else {
                 warn!(
                     credential_id = %credential_id,
                     "a key binds a credential but no key plane is installed"

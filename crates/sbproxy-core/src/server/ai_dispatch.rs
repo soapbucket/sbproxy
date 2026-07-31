@@ -875,7 +875,7 @@ pub(super) async fn realtime_budget_gate(
     ctx: &mut RequestContext,
     model: Option<&str>,
 ) -> std::result::Result<RealtimeAdmission, (u16, String)> {
-    let key_plane = crate::key_plane::current_key_plane();
+    let key_plane = pipeline.key_plane().cloned();
     let prepared =
         prepare_ai_request_identity(session, config, pipeline, ctx, key_plane.as_deref()).await?;
 
@@ -2306,7 +2306,7 @@ pub(super) async fn handle_ai_proxy(
     // Resolve authentication and its immutable effective policy before any AI
     // dispatch branch can return or contact a provider/cache. The key plane and
     // policy snapshots stay pinned for the rest of this request.
-    let key_plane = crate::key_plane::current_key_plane();
+    let key_plane = pipeline.key_plane().cloned();
     let prepared_identity =
         match prepare_ai_request_identity(session, config, pipeline, ctx, key_plane.as_deref())
             .await

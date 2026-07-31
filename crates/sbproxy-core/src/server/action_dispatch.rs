@@ -241,12 +241,12 @@ pub(super) async fn handle_action(
                 // passed. Settlement is deferred until the final outbound
                 // request seam so peer validation and credential preparation
                 // cannot consume quota for a request that never leaves.
-                let key_plane = crate::key_plane::current_key_plane();
+                let key_plane = pipeline.key_plane();
                 let quota_pool_config = ai.config.quota_pool.clone();
                 let quota_pool_admission =
                     sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
                         quota_pool_config.clone(),
-                        ai.config.quota_pool_store(key_plane.as_ref().map(|plane| {
+                        ai.config.quota_pool_store(key_plane.map(|plane| {
                             (plane.governance_store(), plane.governance_consistency())
                         })),
                         super::ai_dispatch::quota_pool_member_id_for_request(ctx),

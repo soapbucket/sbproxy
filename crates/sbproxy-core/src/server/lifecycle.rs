@@ -748,6 +748,19 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
     {
         let compiled = &new_pipeline.config;
 
+        // Config seeds target the external system of record, whose generic
+        // backend contract has no cross-record transaction. Apply them only
+        // after every reject-only preflight has succeeded. A backend failure
+        // degrades this generation but still publishes plane B with pipeline B,
+        // never pipeline B against plane A.
+        if let Err(e) = crate::key_plane::seed_prepared_key_plane(
+            new_pipeline.key_plane(),
+            compiled.server.key_management.as_ref(),
+        ) {
+            tracing::error!(error = %e, "failed to seed dynamic key plane on reload");
+            outcome.degrade(DegradedSubsystem::KeyPlane);
+        }
+
         // WOR-594: refresh the operator-configured Lua sandbox limits on
         // reload so SIGHUP / hot-reload pick up changes to
         // `proxy.scripting.lua.sandbox:` without restarting the process.
@@ -790,17 +803,13 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
         // `agent_detect.*` takes effect.
         install_detection_singletons(compiled);
 
-        // WOR-1546: reconcile the dynamic key plane so a reload that changed
-        // `key_management:` re-seeds config records and swaps the live plane.
-        // Config-seeded records are re-asserted unless `allow_api_override`.
-        if let Some(km) = compiled.server.key_management.as_ref() {
-            if let Err(e) = crate::key_plane::init_key_plane(km) {
-                tracing::error!(error = %e, "failed to reconcile dynamic key plane on reload");
-                outcome.degrade(DegradedSubsystem::KeyPlane);
-            }
-        } else {
-            crate::key_plane::uninstall_key_plane();
-        }
+        // Publish the candidate key plane as the admin and cluster view. The
+        // request path uses the same Arc pinned inside `new_pipeline`, so a
+        // request that started on generation A cannot cross into B here.
+        crate::key_plane::activate_key_plane(
+            new_pipeline.key_plane().cloned(),
+            compiled.server.key_management.as_ref(),
+        );
     }
 
     // WOR-1835: same reasoning as the boot path above - retry starting
@@ -1312,33 +1321,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         crate::rate_limit_budget::install_registry(rl);
     }
 
-    // --- WOR-1546: assemble and install the dynamic key plane ---
-    //
-    // Lowered from `proxy.key_management:`. Builds the store, policy cache, and
-    // at-rest crypto, seeds config records, and (for the redis backend/tier)
-    // starts the cross-replica invalidation subscriber. Inert when the block is
-    // absent or `enabled: false`.
-    // Install the one process-owned cluster before the key plane so the mesh
-    // cache tier consumes this handle instead of opening duplicate listeners.
+    // Install the one process-owned cluster before pipeline construction so a
+    // candidate mesh-backed key plane consumes this handle instead of opening
+    // duplicate listeners.
     crate::cluster::reconcile_process_cluster(&server_config)?;
-
-    if let Some(km) = server_config.key_management.as_ref() {
-        if let Err(e) = crate::key_plane::init_key_plane(km) {
-            tracing::error!(error = %e, "failed to install dynamic key plane");
-        }
-    } else {
-        crate::key_plane::uninstall_key_plane();
-    }
-
-    // WOR-1835: start cross-node governance-counter dissemination now that
-    // both the process cluster handle (reconciled above) and the key plane
-    // (installed just above, when configured) are in place. This cannot run
-    // any earlier: `reconcile_process_cluster` starts cluster metrics before
-    // the key plane exists, so a check made there would never see the
-    // approximate governance store. See `cluster::start_governance_dissemination`
-    // for the idempotency contract.
-    crate::cluster::start_governance_dissemination();
-    crate::cluster::start_rate_limit_dissemination();
 
     // --- WOR-1186: register the session-ledger sink when enabled ---
     //
@@ -1484,6 +1470,22 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         .max()
         .unwrap_or(DEFAULT_MODEL_PLANE_BODY_LIMIT);
     let _model_plane_shutdown = start_process_model_plane(model_plane_body_limit)?;
+
+    // The pipeline constructor prepared this exact generation's key plane
+    // without touching global or store state. Boot has completed every other
+    // fallible preflight, so apply declarative seeds and then expose the plane
+    // to admin/cluster consumers immediately before publishing the matching
+    // request pipeline.
+    crate::key_plane::seed_prepared_key_plane(
+        pipeline.key_plane(),
+        pipeline.config.server.key_management.as_ref(),
+    )?;
+    crate::key_plane::activate_key_plane(
+        pipeline.key_plane().cloned(),
+        pipeline.config.server.key_management.as_ref(),
+    );
+    crate::cluster::start_governance_dissemination();
+    crate::cluster::start_rate_limit_dissemination();
 
     // Store in hot-reload slot.
     reload::load_pipeline(pipeline);

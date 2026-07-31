@@ -1788,7 +1788,7 @@ fn invalidate(plane: &KeyPlane, id: &str) {
     // A credential's resolved secret is cached separately from its record, so
     // a rotation has to drop both on the same signal or the old secret keeps
     // going upstream until the TTL lapses.
-    crate::key_plane::invalidate_resolved_credential(id);
+    plane.invalidate_resolved_credential(id);
 }
 
 fn status_verb(status: RecordStatus) -> &'static str {

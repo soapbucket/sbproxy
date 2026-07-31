@@ -2399,13 +2399,13 @@ pub(super) async fn request_filter(
     // those sources before it falls back to native-key admission. Generic
     // proxy actions have no later resolver and remain fully governed here.
     let ai_action_resolves_overlapping_credentials = ai_proxy_owns_replay_paths;
-    if let Some(plane) = crate::key_plane::current_key_plane() {
+    if let Some(plane) = pipeline.key_plane() {
         let origin_label = ctx.hostname.to_string();
         // Bind the outcome before matching so the immutable borrow of
         // `session` ends here rather than spanning the arms, which need it
         // mutably to write an error response.
         let outcome =
-            resolve_inbound_key(&plane, &session.req_header().headers, raw_peer_ip, ctx).await;
+            resolve_inbound_key(plane, &session.req_header().headers, raw_peer_ip, ctx).await;
         match outcome {
             InboundKeyPhase::Resolved => {
                 ctx.inbound_key_mode = crate::context::InboundKeyMode::Minted;

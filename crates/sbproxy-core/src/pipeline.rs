@@ -1110,6 +1110,12 @@ pub struct CompiledIdempotency {
 pub struct CompiledPipeline {
     /// The underlying compiled config (origins, host_map, server settings).
     pub config: CompiledConfig,
+    /// Dynamic key plane built from the same immutable config generation.
+    ///
+    /// Request contexts pin the pipeline at ingress, so keeping the plane here
+    /// prevents a reload from changing key resolution, governance, or bound
+    /// upstream credentials underneath an in-flight request.
+    pub(crate) key_plane: Option<Arc<crate::key_plane::KeyPlane>>,
     /// Sensitive request-header names for this exact config generation.
     ///
     /// Requests pin a pipeline at ingress. Keeping custom credential carriers
@@ -1290,6 +1296,7 @@ impl Default for CompiledPipeline {
         let sensitive_header_names = compile_sensitive_header_names(&config);
         Self {
             config,
+            key_plane: None,
             sensitive_header_names,
             router,
             actions: Vec::new(),
@@ -1351,6 +1358,11 @@ fn parse_outbound_credential_config(
 }
 
 impl CompiledPipeline {
+    /// Dynamic key plane for this exact pipeline generation.
+    pub fn key_plane(&self) -> Option<&Arc<crate::key_plane::KeyPlane>> {
+        self.key_plane.as_ref()
+    }
+
     /// Whether a request header is sensitive for this pipeline generation.
     pub(crate) fn is_sensitive_header(&self, header_name: &str) -> bool {
         self.sensitive_header_names.contains(header_name)
@@ -1804,8 +1816,16 @@ impl CompiledPipeline {
             }
         };
 
+        let key_plane = match mode {
+            PipelineConstructionMode::Runtime => {
+                crate::key_plane::prepare_key_plane(config.server.key_management.as_ref())?
+            }
+            PipelineConstructionMode::Validation => None,
+        };
+
         let pipeline = Self {
             config,
+            key_plane,
             sensitive_header_names,
             router,
             actions,
