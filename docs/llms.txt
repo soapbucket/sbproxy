@@ -41,6 +41,13 @@ For human-facing documentation, see `docs/architecture.md`, `docs/configuration.
 - ai_context_compression.eval: a deterministic off/on smoke gate covers synthetic retrieval and coding-agent shapes; external benchmark adapters are import-and-report-only.
 - ai_guardrails.default_centroids: toxicity, jailbreak, and content-safety classifier modes ship versioned MiniLM centroids with exact model, tokenizer, and artifact SHA-256 pins; operator examples extend the defaults.
 
+## RAG
+
+- ai_rag.gateway_retrieval: a per-route `rag:` block on `ai_proxy` embeds the query, runs a tenant-scoped vector search, and injects retrieved context between the original and augmented input guardrail passes (see `docs/rag.md`).
+- ai_rag.providers: five embedding adapters (openai, compatible, cohere, bedrock, vertex) and five vector stores (chroma, pinecone, qdrant, redis, weaviate) behind `rag-*` Cargo features; the released binary ships `rag-full`.
+- ai_rag.failure_policy: `on_failure.mode` is `fail_closed` (502 `rag_retrieval_failed`, default), `continue_without_context`, or `use_stale` with a bounded per-runtime cache that fails closed when expired.
+- ai_rag.metrics: `sbproxy_ai_rag_requests_total{embedding,vector_store,outcome}`, `sbproxy_ai_rag_latency_seconds{stage,provider}`, and `sbproxy_ai_rag_context_bytes`; query text and chunk content are never traced.
+
 ## Audit
 
 - admin_audit_envelope: typed `AdminAuditEvent` carrying actor, action, target, before/after diff, reason, request_id, trace_id, ip, and user_agent; emitted by every state-mutating endpoint.

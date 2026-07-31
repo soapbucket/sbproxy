@@ -56,6 +56,7 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [ai-predictive-budget.md](ai-predictive-budget.md) - predictive budgets with soft-landing: warn, then downgrade, then block as a scope approaches its cap.
 - [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md) - classify upstream failures (timeout, rate-limit, context-window, content-policy) and set per-error retry counts.
 - [ai-context-compression.md](ai-context-compression.md) - selectable compression profiles, explicit input budgets, Redis summary state, value accounting, evaluation, metrics, and logs.
+- [rag.md](rag.md) - SBproxy in front of a RAG pipeline: gateway-side retrieval from five vector stores, plus marked-context governance, guardrails, and metering.
 - [local-inference.md](local-inference.md) - run embeddings (semantic cache) and prompt-injection classify on local ONNX models via the sidecar or in-process.
 - [ai-lb-benchmark.md](ai-lb-benchmark.md) - P50/P95/P99/P99.9 latency comparison across AI router strategies under skewed load.
 - [providers.md](providers.md) - the catalog of supported LLM providers.

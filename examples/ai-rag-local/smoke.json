@@ -1,0 +1,30 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "cases": [{
+    "name": "retrieved refund policy reaches the model",
+    "request": {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "headers": {
+        "Host": "ai.localhost",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "model": "fixture-chat",
+        "messages": [{"role":"user","content":"When do refunds arrive?"}]
+      }
+    },
+    "expect": {
+      "status": 200,
+      "body": {
+        "type": "jsonShape",
+        "shape": {
+          "choices": [{"message":{"content":"Refunds take five business days."}}]
+        }
+      }
+    }
+  }],
+  "audit_check": false
+}

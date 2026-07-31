@@ -610,6 +610,10 @@ Input guardrails apply to whichever body field the surface carries user text in:
 
 A single built-in guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. Multipart-bodied surfaces (image edits, image variations, audio transcription) bypass the built-in input check today because their bodies are forwarded byte-transparently; built-in output scanning for those surfaces is reserved for a follow-up. External adapters apply their documented [unavailable-content policy](guardrails.md#streaming-and-multipart-content) to multipart bodies.
 
+### Gateway-side retrieval (RAG)
+
+An `ai_proxy` route can carry a `rag:` block that makes the gateway perform retrieval itself: it embeds the request's query, runs a tenant-scoped search against a configured vector store, and injects the retrieved chunks as marked system context before dispatch. The stage order is fixed: input guardrails run over the original request, then retrieval, then context injection, then the input guardrails run again over the augmented request, and only then do the AI policy plane, budgets, caching, and routing proceed. Retrieved text therefore gets the same screening as user text, and a prompt the original pass rejects never causes embedding egress. Field reference, failure policy, limits, build features, and metrics are in [rag.md](rag.md); the runnable fixture walkthrough is [`examples/ai-rag-local/`](../examples/ai-rag-local/).
+
 ### Safety guardrail modes
 
 `toxicity`, `jailbreak`, and `content_safety` each have two explicit modes.
