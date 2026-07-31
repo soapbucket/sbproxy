@@ -472,6 +472,13 @@
           "enum": [
             "embedded"
           ]
+        },
+        {
+          "description": "Force mistral.rs (WOR-1861). `Auto` never resolves to this: mistral.rs is an explicit opt-in that stays behind vLLM (safetensors) and llama.cpp (GGUF) until it has certification mileage, and the planner must not prefer it for large MoE prefill workloads.",
+          "type": "string",
+          "enum": [
+            "mistralrs"
+          ]
         }
       ]
     },

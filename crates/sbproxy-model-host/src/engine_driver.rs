@@ -545,6 +545,9 @@ impl LaunchRequest {
             ),
             EngineKind::LlamaCpp => self.artifact.metadata.format == ArtifactFormat::Gguf,
             EngineKind::Embedded => self.artifact.metadata.format == ArtifactFormat::Safetensors,
+            // Safetensors-only for now: GGUF stays llama.cpp's certified
+            // lane (WOR-1861).
+            EngineKind::MistralRs => self.artifact.metadata.format == ArtifactFormat::Safetensors,
         };
         if !compatible {
             return Err(EngineDriverError::new(
@@ -691,6 +694,14 @@ fn argument_rule(kind: EngineKind, flag: &str) -> Option<ArgumentRule> {
             Some(ArgumentRule::Boolean)
         }
         (EngineKind::LlamaCpp, "--threads" | "--batch-size" | "--ubatch-size" | "--seed") => {
+            Some(ArgumentRule::Value(ArgumentValue::Unsigned))
+        }
+        // mistral.rs's stable allowlist (WOR-1861). `-m`, `--host`,
+        // `--port`, `--max-seq-len`, `--max-seqs`, and `--cpu` stay off
+        // it: they are runtime-owned, derived from the fit plan and the
+        // launch request.
+        (EngineKind::MistralRs, "--no-kv-cache") => Some(ArgumentRule::Boolean),
+        (EngineKind::MistralRs, "--prefix-cache-n") => {
             Some(ArgumentRule::Value(ArgumentValue::Unsigned))
         }
         _ => None,

@@ -2156,6 +2156,13 @@
           "enum": [
             "llama_cpp"
           ]
+        },
+        {
+          "description": "Use mistral.rs (WOR-1861). An explicit opt-in that `Auto` never selects; the pure-Rust subprocess lane over the upstream pinned prebuilt binary, serving safetensors weights.",
+          "type": "string",
+          "enum": [
+            "mistralrs"
+          ]
         }
       ]
     },

@@ -65,10 +65,11 @@ pub enum BinaryAcquirePlan {
 /// `PATH`. No fetch, no filesystem writes; it only probes the host
 /// (CUDA prerequisites and, on macOS, the OS product version).
 ///
-/// Only binary engines (llama.cpp) are acquired here. vLLM is not a
-/// single-binary release (use a container or venv), and the embedded
-/// engine runs in-process; both return [`BinaryAcquirePlan::Blocked`]
-/// with the reason unless already on `PATH`.
+/// Only binary engines (llama.cpp and mistral.rs) are acquired here.
+/// vLLM is not a single-binary release (use a container or venv), and
+/// the embedded engine runs in-process; both return
+/// [`BinaryAcquirePlan::Blocked`] with the reason unless already on
+/// `PATH`.
 pub fn plan_binary_acquire(
     engine: EngineKind,
     prov: Option<&EngineProvisioning>,
@@ -216,6 +217,30 @@ pub fn plan_binary_acquire_with_cuda(
         EngineKind::Embedded => BinaryAcquirePlan::Blocked(
             "the embedded engine runs in-process; there is no binary to acquire".to_string(),
         ),
+        // mistral.rs is the second single-binary release engine
+        // (WOR-1861). The concrete asset (and its built-in digest)
+        // depends on the probed GPU compute capability, which the driver
+        // knows at provision time; the plan carries the pinned tag, the
+        // accel flavour, and only an explicitly configured sha256. A
+        // `None` sha256 here still verifies against the built-in
+        // per-asset digest table during provisioning.
+        EngineKind::MistralRs => {
+            if Platform::detect().is_none() {
+                return BinaryAcquirePlan::Blocked(format!(
+                    "no prebuilt mistral.rs release for {}/{}; install mistralrs on PATH",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ));
+            }
+            let tag = acquire
+                .and_then(|a| a.version.clone())
+                .unwrap_or_else(|| crate::mistralrs_release::DEFAULT_MISTRALRS_RELEASE_TAG.into());
+            BinaryAcquirePlan::FetchRelease {
+                tag,
+                accel: acquire.map(|a| a.accel).unwrap_or_default(),
+                sha256: acquire.and_then(|a| a.sha256.clone()),
+            }
+        }
     }
 }
 
@@ -370,6 +395,79 @@ mod tests {
         assert_eq!(
             plan_binary_acquire(EngineKind::Vllm, Some(&prov), None),
             BinaryAcquirePlan::ProvisionUvx { vllm_version: None }
+        );
+    }
+
+    #[test]
+    fn mistralrs_on_path_wins_for_release_default() {
+        let plan = plan_binary_acquire(
+            EngineKind::MistralRs,
+            None,
+            Some(PathBuf::from("/usr/local/bin/mistralrs")),
+        );
+        assert_eq!(
+            plan,
+            BinaryAcquirePlan::OnPath(PathBuf::from("/usr/local/bin/mistralrs"))
+        );
+    }
+
+    #[test]
+    fn mistralrs_release_uses_default_tag_when_unset() {
+        // No binary on PATH, no acquire block: fetch the pinned default
+        // tag. The sha256 stays `None` at plan time because the concrete
+        // asset depends on the probed compute capability; the driver
+        // resolves the built-in per-asset digest during provisioning.
+        match plan_binary_acquire(EngineKind::MistralRs, None, None) {
+            BinaryAcquirePlan::FetchRelease { tag, sha256, .. } => {
+                assert_eq!(tag, crate::mistralrs_release::DEFAULT_MISTRALRS_RELEASE_TAG);
+                assert_eq!(sha256, None);
+            }
+            BinaryAcquirePlan::Blocked(reason) => {
+                assert!(reason.contains("no prebuilt"), "{reason}")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mistralrs_release_honours_pinned_version_and_sha() {
+        let prov = EngineProvisioning {
+            acquire: Some(EngineAcquire {
+                source: AcquireSource::Release,
+                version: Some("v0.9.1".to_string()),
+                sha256: Some("abc123".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match plan_binary_acquire(EngineKind::MistralRs, Some(&prov), None) {
+            BinaryAcquirePlan::FetchRelease { tag, sha256, .. } => {
+                assert_eq!(tag, "v0.9.1");
+                assert_eq!(sha256.as_deref(), Some("abc123"));
+            }
+            BinaryAcquirePlan::Blocked(r) => assert!(r.contains("no prebuilt")),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mistralrs_explicit_path_override_wins_even_over_path() {
+        let prov = EngineProvisioning {
+            acquire: Some(EngineAcquire {
+                source: AcquireSource::Path,
+                path: Some("/opt/mistralrs/mistralrs".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plan = plan_binary_acquire(
+            EngineKind::MistralRs,
+            Some(&prov),
+            Some(PathBuf::from("/usr/local/bin/mistralrs")),
+        );
+        assert_eq!(
+            plan,
+            BinaryAcquirePlan::Explicit(PathBuf::from("/opt/mistralrs/mistralrs"))
         );
     }
 

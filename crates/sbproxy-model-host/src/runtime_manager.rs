@@ -2918,6 +2918,11 @@ impl ProductionDeploymentPreparer {
                 EngineKind::SGLang,
                 Arc::new(SGLangDriver::default()) as Arc<dyn EngineDriver>,
             ),
+            (
+                EngineKind::MistralRs,
+                Arc::new(crate::mistralrs_driver::MistralRsDriver::default())
+                    as Arc<dyn EngineDriver>,
+            ),
         ]);
         Self {
             catalog,
@@ -3711,7 +3716,8 @@ fn default_container_image(kind: EngineKind) -> Option<&'static str> {
     match kind {
         EngineKind::Vllm => Some(crate::vllm_driver::DEFAULT_VLLM_IMAGE),
         EngineKind::SGLang => Some(crate::sglang_driver::DEFAULT_SGLANG_IMAGE),
-        EngineKind::LlamaCpp | EngineKind::Embedded => None,
+        // Binary engines (and the in-process one) have no container path.
+        EngineKind::LlamaCpp | EngineKind::Embedded | EngineKind::MistralRs => None,
     }
 }
 
@@ -3773,6 +3779,7 @@ fn provisioning_for(
         EngineKind::Vllm => sbproxy_config::ManagedEngineKind::Vllm,
         EngineKind::SGLang => sbproxy_config::ManagedEngineKind::SGLang,
         EngineKind::LlamaCpp => sbproxy_config::ManagedEngineKind::LlamaCpp,
+        EngineKind::MistralRs => sbproxy_config::ManagedEngineKind::MistralRs,
         EngineKind::Embedded => return EngineProvisioning::default(),
     };
     // WOR-1917: when the operator has not configured this engine under

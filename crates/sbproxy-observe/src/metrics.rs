@@ -3931,7 +3931,7 @@ pub fn set_model_host_deployment_state(deployment: &str, engine: &str, state: &s
     let deployment = sanitize_label("deployment", deployment);
     let engine = closed_label(
         engine,
-        &["vllm", "sglang", "llama_cpp", "embedded"],
+        &["vllm", "sglang", "llama_cpp", "embedded", "mistralrs"],
         "unknown",
     );
     let state = closed_label(state, STATES, "unknown");
