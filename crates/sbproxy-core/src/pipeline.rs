@@ -1365,6 +1365,13 @@ impl CompiledPipeline {
             .map(|config| &config.inbound)
     }
 
+    /// Whether a header is a primary credential carrier for this exact
+    /// pipeline generation.
+    pub(crate) fn is_credential_carrier(&self, header_name: &str) -> bool {
+        self.inbound_key_config()
+            .is_some_and(|inbound| inbound.is_credential_carrier(header_name))
+    }
+
     /// The response-cache handle the data path must use for `origin_id`.
     ///
     /// With at-rest encryption on, this is the handle bound to that

@@ -2007,9 +2007,10 @@ pub const FORBIDDEN_SWEEP_HEADERS: &[&str] = &[
 /// carrier.
 ///
 /// In addition to headers that cannot be swept safely, credentials may not
-/// claim realtime handshake metadata, distributed tracing state, or outbound
-/// Web Bot Auth signature fields. Those values have independent protocol
-/// meaning and are written by the proxy.
+/// claim realtime handshake metadata, distributed tracing state, outbound
+/// Web Bot Auth signature fields, or headers promoted into logs and capture
+/// envelopes. Those values have independent protocol meaning or leave the raw
+/// request-header surface before generic secret redaction can protect them.
 pub fn credential_header_is_reserved(header: &str) -> bool {
     let lower = header.trim().to_ascii_lowercase();
     FORBIDDEN_SWEEP_HEADERS.contains(&lower.as_str())
@@ -2024,8 +2025,19 @@ pub fn credential_header_is_reserved(header: &str) -> bool {
                 | "signature-input"
                 | "signature"
                 | "signature-agent"
+                | "x-sb-user-id"
+                | "x-sb-session-id"
+                | "x-sb-parent-session-id"
+                | "user-agent"
+                | "referer"
+                | "b3"
+                | "x-b3-traceid"
+                | "x-b3-spanid"
+                | "x-b3-sampled"
+                | "x-b3-parentspanid"
         )
         || lower.starts_with("sec-websocket-")
+        || lower.starts_with("x-sb-property-")
 }
 
 fn default_inbound_headers() -> Vec<InboundHeaderConfig> {
@@ -2172,6 +2184,21 @@ impl KeyInboundConfig {
             }
         }
         names
+    }
+
+    /// Whether `header_name` is a primary inbound credential carrier.
+    ///
+    /// Match-only `provider_hints[].also_header` metadata is deliberately
+    /// excluded because it never contains the credential value.
+    pub fn is_credential_carrier(&self, header_name: &str) -> bool {
+        let canonical = header_name.trim();
+        self.headers
+            .iter()
+            .any(|entry| entry.name.trim().eq_ignore_ascii_case(canonical))
+            || self
+                .provider_hints
+                .iter()
+                .any(|hint| hint.header.trim().eq_ignore_ascii_case(canonical))
     }
 }
 
@@ -9338,6 +9365,53 @@ native_key_policy:
                 native_key_policy: None,
             };
             assert!(cfg.validate().is_err(), "{forbidden} must be rejected");
+        }
+    }
+
+    #[test]
+    fn inbound_validation_rejects_observability_and_capture_owned_headers() {
+        for forbidden in [
+            "X-Sb-User-Id",
+            "x-sb-session-id",
+            "X-SB-PARENT-SESSION-ID",
+            "x-sb-property-credential",
+            "User-Agent",
+            "Referer",
+            "b3",
+            "x-b3-traceid",
+            "x-b3-spanid",
+            "x-b3-sampled",
+            "x-b3-parentspanid",
+        ] {
+            for provider_hint in [false, true] {
+                let cfg = KeyInboundConfig {
+                    headers: if provider_hint {
+                        Vec::new()
+                    } else {
+                        vec![InboundHeaderConfig {
+                            name: format!("  {forbidden}  "),
+                            scheme: String::new(),
+                        }]
+                    },
+                    require: false,
+                    provider_hints: if provider_hint {
+                        vec![ProviderHintConfig {
+                            provider: "custom".into(),
+                            header: format!("  {forbidden}  "),
+                            scheme: String::new(),
+                            value_prefix: String::new(),
+                            also_header: None,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    native_key_policy: None,
+                };
+                assert!(
+                    cfg.validate().is_err(),
+                    "{forbidden} must not be a primary credential carrier"
+                );
+            }
         }
     }
 

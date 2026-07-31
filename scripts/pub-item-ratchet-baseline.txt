@@ -4,6 +4,6 @@
 # Enforced by scripts/check-pub-item-ratchet.sh. This number must never
 # go up. Lower it whenever a cleanup lands; the script tells you to.
 #
-# Measured on WOR-2065, 2026-07-30, after the sbproxy-security and
-# sbproxy-cache sweep.
-208
+# Measured on WOR-1941, 2026-07-30, after inbound key validation gained its
+# production config-compile consumer.
+207

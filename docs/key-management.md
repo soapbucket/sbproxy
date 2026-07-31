@@ -130,6 +130,15 @@ is Anthropic, `sk-or-` is OpenRouter, a bare `sk-` bearer is OpenAI,
 `x-goog-api-key` is Gemini, `api-key` is Azure), and are ordered: the first
 match wins, so specific prefixes belong before loose ones.
 
+Primary credential carriers are security-sensitive protocol fields, so SBproxy
+validates them even when `key_management.enabled` is currently `false`.
+Carriers cannot reuse hop-by-hop, framing, WebSocket, tracing, signature,
+correlation, access-log identity, or capture-envelope headers. This includes
+`x-sb-user-id`, the session headers, and the `x-sb-property-*` namespace.
+`provider_hints[].also_header` is match metadata rather than a credential
+carrier, so it may still name protocol metadata such as a provider version
+header.
+
 Recognized native credentials require an explicit
 `inbound.native_key_policy.allowed_providers` allowlist. If the policy is
 absent or the recognized provider is not listed, SBproxy returns 403 before

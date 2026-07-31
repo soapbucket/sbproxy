@@ -108,15 +108,9 @@ fn build_context(
 ) -> serde_json::Value {
     use serde_json::{json, Value};
     let req = session.req_header();
-    let mut headers = serde_json::Map::new();
-    for (name, value) in req.headers.iter() {
-        if let Ok(v) = value.to_str() {
-            headers.insert(
-                name.as_str().to_ascii_lowercase(),
-                Value::String(v.to_string()),
-            );
-        }
-    }
+    let headers = build_header_context(&req.headers, |name| {
+        ctx.pipeline.is_credential_carrier(name)
+    });
     let query = req.uri.query().unwrap_or("");
     let attribution: serde_json::Map<String, Value> = ctx
         .attribution_tags
@@ -140,6 +134,23 @@ fn build_context(
         "client_ip": ctx.client_ip.map(|ip| ip.to_string()).unwrap_or_default(),
         "attribution": attribution,
     })
+}
+
+fn build_header_context(
+    headers: &http::HeaderMap,
+    is_credential_carrier: impl Fn(&str) -> bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut captured = serde_json::Map::new();
+    for (name, value) in headers {
+        let canonical = name.as_str().to_ascii_lowercase();
+        if is_credential_carrier(&canonical) {
+            continue;
+        }
+        if let Ok(value) = value.to_str() {
+            captured.insert(canonical, serde_json::Value::String(value.to_string()));
+        }
+    }
+    captured
 }
 
 /// Resolve `${...}` references in a static value against the context.
@@ -383,6 +394,27 @@ mod tests {
         assert_eq!(
             eval_cel("provider + \"/\" + model", &c).unwrap(),
             "openai/gpt-4o"
+        );
+    }
+
+    #[test]
+    fn custom_log_header_context_excludes_primary_credential_carriers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-opaque-credential",
+            http::HeaderValue::from_static("opaque-caller-secret"),
+        );
+        headers.insert("x-public", http::HeaderValue::from_static("visible"));
+
+        let captured = build_header_context(&headers, |name| name == "x-opaque-credential");
+        assert!(!captured.contains_key("x-opaque-credential"));
+        assert_eq!(
+            captured.get("x-public"),
+            Some(&serde_json::Value::String("visible".to_string()))
+        );
+        assert!(
+            !format!("{captured:?}").contains("opaque-caller-secret"),
+            "custom log templates and scripts must never receive credential material"
         );
     }
 }
