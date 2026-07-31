@@ -456,11 +456,19 @@ fn native_bypass_is_safe(is_stream: bool, request_transform_selected: bool) -> b
     !is_stream && !request_transform_selected
 }
 
-fn upstream_response_is_successful_sse(status: u16, content_type: Option<&str>) -> bool {
+// A streaming request stays on the streaming relay only when the upstream
+// answered with a streaming body: SSE, or NDJSON (Ollama's framing, which
+// the usage-parser stack handles line-by-line). Anything else, JSON errors
+// and buffered JSON successes alike, takes the bounded buffered relay.
+fn upstream_response_is_successful_stream(status: u16, content_type: Option<&str>) -> bool {
     (200..300).contains(&status)
         && content_type
             .and_then(|value| value.split(';').next())
-            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
+            .map(str::trim)
+            .is_some_and(|media_type| {
+                media_type.eq_ignore_ascii_case("text/event-stream")
+                    || media_type.eq_ignore_ascii_case("application/x-ndjson")
+            })
 }
 
 const DEFAULT_BUFFERED_AI_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -875,7 +883,7 @@ pub(super) async fn realtime_budget_gate(
     ctx: &mut RequestContext,
     model: Option<&str>,
 ) -> std::result::Result<RealtimeAdmission, (u16, String)> {
-    let key_plane = crate::key_plane::current_key_plane();
+    let key_plane = pipeline.key_plane().cloned();
     let prepared =
         prepare_ai_request_identity(session, config, pipeline, ctx, key_plane.as_deref()).await?;
 
@@ -1867,6 +1875,9 @@ fn principal_for_resolved_virtual_key(
 fn mark_guardrail_block(ctx: &mut RequestContext, category: String) {
     sbproxy_ai::ai_metrics::record_guardrail_block(&category);
     ctx.ai_outcome = Some("guardrail_block".to_string());
+    // WOR-2094: the ring row explains the block alongside the badge.
+    ctx.record_policy_decision("guardrail", "deny");
+    ctx.deny_reason = Some(format!("guardrail: {category}"));
     ctx.ai_guardrail_category = Some(category);
     ctx.ai_guardrail_action = Some("block".to_string());
 }
@@ -2277,7 +2288,16 @@ pub(super) async fn handle_ai_proxy(
     // guard is `!Send` and `request_filter` is an async function that
     // must be `Send`. The surface field is carried by the explicit
     // `debug!` above and by the per-surface metrics below.
-    let ai_span = sbproxy_ai::tracing_spans::ai_request_span(surface_label, &method_str);
+    // WOR-2085: the surface label identifies the endpoint for metrics;
+    // the OTel GenAI operation name is a separate, coarser vocabulary
+    // (`chat` / `embeddings` / `image_generation` / `audio`) that trace
+    // backends filter on. Stamping the label into the operation slot
+    // misreported every chat and audio request.
+    let ai_span = sbproxy_ai::tracing_spans::ai_request_span(
+        surface_label,
+        surface.operation_name(),
+        &method_str,
+    );
     // Parent the exported span on the caller's trace when the inbound
     // request carried a genuine traceparent/B3 header (request_phase.rs
     // populated both trace_ctx and the is_remote flag). Explicit and
@@ -2294,6 +2314,11 @@ pub(super) async fn handle_ai_proxy(
     // already populated `ctx.tenant_id` (defaulting to `__default__`
     // when no tenant is configured) by the time dispatch runs.
     ai_span.record("sbproxy.tenant_id", ctx.tenant_id.as_str());
+    // WOR-2093: session linkage on the exported span, so key, session,
+    // and trace join in the collector.
+    if let Some(session_id) = ctx.session_id.as_ref() {
+        ai_span.record("sbproxy.session_id", session_id.to_string().as_str());
+    }
 
     // Increment the per-surface request counter and start the latency
     // clock. The latency guard records elapsed time at function exit
@@ -2306,7 +2331,7 @@ pub(super) async fn handle_ai_proxy(
     // Resolve authentication and its immutable effective policy before any AI
     // dispatch branch can return or contact a provider/cache. The key plane and
     // policy snapshots stay pinned for the rest of this request.
-    let key_plane = crate::key_plane::current_key_plane();
+    let key_plane = pipeline.key_plane().cloned();
     let prepared_identity =
         match prepare_ai_request_identity(session, config, pipeline, ctx, key_plane.as_deref())
             .await
@@ -2320,6 +2345,10 @@ pub(super) async fn handle_ai_proxy(
     let resolved_request_vk = prepared_identity.resolved_request_key;
     let peer_policy_revision = prepared_identity.policy_revision;
     ai_span.record("sbproxy.policy_version", peer_policy_revision.as_str());
+    // WOR-2094: mirror the span's policy revision onto the request
+    // context so the admin ring row names the key-policy generation
+    // that governed this request.
+    ctx.ai_policy_version = Some(peer_policy_revision.clone());
     let router = config.router();
     if ctx.inbound_key_mode == crate::context::InboundKeyMode::Native
         && router.cascade_config().is_some()
@@ -2350,14 +2379,9 @@ pub(super) async fn handle_ai_proxy(
         return Ok(());
     }
     let effective_policy = ctx.effective_key_policy.as_ref();
-    let trace_key_id = effective_policy
-        .map(|policy| policy.key_id.as_str())
-        .filter(|key_id| !key_id.is_empty())
-        .or_else(|| {
-            let key_id = ctx.principal.api_key_id();
-            (!key_id.is_empty()).then_some(key_id)
-        });
-    if let Some(key_id) = trace_key_id {
+    // WOR-2093: the canonical accountability id, so the span agrees with
+    // the access log, the admin ring, and the inbound-key metric.
+    if let Some(key_id) = ctx.accountable_key_id() {
         ai_span.record("sbproxy.key_id", key_id);
     }
     let trace_project = effective_policy
@@ -4187,6 +4211,7 @@ pub(super) async fn handle_ai_proxy(
                             ctx.native_key_provider.clone(),
                             ctx.inbound_key_mode.as_str(),
                         )
+                        .with_api_key_id(ctx.accountable_key_id())
                         .emit();
                         sbproxy_observe::metrics::record_governance_fail_open(&key_id);
                         // No lease: there is no reservation to settle or
@@ -4323,7 +4348,7 @@ pub(super) async fn handle_ai_proxy(
                 origin: hostname.to_string(),
                 model_id,
                 prompt: extracted_prompt.clone(),
-                headers: snapshot_request_headers(session),
+                headers: snapshot_request_headers(session, pipeline),
             };
             if let Some(verdict) = hook.classify_prompt(&classify_req).await {
                 debug!(
@@ -4916,7 +4941,7 @@ pub(super) async fn handle_ai_proxy(
                     origin: hostname.to_string(),
                     model_id: model_id.clone(),
                     prompt: extracted_prompt.clone(),
-                    request_headers: snapshot_request_headers(session),
+                    request_headers: snapshot_request_headers(session, pipeline),
                     request_body: body_bytes.clone(),
                     method: method.as_str().to_string(),
                     path: path.clone(),
@@ -6652,7 +6677,10 @@ pub(super) async fn handle_ai_proxy(
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok());
-            if !upstream_response_is_successful_sse(resp.status().as_u16(), response_content_type) {
+            if !upstream_response_is_successful_stream(
+                resp.status().as_u16(),
+                response_content_type,
+            ) {
                 // A provider may reject a streaming request with an ordinary
                 // JSON error, or may return a buffered JSON success. Both use
                 // the normal bounded relay, including idempotency capture.
@@ -6703,9 +6731,9 @@ pub(super) async fn handle_ai_proxy(
                 )
                 .await;
             }
-            // SSE streaming with idempotency engaged: drop the capture
+            // Streaming with idempotency engaged: drop the capture
             // (releases the per-origin pool permit) and abandon caching only
-            // after the response has been confirmed as successful SSE.
+            // after the response has been confirmed as a successful stream.
             if idem_capture.take().is_some() {
                 debug!(
                     "AI proxy: idempotency miss on streaming request; abandoning cache record (SSE framing-aware capture is out of scope for v1)"
@@ -7828,6 +7856,7 @@ pub(super) async fn relay_ai_response_with_cache(
             if let Some(ctx) = ctx.as_mut() {
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
+                ctx.ai_tokens_cached = (cached_input > 0).then_some(cached_input);
                 let project = ctx.principal.attrs.project.as_deref().unwrap_or("");
                 let user = ctx.principal.attrs.user.as_deref().unwrap_or("");
                 if ctx.principal.attrs.tags.is_empty() {
@@ -7969,6 +7998,7 @@ pub(super) async fn relay_ai_response_with_cache(
             if prompt_tokens != 0 || completion_tokens != 0 {
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
+                ctx.ai_tokens_cached = (cached_input > 0).then_some(cached_input);
                 let usage = sbproxy_ai::budget::AiUsage::Tokens {
                     input: prompt_tokens,
                     output: completion_tokens,
@@ -13028,7 +13058,7 @@ mod compression_selection_tests {
         ai_policy_input_tokens_est, bind_compression_selection, buffered_ai_response_body_limit,
         compression_header_value, compression_selection_bypasses_cache,
         compression_selection_outcome, native_bypass_body_changed, native_bypass_is_safe,
-        resolve_compression_selection_intent, upstream_response_is_successful_sse,
+        resolve_compression_selection_intent, upstream_response_is_successful_stream,
         CompressionSelectionError, CompressionSelectionSource, ResolvedRequestKey,
     };
     use http::{HeaderMap, HeaderValue};
@@ -13204,20 +13234,30 @@ mod compression_selection_tests {
     }
 
     #[test]
-    fn only_successful_event_stream_responses_enter_sse_relay() {
-        assert!(upstream_response_is_successful_sse(
+    fn only_successful_streaming_responses_enter_stream_relay() {
+        assert!(upstream_response_is_successful_stream(
             200,
             Some("text/event-stream; charset=utf-8")
         ));
-        assert!(!upstream_response_is_successful_sse(
+        // Ollama streams NDJSON rather than SSE; it must stay on the
+        // streaming relay or its usage parser never sees the body.
+        assert!(upstream_response_is_successful_stream(
+            200,
+            Some("application/x-ndjson")
+        ));
+        assert!(!upstream_response_is_successful_stream(
             400,
             Some("text/event-stream")
         ));
-        assert!(!upstream_response_is_successful_sse(
+        assert!(!upstream_response_is_successful_stream(
+            400,
+            Some("application/x-ndjson")
+        ));
+        assert!(!upstream_response_is_successful_stream(
             200,
             Some("application/json")
         ));
-        assert!(!upstream_response_is_successful_sse(200, None));
+        assert!(!upstream_response_is_successful_stream(200, None));
     }
 
     #[test]

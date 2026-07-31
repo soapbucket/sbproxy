@@ -296,6 +296,8 @@ pub(super) fn capture_headers_for_log(
     max_value_bytes: usize,
     redact_pii: bool,
     redact_pii_rules: &[String],
+    is_sensitive: impl Fn(&str) -> bool,
+    is_credential_carrier: impl Fn(&str) -> bool,
 ) -> std::collections::BTreeMap<String, String> {
     if allowlist.is_empty() {
         return std::collections::BTreeMap::new();
@@ -305,14 +307,20 @@ pub(super) fn capture_headers_for_log(
             let redactor = default_pii_redactor();
             sbproxy_observe::capture::capture_headers(
                 headers,
-                |name| allowlist.matches(name),
+                |name| {
+                    !is_credential_carrier(name)
+                        && allowlist.matches_with_sensitive(name, &is_sensitive)
+                },
                 max_value_bytes,
                 Some(|v: &str| redactor.redact(v).into_owned()),
             )
         } else if let Some(redactor) = build_scoped_pii_redactor(redact_pii_rules) {
             sbproxy_observe::capture::capture_headers(
                 headers,
-                |name| allowlist.matches(name),
+                |name| {
+                    !is_credential_carrier(name)
+                        && allowlist.matches_with_sensitive(name, &is_sensitive)
+                },
                 max_value_bytes,
                 Some(|v: &str| redactor.redact(v).into_owned()),
             )
@@ -320,7 +328,10 @@ pub(super) fn capture_headers_for_log(
             // No matching rules: fall through to no-redaction.
             sbproxy_observe::capture::capture_headers(
                 headers,
-                |name| allowlist.matches(name),
+                |name| {
+                    !is_credential_carrier(name)
+                        && allowlist.matches_with_sensitive(name, &is_sensitive)
+                },
                 max_value_bytes,
                 None::<fn(&str) -> String>,
             )
@@ -328,7 +339,10 @@ pub(super) fn capture_headers_for_log(
     } else {
         sbproxy_observe::capture::capture_headers(
             headers,
-            |name| allowlist.matches(name),
+            |name| {
+                !is_credential_carrier(name)
+                    && allowlist.matches_with_sensitive(name, &is_sensitive)
+            },
             max_value_bytes,
             None::<fn(&str) -> String>,
         )
@@ -355,7 +369,8 @@ pub(super) fn log_capture_header_warnings(cfg: &sbproxy_config::AccessLogConfig)
             tracing::warn!(
                 header = %header,
                 "access_log.capture_headers.request includes a sensitive header by exact match; \
-                 values will be captured (redact_secrets still strips known token shapes)",
+                 configured primary credential carriers remain excluded; other exact sensitive \
+                 values are captured (redact_secrets still strips known token shapes)",
             );
         }
     }
@@ -370,7 +385,8 @@ pub(super) fn log_capture_header_warnings(cfg: &sbproxy_config::AccessLogConfig)
             tracing::warn!(
                 header = %header,
                 "access_log.capture_headers.response includes a sensitive header by exact match; \
-                 values will be captured (redact_secrets still strips known token shapes)",
+                 configured primary credential carriers remain excluded; other exact sensitive \
+                 values are captured (redact_secrets still strips known token shapes)",
             );
         }
     }
@@ -387,7 +403,7 @@ pub(super) fn emit_access_log(
     hostname: &str,
     duration_secs: f64,
 ) {
-    let pipeline = reload::current_pipeline();
+    let pipeline = &ctx.pipeline;
     let Some(cfg) = pipeline.config.access_log.as_ref() else {
         return;
     };
@@ -463,13 +479,11 @@ pub(super) fn emit_access_log(
     } else {
         Some(auth_type.clone().unwrap_or_else(|| "none".to_string()))
     };
-    // WOR-1498: the credential (API key) that injected the policy, for
-    // the log-based per-credential reconciliation. Empty string means
-    // un-credentialed; record it as absent rather than a blank column.
-    let api_key_id = match ctx.principal.api_key_id() {
-        "" => None,
-        id => Some(id.to_string()),
-    };
+    // WOR-2093: the canonical accountability id, shared with the ring
+    // entry, the inbound-key metric, and spans so one request never
+    // reports different key ids on different surfaces. Absent rather
+    // than a blank column for un-credentialed traffic.
+    let api_key_id = ctx.accountable_key_id().map(str::to_string);
     let workspace_id = ctx
         .origin_idx
         .and_then(|idx| pipeline.config.origins.get(idx))
@@ -525,6 +539,8 @@ pub(super) fn emit_access_log(
                 cfg.capture_headers.max_value_bytes,
                 cfg.capture_headers.redact_pii,
                 &cfg.capture_headers.redact_pii_rules,
+                |name| pipeline.is_sensitive_header(name),
+                |name| pipeline.is_credential_carrier(name),
             );
             let resp_headers = match session.response_written() {
                 Some(written) => capture_headers_for_log(
@@ -533,6 +549,8 @@ pub(super) fn emit_access_log(
                     cfg.capture_headers.max_value_bytes,
                     cfg.capture_headers.redact_pii,
                     &cfg.capture_headers.redact_pii_rules,
+                    |name| pipeline.is_sensitive_header(name),
+                    |name| pipeline.is_credential_carrier(name),
                 ),
                 None => std::collections::BTreeMap::new(),
             };
@@ -1235,7 +1253,50 @@ mod outcome_tests {
 
 #[cfg(test)]
 mod capture_tests {
-    use super::capture_headers_for_log;
+    use super::{capture_headers_for_log, log_capture_header_warnings};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLogGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("warning capture")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogWriter {
+        type Writer = SharedLogGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogGuard(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_header_warnings(cfg: &sbproxy_config::AccessLogConfig) -> String {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(SharedLogWriter(Arc::clone(&captured)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_capture_header_warnings(cfg);
+        });
+        let bytes = captured.lock().expect("warning capture").clone();
+        String::from_utf8(bytes).expect("warning output is UTF-8")
+    }
 
     const DPOP_PROOF: &str = concat!(
         "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2",
@@ -1257,7 +1318,15 @@ mod capture_tests {
         for pattern in ["*", "d*", "dpop"] {
             let (allowlist, _) =
                 sbproxy_config::CompiledHeaderAllowlist::compile(&[pattern.to_string()]);
-            let captured = capture_headers_for_log(&headers, &allowlist, 4096, false, &[]);
+            let captured = capture_headers_for_log(
+                &headers,
+                &allowlist,
+                4096,
+                false,
+                &[],
+                sbproxy_config::types::is_sensitive_header,
+                |_| false,
+            );
             let line = sbproxy_observe::AccessLogEntry::builder()
                 .request_headers(captured)
                 .build()
@@ -1277,5 +1346,50 @@ mod capture_tests {
                 "capture pattern {pattern:?} emitted a compact DPoP proof: {line}"
             );
         }
+    }
+
+    #[test]
+    fn exact_capture_cannot_override_a_primary_credential_carrier() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-opaque-credential",
+            http::HeaderValue::from_static("opaque-caller-secret"),
+        );
+        let (allowlist, _) =
+            sbproxy_config::CompiledHeaderAllowlist::compile(&["x-opaque-credential".to_string()]);
+        let captured = capture_headers_for_log(
+            &headers,
+            &allowlist,
+            4096,
+            false,
+            &[],
+            |_| false,
+            |name| name == "x-opaque-credential",
+        );
+        assert!(
+            captured.is_empty(),
+            "credential carriers must stay out of access logs even when named exactly"
+        );
+    }
+
+    #[test]
+    fn exact_sensitive_capture_warning_does_not_promise_carrier_capture() {
+        let mut cfg = sbproxy_config::AccessLogConfig::default();
+        cfg.capture_headers.request = vec!["x-sb-api".to_string()];
+        cfg.capture_headers.response = vec!["x-api-key".to_string()];
+
+        let warning = capture_header_warnings(&cfg);
+
+        assert_eq!(
+            warning
+                .matches("configured primary credential carriers remain excluded")
+                .count(),
+            2,
+            "request and response warnings must explain the hard carrier exclusion: {warning}"
+        );
+        assert!(
+            !warning.contains("values will be captured"),
+            "warning must not promise that a configured carrier is captured: {warning}"
+        );
     }
 }

@@ -224,7 +224,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_mtls_handshake_total` | Counter | `stable` | `beta` | `result` | mTLS client-certificate verification outcomes. |
 | `sbproxy_object_authz_violations_total` | Counter | `stable` | `beta` | `origin`, `kind` | Object/function-level authorization violations, by kind (bola, bfla, enumeration). |
 | `sbproxy_ocsp_fetch_total` | Counter | `stable` | `beta` | `result` | OCSP fetch attempts, by outcome. |
-| `sbproxy_ocsp_staple_age_seconds` | Gauge | `stable` | `beta` | `host` | Age of the cached OCSP staple for the host, in seconds. |
+| `sbproxy_ocsp_staple_age_seconds` | Gauge | `stable` | `beta` | `host` | Age of the cached OCSP staple for the host, in seconds. Published once a minute by the refresh task; absent until the first successful fetch, so never-stapled is distinguishable from stale. |
 | `sbproxy_operator_leader_is_leader` | Gauge | `stable` | `beta` | none | 1 when this operator replica currently holds the leader lease. |
 | `sbproxy_operator_leader_transitions_total` | Counter | `stable` | `beta` | `result` | Leader-election lifecycle events on this replica. |
 | `sbproxy_operator_reconcile_duration_seconds` | Histogram | `stable` | `beta` | `kind` | Operator reconcile duration, by CRD kind. |

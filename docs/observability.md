@@ -878,7 +878,8 @@ Then send one chat request. A healthy LLM-native backend shows a trace shaped li
 trace: 9ff0a9a1c66e4c41ad3f2a8515d9d025
 span: ai.request
 attributes:
-  gen_ai.operation.name = chat_completions
+  gen_ai.operation.name = chat
+  sbproxy.ai.surface = chat_completions
   gen_ai.system = openai
   gen_ai.request.model = gpt-4o-mini
   gen_ai.response.model = gpt-4o-mini-2024-07-18
@@ -900,6 +901,8 @@ events:
   gen_ai.user.message
   gen_ai.assistant.message
 ```
+
+`gen_ai.operation.name` carries the OTel GenAI operation vocabulary, derived from the classified surface: `chat` (chat completions, Anthropic Messages, OpenAI Responses, realtime), `embeddings`, `image_generation` (generations, edits, variations), and `audio` (transcription, translation, speech). Control-plane surfaces such as `models` or `files` are not generation operations and pass their surface label through unchanged. The finer-grained endpoint identity always rides on `sbproxy.ai.surface`.
 
 On a blocked or failed generation, `otel.status_code = ERROR` and `error.type` is one of `guardrail_blocked`, `rate_limited`, `content_filter`, `budget_exceeded`, `upstream_5xx`, or `timeout`; generic dispatch failures use `provider_error`. Phoenix, Langfuse, Datadog, Honeycomb, Jaeger, and Tempo all preserve those attributes. The difference is presentation: Phoenix and Langfuse render a generation view, while the generic trace backends expose the same fields as searchable attributes.
 

@@ -937,6 +937,10 @@ pub struct RequestContext {
     pub ai_prompt_fingerprint: Option<String>,
     /// Completion / output tokens reported by the provider response.
     pub ai_tokens_out: Option<u64>,
+    /// Tokens served from the upstream provider's prompt cache
+    /// (Anthropic `cache_read_input_tokens`, OpenAI `cached_tokens`).
+    /// `None` when the provider reported no cache activity.
+    pub ai_tokens_cached: Option<u64>,
     /// Rate-limiter bucket for the authenticated virtual key, set only
     /// when the key carries a tokens-per-minute cap (WOR-1833). The
     /// request-completion path uses it to charge the response's token
@@ -1059,6 +1063,17 @@ pub struct RequestContext {
     pub native_key_provider: Option<String>,
     /// Secret-free inbound key classification for metrics and audit.
     pub inbound_key_mode: InboundKeyMode,
+    /// Governed key-policy revision applied to this request, in the
+    /// `r{rev}:{digest}` / `c:{rev}:{digest}` vocabulary the
+    /// `sbproxy.policy_version` span attribute uses. `None` when no
+    /// key policy resolved.
+    pub ai_policy_version: Option<String>,
+    /// Bounded, ordered `policy_type:verdict` pairs recorded as each
+    /// enforcer decides (WOR-2094). Explains why the gateway acted.
+    pub policy_decisions: Vec<String>,
+    /// Machine-readable reason from the policy, guardrail, or auth
+    /// layer that denied this request, when one did (WOR-2094).
+    pub deny_reason: Option<String>,
     /// Accepted ingress governance reservation owned by this request.
     ///
     /// Successful response accounting settles it with actual usage. Paths
@@ -1311,6 +1326,55 @@ impl RequestContext {
         self.fallback_triggered || self.admin_failover_to.is_some()
     }
 
+    /// Canonical, secret-free key identity for accountability surfaces.
+    ///
+    /// One derivation shared by the access log, the admin request ring,
+    /// the inbound-key metric, audit events, and spans, so a single request
+    /// never reports different key ids on different surfaces. Precedence:
+    /// the governed effective policy's key id (set once per AI request),
+    /// then the resolved minted record, then the synthesized native policy
+    /// record, then the authenticated principal's public key id. Every
+    /// source is a public identifier; none carries the raw secret.
+    pub fn accountable_key_id(&self) -> Option<&str> {
+        if let Some(policy) = self.effective_key_policy.as_ref() {
+            if !policy.key_id.is_empty() {
+                return Some(policy.key_id.as_str());
+            }
+        }
+        if let Some(record) = self.resolved_inbound_key.as_deref() {
+            if !record.key_id.is_empty() {
+                return Some(record.key_id.as_str());
+            }
+        }
+        if let Some(record) = self.native_key_policy_record.as_deref() {
+            if !record.key_id.is_empty() {
+                return Some(record.key_id.as_str());
+            }
+        }
+        let principal_id = self.principal.api_key_id();
+        (!principal_id.is_empty()).then_some(principal_id)
+    }
+
+    /// Record one policy decision as a `policy_type:verdict` pair for
+    /// the admin ring's explainability column (WOR-2094).
+    ///
+    /// Bounded so a pathological chain cannot grow a per-request
+    /// allocation: past the cap the final slot is replaced with a
+    /// truncation marker rather than growing further.
+    pub fn record_policy_decision(&mut self, policy_type: &str, verdict: &str) {
+        const MAX_POLICY_DECISIONS: usize = 16;
+        match self.policy_decisions.len().cmp(&MAX_POLICY_DECISIONS) {
+            std::cmp::Ordering::Less => {
+                self.policy_decisions
+                    .push(format!("{policy_type}:{verdict}"));
+            }
+            std::cmp::Ordering::Equal => {
+                self.policy_decisions.push("...:truncated".to_string());
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+
     /// Create a new, empty request context.
     pub fn new() -> Self {
         Self {
@@ -1461,6 +1525,7 @@ impl RequestContext {
             ai_prompt_tokens_est: None,
             ai_prompt_fingerprint: None,
             ai_tokens_out: None,
+            ai_tokens_cached: None,
             ai_key_tpm_bucket: None,
             ai_lane_priority: None,
             managed_model_permit: None,
@@ -1485,6 +1550,9 @@ impl RequestContext {
             inbound_key_header: None,
             native_key_provider: None,
             inbound_key_mode: InboundKeyMode::None,
+            ai_policy_version: None,
+            policy_decisions: Vec::new(),
+            deny_reason: None,
             governance_lease: None,
             ai_admission: None,
             ai_realtime_session: None,
@@ -1543,6 +1611,48 @@ impl Default for RequestContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accountable_key_id_precedence_is_policy_then_record_then_principal() {
+        // WOR-2093: one derivation for every surface. The precedence
+        // mirrors specificity: the governed effective policy knows the
+        // canonical id, records are next, the principal is the fallback.
+        let mut ctx = RequestContext::new();
+        assert!(ctx.accountable_key_id().is_none(), "no key -> no id");
+
+        ctx.principal.attrs.key_id = Some("principal-id".to_string());
+        assert_eq!(ctx.accountable_key_id(), Some("principal-id"));
+
+        let now = chrono::Utc::now();
+        ctx.native_key_policy_record = Some(Box::new(sbproxy_keystore::record::KeyRecord::new(
+            "native:t:api:openai",
+            "hash",
+            now,
+        )));
+        assert_eq!(ctx.accountable_key_id(), Some("native:t:api:openai"));
+
+        ctx.resolved_inbound_key = Some(Box::new(sbproxy_keystore::record::KeyRecord::new(
+            "sbp_minted_id",
+            "hash",
+            now,
+        )));
+        assert_eq!(
+            ctx.accountable_key_id(),
+            Some("sbp_minted_id"),
+            "a minted record beats native attribution"
+        );
+    }
+
+    #[test]
+    fn policy_decisions_are_bounded_with_a_truncation_marker() {
+        let mut ctx = RequestContext::new();
+        for i in 0..40 {
+            ctx.record_policy_decision(&format!("policy_{i}"), "allow");
+        }
+        assert_eq!(ctx.policy_decisions.len(), 17, "16 entries + marker");
+        assert_eq!(ctx.policy_decisions.last().unwrap(), "...:truncated");
+        assert_eq!(ctx.policy_decisions[0], "policy_0:allow");
+    }
 
     #[test]
     fn new_context_has_sensible_defaults() {

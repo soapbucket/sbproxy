@@ -1839,7 +1839,6 @@ fn usage_event_from_context(
 ) -> sbproxy_ai::usage_sink::LlmUsageEvent {
     let prompt_tokens = ctx.ai_tokens_in.unwrap_or(0);
     let completion_tokens = ctx.ai_tokens_out.unwrap_or(0);
-    let api_key_id = ctx.principal.api_key_id();
     sbproxy_ai::usage_sink::LlmUsageEvent {
         provider,
         model: ctx.ai_model.clone().unwrap_or_default(),
@@ -1855,7 +1854,9 @@ fn usage_event_from_context(
             .map(|s| s.elapsed().as_millis() as u64)
             .unwrap_or(0),
         status: ctx.response_status.unwrap_or(0),
-        key_id: (!api_key_id.is_empty()).then(|| api_key_id.to_string()),
+        // WOR-2093: the canonical accountability id, matching every
+        // other per-request surface.
+        key_id: ctx.accountable_key_id().map(str::to_string),
         tenant_id: (!ctx.tenant_id.is_empty()).then(|| ctx.tenant_id.to_string()),
         project: ctx.principal.attrs.project.clone(),
         user: ctx.principal.attrs.user.clone(),
@@ -1863,6 +1864,7 @@ fn usage_event_from_context(
         tags: ctx.principal.attrs.tags.clone(),
         metadata: ctx.principal.attrs.metadata.clone(),
         request_id: (!ctx.request_id.is_empty()).then(|| ctx.request_id.to_string()),
+        session_id: ctx.session_id.map(|id| id.to_string()),
         tag: ctx.ai_policy_sink_tag.clone(),
         priority: ctx.ai_lane_priority.map(|p| p.as_str().to_string()),
         // WOR-1906: a served (local) request still holds its deployment
@@ -2184,8 +2186,9 @@ pub(super) fn req_header_value(session: &Session, name: &str) -> Option<String> 
 /// and clone it.
 pub(super) fn snapshot_request_headers(
     session: &Session,
+    pipeline: &crate::pipeline::CompiledPipeline,
 ) -> std::collections::HashMap<String, String> {
-    snapshot_request_headers_from(session.req_header())
+    snapshot_request_headers_from(session.req_header(), pipeline)
 }
 
 /// Inner form of [`snapshot_request_headers`] that operates on a
@@ -2193,8 +2196,9 @@ pub(super) fn snapshot_request_headers(
 /// `RequestHeader` in-process without a live Pingora session.
 pub(super) fn snapshot_request_headers_from(
     req: &pingora_http::RequestHeader,
+    pipeline: &crate::pipeline::CompiledPipeline,
 ) -> std::collections::HashMap<String, String> {
-    snapshot_request_headers_from_with_sensitive(req, sbproxy_config::types::is_sensitive_header)
+    snapshot_request_headers_from_with_sensitive(req, |name| pipeline.is_sensitive_header(name))
 }
 
 /// Testable inner snapshot seam. Production passes the active config-aware

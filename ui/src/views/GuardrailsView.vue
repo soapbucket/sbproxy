@@ -34,14 +34,13 @@ const streamViolations = computed(() =>
   fam("sbproxy_ai_stream_guardrail_violations_total"),
 );
 const streamSkipped = computed(() => fam("sbproxy_ai_stream_guardrail_skipped_total"));
-const decodeFallback = computed(() =>
-  fam("sbproxy_ai_stream_guardrail_decode_fallback_total"),
-);
 const poisoningFindings = computed(() =>
   fam("sbproxy_ai_context_poisoning_findings_total"),
 );
-const poisoningBlocked = computed(() =>
-  fam("sbproxy_ai_context_poisoning_blocked_total"),
+// WOR-2095: blocked poisoning findings are the `action="block"` slice of
+// the findings family; the separate *_blocked_total name never existed.
+const poisoningBlockCount = computed(() =>
+  sumSamples(poisoningFindings.value, { action: "block" }),
 );
 const wafBlocks = computed(() => fam("sbproxy_waf_persistent_blocks_total"));
 const framingBlocks = computed(() => fam("sbproxy_http_framing_blocks_total"));
@@ -57,7 +56,7 @@ const totalBlocks = computed(
   () =>
     sumSamples(guardrailBlocks.value) +
     sumSamples(streamViolations.value) +
-    sumSamples(poisoningBlocked.value),
+    poisoningBlockCount.value,
 );
 const totalWafPlane = computed(
   () =>
@@ -128,9 +127,8 @@ const hasAnySignal = computed(
         <div v-if="streamByGuardrail.length">
           <h3>Streaming guardrails</h3>
           <MiniBars :items="streamByGuardrail" :format="formatNumber" />
-          <p class="hint" v-if="sumSamples(streamSkipped) > 0 || sumSamples(decodeFallback) > 0">
-            {{ formatNumber(sumSamples(streamSkipped)) }} evaluations skipped,
-            {{ formatNumber(sumSamples(decodeFallback)) }} decode fallbacks.
+          <p class="hint" v-if="sumSamples(streamSkipped) > 0">
+            {{ formatNumber(sumSamples(streamSkipped)) }} evaluations skipped.
           </p>
         </div>
         <div v-if="poisoningByRule.length">

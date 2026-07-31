@@ -1600,14 +1600,14 @@ async fn run_capability_announcer() {
 ///
 /// This is deliberately not part of `start_cluster_metrics`. That function
 /// runs from `reconcile_process_cluster`, which `server::lifecycle` calls
-/// *before* `key_plane::init_key_plane` installs the approximate store, on
+/// *before* lifecycle activates the prepared approximate store, on
 /// both the boot path (`server::lifecycle::run`) and the config-reload path
 /// (`server::lifecycle::reload_from_config_yaml`). A governance check made
 /// inside `start_cluster_metrics` would always observe `current_key_plane()`
 /// as not-yet-updated for this cycle and never spawn. Instead,
 /// `server::lifecycle` calls this function itself, immediately after
-/// `init_key_plane` returns on both paths, once both the process cluster
-/// handle and the key plane are guaranteed installed.
+/// key-plane activation on both paths, once both the process cluster handle and
+/// the key plane are guaranteed installed.
 ///
 /// Idempotent: guarded by its own atomic, separate from
 /// `start_cluster_metrics`'s `STARTED` gate, so it does not consume that

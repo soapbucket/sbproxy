@@ -1,10 +1,10 @@
-//! WOR-1546: assembly and process-global handle for the dynamic key plane.
+//! WOR-1546: assembly and publication for the dynamic key plane.
 //!
 //! The `key_management:` config block is lowered here into a live `KeyPlane`:
 //! a `KeyCrypto` handle (pepper + master), a `KeyStore` backend, and a
-//! fail-closed `TtlCache` in front of it. The plane is held in a global
-//! `ArcSwapOption` (like the rate-limit registry and the compiled pipeline) so
-//! the auth dispatch and the admin API resolve against one shared instance.
+//! fail-closed `TtlCache` in front of it. Each compiled pipeline owns its exact
+//! plane generation for request processing. A global `ArcSwapOption` follows
+//! the published generation for admin and cluster control-plane consumers.
 //!
 //! Async work (seeding the config records, the Redis invalidation subscriber)
 //! runs on a dedicated, process-lifetime runtime so it is independent of the
@@ -36,6 +36,7 @@ use sbproxy_keystore::{EmbeddedKeyStore, KeyStore, TtlCache, TtlCacheConfig};
 pub struct KeyPlane {
     crypto: KeyCrypto,
     cache: Arc<TtlCache>,
+    resolved_credentials: ResolvedCredentialCache,
     failure_mode_allow: bool,
     allow_api_override: bool,
     oidc_claim_field: Option<String>,
@@ -93,6 +94,7 @@ impl KeyPlane {
         Self {
             crypto,
             cache,
+            resolved_credentials: parking_lot::Mutex::new(std::collections::HashMap::new()),
             failure_mode_allow,
             allow_api_override,
             oidc_claim_field,
@@ -217,30 +219,40 @@ impl std::fmt::Display for CredentialResolveError {
 /// How long a resolved credential secret stays cached.
 ///
 /// Vault resolution is a network round-trip and must not run per request.
-/// Dropped by [`invalidate_resolved_credential`] on any admin mutation, so a
-/// rotation takes effect on the same signal that drops the record itself.
+/// Dropped by [`KeyPlane::invalidate_resolved_credential`] on any admin
+/// mutation, so a rotation takes effect on the same signal that drops the
+/// record itself.
 const RESOLVED_CREDENTIAL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 type ResolvedCredentialCache =
     parking_lot::Mutex<std::collections::HashMap<String, (std::time::Instant, ResolvedCredential)>>;
 
-fn resolved_credential_cache() -> &'static ResolvedCredentialCache {
-    static CACHE: OnceLock<ResolvedCredentialCache> = OnceLock::new();
-    CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
-}
-
 /// Drop any cached resolved secret for `id`. Called from the admin mutation
 /// path alongside the record-cache invalidation.
 pub fn invalidate_resolved_credential(id: &str) {
-    resolved_credential_cache().lock().remove(id);
+    if let Some(plane) = current_key_plane() {
+        plane.invalidate_resolved_credential(id);
+    }
 }
 
 /// Drop every cached resolved secret.
 pub fn invalidate_all_resolved_credentials() {
-    resolved_credential_cache().lock().clear();
+    if let Some(plane) = current_key_plane() {
+        plane.invalidate_all_resolved_credentials();
+    }
 }
 
 impl KeyPlane {
+    /// Drop one resolved upstream secret from this plane generation.
+    pub(crate) fn invalidate_resolved_credential(&self, id: &str) {
+        self.resolved_credentials.lock().remove(id);
+    }
+
+    /// Drop every resolved upstream secret from this plane generation.
+    pub(crate) fn invalidate_all_resolved_credentials(&self) {
+        self.resolved_credentials.lock().clear();
+    }
+
     /// Resolve a key's bound credential into the header the upstream carries.
     ///
     /// `tenant_id` is the owning tenant of the key that names this credential.
@@ -258,7 +270,7 @@ impl KeyPlane {
         tenant_id: Option<&str>,
     ) -> std::result::Result<ResolvedCredential, CredentialResolveError> {
         if let Some(hit) = {
-            let cache = resolved_credential_cache().lock();
+            let cache = self.resolved_credentials.lock();
             cache.get(id).and_then(|(at, value)| {
                 (at.elapsed() < RESOLVED_CREDENTIAL_TTL).then(|| value.clone())
             })
@@ -315,7 +327,7 @@ impl KeyPlane {
             header: record.header.trim().to_ascii_lowercase(),
             value: format!("{}{}", record.scheme, secret),
         };
-        resolved_credential_cache().lock().insert(
+        self.resolved_credentials.lock().insert(
             id.to_string(),
             (std::time::Instant::now(), resolved.clone()),
         );
@@ -800,36 +812,17 @@ async fn seed_records(
     Ok(())
 }
 
-/// Build, seed, and install the key plane from config. Idempotent across
-/// reloads: re-seeds config records and replaces the installed plane. A no-op
-/// when the block is disabled, in which case any previously installed plane
-/// is removed.
-///
-/// Synchronous: runs async seeding on the dedicated key runtime and returns once
-/// the seed is applied, so seeded keys are usable as soon as the server accepts
-/// traffic.
-pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
-    if !cfg.enabled {
-        uninstall_key_plane();
-        return Ok(());
-    }
+/// Build a candidate key plane without changing process-global or store state.
+pub(crate) fn prepare_key_plane(
+    cfg: Option<&KeyManagementConfig>,
+) -> Result<Option<Arc<KeyPlane>>> {
+    let Some(cfg) = cfg.filter(|cfg| cfg.enabled) else {
+        return Ok(None);
+    };
     let (governance_store, approximate_store) = build_governance_store(&cfg.governance)?;
     let crypto = build_crypto(cfg)?;
     let store = build_store(cfg)?;
     let cache = build_cache(cfg, store.clone());
-
-    let now = Utc::now();
-    // Seed on a fresh thread driving the dedicated key runtime. A fresh thread
-    // is never already inside a runtime, so `block_on` is safe whether
-    // `init_key_plane` is called at boot (no runtime) or on reload (which may
-    // run on a tokio worker, where a nested `block_on` would otherwise panic).
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| key_runtime().block_on(seed_records(&store, &crypto, cfg, now)))
-            .join()
-            .expect("key-plane seed thread panicked")
-    })
-    .context("seed key_management records")?;
 
     let plane = Arc::new(
         KeyPlane::from_parts_with_governance(
@@ -844,7 +837,46 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
         )
         .with_inbound(cfg.inbound.clone()),
     );
-    install_key_plane(plane);
+    Ok(Some(plane))
+}
+
+/// Apply declarative seeds after every other candidate preflight succeeds.
+///
+/// Keeping this separate from [`prepare_key_plane`] prevents a later model or
+/// pipeline preflight failure from exposing candidate records through
+/// generation A's shared store. The generic `KeyStore` contract has no
+/// cross-backend batch transaction, so reload treats an error here as a
+/// degraded generation B after all reject-only work has passed; boot still
+/// returns the error.
+pub(crate) fn seed_prepared_key_plane(
+    plane: Option<&Arc<KeyPlane>>,
+    cfg: Option<&KeyManagementConfig>,
+) -> Result<()> {
+    let Some((plane, cfg)) = plane.zip(cfg.filter(|cfg| cfg.enabled)) else {
+        return Ok(());
+    };
+    let store = plane.cache().store().clone();
+    let now = Utc::now();
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| key_runtime().block_on(seed_records(&store, plane.crypto(), cfg, now)))
+            .join()
+            .expect("key-plane seed thread panicked")
+    })
+    .context("seed key_management records")
+}
+
+/// Install a prepared key plane as the process-global admin and cluster view.
+///
+/// Request paths do not read this slot. They use the plane pinned to their
+/// [`crate::pipeline::CompiledPipeline`] generation, so this back-to-back
+/// control-plane swap cannot change an in-flight request.
+pub(crate) fn activate_key_plane(plane: Option<Arc<KeyPlane>>, cfg: Option<&KeyManagementConfig>) {
+    plane_slot().store(plane.clone());
+
+    let Some((plane, cfg)) = plane.zip(cfg.filter(|cfg| cfg.enabled)) else {
+        return;
+    };
 
     // Cross-replica invalidation: subscribe to the Redis channel so a peer's
     // mutation drops the matching local cache entry. Runs forever on the key
@@ -871,6 +903,7 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
     }
 
     if let Some(url) = subscribe_url {
+        let cache = plane.cache().clone();
         key_runtime().spawn(async move {
             loop {
                 if let Err(e) =
@@ -889,6 +922,19 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
         cache_tier = ?cfg.cache.tier,
         "dynamic key plane installed"
     );
+}
+
+/// Build, seed, and immediately install a key plane.
+///
+/// Boot and reload use the crate-internal `prepare_key_plane`,
+/// `seed_prepared_key_plane`, and `activate_key_plane` steps directly so the
+/// plane can be committed with its matching pipeline. This wrapper remains for
+/// callers and tests that intentionally manage only the process-global admin
+/// view.
+pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
+    let plane = prepare_key_plane(Some(cfg))?;
+    seed_prepared_key_plane(plane.as_ref(), Some(cfg))?;
+    activate_key_plane(plane, Some(cfg));
     Ok(())
 }
 
@@ -975,6 +1021,42 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(current_key_plane().is_none());
+    }
+
+    #[test]
+    fn candidate_preparation_does_not_seed_the_live_store_before_commit() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let mut cfg = base_cfg(&path);
+        cfg.seed.keys.push(
+            serde_json::from_value(serde_json::json!({
+                "key_id": "candidate-only",
+                "secret": "candidate-secret"
+            }))
+            .expect("seed fixture"),
+        );
+
+        let plane = prepare_key_plane(Some(&cfg))
+            .expect("prepare candidate")
+            .expect("enabled plane");
+        let store = plane.cache().store().clone();
+        assert!(
+            key_runtime()
+                .block_on(store.get_key("candidate-only"))
+                .expect("read candidate store")
+                .is_none(),
+            "candidate construction must not mutate the store before commit",
+        );
+
+        seed_prepared_key_plane(Some(&plane), Some(&cfg)).expect("seed at commit boundary");
+        assert!(
+            key_runtime()
+                .block_on(store.get_key("candidate-only"))
+                .expect("read committed store")
+                .is_some(),
+            "the explicit commit step applies declarative seeds",
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1461,12 +1543,58 @@ mod resolve_credential_secret_tests {
             "served from cache until invalidated"
         );
 
-        invalidate_resolved_credential("c6");
+        p.invalidate_resolved_credential("c6");
         p.cache().invalidate("c6").await;
         assert_eq!(
             p.resolve_credential_secret("c6", None).await.unwrap().value,
             "Bearer second",
             "invalidation drops the resolved secret, not just the record"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_credential_cache_is_isolated_per_key_plane_generation() {
+        // The same record id can legitimately resolve differently after reload.
+        invalidate_all_resolved_credentials();
+        let plane_a = plane();
+        let plane_b = plane();
+        put(
+            &plane_a,
+            credential(
+                "shared-id",
+                CredentialMaterial::Plaintext {
+                    value: "generation-a".into(),
+                },
+            ),
+        )
+        .await;
+        put(
+            &plane_b,
+            credential(
+                "shared-id",
+                CredentialMaterial::Plaintext {
+                    value: "generation-b".into(),
+                },
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            plane_a
+                .resolve_credential_secret("shared-id", None)
+                .await
+                .unwrap()
+                .value,
+            "Bearer generation-a",
+        );
+        assert_eq!(
+            plane_b
+                .resolve_credential_secret("shared-id", None)
+                .await
+                .unwrap()
+                .value,
+            "Bearer generation-b",
+            "a newer plane must not reuse a resolved secret cached by an older plane",
         );
     }
 }

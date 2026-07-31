@@ -1,4 +1,4 @@
-# E2E tests for SBproxy. Runs on tag pushes, on a nightly schedule,
+# E2E tests for SBproxy. Runs on tag pushes, on a weekly schedule,
 # and on manual dispatch. The PR-required CI lane (`ci.yml`) excludes
 # `sbproxy-e2e` because the harness spawns the proxy binary, listens
 # on real ports, and exercises the network stack; on shared GitHub
@@ -18,7 +18,7 @@ on:
   # the branch selector, so a deliberate break can prove this lane from
   # a test branch without moving main.
   schedule:
-    - cron: '30 9 * * *' # 09:30 UTC daily
+    - cron: '30 9 * * 1' # 09:30 UTC every Monday
   workflow_dispatch: {}
 
 permissions:
@@ -76,7 +76,7 @@ jobs:
         if: github.event_name == 'push'
         run: cargo test -p sbproxy-e2e --locked -- --test-threads=1
 
-      - name: e2e (nightly/manual, Redis required)
+      - name: e2e (weekly/manual, Redis required)
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         env:
           # Pin the harness to the binaries built in this job. The harness

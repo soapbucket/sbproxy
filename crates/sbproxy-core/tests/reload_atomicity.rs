@@ -16,7 +16,7 @@
 //! a time behind [`SERIAL`].
 
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Serializes the tests in this binary. The reload path is a
 /// process-wide transaction (live pipeline, provider catalog, sink
@@ -83,6 +83,33 @@ origins:
       content_type: text/plain
       body: ok
 "#
+    )
+}
+
+/// A static origin plus an embedded dynamic key plane. The explicit store
+/// path and pepper let tests distinguish two independently built generations.
+fn static_config_with_key_plane(host: &str, store_path: &Path, pepper: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: {store_path}
+    crypto:
+      pepper: {pepper}
+      master_key: test-master
+origins:
+  "{host}":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+"#,
+        store_path = store_path.display(),
     )
 }
 
@@ -249,6 +276,125 @@ origins:
     assert!(
         sbproxy_observe::sink_dispatcher::current_sink_dispatcher().is_none(),
         "a failed reload must not install the candidate's sink dispatcher",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_key_plane_build_rejects_the_reload_and_preserves_generation_a() {
+    let _serial = serial();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let config_path = temp.path().join("sb.yml");
+    let store_a = temp.path().join("keys-a.redb");
+
+    std::fs::write(
+        &config_path,
+        static_config_with_key_plane("keys-a.test", &store_a, "test-pepper-a"),
+    )
+    .expect("write generation A");
+    reload(&config_path).expect("load generation A");
+    let pipeline_revision_a = live_revision();
+    let plane_a = sbproxy_core::key_plane::current_key_plane().expect("generation A key plane");
+
+    let missing_pepper = temp.path().join("missing-pepper");
+    let store_b = temp.path().join("keys-b.redb");
+    std::fs::write(
+        &config_path,
+        static_config_with_key_plane(
+            "keys-b.test",
+            &store_b,
+            &format!("file:{}", missing_pepper.display()),
+        ),
+    )
+    .expect("write generation B");
+
+    let error = reload(&config_path).expect_err("an unbuildable key plane must reject the reload");
+    assert!(
+        format!("{error:#}").contains("missing-pepper"),
+        "failure must name the unresolved key material: {error:#}",
+    );
+    assert_eq!(
+        live_revision(),
+        pipeline_revision_a,
+        "pipeline A must remain published",
+    );
+    assert!(
+        live_hostnames().iter().any(|host| host == "keys-a.test"),
+        "generation A must keep serving",
+    );
+    assert!(
+        Arc::ptr_eq(
+            &plane_a,
+            &sbproxy_core::key_plane::current_key_plane()
+                .expect("generation A key plane remains installed"),
+        ),
+        "the failed candidate must not replace key plane A",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successful_reload_keeps_each_key_plane_pinned_to_its_pipeline_generation() {
+    let _serial = serial();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let config_path = temp.path().join("sb.yml");
+
+    std::fs::write(
+        &config_path,
+        static_config_with_key_plane(
+            "pinned-a.test",
+            &temp.path().join("pinned-a.redb"),
+            "generation-a-pepper",
+        ),
+    )
+    .expect("write generation A");
+    reload(&config_path).expect("load generation A");
+    let pipeline_a = sbproxy_core::reload::current_pipeline_full();
+    let plane_a = pipeline_a
+        .key_plane()
+        .cloned()
+        .expect("pipeline A owns key plane A");
+    let hash_a = plane_a.crypto().hash_secret("same-presented-key");
+
+    std::fs::write(
+        &config_path,
+        static_config_with_key_plane(
+            "pinned-b.test",
+            &temp.path().join("pinned-b.redb"),
+            "generation-b-pepper",
+        ),
+    )
+    .expect("write generation B");
+    reload(&config_path).expect("load generation B");
+    let pipeline_b = sbproxy_core::reload::current_pipeline_full();
+    let plane_b = pipeline_b
+        .key_plane()
+        .cloned()
+        .expect("pipeline B owns key plane B");
+
+    assert!(
+        !Arc::ptr_eq(&plane_a, &plane_b),
+        "a successful reload must build a distinct key-plane snapshot",
+    );
+    assert_eq!(
+        pipeline_a
+            .key_plane()
+            .expect("old request retains plane A")
+            .crypto()
+            .hash_secret("same-presented-key"),
+        hash_a,
+        "an in-flight generation-A request must retain generation-A crypto",
+    );
+    assert_ne!(
+        plane_b.crypto().hash_secret("same-presented-key"),
+        hash_a,
+        "generation B must use its own configured crypto",
+    );
+    assert!(
+        Arc::ptr_eq(
+            &plane_b,
+            &sbproxy_core::key_plane::current_key_plane()
+                .expect("admin view advances to generation B"),
+        ),
+        "the global admin view must follow the published generation",
     );
 }
 

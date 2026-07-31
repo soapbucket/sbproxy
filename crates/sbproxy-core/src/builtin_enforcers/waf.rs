@@ -101,6 +101,8 @@ impl PolicyEnforcer for WafEnforcer {
         let tenant = ctx.tenant_id.to_string();
         let key_provider = ctx.native_key_provider.clone();
         let key_mode = ctx.inbound_key_mode.as_str().to_string();
+        // WOR-2093: captured up front for the same `async move` reason.
+        let api_key_id = ctx.accountable_key_id().map(str::to_string);
         let block_state = policy.block_store().map(|store| {
             let kind = store.key_kind();
             let key = resolve_block_key(kind, store.cel_key(), req, ctx);
@@ -166,6 +168,7 @@ impl PolicyEnforcer for WafEnforcer {
                                     )
                                     .with_tenant_id(tenant.clone())
                                     .with_key_context(key_provider.clone(), key_mode.clone())
+                                    .with_api_key_id(api_key_id.clone())
                                     .emit();
                                 }
                                 sbproxy_modules::policy::waf::StrikeOutcome::Counted => {

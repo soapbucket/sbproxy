@@ -3236,6 +3236,14 @@ pub fn record_cert_expiry(host: &str, seconds_until_expiry: f64) {
 /// `sbproxy_ocsp_staple_age_seconds{host}`. A stale staple (over
 /// 24 hours) signals an OCSP refresh failure that has not yet
 /// produced a hard handshake error.
+///
+/// WOR-2086: driven once a minute by the stapler's age tick
+/// (`OcspStapler::publish_staple_age`), not only at fetch time. The
+/// series is absent until the first successful fetch, which is
+/// deliberate: for a deployment that expects stapling, never-fetched
+/// is worse than old, and an absent series is what lets an alert
+/// distinguish the two. `SBProxyOcspStapleStale` in
+/// `dashboards/prometheus/alerts.yml` fires past 26 hours.
 pub fn record_ocsp_staple_age(host: &str, age_seconds: f64) {
     use prometheus::{register_gauge_vec, GaugeVec};
     use std::sync::OnceLock;

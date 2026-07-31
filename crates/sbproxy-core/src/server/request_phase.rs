@@ -2399,13 +2399,13 @@ pub(super) async fn request_filter(
     // those sources before it falls back to native-key admission. Generic
     // proxy actions have no later resolver and remain fully governed here.
     let ai_action_resolves_overlapping_credentials = ai_proxy_owns_replay_paths;
-    if let Some(plane) = crate::key_plane::current_key_plane() {
+    if let Some(plane) = pipeline.key_plane() {
         let origin_label = ctx.hostname.to_string();
         // Bind the outcome before matching so the immutable borrow of
         // `session` ends here rather than spanning the arms, which need it
         // mutably to write an error response.
         let outcome =
-            resolve_inbound_key(&plane, &session.req_header().headers, raw_peer_ip, ctx).await;
+            resolve_inbound_key(plane, &session.req_header().headers, raw_peer_ip, ctx).await;
         match outcome {
             InboundKeyPhase::Resolved => {
                 ctx.inbound_key_mode = crate::context::InboundKeyMode::Minted;
@@ -2461,6 +2461,7 @@ pub(super) async fn request_filter(
                                     ctx.native_key_provider.clone(),
                                     ctx.inbound_key_mode.as_str(),
                                 )
+                                .with_api_key_id(ctx.accountable_key_id())
                                 .emit();
                                 send_error(session, 429, "rate limit exceeded for this key")
                                     .await?;
@@ -2473,6 +2474,10 @@ pub(super) async fn request_filter(
                         } => {
                             ctx.native_key_provider = Some(provider);
                             ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
+                            // WOR-2094: the ring row names the denial.
+                            ctx.record_policy_decision("native_key_policy", "deny");
+                            ctx.deny_reason =
+                                Some("native_key_policy: provider not allowed".to_string());
                             finalize_inbound_key_trust(ctx, AuthTrustOutcome::Missing);
                             sbproxy_observe::metrics::record_auth(
                                 &origin_label,
@@ -3090,6 +3095,13 @@ pub(super) async fn request_filter(
             // dashboards and SIEM rules can break down by module
             // instead of inferring from the response status.
             sbproxy_observe::metrics::record_policy(&policy_origin, policy_type, "deny");
+            // WOR-2094: mirror the denial onto the ring row's
+            // explainability columns. Enforcers that already recorded a
+            // more specific reason keep it.
+            ctx.record_policy_decision(policy_type, "deny");
+            if ctx.deny_reason.is_none() {
+                ctx.deny_reason = Some(format!("{policy_type}: {msg}"));
+            }
             // Audit-log the denial alongside the metric. Policy
             // metrics roll up to dashboards; the audit channel
             // feeds the SIEM with structured per-event records so
@@ -3109,6 +3121,7 @@ pub(super) async fn request_filter(
                 ctx.native_key_provider.clone(),
                 ctx.inbound_key_mode.as_str(),
             )
+            .with_api_key_id(ctx.accountable_key_id())
             .emit();
             if let Some(response) =
                 take_concurrent_limit_denial_response(ctx, status, &msg, policy_type)

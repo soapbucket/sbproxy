@@ -545,7 +545,11 @@ async fn inspect_content(
         content_type: "application/json",
         body: serde_json::json!({
             "record": CompressionRecordMetadata::from_record(id, backend, consistency, &record),
-            "summary": record.summary,
+            // WOR-2095: the running summary is derived from prompt
+            // content, and a summarizer can echo a secret the caller
+            // pasted. Strip known token shapes on the read path; the
+            // stored record keeps its exact bytes for the data plane.
+            "summary": sbproxy_observe::redact::redact_secrets(&record.summary),
         })
         .to_string(),
         headers: vec![

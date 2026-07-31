@@ -1337,6 +1337,26 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         );
     }
 
+    if let Some(key_management) = config_file.proxy.key_management.as_ref() {
+        key_management
+            .inbound
+            .validate()
+            .map_err(|error| anyhow::anyhow!("config compile: {error}"))?;
+
+        let correlation = &config_file.proxy.correlation_id;
+        if correlation.enabled
+            && key_management
+                .inbound
+                .is_credential_carrier(&correlation.header)
+        {
+            anyhow::bail!(
+                "config compile: proxy.correlation_id.header {:?} may not also be a primary \
+                 credential carrier because correlation IDs are logged, forwarded, and echoed",
+                correlation.header
+            );
+        }
+    }
+
     if let Some(local_path) = config_file
         .proxy
         .compression_state
@@ -2068,6 +2088,71 @@ fn transform_type_is(value: &serde_json::Value, wanted: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn compile_rejects_invalid_inbound_key_config_even_when_disabled() {
+        for carrier_yaml in [
+            "headers:\n        - name: x-sb-property-credential",
+            "headers: []\n      provider_hints:\n        - provider: custom\n          header: x-sb-user-id",
+        ] {
+            let yaml = format!(
+                "proxy:\n  key_management:\n    enabled: false\n    inbound:\n      {carrier_yaml}\n"
+            );
+            let error = compile_config(&yaml)
+                .err()
+                .expect("compile must run inbound credential validation");
+            assert!(
+                format!("{error:#}").contains("may not carry a key"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_rejects_primary_carriers_that_collide_with_correlation_ids() {
+        for (correlation_yaml, inbound_yaml) in [
+            (
+                "",
+                "headers:\n        - name: X-Request-Id\n          scheme: ''\n      provider_hints: []",
+            ),
+            (
+                "  correlation_id:\n    header: X-Custom-Correlation\n",
+                "headers: []\n      provider_hints:\n        - provider: custom\n          header: x-custom-correlation",
+            ),
+        ] {
+            let yaml = format!(
+                "proxy:\n{correlation_yaml}  key_management:\n    enabled: false\n    inbound:\n      {inbound_yaml}\n"
+            );
+            let error = compile_config(&yaml)
+                .err()
+                .expect("correlation IDs must not carry credentials");
+            let message = format!("{error:#}");
+            assert!(message.contains("correlation_id"), "{message}");
+            assert!(message.contains("credential"), "{message}");
+        }
+    }
+
+    #[test]
+    fn compile_allows_reserved_match_metadata_and_disabled_correlation() {
+        let yaml = r#"
+proxy:
+  correlation_id:
+    enabled: false
+    header: X-Custom-Correlation
+  key_management:
+    enabled: false
+    inbound:
+      headers:
+        - name: X-Custom-Correlation
+          scheme: ""
+      provider_hints:
+        - provider: custom
+          header: X-Opaque-Credential
+          also_header: X-Sb-User-Id
+"#;
+        compile_config(yaml)
+            .expect("disabled correlation and non-carrier metadata must remain valid");
+    }
 
     #[test]
     fn top_level_feature_flags_compile_into_the_runtime_snapshot() {

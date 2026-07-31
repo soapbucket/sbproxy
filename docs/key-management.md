@@ -137,6 +137,17 @@ is Anthropic, `sk-or-` is OpenRouter, a bare `sk-` bearer is OpenAI,
 `x-goog-api-key` is Gemini, `api-key` is Azure), and are ordered: the first
 match wins, so specific prefixes belong before loose ones.
 
+Primary credential carriers are security-sensitive protocol fields, so SBproxy
+validates them even when `key_management.enabled` is currently `false`.
+Carriers cannot reuse hop-by-hop, framing, WebSocket, tracing, signature,
+correlation, budget identity, A2A envelope, access-log identity, or
+capture-envelope headers. This includes `x-user-id`, `x-end-user`,
+`x-sbproxy-tag`, `x-sb-user-id`, the session headers, and the `x-a2a-*` and
+`x-sb-property-*` namespaces.
+`provider_hints[].also_header` is match metadata rather than a credential
+carrier, so it may still name protocol metadata such as a provider version
+header.
+
 Recognized native credentials require an explicit
 `inbound.native_key_policy.allowed_providers` allowlist. If the policy is
 absent or the recognized provider is not listed, SBproxy returns 403 before
@@ -204,6 +215,14 @@ secret-free tenant/origin/provider policy-bucket id. Access logs, request
 events, and security audit records carry the same `key_provider` and
 `key_mode` fields. No raw provider key is stored in those records or metric
 labels.
+
+One canonical key id spans every per-request surface: the admin request
+ring (`GET /api/requests?api_key_id=`), the access log, the metric label,
+usage events, and the `sbproxy.key_id` span attribute all report the same
+id for the same request, so "what did this key do" has one answer
+everywhere. Key and credential lifecycle changes are audited with the
+acting operator and a status diff, queryable at `GET /api/audit/events`;
+see [admin-api-reference.md](admin-api-reference.md).
 
 ### Requiring a key
 

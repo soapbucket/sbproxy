@@ -118,15 +118,11 @@ const families = computed<MetricFamily[]>(() => {
 
 const sbFamilies = computed(() => families.value.filter((f) => f.name.startsWith("sbproxy_")));
 
-// Core proxy families (canonical names, with the legacy fallbacks the
-// UI has always tolerated for older binaries).
+// Core proxy families. Names match the metric registry exactly; the
+// legacy fallback aliases were removed (WOR-2095) because no shipped
+// binary has ever emitted them.
 const requestFamily = computed(() =>
-  findFamily(
-    families.value,
-    "sbproxy_requests_total",
-    "sbproxy_http_requests_total",
-    "sbproxy_request_total",
-  ),
+  findFamily(families.value, "sbproxy_requests_total"),
 );
 const latencyFamilyName = "sbproxy_request_duration_seconds";
 const latencyFamily = computed(() => findFamily(families.value, latencyFamilyName));
@@ -144,8 +140,6 @@ const tokenFamily = computed(() =>
     families.value,
     "sbproxy_ai_tokens_attributed_total",
     "sbproxy_tokens_attributed_total",
-    "sbproxy_ai_tokens_total",
-    "sbproxy_tokens_total",
   ),
 );
 const costFamily = computed(() =>
@@ -153,8 +147,6 @@ const costFamily = computed(() =>
     families.value,
     "sbproxy_ai_cost_usd_micros_total",
     "sbproxy_ai_cost_dollars_attributed_total",
-    "sbproxy_ai_cost_usd_total",
-    "sbproxy_ai_cost_total",
   ),
 );
 const providerErrorsFamily = computed(() =>
@@ -355,11 +347,7 @@ function familyTotal(name: string[], filter?: Record<string, string>) {
   return (fams: MetricFamily[]) => sumSamples(findFamily(fams, ...name), filter);
 }
 
-const requestNames = [
-  "sbproxy_requests_total",
-  "sbproxy_http_requests_total",
-  "sbproxy_request_total",
-];
+const requestNames = ["sbproxy_requests_total"];
 
 const reqRate = computed(() =>
   rateSeries(snapshots.value, familyTotal(requestNames, originFilter.value)),
