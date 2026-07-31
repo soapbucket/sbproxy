@@ -84,16 +84,6 @@ ignore = [
   # CRL parsing in the SDK; the default chain skips it entirely.
   "RUSTSEC-2026-0104",
 
-  # RUSTSEC-2026-0222: wasmtime stores can mix up type indices between
-  # engines. Requires more than one `wasmtime::Engine` in the process; the
-  # wasm extension runtime builds exactly one global Engine behind a
-  # `OnceLock` (sbproxy-extension/src/wasm/mod.rs `build_engine`) and every
-  # Store comes from it, so the cross-engine confusion cannot occur here.
-  # No patched release exists on the 44.x line (patched: 46.0.2+/47.0.3+),
-  # so the real fix is the wasmtime 44 -> 46/47 bump tracked in WOR-2105;
-  # remove this entry with that bump.
-  "RUSTSEC-2026-0222",
-
   # --- WOR-616: unmaintained transitive crates -----------------------------
   # The following six advisories are all `unmaintained`-class warnings (not
   # active vulnerabilities; `cargo audit` reports 0 vulnerabilities). Each
