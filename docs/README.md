@@ -79,7 +79,7 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 
 Point a framework you already run at the gateway: chat completions through the OpenAI-compatible endpoint, tools through the MCP gateway. Every snippet on these pages was validated against a running proxy.
 
-- [langchain.md](langchain.md) - LangChain (python): ChatOpenAI with a gateway base_url, MCP tools via langchain-mcp-adapters.
+- [langchain.md](langchain.md) - LangChain (python): any provider through ChatOpenAI at the gateway, native ChatAnthropic on `/v1/messages`, MCP tools via langchain-mcp-adapters.
 - [vercel-ai-sdk.md](vercel-ai-sdk.md) - Vercel AI SDK (typescript): the openai-compatible provider, MCP tools via the AI SDK's MCP client.
 - [pydantic-ai.md](pydantic-ai.md) - Pydantic AI (python): OpenAIChatModel through the gateway, MCP toolsets on an Agent.
 - [mastra.md](mastra.md) - Mastra (typescript): agents on a gateway-backed model, tools from the MCP client.

@@ -1,6 +1,6 @@
 # Secret Backends
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-07-31*
 
 SBproxy resolves secret material through provider-specific reference schemes. The scheme names the provider type, the authority names the configured backend instance, and the path is interpreted by that provider:
 
@@ -393,8 +393,32 @@ Per-tenant and per-origin backend scopes (where the same reference name resolves
 
 Every backend caches successful reads for the configured TTL. A `set` on the same key invalidates the cache so a follow-up `get` sees the new value. There is no proactive watch-based invalidation today. A future watch hook can invalidate Kubernetes entries when Secret objects change.
 
+## Generating Secret Values
+
+Everything above covers referencing secrets that already exist. Some secrets you have to invent yourself: a static virtual key in a `credentials:` block, and the `pepper` and `master_key` under `key_management.crypto`. For all three, generate 32 bytes from a cryptographic random source and use the hex form:
+
+```bash
+openssl rand -hex 32
+```
+
+That prints 64 hex characters, which is the recommended size for each of these values. On Windows, `openssl` is available in Git Bash but not in plain PowerShell; the PowerShell equivalent is:
+
+```powershell
+$b = [byte[]]::new(32)
+[System.Security.Cryptography.RandomNumberGenerator]::Fill($b)
+($b | ForEach-Object ToString x2) -join ''
+```
+
+Do not derive these values from passwords, hostnames, or anything guessable, and do not reuse one value across the three roles. Generate each one once, store it in your secret manager or an environment variable, and reference it from the config (`env:NAME`, `file:PATH`, or a backend URI from the scheme table above).
+
+Two of the three have a better alternative than hand-generation:
+
+* **Virtual keys:** the dynamic key-management admin API mints keys server-side (`POST /admin/keys`) with the right shape and entropy, and returns the plaintext token exactly once. Prefer minting over inventing a static key; see [key-management.md](key-management.md). A hand-generated static key is fine for local walkthroughs, but replace placeholder values like `sk-your-virtual-key` before anything reachable beyond localhost.
+* **`pepper` and `master_key`:** if you leave them unset, sbproxy generates an ephemeral value at boot and warns. That is a fallback so a first run works, not a recommendation. Stored key hashes and encrypted credentials do not survive a restart without stable values, so set both before minting any key you intend to keep.
+
 ## Related Reading
 
 * `docs/configuration.md` for the `proxy.secrets` block and reference URI grammar.
 * `docs/multi-tenant.md` for the inheritance model and isolation guarantees.
 * `docs/migration-credentials.md` for the `virtual_keys:` to `credentials:` migration and the vault reference migration note.
+* `docs/key-management.md` for the dynamic key store the `pepper` and `master_key` protect.
