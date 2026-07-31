@@ -532,12 +532,20 @@ jobs:
           mv stage/arm64/sbproxy docker-ctx/linux/arm64/sbproxy
           chmod +x docker-ctx/linux/*/sbproxy
           cp artifacts/sbom/sbom.cyclonedx.json docker-ctx/sbom.cyclonedx.json
+          # Staged empty dir: distroless has no shell, so the writable
+          # state directory must arrive via COPY from the build context.
+          mkdir -p docker-ctx/var/lib/sbproxy
           cat > docker-ctx/Dockerfile <<'EOF'
           # syntax=docker/dockerfile:1.7
           FROM gcr.io/distroless/cc-debian12:nonroot
           ARG TARGETOS
           ARG TARGETARCH
           COPY ${TARGETOS}/${TARGETARCH}/sbproxy /usr/local/bin/sbproxy
+          # /var/lib/sbproxy must exist and be writable by the nonroot
+          # runtime user (uid 65532): the documented defaults for the
+          # key_management keystore and usage rollups live there, and
+          # the base image only has a root-owned /var/lib (WOR-2087).
+          COPY --chown=65532:65532 var/lib/sbproxy /var/lib/sbproxy
           EXPOSE 8080 9090
           ENTRYPOINT ["/usr/local/bin/sbproxy"]
           EOF
