@@ -21,7 +21,7 @@ embedding-vertex = []
 vector-chroma = []
 vector-pinecone = []
 vector-qdrant = []
-vector-redis = ["dep:redis"]
+vector-redis = ["dep:redis", "dep:rustls"]
 vector-weaviate = []
 full = [
   "embedding-openai",
@@ -50,6 +50,11 @@ percent-encoding.workspace = true
 # The rustls comparator is required for safe rediss:// support; the
 # workspace redis dependency ships tokio-comp + streams only.
 redis = { workspace = true, optional = true, features = ["tokio-rustls-comp"] }
+# Direct rustls dependency so the rediss:// path can install the ring
+# CryptoProvider itself; a workspace build that unifies both provider
+# features would otherwise panic at the first TLS handshake in a process
+# that never selected one.
+rustls = { workspace = true, optional = true }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -191,6 +191,14 @@ impl RedisVectorStore {
             ));
         }
         let addr = if tls {
+            // rustls 0.23 requires a process-global CryptoProvider before
+            // any TLS handshake. The sbproxy binary installs one at boot,
+            // but this crate can be embedded (or tested) in a process that
+            // never did, and a workspace build that unifies both the
+            // `ring` and `aws-lc-rs` features leaves rustls unable to
+            // pick one on its own. `install_default()` is idempotent and
+            // loses harmlessly to an already-installed provider.
+            let _ = rustls::crypto::ring::default_provider().install_default();
             ConnectionAddr::TcpTls {
                 host,
                 port,
