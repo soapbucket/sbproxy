@@ -26,37 +26,55 @@ inputs:
     description: 'shared-key passed to Swatinem/rust-cache. Distinct caches stay split; jobs that share a build matrix should pass the same value.'
     required: false
     default: ci
+  cache-save:
+    description: 'Whether this job writes the cache. Defaults to main-only. A ~3 GB entry per PR evicts the good main cache against the 10 GB per-repo limit, which makes every restore a partial one, so branches restore and do not save.'
+    required: false
+    default: ''
+  components:
+    description: 'Extra rustup components, comma separated (for example "rustfmt, clippy").'
+    required: false
+    default: ''
   free-disk:
-    description: 'Run jlumbroso/free-disk-space before the build. Disable for jobs that fit comfortably under the default runner free space.'
+    description: 'Reclaim runner disk before the build. Disable for jobs that fit comfortably under the default runner free space.'
     required: false
     default: 'true'
   install-system-deps:
     description: 'Install protobuf-compiler, clang, libclang-dev, libc6-dev. Required by the workspace transitive deps; disable only when the job does no Rust compilation.'
     required: false
     default: 'true'
+  install-redis:
+    description: 'Also install redis-server, for lanes that run the live Redis integration tests.'
+    required: false
+    default: 'false'
 
 runs:
   using: composite
   steps:
-    - name: free disk space
+    # Deleting the largest preinstalled toolchains reclaims ~25 GB in a couple
+    # of seconds. jlumbroso/free-disk-space used to do this and reclaimed the
+    # same space through `apt-get purge`, which cost 95 s on every run.
+    - name: reclaim runner disk
       if: inputs.free-disk == 'true'
-      uses: jlumbroso/free-disk-space@main
-      with:
-        tool-cache: false
-        android: true
-        dotnet: true
-        haskell: true
-        large-packages: false
-        docker-images: true
-        swap-storage: false
+      shell: bash
+      run: |
+        sudo rm -rf \
+          /usr/local/lib/android \
+          /usr/share/dotnet \
+          /opt/ghc \
+          /usr/local/.ghcup
+        sudo docker image prune --all --force >/dev/null 2>&1 || true
+        df -h /
 
     - name: install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
 
     - name: rust-cache
       uses: Swatinem/rust-cache@v2
       with:
         shared-key: ${{ inputs.cache-key }}
+        save-if: ${{ inputs.cache-save != '' && inputs.cache-save || github.ref == 'refs/heads/main' }}
 
     - name: install system deps
       if: inputs.install-system-deps == 'true'
@@ -64,3 +82,6 @@ runs:
       run: |
         sudo apt-get update
         sudo apt-get install -y protobuf-compiler clang libclang-dev libc6-dev
+        if [ "${{ inputs.install-redis }}" = "true" ]; then
+          sudo apt-get install -y redis-server
+        fi
