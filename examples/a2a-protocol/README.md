@@ -1,12 +1,20 @@
 # A2A protocol envelope and policy
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-31*
 
 ![A2A protocol envelope and policy](../../docs/assets/a2a-protocol.gif)
 
 The `a2a` policy enforces per-route safety on agent-to-agent traffic. Detection runs once per request and matches three signals: `Content-Type: application/a2a+json` (Google A2A), `MCP-Method: agents.invoke` (Anthropic A2A), and an optional operator route glob. When a request is detected as A2A, the policy applies a chain-depth cap, a cycle check, a callee allowlist, and a caller denylist before the request reaches the upstream. Off-list callers and callees get `403`, depth violations get `429`, and cycles get `409` with structured JSON error bodies.
 
 The runtime always builds an `A2AContext` once detection fires, even when the optional body parsers are off. That means the policy enforces route limits in the OSS default build with no extra cargo features set; the parser features add envelope-aware fields the policy can use, but the safety floor does not depend on them.
+
+## The envelope has to come from somewhere you trust
+
+This example drives the policy with `X-A2A-*` headers, which is the simplest thing to show with curl. Those headers are only read from a peer listed in `proxy.trusted_proxies`, and `sb.yml` sets that to loopback so the commands below work from the same host.
+
+That is not a detail you can drop when copying this config. The headers are inputs the caller would otherwise pick for itself: `X-A2A-Chain-Depth: 1` clears any depth cap, an absent `X-A2A-Chain` leaves cycle detection nothing to compare, and `X-A2A-Caller-Agent-Id` renames the caller off the denylist. Without `trusted_proxies`, the two denial cases below return `200` rather than `429` and `403`, and the policy is decoration.
+
+In a real deployment either point `trusted_proxies` at the sidecar or mesh ingress that stamps the envelope, or skip the headers entirely and let the chain come from a signed token: SBproxy reads the RFC 8693 `act` claim chain off the verified principal, and a caller cannot flatten that one. [A2A gateway](../../docs/a2a-gateway.md) covers both paths.
 
 ## Run
 

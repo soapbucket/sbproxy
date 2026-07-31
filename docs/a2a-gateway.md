@@ -1,5 +1,5 @@
 # A2A gateway
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-31*
 
 The `a2a` action proxies agent-to-agent requests to an upstream A2A endpoint. Pairs with MCP federation (one gateway, two protocols) and the AP2 / ACP / RAR payment surfaces.
 
@@ -17,6 +17,69 @@ Design-stage, not in the current binary:
 - Serving the configured card at `/.well-known/agent.json`. The `agent_card` block is stored on the action, but nothing serves it; the well-known path proxies through to the upstream like any other path.
 - CEL bindings for `capabilities.*`. Policies cannot branch on what the card advertises.
 - 406 modality negotiation on the request path. No 406 is emitted today.
+
+## Where the envelope comes from, and why it matters
+
+The `a2a` policy decides on an envelope: who is calling, who is being
+called, and how deep the delegation chain already runs. Those checks are
+only worth as much as the envelope is, so it is worth being explicit
+about where each field originates.
+
+There are two sources, and they are not equally trustworthy.
+
+**A signed token. Preferred.** SBproxy reads the [RFC 8693](https://datatracker.ietf.org/doc/html/rfc8693#section-4.1)
+`act` (actor) claim chain off the verified principal. Each delegation
+hop nests one `act` inside the last, so the chain is part of what the
+issuer signed. A caller cannot shorten it without invalidating the
+token. When the principal carries an `act` chain it overrides whatever
+the transport claimed, and the hop is recorded as `allow:verified`.
+
+**The `X-A2A-*` headers. Only from a trusted peer.** The envelope may
+instead arrive as `X-A2A-Caller-Agent-Id`, `X-A2A-Callee-Agent-Id`,
+`X-A2A-Task-Id`, `X-A2A-Parent-Request-Id`, `X-A2A-Chain-Depth`, and
+`X-A2A-Chain`. These are read **only** when the immediate peer appears
+in `proxy.trusted_proxies`. From anyone else they are stripped on
+ingress and ignored, and the hop is recorded as `allow:unverified`.
+
+The reason is that every one of these headers is an input the caller
+would otherwise choose for itself. A caller that sets its own
+`X-A2A-Chain-Depth: 1` clears any `max_chain_depth`. One that omits
+`X-A2A-Chain` presents an empty chain, and cycle detection has nothing
+to compare. One that sets its own `X-A2A-Caller-Agent-Id` renames itself
+off `caller_denylist`. Honouring these from an arbitrary client makes
+the policy advisory: it governs well-behaved agents that declare
+themselves honestly and does nothing to the ones you configured it for.
+
+So configure one of:
+
+- an authentication provider that yields a verified principal with `act`
+  claims, or
+- `proxy.trusted_proxies` covering the sidecar or mesh ingress that
+  stamps the envelope, which must itself sit between the caller and
+  SBproxy.
+
+If neither is configured the policy still runs, but it evaluates an
+empty envelope: depth 1, no chain, no caller identity. Nothing trips.
+Watch `sbproxy_a2a_hops_total{decision="allow:unverified"}` for that
+case, and `decision="skip:undetected"` for requests the policy never
+engaged on at all. A route showing only those two is configured but not
+protecting anything.
+
+## Which requests are treated as A2A
+
+Detection is what decides whether the policy runs. It has three inputs,
+and only one of them is yours:
+
+| Signal | Controlled by | Notes |
+|---|---|---|
+| `Content-Type: application/a2a+json` | the caller | Google A2A draft |
+| `MCP-Method: agents.invoke` | the caller | Anthropic A2A draft |
+| `route_glob` | the operator | Declares a path as A2A regardless of headers |
+
+Because the first two are the caller's to send or withhold, a caller
+that wants to avoid the policy simply sends neither, and an undetected
+request is allowed. **Set `route_glob` on any route you actually intend
+to govern.** It is the only signal a caller cannot opt out of.
 
 ## Wire shape
 

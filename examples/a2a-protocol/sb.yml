@@ -25,6 +25,13 @@
 # `a2a-google` cargo features). See README.md for the spec
 # instability caveat.
 #
+# Those headers are only honoured from a peer in
+# `proxy.trusted_proxies`, which is why this example sets it to
+# loopback below. Without that, every curl here is an untrusted
+# client, the envelope comes back empty, and the two denial cases
+# below quietly return 200 instead of 429 / 403. A policy whose
+# inputs the caller controls is not a policy.
+#
 # Run:
 #   make run CONFIG=examples/a2a-protocol/sb.yml
 #
@@ -69,6 +76,26 @@
 
 proxy:
   http_bind_port: 8080
+  # REQUIRED for the `X-A2A-*` flow below to do anything.
+  #
+  # The envelope headers are only read from a peer listed here. From
+  # anyone else they are stripped on ingress and ignored, because a
+  # caller that can set its own `X-A2A-Chain-Depth` can set it to 1 and
+  # walk past `max_chain_depth`, and one that can set its own
+  # `X-A2A-Caller-Agent-Id` can rename itself off `caller_denylist`.
+  #
+  # Loopback is listed here so this example is runnable with curl from
+  # the same host. In a real deployment this is the sidecar or mesh
+  # ingress that terminates the caller's connection and stamps the
+  # envelope itself, never a range that reaches untrusted clients.
+  #
+  # The alternative, and the stronger one, is to skip these headers
+  # entirely and let the chain come from a signed token: SBproxy reads
+  # the RFC 8693 `act` claim chain off the verified principal, and a
+  # caller cannot flatten that. See docs/a2a-gateway.md.
+  trusted_proxies:
+    - "127.0.0.1/32"
+    - "::1/128"
 
 origins:
   "a2a.local":
