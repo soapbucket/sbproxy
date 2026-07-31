@@ -182,11 +182,13 @@ pub fn record_tool_outcome(span: &Span, outcome: &str, cost_usd: Option<f64>) {
 ///
 /// Opened at the entry of `handle_ai_proxy`. Records:
 ///
-/// - `gen_ai.operation.name` defaulted to `surface` so traces are
-///   pre-bucketed by the classified surface (chat_completions,
-///   embeddings, image_generation, audio, assistants, etc.). The
-///   field is also emitted as `sbproxy.ai.surface` for any internal
-///   tooling that prefers the original label.
+/// - `gen_ai.operation.name` set to `operation`, the OTel GenAI
+///   operation vocabulary (`chat`, `embeddings`, `image_generation`,
+///   `audio`; control-plane surfaces pass their label through). The
+///   caller derives it via `AiSurface::operation_name` (WOR-2085).
+/// - `sbproxy.ai.surface` carries the finer-grained surface label
+///   (chat_completions, image_edits, audio_speech, ...) for internal
+///   tooling that buckets by endpoint rather than by operation.
 /// - `http.request.method` mirrors the OpenTelemetry HTTP semantic
 ///   convention for HTTP method.
 /// - Empty placeholders for `sbproxy.tenant_id`, `gen_ai.system`,
@@ -197,10 +199,10 @@ pub fn record_tool_outcome(span: &Span, outcome: &str, cost_usd: Option<f64>) {
 ///   call complete (a `tracing::field::Empty` field becomes a settable
 ///   slot on the live span). The tenant slot is populated from
 ///   `RequestContext.tenant_id` at dispatch entry (WOR-1098).
-pub fn ai_request_span(surface: &str, method: &str) -> Span {
+pub fn ai_request_span(surface: &str, operation: &str, method: &str) -> Span {
     tracing::info_span!(
         "ai.request",
-        "gen_ai.operation.name" = surface,
+        "gen_ai.operation.name" = operation,
         "sbproxy.ai.surface" = surface,
         "http.request.method" = method,
         // WOR-1098: tenant attribution. Left Empty here and filled in
@@ -703,12 +705,14 @@ mod tests {
         let layer = CaptureLayer::default();
         let subscriber = tracing_subscriber::registry().with(layer.clone());
         tracing::subscriber::with_default(subscriber, || {
-            let _s = ai_request_span("chat_completions", "POST");
+            let _s = ai_request_span("chat_completions", OP_CHAT, "POST");
         });
 
         let spans = snapshot_spans(&layer);
         let span = find_span(&spans, "ai.request");
-        assert_field(span, "gen_ai.operation.name", "chat_completions");
+        // WOR-2085: the operation slot carries the OTel vocabulary,
+        // not the surface label; the label lives on sbproxy.ai.surface.
+        assert_field(span, "gen_ai.operation.name", OP_CHAT);
         assert_field(span, "sbproxy.ai.surface", "chat_completions");
         assert_field(span, "http.request.method", "POST");
     }
@@ -723,7 +727,7 @@ mod tests {
         let layer = CaptureLayer::default();
         let subscriber = tracing_subscriber::registry().with(layer.clone());
         tracing::subscriber::with_default(subscriber, || {
-            let span = ai_request_span("chat_completions", "POST");
+            let span = ai_request_span("chat_completions", OP_CHAT, "POST");
             span.record("sbproxy.tenant_id", "acme");
         });
 
@@ -738,7 +742,7 @@ mod tests {
         let layer = CaptureLayer::default();
         let subscriber = tracing_subscriber::registry().with(layer.clone());
         tracing::subscriber::with_default(subscriber, || {
-            let span = ai_request_span("chat_completions", "POST");
+            let span = ai_request_span("chat_completions", OP_CHAT, "POST");
             span.record("sbproxy.key_id", "key-public-id");
             span.record("sbproxy.policy_version", "r7:0123456789abcdef");
             span.record("sbproxy.project", "foundation");
@@ -767,7 +771,7 @@ mod tests {
         let layer = CaptureLayer::default();
         let subscriber = tracing_subscriber::registry().with(layer.clone());
         tracing::subscriber::with_default(subscriber, || {
-            let span = ai_request_span("chat_completions", "POST");
+            let span = ai_request_span("chat_completions", OP_CHAT, "POST");
             let _entered = span.clone().entered();
             // Routing layer would normally do this once the provider
             // is resolved. We mimic the same calls here.
@@ -800,7 +804,7 @@ mod tests {
         let layer = CaptureLayer::default();
         let subscriber = tracing_subscriber::registry().with(layer.clone());
         tracing::subscriber::with_default(subscriber, || {
-            let span = ai_request_span("chat", "POST");
+            let span = ai_request_span("chat_completions", OP_CHAT, "POST");
             // input 100, output 50, cache_read 20, cache_write 5, reasoning 30
             record_token_usage_split(&span, 100, 50, 20, 5, 30);
             record_pricing_version(&span, "catalog-2026-06-01");
@@ -826,7 +830,7 @@ mod tests {
         let layer = CaptureLayer::default();
         let subscriber = tracing_subscriber::registry().with(layer.clone());
         tracing::subscriber::with_default(subscriber, || {
-            let span = ai_request_span("chat", "POST");
+            let span = ai_request_span("chat_completions", OP_CHAT, "POST");
             record_cost_usd(&span, 0.001234);
         });
         let spans = snapshot_spans(&layer);
@@ -843,7 +847,7 @@ mod tests {
         let layer = CaptureLayer::default();
         let subscriber = tracing_subscriber::registry().with(layer.clone());
         tracing::subscriber::with_default(subscriber, || {
-            let span = ai_request_span("chat", "POST");
+            let span = ai_request_span("chat_completions", OP_CHAT, "POST");
             record_cost_usd_micros(&span, 1_234);
         });
         let spans = snapshot_spans(&layer);
@@ -861,7 +865,7 @@ mod tests {
         let layer = CaptureLayer::default();
         let subscriber = tracing_subscriber::registry().with(layer.clone());
         tracing::subscriber::with_default(subscriber, || {
-            let span = ai_request_span("chat", "POST");
+            let span = ai_request_span("chat_completions", OP_CHAT, "POST");
             record_error(
                 &span,
                 error_type::GUARDRAIL_BLOCKED,
@@ -896,7 +900,7 @@ mod tests {
         let layer = CaptureLayer::default();
         let subscriber = tracing_subscriber::registry().with(layer.clone());
         tracing::subscriber::with_default(subscriber, || {
-            let span = ai_request_span("chat", "POST");
+            let span = ai_request_span("chat_completions", OP_CHAT, "POST");
             record_input_content(&span, "summarize this [redacted]");
             record_output_content(&span, "here is the summary");
         });
@@ -989,7 +993,7 @@ mod tests {
         let layer = CaptureLayer::default();
         let subscriber = tracing_subscriber::registry().with(layer.clone());
         tracing::subscriber::with_default(subscriber, || {
-            let span = ai_request_span("chat_completions", "POST");
+            let span = ai_request_span("chat_completions", OP_CHAT, "POST");
             span.record("gen_ai.system", "openai");
             span.record("gen_ai.request.model", "gpt-4o");
             span.record("llm.provider", "openai");
@@ -1019,7 +1023,9 @@ mod tests {
             );
         }
 
-        assert_field(span, "gen_ai.operation.name", "chat_completions");
+        // WOR-2085: the operation slot carries the OTel vocabulary,
+        // not the surface label; the label lives on sbproxy.ai.surface.
+        assert_field(span, "gen_ai.operation.name", OP_CHAT);
         assert_field(span, "gen_ai.system", "openai");
         assert_field(span, "gen_ai.request.model", "gpt-4o");
         assert_field(span, "gen_ai.response.model", "gpt-4o-2024-08-06");
@@ -1089,6 +1095,39 @@ mod tests {
     }
 
     #[test]
+    fn request_span_reports_the_otel_operation_not_the_surface_label() {
+        // WOR-2085, end to end through the production pair: classify the
+        // path exactly as the dispatcher does, then open the span with
+        // the derived operation name. Asserting on the constant's value
+        // alone would prove nothing; this pins what a trace backend sees
+        // for each endpoint family.
+        use tracing_subscriber::prelude::*;
+        let cases = [
+            ("/v1/chat/completions", "chat", "chat_completions"),
+            ("/v1/messages", "chat", "messages"),
+            ("/v1/embeddings", "embeddings", "embeddings"),
+            ("/v1/images/edits", "image_generation", "image_edits"),
+            ("/v1/audio/transcriptions", "audio", "audio_transcription"),
+            ("/v1/audio/speech", "audio", "audio_speech"),
+            // Control-plane surface: not a generation operation, so the
+            // label passes through rather than being forced to `chat`.
+            ("/v1/models", "models", "models"),
+        ];
+        for (path, expected_operation, expected_surface) in cases {
+            let layer = CaptureLayer::default();
+            let subscriber = tracing_subscriber::registry().with(layer.clone());
+            tracing::subscriber::with_default(subscriber, || {
+                let surface = crate::handler::classify_surface("POST", path);
+                let _s = ai_request_span(surface.label(), surface.operation_name(), "POST");
+            });
+            let spans = snapshot_spans(&layer);
+            let span = find_span(&spans, "ai.request");
+            assert_field(span, "gen_ai.operation.name", expected_operation);
+            assert_field(span, "sbproxy.ai.surface", expected_surface);
+        }
+    }
+
+    #[test]
     fn streaming_span_records_operation_and_finish_reasons() {
         use tracing_subscriber::prelude::*;
         let layer = CaptureLayer::default();
@@ -1146,7 +1185,7 @@ mod tests {
         let layer = CaptureLayer::default();
         let subscriber = tracing_subscriber::registry().with(layer.clone());
         tracing::subscriber::with_default(subscriber, || {
-            let span = ai_request_span("chat_completions", "POST");
+            let span = ai_request_span("chat_completions", OP_CHAT, "POST");
             let _entered = span.entered();
             record_input_message(0, "system", "You are a helpful assistant.");
             record_input_message(1, "user", "Hello!");

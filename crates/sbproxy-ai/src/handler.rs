@@ -1194,6 +1194,55 @@ impl AiSurface {
         }
     }
 
+    /// The OpenTelemetry GenAI `gen_ai.operation.name` for this surface
+    /// (WOR-2085).
+    ///
+    /// [`Self::label`] is the metrics/tracing *surface* identifier and
+    /// stays exactly as it is; this mapping exists because the OTel
+    /// convention names the operation differently: a chat completion is
+    /// `chat`, not `chat_completions`, and every image or audio shape
+    /// collapses onto one operation name. Before this mapping the
+    /// request span stamped the surface label into
+    /// `gen_ai.operation.name`, which happened to be right for
+    /// embeddings and `images/generations` and wrong for everything
+    /// else, chat included.
+    ///
+    /// Control-plane surfaces (models, files, batches, fine-tuning,
+    /// assistants, threads, moderations, reranking, unknown) are
+    /// deliberately left on their surface label: they are not GenAI
+    /// generation operations, the convention has no name for them, and
+    /// relabelling them `chat` would be the exact misreporting this
+    /// mapping removes.
+    pub fn operation_name(&self) -> &'static str {
+        match self {
+            // Chat-shaped generation, whatever the inbound dialect:
+            // OpenAI chat completions, Anthropic Messages, OpenAI
+            // Responses, and the realtime session all produce chat
+            // turns.
+            AiSurface::ChatCompletions
+            | AiSurface::Messages
+            | AiSurface::Responses
+            | AiSurface::Realtime => crate::tracing_spans::OP_CHAT,
+            AiSurface::Embeddings => crate::tracing_spans::OP_EMBEDDINGS,
+            AiSurface::ImageGeneration | AiSurface::ImageEdits | AiSurface::ImageVariations => {
+                crate::tracing_spans::OP_IMAGE_GENERATION
+            }
+            AiSurface::AudioTranscription | AiSurface::AudioSpeech => {
+                crate::tracing_spans::OP_AUDIO
+            }
+            // Not generation operations; see the doc comment.
+            AiSurface::Models
+            | AiSurface::Assistants
+            | AiSurface::Threads
+            | AiSurface::Batches
+            | AiSurface::FineTuning
+            | AiSurface::Files
+            | AiSurface::Moderations
+            | AiSurface::Reranking
+            | AiSurface::Unknown => self.label(),
+        }
+    }
+
     /// Whether v1 shadow evaluation may replay this request surface.
     ///
     /// Only chat evaluation surfaces are safe to copy. Mutating and non-chat
