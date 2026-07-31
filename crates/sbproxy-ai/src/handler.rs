@@ -136,6 +136,17 @@ pub struct AiHandlerConfig {
     /// `pii` configured and a trace backend inside your trust boundary.
     #[serde(default)]
     pub trace_content: bool,
+    /// WOR-2096: retain a redacted sample of this origin's prompt and
+    /// response text in a bounded in-memory store so an operator can
+    /// inspect one request's content from the admin console. Off by
+    /// default, and gated twice: capture happens only when this flag is
+    /// on AND the governed key's policy sets `allow_content_capture`.
+    /// The same redaction stack as `trace_content` applies (secret
+    /// redactor, then the origin's `pii` redactor, then the payload
+    /// cap). Nothing is durable: the store clears on restart, and the
+    /// production-grade content path remains OTLP `trace_content`.
+    #[serde(default)]
+    pub capture_content: bool,
     /// Opaque semantic-cache configuration block. The OSS proxy
     /// stores this verbatim and surfaces it through the stream cache
     /// recorder hook so the enterprise implementation can read its
@@ -1444,6 +1455,7 @@ mod tests {
             shadow: None,
             pii: None,
             trace_content: false,
+            capture_content: false,
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
@@ -1486,6 +1498,7 @@ mod tests {
             shadow: None,
             pii: None,
             trace_content: false,
+            capture_content: false,
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
@@ -1528,6 +1541,7 @@ mod tests {
             shadow: None,
             pii: None,
             trace_content: false,
+            capture_content: false,
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
@@ -1571,6 +1585,7 @@ mod tests {
             shadow: None,
             pii: None,
             trace_content: false,
+            capture_content: false,
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),

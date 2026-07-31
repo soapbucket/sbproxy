@@ -88,6 +88,7 @@ pub mod config_source;
 /// upstream authority, verify it, merge it over the base document, and
 /// apply it through the shared reload transaction.
 pub mod config_subscriber;
+pub mod content_capture;
 pub mod context;
 pub mod dispatch;
 /// Host capability diagnostics behind `sbproxy doctor`.

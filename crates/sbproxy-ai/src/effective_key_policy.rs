@@ -138,6 +138,9 @@ pub enum PolicyEnforcementProof {
     Budget,
     /// Served-model admission uses the key's priority lane.
     AdmissionPriority,
+    /// Request dispatch reads the effective content-capture consent bit
+    /// before retaining any redacted sample (WOR-2096).
+    Observability,
 }
 
 impl PolicyEnforcementProof {
@@ -159,6 +162,7 @@ impl PolicyEnforcementProof {
             Self::RateLimit => "rate_limit",
             Self::Budget => "budget",
             Self::AdmissionPriority => "admission_priority",
+            Self::Observability => "observability",
         }
     }
 }
@@ -451,6 +455,15 @@ declare_policy_fields! {
         Boolean,
         False
     ),
+    /// WOR-2096: consent bit for the origin's opt-in content capture.
+    AllowContentCapture => (
+        "allow_content_capture",
+        Observability,
+        Patch,
+        ["allow_content_capture"],
+        Boolean,
+        False
+    ),
     /// Per-minute request cap.
     MaxRequestsPerMinute => (
         "max_requests_per_minute",
@@ -543,6 +556,10 @@ pub struct EffectiveKeyPolicy {
     pub inject_mcp: Option<PolicyMcpRef>,
     /// Whether body-aware prompt-injection evaluation is bypassed.
     pub bypass_prompt_injection: bool,
+    /// WOR-2096: whether this key consents to the origin's opt-in
+    /// redacted content capture. Both this and the origin flag must be
+    /// true before any sample is retained.
+    pub allow_content_capture: bool,
     /// Maximum requests per minute.
     pub max_requests_per_minute: Option<u64>,
     /// Maximum completed tokens per minute.
@@ -597,6 +614,7 @@ impl EffectiveKeyPolicy {
             inject_tools: key.inject_tools.clone(),
             inject_mcp: key.inject_mcp.as_ref().map(PolicyMcpRef::from),
             bypass_prompt_injection: key.bypass_prompt_injection,
+            allow_content_capture: key.allow_content_capture,
             max_requests_per_minute: key.max_requests_per_minute,
             max_tokens_per_minute: key.max_tokens_per_minute,
             budget: key.budget.as_ref().map(|budget| KeyBudgetPolicy {

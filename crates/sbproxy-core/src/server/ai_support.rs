@@ -264,23 +264,42 @@ const AI_TRACE_CONTENT_MAX_MESSAGES: usize = sbproxy_observe::capture::MAX_PROPE
 #[derive(Clone, Copy)]
 pub(super) struct AiTraceContentArgs<'a> {
     enabled: bool,
+    /// WOR-2096: whether the console content-capture gate passed
+    /// (origin flag AND key-policy consent). Independent of the span
+    /// gate above.
+    capture: bool,
     pii_redactor: Option<&'a sbproxy_security::pii::PiiRedactor>,
 }
 
 impl<'a> AiTraceContentArgs<'a> {
     pub(super) fn from_config(config: &'a AiHandlerConfig) -> Self {
+        // The redactor borrow is cheap; carrying it unconditionally
+        // lets the WOR-2096 capture path reuse it when the span gate is
+        // off. Both consumers still check their own gate before use.
         Self {
             enabled: config.trace_content,
-            pii_redactor: if config.trace_content {
-                config.pii_redactor()
-            } else {
-                None
-            },
+            capture: false,
+            pii_redactor: config.pii_redactor(),
         }
+    }
+
+    /// Set the WOR-2096 console-capture gate, computed by the caller
+    /// from the origin flag and the resolved key policy.
+    pub(super) fn with_capture(mut self, capture: bool) -> Self {
+        self.capture = capture;
+        self
     }
 
     pub(super) fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub(super) fn capture_enabled(&self) -> bool {
+        self.capture
+    }
+
+    pub(super) fn redactor(&self) -> Option<&'a sbproxy_security::pii::PiiRedactor> {
+        self.pii_redactor
     }
 }
 
@@ -456,6 +475,39 @@ pub(super) fn record_ai_input_trace(
             }
         }
     });
+}
+
+/// Redacted role-aware messages for the WOR-2096 content-capture store.
+///
+/// Same redaction stack and caps as `trace_content` span events, but
+/// gated independently: capture can be on while span content is off,
+/// and vice versa. Empty when everything redacts away.
+pub(super) fn captured_content_messages(
+    aggregate: &str,
+    messages: &[AiTraceMessage],
+    pii_redactor: Option<&sbproxy_security::pii::PiiRedactor>,
+) -> Vec<crate::content_capture::CapturedMessage> {
+    if messages.is_empty() {
+        let redacted = redact_ai_trace_content(aggregate, pii_redactor);
+        if redacted.trim().is_empty() {
+            return Vec::new();
+        }
+        return vec![crate::content_capture::CapturedMessage {
+            role: "user".to_string(),
+            content: redacted,
+        }];
+    }
+    messages
+        .iter()
+        .take(AI_TRACE_CONTENT_MAX_MESSAGES)
+        .filter_map(|message| {
+            let redacted = redact_ai_trace_content(&message.content, pii_redactor);
+            (!redacted.trim().is_empty()).then(|| crate::content_capture::CapturedMessage {
+                role: message.role.clone(),
+                content: redacted,
+            })
+        })
+        .collect()
 }
 
 pub(super) fn record_ai_output_trace(

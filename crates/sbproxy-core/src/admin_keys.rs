@@ -200,6 +200,7 @@ struct KeyMutation {
     /// Federated-MCP injection ref. JSON `null` clears it.
     inject_mcp: Patch<serde_json::Value>,
     bypass_prompt_injection: Patch<bool>,
+    allow_content_capture: Patch<bool>,
     project: Patch<String>,
     user: Patch<String>,
     tags: Patch<Vec<String>>,
@@ -286,6 +287,10 @@ fn validate_key_mutation(m: &KeyMutation) -> Result<(), String> {
             "bypass_prompt_injection",
             matches!(&m.bypass_prompt_injection, Patch::Null),
         ),
+        (
+            "allow_content_capture",
+            matches!(&m.allow_content_capture, Patch::Null),
+        ),
     ] {
         if is_null {
             return Err(format!(
@@ -341,6 +346,9 @@ fn apply_key_mutation(rec: &mut KeyRecord, m: &KeyMutation) {
     apply_nullable(&mut rec.inject_mcp, &m.inject_mcp);
     if let Patch::Value(value) = &m.bypass_prompt_injection {
         rec.bypass_prompt_injection = *value;
+    }
+    if let Patch::Value(value) = &m.allow_content_capture {
+        rec.allow_content_capture = *value;
     }
     apply_nullable(&mut rec.project, &m.project);
     apply_nullable(&mut rec.user, &m.user);
@@ -1632,6 +1640,7 @@ struct KeyView {
     #[serde(skip_serializing_if = "Option::is_none")]
     inject_mcp: Option<serde_json::Value>,
     bypass_prompt_injection: bool,
+    allow_content_capture: bool,
     project: Option<String>,
     user: Option<String>,
     tags: Vec<String>,
@@ -1669,6 +1678,7 @@ impl From<&KeyRecord> for KeyView {
             inject_tools: r.inject_tools.clone(),
             inject_mcp: r.inject_mcp.clone(),
             bypass_prompt_injection: r.bypass_prompt_injection,
+            allow_content_capture: r.allow_content_capture,
             project: r.project.clone(),
             user: r.user.clone(),
             tags: r.tags.clone(),

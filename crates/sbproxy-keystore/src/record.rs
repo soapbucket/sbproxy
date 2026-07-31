@@ -149,6 +149,13 @@ pub struct KeyRecord {
     /// that legitimately submit injection-shaped prompts.
     #[serde(default)]
     pub bypass_prompt_injection: bool,
+    /// WOR-2096: allow the origin's opt-in content capture to retain a
+    /// redacted sample of this key's prompt and response text for
+    /// console inspection. Default false; capture happens only when the
+    /// origin also enables `capture_content`, so both the operator and
+    /// the key owner have said yes.
+    #[serde(default)]
+    pub allow_content_capture: bool,
     /// Project attribution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
@@ -219,6 +226,7 @@ impl KeyRecord {
             inject_tools: Vec::new(),
             inject_mcp: None,
             bypass_prompt_injection: false,
+            allow_content_capture: false,
             project: None,
             user: None,
             tags: Vec::new(),
