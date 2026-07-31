@@ -15,8 +15,8 @@ use crate::{
     AcceleratorKind, AcquireSource, ArtifactFormat, CommandOutput, EngineAvailability,
     EngineCapabilities, EngineCommand, EngineDetection, EngineDriver, EngineDriverError,
     EngineFailureReason, EngineHealth, EngineKind, EngineLaunchMethod, EngineProcessRunner,
-    EngineProvisioning, KvCacheQuant, LaunchRequest, ProvisionRequest, ProvisionedEngine,
-    RunningEngine, WorkerProfile,
+    EngineProvisioning, LaunchRequest, ProvisionRequest, ProvisionedEngine, RunningEngine,
+    WorkerProfile,
 };
 
 /// Default vLLM package pin used by managed uv provisioning.
@@ -994,11 +994,11 @@ fn append_vllm_precision_arguments(arguments: &mut Vec<String>, request: &Launch
     if let Some(quantization) = quantization {
         arguments.extend(["--quantization".to_string(), quantization.to_string()]);
     }
-    let kv_dtype = match request.kv_quant {
-        KvCacheQuant::Auto | KvCacheQuant::F16 => None,
-        KvCacheQuant::Fp8 | KvCacheQuant::Int8 | KvCacheQuant::Int4 => Some("fp8"),
-    };
-    if let Some(kv_dtype) = kv_dtype {
+    // The dtype and the bytes-per-element the fit planner sized with come
+    // from one table, so the two cannot drift apart (WOR-2069).
+    if let Some(kv_dtype) =
+        crate::config::effective_kv_cache(request.kv_quant, EngineKind::Vllm).flag_value
+    {
         arguments.extend(["--kv-cache-dtype".to_string(), kv_dtype.to_string()]);
     }
 }

@@ -792,7 +792,7 @@ Each entry accepts these settings.
 | `modality` | Task the model performs: `chat` (default), `embedding`, `rerank`, `speech_to_text`, `text_to_speech`, or `image`. It drives the engine's task flag (`embedding` serves `--task embed`, `rerank` serves `--task score`) and zeroes the KV-cache term in the fit. Set it to serve an embedding or rerank model from a raw `hf:` reference, which has no catalog entry to carry the modality. |
 | `max_context` | Context length to plan VRAM for and pass to the engine. |
 | `keep_alive` | Idle time before the engine unloads, as a duration like `30m` or `1h`. Omitting it keeps the engine resident until eviction. |
-| `kv_quant` | KV-cache quantization: `auto` (default), `f16`, `fp8`, `int8`, or `int4`. |
+| `kv_quant` | KV-cache quantization: `auto` (default), `f16`, `fp8`, `int8`, or `int4`. What each mode costs depends on the engine: vLLM and SGLang expose only fp8 KV, so `int8` and `int4` are both served as fp8 there, while llama.cpp quantizes for real (`q8_0`, `q4_0`). The fit planner sizes the mode the engine will actually run and logs any substitution. See the table in [gpu-fit-planning.md](gpu-fit-planning.md). |
 | `enable_prefix_caching` | Enable vLLM's automatic prefix caching, reusing KV blocks across requests that share a prompt prefix. |
 | `pinned` | Keep the model resident and never evict it to make room. |
 | `gguf_file` | Exact GGUF filename to serve from a multi-file llama.cpp repo. |
@@ -809,6 +809,7 @@ Host-wide settings sit on the `serve:` block itself.
 | `catalog_file` | Operator catalog file that replaces the built-in certified catalog. |
 | `cache_dir` | Directory for the content-addressed weight cache. |
 | `cache_budget_gib` | Size at which the weight cache starts evicting, in GiB. It is a garbage-collection threshold, not a limit the OS enforces: the cache can exceed it transiently, and a single artifact larger than the budget still downloads. Size the mount for the weights you intend to hold, and let this decide when old ones go. `sbproxy doctor` compares it against free space on the cache mount, and `sbproxy doctor --strict` refuses to boot a worker whose mount cannot hold it. |
+| `allow_unpinned_refs` | Permit unpinned raw `hf:` or `file:` references on a node holding the `worker` cluster role. Default `false`. A raw reference runs the engine in repo mode: external egress, a writable cache mount, and no digest verification. Fine for `sbproxy run` and a workstation, which are unaffected; a fleet worker must opt in. |
 | `eviction` | VRAM-pressure policy: `lru` (default) or `never`. |
 | `engines` | Per-engine provisioning map (`launch`, `image`, `acquire`, `shm_size_gib`). |
 | `max_concurrent_requests` | Cap on concurrently dispatched served-lane requests. |

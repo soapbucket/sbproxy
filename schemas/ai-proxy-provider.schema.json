@@ -197,6 +197,11 @@
           ],
           "format": "double"
         },
+        "allow_unpinned_refs": {
+          "description": "Support: preview. Permit unpinned raw `hf:` references on a node that holds the `worker` cluster role. Defaults to `false`.\n\nA raw reference runs the engine in repo mode, which gives up three protections a pinned catalog artifact gets: the container runs on the default bridge with DNS and external egress instead of an `--internal` network, the Hugging Face cache is mounted writable instead of read-only, and the launch-time trust and file-map checks are skipped because there are no local bytes to verify. No digest is ever computed for those weights, so the pull policy, offline mode, and digest-failure contract cover nothing on that path.\n\nThat trade is right for `sbproxy run <model>` on a workstation and for evaluating a model with no catalog entry yet. It is a poor fit for a long-lived fleet worker holding cluster identity, so the startup gate refuses it there unless this is set. Nodes without the worker role are unaffected either way.",
+          "default": false,
+          "type": "boolean"
+        },
         "eviction": {
           "description": "What to do under VRAM pressure. Defaults to LRU eviction.",
           "default": "lru",

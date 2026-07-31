@@ -82,6 +82,13 @@ pub fn build_launch_spec(
                 args.push("--quantization".to_string());
                 args.push(q.to_string());
             }
+            // This template previously emitted no KV dtype at all, so a
+            // configured `kv_quant` was silently dropped here while the
+            // fit planner had already sized the cache for it (WOR-2069).
+            if let Some(dtype) = sglang_kv_cache_dtype(kv_quant) {
+                args.push("--kv-cache-dtype".to_string());
+                args.push(dtype.to_string());
+            }
             args.push("--context-length".to_string());
             args.push(plan.seq_len.to_string());
         }
@@ -271,26 +278,24 @@ fn vllm_quantization(quant_name: &str) -> Option<&'static str> {
 
 /// Map a KV-quant mode to vLLM's `--kv-cache-dtype`, or `None` when no
 /// flag is needed (`Auto` / `F16` are vLLM's default).
+///
+/// Delegates to the shared table so this template, the managed vLLM
+/// driver, and the fit planner all agree on what the engine will run
+/// (WOR-2069).
 fn vllm_kv_cache_dtype(kv: KvCacheQuant) -> Option<&'static str> {
-    match kv {
-        KvCacheQuant::Auto | KvCacheQuant::F16 => None,
-        KvCacheQuant::Fp8 => Some("fp8"),
-        // vLLM exposes fp8 variants; int8/int4 KV map to the nearest
-        // supported low-precision dtype it accepts.
-        KvCacheQuant::Int8 => Some("fp8"),
-        KvCacheQuant::Int4 => Some("fp8"),
-    }
+    crate::config::effective_kv_cache(kv, EngineKind::Vllm).flag_value
+}
+
+/// Map a KV-quant mode to SGLang's `--kv-cache-dtype`, or `None` for the
+/// engine default.
+fn sglang_kv_cache_dtype(kv: KvCacheQuant) -> Option<&'static str> {
+    crate::config::effective_kv_cache(kv, EngineKind::SGLang).flag_value
 }
 
 /// Map a KV-quant mode to llama.cpp's `--cache-type-{k,v}` value, or
 /// `None` for the f16 default.
 fn llama_cache_type(kv: KvCacheQuant) -> Option<&'static str> {
-    match kv {
-        KvCacheQuant::Auto | KvCacheQuant::F16 => None,
-        KvCacheQuant::Fp8 => Some("q8_0"),
-        KvCacheQuant::Int8 => Some("q8_0"),
-        KvCacheQuant::Int4 => Some("q4_0"),
-    }
+    crate::config::effective_kv_cache(kv, EngineKind::LlamaCpp).flag_value
 }
 
 /// Additional engine flags for the serving knobs on a

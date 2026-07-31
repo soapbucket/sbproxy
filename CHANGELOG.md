@@ -256,6 +256,18 @@ the next version cut.
 
 ### Fixed
 
+- **`kv_quant: int4` no longer under-sizes the KV cache on vLLM and SGLang.**
+  The fit planner sized the requested mode (int4 at 0.5 bytes per element)
+  while both CUDA engine drivers substituted fp8 at 1.0, because neither
+  exposes an integer KV kernel. The plan booked half the cache the engine
+  would allocate, and the plan is what derives `--gpu-memory-utilization`,
+  so a tight long-context config could fail at first-token graph capture.
+  The dtype passed to the engine and the bytes the planner books now come
+  from one table, so they cannot drift apart, and a substitution is logged
+  rather than silent. llama.cpp is unaffected: its `q8_0` and `q4_0` caches
+  are real. The legacy SGLang launch template also dropped the KV flag
+  entirely and now emits it. See
+  [`docs/gpu-fit-planning.md`](docs/gpu-fit-planning.md).
 - **The worker image pins vLLM.** `Dockerfile.worker` installed vLLM with a
   bare `pip3 install vllm`, so every rebuild resolved to whatever version was
   newest and drifted the image off `DEFAULT_VLLM_VERSION`, which the fit

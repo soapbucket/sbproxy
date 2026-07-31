@@ -226,6 +226,16 @@ jobs:
         if: steps.filter.outputs.code == 'true'
         run: bash scripts/check-metrics-stability.sh
 
+      # dead_code cannot see a `pub` item inside a `pub mod` of a library
+      # crate, so write-only code lands with a green build. This ratchet
+      # stops the count from growing while the existing backlog is worked
+      # down. Runs without the enterprise cross-check, which is fine: the
+      # count is the same either way, and the cross-check only matters
+      # before a deletion.
+      - name: no new pub items whose only consumer is a test (WOR-2065)
+        if: steps.filter.outputs.code == 'true'
+        run: bash scripts/check-pub-item-ratchet.sh
+
       - name: install.sh verifies its download (WOR-1914)
         if: steps.filter.outputs.code == 'true'
         run: sh scripts/tests/install_verify.sh

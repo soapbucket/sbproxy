@@ -1,0 +1,58 @@
+{
+  "_comment": [
+    "Human verdicts for candidates where the class rule in",
+    "scripts/scan-pub-item-usage.py gets the wrong answer. The scan can see",
+    "whether a name is referenced; it cannot see why an item exists. Anything",
+    "recorded here is reported with this verdict instead of the inferred one.",
+    "",
+    "Keys are '<repo-relative file>::<item name>'. The scan fails if a key",
+    "names an item that no longer exists, so this file cannot rot into a list",
+    "of excuses for code that was already deleted."
+  ],
+  "verdicts": {
+    "crates/sbproxy-security/src/agent_verify.rs::with_ptr": {
+      "verdict": "keep",
+      "reason": "StubResolver is exported from lib.rs as a test double for out-of-crate consumers to build against. Its builders are the API; narrowing them would leave a stub nobody can configure."
+    },
+    "crates/sbproxy-security/src/agent_verify.rs::with_forward": {
+      "verdict": "keep",
+      "reason": "Same as with_ptr: part of the exported StubResolver builder surface."
+    },
+    "crates/sbproxy-security/src/agent_verify.rs::with_reverse_error": {
+      "verdict": "keep",
+      "reason": "Same as with_ptr. Narrowed to pub(crate) during this sweep and reverted: the lib-only build then warns, because the only in-crate caller is a test."
+    },
+    "crates/sbproxy-security/src/agent_verify.rs::with_forward_error": {
+      "verdict": "keep",
+      "reason": "Same as with_ptr. It looked dead because the stub's forward-error branch had no test at all; that gap is now covered rather than the builder deleted."
+    },
+    "crates/sbproxy-security/src/pii.rs::RuleValidator": {
+      "verdict": "keep",
+      "reason": "Types the pub field CompiledRule::validator, so narrowing it is a private-in-public error rather than a cleanup."
+    },
+    "crates/sbproxy-security/src/pii.rs::redact_body": {
+      "verdict": "keep",
+      "reason": "Called directly by the out-of-tree consumer. Also recorded in a doc comment at the definition."
+    },
+    "crates/sbproxy-cache/src/two_tier.rs::TwoTierCache": {
+      "verdict": "escalated",
+      "reason": "The whole two_tier module is unwired: no consumer in this repository and none in the out-of-tree tree. This is the sliding_window shape and needs a wire-or-delete decision of its own, not a visibility change inside a cleanup PR. Tracked at https://linear.app/soapbucket/issue/WOR-2081."
+    },
+    "crates/sbproxy-cache/src/two_tier.rs::AiCachedResponse": {
+      "verdict": "escalated",
+      "reason": "Part of the unwired two_tier module. See TwoTierCache."
+    },
+    "crates/sbproxy-cache/src/two_tier.rs::CacheStats": {
+      "verdict": "escalated",
+      "reason": "Part of the unwired two_tier module. See TwoTierCache."
+    },
+    "crates/sbproxy-cache/src/two_tier.rs::DEFAULT_SIMILARITY_THRESHOLD": {
+      "verdict": "escalated",
+      "reason": "Part of the unwired two_tier module. See TwoTierCache."
+    },
+    "crates/sbproxy-cache/src/two_tier.rs::exact_key": {
+      "verdict": "escalated",
+      "reason": "Part of the unwired two_tier module. See TwoTierCache."
+    }
+  }
+}

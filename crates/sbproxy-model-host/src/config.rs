@@ -333,8 +333,13 @@ pub enum KvCacheQuant {
 }
 
 impl KvCacheQuant {
-    /// Bytes per KV element for this mode, or `None` for `Auto` (the
-    /// caller uses the weight quant's default instead).
+    /// Bytes per KV element for this mode *as requested*, or `None` for
+    /// `Auto` (the caller uses the weight quant's default instead).
+    ///
+    /// This is the ideal, not what any particular engine delivers. No
+    /// engine accepts every mode, so the fit planner must size from
+    /// [`effective_kv_cache`] instead; sizing from this value is how
+    /// WOR-2069 under-estimated int4 KV on vLLM by a factor of two.
     pub fn bytes_per_element(self) -> Option<f64> {
         match self {
             KvCacheQuant::Auto => None,
@@ -349,6 +354,112 @@ impl KvCacheQuant {
     /// gate it on GPU capability, like FP8 weights).
     pub fn needs_fp8(self) -> bool {
         matches!(self, KvCacheQuant::Fp8)
+    }
+}
+
+/// What an engine will actually do with a requested [`KvCacheQuant`].
+///
+/// Both halves come from one table ([`effective_kv_cache`]) on purpose.
+/// The engine drivers read [`flag_value`](Self::flag_value) to build
+/// argv and the fit planner reads
+/// [`bytes_per_element`](Self::bytes_per_element) to size the cache, so
+/// keeping them in separate `match` arms is how the two silently
+/// disagreed: the planner sized int4 at 0.5 bytes while every CUDA
+/// driver substituted fp8 at 1.0, halving the KV estimate that derives
+/// `--gpu-memory-utilization` (WOR-2069). Deriving both from the same
+/// row makes that class of drift impossible rather than merely fixed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EffectiveKvCache {
+    /// The dtype string to pass this engine, or `None` to pass no flag
+    /// and take the engine's own default.
+    pub flag_value: Option<&'static str>,
+    /// Bytes per KV element the engine will really use, or `None` when
+    /// it follows the weight quant's default.
+    pub bytes_per_element: Option<f64>,
+    /// The mode the engine actually runs, which differs from the request
+    /// when the engine has no kernel for it.
+    pub effective: KvCacheQuant,
+}
+
+impl EffectiveKvCache {
+    /// Whether the engine substituted something other than what was
+    /// asked for, so a caller can say so rather than silently serving a
+    /// different cache than the operator configured.
+    pub fn is_substituted(self, requested: KvCacheQuant) -> bool {
+        self.effective != requested
+    }
+}
+
+/// Resolve a requested KV mode against what `engine` can actually run.
+///
+/// The substitutions are real engine limitations, not policy:
+///
+/// - **vLLM and SGLang** expose only fp8 KV variants, so `int8` and
+///   `int4` both land on fp8 at 1.0 bytes per element. An `int4` request
+///   therefore saves nothing on either, and sizing it at 0.5 would leave
+///   the engine half the cache it needs.
+/// - **llama.cpp** quantizes the K and V caches for real, so `int8` maps
+///   to `q8_0` and `int4` to `q4_0` and the savings are genuine.
+/// - **The embedded engine** takes no KV flag at all, so every request
+///   follows the weight quant's default. Reported as `Auto` rather than
+///   as the requested mode, so the planner never books a saving the
+///   engine will not deliver.
+pub fn effective_kv_cache(kv: KvCacheQuant, engine: EngineKind) -> EffectiveKvCache {
+    // No flag, engine default. Shared by `Auto` everywhere and by every
+    // mode on the embedded engine.
+    const DEFAULT: EffectiveKvCache = EffectiveKvCache {
+        flag_value: None,
+        bytes_per_element: None,
+        effective: KvCacheQuant::Auto,
+    };
+    // f16 is every engine's default, so it is requested by passing no
+    // flag; the planner still books the concrete 2.0.
+    const F16: EffectiveKvCache = EffectiveKvCache {
+        flag_value: None,
+        bytes_per_element: Some(2.0),
+        effective: KvCacheQuant::F16,
+    };
+
+    if engine == EngineKind::Embedded {
+        return DEFAULT;
+    }
+    match (kv, engine) {
+        (KvCacheQuant::Auto, _) => DEFAULT,
+        (KvCacheQuant::F16, _) => F16,
+
+        // vLLM: one fp8 KV dtype, whatever low-precision mode was asked for.
+        (KvCacheQuant::Fp8 | KvCacheQuant::Int8 | KvCacheQuant::Int4, EngineKind::Vllm) => {
+            EffectiveKvCache {
+                flag_value: Some("fp8"),
+                bytes_per_element: Some(1.0),
+                effective: KvCacheQuant::Fp8,
+            }
+        }
+        // SGLang: same, under its own spelling.
+        (KvCacheQuant::Fp8 | KvCacheQuant::Int8 | KvCacheQuant::Int4, EngineKind::SGLang) => {
+            EffectiveKvCache {
+                flag_value: Some("fp8_e5m2"),
+                bytes_per_element: Some(1.0),
+                effective: KvCacheQuant::Fp8,
+            }
+        }
+
+        // llama.cpp quantizes K and V for real.
+        (KvCacheQuant::Fp8 | KvCacheQuant::Int8, EngineKind::LlamaCpp) => EffectiveKvCache {
+            flag_value: Some("q8_0"),
+            bytes_per_element: Some(1.0),
+            // fp8 and int8 are both 8-bit; llama.cpp's is the integer one.
+            effective: KvCacheQuant::Int8,
+        },
+        (KvCacheQuant::Int4, EngineKind::LlamaCpp) => EffectiveKvCache {
+            flag_value: Some("q4_0"),
+            bytes_per_element: Some(0.5),
+            effective: KvCacheQuant::Int4,
+        },
+
+        // Handled above; kept explicit so a new engine kind fails to
+        // compile here rather than silently defaulting.
+        (_, EngineKind::Embedded) => DEFAULT,
     }
 }
 
@@ -605,6 +716,26 @@ pub struct ModelHostConfig {
     /// `POST /admin/model-host/gc` route.
     #[serde(default)]
     pub cache_budget_gib: Option<f64>,
+    /// Support: preview.
+    /// Permit unpinned raw `hf:` references on a node that holds the
+    /// `worker` cluster role. Defaults to `false`.
+    ///
+    /// A raw reference runs the engine in repo mode, which gives up three
+    /// protections a pinned catalog artifact gets: the container runs on
+    /// the default bridge with DNS and external egress instead of an
+    /// `--internal` network, the Hugging Face cache is mounted writable
+    /// instead of read-only, and the launch-time trust and file-map checks
+    /// are skipped because there are no local bytes to verify. No digest
+    /// is ever computed for those weights, so the pull policy, offline
+    /// mode, and digest-failure contract cover nothing on that path.
+    ///
+    /// That trade is right for `sbproxy run <model>` on a workstation and
+    /// for evaluating a model with no catalog entry yet. It is a poor fit
+    /// for a long-lived fleet worker holding cluster identity, so the
+    /// startup gate refuses it there unless this is set. Nodes without the
+    /// worker role are unaffected either way.
+    #[serde(default)]
+    pub allow_unpinned_refs: bool,
     /// What to do under VRAM pressure. Defaults to LRU eviction.
     #[serde(default)]
     pub eviction: EvictionPolicy,
@@ -1429,5 +1560,145 @@ models:
         assert_eq!(d2.resolved, EngineKind::Vllm);
         assert!(!d2.runnable);
         assert!(d2.blocker.is_some());
+    }
+}
+
+/// The KV-cache contract (WOR-2069): what the fit planner books and what
+/// the engine actually runs must agree, for every mode on every engine.
+#[cfg(test)]
+mod kv_cache_contract {
+    use super::*;
+
+    /// Every engine kind, so adding one forces a decision here.
+    const ENGINES: [EngineKind; 4] = [
+        EngineKind::Vllm,
+        EngineKind::SGLang,
+        EngineKind::LlamaCpp,
+        EngineKind::Embedded,
+    ];
+
+    const MODES: [KvCacheQuant; 5] = [
+        KvCacheQuant::Auto,
+        KvCacheQuant::F16,
+        KvCacheQuant::Fp8,
+        KvCacheQuant::Int8,
+        KvCacheQuant::Int4,
+    ];
+
+    /// Bytes per element each dtype string really costs. This is the
+    /// independent half of the check: if the table ever claims a saving
+    /// the dtype does not deliver, this map disagrees and the test fails.
+    fn bytes_for_dtype(dtype: &str) -> f64 {
+        match dtype {
+            // vLLM and SGLang spellings of 8-bit float KV.
+            "fp8" | "fp8_e5m2" => 1.0,
+            // llama.cpp block quants.
+            "q8_0" => 1.0,
+            "q4_0" => 0.5,
+            other => panic!("unknown KV dtype {other}: add its real cost to this test"),
+        }
+    }
+
+    #[test]
+    fn planned_bytes_always_match_the_dtype_the_engine_is_given() {
+        for engine in ENGINES {
+            for mode in MODES {
+                let effective = effective_kv_cache(mode, engine);
+                match (effective.flag_value, effective.bytes_per_element) {
+                    // A flag is passed: the booked cost must be that
+                    // dtype's real cost. This is the assertion that
+                    // WOR-2069 violated, int4 on vLLM booking 0.5 while
+                    // the engine was handed fp8 at 1.0.
+                    (Some(dtype), Some(bytes)) => assert_eq!(
+                        bytes,
+                        bytes_for_dtype(dtype),
+                        "{engine:?} + {mode:?}: planned {bytes} bytes/element but the engine \
+                         is launched with --kv-cache-dtype {dtype}"
+                    ),
+                    // No flag means the engine default. Only f16 may book
+                    // a concrete cost there, because f16 is the default.
+                    (None, Some(bytes)) => assert_eq!(
+                        bytes, 2.0,
+                        "{engine:?} + {mode:?}: no dtype flag is passed, so the engine runs its \
+                         f16 default, but the plan books {bytes} bytes/element"
+                    ),
+                    (None, None) => {}
+                    (Some(dtype), None) => panic!(
+                        "{engine:?} + {mode:?}: launched with {dtype} but the plan books no cost"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_plan_never_books_a_saving_the_engine_will_not_deliver() {
+        // The direction that matters. Over-booking wastes VRAM; under-
+        // booking hands the engine less cache than it allocates, and the
+        // shortfall surfaces at first-token graph capture.
+        for engine in ENGINES {
+            for mode in MODES {
+                let requested = mode.bytes_per_element();
+                let effective = effective_kv_cache(mode, engine).bytes_per_element;
+                if let (Some(requested), Some(effective)) = (requested, effective) {
+                    assert!(
+                        effective >= requested,
+                        "{engine:?} + {mode:?}: plan books {effective} bytes/element against a \
+                         request of {requested}, which under-sizes the cache"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_engines_substitute_fp8_for_the_integer_modes() {
+        // The specific WOR-2069 regression, pinned per engine.
+        for engine in [EngineKind::Vllm, EngineKind::SGLang] {
+            for mode in [KvCacheQuant::Int8, KvCacheQuant::Int4] {
+                let effective = effective_kv_cache(mode, engine);
+                assert_eq!(
+                    effective.bytes_per_element,
+                    Some(1.0),
+                    "{engine:?} has no integer KV kernel, so {mode:?} costs fp8's 1.0"
+                );
+                assert_eq!(effective.effective, KvCacheQuant::Fp8);
+                assert!(
+                    effective.is_substituted(mode),
+                    "{engine:?} + {mode:?} is a substitution and must be reported as one"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn llama_cpp_delivers_real_four_bit_kv() {
+        // The saving is genuine here, so it must not be flattened along
+        // with the CUDA engines.
+        let effective = effective_kv_cache(KvCacheQuant::Int4, EngineKind::LlamaCpp);
+        assert_eq!(effective.flag_value, Some("q4_0"));
+        assert_eq!(effective.bytes_per_element, Some(0.5));
+        assert!(!effective.is_substituted(KvCacheQuant::Int4));
+    }
+
+    #[test]
+    fn the_embedded_engine_books_no_saving_because_it_takes_no_flag() {
+        // It ignores kv_quant entirely, so booking fp8's 1.0 would be a
+        // 2x under-estimate against the f16 it really runs.
+        for mode in MODES {
+            let effective = effective_kv_cache(mode, EngineKind::Embedded);
+            assert_eq!(effective.flag_value, None, "{mode:?}");
+            assert_eq!(effective.bytes_per_element, None, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn auto_defers_to_the_weight_quant_on_every_engine() {
+        for engine in ENGINES {
+            let effective = effective_kv_cache(KvCacheQuant::Auto, engine);
+            assert_eq!(effective.flag_value, None, "{engine:?}");
+            assert_eq!(effective.bytes_per_element, None, "{engine:?}");
+            assert!(!effective.is_substituted(KvCacheQuant::Auto), "{engine:?}");
+        }
     }
 }

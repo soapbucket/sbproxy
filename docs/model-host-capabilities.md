@@ -45,6 +45,7 @@ Registry version: `1`
 | `serve.catalog_file` | `preview` | `manifest.catalog_v2` | `none` |
 | `serve.cache_dir` | `stable` | `artifact.cache_addressing` | `contract.cache_directory_changes_artifact_path` |
 | `serve.cache_budget_gib` | `preview` | `artifact.cache_budget` | `contract.cache_budget_protects_active_artifacts` |
+| `serve.allow_unpinned_refs` | `preview` | `artifact.verified_acquisition` | `none` |
 | `serve.eviction` | `stable` | `lifecycle.single_node_residency` | `contract.eviction_changes_admission` |
 | `serve.engines` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.max_concurrent_requests` | `stable` | `lifecycle.priority_admission` | `contract.priority_gate_changes_dispatch` |
