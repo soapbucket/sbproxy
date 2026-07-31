@@ -2641,6 +2641,12 @@ pub struct SeedKeyConfig {
     /// Skip the body-aware prompt-injection scan for this key. Default false.
     #[serde(default)]
     pub bypass_prompt_injection: bool,
+    /// Consent to the origin's opt-in redacted content capture for
+    /// console inspection. Default false. A sample is retained only
+    /// when the AI origin also sets `capture_content: true`, so both
+    /// the operator and the key owner must opt in.
+    #[serde(default)]
+    pub allow_content_capture: bool,
     /// Project attribution.
     #[serde(default)]
     pub project: Option<String>,

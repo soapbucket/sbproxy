@@ -160,6 +160,7 @@ pub fn key_record_to_effective_policy(
         inject_tools: record.inject_tools.clone(),
         inject_mcp,
         bypass_prompt_injection: record.bypass_prompt_injection,
+        allow_content_capture: record.allow_content_capture,
         max_requests_per_minute: record.max_requests_per_minute,
         max_tokens_per_minute: record.max_tokens_per_minute,
         budget: record.budget.as_ref().map(|budget| KeyBudgetPolicy {
