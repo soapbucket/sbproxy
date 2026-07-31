@@ -20,6 +20,7 @@ members = [
     "crates/sbproxy-middleware",
     "crates/sbproxy-extension",
     "crates/sbproxy-ai",
+    "crates/sbproxy-rag",
     "crates/sbproxy-tls",
     "crates/sbproxy-openapi",
     "crates/sbproxy-k8s-operator",
@@ -57,6 +58,7 @@ default-members = [
     "crates/sbproxy-middleware",
     "crates/sbproxy-extension",
     "crates/sbproxy-ai",
+    "crates/sbproxy-rag",
     "crates/sbproxy-tls",
     "crates/sbproxy-openapi",
     "crates/sbproxy-classifiers",
@@ -99,6 +101,10 @@ sbproxy-middleware = { path = "crates/sbproxy-middleware" }
 sbproxy-extension = { path = "crates/sbproxy-extension" }
 sbproxy-model-host = { path = "crates/sbproxy-model-host" }
 sbproxy-ai = { path = "crates/sbproxy-ai" }
+# WOR-2098: retrieval-augmented generation runtime. Providers are cargo
+# features that default off, so consumers opt into exactly the embedding
+# and vector-store adapters they compile.
+sbproxy-rag = { path = "crates/sbproxy-rag", default-features = false }
 sbproxy-tls = { path = "crates/sbproxy-tls" }
 sbproxy-openapi = { path = "crates/sbproxy-openapi" }
 sbproxy-classifiers = { path = "crates/sbproxy-classifiers" }
@@ -122,6 +128,10 @@ serde_yaml = { package = "yaml_serde", version = "0.10" }
 # Concurrency and data structures
 arc-swap = "1"
 dashmap = "6"
+# Bounded LRU maps (sbproxy-ai response caches, sbproxy-rag stale-context
+# cache). Same 0.16 line sbproxy-ai already pins so the lockfile keeps one
+# copy.
+lru = "0.16"
 parking_lot = "0.12"
 smallvec = { version = "1", features = ["union"] }
 compact_str = "0.8"

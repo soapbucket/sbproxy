@@ -91,6 +91,19 @@ impl OutboundClientBuilder {
         self
     }
 
+    /// Pins `domain` to the given socket addresses instead of re-resolving it.
+    ///
+    /// Requests keep the original URL host (so TLS verification and the
+    /// `Host` header are unchanged) but dial only the pinned addresses.
+    /// Callers that validated a hostname against an SSRF policy use this to
+    /// close the gap between validation-time resolution and dial-time
+    /// resolution (DNS rebinding).
+    #[must_use]
+    pub fn resolve_to_addrs(mut self, domain: &str, addrs: &[std::net::SocketAddr]) -> Self {
+        self.inner = self.inner.resolve_to_addrs(domain, addrs);
+        self
+    }
+
     /// Builds the configured TLS-verifying client.
     pub fn build(self) -> Result<reqwest::Client, reqwest::Error> {
         self.inner.build()

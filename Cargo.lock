@@ -8915,6 +8915,7 @@ dependencies = [
  "sbproxy-openapi",
  "sbproxy-platform",
  "sbproxy-plugin",
+ "sbproxy-rag",
  "sbproxy-security",
  "sbproxy-tls",
  "sbproxy-transport",
@@ -9370,6 +9371,30 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "url",
+]
+
+[[package]]
+name = "sbproxy-rag"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "lru",
+ "minijinja",
+ "parking_lot",
+ "percent-encoding",
+ "redis",
+ "reqwest 0.12.28",
+ "sbproxy-ai",
+ "sbproxy-httpkit",
+ "sbproxy-security",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "url",
 ]
 
