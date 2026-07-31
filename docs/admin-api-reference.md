@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-07-31*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -492,6 +492,16 @@ Response body: an array of `RequestLogEntry`:
 | `tokens_in`, `tokens_out` | int | Parsed prompt and completion tokens. |
 | `cost_usd_micros` | int | Estimated AI cost in millionths of a US dollar. |
 | `guardrail_category`, `guardrail_action` | string | Bounded guardrail outcome when a guardrail intervened. |
+| `api_key_id` | string | Canonical public id of the key that governed the request, when one resolved. Matches the access log column, the `sbproxy_inbound_key_requests_total{api_key_id}` label, and the `sbproxy.key_id` span attribute. Never the secret. |
+| `key_mode` | string | Inbound credential mode: `none`, `minted`, or `native`. |
+| `key_provider` | string | Recognized native provider label, present on `native` rows. |
+| `tenant_id` | string | Origin-scoped tenant label (`__default__` when the origin declares none). |
+| `user_id` | string | Resolved end-user identifier when user capture resolved one, already capped and redacted. |
+| `error_class` | string | Coarse failure class (`auth_denied`, `rate_limited`, `upstream_5xx`, ...). Absent on success. |
+| `config_revision` | string | Config revision of the pipeline generation that served the request. |
+| `policy_version` | string | Governed key-policy revision that applied, when a key policy resolved. Same vocabulary as the `sbproxy.policy_version` span attribute. |
+| `policy_decisions` | array | Bounded, ordered `policy_type:verdict` pairs recorded as enforcers decided. Explains what applied, not just what denied. |
+| `deny_reason` | string | Machine-readable reason from the policy, guardrail, or auth layer that denied the request, when one did. |
 
 This is an in-memory ring buffer; entries are lost when the process
 exits. For durable request logs, enable the structured access log
@@ -500,11 +510,17 @@ exits. For durable request logs, enable the structured access log
 Supported query parameters: `status` (exact match), `method`
 (case-insensitive), `path` (substring), `guardrail_action`,
 `guardrail_category`, `cache_status`, `retried`, `property_key`,
-`property_value`, `offset`, and `limit` (defaults to and is clamped at
+`property_value`, `api_key_id` (exact canonical key id), `key_mode`
+(`none`, `minted`, or `native`), `session_id` (exact ULID), `offset`,
+and `limit` (defaults to and is clamped at
 `max_log_entries`). `cache_status` accepts the four values listed above.
 `retried` accepts only `true` or `false`. Property matching is exact after
 URL decoding; `property_value` requires `property_key`. No parameters returns
 the newest entries.
+
+To answer "what did this key do", filter by `api_key_id`; every row a
+governed request produced carries the same canonical id across this
+ring, the access log, the inbound-key metric, and exported spans.
 
 The admin UI derives its Sessions list and detail pages from this ring. Those
 pages are a recent operational view, not durable trace storage, a timing
@@ -734,6 +750,34 @@ Recent rate-limit budget audit rows (suspend, throttle, resume
 transitions), newest first. `?limit=` bounds the count (default 50).
 Returns `[]` (not an error) when no `rate_limits:` block is
 configured, so there is nothing to have audited.
+
+### `GET /api/audit/events`
+
+Unified audit sample across five channels, newest first: `security`
+(auth denials and policy violations), `key` (key and credential
+lifecycle mutations), `config` (config writes and reloads), `admin`
+(sign-ins and every mutating admin action), and `policy` (non-allow
+policy verdicts).
+
+| Field | Type | Description |
+|---|---|---|
+| `timestamp` | string | RFC 3339 timestamp of the event. |
+| `channel` | string | One of `security`, `key`, `config`, `admin`, `policy`. |
+| `kind` | string | Channel-specific kind: the security event type, the lifecycle operation, the config source, the admin action, or the denying policy type. |
+| `actor` | string | Operator who performed the change, on change channels. |
+| `tenant_id` | string | Tenant scope, when known. |
+| `api_key_id` | string | Canonical public key id the event is attributed to, when one resolved. Never the secret. |
+| `request_id` | string | Request correlation id for request-scoped events. |
+| `detail` | string | Bounded machine-readable detail: the deny reason, the revision pair, or the status diff. |
+
+Query parameters: `limit` (default 100, capped at 1000), `channel`,
+`kind`, and `key_id` (all exact matches).
+
+This is a bounded in-memory sample for runtime inspection: the ring
+holds the most recent 1,000 events and clears on restart. The durable
+audit trail is whatever your log pipeline or OTel collector ships the
+`security_audit`, `key_audit`, `config_audit`, and
+`sbproxy::admin::audit` tracing targets to.
 
 ### `GET /api/rate_limits/budget`
 

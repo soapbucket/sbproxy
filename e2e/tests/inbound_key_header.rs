@@ -1551,3 +1551,138 @@ fn a_bound_credential_is_re_injected_on_an_upstream_retry() {
         "and it must be the credential, never the caller's minted key"
     );
 }
+
+/// WOR-2093: the admin request ring answers "what did this key do".
+///
+/// Every row carries the canonical key id, the key mode, the tenant,
+/// and the config revision that served it, and the server-side
+/// `api_key_id` / `key_mode` / `session_id` filters return exactly the
+/// matching rows. A denial names the key in the audit sample too
+/// (WOR-2094, via /api/audit/events).
+#[test]
+fn request_rows_carry_key_attribution_and_filter_by_key() {
+    let admin_port = free_port();
+    let upstream = StubUpstream::start().expect("stub upstream");
+    let harness = ProxyHarness::start_with_yaml(&config(admin_port, upstream.port, ""))
+        .expect("proxy starts");
+
+    let minted = reqwest::blocking::Client::new()
+        .post(format!("http://127.0.0.1:{admin_port}/admin/keys"))
+        .basic_auth("admin", Some("secret"))
+        .json(&serde_json::json!({"name": "attribution"}))
+        .send()
+        .expect("mint request")
+        .json::<serde_json::Value>()
+        .expect("mint response json");
+    let token = minted["token"].as_str().expect("token").to_string();
+    let key_id = minted["key"]["key_id"]
+        .as_str()
+        .expect("key id")
+        .to_string();
+
+    let session = "01JAT3S6Q0V4X5Y6Z7A8B9C0D1";
+    let client = reqwest::blocking::Client::new();
+    // One governed request with a caller-supplied session, one native
+    // (recognized Anthropic shape, allowed by the policy), one unkeyed.
+    let governed = client
+        .get(format!("{}/governed", harness.base_url()))
+        .header("Host", "tools.local")
+        .header("x-sb-api", &token)
+        .header("x-sb-session-id", session)
+        .send()
+        .expect("governed request");
+    assert_eq!(governed.status().as_u16(), 200);
+    upstream.next_request();
+    let native = client
+        .get(format!("{}/native", harness.base_url()))
+        .header("Host", "tools.local")
+        .header("authorization", "Bearer sk-ant-e2e-native-shape-key")
+        .send()
+        .expect("native request");
+    assert_eq!(native.status().as_u16(), 200);
+    upstream.next_request();
+    let unkeyed = client
+        .get(format!("{}/unkeyed", harness.base_url()))
+        .header("Host", "tools.local")
+        .send()
+        .expect("unkeyed request");
+    assert_eq!(unkeyed.status().as_u16(), 200);
+    upstream.next_request();
+
+    let rows_for = |query: &str| -> Vec<serde_json::Value> {
+        client
+            .get(format!("http://127.0.0.1:{admin_port}/api/requests{query}"))
+            .basic_auth("admin", Some("secret"))
+            .send()
+            .expect("ring query")
+            .json::<Vec<serde_json::Value>>()
+            .expect("ring rows json")
+    };
+
+    // The ring write races the response by a hair; poll briefly.
+    let mut minted_rows = Vec::new();
+    for _ in 0..50 {
+        minted_rows = rows_for(&format!("?api_key_id={key_id}"));
+        if !minted_rows.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        minted_rows.len(),
+        1,
+        "the key filter returns exactly the governed row: {minted_rows:?}"
+    );
+    let row = &minted_rows[0];
+    assert_eq!(row["path"], "/governed");
+    assert_eq!(row["api_key_id"], key_id.as_str());
+    assert_eq!(row["key_mode"], "minted");
+    assert_eq!(row["session_id"], session);
+    assert_eq!(row["tenant_id"], "__default__");
+    assert!(
+        row["config_revision"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()),
+        "every row names the config generation that served it: {row}"
+    );
+    assert!(
+        !row.to_string().contains("sbp_"),
+        "a ring row must never carry the raw minted secret: {row}"
+    );
+
+    let native_rows = rows_for("?key_mode=native");
+    assert_eq!(native_rows.len(), 1, "native filter: {native_rows:?}");
+    assert_eq!(native_rows[0]["path"], "/native");
+    assert_eq!(native_rows[0]["key_provider"], "anthropic");
+    assert!(
+        !native_rows[0].to_string().contains("sk-ant-"),
+        "a ring row must never carry the caller's native secret: {}",
+        native_rows[0]
+    );
+
+    let session_rows = rows_for(&format!("?session_id={session}"));
+    assert_eq!(session_rows.len(), 1, "session filter: {session_rows:?}");
+    assert_eq!(session_rows[0]["api_key_id"], key_id.as_str());
+
+    let none_rows = rows_for("?key_mode=none");
+    assert!(
+        none_rows
+            .iter()
+            .any(|row| row["path"] == "/unkeyed" && row["api_key_id"].is_null()),
+        "unkeyed traffic stays visible and unattributed: {none_rows:?}"
+    );
+
+    assert_eq!(
+        client
+            .get(format!(
+                "http://127.0.0.1:{admin_port}/api/requests?key_mode=bogus"
+            ))
+            .basic_auth("admin", Some("secret"))
+            .send()
+            .expect("bad filter")
+            .status()
+            .as_u16(),
+        400,
+        "key_mode is a closed vocabulary"
+    );
+}

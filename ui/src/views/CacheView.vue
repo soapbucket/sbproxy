@@ -27,11 +27,7 @@ const selectedOrigin = ref("");
 const cacheResultsFamily = computed(() => {
   const text = metricsReq.data.value;
   if (!text) return undefined;
-  return findFamily(
-    parsePrometheus(text),
-    "sbproxy_cache_results_total",
-    "sbproxy_cache_hits_total",
-  );
+  return findFamily(parsePrometheus(text), "sbproxy_cache_results_total");
 });
 const originOptions = computed(() => {
   const fromMetrics =

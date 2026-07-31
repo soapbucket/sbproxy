@@ -514,6 +514,7 @@ mod tests {
             tags: Vec::new(),
             metadata: std::collections::BTreeMap::new(),
             request_id: rid.map(|s| s.to_string()),
+            session_id: None,
             tag: None,
             priority: None,
             engine_version: None,

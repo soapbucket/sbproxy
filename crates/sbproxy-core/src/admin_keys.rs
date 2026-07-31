@@ -1269,6 +1269,7 @@ fn set_key_status(id: &str, status: RecordStatus, body: Option<&str>) -> Resp {
     if rec.status == RecordStatus::Revoked {
         return terminal_key(id, rec.policy_revision);
     }
+    let prior_status = rec.status;
     rec.status = status;
     rec.updated_at = Utc::now();
     let rec = match store_key_if_revision(&plane, rec, expected_revision) {
@@ -1276,7 +1277,13 @@ fn set_key_status(id: &str, status: RecordStatus, body: Option<&str>) -> Resp {
         Err(response) => return response,
     };
     invalidate(&plane, id);
-    audit_mutation(status_verb(status), "key", id);
+    audit_mutation_scoped(
+        status_verb(status),
+        "key",
+        id,
+        rec.tenant_id.as_deref(),
+        Some((prior_status, status)),
+    );
     ok(json!({ "key": KeyView::from(&rec) }))
 }
 
@@ -1549,13 +1556,20 @@ fn set_credential_status(id: &str, status: RecordStatus) -> Resp {
         Ok(None) => return not_found("credential not found"),
         Err(e) => return internal_error(&e),
     };
+    let prior_status = rec.status;
     rec.status = status;
     rec.updated_at = Utc::now();
     if let Err(e) = store_credential(&plane, rec.clone()) {
         return internal_error(&e);
     }
     invalidate(&plane, id);
-    audit_mutation(status_verb(status), "credential", id);
+    audit_mutation_scoped(
+        status_verb(status),
+        "credential",
+        id,
+        rec.tenant_id.as_deref(),
+        Some((prior_status, status)),
+    );
     ok(json!({ "credential": CredentialView::from(&rec) }))
 }
 
@@ -1801,8 +1815,46 @@ fn status_verb(status: RecordStatus) -> &'static str {
 
 /// Emit an audit record for a key/credential mutation. Wired to the audit sink
 /// in WOR-1557; here it stamps the structured event onto the tracing pipeline.
+///
+/// WOR-2094: names the acting operator (from the admin dispatch
+/// thread-local) so the trail answers who changed what, not just that
+/// something changed.
 fn audit_mutation(op: &str, kind: &str, id: &str) {
-    sbproxy_observe::KeyAuditEntry::new(op, kind, id).emit();
+    audit_mutation_scoped(op, kind, id, None, None);
+}
+
+/// [`audit_mutation`] with tenant scope and a secret-free status diff
+/// for mutations where both are cheaply at hand (WOR-2094).
+fn audit_mutation_scoped(
+    op: &str,
+    kind: &str,
+    id: &str,
+    tenant_id: Option<&str>,
+    status_diff: Option<(RecordStatus, RecordStatus)>,
+) {
+    let mut entry = sbproxy_observe::KeyAuditEntry::new(op, kind, id);
+    if let Some(actor) = crate::admin::current_admin_actor() {
+        entry = entry.with_actor(actor);
+    }
+    if let Some(tenant_id) = tenant_id {
+        entry = entry.with_tenant_id(tenant_id);
+    }
+    if let Some((before, after)) = status_diff {
+        entry = entry.with_diff(
+            Some(json!({ "status": status_label(before) })),
+            Some(json!({ "status": status_label(after) })),
+        );
+    }
+    entry.emit();
+}
+
+/// Closed status vocabulary for the audit diff; never a secret.
+fn status_label(status: RecordStatus) -> &'static str {
+    match status {
+        RecordStatus::Active => "active",
+        RecordStatus::Blocked => "blocked",
+        RecordStatus::Revoked => "revoked",
+    }
 }
 
 fn parse_body<T: for<'de> Deserialize<'de> + Default>(body: Option<&str>) -> Result<T, Resp> {

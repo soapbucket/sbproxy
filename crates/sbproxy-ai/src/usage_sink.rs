@@ -65,6 +65,11 @@ pub struct LlmUsageEvent {
     /// exactly-once on replay. `None` events are never deduplicated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// Session the request belonged to, when the capture envelope
+    /// resolved one (WOR-2093). Lets a downstream store join spend to
+    /// the session a key has had without going through the access log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// Optional tag set by a `set_sink_tag` action from the AI policy
     /// plane (WOR-1542), so a policy decision is queryable in the spend
     /// record.
@@ -812,6 +817,7 @@ mod tests {
             tags: Vec::new(),
             metadata: std::collections::BTreeMap::new(),
             request_id: None,
+            session_id: None,
             tag: None,
             priority: None,
             engine_version: None,
