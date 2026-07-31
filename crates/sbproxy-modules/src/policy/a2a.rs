@@ -148,6 +148,31 @@ impl A2APolicyDecision {
     }
 
     /// Stable string label used for metrics / audit `reason` fields.
+    /// Value for the `decision` label on `sbproxy_a2a_hops_total`.
+    ///
+    /// Allows are split by whether the envelope's identity was verified,
+    /// because the two are operationally different facts that used to
+    /// share one label. A policy that never engages, or that only ever
+    /// sees forgeable caller-supplied envelopes, emits an unbroken
+    /// stream of allows and reads exactly like a healthy one. Splitting
+    /// the label lets an operator alert on "this policy is configured
+    /// but has never evaluated a verified chain."
+    ///
+    /// Denials keep naming the control that fired, which is what a page
+    /// is written against, and ignore verification state.
+    pub fn metric_label(&self, identity_verified: bool) -> String {
+        if self.is_allow() {
+            if identity_verified {
+                "allow:verified".to_string()
+            } else {
+                "allow:unverified".to_string()
+            }
+        } else {
+            format!("deny:{}", self.reason_label())
+        }
+    }
+
+    /// Short label naming the control that produced a denial.
     pub fn reason_label(&self) -> &'static str {
         match self {
             Self::Allow => "allow",
@@ -391,6 +416,35 @@ mod tests {
             // `auth::a2a` trust-gate tests.
             identity_verified: true,
         }
+    }
+
+    #[test]
+    fn metric_label_separates_verified_allows_from_unverified_ones() {
+        // Without this split a policy that never engages emits the same
+        // `allow` as one that evaluated a verified chain, so a dashboard
+        // showing nothing but allows reads as healthy whether the policy
+        // is working or completely bypassed.
+        assert_eq!(
+            A2APolicyDecision::Allow.metric_label(true),
+            "allow:verified"
+        );
+        assert_eq!(
+            A2APolicyDecision::Allow.metric_label(false),
+            "allow:unverified"
+        );
+    }
+
+    #[test]
+    fn metric_label_for_a_denial_names_the_control_that_fired() {
+        let denied = A2APolicyDecision::ChainDepthExceeded { limit: 5, depth: 9 };
+        assert_eq!(denied.metric_label(true), "deny:depth");
+    }
+
+    #[test]
+    fn metric_label_for_a_denial_ignores_verification_state() {
+        // A deny is a deny; the reason is what an operator pages on.
+        let denied = A2APolicyDecision::ChainDepthExceeded { limit: 5, depth: 9 };
+        assert_eq!(denied.metric_label(false), denied.metric_label(true));
     }
 
     #[test]

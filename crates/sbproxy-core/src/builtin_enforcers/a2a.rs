@@ -68,7 +68,19 @@ impl PolicyEnforcer for A2AEnforcer {
                 // Evaluate against the zero-default envelope so route
                 // limits still apply; `identity_verified` stays false.
                 Some(spec) => sbproxy_modules::A2AContext::empty(spec.to_spec()),
-                None => return Box::pin(async move { Ok(PolicyDecision::Allow) }),
+                None => {
+                    // The policy is configured on this route but did not
+                    // engage. Record it: an unbroken stream of allows
+                    // from a policy that never runs is indistinguishable
+                    // from a healthy one, which is how a bypass stays
+                    // invisible on a dashboard.
+                    sbproxy_observe::metrics::record_a2a_hop(
+                        &ctx.hostname.to_string(),
+                        "none",
+                        "skip:undetected",
+                    );
+                    return Box::pin(async move { Ok(PolicyDecision::Allow) });
+                }
             },
         };
 
@@ -87,12 +99,13 @@ impl PolicyEnforcer for A2AEnforcer {
         let callable_endpoint = req.uri().path().to_string();
         let decision = policy.evaluate(&a2a_ctx, &callable_endpoint);
         sbproxy_observe::metrics::record_a2a_chain_depth(&route, spec_label, a2a_ctx.chain_depth);
+        let decision_label = decision.metric_label(a2a_ctx.identity_verified);
         if decision.is_allow() {
-            sbproxy_observe::metrics::record_a2a_hop(&route, spec_label, "allow");
+            sbproxy_observe::metrics::record_a2a_hop(&route, spec_label, &decision_label);
             return Box::pin(async move { Ok(PolicyDecision::Allow) });
         }
         let reason = decision.reason_label();
-        sbproxy_observe::metrics::record_a2a_hop(&route, spec_label, &format!("deny:{reason}"));
+        sbproxy_observe::metrics::record_a2a_hop(&route, spec_label, &decision_label);
         sbproxy_observe::metrics::record_a2a_denied(&route, reason);
         let body = decision.json_body();
         let status = decision.http_status();
