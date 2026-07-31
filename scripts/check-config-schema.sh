@@ -17,6 +17,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# shellcheck source=scripts/lib/workspace-bin.sh
+. "$(dirname "$0")/lib/workspace-bin.sh"
+
 # schema file : "cargo run" args that regenerate it
 schemas=(
     "schemas/sb-config.schema.json|-p sbproxy-config --bin generate-schema"
@@ -32,8 +35,9 @@ status=0
 for entry in "${schemas[@]}"; do
     file="${entry%%|*}"
     args="${entry#*|}"
+    bin_name="${args##*--bin }"
     # shellcheck disable=SC2086
-    cargo run --quiet $args >"$GENERATED"
+    run_workspace_bin "$bin_name" $args >"$GENERATED"
     if diff -u "$file" "$GENERATED" >/dev/null; then
         echo "$file is up to date."
     else
