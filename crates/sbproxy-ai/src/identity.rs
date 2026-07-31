@@ -187,6 +187,11 @@ pub struct VirtualKeyConfig {
     /// otherwise self-flag.
     #[serde(default)]
     pub bypass_prompt_injection: bool,
+    /// Consent to the origin's opt-in redacted content capture
+    /// (WOR-2096). Default false; a sample is retained only when the
+    /// origin also sets `capture_content: true`.
+    #[serde(default)]
+    pub allow_content_capture: bool,
 }
 
 impl VirtualKeyConfig {
@@ -530,6 +535,7 @@ mod tests {
             inject_mcp: None,
             enabled,
             bypass_prompt_injection: false,
+            allow_content_capture: false,
         }
     }
 
@@ -559,6 +565,7 @@ mod tests {
             inject_mcp: None,
             enabled: true,
             bypass_prompt_injection: false,
+            allow_content_capture: false,
         }
     }
 

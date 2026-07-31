@@ -251,6 +251,7 @@ fn effective_policy_to_virtual_key(
         }),
         enabled: true,
         bypass_prompt_injection: policy.bypass_prompt_injection,
+        allow_content_capture: policy.allow_content_capture,
     }
 }
 
@@ -1872,6 +1873,17 @@ fn principal_for_resolved_virtual_key(
 /// arrangement in which the dashboard cannot silently disagree with the access
 /// log: a new block path has to go through here to stamp the context, and
 /// stamping the context increments the counter.
+/// WOR-2096: both the origin flag and the governed key's policy must
+/// consent before any redacted content sample is retained. Fail closed:
+/// no effective policy (unkeyed or native traffic) means no capture.
+fn content_capture_allowed(config: &AiHandlerConfig, ctx: &RequestContext) -> bool {
+    config.capture_content
+        && ctx
+            .effective_key_policy
+            .as_ref()
+            .is_some_and(|policy| policy.allow_content_capture)
+}
+
 fn mark_guardrail_block(ctx: &mut RequestContext, category: String) {
     sbproxy_ai::ai_metrics::record_guardrail_block(&category);
     ctx.ai_outcome = Some("guardrail_block".to_string());
@@ -4319,7 +4331,8 @@ pub(super) async fn handle_ai_proxy(
     // Keep a single extraction available to both the prompt classifier
     // and the intent detection hook so we do not re-parse the body twice.
     let extracted_prompt = extract_prompt_text(&body);
-    let trace_content = AiTraceContentArgs::from_config(config);
+    let trace_content =
+        AiTraceContentArgs::from_config(config).with_capture(content_capture_allowed(config, ctx));
 
     // WOR-1228: emit the prompt as the OpenInference `input.value` span
     // attribute when the origin opts into content capture. Off by default;
@@ -4329,6 +4342,28 @@ pub(super) async fn handle_ai_proxy(
     if trace_content.enabled() && !extracted_prompt.is_empty() {
         let trace_messages = extract_prompt_trace_messages(&body);
         record_ai_input_trace(&ai_span, trace_content, &extracted_prompt, &trace_messages);
+    }
+    // WOR-2096: retain a redacted console sample when the origin opts in
+    // AND the governed key's policy consents. Independent of the
+    // trace_content span gate; same redaction stack and caps.
+    if trace_content.capture_enabled() && !extracted_prompt.is_empty() {
+        let capture_messages = captured_content_messages(
+            &extracted_prompt,
+            &extract_prompt_trace_messages(&body),
+            trace_content.redactor(),
+        );
+        if !capture_messages.is_empty() {
+            crate::content_capture::store_input(crate::content_capture::ContentSample {
+                request_id: ctx.request_id.to_string(),
+                api_key_id: ctx.accountable_key_id().map(str::to_string),
+                tenant_id: ctx.tenant_id.to_string(),
+                origin: hostname.to_string(),
+                model: (!model.is_empty()).then(|| model.clone()),
+                captured_at: chrono::Utc::now().to_rfc3339(),
+                input_messages: capture_messages,
+                output_text: None,
+            });
+        }
     }
 
     if let Some(hook) = pipeline.hooks.prompt_classifier.as_ref().cloned() {
@@ -8082,6 +8117,16 @@ pub(super) async fn relay_ai_response_with_cache(
         let completion = extract_completion_text(&resp_body);
         record_ai_output_trace(&ai_span, trace_content, &completion);
     }
+    // WOR-2096: attach the redacted response to the console sample.
+    if (200..300).contains(&status) && trace_content.capture_enabled() {
+        if let Some(request_id) = ctx.as_ref().map(|c| c.request_id.to_string()) {
+            let completion = extract_completion_text(&resp_body);
+            let redacted = redact_ai_trace_content(&completion, trace_content.redactor());
+            if !redacted.trim().is_empty() {
+                crate::content_capture::attach_output(&request_id, redacted);
+            }
+        }
+    }
 
     // Keep the internal response canonical through policy, accounting, and
     // semantic-cache writes. Adapt the bytes crossing the client boundary
@@ -9523,7 +9568,10 @@ pub(super) async fn relay_ai_stream(
     // a per-chunk `is_noop` short-circuit so byte-forward streaming
     // stays zero-overhead.
     let mut reversible_restore = StreamingReversibleRestore::new(reversible_pairs);
-    let mut trace_stream_content = trace_content.enabled().then(AiTraceStreamContent::default);
+    // WOR-2096: reassemble streamed text when either the span gate or
+    // the console capture gate wants the completion.
+    let mut trace_stream_content = (trace_content.enabled() || trace_content.capture_enabled())
+        .then(AiTraceStreamContent::default);
     // WOR-1144: set when the stream-safety classifier rejects a chunk so
     // the relay stops forwarding (fail closed) instead of delivering
     // flagged content. Leaves `upstream_complete` false so the recorder
@@ -10021,6 +10069,15 @@ pub(super) async fn relay_ai_stream(
         if let Some(trace) = trace_stream_content.take() {
             let completion = trace.finish();
             record_ai_output_trace(&ai_span, trace_content, &completion);
+            // WOR-2096: same completion, console sample gate.
+            if trace_content.capture_enabled() {
+                if let Some(request_id) = ctx.as_ref().map(|c| c.request_id.to_string()) {
+                    let redacted = redact_ai_trace_content(&completion, trace_content.redactor());
+                    if !redacted.trim().is_empty() {
+                        crate::content_capture::attach_output(&request_id, redacted);
+                    }
+                }
+            }
         }
     }
 

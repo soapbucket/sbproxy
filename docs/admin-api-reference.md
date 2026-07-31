@@ -522,6 +522,28 @@ To answer "what did this key do", filter by `api_key_id`; every row a
 governed request produced carries the same canonical id across this
 ring, the access log, the inbound-key metric, and exported spans.
 
+### `GET /api/requests/{request_id}/content`
+
+Fetch one request's redacted content sample: the prompt messages and
+response text retained when the AI origin sets `capture_content: true`
+AND the governed key's policy sets `allow_content_capture`. Both flags
+default to off and both must be on; unkeyed and native-key traffic is
+never sampled.
+
+Admin role required (a read-only operator receives `403`). Every read
+is audited before the content is returned: an `inspect_request_content`
+event naming the operator lands on the `sbproxy::admin::audit` tracing
+target and the `/api/audit/events` sample. `404` means no sample exists
+for that request id, either because a gate was off or because the
+bounded store (200 samples, at most 50 per tenant, cleared on restart)
+has already evicted it.
+
+Samples are redacted before storage: the secret redactor, the origin's
+PII redactor when configured, and an 8 KiB payload cap all apply, and
+configured credential carriers never reach capture surfaces. The
+durable content path is OTLP `trace_content:`; this endpoint is a
+runtime inspection sample.
+
 The admin UI derives its Sessions list and detail pages from this ring. Those
 pages are a recent operational view, not durable trace storage, a timing
 waterfall, or a request replay facility.

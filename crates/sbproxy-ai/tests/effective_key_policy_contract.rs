@@ -48,6 +48,7 @@ fn policy() -> EffectiveKeyPolicy {
             filter: vec!["search*".into()],
         }),
         bypass_prompt_injection: false,
+        allow_content_capture: true,
         max_requests_per_minute: Some(60),
         max_tokens_per_minute: Some(100_000),
         budget: Some(KeyBudgetPolicy {
@@ -64,6 +65,8 @@ const GOVERNED_KEY_E2E_SOURCE_PATH: &str = "e2e/tests/governed_key_policy.rs";
 const GOVERNED_KEY_E2E_SOURCE: &str = include_str!("../../../e2e/tests/governed_key_policy.rs");
 const AI_DISPATCH_SOURCE_PATH: &str = "crates/sbproxy-core/src/server/ai_dispatch.rs";
 const AI_DISPATCH_SOURCE: &str = include_str!("../../sbproxy-core/src/server/ai_dispatch.rs");
+const CONTENT_CAPTURE_E2E_SOURCE_PATH: &str = "e2e/tests/content_capture.rs";
+const CONTENT_CAPTURE_E2E_SOURCE: &str = include_str!("../../../e2e/tests/content_capture.rs");
 
 #[derive(Clone, Copy)]
 struct EnforcementTestRegistration {
@@ -153,6 +156,20 @@ fn governed_key_e2e_test(
     EnforcementTestRegistration {
         source_path: GOVERNED_KEY_E2E_SOURCE_PATH,
         source: GOVERNED_KEY_E2E_SOURCE,
+        test_name,
+        behavior_markers,
+        assertion,
+    }
+}
+
+fn content_capture_e2e_test(
+    test_name: &'static str,
+    behavior_markers: &'static [&'static str],
+    assertion: EnforcementAssertion,
+) -> EnforcementTestRegistration {
+    EnforcementTestRegistration {
+        source_path: CONTENT_CAPTURE_E2E_SOURCE_PATH,
+        source: CONTENT_CAPTURE_E2E_SOURCE,
         test_name,
         behavior_markers,
         assertion,
@@ -386,6 +403,16 @@ fn registered_enforcement_test(proof: PolicyEnforcementProof) -> EnforcementTest
             ],
             |policy| assert_eq!(policy.priority, KeyPriority::Interactive),
         ),
+        PolicyEnforcementProof::Observability => content_capture_e2e_test(
+            "both_gates_on_captures_a_redacted_sample_and_audits_the_read",
+            &[
+                "mint_key(admin_port, true)",
+                "a planted provider token must never survive into a sample",
+                "fetch_content(admin_port, &request_id)",
+                "content inspection must be audited",
+            ],
+            |policy| assert!(policy.allow_content_capture),
+        ),
     }
 }
 
@@ -419,6 +446,7 @@ fn every_policy_field_registers_a_concrete_enforcement_test() {
             "inject_tools",
             "inject_mcp",
             "bypass_prompt_injection",
+            "allow_content_capture",
             "max_requests_per_minute",
             "max_tokens_per_minute",
             "budget",
@@ -441,7 +469,7 @@ fn every_policy_field_registers_a_concrete_enforcement_test() {
             );
         }
     }
-    assert_eq!(registered_assertions.len(), 15);
+    assert_eq!(registered_assertions.len(), 16);
 }
 
 #[test]

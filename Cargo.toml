@@ -200,8 +200,8 @@ rquickjs = { version = "0.11", features = ["bindgen", "classes", "properties", "
 # wasmtime + wasi-common move in lockstep; bump both together. The version
 # floor is set by the cargo-deny advisory gate, which fails on any
 # unpatched RUSTSEC entry against wasmtime.
-wasmtime = { version = "44.0.1", default-features = false, features = ["cranelift", "runtime", "parallel-compilation"] }
-wasi-common = "44"
+wasmtime = { version = "46.0.2", default-features = false, features = ["cranelift", "runtime", "parallel-compilation"] }
+wasi-common = "46"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }

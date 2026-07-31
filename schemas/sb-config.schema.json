@@ -4855,6 +4855,11 @@
           "default": false,
           "type": "boolean"
         },
+        "allow_content_capture": {
+          "description": "Consent to the origin's opt-in redacted content capture for console inspection. Default false. A sample is retained only when the AI origin also sets `capture_content: true`, so both the operator and the key owner must opt in.",
+          "default": false,
+          "type": "boolean"
+        },
         "project": {
           "description": "Project attribution.",
           "default": null,

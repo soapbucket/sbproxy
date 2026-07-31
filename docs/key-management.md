@@ -224,6 +224,12 @@ everywhere. Key and credential lifecycle changes are audited with the
 acting operator and a status diff, queryable at `GET /api/audit/events`;
 see [admin-api-reference.md](admin-api-reference.md).
 
+A key policy may set `allow_content_capture: true` to consent to the
+origin's opt-in console content sampling. Consent alone captures nothing:
+the AI origin must also set `capture_content: true`, and every retained
+sample is redacted before storage. See the console content samples
+section of [ai-gateway.md](ai-gateway.md).
+
 ### Requiring a key
 
 `require: true` refuses a request that carried no minted key, with a 401. It is

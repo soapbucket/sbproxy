@@ -1814,6 +1814,25 @@ origin's configured PII redactor when present, and an 8 KiB payload cap with a
 `...[truncated]` marker. Streaming responses are assembled from forwarded
 chunks before the completion is recorded.
 
+### Console content samples
+
+`capture_content: true` on an AI origin retains a redacted sample of the
+prompt and response in a bounded in-memory store so an operator can inspect
+one request's content from the admin console without a trace backend. The
+gate is two-sided and fails closed: a sample is retained only when the origin
+sets this flag AND the governed key's policy sets `allow_content_capture`.
+Unkeyed and native-key traffic is never sampled, because only a minted key's
+policy can carry the consent bit.
+
+The same redaction stack as `trace_content` always applies (the secret
+redactor, the origin's PII redactor when configured, the 8 KiB cap), and
+configured credential carriers never reach capture surfaces. The store holds
+the most recent 200 samples, at most 50 per tenant, and clears on restart.
+Samples are fetched with `GET /api/requests/{request_id}/content` (admin role
+only; every read is audited with the operator's name). For durable content
+capture, use `trace_content` with your collector; this store is a runtime
+inspection sample, not a log.
+
 ## Verifiable usage ledger
 
 The `ledger` usage sink turns the stream of completed LLM calls into a tamper-evident record: each entry is hash-chained to the one before it, so editing any past record breaks every link after it, and with a signing seed configured each entry is Ed25519-signed. Appends happen after the response is already sent, so the ledger never adds latency to the call it records.

@@ -2523,6 +2523,66 @@ pub fn handle_admin_request(
             ),
         };
     }
+    // WOR-2096: fetch one request's redacted content sample. Admin role
+    // only, and every read is audited before the content is returned.
+    if let Some(request_id) = path_only
+        .strip_prefix("/api/requests/")
+        .and_then(|rest| rest.strip_suffix("/content"))
+    {
+        if !method.eq_ignore_ascii_case("GET") {
+            return (
+                405,
+                "application/json",
+                r#"{"error":"method not allowed"}"#.to_string(),
+            );
+        }
+        if current_admin_role() != Some(AdminRole::Admin) {
+            return (
+                403,
+                "application/json",
+                r#"{"error":"forbidden: content inspection requires the admin role"}"#.to_string(),
+            );
+        }
+        let Some(sample) = crate::content_capture::sample_for(request_id) else {
+            return (
+                404,
+                "application/json",
+                r#"{"error":"no content sample for that request id; capture requires the origin's capture_content flag AND the key policy's allow_content_capture consent"}"#
+                    .to_string(),
+            );
+        };
+        // Audit BEFORE returning content, mirroring the compression
+        // content endpoint's posture: an operator reading caller
+        // content is itself a security-relevant event.
+        let operator = current_admin_actor().unwrap_or_default();
+        tracing::info!(
+            target: "sbproxy::admin::audit",
+            operator = %operator,
+            request_id = %request_id,
+            tenant_id = %sample.tenant_id,
+            action = "inspect_request_content",
+            "admin content inspection"
+        );
+        sbproxy_observe::audit_ring::push_audit_event(
+            sbproxy_observe::audit_ring::AuditRingEvent::new(
+                "admin",
+                "inspect_request_content",
+                Some(operator),
+                Some(sample.tenant_id.clone()),
+                sample.api_key_id.clone(),
+                Some(request_id.to_string()),
+                None,
+            ),
+        );
+        return match serde_json::to_string(&sample) {
+            Ok(body) => (200, "application/json", body),
+            Err(e) => (
+                500,
+                "application/json",
+                format!(r#"{{"error":"serialization failed: {e}"}}"#),
+            ),
+        };
+    }
     // WOR-1718: recent request log with filters + pagination. Query params:
     // `status` (exact), `method` (case-insensitive), `path` (substring),
     // `offset`, `limit`. No params returns the newest entries, unchanged.
@@ -3089,7 +3149,7 @@ thread_local! {
     /// this blocking thread (WOR-2094). The blocking dispatcher runs one
     /// request end-to-end on one pooled thread, so a scoped slot is
     /// sound; the guard clears it before the thread returns to the pool.
-    static CURRENT_ADMIN_ACTOR: std::cell::RefCell<Option<String>> =
+    static CURRENT_ADMIN_ACTOR: std::cell::RefCell<Option<(String, AdminRole)>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -3098,7 +3158,13 @@ thread_local! {
 /// audit emitters below the sync dispatcher so mutations name their
 /// actor without threading a parameter through every handler.
 pub(crate) fn current_admin_actor() -> Option<String> {
-    CURRENT_ADMIN_ACTOR.with(|slot| slot.borrow().clone())
+    CURRENT_ADMIN_ACTOR.with(|slot| slot.borrow().as_ref().map(|(name, _)| name.clone()))
+}
+
+/// Role of the operator dispatching on this thread (WOR-2096), for
+/// handlers below the sync dispatcher that gate on admin-only reads.
+pub(crate) fn current_admin_role() -> Option<AdminRole> {
+    CURRENT_ADMIN_ACTOR.with(|slot| slot.borrow().as_ref().map(|(_, role)| *role))
 }
 
 /// Clears the actor slot when the dispatch scope ends.
@@ -3112,7 +3178,7 @@ impl Drop for AdminActorGuard {
 
 /// Install `actor` as the dispatching operator for this thread and
 /// return a guard that clears it on scope exit.
-fn set_current_admin_actor(actor: Option<String>) -> AdminActorGuard {
+fn set_current_admin_actor(actor: Option<(String, AdminRole)>) -> AdminActorGuard {
     CURRENT_ADMIN_ACTOR.with(|slot| *slot.borrow_mut() = actor);
     AdminActorGuard
 }
@@ -3950,7 +4016,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     // WOR-2094: carry the authenticated operator onto the dispatch
     // thread so audit emitters below the sync dispatcher can name the
     // actor of a mutation.
-    let actor_for_task = principal.as_ref().map(|p| p.username.clone());
+    let actor_for_task = principal.as_ref().map(|p| (p.username.clone(), p.role));
     let (status, content_type, body) = match tokio::task::spawn_blocking(move || {
         let _actor_guard = set_current_admin_actor(actor_for_task);
         handle_admin_request(

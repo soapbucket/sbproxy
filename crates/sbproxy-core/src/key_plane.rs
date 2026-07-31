@@ -732,6 +732,7 @@ fn lower_seed_key(
     rec.inject_tools = seed.inject_tools.clone();
     rec.inject_mcp = seed.inject_mcp.clone();
     rec.bypass_prompt_injection = seed.bypass_prompt_injection;
+    rec.allow_content_capture = seed.allow_content_capture;
     rec.project = seed.project.clone();
     rec.user = seed.user.clone();
     rec.tags = seed.tags.clone();
@@ -1176,6 +1177,7 @@ mod tests {
                 inject_tools: vec![],
                 inject_mcp: Some(serde_json::json!({ "ref": "toolhub" })),
                 bypass_prompt_injection: false,
+                allow_content_capture: false,
                 project: None,
                 user: None,
                 tags: vec!["production".into()],
@@ -1297,6 +1299,7 @@ mod tests {
                 inject_tools: vec![],
                 inject_mcp: None,
                 bypass_prompt_injection: false,
+                allow_content_capture: false,
                 project: None,
                 user: None,
                 tags: vec![],
