@@ -1,6 +1,6 @@
 //! Route-scoped RAG runtime registry (WOR-2098).
 //!
-//! [`RagRuntimeRegistry`] parallels [`CompiledPipeline`]'s per-origin
+//! [`RagRuntimeRegistry`](crate::rag_runtime::RagRuntimeRegistry) parallels [`CompiledPipeline`]'s per-origin
 //! vectors the same way
 //! [`CompressionRuntimeRegistry`](crate::compression_runtime::CompressionRuntimeRegistry)
 //! does: one slot per compiled origin action plus one slot per compiled
@@ -11,7 +11,7 @@
 //! have pinned.
 //!
 //! Selection is strict: a forward rule without its own `rag:` block has no
-//! runtime, and [`RagRuntimeRegistry::get`] never falls back to the origin
+//! runtime, and [`RagRuntimeRegistry::get`](crate::rag_runtime::RagRuntimeRegistry::get) never falls back to the origin
 //! runtime for it. Retrieval scope is part of the route contract, so an
 //! operator who augments `/support/` traffic must not silently augment a
 //! carved-out `/health` rule as well.
