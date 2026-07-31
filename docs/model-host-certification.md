@@ -102,10 +102,13 @@ The four failures from the 2026-07-30 run now have explicit contracts:
   engine exited, removes its durable ownership record, and releases the public
   listener.
 - The launchd bootstrap registers every exact gateway generation before it can
-  execute. `service uninstall` holds the same lifecycle lock across unload,
-  reads the ownership directory from the service environment file, and keeps
-  the plist plus retry state until every registered owner's engine cleanup
-  succeeds. A loaded legacy plist without registration fails closed.
+  execute. The registry preserves bootstrap provenance separately from later
+  uninstall observations. `service uninstall` holds the same lifecycle lock,
+  requires the exact initially loaded generation to be bootstrap-registered
+  before unload, reads the ownership directory from the service environment
+  file, and keeps the plist plus retry state until exact-owner engine cleanup
+  succeeds. A legacy or interrupted install with no matching registration
+  fails closed.
 - A managed child blocks before `exec` until its owner and engine
   fingerprints are on durable storage. Persistence failure stops the child
   before it can execute. An `exec` failure is reported through the normal

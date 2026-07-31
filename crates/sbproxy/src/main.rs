@@ -3366,7 +3366,8 @@ fn ensure_service_env_file(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-const SERVICE_UNINSTALL_STATE_SCHEMA_VERSION: u32 = 1;
+const LEGACY_SERVICE_UNINSTALL_STATE_SCHEMA_VERSION: u32 = 1;
+const SERVICE_UNINSTALL_STATE_SCHEMA_VERSION: u32 = 2;
 const MAX_SERVICE_OWNER_GENERATIONS: usize = 4_096;
 const MAX_SERVICE_UNINSTALL_STATE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SERVICE_UNLOAD_ATTEMPTS: usize = 8;
@@ -3377,6 +3378,8 @@ struct ServiceUninstallState {
     schema_version: u32,
     ownership_directory: PathBuf,
     owners: Vec<sbproxy_model_host::ManagedEngineOwner>,
+    #[serde(default)]
+    bootstrap_registered_owners: Vec<sbproxy_model_host::ManagedEngineOwner>,
 }
 
 #[derive(Debug)]
@@ -3437,7 +3440,7 @@ fn append_service_owner(
     state: &mut ServiceUninstallState,
     owner: &sbproxy_model_host::ManagedEngineOwner,
 ) -> anyhow::Result<bool> {
-    if state.owners.contains(owner) {
+    if service_owner_list_contains(&state.owners, owner) {
         return Ok(false);
     }
     if state.owners.len() >= MAX_SERVICE_OWNER_GENERATIONS {
@@ -3448,6 +3451,46 @@ fn append_service_owner(
     }
     state.owners.push(owner.clone());
     Ok(true)
+}
+
+fn service_owner_list_contains(
+    owners: &[sbproxy_model_host::ManagedEngineOwner],
+    owner: &sbproxy_model_host::ManagedEngineOwner,
+) -> bool {
+    owners
+        .iter()
+        .any(|candidate| candidate.same_process_generation(owner))
+}
+
+fn register_bootstrap_service_owner(
+    state: &mut ServiceUninstallState,
+    owner: &sbproxy_model_host::ManagedEngineOwner,
+) -> anyhow::Result<bool> {
+    let owner_is_new = !service_owner_list_contains(&state.owners, owner);
+    let registration_is_new =
+        !service_owner_list_contains(&state.bootstrap_registered_owners, owner);
+    if owner_is_new && state.owners.len() >= MAX_SERVICE_OWNER_GENERATIONS {
+        anyhow::bail!(
+            "service owner generation limit ({MAX_SERVICE_OWNER_GENERATIONS}) reached; \
+             uninstall and inspect the durable lifecycle state before restarting"
+        );
+    }
+    if registration_is_new
+        && state.bootstrap_registered_owners.len() >= MAX_SERVICE_OWNER_GENERATIONS
+    {
+        anyhow::bail!(
+            "bootstrap-registered service owner generation limit \
+             ({MAX_SERVICE_OWNER_GENERATIONS}) reached; uninstall and inspect the durable \
+             lifecycle state before restarting"
+        );
+    }
+    if owner_is_new {
+        state.owners.push(owner.clone());
+    }
+    if registration_is_new {
+        state.bootstrap_registered_owners.push(owner.clone());
+    }
+    Ok(owner_is_new || registration_is_new)
 }
 
 fn register_service_owner_locked(
@@ -3467,6 +3510,7 @@ fn register_service_owner_locked(
         schema_version: SERVICE_UNINSTALL_STATE_SCHEMA_VERSION,
         ownership_directory: ownership_directory.to_path_buf(),
         owners: Vec::new(),
+        bootstrap_registered_owners: Vec::new(),
     });
     if state.ownership_directory != ownership_directory {
         anyhow::bail!(
@@ -3477,7 +3521,7 @@ fn register_service_owner_locked(
             ownership_directory.display()
         );
     }
-    if append_service_owner(&mut state, owner)? {
+    if register_bootstrap_service_owner(&mut state, owner)? {
         persist_service_uninstall_state(state_path, &state)?;
     }
     Ok(())
@@ -3680,11 +3724,25 @@ fn read_service_uninstall_state(
             MAX_SERVICE_UNINSTALL_STATE_BYTES
         );
     }
-    let state: ServiceUninstallState = serde_json::from_slice(&bytes)
+    let mut state: ServiceUninstallState = serde_json::from_slice(&bytes)
         .map_err(|error| anyhow::anyhow!("parse '{}': {error}", path.display()))?;
-    if state.schema_version != SERVICE_UNINSTALL_STATE_SCHEMA_VERSION
-        || !state.ownership_directory.is_absolute()
+    match state.schema_version {
+        LEGACY_SERVICE_UNINSTALL_STATE_SCHEMA_VERSION => {
+            // Schema 1 mixed bootstrap registrations with owners observed by
+            // uninstall, so none of its entries can prove registration.
+            state.bootstrap_registered_owners.clear();
+            state.schema_version = SERVICE_UNINSTALL_STATE_SCHEMA_VERSION;
+        }
+        SERVICE_UNINSTALL_STATE_SCHEMA_VERSION => {}
+        _ => anyhow::bail!("validate '{}': unsupported or unsafe state", path.display()),
+    }
+    if !state.ownership_directory.is_absolute()
         || state.owners.len() > MAX_SERVICE_OWNER_GENERATIONS
+        || state.bootstrap_registered_owners.len() > MAX_SERVICE_OWNER_GENERATIONS
+        || !state
+            .bootstrap_registered_owners
+            .iter()
+            .all(|owner| service_owner_list_contains(&state.owners, owner))
     {
         anyhow::bail!("validate '{}': unsupported or unsafe state", path.display());
     }
@@ -3846,11 +3904,38 @@ fn perform_service_uninstall(
         });
     }
 
+    // The plist on disk can be newer than the generation launchd is still
+    // running. Prove the exact initially observed process completed this
+    // version's bootstrap registration before trusting the cooperative lock.
+    // Owners recorded only by an older uninstall attempt do not carry that
+    // provenance and cannot authorize unload.
+    let mut initially_registered_owner = match status {
+        LaunchdJobStatus::Loaded { pid: Some(pid) } => {
+            let owner = cleanup.capture_owner(pid)?;
+            let was_bootstrap_registered = state.as_ref().is_some_and(|state| {
+                service_owner_list_contains(&state.bootstrap_registered_owners, &owner)
+            });
+            if !was_bootstrap_registered {
+                anyhow::bail!(
+                    "launchd job '{SERVICE_LABEL}' generation pid {pid} was not registered by \
+                     the service bootstrap; refusing to unload because the plist on disk cannot \
+                     prove which generation launchd is running. Reinstall the intended model \
+                     with this sbproxy version (`sbproxy service install <model>`), wait for \
+                     `sbproxy service status` to report running, then retry uninstall. The \
+                     existing plist and lifecycle state were retained."
+                );
+            }
+            Some((pid, owner))
+        }
+        LaunchdJobStatus::NotLoaded | LaunchdJobStatus::Loaded { pid: None } => None,
+    };
+
     if state.is_none() {
         state = Some(ServiceUninstallState {
             schema_version: SERVICE_UNINSTALL_STATE_SCHEMA_VERSION,
             ownership_directory: service_engine_ownership_directory(paths)?,
             owners: Vec::new(),
+            bootstrap_registered_owners: Vec::new(),
         });
     }
     let state = state.as_mut().expect("uninstall state initialized");
@@ -3874,12 +3959,21 @@ fn perform_service_uninstall(
             }
         };
 
-        let owner = cleanup.capture_owner(pid)?;
+        let owner = if let Some((registered_pid, owner)) = initially_registered_owner.take() {
+            debug_assert_eq!(registered_pid, pid);
+            owner
+        } else {
+            cleanup.capture_owner(pid)?
+        };
         let owner_was_added = append_service_owner(state, &owner)?;
         if owner_was_added {
             persist_service_uninstall_state(&paths.uninstall_state, state)?;
         }
-        if prior_owner.as_ref() == Some(&owner) && !owner_was_added {
+        if prior_owner
+            .as_ref()
+            .is_some_and(|prior| prior.same_process_generation(&owner))
+            && !owner_was_added
+        {
             no_progress += 1;
             if no_progress >= MAX_SERVICE_UNLOAD_NO_PROGRESS {
                 anyhow::bail!(
@@ -9979,12 +10073,37 @@ mod tests {
         pid: u32,
         start_fingerprint: u64,
     ) -> sbproxy_model_host::ManagedEngineOwner {
+        fake_managed_engine_owner_with_executable(pid, start_fingerprint, None)
+    }
+
+    fn fake_managed_engine_owner_with_executable(
+        pid: u32,
+        start_fingerprint: u64,
+        executable: Option<&str>,
+    ) -> sbproxy_model_host::ManagedEngineOwner {
         serde_json::from_value(serde_json::json!({
             "pid": pid,
             "start_fingerprint": start_fingerprint,
-            "executable": null,
+            "executable": executable,
         }))
         .expect("construct a distinct opaque owner token")
+    }
+
+    fn register_test_service_owner(
+        paths: &ServicePaths,
+        owner: &sbproxy_model_host::ManagedEngineOwner,
+    ) {
+        let ownership_directory =
+            service_engine_ownership_directory(paths).expect("resolve test ownership directory");
+        let lifecycle_lock =
+            acquire_service_lifecycle_lock(&paths.lifecycle_lock).expect("lock lifecycle");
+        register_service_owner_locked(
+            &lifecycle_lock,
+            &paths.uninstall_state,
+            &ownership_directory,
+            owner,
+        )
+        .expect("register test bootstrap generation");
     }
 
     #[cfg(unix)]
@@ -10008,7 +10127,8 @@ mod tests {
             .unwrap()
             .expect("durable lifecycle state");
         assert_eq!(state.ownership_directory, ownership_directory);
-        assert_eq!(state.owners, vec![owner]);
+        assert_eq!(state.owners, vec![owner.clone()]);
+        assert_eq!(state.bootstrap_registered_owners, vec![owner]);
         assert!(paths.lifecycle_lock.exists());
         drop(lifecycle_lock);
         let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
@@ -10028,6 +10148,7 @@ mod tests {
                 schema_version: SERVICE_UNINSTALL_STATE_SCHEMA_VERSION,
                 ownership_directory: ownership_directory.clone(),
                 owners: owners.clone(),
+                bootstrap_registered_owners: Vec::new(),
             },
         )
         .unwrap();
@@ -10050,6 +10171,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(state.owners, owners);
+        assert!(state.bootstrap_registered_owners.is_empty());
         drop(lifecycle_lock);
         let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
     }
@@ -10216,6 +10338,173 @@ mod tests {
     }
 
     #[test]
+    fn service_uninstall_fails_closed_when_loaded_generation_has_no_registry() {
+        let paths = service_temp_paths("loaded-without-registry");
+        write_registered_service_plist(&paths);
+        let mut launchd = FakeLaunchd {
+            statuses: [
+                LaunchdJobStatus::Loaded {
+                    pid: Some(std::process::id()),
+                },
+                LaunchdJobStatus::NotLoaded,
+            ]
+            .into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+
+        let error = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect_err("a plist marker cannot prove the running generation registered");
+
+        assert!(error.to_string().contains("not registered"), "{error:#}");
+        assert_eq!(launchd.unload_calls, 0);
+        assert_eq!(cleanup.capture_calls, 1);
+        assert!(paths.plist.exists(), "the retry handle must remain");
+        assert!(
+            !paths.uninstall_state.exists(),
+            "uninstall must not invent registration state"
+        );
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_fails_closed_when_registry_has_only_an_unrelated_owner() {
+        let paths = service_temp_paths("loaded-with-unrelated-registry");
+        write_registered_service_plist(&paths);
+        let ownership_directory = paths
+            .config
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("managed-engines");
+        let unrelated_owner = fake_managed_engine_owner(91_001, 91_001);
+        persist_service_uninstall_state(
+            &paths.uninstall_state,
+            &ServiceUninstallState {
+                schema_version: SERVICE_UNINSTALL_STATE_SCHEMA_VERSION,
+                ownership_directory,
+                owners: vec![unrelated_owner.clone()],
+                bootstrap_registered_owners: Vec::new(),
+            },
+        )
+        .unwrap();
+        let state_before = std::fs::read(&paths.uninstall_state).unwrap();
+        let mut launchd = FakeLaunchd {
+            statuses: [
+                LaunchdJobStatus::Loaded {
+                    pid: Some(std::process::id()),
+                },
+                LaunchdJobStatus::NotLoaded,
+            ]
+            .into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+
+        let error = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect_err("an unrelated owner cannot authorize unloading this generation");
+
+        assert!(error.to_string().contains("not registered"), "{error:#}");
+        assert_eq!(launchd.unload_calls, 0);
+        assert_eq!(cleanup.capture_calls, 1);
+        assert!(paths.plist.exists(), "the retry handle must remain");
+        assert_eq!(
+            std::fs::read(&paths.uninstall_state).unwrap(),
+            state_before,
+            "an untrusted observation must not mutate lifecycle state"
+        );
+        let state = read_service_uninstall_state(&paths.uninstall_state)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.owners, vec![unrelated_owner]);
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_does_not_trust_an_owner_recorded_only_by_uninstall() {
+        let paths = service_temp_paths("loaded-with-unregistered-observation");
+        write_registered_service_plist(&paths);
+        let ownership_directory = paths
+            .config
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("managed-engines");
+        let mut cleanup = fake_service_cleanup(false);
+        persist_service_uninstall_state(
+            &paths.uninstall_state,
+            &ServiceUninstallState {
+                schema_version: SERVICE_UNINSTALL_STATE_SCHEMA_VERSION,
+                ownership_directory,
+                owners: vec![cleanup.owner.clone()],
+                bootstrap_registered_owners: Vec::new(),
+            },
+        )
+        .unwrap();
+        let state_before = std::fs::read(&paths.uninstall_state).unwrap();
+        let mut launchd = FakeLaunchd {
+            statuses: [LaunchdJobStatus::Loaded {
+                pid: Some(std::process::id()),
+            }]
+            .into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+
+        let error = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect_err("an uninstall observation does not prove bootstrap registration");
+
+        assert!(error.to_string().contains("not registered"), "{error:#}");
+        assert_eq!(launchd.unload_calls, 0);
+        assert_eq!(cleanup.capture_calls, 1);
+        assert_eq!(
+            std::fs::read(&paths.uninstall_state).unwrap(),
+            state_before,
+            "uninstall must preserve the provenance-bearing registry"
+        );
+        assert!(paths.plist.exists());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_matches_registration_by_process_generation() {
+        let paths = service_temp_paths("registration-survives-binary-replacement");
+        write_registered_service_plist(&paths);
+        let pid = 92_001;
+        let registered_owner =
+            fake_managed_engine_owner_with_executable(pid, 92_001, Some("/usr/local/bin/sbproxy"));
+        let recaptured_owner = fake_managed_engine_owner_with_executable(
+            pid,
+            92_001,
+            Some("/usr/local/bin/sbproxy (deleted)"),
+        );
+        register_test_service_owner(&paths, &registered_owner);
+        let mut launchd = FakeLaunchd {
+            statuses: [
+                LaunchdJobStatus::Loaded { pid: Some(pid) },
+                LaunchdJobStatus::NotLoaded,
+            ]
+            .into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+        cleanup.owners_by_pid.insert(pid, recaptured_owner);
+
+        let outcome = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect("an executable audit-path change must not change process identity");
+
+        assert_eq!(launchd.unload_calls, 1);
+        assert_eq!(outcome.engines_reaped, 1);
+        assert_eq!(cleanup.reaped_owners, vec![registered_owner]);
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
     fn service_uninstall_retains_exact_retry_state_and_plist_until_reap_succeeds() {
         let paths = service_temp_paths("transaction");
         write_registered_service_plist(&paths);
@@ -10244,6 +10533,7 @@ mod tests {
             unload_calls: 0,
         };
         let mut failing_cleanup = fake_service_cleanup(true);
+        register_test_service_owner(&paths, &failing_cleanup.owner);
 
         let error = perform_service_uninstall(&paths, &mut first_launchd, &mut failing_cleanup)
             .expect_err("reap failure must leave a retry transaction");
@@ -10294,6 +10584,7 @@ mod tests {
             unload_calls: 0,
         };
         let mut cleanup = fake_service_cleanup(false);
+        register_test_service_owner(&paths, &cleanup.owner);
 
         let outcome = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
             .expect("a concurrently unloaded job already reached the requested state");
@@ -10318,6 +10609,7 @@ mod tests {
             unload_calls: 0,
         };
         let mut cleanup = fake_service_cleanup(false);
+        register_test_service_owner(&paths, &cleanup.owner);
 
         let error = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
             .expect_err("a still-loaded job must preserve its transaction");
@@ -10356,6 +10648,7 @@ mod tests {
         cleanup
             .owners_by_pid
             .insert(replacement_pid, replacement_owner.clone());
+        register_test_service_owner(&paths, &first_owner);
 
         let outcome = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
             .expect("every observed KeepAlive generation is captured");
@@ -10439,9 +10732,9 @@ mod tests {
             unload_calls: 0,
         };
         let mut cleanup = fake_service_cleanup(false);
-        cleanup
-            .owners_by_pid
-            .insert(pid, fake_managed_engine_owner(pid, 81));
+        let owner = fake_managed_engine_owner(pid, 81);
+        cleanup.owners_by_pid.insert(pid, owner.clone());
+        register_test_service_owner(&paths, &owner);
 
         let error = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
             .expect_err("a launchd job that never changes must fail in bounded time");

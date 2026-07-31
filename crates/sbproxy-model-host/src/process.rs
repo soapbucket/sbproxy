@@ -51,6 +51,16 @@ pub struct ManagedEngineOwner {
     executable: Option<PathBuf>,
 }
 
+impl ManagedEngineOwner {
+    /// Whether two tokens identify the same process generation.
+    ///
+    /// The executable path is audit context only. It can change its rendered
+    /// form when an installed binary is replaced while the process is alive.
+    pub fn same_process_generation(&self, other: &Self) -> bool {
+        self.pid == other.pid && self.start_fingerprint == other.start_fingerprint
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManagedProcessOwnership {
