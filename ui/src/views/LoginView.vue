@@ -4,6 +4,7 @@ import { useRoute, useRouter } from "vue-router";
 import { useAuth } from "../composables/useAuth";
 import { ApiError } from "../api";
 import BrandMark from "../components/BrandMark.vue";
+import DocumentationLink from "../components/DocumentationLink.vue";
 
 const { login, sessionExpired } = useAuth();
 const route = useRoute();
@@ -70,6 +71,9 @@ async function submit() {
       >
         {{ submitting ? "Signing in..." : "Sign in" }}
       </button>
+      <div class="card__docs">
+        <DocumentationLink />
+      </div>
     </form>
   </div>
 </template>
@@ -90,6 +94,11 @@ async function submit() {
 }
 .card__brand {
   margin-bottom: var(--sb-space-2);
+}
+.card__docs {
+  display: flex;
+  padding-top: var(--sb-space-2);
+  border-top: 1px solid var(--sb-border);
 }
 label {
   display: flex;

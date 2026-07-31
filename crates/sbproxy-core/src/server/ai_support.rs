@@ -8,6 +8,19 @@
 
 use super::*;
 
+/// Internal cache metadata. New AI idempotency entries store final client-wire
+/// bytes and carry this marker so replay never runs a second format adapter.
+/// The header is stripped before the cached response is sent to a client.
+pub(super) const AI_IDEMPOTENCY_BODY_FORMAT_HEADER: &str = "x-sbproxy-idempotency-body-format";
+pub(super) const AI_IDEMPOTENCY_WIRE_BODY_FORMAT: &str = "wire-v1";
+
+pub(super) fn ai_idempotency_body_is_wire(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case(AI_IDEMPOTENCY_BODY_FORMAT_HEADER)
+            && value == AI_IDEMPOTENCY_WIRE_BODY_FORMAT
+    })
+}
+
 /// Best-effort extraction of a single prompt string from a parsed AI request
 /// body.
 ///
@@ -2381,6 +2394,7 @@ pub(super) async fn write_ai_cached_response(
             || lname == "connection"
             || lname == "keep-alive"
             || lname == "x-sbproxy-idempotency"
+            || lname == AI_IDEMPOTENCY_BODY_FORMAT_HEADER
         {
             continue;
         }
@@ -2414,9 +2428,8 @@ pub(super) struct AiIdempotencyCapture {
 
 impl AiIdempotencyCapture {
     /// Persist the recorded response under `(workspace_id, key)`.
-    /// `body` is the **post-translation** OpenAI-shape bytes the
-    /// client saw, so retries replay byte-identical to the original
-    /// served response.
+    /// `body` contains the final client-wire bytes after format adaptation
+    /// and reversible restoration, so retries replay byte-identically.
     pub(super) fn record(self, status: u16, headers: Vec<(String, String)>, body: Vec<u8>) {
         sbproxy_middleware::idempotency::record_response(
             self.idem.cache.as_ref(),
@@ -2504,7 +2517,8 @@ pub(super) async fn relay_ai_response_with_idempotency(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     let resp_body = read_capped_response_body(resp, max_body_size).await?;
-    let translated = sbproxy_ai::translators::translate_response_bytes(format, &resp_body);
+    let translated =
+        sbproxy_ai::translators::translate_success_response_bytes(format, status, &resp_body);
     crate::server::ai_dispatch::record_ai_provider_response_failure(
         ai_span,
         provider_name,
@@ -2567,8 +2581,13 @@ pub(super) async fn relay_ai_response_with_idempotency(
         // we send back: at minimum the content-type so a replay
         // surfaces the same shape. Skip framing headers Pingora will
         // recompute.
-        let headers: Vec<(String, String)> =
-            vec![("content-type".to_string(), content_type.clone())];
+        let headers: Vec<(String, String)> = vec![
+            ("content-type".to_string(), content_type.clone()),
+            (
+                AI_IDEMPOTENCY_BODY_FORMAT_HEADER.to_string(),
+                AI_IDEMPOTENCY_WIRE_BODY_FORMAT.to_string(),
+            ),
+        ];
         cap.record(status, headers, translated_bytes.to_vec());
     }
 

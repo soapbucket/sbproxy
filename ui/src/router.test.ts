@@ -1,8 +1,56 @@
+import { existsSync } from "node:fs";
+
 import { api } from "./api";
 import { useAuth } from "./composables/useAuth";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { router } from "./router";
+
+describe("documentation routes", () => {
+  it("accounts for every shipped route and maps every view to a documentation slug", () => {
+    const unaccounted = router
+      .getRoutes()
+      .filter((route) => {
+        if (!Object.prototype.hasOwnProperty.call(route.meta, "documentation")) {
+          return true;
+        }
+        if (!route.components) return route.meta.documentation !== null;
+        return (
+          typeof route.meta.documentation !== "string" ||
+          route.meta.documentation.trim().length === 0
+        );
+      })
+      .map((route) => route.path)
+      .sort();
+
+    expect(unaccounted).toEqual([]);
+  });
+
+  it("maps every documentation slug to a shipped source page", () => {
+    const missingDocs = [
+      ...new Set(
+        router
+          .getRoutes()
+          .map((route) => route.meta.documentation)
+          .filter((slug): slug is string => typeof slug === "string"),
+      ),
+    ]
+      .filter(
+        (slug) =>
+          !existsSync(new URL(`../../docs/${slug}.md`, import.meta.url)),
+      )
+      .sort();
+
+    expect(missingDocs).toEqual([]);
+  });
+
+  it("intentionally maps the unauthenticated login view", () => {
+    const route = router.resolve("/login");
+
+    expect(route.meta.public).toBe(true);
+    expect(route.meta.documentation).toBe("admin-ui");
+  });
+});
 
 describe("session routes", () => {
   it("resolves the sessions index", () => {

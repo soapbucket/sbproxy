@@ -436,6 +436,169 @@ pub fn translate_anthropic_request_to_openai(body: &[u8]) -> Result<Vec<u8>, Cha
     Ok(super::openai_responses::hub_request_to_openai_bytes(&hub))
 }
 
+/// Return whether every Anthropic request field that can affect content or
+/// provider behavior is represented in the canonical request inspected by
+/// gateway governance.
+///
+/// The Anthropic parser intentionally ignores unknown content blocks and
+/// extensions. Native byte forwarding is safe only when this stricter check
+/// proves that no such field can skip the canonical policy path. This is
+/// deliberately conservative: new Anthropic fields remain on the translated
+/// path until their canonical representation is implemented here and in the
+/// hub bridge.
+pub fn native_request_is_losslessly_governable(body: &[u8]) -> bool {
+    let Ok(Value::Object(request)) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    if !has_only_keys(
+        &request,
+        &[
+            "model",
+            "messages",
+            "max_tokens",
+            "system",
+            "stop_sequences",
+            "stream",
+            "temperature",
+            "top_p",
+            "tools",
+        ],
+    ) {
+        return false;
+    }
+    if request.get("model").and_then(Value::as_str).is_none()
+        || request
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_none_or(|messages| !messages.iter().all(governable_message))
+    {
+        return false;
+    }
+    if request.get("max_tokens").is_some_and(|value| {
+        value
+            .as_u64()
+            .is_none_or(|tokens| tokens > u64::from(u32::MAX))
+    }) || request
+        .get("stream")
+        .is_some_and(|value| !value.is_boolean())
+        || ["temperature", "top_p"].iter().any(|field| {
+            request
+                .get(*field)
+                .is_some_and(|value| !governable_f32(value))
+        })
+        || request.get("stop_sequences").is_some_and(|value| {
+            value
+                .as_array()
+                .is_none_or(|items| !items.iter().all(Value::is_string))
+        })
+        || request
+            .get("system")
+            .is_some_and(|value| !governable_system(value))
+        || request.get("tools").is_some_and(|value| {
+            value
+                .as_array()
+                .is_none_or(|tools| !tools.iter().all(governable_tool))
+        })
+    {
+        return false;
+    }
+    true
+}
+
+fn has_only_keys(object: &Map<String, Value>, allowed: &[&str]) -> bool {
+    object.keys().all(|key| allowed.contains(&key.as_str()))
+}
+
+fn governable_system(value: &Value) -> bool {
+    match value {
+        Value::String(_) => true,
+        Value::Array(blocks) => blocks.iter().all(governable_text_block),
+        _ => false,
+    }
+}
+
+fn governable_f32(value: &Value) -> bool {
+    value
+        .as_f64()
+        .is_some_and(|number| (number as f32).is_finite())
+}
+
+fn governable_message(value: &Value) -> bool {
+    let Some(message) = value.as_object() else {
+        return false;
+    };
+    if !has_only_keys(message, &["role", "content"])
+        || !matches!(
+            message.get("role").and_then(Value::as_str),
+            Some("user" | "assistant")
+        )
+    {
+        return false;
+    }
+    match message.get("content") {
+        Some(Value::String(_)) => true,
+        Some(Value::Array(blocks)) => {
+            if !blocks.iter().all(governable_content_block) {
+                return false;
+            }
+            let tool_result_count = blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+                .count();
+            tool_result_count == 0 || (tool_result_count == 1 && blocks.len() == 1)
+        }
+        _ => false,
+    }
+}
+
+fn governable_content_block(value: &Value) -> bool {
+    let Some(block) = value.as_object() else {
+        return false;
+    };
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") => governable_text_block(value),
+        Some("tool_use") => {
+            has_only_keys(block, &["type", "id", "name", "input"])
+                && block.get("id").is_some_and(Value::is_string)
+                && block.get("name").is_some_and(Value::is_string)
+                && block.contains_key("input")
+        }
+        Some("tool_result") => {
+            has_only_keys(block, &["type", "tool_use_id", "content"])
+                && block.get("tool_use_id").is_some_and(Value::is_string)
+                && block
+                    .get("content")
+                    .is_some_and(governable_tool_result_content)
+        }
+        _ => false,
+    }
+}
+
+fn governable_text_block(value: &Value) -> bool {
+    value.as_object().is_some_and(|block| {
+        has_only_keys(block, &["type", "text"])
+            && block.get("type").and_then(Value::as_str) == Some("text")
+            && block.get("text").is_some_and(Value::is_string)
+    })
+}
+
+fn governable_tool_result_content(value: &Value) -> bool {
+    match value {
+        Value::String(_) => true,
+        Value::Array(blocks) => blocks.iter().all(governable_text_block),
+        _ => false,
+    }
+}
+
+fn governable_tool(value: &Value) -> bool {
+    value.as_object().is_some_and(|tool| {
+        has_only_keys(tool, &["name", "description", "input_schema"])
+            && tool.get("name").is_some_and(Value::is_string)
+            && tool.get("description").is_none_or(Value::is_string)
+            && tool.contains_key("input_schema")
+    })
+}
+
 /// Translate the raw OpenAI Chat Completions response body (the shape
 /// the gateway already produces today) into Anthropic Messages shape.
 /// Used by the dispatch shim so an Anthropic inbound client receives
@@ -622,6 +785,151 @@ mod tests {
         assert_eq!(parts.len(), 2);
         matches!(parts[0], ContentPart::Text { .. });
         matches!(parts[1], ContentPart::Image { .. });
+    }
+
+    #[test]
+    fn native_bypass_eligibility_rejects_content_the_hub_drops() {
+        for block in [
+            json!({
+                "type": "document",
+                "source": {"type": "text", "data": "governed document"}
+            }),
+            json!({
+                "type": "search_result",
+                "source": "search",
+                "content": [{"type": "text", "text": "governed result"}]
+            }),
+        ] {
+            let req = json!({
+                "model": "claude-3-5-sonnet",
+                "max_tokens": 64,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "supported"},
+                        block
+                    ]
+                }]
+            });
+            assert!(!native_request_is_losslessly_governable(
+                req.to_string().as_bytes()
+            ));
+        }
+    }
+
+    #[test]
+    fn native_bypass_eligibility_accepts_fully_governed_messages() {
+        let req = json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 64,
+            "system": [{"type": "text", "text": "be concise"}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "lookup",
+                        "input": {"query": "hello"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "result"
+                    }]
+                }
+            ],
+            "stop_sequences": ["STOP"],
+            "tools": [{
+                "name": "lookup",
+                "description": "Look up a value",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}}
+                }
+            }]
+        });
+        assert!(native_request_is_losslessly_governable(
+            req.to_string().as_bytes()
+        ));
+    }
+
+    #[test]
+    fn native_bypass_eligibility_rejects_unrepresented_controls() {
+        let base = json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        for req in [
+            {
+                let mut request = base.clone();
+                request["top_k"] = json!(40);
+                request
+            },
+            {
+                let mut request = base.clone();
+                request["metadata"] = json!({"user_id": "customer-1"});
+                request
+            },
+            {
+                let mut request = base.clone();
+                request["messages"][0]["content"] = json!([{
+                    "type": "text",
+                    "text": "hello",
+                    "cache_control": {"type": "ephemeral"}
+                }]);
+                request
+            },
+            {
+                let mut request = base.clone();
+                request["temperature"] = json!(1e100);
+                request
+            },
+        ] {
+            assert!(!native_request_is_losslessly_governable(
+                req.to_string().as_bytes()
+            ));
+        }
+    }
+
+    #[test]
+    fn native_bypass_eligibility_rejects_lossy_tool_result_arrays() {
+        for content in [
+            json!([
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "first result"
+                },
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_2",
+                    "content": "second result"
+                }
+            ]),
+            json!([
+                {"type": "text", "text": "context the bridge would drop"},
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "tool result"
+                }
+            ]),
+        ] {
+            let req = json!({
+                "model": "claude-3-5-sonnet",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": content}]
+            });
+            assert!(!native_request_is_losslessly_governable(
+                req.to_string().as_bytes()
+            ));
+        }
     }
 
     #[test]

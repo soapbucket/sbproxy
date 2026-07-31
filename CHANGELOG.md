@@ -1691,8 +1691,8 @@ AI providers behind one OpenAI-compatible API.
   with `x-sbproxy-idempotency: HIT` and never contacts the
   provider. On a body conflict the gateway returns 409
   `ledger.idempotency_conflict` per the RFC. On a miss the
-  gateway forwards, then records the post-translation OpenAI-shape
-  bytes the client actually saw so retries replay byte-identical.
+  gateway forwards, then records the final client-wire bytes.
+  Retries receive the same bytes.
   Reuses the same per-request and pool caps shipped on
   `CompiledIdempotency`: `max_request_body_bytes`,
   `max_response_body_bytes`, `max_concurrent_buffers`. The four

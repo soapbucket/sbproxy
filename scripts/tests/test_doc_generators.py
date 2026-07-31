@@ -498,5 +498,141 @@ class WireExampleGifsTests(TemporaryRepository):
         self.assertEqual(readme.read_bytes(), before)
 
 
+class SyncDocConfigsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        (self.root / "docs").mkdir()
+        example = self.root / "examples" / "basic-proxy"
+        example.mkdir(parents=True)
+        self.canonical_body = (
+            "proxy:\n"
+            "  http_bind_port: 8080\n"
+            "\n"
+            "origins:\n"
+            '  "myapp.example.com":\n'
+            "    action:\n"
+            "      type: proxy\n"
+            "      url: https://test.sbproxy.dev\n"
+        )
+        (example / "sb.yml").write_text(
+            "# yaml-language-server: $schema=../../schemas/sb-config.schema.json\n"
+            "# sbproxy-docs:begin\n"
+            f"{self.canonical_body}"
+            "# sbproxy-docs:end\n"
+        )
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def run_guard(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(REPOSITORY / "scripts" / "sync-doc-configs.py"),
+                "--root",
+                str(self.root),
+                *arguments,
+            ],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_check_rejects_a_broken_strict_config(self) -> None:
+        document = self.root / "docs" / "reference.md"
+        document.write_text(
+            "<!-- sbproxy-config: examples/basic-proxy/sb.yml -->\n"
+            "```yaml\n"
+            f"{self.canonical_body.replace('test.sbproxy.dev', 'stale.example.com')}"
+            "```\n"
+        )
+        before = document.read_bytes()
+
+        result = self.run_guard("--check")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("drift", result.stderr)
+        self.assertEqual(document.read_bytes(), before, "--check rewrote the doc")
+
+    def test_check_accepts_a_strict_config_and_an_explicit_excerpt(self) -> None:
+        (self.root / "docs" / "reference.md").write_text(
+            "<!-- sbproxy-config: examples/basic-proxy/sb.yml -->\n"
+            "```yaml\n"
+            f"{self.canonical_body}"
+            "```\n"
+            "\n"
+            "<!-- sbproxy-config-excerpt -->\n"
+            "```yaml\n"
+            "action:\n"
+            "  type: proxy\n"
+            "```\n"
+        )
+
+        result = self.run_guard("--check")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("1 strict block", result.stdout)
+        self.assertIn("1 excerpt", result.stdout)
+
+    def test_check_rejects_a_source_outside_the_example_compiler_sweep(self) -> None:
+        alternate = self.root / "examples" / "basic-proxy" / "alternate.yml"
+        alternate.write_text(
+            "# sbproxy-docs:begin\n"
+            f"{self.canonical_body}"
+            "# sbproxy-docs:end\n"
+        )
+        (self.root / "docs" / "reference.md").write_text(
+            "<!-- sbproxy-config: examples/basic-proxy/alternate.yml -->\n"
+            "```yaml\n"
+            f"{self.canonical_body}"
+            "```\n"
+        )
+
+        result = self.run_guard("--check")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("compiler sweep", result.stderr)
+
+    def test_check_walks_nested_documentation_directories(self) -> None:
+        nested = self.root / "docs" / "guides"
+        nested.mkdir()
+        (nested / "reference.md").write_text(
+            "<!-- sbproxy-config: examples/basic-proxy/sb.yml -->\n"
+            "```yaml\n"
+            "stale: true\n"
+            "```\n"
+        )
+
+        result = self.run_guard("--check")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("docs/guides/reference.md", result.stderr)
+
+    def test_sync_refreshes_strict_config_without_rewriting_excerpt(self) -> None:
+        document = self.root / "docs" / "reference.md"
+        excerpt = "action:\n  type: proxy\n"
+        document.write_text(
+            "<!-- sbproxy-config: examples/basic-proxy/sb.yml -->\n"
+            "```yaml\n"
+            "stale: true\n"
+            "```\n"
+            "\n"
+            "<!-- sbproxy-config-excerpt -->\n"
+            "```yaml\n"
+            f"{excerpt}"
+            "```\n"
+        )
+
+        result = self.run_guard()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        contents = document.read_text()
+        self.assertIn(self.canonical_body, contents)
+        self.assertIn(excerpt, contents)
+        self.assertNotIn("stale: true", contents)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -101,6 +101,92 @@ fn messages_stream_against_openai_upstream_emits_anthropic_sse() {
 }
 
 #[test]
+fn messages_stream_provider_error_preserves_json_response() {
+    let error = json!({
+        "error": {
+            "type": "invalid_request_error",
+            "message": "stream request rejected"
+        }
+    });
+    let expected = serde_json::to_vec(&error).expect("error JSON");
+    let upstream = MockUpstream::start_with_status(error, 400).expect("start JSON error upstream");
+    let harness = ProxyHarness::start_with_yaml(&openai_provider_config(&upstream.base_url()))
+        .expect("proxy");
+    let request = json!({
+        "model": "gpt-4o",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true,
+    });
+
+    let response = harness
+        .post_json("/v1/messages", "ai.localhost", &request, &[])
+        .expect("post");
+
+    assert_eq!(response.status, 400);
+    assert_eq!(
+        response.headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok()),
+        Some(expected.len())
+    );
+    assert_eq!(response.body, expected);
+}
+
+#[test]
+fn messages_stream_non_sse_success_is_rewrapped_for_anthropic_client() {
+    let fallback = json!({
+        "id": "chatcmpl-buffered",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "buffered response"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+    });
+    let upstream = MockUpstream::start(fallback).expect("start JSON upstream");
+    let harness = ProxyHarness::start_with_yaml(&openai_provider_config(&upstream.base_url()))
+        .expect("proxy");
+    let request = json!({
+        "model": "gpt-4o",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true,
+    });
+
+    let response = harness
+        .post_json("/v1/messages", "ai.localhost", &request, &[])
+        .expect("post");
+
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok()),
+        Some(response.body.len())
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.body).expect("Anthropic response JSON");
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["content"][0]["text"], "buffered response");
+    assert_eq!(body["usage"]["input_tokens"], 3);
+    assert_eq!(body["usage"]["output_tokens"], 2);
+    assert!(body.get("choices").is_none(), "{body}");
+}
+
+#[test]
 fn responses_stream_against_openai_upstream_is_translated() {
     let upstream =
         MockUpstream::start_sse_raw(openai_chat_sse_frames(), "text/event-stream".to_string())

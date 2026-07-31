@@ -71,13 +71,6 @@ pub enum ReverseDnsVerdict {
     DnsError(String),
 }
 
-impl ReverseDnsVerdict {
-    /// True iff the verdict is [`Self::Verified`].
-    pub fn is_verified(&self) -> bool {
-        matches!(self, Self::Verified(_))
-    }
-}
-
 /// DNS resolver port surfaced to `agent_verify`. Keeps this crate free
 /// of a hard DNS dependency; callers wire in a real implementation
 /// (e.g. `hickory-resolver`) and tests wire in [`StubResolver`].
@@ -343,7 +336,7 @@ struct CacheEntry {
 impl ReverseDnsCache {
     /// Hard cap on cached verdict TTL. Even if the underlying DNS
     /// records claim to be valid for longer, we re-verify after this.
-    pub const MAX_TTL: Duration = Duration::from_secs(60 * 60);
+    pub(crate) const MAX_TTL: Duration = Duration::from_secs(60 * 60);
 
     /// Build a cache with the supplied entry capacity.
     pub fn new(max_entries: usize) -> Self {
@@ -367,7 +360,7 @@ impl ReverseDnsCache {
     }
 
     /// Insert a verdict with the supplied effective TTL; the TTL is
-    /// silently capped at [`Self::MAX_TTL`].
+    /// silently capped at `MAX_TTL`.
     pub fn insert(&self, ip: IpAddr, verdict: ReverseDnsVerdict, ttl: Duration) {
         let ttl = ttl.min(Self::MAX_TTL);
         let mut inner = self.inner.lock().expect("rdns cache mutex poisoned");
@@ -430,7 +423,6 @@ mod tests {
             verdict,
             ReverseDnsVerdict::Verified("crawl-66-249-66-1.googlebot.com".to_string())
         );
-        assert!(verdict.is_verified());
     }
 
     #[test]
@@ -501,6 +493,23 @@ mod tests {
     }
 
     #[test]
+    fn forward_error_is_reported_as_unverified() {
+        // The stub's forward-error branch had no coverage, which is what
+        // made its builder look dead. A forward lookup that fails is not
+        // the same as one that succeeds and disagrees, and the verdict
+        // has to say which happened.
+        let ip = ip4(1, 2, 3, 4);
+        let resolver = StubResolver::new()
+            .with_ptr(ip, vec!["crawl-1.googlebot.com".to_string()])
+            .with_forward_error("REFUSED");
+        let verdict = verify_reverse_dns(&resolver, ip, &[".googlebot.com"]);
+        match verdict {
+            ReverseDnsVerdict::DnsError(msg) => assert!(msg.contains("REFUSED"), "got {msg}"),
+            other => panic!("expected DnsError from a failed forward lookup, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn ipv6_path_works() {
         let ip = IpAddr::V6(Ipv6Addr::new(
             0x2607, 0xf8b0, 0x4004, 0x812, 0, 0, 0, 0x200e,
@@ -521,7 +530,7 @@ mod tests {
             .with_ptr(ip, vec!["Crawl-1.GoogleBot.COM".to_string()])
             .with_forward("crawl-1.googlebot.com", vec![ip]);
         let verdict = verify_reverse_dns(&resolver, ip, &[".googlebot.com"]);
-        assert!(verdict.is_verified());
+        assert!(matches!(verdict, ReverseDnsVerdict::Verified(_)));
     }
 
     #[test]
