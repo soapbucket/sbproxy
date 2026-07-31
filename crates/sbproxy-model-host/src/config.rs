@@ -92,6 +92,23 @@ impl EngineKind {
     pub fn is_in_process(self) -> bool {
         matches!(self, EngineKind::Embedded)
     }
+
+    /// The model id this engine's OpenAI surface accepts in request
+    /// bodies for a managed deployment (WOR-1861). vLLM and SGLang are
+    /// launched with `--served-model-name <deployment>`, so the
+    /// deployment id is the served name; llama.cpp and the embedded
+    /// engine ignore the field. mistral.rs has no served-name flag: it
+    /// registers the model under the id it loaded (the snapshot path)
+    /// and accepts `default` as the alias for the loaded model, so the
+    /// deployment id would be rejected with a 404-shaped error.
+    pub fn request_model_id(self, deployment: &str) -> &str {
+        match self {
+            EngineKind::Vllm | EngineKind::SGLang | EngineKind::LlamaCpp | EngineKind::Embedded => {
+                deployment
+            }
+            EngineKind::MistralRs => "default",
+        }
+    }
 }
 
 /// The engine an operator asks for on a model (WOR-1684). Unlike
@@ -1182,6 +1199,11 @@ models:
         assert_eq!(EngineKind::LlamaCpp.binary_name(), "llama-server");
         assert_eq!(EngineKind::Embedded.binary_name(), "embedded");
         assert_eq!(EngineKind::MistralRs.binary_name(), "mistralrs");
+        // The outbound request model id: vLLM/SGLang serve under the
+        // deployment id (--served-model-name); mistral.rs only accepts
+        // its loaded id or the `default` alias (WOR-1861).
+        assert_eq!(EngineKind::Vllm.request_model_id("dep-1"), "dep-1");
+        assert_eq!(EngineKind::MistralRs.request_model_id("dep-1"), "default");
     }
 
     #[test]

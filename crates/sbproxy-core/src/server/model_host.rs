@@ -2896,14 +2896,13 @@ pub async fn managed_upstream(
             )
         })?;
     let deployment = route.deployment.clone();
-    let engine_model = deployment.clone();
     let admission = manager
         .admit(&deployment, priority)
         .await
         .map_err(|error| format!("{}: {}", error.reason.as_str(), error.detail))?;
     let mut permit = ManagedModelPermit {
         manager,
-        deployment,
+        deployment: deployment.clone(),
         admission,
         engine_version: None,
     };
@@ -2911,6 +2910,9 @@ pub async fn managed_upstream(
         .ensure_ready(priority)
         .await
         .map_err(|error| format!("{}: {error}", error.reason_code()))?;
+    // Engine-aware outbound model id: mistral.rs has no served-model-name
+    // flag and accepts `default` for the loaded model (WOR-1861).
+    let engine_model = running.kind.request_model_id(&deployment).to_string();
     // Capture the served engine version on the permit, which lives on the
     // request context through the complete response, so the end-of-request
     // usage record can answer "what served this" from the ledger alone
