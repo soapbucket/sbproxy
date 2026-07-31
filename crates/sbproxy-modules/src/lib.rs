@@ -22,7 +22,9 @@ pub use action::{
     ProxyAction, RoutingOutcome, RoutingRequest, RoutingStrategy, RoutingStrategyRegistration,
     TargetState, VersionSource,
 };
-pub use auth::a2a::{detect as detect_a2a, A2AContext, A2ASpec, ChainHop, DetectedSpec};
+pub use auth::a2a::{
+    detect as detect_a2a, envelope_from_headers, A2AContext, A2ASpec, ChainHop, DetectedSpec,
+};
 pub use auth::{ApiKeyAuth, Auth};
 pub use compile::*;
 pub use policy::{

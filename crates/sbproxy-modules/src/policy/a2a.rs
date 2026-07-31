@@ -14,7 +14,7 @@
 
 use serde::Deserialize;
 
-use crate::auth::a2a::A2AContext;
+use crate::auth::a2a::{A2AContext, DetectedSpec};
 
 /// Hard ceiling on `max_chain_depth`. Cannot be lifted via config;
 /// the limit reflects a memory bound on chain reconstruction (each
@@ -245,6 +245,24 @@ impl A2APolicy {
     }
 
     /// Operator route glob, when configured.
+    /// Whether this policy governs the given request, consulting the
+    /// operator's `route_glob` alongside the caller-supplied detection
+    /// signals.
+    ///
+    /// This is the operator-controlled entry point. Header detection
+    /// alone is not sufficient, because both signals it matches on
+    /// (`Content-Type` and `MCP-Method`) are chosen by the caller, so a
+    /// caller that omits them is never detected. Declaring `route_glob`
+    /// makes the route governed regardless of what the caller sends.
+    ///
+    /// Prefer this over calling [`crate::detect_a2a`] directly; the
+    /// bare function cannot see the policy's configured glob.
+    pub fn governs(&self, headers: &http::HeaderMap, path: &str) -> Option<DetectedSpec> {
+        crate::auth::a2a::detect(headers, path, self.route_glob())
+    }
+
+    /// Operator escape-hatch glob, if configured. Most callers want
+    /// [`Self::governs`], which applies it.
     pub fn route_glob(&self) -> Option<&str> {
         self.config.route_glob.as_deref()
     }
@@ -368,7 +386,50 @@ mod tests {
             chain_depth,
             chain,
             raw_envelope_version: "google-v0".to_string(),
+            // These fixtures model an envelope the proxy has already
+            // decided to trust; the untrusted case is covered in the
+            // `auth::a2a` trust-gate tests.
+            identity_verified: true,
         }
+    }
+
+    #[test]
+    fn governs_matches_operator_declared_route_without_caller_headers() {
+        // The operator declares the route as A2A. A caller that sends no
+        // A2A-shaped headers at all must still be governed, otherwise
+        // the policy is opt-in for the attacker.
+        let policy = A2APolicy::with_config(A2APolicyConfig {
+            route_glob: Some("/agents/**".to_string()),
+            ..A2APolicyConfig::default()
+        });
+
+        assert!(policy
+            .governs(&http::HeaderMap::new(), "/agents/invoke")
+            .is_some());
+    }
+
+    #[test]
+    fn governs_ignores_routes_outside_the_declared_glob() {
+        let policy = A2APolicy::with_config(A2APolicyConfig {
+            route_glob: Some("/agents/**".to_string()),
+            ..A2APolicyConfig::default()
+        });
+
+        assert!(policy
+            .governs(&http::HeaderMap::new(), "/public/health")
+            .is_none());
+    }
+
+    #[test]
+    fn governs_still_honors_header_detection_when_no_glob_configured() {
+        let policy = A2APolicy::with_config(A2APolicyConfig::default());
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/a2a+json"),
+        );
+
+        assert!(policy.governs(&headers, "/anything").is_some());
     }
 
     fn hop(agent: &str, rid: &str) -> ChainHop {

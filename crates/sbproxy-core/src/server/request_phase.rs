@@ -496,6 +496,20 @@ pub(super) async fn request_filter(
             req.remove_header("x-sbproxy-tls-ja4");
             req.remove_header("x-sbproxy-tls-ja4h");
             req.remove_header("x-sbproxy-tls-trustworthy");
+            // WOR-2120: strip the A2A envelope headers from untrusted
+            // peers. These feed `caller_denylist`, `callee_allowlist`,
+            // and cycle detection, so honoring them from an arbitrary
+            // client lets that client name itself, name its callee, and
+            // assert its own call chain. `envelope_from_headers` also
+            // gates on the same trust decision; removing them here
+            // additionally keeps a forged value from reaching the
+            // upstream, which would re-introduce the forgery one hop in.
+            req.remove_header("x-a2a-caller-agent-id");
+            req.remove_header("x-a2a-callee-agent-id");
+            req.remove_header("x-a2a-task-id");
+            req.remove_header("x-a2a-parent-request-id");
+            req.remove_header("x-a2a-chain-depth");
+            req.remove_header("x-a2a-chain");
         }
     }
 
@@ -726,36 +740,18 @@ pub(super) async fn request_filter(
             None, // operator route_glob is per-policy; consulted later
         );
         if let Some(signal) = detected {
-            let spec = signal.to_spec();
-            let mut a2a_ctx = sbproxy_modules::A2AContext::empty(spec);
-            let h = &session.req_header().headers;
-            if let Some(v) = h.get("x-a2a-caller-agent-id").and_then(|v| v.to_str().ok()) {
-                a2a_ctx.caller_agent_id = v.to_string();
-            }
-            if let Some(v) = h.get("x-a2a-callee-agent-id").and_then(|v| v.to_str().ok()) {
-                a2a_ctx.callee_agent_id = Some(v.to_string());
-            }
-            if let Some(v) = h.get("x-a2a-task-id").and_then(|v| v.to_str().ok()) {
-                a2a_ctx.task_id = v.to_string();
-            }
-            if let Some(v) = h
-                .get("x-a2a-parent-request-id")
-                .and_then(|v| v.to_str().ok())
-            {
-                a2a_ctx.parent_request_id = Some(v.to_string());
-            }
-            if let Some(v) = h
-                .get("x-a2a-chain-depth")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u32>().ok())
-            {
-                a2a_ctx.chain_depth = v.max(1);
-            }
-            if let Some(raw) = h.get("x-a2a-chain").and_then(|v| v.to_str().ok()) {
-                if let Ok(parsed) = serde_json::from_str::<Vec<sbproxy_modules::ChainHop>>(raw) {
-                    a2a_ctx.chain = parsed;
-                }
-            }
+            // WOR-2120: the envelope is only populated from headers when
+            // the immediate peer is in `proxy.trusted_proxies`. An
+            // untrusted caller gets the zero-default envelope with
+            // `identity_verified` clear, so the policy can tell "no
+            // identity asserted" apart from "identity asserted by
+            // someone we trust" instead of treating a forged
+            // `x-a2a-chain-depth: 1` as a genuine chain root.
+            let a2a_ctx = sbproxy_modules::envelope_from_headers(
+                &session.req_header().headers,
+                signal.to_spec(),
+                peer_trusted,
+            );
             ctx.a2a = Some(a2a_ctx);
         }
     }

@@ -53,9 +53,23 @@ impl PolicyEnforcer for A2AEnforcer {
                 });
             }
         };
+        // WOR-2120: the request filter detects on caller-supplied
+        // signals only (`Content-Type`, `MCP-Method`), because the
+        // operator's `route_glob` is per-policy and not reachable from
+        // there. Consult it here, where the compiled policy is in hand,
+        // so a route the operator declared as A2A is governed even when
+        // the caller sends nothing that looks like A2A. Without this the
+        // policy is opt-in for the attacker: omit one header, skip every
+        // check.
         let a2a_ctx = match ctx.a2a.clone() {
             Some(c) => c,
-            None => return Box::pin(async move { Ok(PolicyDecision::Allow) }),
+            None => match policy.governs(req.headers(), req.uri().path()) {
+                // Operator-declared route, no envelope stamped upstream.
+                // Evaluate against the zero-default envelope so route
+                // limits still apply; `identity_verified` stays false.
+                Some(spec) => sbproxy_modules::A2AContext::empty(spec.to_spec()),
+                None => return Box::pin(async move { Ok(PolicyDecision::Allow) }),
+            },
         };
         let route = ctx.hostname.to_string();
         let spec_label = a2a_ctx.spec.as_label();

@@ -85,6 +85,20 @@ pub struct A2AContext {
     /// `"google-v0"`). Surfaced to the audit event verbatim so
     /// reconstructions across spec rev bumps stay debuggable.
     pub raw_envelope_version: String,
+    /// Whether the identity fields on this envelope came from a source
+    /// the proxy trusts.
+    ///
+    /// False means the fields were either absent or supplied by an
+    /// untrusted peer and therefore discarded. The distinction matters:
+    /// an untrusted caller that simply omits `x-a2a-chain` is
+    /// indistinguishable from a genuine chain root, so a policy that
+    /// wants to fail closed on unknown identity needs this flag rather
+    /// than inferring trust from `chain_depth == 1`.
+    ///
+    /// Set by [`envelope_from_headers`] from the caller's trust
+    /// decision; body parsers leave it false because a request body is
+    /// no more trustworthy than the headers that framed it.
+    pub identity_verified: bool,
 }
 
 impl A2AContext {
@@ -101,8 +115,59 @@ impl A2AContext {
             chain_depth: 1,
             chain: Vec::new(),
             raw_envelope_version: spec.as_label().to_string(),
+            identity_verified: false,
         }
     }
+}
+
+/// Build an [`A2AContext`] from the `x-a2a-*` request headers, honoring
+/// them only when the immediate peer is trusted.
+///
+/// `peer_trusted` MUST be the same trust decision the request filter
+/// makes from `proxy.trusted_proxies`. When it is false every
+/// `x-a2a-*` field is discarded and the returned envelope is the
+/// zero-default for `spec` with [`A2AContext::identity_verified`]
+/// clear.
+///
+/// This is the security boundary for the header transport. The fields
+/// feed `caller_denylist`, `callee_allowlist`, and cycle detection, so
+/// honoring them from an arbitrary client lets that client name itself,
+/// name its callee, and assert its own call chain.
+pub fn envelope_from_headers(
+    headers: &http::HeaderMap,
+    spec: A2ASpec,
+    peer_trusted: bool,
+) -> A2AContext {
+    let mut ctx = A2AContext::empty(spec);
+    if !peer_trusted {
+        return ctx;
+    }
+    ctx.identity_verified = true;
+
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+
+    if let Some(v) = get("x-a2a-caller-agent-id") {
+        ctx.caller_agent_id = v.to_string();
+    }
+    if let Some(v) = get("x-a2a-callee-agent-id") {
+        ctx.callee_agent_id = Some(v.to_string());
+    }
+    if let Some(v) = get("x-a2a-task-id") {
+        ctx.task_id = v.to_string();
+    }
+    if let Some(v) = get("x-a2a-parent-request-id") {
+        ctx.parent_request_id = Some(v.to_string());
+    }
+    if let Some(v) = get("x-a2a-chain-depth").and_then(|s| s.parse::<u32>().ok()) {
+        ctx.chain_depth = v.max(1);
+    }
+    if let Some(parsed) =
+        get("x-a2a-chain").and_then(|raw| serde_json::from_str::<Vec<ChainHop>>(raw).ok())
+    {
+        ctx.chain = parsed;
+    }
+
+    ctx
 }
 
 /// Detection signal: which spec a request appears to be A2A under.
@@ -287,6 +352,57 @@ mod tests {
         assert_eq!(ctx.chain_depth, 1);
         assert!(ctx.chain.is_empty());
         assert_eq!(ctx.raw_envelope_version, "google-v0");
+    }
+
+    /// Every `x-a2a-*` field an untrusted caller can set. Used by the
+    /// trust-gate tests below so both directions cover the same surface.
+    fn forged_envelope_headers() -> http::HeaderMap {
+        headers(&[
+            ("x-a2a-caller-agent-id", "billing-orchestrator"),
+            ("x-a2a-callee-agent-id", "payments-agent"),
+            ("x-a2a-task-id", "task-42"),
+            ("x-a2a-parent-request-id", "req-41"),
+            ("x-a2a-chain-depth", "1"),
+            (
+                "x-a2a-chain",
+                r#"[{"agent_id":"a","request_id":"r","timestamp_ms":1}]"#,
+            ),
+        ])
+    }
+
+    #[test]
+    fn envelope_from_untrusted_peer_ignores_forged_identity_headers() {
+        let ctx = envelope_from_headers(&forged_envelope_headers(), A2ASpec::GoogleV0, false);
+
+        // An untrusted caller must not be able to name itself, name its
+        // callee, or assert a chain. Those three feed `caller_denylist`,
+        // `callee_allowlist`, and cycle detection respectively.
+        assert_eq!(ctx.caller_agent_id, "");
+        assert_eq!(ctx.callee_agent_id, None);
+        assert!(ctx.chain.is_empty());
+    }
+
+    #[test]
+    fn envelope_from_trusted_peer_honors_identity_headers() {
+        let ctx = envelope_from_headers(&forged_envelope_headers(), A2ASpec::GoogleV0, true);
+
+        assert_eq!(ctx.caller_agent_id, "billing-orchestrator");
+        assert_eq!(ctx.callee_agent_id, Some("payments-agent".to_string()));
+        assert_eq!(ctx.task_id, "task-42");
+        assert_eq!(ctx.chain.len(), 1);
+    }
+
+    #[test]
+    fn envelope_from_untrusted_peer_marks_identity_unverified() {
+        let trusted = envelope_from_headers(&forged_envelope_headers(), A2ASpec::GoogleV0, true);
+        let untrusted = envelope_from_headers(&forged_envelope_headers(), A2ASpec::GoogleV0, false);
+
+        // The policy needs to tell "no chain was asserted" apart from
+        // "a chain was asserted but we do not trust it", so it can deny
+        // on unknown identity rather than silently treating the caller
+        // as a chain root.
+        assert!(trusted.identity_verified);
+        assert!(!untrusted.identity_verified);
     }
 
     #[test]
