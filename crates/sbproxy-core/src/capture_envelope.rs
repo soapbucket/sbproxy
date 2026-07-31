@@ -221,16 +221,15 @@ pub fn dispatch_terminal_event(
     );
     ev.event_type = event_type;
     ev.latency_ms = latency_ms;
+    ev.tenant_id = Some(ctx.tenant_id.to_string());
     ev.session_id = ctx.session_id;
     ev.parent_session_id = ctx.parent_session_id;
     ev.user_id = ctx.user_id.clone();
     ev.user_id_source = ctx.user_id_source;
-    // WOR-1498: the credential (API key) that injected the policy, so
-    // the request-event ledger join keys on it like the metrics do.
-    ev.api_key_id = match ctx.principal.api_key_id() {
-        "" => None,
-        id => Some(id.to_string()),
-    };
+    // WOR-2093: the canonical accountability id, shared with the access
+    // log, the admin ring, the inbound-key metric, and spans, so every
+    // surface reports the same key for the same request.
+    ev.api_key_id = ctx.accountable_key_id().map(str::to_string);
     ev.key_provider = ctx.native_key_provider.clone();
     ev.key_mode = Some(ctx.inbound_key_mode.as_str().to_string());
     ev.properties = ctx.properties.clone();
@@ -243,6 +242,7 @@ pub fn dispatch_terminal_event(
     ev.prompt_fingerprint = ctx.ai_prompt_fingerprint.clone();
     ev.tokens_in = ctx.ai_tokens_in.and_then(|v| u32::try_from(v).ok());
     ev.tokens_out = ctx.ai_tokens_out.and_then(|v| u32::try_from(v).ok());
+    ev.tokens_cached = ctx.ai_tokens_cached.and_then(|v| u32::try_from(v).ok());
     ev.cost_usd_micros = ctx.ai_cost_usd_micros;
     // WOR-1874: guardrail intervention columns, mirrored onto the
     // event envelope so log-only consumers can filter on them.

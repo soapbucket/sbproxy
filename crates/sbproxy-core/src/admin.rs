@@ -389,6 +389,48 @@ pub struct RequestLogEntry {
     /// What the intervening guardrail did (`block` today; WOR-1874).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guardrail_action: Option<String>,
+    /// Canonical public id of the key that governed this request, when
+    /// one resolved (WOR-2093). Matches the access log column, the
+    /// `sbproxy_inbound_key_requests_total{api_key_id}` label, and the
+    /// `sbproxy.key_id` span attribute. Never the raw secret.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_id: Option<String>,
+    /// Inbound credential mode: `none`, `minted`, or `native` (WOR-2093).
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub key_mode: String,
+    /// Recognized native provider label; never credential material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_provider: Option<String>,
+    /// Origin-scoped tenant label (`__default__` when unset).
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub tenant_id: String,
+    /// Resolved end-user identifier, when user capture resolved one.
+    /// Already length-capped and redaction-applied by capture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// Coarse machine-readable failure class (`auth_denied`,
+    /// `rate_limited`, `upstream_5xx`, ...), absent on success
+    /// (WOR-2094).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    /// Config revision of the pipeline generation that served this
+    /// request (WOR-2094): every row names the config that governed it.
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub config_revision: String,
+    /// Governed key-policy revision that applied, when a key policy
+    /// resolved (WOR-2094). Same `r{rev}:{digest}` / `c:{rev}:{digest}`
+    /// vocabulary as the `sbproxy.policy_version` span attribute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<String>,
+    /// Bounded, ordered summary of policy decisions on this request as
+    /// `policy_type:verdict` pairs (WOR-2094). Explains why the gateway
+    /// acted, not just that it did.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub policy_decisions: Vec<String>,
+    /// Machine-readable reason from the policy or auth layer that
+    /// denied this request, when one did (WOR-2094).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deny_reason: Option<String>,
 }
 
 /// Filters for [`AdminState::query_requests`] (WOR-1718 / WOR-1874).
@@ -414,6 +456,12 @@ pub struct RequestLogFilter<'a> {
     pub property_key: Option<&'a str>,
     /// Exact redacted property value. Requires `property_key`.
     pub property_value: Option<&'a str>,
+    /// Exact canonical key id match (WOR-2093).
+    pub api_key_id: Option<&'a str>,
+    /// Exact inbound key mode match: `none`, `minted`, or `native`.
+    pub key_mode: Option<&'a str>,
+    /// Exact session id match (WOR-2093; previously client-side only).
+    pub session_id: Option<&'a str>,
 }
 
 // --- Admin State ---
@@ -754,6 +802,20 @@ impl AdminState {
                 (None, _) => true,
                 (Some(key), None) => e.properties.contains_key(key),
                 (Some(key), Some(value)) => e.properties.get(key).is_some_and(|v| v == value),
+            })
+            // WOR-2093: key-accountability filters so the Keys view can
+            // deep-link to one credential's traffic, and session rows
+            // resolve server-side instead of client-side.
+            .filter(|e| {
+                filter
+                    .api_key_id
+                    .is_none_or(|id| e.api_key_id.as_deref() == Some(id))
+            })
+            .filter(|e| filter.key_mode.is_none_or(|mode| e.key_mode == mode))
+            .filter(|e| {
+                filter
+                    .session_id
+                    .is_none_or(|id| e.session_id.as_deref() == Some(id))
             })
             .skip(offset)
             .take(limit)
@@ -1124,6 +1186,17 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
     }
     let _guard = Guard(&state.reload_in_progress);
 
+    // WOR-2094: snapshot the outgoing generation so the config audit
+    // event can name the revision pair and the origin delta.
+    let prior_pipeline = crate::reload::current_pipeline();
+    let prior_revision = prior_pipeline.config_revision.clone();
+    let prior_origins: std::collections::BTreeSet<String> = prior_pipeline
+        .config
+        .origins
+        .iter()
+        .map(|origin| origin.hostname.to_string())
+        .collect();
+
     // --- Read + compile + load ---
     let yaml = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -1185,6 +1258,29 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
         loaded_at = %loaded_at,
         "admin reload: pipeline swapped"
     );
+
+    // WOR-2094: config changes are audited with the actor (when the
+    // reload came through an authenticated admin request), the revision
+    // pair, and the origin delta. This is the previously-dead
+    // ConfigAuditEntry channel's first production emitter.
+    let next_pipeline = crate::reload::current_pipeline();
+    let next_origins: std::collections::BTreeSet<String> = next_pipeline
+        .config
+        .origins
+        .iter()
+        .map(|origin| origin.hostname.to_string())
+        .collect();
+    let mut entry = sbproxy_observe::ConfigAuditEntry::new(
+        "api",
+        next_origins.difference(&prior_origins).cloned().collect(),
+        prior_origins.difference(&next_origins).cloned().collect(),
+        Vec::new(),
+    )
+    .with_revisions(Some(prior_revision.as_str()), Some(revision.as_str()));
+    if let Some(actor) = current_admin_actor() {
+        entry = entry.with_actor(actor);
+    }
+    entry.emit();
 
     // A reload can succeed while one subsystem stayed on prior state.
     // The caller (often an unattended config authority) needs to see
@@ -2390,6 +2486,43 @@ pub fn handle_admin_request(
             ),
         };
     }
+    // WOR-2094: unified audit sample across the security, key, config,
+    // admin, and policy channels. A bounded in-memory ring; the durable
+    // trail is whatever the OTel collector ships the tracing targets to.
+    if path_only == "/api/audit/events" {
+        let limit: usize = rl_query_param(path, "limit")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100)
+            .min(1_000);
+        let channel = decoded_query_param(path, "channel");
+        if channel
+            .as_deref()
+            .is_some_and(|c| !matches!(c, "security" | "key" | "config" | "admin" | "policy"))
+        {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"channel must be security, key, config, admin, or policy"}"#
+                    .to_string(),
+            );
+        }
+        let kind = decoded_query_param(path, "kind");
+        let key_id = decoded_query_param(path, "key_id");
+        let events = sbproxy_observe::audit_ring::recent_audit_events(
+            limit,
+            channel.as_deref(),
+            kind.as_deref(),
+            key_id.as_deref(),
+        );
+        return match serde_json::to_string(&events) {
+            Ok(body) => (200, "application/json", body),
+            Err(e) => (
+                500,
+                "application/json",
+                format!(r#"{{"error":"serialization failed: {e}"}}"#),
+            ),
+        };
+    }
     // WOR-1718: recent request log with filters + pagination. Query params:
     // `status` (exact), `method` (case-insensitive), `path` (substring),
     // `offset`, `limit`. No params returns the newest entries, unchanged.
@@ -2434,6 +2567,20 @@ pub fn handle_admin_request(
                 r#"{"error":"property_value requires property_key"}"#.to_string(),
             );
         }
+        // WOR-2093: key-accountability filters.
+        let api_key_id_f = decoded_query_param(path, "api_key_id");
+        let key_mode_f = decoded_query_param(path, "key_mode");
+        if key_mode_f
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "none" | "minted" | "native"))
+        {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"key_mode must be none, minted, or native"}"#.to_string(),
+            );
+        }
+        let session_id_f = decoded_query_param(path, "session_id");
         let offset = rl_query_param(path, "offset")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
@@ -2452,6 +2599,9 @@ pub fn handle_admin_request(
                 retried: retried_f,
                 property_key: property_key_f.as_deref(),
                 property_value: property_value_f.as_deref(),
+                api_key_id: api_key_id_f.as_deref(),
+                key_mode: key_mode_f.as_deref(),
+                session_id: session_id_f.as_deref(),
             },
             offset,
             limit,
@@ -2934,6 +3084,39 @@ pub fn admin_log_sink() -> Option<&'static Arc<AdminState>> {
     ADMIN_LOG_SINK.get()
 }
 
+thread_local! {
+    /// Operator username for the admin request currently dispatching on
+    /// this blocking thread (WOR-2094). The blocking dispatcher runs one
+    /// request end-to-end on one pooled thread, so a scoped slot is
+    /// sound; the guard clears it before the thread returns to the pool.
+    static CURRENT_ADMIN_ACTOR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The authenticated operator for the admin request currently being
+/// dispatched on this thread, when one resolved (WOR-2094). Read by
+/// audit emitters below the sync dispatcher so mutations name their
+/// actor without threading a parameter through every handler.
+pub(crate) fn current_admin_actor() -> Option<String> {
+    CURRENT_ADMIN_ACTOR.with(|slot| slot.borrow().clone())
+}
+
+/// Clears the actor slot when the dispatch scope ends.
+struct AdminActorGuard;
+
+impl Drop for AdminActorGuard {
+    fn drop(&mut self) {
+        CURRENT_ADMIN_ACTOR.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Install `actor` as the dispatching operator for this thread and
+/// return a guard that clears it on scope exit.
+fn set_current_admin_actor(actor: Option<String>) -> AdminActorGuard {
+    CURRENT_ADMIN_ACTOR.with(|slot| *slot.borrow_mut() = actor);
+    AdminActorGuard
+}
+
 /// Record the raw-bytes hash of a config the process just loaded, so
 /// `GET /admin/drift` compares against what is actually running.
 ///
@@ -3392,6 +3575,18 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                 path = %path,
                 "admin action"
             );
+            // WOR-2094: same event on the console's audit sample.
+            sbproxy_observe::audit_ring::push_audit_event(
+                sbproxy_observe::audit_ring::AuditRingEvent::new(
+                    "admin",
+                    "admin_action",
+                    Some(p.username.clone()),
+                    None,
+                    None,
+                    None,
+                    Some(format!("{method} {path}")),
+                ),
+            );
         }
     }
     // A session-authenticated request synthesizes a Basic header so
@@ -3752,7 +3947,12 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     let auth_owned = auth_for_dispatch;
     let body_for_task = body_owned.clone();
     let state_for_task = state.clone();
+    // WOR-2094: carry the authenticated operator onto the dispatch
+    // thread so audit emitters below the sync dispatcher can name the
+    // actor of a mutation.
+    let actor_for_task = principal.as_ref().map(|p| p.username.clone());
     let (status, content_type, body) = match tokio::task::spawn_blocking(move || {
+        let _actor_guard = set_current_admin_actor(actor_for_task);
         handle_admin_request(
             &method_owned,
             &path_owned,
@@ -3958,6 +4158,19 @@ async fn handle_admin_login<S: tokio::io::AsyncWrite + Unpin>(
         Some(r) => r,
         None => {
             tracing::warn!(target: "sbproxy::admin::audit", operator = %user, "admin login failed");
+            // WOR-2094: failed sign-ins are first-class security
+            // events on the console's audit sample.
+            sbproxy_observe::audit_ring::push_audit_event(
+                sbproxy_observe::audit_ring::AuditRingEvent::new(
+                    "admin",
+                    "login_failed",
+                    Some(user.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            );
             let _ = write_admin_response_headed(
                 sock,
                 401,
@@ -3972,6 +4185,17 @@ async fn handle_admin_login<S: tokio::io::AsyncWrite + Unpin>(
     let ttl_secs = 8 * 3600;
     let (token, csrf) = state.session_signer.mint(&user, role, ttl_secs, unix_now());
     tracing::info!(target: "sbproxy::admin::audit", operator = %user, role = %role_label(role), "admin login");
+    sbproxy_observe::audit_ring::push_audit_event(
+        sbproxy_observe::audit_ring::AuditRingEvent::new(
+            "admin",
+            "login",
+            Some(user.clone()),
+            None,
+            None,
+            None,
+            Some(format!("role: {}", role_label(role))),
+        ),
+    );
     let secure_attr = if secure { "; Secure" } else { "" };
     let cookie = format!(
         "{}={token}; HttpOnly; SameSite=Strict; Path=/{secure_attr}; Max-Age={ttl_secs}",
@@ -4763,6 +4987,97 @@ mod tests {
         );
         assert_eq!(not_retried.len(), 1);
         assert_eq!(not_retried[0].path, "/plain");
+    }
+
+    #[test]
+    fn query_requests_filters_on_key_attribution_columns() {
+        // WOR-2093: the ring answers "what did this key do" server-side.
+        let state = make_state();
+        state.log_request(RequestLogEntry {
+            timestamp: "t0".to_string(),
+            origin: "o".to_string(),
+            method: "GET".to_string(),
+            path: "/governed".to_string(),
+            status: 200,
+            latency_ms: 1.0,
+            client_ip: "127.0.0.1".to_string(),
+            api_key_id: Some("sbp_key_a".to_string()),
+            key_mode: "minted".to_string(),
+            tenant_id: "tenant-a".to_string(),
+            session_id: Some("01JAT3S6Q0V4X5Y6Z7A8B9C0D1".to_string()),
+            config_revision: "rev-1".to_string(),
+            ..Default::default()
+        });
+        state.log_request(RequestLogEntry {
+            timestamp: "t1".to_string(),
+            origin: "o".to_string(),
+            method: "GET".to_string(),
+            path: "/native".to_string(),
+            status: 200,
+            latency_ms: 1.0,
+            client_ip: "127.0.0.1".to_string(),
+            api_key_id: Some("native:tenant-a:api:openai".to_string()),
+            key_mode: "native".to_string(),
+            key_provider: Some("openai".to_string()),
+            ..Default::default()
+        });
+        state.log_request(RequestLogEntry {
+            timestamp: "t2".to_string(),
+            origin: "o".to_string(),
+            method: "GET".to_string(),
+            path: "/unkeyed".to_string(),
+            status: 200,
+            latency_ms: 1.0,
+            client_ip: "127.0.0.1".to_string(),
+            key_mode: "none".to_string(),
+            ..Default::default()
+        });
+
+        let by_key = state.query_requests(
+            &RequestLogFilter {
+                api_key_id: Some("sbp_key_a"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert_eq!(by_key.len(), 1);
+        assert_eq!(by_key[0].path, "/governed");
+        assert_eq!(by_key[0].config_revision, "rev-1");
+
+        let native = state.query_requests(
+            &RequestLogFilter {
+                key_mode: Some("native"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].key_provider.as_deref(), Some("openai"));
+
+        let by_session = state.query_requests(
+            &RequestLogFilter {
+                session_id: Some("01JAT3S6Q0V4X5Y6Z7A8B9C0D1"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert_eq!(by_session.len(), 1);
+        assert_eq!(by_session[0].api_key_id.as_deref(), Some("sbp_key_a"));
+
+        // Combined: key AND mode narrows to the intersection.
+        let combined = state.query_requests(
+            &RequestLogFilter {
+                api_key_id: Some("sbp_key_a"),
+                key_mode: Some("native"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert!(combined.is_empty());
     }
 
     #[test]

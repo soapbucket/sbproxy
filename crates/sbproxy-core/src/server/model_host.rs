@@ -454,6 +454,7 @@ impl sbproxy_model_host::ModelHostObserver for MetricsObserver {
             Some(sbproxy_model_host::EngineKind::SGLang) => "sglang",
             Some(sbproxy_model_host::EngineKind::LlamaCpp) => "llama_cpp",
             Some(sbproxy_model_host::EngineKind::Embedded) => "embedded",
+            Some(sbproxy_model_host::EngineKind::MistralRs) => "mistralrs",
             None => "unknown",
         };
         sbproxy_observe::metrics::set_model_host_deployment_state(
@@ -1827,6 +1828,9 @@ fn managed_deployment_from_model(
         sbproxy_model_host::EngineChoice::Vllm => sbproxy_config::ManagedEngineChoice::Vllm,
         sbproxy_model_host::EngineChoice::SGLang => sbproxy_config::ManagedEngineChoice::SGLang,
         sbproxy_model_host::EngineChoice::LlamaCpp => sbproxy_config::ManagedEngineChoice::LlamaCpp,
+        sbproxy_model_host::EngineChoice::MistralRs => {
+            sbproxy_config::ManagedEngineChoice::MistralRs
+        }
         sbproxy_model_host::EngineChoice::Embedded => {
             anyhow::bail!("signed cluster deployments do not support the embedded engine")
         }
@@ -2892,14 +2896,13 @@ pub async fn managed_upstream(
             )
         })?;
     let deployment = route.deployment.clone();
-    let engine_model = deployment.clone();
     let admission = manager
         .admit(&deployment, priority)
         .await
         .map_err(|error| format!("{}: {}", error.reason.as_str(), error.detail))?;
     let mut permit = ManagedModelPermit {
         manager,
-        deployment,
+        deployment: deployment.clone(),
         admission,
         engine_version: None,
     };
@@ -2907,6 +2910,9 @@ pub async fn managed_upstream(
         .ensure_ready(priority)
         .await
         .map_err(|error| format!("{}: {error}", error.reason_code()))?;
+    // Engine-aware outbound model id: mistral.rs has no served-model-name
+    // flag and accepts `default` for the loaded model (WOR-1861).
+    let engine_model = running.kind.request_model_id(&deployment).to_string();
     // Capture the served engine version on the permit, which lives on the
     // request context through the complete response, so the end-of-request
     // usage record can answer "what served this" from the ledger alone

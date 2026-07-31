@@ -46,6 +46,20 @@ const PUBLISHED_METRICS: &[&str] = &[
     "sbproxy_model_host_load_queue_depth",
     "sbproxy_model_host_artifact_errors_total",
     "sbproxy_model_host_placement_rejections_total",
+    // WOR-2095: governed vs native traffic split, summed fleet-wide.
+    "sbproxy_inbound_key_requests_total",
+    // WOR-2095: mesh convergence and health. The whole mesh_ prefix was
+    // dark on every console surface; these seven answer "is replication
+    // converging and is any node isolated" without a Prometheus stack.
+    // Registered on the global default registry, which snapshot_named
+    // gathers alongside the custom one.
+    "mesh_anti_entropy_rounds_total",
+    "mesh_anti_entropy_keys_total",
+    "mesh_replication_writes_total",
+    "mesh_replication_read_repairs_total",
+    "mesh_peer_state_transitions_total",
+    "mesh_node_isolated",
+    "mesh_handoff_keys_total",
 ];
 
 /// Process-global fleet-metrics aggregator, installed when the mesh key

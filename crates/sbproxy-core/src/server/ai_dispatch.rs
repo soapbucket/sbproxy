@@ -1884,6 +1884,9 @@ fn principal_for_resolved_virtual_key(
 fn mark_guardrail_block(ctx: &mut RequestContext, category: String) {
     sbproxy_ai::ai_metrics::record_guardrail_block(&category);
     ctx.ai_outcome = Some("guardrail_block".to_string());
+    // WOR-2094: the ring row explains the block alongside the badge.
+    ctx.record_policy_decision("guardrail", "deny");
+    ctx.deny_reason = Some(format!("guardrail: {category}"));
     ctx.ai_guardrail_category = Some(category);
     ctx.ai_guardrail_action = Some("block".to_string());
 }
@@ -2562,6 +2565,11 @@ pub(super) async fn handle_ai_proxy(
     // already populated `ctx.tenant_id` (defaulting to `__default__`
     // when no tenant is configured) by the time dispatch runs.
     ai_span.record("sbproxy.tenant_id", ctx.tenant_id.as_str());
+    // WOR-2093: session linkage on the exported span, so key, session,
+    // and trace join in the collector.
+    if let Some(session_id) = ctx.session_id.as_ref() {
+        ai_span.record("sbproxy.session_id", session_id.to_string().as_str());
+    }
 
     // Increment the per-surface request counter and start the latency
     // clock. The latency guard records elapsed time at function exit
@@ -2588,6 +2596,10 @@ pub(super) async fn handle_ai_proxy(
     let resolved_request_vk = prepared_identity.resolved_request_key;
     let peer_policy_revision = prepared_identity.policy_revision;
     ai_span.record("sbproxy.policy_version", peer_policy_revision.as_str());
+    // WOR-2094: mirror the span's policy revision onto the request
+    // context so the admin ring row names the key-policy generation
+    // that governed this request.
+    ctx.ai_policy_version = Some(peer_policy_revision.clone());
     let router = config.router();
     if ctx.inbound_key_mode == crate::context::InboundKeyMode::Native
         && router.cascade_config().is_some()
@@ -2618,14 +2630,9 @@ pub(super) async fn handle_ai_proxy(
         return Ok(());
     }
     let effective_policy = ctx.effective_key_policy.as_ref();
-    let trace_key_id = effective_policy
-        .map(|policy| policy.key_id.as_str())
-        .filter(|key_id| !key_id.is_empty())
-        .or_else(|| {
-            let key_id = ctx.principal.api_key_id();
-            (!key_id.is_empty()).then_some(key_id)
-        });
-    if let Some(key_id) = trace_key_id {
+    // WOR-2093: the canonical accountability id, so the span agrees with
+    // the access log, the admin ring, and the inbound-key metric.
+    if let Some(key_id) = ctx.accountable_key_id() {
         ai_span.record("sbproxy.key_id", key_id);
     }
     let trace_project = effective_policy
@@ -4455,6 +4462,7 @@ pub(super) async fn handle_ai_proxy(
                             ctx.native_key_provider.clone(),
                             ctx.inbound_key_mode.as_str(),
                         )
+                        .with_api_key_id(ctx.accountable_key_id())
                         .emit();
                         sbproxy_observe::metrics::record_governance_fail_open(&key_id);
                         // No lease: there is no reservation to settle or
@@ -8157,6 +8165,7 @@ pub(super) async fn relay_ai_response_with_cache(
             if let Some(ctx) = ctx.as_mut() {
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
+                ctx.ai_tokens_cached = (cached_input > 0).then_some(cached_input);
                 let project = ctx.principal.attrs.project.as_deref().unwrap_or("");
                 let user = ctx.principal.attrs.user.as_deref().unwrap_or("");
                 if ctx.principal.attrs.tags.is_empty() {
@@ -8298,6 +8307,7 @@ pub(super) async fn relay_ai_response_with_cache(
             if prompt_tokens != 0 || completion_tokens != 0 {
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
+                ctx.ai_tokens_cached = (cached_input > 0).then_some(cached_input);
                 let usage = sbproxy_ai::budget::AiUsage::Tokens {
                     input: prompt_tokens,
                     output: completion_tokens,

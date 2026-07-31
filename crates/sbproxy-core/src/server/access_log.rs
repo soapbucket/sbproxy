@@ -479,13 +479,11 @@ pub(super) fn emit_access_log(
     } else {
         Some(auth_type.clone().unwrap_or_else(|| "none".to_string()))
     };
-    // WOR-1498: the credential (API key) that injected the policy, for
-    // the log-based per-credential reconciliation. Empty string means
-    // un-credentialed; record it as absent rather than a blank column.
-    let api_key_id = match ctx.principal.api_key_id() {
-        "" => None,
-        id => Some(id.to_string()),
-    };
+    // WOR-2093: the canonical accountability id, shared with the ring
+    // entry, the inbound-key metric, and spans so one request never
+    // reports different key ids on different surfaces. Absent rather
+    // than a blank column for un-credentialed traffic.
+    let api_key_id = ctx.accountable_key_id().map(str::to_string);
     let workspace_id = ctx
         .origin_idx
         .and_then(|idx| pipeline.config.origins.get(idx))

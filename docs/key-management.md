@@ -216,6 +216,14 @@ events, and security audit records carry the same `key_provider` and
 `key_mode` fields. No raw provider key is stored in those records or metric
 labels.
 
+One canonical key id spans every per-request surface: the admin request
+ring (`GET /api/requests?api_key_id=`), the access log, the metric label,
+usage events, and the `sbproxy.key_id` span attribute all report the same
+id for the same request, so "what did this key do" has one answer
+everywhere. Key and credential lifecycle changes are audited with the
+acting operator and a status diff, queryable at `GET /api/audit/events`;
+see [admin-api-reference.md](admin-api-reference.md).
+
 ### Requiring a key
 
 `require: true` refuses a request that carried no minted key, with a 401. It is

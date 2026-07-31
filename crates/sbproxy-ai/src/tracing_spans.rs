@@ -211,6 +211,10 @@ pub fn ai_request_span(surface: &str, operation: &str, method: &str) -> Span {
         // spans can be filtered by tenant downstream without parsing
         // the event payload.
         "sbproxy.tenant_id" = Empty,
+        // WOR-2093: session linkage so the collector can join a key's
+        // traffic to its sessions. Filled at dispatch entry when the
+        // capture envelope resolved a session id.
+        "sbproxy.session_id" = Empty,
         // Governed-key route attribution. These four fixed slots are filled
         // after request policy resolution. Free-form tags and metadata are
         // deliberately not declared as span fields.

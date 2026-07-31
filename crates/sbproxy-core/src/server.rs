@@ -3217,6 +3217,8 @@ fn emit_auth_audit(
         ctx.native_key_provider.clone(),
         ctx.inbound_key_mode.as_str(),
     )
+    // WOR-2093: a denial names the key it denied, when one resolved.
+    .with_api_key_id(ctx.accountable_key_id())
     .emit();
 }
 
@@ -3311,6 +3313,26 @@ fn emit_policy_verdict(
         // `docs/adr-policy-audit-binding.md`. Tenant label uses the
         // workspace id as the OSS-scope tenant proxy.
         sbproxy_observe::metrics::record_policy_audit_event_dropped(&ctx.workspace_id);
+    }
+    // WOR-2094: non-allow verdicts land on the console's audit sample.
+    // Allow verdicts stay off the ring (they would flood it at request
+    // volume); the per-request policy_decisions column carries them.
+    if !matches!(verdict, sbproxy_observe::events::VerdictTag::Allow) {
+        sbproxy_observe::audit_ring::push_audit_event(
+            sbproxy_observe::audit_ring::AuditRingEvent::new(
+                "policy",
+                policy_id,
+                None,
+                Some(ctx.tenant_id.clone()),
+                None,
+                Some(ctx.request_id.clone()),
+                Some(format!(
+                    "{} verdict on {} surface ({elapsed_ms}ms)",
+                    verdict.as_label(),
+                    surface.as_label(),
+                )),
+            ),
+        );
     }
 }
 
@@ -3567,6 +3589,9 @@ async fn check_policies(
                     "policy enforce() returned error; treating as deny"
                 );
                 emit_policy_verdict(verdict_ctx, policy_id, surface, VerdictTag::Deny, started);
+                // WOR-2094: the ring row explains the denial too.
+                ctx.record_policy_decision(policy_id, VerdictTag::Deny.as_label());
+                ctx.deny_reason = Some(format!("{policy_id}: enforce error"));
                 return Some((500, "policy error".to_string(), "plugin"));
             }
         };
@@ -3576,7 +3601,11 @@ async fn check_policies(
             &mut confirm_state,
         );
         emit_policy_verdict(verdict_ctx, policy_id, surface, translated.verdict, started);
+        // WOR-2094: mirror every verdict onto the request context so the
+        // admin ring row can explain what applied, not just what denied.
+        ctx.record_policy_decision(policy_id, translated.verdict.as_label());
         if let Some(deny) = translated.deny {
+            ctx.deny_reason = Some(format!("{policy_id}: {}", deny.1));
             return Some(deny);
         }
     }

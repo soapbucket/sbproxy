@@ -1271,6 +1271,11 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                         *model = ready.snapshot_path.display().to_string();
                     }
                 }
+                crate::config::EngineKind::MistralRs => {
+                    // mistral.rs mirrors vLLM here: retarget `-m` to the
+                    // verified immutable snapshot directory (WOR-1861).
+                    crate::launch::mistralrs_use_local_model(&mut spec.args, &ready.snapshot_path);
+                }
             }
         // WOR-1656: for legacy llama.cpp, prefer a locally pre-fetched GGUF over
         // letting the engine download via `--hf-repo`. That needs a

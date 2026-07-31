@@ -5512,16 +5512,14 @@ impl ProxyHttp for SbProxy {
             ctx.response_body_bytes,
             agent_labels,
         );
-        let inbound_api_key_id = ctx
-            .resolved_inbound_key
-            .as_deref()
-            .or(ctx.native_key_policy_record.as_deref())
-            .map(|record| record.key_id.as_str());
+        // WOR-2093: one canonical id for the metric, the ring row below,
+        // the access log, and spans.
+        let accountable_key_id = ctx.accountable_key_id().map(str::to_string);
         sbproxy_observe::metrics::record_inbound_key_request(
             ctx.native_key_provider.as_deref(),
             ctx.inbound_key_mode.as_str(),
             ctx.tenant_id.as_str(),
-            inbound_api_key_id,
+            accountable_key_id.as_deref(),
         );
 
         // WOR-1718: mirror the completed request into the admin request-log
@@ -5565,6 +5563,21 @@ impl ProxyHttp for SbProxy {
                 cost_usd_micros: ctx.ai_cost_usd_micros,
                 guardrail_category: ctx.ai_guardrail_category.clone(),
                 guardrail_action: ctx.ai_guardrail_action.clone(),
+                // WOR-2093: key accountability columns, from the same
+                // canonical derivation as the metric emitted above.
+                api_key_id: accountable_key_id,
+                key_mode: ctx.inbound_key_mode.as_str().to_string(),
+                key_provider: ctx.native_key_provider.clone(),
+                tenant_id: ctx.tenant_id.to_string(),
+                user_id: ctx.user_id.clone(),
+                // WOR-2094: explainability columns; every row names the
+                // config and policy generations that governed it and why
+                // the gateway acted.
+                error_class: super::access_log::classify_error_class(status_u16),
+                config_revision: ctx.pipeline.config_revision.clone(),
+                policy_version: ctx.ai_policy_version.clone(),
+                policy_decisions: ctx.policy_decisions.clone(),
+                deny_reason: ctx.deny_reason.clone(),
             });
         }
 

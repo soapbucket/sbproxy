@@ -526,6 +526,7 @@ impl DoctorReport {
             engine_report("llama_cpp", "llama-server", &env),
             engine_report("vllm", "vllm", &env),
             engine_report("embedded", "embedded", &env),
+            engine_report("mistralrs", "mistralrs", &env),
         ];
 
         let model_cache_dir = sbproxy_model_host::resolve_cache_dir_default(None);
@@ -638,6 +639,7 @@ impl DoctorReport {
         let env = EngineEnv {
             vllm_on_path: self.engine_path("vllm").is_some(),
             llama_server_on_path: self.engine_path("llama_cpp").is_some(),
+            mistralrs_on_path: self.engine_path("mistralrs").is_some(),
             container_runtime: container_for_resolution,
             // uvx provisions vLLM on Linux (sbproxy fetches uv itself).
             vllm_uvx: self.host.os == "linux",
@@ -989,6 +991,7 @@ impl DoctorReport {
             sbproxy_model_host::EngineKind::SGLang => "sglang",
             sbproxy_model_host::EngineKind::LlamaCpp => "llama_cpp",
             sbproxy_model_host::EngineKind::Embedded => "embedded",
+            sbproxy_model_host::EngineKind::MistralRs => "mistralrs",
         };
         self.engines.iter().find(|e| e.engine == engine)
     }
@@ -1232,11 +1235,13 @@ fn engine_report(engine: &'static str, program: &'static str, env: &EngineEnvVie
     let version = path.as_ref().and_then(|_| match program {
         "llama-server" => run_version("llama-server", &["--version"]),
         "vllm" => run_version("vllm", &["--version"]),
+        "mistralrs" => run_version("mistralrs", &["--version"]),
         _ => None,
     });
     let acquisition = match engine {
         "llama_cpp" => llama_acquisition(env, path.is_some()),
         "vllm" => vllm_acquisition(env, path.is_some()),
+        "mistralrs" => mistralrs_acquisition(env, path.is_some()),
         "embedded" => vec![AcquisitionOption {
             method: "built-in",
             available: env.embedded_feature,
@@ -1320,6 +1325,50 @@ fn llama_acquisition(env: &EngineEnvView, on_path: bool) -> Vec<AcquisitionOptio
              export PATH=\"$PWD/build/bin:$PATH\""
                 .to_string()
         },
+    });
+    opts
+}
+
+fn mistralrs_acquisition(env: &EngineEnvView, on_path: bool) -> Vec<AcquisitionOption> {
+    let mut opts = Vec::new();
+    if on_path {
+        opts.push(AcquisitionOption {
+            method: "path",
+            available: true,
+            detail: "already installed on PATH".to_string(),
+        });
+    }
+    // Upstream v0.9 prebuilts: Metal on Apple Silicon; CPU and per-CUDA
+    // compute-capability builds on Linux x86-64. No Intel-mac asset.
+    let prebuilt = match (env.os.as_str(), env.arch.as_str()) {
+        ("linux", "x86_64") => Some("cpu/cuda x86_64"),
+        ("macos", "aarch64") => Some("metal aarch64"),
+        _ => None,
+    };
+    opts.push(AcquisitionOption {
+        method: "prebuilt-release",
+        available: prebuilt.is_some(),
+        detail: match prebuilt {
+            Some(assets) if env.os == "linux" => format!(
+                "sbproxy fetches the pinned mistral.rs {assets} prebuilt; the CUDA build is \
+                 selected by GPU compute capability and needs an NVIDIA driver supporting \
+                 CUDA 12.8 or newer"
+            ),
+            Some(assets) => {
+                format!("sbproxy can fetch the pinned mistral.rs {assets} release binary")
+            }
+            None => format!(
+                "no prebuilt mistral.rs asset for {}/{}; use upstream's installer \
+                 (it builds from source there)",
+                env.os, env.arch
+            ),
+        },
+    });
+    opts.push(AcquisitionOption {
+        method: "source",
+        available: true,
+        detail: "curl -fsSL https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/install.sh | sh (upstream installer; prefers the same prebuilts, builds from source elsewhere)"
+            .to_string(),
     });
     opts
 }
@@ -2279,7 +2328,7 @@ mod tests {
     #[test]
     fn every_engine_reports_acquisition_options() {
         let report = DoctorReport::collect();
-        assert_eq!(report.engines.len(), 3);
+        assert_eq!(report.engines.len(), 4);
         for e in &report.engines {
             assert!(
                 !e.acquisition.is_empty(),
