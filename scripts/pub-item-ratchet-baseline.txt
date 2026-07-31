@@ -6,4 +6,10 @@
 #
 # Measured on WOR-1941, 2026-07-30, after inbound key validation and
 # key-plane generation pinning gained their production consumers.
-207
+#
+# Raised to 216 on WOR-2098, 2026-07-31: the RAG provider adapters ship
+# wire-contract integration tests, and their injection seams (scripted
+# DNS resolver, address policy, fixture-pinned client builder, escape
+# helper, render probe) must be `pub` for `tests/` to reach them. All
+# are `#[doc(hidden)]` and most also have in-crate production callers.
+216
