@@ -361,65 +361,64 @@ impl EngineDriver for MistralRsDriver {
             EngineAvailability::Available | EngineAvailability::Acquirable => {}
         }
 
-        let (executable, version, fingerprint) = match self.acquisition_plan(&request.provisioning)
-        {
-            BinaryAcquirePlan::OnPath(path) => {
-                ensure_executable(self.binaries.as_ref(), &path)?;
-                (path.clone(), None, format!("path:{}", path.display()))
-            }
-            BinaryAcquirePlan::Explicit(path) => {
-                ensure_executable(self.binaries.as_ref(), &path)?;
-                (path.clone(), None, format!("explicit:{}", path.display()))
-            }
-            BinaryAcquirePlan::FetchRelease { tag, sha256, .. } => {
-                let asset = Self::release_asset(&request.provisioning, &request.worker).map_err(
-                    |reason| {
-                        EngineDriverError::new(
-                            EngineFailureReason::EngineIncompatible,
-                            reason,
-                            "install a compatible mistralrs on PATH or configure acquire.path",
-                            false,
-                        )
-                    },
-                )?;
-                let sha256 = sha256.or_else(|| {
-                    crate::mistralrs_release::default_release_sha256(&tag, &asset)
-                        .map(str::to_string)
-                });
-                let path = self
-                    .binaries
-                    .fetch_release(&request.engine_cache_dir, &tag, &asset, sha256.as_deref())
-                    .await
-                    .map_err(|error| {
-                        EngineDriverError::new(
-                            EngineFailureReason::EngineProvisionFailed,
-                            format!("provision mistral.rs release {tag} ({asset}): {error}"),
-                            "verify network policy, release pin, digest, and engine cache \
+        let (executable, version, fingerprint) =
+            match self.acquisition_plan(&request.provisioning) {
+                BinaryAcquirePlan::OnPath(path) => {
+                    ensure_executable(self.binaries.as_ref(), &path)?;
+                    (path.clone(), None, format!("path:{}", path.display()))
+                }
+                BinaryAcquirePlan::Explicit(path) => {
+                    ensure_executable(self.binaries.as_ref(), &path)?;
+                    (path.clone(), None, format!("explicit:{}", path.display()))
+                }
+                BinaryAcquirePlan::FetchRelease { tag, sha256, .. } => {
+                    let asset = Self::release_asset(&request.provisioning, &request.worker)
+                        .map_err(|reason| {
+                            EngineDriverError::new(
+                                EngineFailureReason::EngineIncompatible,
+                                reason,
+                                "install a compatible mistralrs on PATH or configure acquire.path",
+                                false,
+                            )
+                        })?;
+                    let sha256 = sha256.or_else(|| {
+                        crate::mistralrs_release::default_release_sha256(&tag, &asset)
+                            .map(str::to_string)
+                    });
+                    let path = self
+                        .binaries
+                        .fetch_release(&request.engine_cache_dir, &tag, &asset, sha256.as_deref())
+                        .await
+                        .map_err(|error| {
+                            EngineDriverError::new(
+                                EngineFailureReason::EngineProvisionFailed,
+                                format!("provision mistral.rs release {tag} ({asset}): {error}"),
+                                "verify network policy, release pin, digest, and engine cache \
                                  permissions",
-                            true,
-                        )
-                    })?;
-                ensure_executable(self.binaries.as_ref(), &path)?;
-                let fingerprint = sha256
-                    .map(|digest| format!("sha256:{digest}"))
-                    .unwrap_or_else(|| format!("release:{tag}:digest-unpinned"));
-                (path, Some(tag), fingerprint)
-            }
-            BinaryAcquirePlan::Blocked(reason) => {
-                return Err(EngineDriverError::blocked(
-                    reason,
-                    "install a compatible mistralrs or configure a pinned release",
-                ));
-            }
-            BinaryAcquirePlan::BuildCuda { .. } | BinaryAcquirePlan::ProvisionUvx { .. } => {
-                return Err(EngineDriverError::new(
+                                true,
+                            )
+                        })?;
+                    ensure_executable(self.binaries.as_ref(), &path)?;
+                    let fingerprint = sha256
+                        .map(|digest| format!("sha256:{digest}"))
+                        .unwrap_or_else(|| format!("release:{tag}:digest-unpinned"));
+                    (path, Some(tag), fingerprint)
+                }
+                BinaryAcquirePlan::Blocked(reason) => {
+                    return Err(EngineDriverError::blocked(
+                        reason,
+                        "install a compatible mistralrs or configure a pinned release",
+                    ));
+                }
+                BinaryAcquirePlan::BuildCuda { .. } | BinaryAcquirePlan::ProvisionUvx { .. } => {
+                    return Err(EngineDriverError::new(
                     EngineFailureReason::EngineIncompatible,
                     "mistral.rs acquires only PATH, explicit-path, or prebuilt-release binaries",
                     "choose binary release acquisition for mistralrs",
                     false,
                 ));
-            }
-        };
+                }
+            };
         Ok(ProvisionedEngine {
             kind: EngineKind::MistralRs,
             executable,

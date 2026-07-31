@@ -69,6 +69,30 @@ const DEFAULT_MISTRALRS_ASSET_SHA256: &[(&str, &str)] = &[
         "mistralrs-cpu-x86_64-unknown-linux-gnu.tar.gz",
         "f2fc7e319ef1b9124ad89353de676fce8063545e1b7daae56bb9a2fa9b89a63f",
     ),
+    (
+        "mistralrs-cuda128-sm80-x86_64-unknown-linux-gnu.tar.gz",
+        "006ba5cc43e691588739bc958076781d590613568fbf4f35d6e158b9829cd607",
+    ),
+    (
+        "mistralrs-cuda128-sm86-x86_64-unknown-linux-gnu.tar.gz",
+        "e50baa81611abec613dbbce3b8093cf68f1fd5e0ae6d46e965ca61b875a475e8",
+    ),
+    (
+        "mistralrs-cuda128-sm89-x86_64-unknown-linux-gnu.tar.gz",
+        "ffd0e3820f981e33677a8a484ed481b81ad1ff3ec5112f3f439dab2d2dc1f423",
+    ),
+    (
+        "mistralrs-cuda128-sm90-x86_64-unknown-linux-gnu.tar.gz",
+        "4542021e2e211a58899cff7dcfd0ce6d0061e732c68de24dfb73ed3f924793eb",
+    ),
+    (
+        "mistralrs-cuda128-sm100-x86_64-unknown-linux-gnu.tar.gz",
+        "de0a03a4371bfe9de1b3b1be74baf28c1761d57d04d388dad47a38bc9a9c8998",
+    ),
+    (
+        "mistralrs-cuda128-sm120-x86_64-unknown-linux-gnu.tar.gz",
+        "d91c858b4648d4fbdb70966a1ba79bcf9aa3a97c9ab45b5f14a61ea4ea87217b",
+    ),
 ];
 
 /// The release asset filename for a platform + acceleration flavour.
