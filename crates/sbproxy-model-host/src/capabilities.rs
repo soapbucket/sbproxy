@@ -466,6 +466,24 @@ fn assert_managed_driver_capabilities() -> Result<(), String> {
             "unexpected SGLang capabilities: {sglang_capabilities:?}"
         ));
     }
+    // mistral.rs is a binary engine like llama.cpp (no container, no uv)
+    // but loads safetensors and runs on CPU, Metal, and CUDA (WOR-1861).
+    let mistralrs = crate::mistralrs_driver::MistralRsDriver::default();
+    let mistralrs_capabilities = crate::EngineDriver::capabilities(&mistralrs);
+    if mistralrs_capabilities.artifact_formats != [crate::ArtifactFormat::Safetensors]
+        || !mistralrs_capabilities
+            .accelerators
+            .contains(&crate::AcceleratorKind::Cuda)
+        || !mistralrs_capabilities
+            .accelerators
+            .contains(&crate::AcceleratorKind::Metal)
+        || mistralrs_capabilities.supports_container
+        || mistralrs_capabilities.supports_uv
+    {
+        return Err(format!(
+            "unexpected mistral.rs capabilities: {mistralrs_capabilities:?}"
+        ));
+    }
     Ok(())
 }
 
@@ -1219,6 +1237,14 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         domain: CapabilityDomain::Engine,
         status: SupportLevel::Preview,
         summary: "Managed SGLang serves safetensors weights on a CUDA worker from a pinned uv environment or a digest-pinned container, mirroring vLLM and adding RadixAttention prefix caching; live NVIDIA certification remains deferred.",
+        evidence: &["test.engine_drivers"],
+        consumer: None,
+    },
+    CapabilityEntry {
+        id: "engine.mistralrs",
+        domain: CapabilityDomain::Engine,
+        status: SupportLevel::Preview,
+        summary: "Managed mistral.rs serves safetensors weights from the upstream pinned prebuilt binary (PATH-first, sha256-verified), the pure-Rust subprocess lane; an explicit opt-in that auto never selects.",
         evidence: &["test.engine_drivers"],
         consumer: None,
     },

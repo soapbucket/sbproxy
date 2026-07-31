@@ -142,6 +142,25 @@ pub fn build_launch_spec(
             args.push("--ctx-size".to_string());
             args.push(plan.seq_len.to_string());
         }
+        EngineKind::MistralRs => {
+            // WOR-1861: `mistralrs serve -m <repo> --host 127.0.0.1
+            //   --port <p> --no-ui --max-seq-len <ctx>`. The unified v0.9
+            // CLI serves an OpenAI-compatible surface on the loopback
+            // port; `--no-ui` keeps it an API server. mistral.rs takes no
+            // KV dtype flag, so a configured `kv_quant` is deliberately
+            // not emitted (see `effective_kv_cache`, which books no
+            // saving for this engine).
+            args.push("serve".to_string());
+            args.push("-m".to_string());
+            args.push(model.hf_repo.clone());
+            args.push("--host".to_string());
+            args.push("127.0.0.1".to_string());
+            args.push("--port".to_string());
+            args.push(port.to_string());
+            args.push("--no-ui".to_string());
+            args.push("--max-seq-len".to_string());
+            args.push(plan.seq_len.to_string());
+        }
     }
 
     args.extend(extra_args.iter().cloned());
@@ -181,8 +200,10 @@ pub fn wrap_uvx(spec: &LaunchSpec, uv_path: &str, package_version: Option<&str>)
                 ],
             )
         }
-        // vLLM is the default uvx package; llama.cpp and embedded never
-        // reach this wrapper (they are not Python-package engines).
+        // vLLM is the default uvx package; llama.cpp, embedded, and
+        // mistral.rs never reach this wrapper (they are not
+        // Python-package engines: config validation rejects `uvx` for
+        // them and the acquisition planner never yields a uvx plan).
         _ => {
             let from = match package_version {
                 Some(v) => format!("vllm=={v}"),
@@ -239,6 +260,18 @@ pub fn vllm_use_local_snapshot(args: &mut [String], snapshot: &std::path::Path) 
 /// the generated argv is unchanged. A no-op when `--model-path` is absent.
 pub fn sglang_use_local_snapshot(args: &mut [String], snapshot: &std::path::Path) {
     if let Some(index) = args.iter().position(|argument| argument == "--model-path") {
+        if let Some(model) = args.get_mut(index + 1) {
+            *model = snapshot.display().to_string();
+        }
+    }
+}
+
+/// Retarget a mistral.rs `serve -m <source>` argv to one verified local
+/// snapshot directory (WOR-1861), mirroring [`vllm_use_local_snapshot`].
+/// The rest of the generated argv is unchanged. A no-op when `-m` is
+/// absent.
+pub fn mistralrs_use_local_model(args: &mut [String], snapshot: &std::path::Path) {
+    if let Some(index) = args.iter().position(|argument| argument == "-m") {
         if let Some(model) = args.get_mut(index + 1) {
             *model = snapshot.display().to_string();
         }

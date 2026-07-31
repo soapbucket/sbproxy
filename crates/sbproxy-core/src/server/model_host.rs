@@ -454,6 +454,7 @@ impl sbproxy_model_host::ModelHostObserver for MetricsObserver {
             Some(sbproxy_model_host::EngineKind::SGLang) => "sglang",
             Some(sbproxy_model_host::EngineKind::LlamaCpp) => "llama_cpp",
             Some(sbproxy_model_host::EngineKind::Embedded) => "embedded",
+            Some(sbproxy_model_host::EngineKind::MistralRs) => "mistralrs",
             None => "unknown",
         };
         sbproxy_observe::metrics::set_model_host_deployment_state(
@@ -1827,6 +1828,9 @@ fn managed_deployment_from_model(
         sbproxy_model_host::EngineChoice::Vllm => sbproxy_config::ManagedEngineChoice::Vllm,
         sbproxy_model_host::EngineChoice::SGLang => sbproxy_config::ManagedEngineChoice::SGLang,
         sbproxy_model_host::EngineChoice::LlamaCpp => sbproxy_config::ManagedEngineChoice::LlamaCpp,
+        sbproxy_model_host::EngineChoice::MistralRs => {
+            sbproxy_config::ManagedEngineChoice::MistralRs
+        }
         sbproxy_model_host::EngineChoice::Embedded => {
             anyhow::bail!("signed cluster deployments do not support the embedded engine")
         }

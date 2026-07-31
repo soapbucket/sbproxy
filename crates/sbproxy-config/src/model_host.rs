@@ -50,6 +50,11 @@ pub enum ManagedEngineChoice {
     SGLang,
     /// Use llama.cpp.
     LlamaCpp,
+    /// Use mistral.rs (WOR-1861). An explicit opt-in that `Auto` never
+    /// selects; the pure-Rust subprocess lane over the upstream pinned
+    /// prebuilt binary, serving safetensors weights.
+    #[serde(rename = "mistralrs")]
+    MistralRs,
 }
 
 /// Replacement behavior when a deployment changes.
@@ -201,6 +206,11 @@ pub enum ManagedEngineKind {
     SGLang,
     /// llama.cpp's `llama-server`.
     LlamaCpp,
+    /// mistral.rs's unified `mistralrs` CLI (WOR-1861). A single-binary
+    /// engine acquired like llama.cpp: PATH-first, then the pinned
+    /// upstream prebuilt release, sha256-verified.
+    #[serde(rename = "mistralrs")]
+    MistralRs,
 }
 
 /// How a managed engine process is provisioned and launched.

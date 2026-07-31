@@ -12,6 +12,16 @@ the next version cut.
 
 ### Added
 
+- **mistral.rs is a subprocess engine kind.** `engine: mistralrs` drives the
+  upstream v0.9 `mistralrs` CLI as a supervised subprocess over its
+  OpenAI-compatible surface, acquired exactly like llama.cpp: PATH-first,
+  then the pinned upstream prebuilt release (Metal on Apple Silicon; CPU
+  and per-compute-capability CUDA builds on Linux x86-64), sha256-verified
+  against checked-in digests. The lane serves safetensors weights with
+  native tool calls, appears in `sbproxy doctor` and `models list`, and is
+  an explicit opt-in: `auto` never resolves to it and placement ranks it
+  behind the certified lanes. See
+  [`docs/model-host.md`](docs/model-host.md).
 - **A managed worker refuses to boot into a configuration it cannot
   serve.** `sbproxy doctor --strict <config>` runs six named startup checks
   (NVIDIA driver, visible accelerators, per-entry engine compatibility,
