@@ -4323,7 +4323,7 @@ pub(super) async fn handle_ai_proxy(
                 origin: hostname.to_string(),
                 model_id,
                 prompt: extracted_prompt.clone(),
-                headers: snapshot_request_headers(session),
+                headers: snapshot_request_headers(session, pipeline),
             };
             if let Some(verdict) = hook.classify_prompt(&classify_req).await {
                 debug!(
@@ -4916,7 +4916,7 @@ pub(super) async fn handle_ai_proxy(
                     origin: hostname.to_string(),
                     model_id: model_id.clone(),
                     prompt: extracted_prompt.clone(),
-                    request_headers: snapshot_request_headers(session),
+                    request_headers: snapshot_request_headers(session, pipeline),
                     request_body: body_bytes.clone(),
                     method: method.as_str().to_string(),
                     path: path.clone(),

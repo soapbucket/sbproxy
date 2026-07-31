@@ -296,6 +296,7 @@ pub(super) fn capture_headers_for_log(
     max_value_bytes: usize,
     redact_pii: bool,
     redact_pii_rules: &[String],
+    is_sensitive: impl Fn(&str) -> bool,
 ) -> std::collections::BTreeMap<String, String> {
     if allowlist.is_empty() {
         return std::collections::BTreeMap::new();
@@ -305,14 +306,14 @@ pub(super) fn capture_headers_for_log(
             let redactor = default_pii_redactor();
             sbproxy_observe::capture::capture_headers(
                 headers,
-                |name| allowlist.matches(name),
+                |name| allowlist.matches_with_sensitive(name, &is_sensitive),
                 max_value_bytes,
                 Some(|v: &str| redactor.redact(v).into_owned()),
             )
         } else if let Some(redactor) = build_scoped_pii_redactor(redact_pii_rules) {
             sbproxy_observe::capture::capture_headers(
                 headers,
-                |name| allowlist.matches(name),
+                |name| allowlist.matches_with_sensitive(name, &is_sensitive),
                 max_value_bytes,
                 Some(|v: &str| redactor.redact(v).into_owned()),
             )
@@ -320,7 +321,7 @@ pub(super) fn capture_headers_for_log(
             // No matching rules: fall through to no-redaction.
             sbproxy_observe::capture::capture_headers(
                 headers,
-                |name| allowlist.matches(name),
+                |name| allowlist.matches_with_sensitive(name, &is_sensitive),
                 max_value_bytes,
                 None::<fn(&str) -> String>,
             )
@@ -328,7 +329,7 @@ pub(super) fn capture_headers_for_log(
     } else {
         sbproxy_observe::capture::capture_headers(
             headers,
-            |name| allowlist.matches(name),
+            |name| allowlist.matches_with_sensitive(name, &is_sensitive),
             max_value_bytes,
             None::<fn(&str) -> String>,
         )
@@ -387,7 +388,7 @@ pub(super) fn emit_access_log(
     hostname: &str,
     duration_secs: f64,
 ) {
-    let pipeline = reload::current_pipeline();
+    let pipeline = &ctx.pipeline;
     let Some(cfg) = pipeline.config.access_log.as_ref() else {
         return;
     };
@@ -525,6 +526,7 @@ pub(super) fn emit_access_log(
                 cfg.capture_headers.max_value_bytes,
                 cfg.capture_headers.redact_pii,
                 &cfg.capture_headers.redact_pii_rules,
+                |name| pipeline.is_sensitive_header(name),
             );
             let resp_headers = match session.response_written() {
                 Some(written) => capture_headers_for_log(
@@ -533,6 +535,7 @@ pub(super) fn emit_access_log(
                     cfg.capture_headers.max_value_bytes,
                     cfg.capture_headers.redact_pii,
                     &cfg.capture_headers.redact_pii_rules,
+                    |name| pipeline.is_sensitive_header(name),
                 ),
                 None => std::collections::BTreeMap::new(),
             };
@@ -1257,7 +1260,14 @@ mod capture_tests {
         for pattern in ["*", "d*", "dpop"] {
             let (allowlist, _) =
                 sbproxy_config::CompiledHeaderAllowlist::compile(&[pattern.to_string()]);
-            let captured = capture_headers_for_log(&headers, &allowlist, 4096, false, &[]);
+            let captured = capture_headers_for_log(
+                &headers,
+                &allowlist,
+                4096,
+                false,
+                &[],
+                sbproxy_config::types::is_sensitive_header,
+            );
             let line = sbproxy_observe::AccessLogEntry::builder()
                 .request_headers(captured)
                 .build()

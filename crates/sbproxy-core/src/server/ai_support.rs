@@ -2184,8 +2184,9 @@ pub(super) fn req_header_value(session: &Session, name: &str) -> Option<String> 
 /// and clone it.
 pub(super) fn snapshot_request_headers(
     session: &Session,
+    pipeline: &crate::pipeline::CompiledPipeline,
 ) -> std::collections::HashMap<String, String> {
-    snapshot_request_headers_from(session.req_header())
+    snapshot_request_headers_from(session.req_header(), pipeline)
 }
 
 /// Inner form of [`snapshot_request_headers`] that operates on a
@@ -2193,8 +2194,9 @@ pub(super) fn snapshot_request_headers(
 /// `RequestHeader` in-process without a live Pingora session.
 pub(super) fn snapshot_request_headers_from(
     req: &pingora_http::RequestHeader,
+    pipeline: &crate::pipeline::CompiledPipeline,
 ) -> std::collections::HashMap<String, String> {
-    snapshot_request_headers_from_with_sensitive(req, sbproxy_config::types::is_sensitive_header)
+    snapshot_request_headers_from_with_sensitive(req, |name| pipeline.is_sensitive_header(name))
 }
 
 /// Testable inner snapshot seam. Production passes the active config-aware

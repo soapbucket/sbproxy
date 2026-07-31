@@ -4394,13 +4394,27 @@ impl CompiledHeaderAllowlist {
     /// exact matches override the denylist except for DPoP proofs,
     /// which are never loggable.
     pub fn matches(&self, header_name: &str) -> bool {
+        self.matches_with_sensitive(header_name, is_sensitive_header)
+    }
+
+    /// Decide whether `header_name` should be captured using the supplied
+    /// sensitive-header predicate.
+    ///
+    /// Request paths that pin a compiled config generation use this form so
+    /// a concurrent reload cannot change which custom credential carriers
+    /// are excluded from wildcard and prefix captures.
+    pub fn matches_with_sensitive(
+        &self,
+        header_name: &str,
+        is_sensitive: impl Fn(&str) -> bool,
+    ) -> bool {
         if header_name == "dpop" {
             return false;
         }
         if self.exact.contains(header_name) {
             return true;
         }
-        let denied = is_sensitive_header(header_name);
+        let denied = is_sensitive(header_name);
         if denied {
             return false;
         }

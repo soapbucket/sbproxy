@@ -643,6 +643,27 @@ fn realtime_native_provider_credential(
     realtime_provider_credential(&resolved_provider)
 }
 
+fn realtime_native_provider_credential_for_pipeline(
+    provider: &sbproxy_ai::ProviderConfig,
+    headers: &http::HeaderMap,
+    pipeline: &CompiledPipeline,
+    native_provider: &str,
+) -> Option<RealtimeCredential> {
+    let inbound = pipeline.inbound_key_config()?;
+    realtime_native_provider_credential(provider, headers, &inbound.provider_hints, native_provider)
+}
+
+fn realtime_inbound_carrier_names(ctx: &RequestContext) -> Vec<String> {
+    let mut headers = Vec::new();
+    if let Some(header) = ctx.inbound_key_header.as_ref() {
+        headers.push(header.clone());
+    }
+    if let Some(inbound) = ctx.pipeline.inbound_key_config() {
+        headers.extend(inbound.credential_carrier_names());
+    }
+    headers
+}
+
 fn choose_realtime_credential(
     bound: Option<RealtimeCredential>,
     provider: Option<RealtimeCredential>,
@@ -1310,15 +1331,11 @@ impl ProxyHttp for SbProxy {
         Self::CTX: Send + Sync,
     {
         let is_realtime = ctx.ai_realtime_dispatch.is_some();
-        let mut realtime_inbound_key_headers = Vec::new();
-        if is_realtime {
-            if let Some(header) = ctx.inbound_key_header.as_ref() {
-                realtime_inbound_key_headers.push(header.clone());
-            }
-            if let Some(plane) = crate::key_plane::current_key_plane() {
-                realtime_inbound_key_headers.extend(plane.inbound().credential_carrier_names());
-            }
-        }
+        let realtime_inbound_key_headers = if is_realtime {
+            realtime_inbound_carrier_names(ctx)
+        } else {
+            Vec::new()
+        };
 
         // Collect header modifications into owned Vecs, then drop the pipeline
         // guard before calling Pingora's insert_header (requires 'static borrows).
@@ -1447,11 +1464,10 @@ impl ProxyHttp for SbProxy {
                                 return realtime_provider_credential(provider);
                             }
                             let native_provider = ctx.native_key_provider.as_deref()?;
-                            let key_plane = crate::key_plane::current_key_plane()?;
-                            realtime_native_provider_credential(
+                            realtime_native_provider_credential_for_pipeline(
                                 provider,
                                 &session.req_header().headers,
-                                &key_plane.inbound().provider_hints,
+                                &pipeline,
                                 native_provider,
                             )
                         });
@@ -6073,6 +6089,75 @@ mod tests {
             "anthropic",
         )
         .is_none());
+    }
+
+    fn realtime_pipeline_with_provider_hint(
+        header: &str,
+        value_prefix: &str,
+    ) -> std::sync::Arc<CompiledPipeline> {
+        let mut config = sbproxy_config::CompiledConfig::default();
+        let mut key_management = sbproxy_config::KeyManagementConfig::default();
+        key_management.inbound.headers.clear();
+        key_management.inbound.provider_hints = vec![sbproxy_config::ProviderHintConfig {
+            provider: "openai".to_string(),
+            header: header.to_string(),
+            scheme: String::new(),
+            value_prefix: value_prefix.to_string(),
+            also_header: None,
+        }];
+        config.server.key_management = Some(key_management);
+        std::sync::Arc::new(
+            CompiledPipeline::from_config_for_validation(config)
+                .expect("compile realtime pipeline"),
+        )
+    }
+
+    #[test]
+    fn realtime_carriers_and_provider_hints_stay_pinned_across_reload() {
+        let old_pipeline =
+            realtime_pipeline_with_provider_hint("x-native-carrier-a", "old-caller-");
+        let new_pipeline =
+            realtime_pipeline_with_provider_hint("x-native-carrier-b", "new-caller-");
+        let old_ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&old_pipeline),
+            ..RequestContext::default()
+        };
+
+        let carriers = realtime_inbound_carrier_names(&old_ctx);
+        assert!(carriers.iter().any(|name| name == "x-native-carrier-a"));
+        assert!(!carriers.iter().any(|name| name == "x-native-carrier-b"));
+
+        let provider: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "primary",
+            "provider_type": "openai",
+            "api_key": "operator-key-must-not-be-billed",
+            "accept_native_credentials_for": "openai"
+        }))
+        .unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-native-carrier-a",
+            http::HeaderValue::from_static("old-caller-credential"),
+        );
+
+        let credential = realtime_native_provider_credential_for_pipeline(
+            &provider,
+            &headers,
+            &old_pipeline,
+            "openai",
+        )
+        .expect("old pipeline resolves its own provider hint");
+        assert_eq!(credential.value, "Bearer old-caller-credential");
+        assert!(
+            realtime_native_provider_credential_for_pipeline(
+                &provider,
+                &headers,
+                &new_pipeline,
+                "openai",
+            )
+            .is_none(),
+            "new pipeline hints must not change an old request"
+        );
     }
 
     #[test]
