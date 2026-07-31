@@ -468,16 +468,25 @@ impl EngineDriver for MistralRsDriver {
             &request.extra_args,
         )?);
         let mut environment = BTreeMap::new();
-        if request.accelerator == AcceleratorKind::Cuda && !request.selected_devices.is_empty() {
-            environment.insert(
-                "CUDA_VISIBLE_DEVICES".to_string(),
-                request
-                    .selected_devices
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
+        if request.accelerator == AcceleratorKind::Cuda {
+            if !request.selected_devices.is_empty() {
+                environment.insert(
+                    "CUDA_VISIBLE_DEVICES".to_string(),
+                    request
+                        .selected_devices
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            }
+            // v0.9 defaults the FlashInfer decode kernel on for CUDA, and
+            // it fails live on GQA shapes (measured on an L4 with
+            // Qwen2.5-0.5B, qo_heads=14 kv_heads=2: "flashinfer_decode
+            // failed with status 999" on the first decode step). Pin the
+            // certified fallback decode path; revisit when upstream
+            // stabilises FlashInfer.
+            environment.insert("MISTRALRS_FLASHINFER_DECODE".to_string(), "0".to_string());
         }
         let process = self
             .runner

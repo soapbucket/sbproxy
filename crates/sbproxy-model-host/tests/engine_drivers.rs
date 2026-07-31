@@ -1397,6 +1397,9 @@ async fn mistralrs_launch_serves_the_verified_snapshot_with_runtime_owned_flags(
     assert!(arguments.iter().any(|value| value == "--no-kv-cache"));
     assert!(!arguments.iter().any(|value| value == "--cpu"));
     assert_eq!(captured[0].environment["CUDA_VISIBLE_DEVICES"], "1");
+    // The FlashInfer decode kernel fails live on GQA shapes (L4,
+    // status 999), so CUDA launches pin the fallback decode path.
+    assert_eq!(captured[0].environment["MISTRALRS_FLASHINFER_DECODE"], "0");
 }
 
 #[tokio::test]
