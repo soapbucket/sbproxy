@@ -754,9 +754,45 @@ fn build_request_template_context(
     tmpl
 }
 
+/// Render `ctx.principal` as the JSON shape every script engine shares.
+///
+/// One call site for the whole request path, so the Lua `ctx.principal`
+/// table, the JS `ctx.principal` object, and the CEL `principal.*`
+/// namespace can never drift apart: all three are fed from the same
+/// [`sbproxy_plugin::Principal`] on the live context.
+fn principal_context_json(principal: &sbproxy_plugin::Principal) -> serde_json::Value {
+    sbproxy_extension::js::build_principal_json(
+        Some(principal.tenant_id.as_str()),
+        (!principal.sub.is_empty()).then_some(principal.sub.as_str()),
+        Some(principal.source.as_str()),
+        principal.virtual_key.as_ref().map(|vk| vk.name.as_str()),
+        principal
+            .virtual_key
+            .as_ref()
+            .map(|vk| vk.allowed_providers.as_slice())
+            .unwrap_or(&[]),
+        principal.attrs.project.as_deref(),
+        principal.attrs.user.as_deref(),
+        principal.attrs.team.as_deref(),
+        &principal.attrs.tags,
+        &principal.attrs.metadata,
+        &principal.attrs.roles,
+        principal.attrs.claims.as_ref(),
+    )
+}
+
+/// Build the shared `ctx` table handed to every Lua / JS script surface
+/// (request modifiers, response modifiers, and the Lua/JS body
+/// transforms, which all route through here).
+///
+/// Carries `request.aipref`, `request.tls`, and `principal`, mirroring
+/// the CEL namespaces so a policy written for CEL ports across engines.
+/// Absent signals render as empty strings / `false` rather than being
+/// omitted, so a script can branch on `ctx.request.tls.ja4` or
+/// `ctx.principal.attrs.team` without probing for presence first.
 fn script_modifier_context(ctx: &RequestContext) -> serde_json::Value {
     let aipref = ctx.aipref.unwrap_or_default();
-    serde_json::json!({
+    let mut root = serde_json::json!({
         "request": {
             "aipref": {
                 "train": aipref.train,
@@ -765,7 +801,26 @@ fn script_modifier_context(ctx: &RequestContext) -> serde_json::Value {
                 "ai-input": aipref.ai_input,
             }
         }
-    })
+    });
+    // WOR-2083: the TLS fingerprint rides on the request sub-table so
+    // scripts read `ctx.request.tls.ja4` exactly like the CEL surface.
+    if let Some(request) = root.get_mut("request") {
+        let fp = ctx.tls_fingerprint.as_ref();
+        sbproxy_extension::lua::bindings::enrich_request_table_with_tls_fingerprint(
+            request,
+            fp.and_then(|f| f.ja3.as_deref()),
+            fp.and_then(|f| f.ja4.as_deref()),
+            fp.and_then(|f| f.ja4h.as_deref()),
+            fp.is_some_and(|f| f.trustworthy),
+        );
+    }
+    if let Some(map) = root.as_object_mut() {
+        map.insert(
+            "principal".to_string(),
+            principal_context_json(&ctx.principal),
+        );
+    }
+    root
 }
 
 fn insert_json_header(
@@ -3596,16 +3651,17 @@ fn shared_lua_engine() -> anyhow::Result<std::sync::Arc<sbproxy_extension::lua::
 
 /// Execute a Lua request modifier script.
 ///
-/// The script must define `modify_request(req, ctx)` which receives the request
-/// data as a table with `method`, `path`, and `headers` fields, and an empty
-/// context table. It must return a table with `set_headers` (and optionally
-/// `remove_headers`) to apply to the upstream request.
+/// The script must define `modify_request(req, ctx)` which receives the
+/// request data as a table with `method`, `path`, `headers`, and `tls`
+/// fields, and a context table carrying `request.aipref`, `request.tls`,
+/// and `principal` (WOR-2083). It must return a table with `set_headers`
+/// (and optionally `remove_headers`) to apply to the upstream request.
 ///
 /// Returns a list of (header_name, header_value) pairs to set.
 fn lua_request_modifier(
     script: &str,
     req_header: &RequestHeader,
-    hostname: &str,
+    ctx: &RequestContext,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let engine = shared_lua_engine()?;
 
@@ -3617,13 +3673,24 @@ fn lua_request_modifier(
         }
     }
 
-    let req_table = serde_json::json!({
+    let mut req_table = serde_json::json!({
         "method": req_header.method.as_str(),
         "path": req_header.uri.path(),
         "headers": headers_map,
-        "host": hostname,
+        "host": ctx.hostname.as_str(),
     });
-    let ctx_table = serde_json::json!({});
+    // WOR-2083: `req.tls.ja4` etc., matching the CEL `tls.*` namespace.
+    {
+        let fp = ctx.tls_fingerprint.as_ref();
+        sbproxy_extension::lua::bindings::enrich_request_table_with_tls_fingerprint(
+            &mut req_table,
+            fp.and_then(|f| f.ja3.as_deref()),
+            fp.and_then(|f| f.ja4.as_deref()),
+            fp.and_then(|f| f.ja4h.as_deref()),
+            fp.is_some_and(|f| f.trustworthy),
+        );
+    }
+    let ctx_table = script_modifier_context(ctx);
 
     // Try the Rust format first (modify_request returning {set_headers: {...}}).
     // If not found, try the Go format (match_request with req:set_header()).

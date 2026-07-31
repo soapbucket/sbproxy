@@ -76,6 +76,12 @@ the next version cut.
 
 ### Fixed
 
+- **Ollama streaming keeps its stream and its usage accounting.** The
+  buffered-relay fallback for streaming requests keyed on `text/event-stream`
+  alone, so Ollama's NDJSON (`application/x-ndjson`) success responses were
+  buffered whole and their token counts never reached budget recording: a
+  workspace past its cap kept getting 200s. NDJSON responses now stay on the
+  streaming relay, where the Ollama usage parser reads them line by line.
 - **A bulk credential purge now reaches every node.** `invalidate_all` cleared
   only the local shard, so peers kept serving stale resolved credentials until
   TTL. It now fans out to every peer. The same change fixes the opposite problem

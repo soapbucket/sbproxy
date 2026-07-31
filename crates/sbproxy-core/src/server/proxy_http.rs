@@ -2110,7 +2110,7 @@ impl ProxyHttp for SbProxy {
 
         // Apply Lua script request modifiers
         for script in &lua_scripts {
-            match lua_request_modifier(script, session.req_header(), &ctx.hostname) {
+            match lua_request_modifier(script, session.req_header(), ctx) {
                 Ok(headers_to_set) => {
                     for (key, value) in headers_to_set {
                         let _ = upstream_request.insert_header(key, &value);

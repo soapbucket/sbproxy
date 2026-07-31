@@ -349,46 +349,19 @@ impl WasmRuntime {
     }
 }
 
-/// Build the `principal` JSON the WASM module reads on its
-/// per-invocation stdin envelope. Returns a JSON object the caller
-/// splices into the existing input envelope alongside `request`.
-/// Mirrors the CEL `principal.*` namespace and the Lua + JS
-/// builders so a policy ports unchanged across engines.
+/// A `principal` builder for WASM deliberately does not exist here.
 ///
-/// Empty / missing fields render as empty strings / arrays / objects
-/// so a WASM module can branch on `input.principal.attrs.team`
-/// without first probing for presence.
-#[allow(clippy::too_many_arguments)]
-pub fn build_principal_input(
-    tenant_id: Option<&str>,
-    sub: Option<&str>,
-    source: Option<&str>,
-    virtual_key_name: Option<&str>,
-    virtual_key_allowed_providers: &[String],
-    project: Option<&str>,
-    user: Option<&str>,
-    team: Option<&str>,
-    tags: &[String],
-    metadata: &std::collections::BTreeMap<String, String>,
-    roles: &[String],
-    claims: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> serde_json::Value {
-    crate::lua::bindings::build_principal_table(
-        tenant_id,
-        sub,
-        source,
-        virtual_key_name,
-        virtual_key_allowed_providers,
-        project,
-        user,
-        team,
-        tags,
-        metadata,
-        roles,
-        claims,
-    )
-}
-
+/// The WASM transform contract is raw bytes on stdin, raw bytes on
+/// stdout (see [`WasmRuntime::execute`] and the transform docs). There
+/// is no JSON input envelope to splice a principal into, and inventing
+/// one would break every deployed module that parses its body off
+/// stdin. A `build_principal_input` wrapper shipped here for a while
+/// with zero callers for exactly that reason; it was removed under the
+/// half-wired-features cleanup rather than left implying a capability
+/// the wire contract cannot carry. If an envelope-based WASM surface
+/// ever ships, build its principal object from
+/// [`crate::lua::bindings::build_principal_table`], which is what the
+/// Lua and JS surfaces render from today.
 /// Build the JSON input passed to a WASM module's stdin for an HTTP
 /// request transform. Mirrors the Lua / JS `request` table
 /// shape and includes the agent-class fields under `request.agent_*`

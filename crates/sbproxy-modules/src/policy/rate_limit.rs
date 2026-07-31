@@ -873,6 +873,160 @@ impl RateLimitPolicy {
 mod tests {
     use super::*;
 
+    // --- WOR-2084: async L2 store on the hot path ---
+
+    /// Async store fake that records every `incr_with_ttl` key it sees.
+    struct RecordingAsyncStore {
+        count: std::sync::atomic::AtomicI64,
+        keys: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingAsyncStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                count: std::sync::atomic::AtomicI64::new(0),
+                keys: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_platform::storage::AsyncKVStore for RecordingAsyncStore {
+        async fn get(&self, _key: &[u8]) -> anyhow::Result<Option<bytes::Bytes>> {
+            Ok(None)
+        }
+        async fn put(&self, _key: &[u8], _value: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn put_with_ttl(
+            &self,
+            _key: &[u8],
+            _value: &[u8],
+            _ttl_secs: u64,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn incr_with_ttl(&self, key: &[u8], _ttl_secs: u64) -> anyhow::Result<i64> {
+            self.keys
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(key).into_owned());
+            Ok(self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1)
+        }
+        async fn delete(&self, _key: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Sync store fake that panics if the hot path ever reaches it, which
+    /// is exactly the spawn_blocking bridge the async handle exists to
+    /// bypass.
+    struct PanicSyncStore;
+
+    impl sbproxy_platform::storage::KVStore for PanicSyncStore {
+        fn get(&self, _key: &[u8]) -> anyhow::Result<Option<bytes::Bytes>> {
+            panic!("sync store must not be consulted when an async store is attached");
+        }
+        fn put(&self, _key: &[u8], _value: &[u8]) -> anyhow::Result<()> {
+            panic!("sync store must not be consulted when an async store is attached");
+        }
+        fn put_with_ttl(&self, _key: &[u8], _value: &[u8], _ttl_secs: u64) -> anyhow::Result<()> {
+            panic!("sync store must not be consulted when an async store is attached");
+        }
+        fn incr_with_ttl(&self, _key: &[u8], _ttl_secs: u64) -> anyhow::Result<i64> {
+            panic!("sync store must not be consulted when an async store is attached");
+        }
+        fn delete(&self, _key: &[u8]) -> anyhow::Result<()> {
+            panic!("sync store must not be consulted when an async store is attached");
+        }
+        fn scan_prefix(&self, _prefix: &[u8]) -> anyhow::Result<Vec<(bytes::Bytes, bytes::Bytes)>> {
+            panic!("sync store must not be consulted when an async store is attached");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_async_store_carries_the_hot_path_and_the_sync_store_is_never_touched() {
+        // Wired the way the pipeline compiler wires it: both handles
+        // attached, async preferred. The sync fake panics on any call,
+        // so this test fails loudly if the hot path regresses onto the
+        // spawn_blocking bridge.
+        let recorder = RecordingAsyncStore::new();
+        let policy =
+            RateLimitPolicy::from_config(serde_json::json!({ "requests_per_minute": 2.0 }))
+                .expect("valid rpm policy")
+                .with_store(
+                    Some(Arc::new(PanicSyncStore) as Arc<dyn sbproxy_platform::storage::KVStore>),
+                    "origin-a",
+                )
+                .with_async_store(
+                    Some(recorder.clone() as Arc<dyn sbproxy_platform::storage::AsyncKVStore>),
+                    "origin-a",
+                );
+
+        assert!(policy.allow_with_info_async("c1").await.allowed);
+        assert!(policy.allow_with_info_async("c1").await.allowed);
+        let third = policy.allow_with_info_async("c1").await;
+        assert!(
+            !third.allowed,
+            "the shared async counter must deny the third request under a limit of 2"
+        );
+
+        let keys = recorder.keys.lock().unwrap();
+        assert_eq!(keys.len(), 3, "every decision must hit the async store");
+        assert!(
+            keys.iter().all(|k| k.starts_with("sbproxy:rl:origin-a:")),
+            "counter keys must carry the origin-scoped prefix: {keys:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_order_does_not_change_the_counter_key_prefix() {
+        // `with_async_store` only sets the prefix when `with_store` has
+        // not already set it, and vice versa. If the derived prefixes
+        // ever diverged, an upgrade that adds the async handle would
+        // silently reset every live counter into a fresh keyspace.
+        let recorder_a = RecordingAsyncStore::new();
+        let sync_first =
+            RateLimitPolicy::from_config(serde_json::json!({ "requests_per_minute": 10.0 }))
+                .expect("valid rpm policy")
+                .with_store(
+                    Some(Arc::new(PanicSyncStore) as Arc<dyn sbproxy_platform::storage::KVStore>),
+                    "origin-a",
+                )
+                .with_async_store(
+                    Some(recorder_a.clone() as Arc<dyn sbproxy_platform::storage::AsyncKVStore>),
+                    "origin-a",
+                );
+
+        let recorder_b = RecordingAsyncStore::new();
+        let async_first =
+            RateLimitPolicy::from_config(serde_json::json!({ "requests_per_minute": 10.0 }))
+                .expect("valid rpm policy")
+                .with_async_store(
+                    Some(recorder_b.clone() as Arc<dyn sbproxy_platform::storage::AsyncKVStore>),
+                    "origin-a",
+                )
+                .with_store(
+                    Some(Arc::new(PanicSyncStore) as Arc<dyn sbproxy_platform::storage::KVStore>),
+                    "origin-a",
+                );
+
+        assert_eq!(
+            sync_first.debug_key_prefix(),
+            async_first.debug_key_prefix(),
+            "attach order must not move counters into a different keyspace"
+        );
+
+        let _ = sync_first.allow_with_info_async("c1").await;
+        let _ = async_first.allow_with_info_async("c1").await;
+        let key_a = recorder_a.keys.lock().unwrap()[0].clone();
+        let key_b = recorder_b.keys.lock().unwrap()[0].clone();
+        assert_eq!(
+            key_a, key_b,
+            "the same client in the same window must land on the same counter key"
+        );
+    }
+
     // --- Mesh cluster tier ---
 
     fn cluster_tier(node: &str) -> Arc<rate_limit_cluster::RateLimitClusterTier> {

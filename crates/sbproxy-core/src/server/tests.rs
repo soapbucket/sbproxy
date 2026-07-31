@@ -303,6 +303,127 @@ fn js_response_modifier_reads_aipref_context_from_ctx() {
     );
 }
 
+// --- WOR-2083: principal + request.tls across the script engines ---
+
+/// A context carrying a resolved principal and a TLS fingerprint, the
+/// two signals WOR-2083 wires into the non-CEL engines.
+fn ctx_with_principal_and_tls() -> RequestContext {
+    let mut ctx = RequestContext::new();
+    ctx.principal = sbproxy_plugin::Principal {
+        tenant_id: sbproxy_plugin::TenantId::from("acme".to_string()),
+        sub: "svc-batch".to_string(),
+        source: sbproxy_plugin::PrincipalSource::VirtualKey,
+        virtual_key: Some(sbproxy_plugin::VirtualKeyRef {
+            name: "vk-batch".to_string(),
+            allowed_providers: vec!["openai".to_string()],
+        }),
+        attrs: sbproxy_plugin::PrincipalAttrs {
+            team: Some("ml".to_string()),
+            ..Default::default()
+        },
+    };
+    ctx.tls_fingerprint = Some(sbproxy_tls::TlsFingerprint {
+        ja4: Some("t13d1516h2_8daaf6152771".to_string()),
+        trustworthy: true,
+        ..Default::default()
+    });
+    ctx
+}
+
+#[test]
+fn script_modifier_context_exposes_principal_and_tls() {
+    // The one seam every Lua / JS surface routes through: response
+    // modifiers, request modifiers, and the script body transforms.
+    let ctx = ctx_with_principal_and_tls();
+    let script_ctx = script_modifier_context(&ctx);
+
+    assert_eq!(script_ctx["principal"]["tenant_id"], "acme");
+    assert_eq!(script_ctx["principal"]["sub"], "svc-batch");
+    assert_eq!(script_ctx["principal"]["source"], "virtual_key");
+    assert_eq!(script_ctx["principal"]["virtual_key"]["name"], "vk-batch");
+    assert_eq!(script_ctx["principal"]["attrs"]["team"], "ml");
+    assert_eq!(
+        script_ctx["request"]["tls"]["ja4"],
+        "t13d1516h2_8daaf6152771"
+    );
+    assert_eq!(script_ctx["request"]["tls"]["trustworthy"], true);
+}
+
+#[test]
+fn script_modifier_context_renders_empty_principal_without_probing() {
+    // An anonymous request still gets the namespaces, as empty strings
+    // and empty containers, so scripts branch without presence checks.
+    let ctx = RequestContext::new();
+    let script_ctx = script_modifier_context(&ctx);
+
+    assert_eq!(script_ctx["principal"]["sub"], "");
+    assert_eq!(script_ctx["principal"]["attrs"]["team"], "");
+    assert_eq!(script_ctx["request"]["tls"]["ja4"], "");
+    assert_eq!(script_ctx["request"]["tls"]["trustworthy"], false);
+}
+
+#[test]
+fn lua_response_modifier_reads_principal_from_ctx() {
+    let ctx = ctx_with_principal_and_tls();
+    let headers = serde_json::Map::new();
+    let script = r#"
+        function modify_response(resp, ctx)
+          resp.headers["x-team"] = ctx.principal.attrs.team
+          resp.headers["x-tls-ja4"] = ctx.request.tls.ja4
+          return resp
+        end
+    "#;
+
+    let out = lua_response_modifier(script, 200, &headers, &ctx).unwrap();
+
+    assert!(out.contains(&("x-team".to_string(), "ml".to_string())));
+    assert!(out.contains(&(
+        "x-tls-ja4".to_string(),
+        "t13d1516h2_8daaf6152771".to_string()
+    )));
+}
+
+#[test]
+fn js_response_modifier_reads_principal_from_ctx() {
+    let ctx = ctx_with_principal_and_tls();
+    let headers = serde_json::Map::new();
+    let script = r#"
+        function modify_response(resp, ctx) {
+          resp.headers["x-team"] = ctx.principal.attrs.team;
+          resp.headers["x-tenant"] = ctx.principal.tenant_id;
+          return resp;
+        }
+    "#;
+
+    let out = js_response_modifier(script, 200, &headers, &ctx).unwrap();
+
+    assert!(out.contains(&("x-team".to_string(), "ml".to_string())));
+    assert!(out.contains(&("x-tenant".to_string(), "acme".to_string())));
+}
+
+#[test]
+fn lua_request_modifier_reads_tls_and_principal() {
+    let ctx = ctx_with_principal_and_tls();
+    let mut req_header = pingora_http::RequestHeader::build("GET", b"/v1/things", None).unwrap();
+    req_header.insert_header("x-probe", "1").unwrap();
+    let script = r#"
+        function modify_request(req, ctx)
+          return { set_headers = {
+            ["x-tls-ja4"] = req.tls.ja4,
+            ["x-team"] = ctx.principal.attrs.team,
+          } }
+        end
+    "#;
+
+    let out = lua_request_modifier(script, &req_header, &ctx).unwrap();
+
+    assert!(out.contains(&(
+        "x-tls-ja4".to_string(),
+        "t13d1516h2_8daaf6152771".to_string()
+    )));
+    assert!(out.contains(&("x-team".to_string(), "ml".to_string())));
+}
+
 // --- resolve_override parsing ---
 
 #[test]
