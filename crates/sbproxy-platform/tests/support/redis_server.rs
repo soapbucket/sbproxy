@@ -275,6 +275,11 @@ impl RedisServer {
     }
 
     fn wait_until_ready(&mut self) {
+        // The TLS readiness probe below builds a rustls ClientConfig, which
+        // panics unless a CryptoProvider is already selected. Every spawn_*
+        // constructor funnels through here before a test touches TLS, so this
+        // is the earliest point that covers all of them.
+        super::install_default_crypto_provider();
         let client = readiness_client(self.port, &self.mode);
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         loop {
