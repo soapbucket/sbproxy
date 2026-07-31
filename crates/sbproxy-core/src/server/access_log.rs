@@ -369,7 +369,8 @@ pub(super) fn log_capture_header_warnings(cfg: &sbproxy_config::AccessLogConfig)
             tracing::warn!(
                 header = %header,
                 "access_log.capture_headers.request includes a sensitive header by exact match; \
-                 values will be captured (redact_secrets still strips known token shapes)",
+                 configured primary credential carriers remain excluded; other exact sensitive \
+                 values are captured (redact_secrets still strips known token shapes)",
             );
         }
     }
@@ -384,7 +385,8 @@ pub(super) fn log_capture_header_warnings(cfg: &sbproxy_config::AccessLogConfig)
             tracing::warn!(
                 header = %header,
                 "access_log.capture_headers.response includes a sensitive header by exact match; \
-                 values will be captured (redact_secrets still strips known token shapes)",
+                 configured primary credential carriers remain excluded; other exact sensitive \
+                 values are captured (redact_secrets still strips known token shapes)",
             );
         }
     }
@@ -1253,7 +1255,50 @@ mod outcome_tests {
 
 #[cfg(test)]
 mod capture_tests {
-    use super::capture_headers_for_log;
+    use super::{capture_headers_for_log, log_capture_header_warnings};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLogGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("warning capture")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogWriter {
+        type Writer = SharedLogGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogGuard(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_header_warnings(cfg: &sbproxy_config::AccessLogConfig) -> String {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(SharedLogWriter(Arc::clone(&captured)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_capture_header_warnings(cfg);
+        });
+        let bytes = captured.lock().expect("warning capture").clone();
+        String::from_utf8(bytes).expect("warning output is UTF-8")
+    }
 
     const DPOP_PROOF: &str = concat!(
         "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2",
@@ -1326,6 +1371,27 @@ mod capture_tests {
         assert!(
             captured.is_empty(),
             "credential carriers must stay out of access logs even when named exactly"
+        );
+    }
+
+    #[test]
+    fn exact_sensitive_capture_warning_does_not_promise_carrier_capture() {
+        let mut cfg = sbproxy_config::AccessLogConfig::default();
+        cfg.capture_headers.request = vec!["x-sb-api".to_string()];
+        cfg.capture_headers.response = vec!["x-api-key".to_string()];
+
+        let warning = capture_header_warnings(&cfg);
+
+        assert_eq!(
+            warning
+                .matches("configured primary credential carriers remain excluded")
+                .count(),
+            2,
+            "request and response warnings must explain the hard carrier exclusion: {warning}"
+        );
+        assert!(
+            !warning.contains("values will be captured"),
+            "warning must not promise that a configured carrier is captured: {warning}"
         );
     }
 }

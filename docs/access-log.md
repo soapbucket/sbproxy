@@ -131,8 +131,12 @@ that counts toward the cap.
 
 A hardcoded denylist of sensitive headers (`authorization`, `cookie`,
 `set-cookie`, `proxy-authorization`, `x-api-key`) is excluded from `*`
-and glob matches. To capture one of these, list it by exact name; the
-proxy logs a `WARN` at config load so the choice is visible.
+and glob matches. An exact name opts a denied header into capture, and the
+proxy logs a `WARN` at config load so the choice is visible. There are two
+hard exclusions: `dpop` is never loggable, and every header configured as a
+primary credential carrier under `key_management.inbound` remains excluded
+even when named exactly. The warning calls out these limits rather than
+promising that a carrier value will be captured.
 
 When `redact_pii: true`, the `sbproxy-security` PII redactor runs over
 captured header values. `redact_pii_rules` (empty by default) optionally
@@ -229,6 +233,12 @@ Rules:
 - A field whose script errors, or that resolves to the empty string, is
   omitted from the line rather than failing the request.
 - Custom values pass through the same redaction as every other field.
+- The request-header context omits every configured primary credential
+  carrier before interpolation or a script runs. `${request.header.NAME}`
+  therefore resolves to an empty string for a carrier, and
+  `request.headers["name"]` is absent in CEL, Lua, and JavaScript. A
+  `provider_hints[].also_header` is matching metadata, not a primary carrier,
+  so it remains available unless the same name is configured as a carrier.
 
 ### Scopes
 

@@ -2008,9 +2008,10 @@ pub const FORBIDDEN_SWEEP_HEADERS: &[&str] = &[
 ///
 /// In addition to headers that cannot be swept safely, credentials may not
 /// claim realtime handshake metadata, distributed tracing state, outbound
-/// Web Bot Auth signature fields, or headers promoted into logs and capture
-/// envelopes. Those values have independent protocol meaning or leave the raw
-/// request-header surface before generic secret redaction can protect them.
+/// Web Bot Auth signature fields, or headers promoted into governance, logs,
+/// and capture envelopes. Those values have independent protocol meaning or
+/// leave the raw request-header surface before generic secret redaction can
+/// protect them.
 pub fn credential_header_is_reserved(header: &str) -> bool {
     let lower = header.trim().to_ascii_lowercase();
     FORBIDDEN_SWEEP_HEADERS.contains(&lower.as_str())
@@ -2025,6 +2026,9 @@ pub fn credential_header_is_reserved(header: &str) -> bool {
                 | "signature-input"
                 | "signature"
                 | "signature-agent"
+                | "x-user-id"
+                | "x-end-user"
+                | "x-sbproxy-tag"
                 | "x-sb-user-id"
                 | "x-sb-session-id"
                 | "x-sb-parent-session-id"
@@ -2037,6 +2041,7 @@ pub fn credential_header_is_reserved(header: &str) -> bool {
                 | "x-b3-parentspanid"
         )
         || lower.starts_with("sec-websocket-")
+        || lower.starts_with("x-a2a-")
         || lower.starts_with("x-sb-property-")
 }
 
@@ -9382,6 +9387,15 @@ native_key_policy:
             "x-b3-spanid",
             "x-b3-sampled",
             "x-b3-parentspanid",
+            "x-user-id",
+            "x-end-user",
+            "x-sbproxy-tag",
+            "x-a2a-caller-agent-id",
+            "x-a2a-callee-agent-id",
+            "x-a2a-task-id",
+            "x-a2a-parent-request-id",
+            "x-a2a-chain-depth",
+            "x-a2a-chain",
         ] {
             for provider_hint in [false, true] {
                 let cfg = KeyInboundConfig {

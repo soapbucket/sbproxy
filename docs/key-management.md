@@ -133,8 +133,10 @@ match wins, so specific prefixes belong before loose ones.
 Primary credential carriers are security-sensitive protocol fields, so SBproxy
 validates them even when `key_management.enabled` is currently `false`.
 Carriers cannot reuse hop-by-hop, framing, WebSocket, tracing, signature,
-correlation, access-log identity, or capture-envelope headers. This includes
-`x-sb-user-id`, the session headers, and the `x-sb-property-*` namespace.
+correlation, budget identity, A2A envelope, access-log identity, or
+capture-envelope headers. This includes `x-user-id`, `x-end-user`,
+`x-sbproxy-tag`, `x-sb-user-id`, the session headers, and the `x-a2a-*` and
+`x-sb-property-*` namespaces.
 `provider_hints[].also_header` is match metadata rather than a credential
 carrier, so it may still name protocol metadata such as a provider version
 header.
