@@ -452,8 +452,17 @@ fn ai_policy_input_tokens_est(model: &str, body: &serde_json::Value) -> i64 {
     i64::try_from(tokens).unwrap_or(i64::MAX)
 }
 
-fn native_bypass_is_safe(is_stream: bool, request_transform_selected: bool) -> bool {
-    !is_stream && !request_transform_selected
+/// Whether one attempt may replay the original native request bytes to the
+/// upstream instead of the governed canonical body. Streaming, any request
+/// transform, and any selected RAG runtime (which pins the request to the
+/// canonical route for every retrieval outcome, including no-match,
+/// continue, and stale) each make the bypass unsafe on their own.
+fn native_bypass_is_safe(
+    is_stream: bool,
+    request_transform_selected: bool,
+    rag_requires_canonical_path: bool,
+) -> bool {
+    !is_stream && !request_transform_selected && !rag_requires_canonical_path
 }
 
 // A streaming request stays on the streaming relay only when the upstream
@@ -2229,6 +2238,248 @@ mod compression_request_control_tests {
             )
             .supported_chat
         );
+    }
+}
+
+/// Stage at which [`evaluate_ai_input_guardrails`] runs for one request.
+///
+/// The original stage evaluates the client-supplied canonical request
+/// before any retrieval or provider egress. The augmented stage re-runs
+/// the same pipeline after RAG context injection, because retrieved
+/// content is untrusted input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputGuardrailStage {
+    /// The canonical client request, before any retrieval egress.
+    Original,
+    /// The request body after RAG context injection.
+    #[cfg(feature = "rag")]
+    RagAugmented,
+}
+
+impl InputGuardrailStage {
+    /// Bounded tracing label for this evaluation stage.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Original => "original",
+            #[cfg(feature = "rag")]
+            Self::RagAugmented => "rag_augmented",
+        }
+    }
+
+    /// True for the post-injection re-evaluation pass.
+    const fn is_rag_augmented(self) -> bool {
+        match self {
+            Self::Original => false,
+            #[cfg(feature = "rag")]
+            Self::RagAugmented => true,
+        }
+    }
+}
+
+/// Outcome of one pass of the shared AI input-guardrail evaluator.
+enum InputGuardrailDecision {
+    /// Every configured input guardrail allowed the request.
+    Allow {
+        /// Mesh detectors that flagged without reaching the block quorum.
+        flagged_count: usize,
+        /// Classified guardrail labels for the AI policy plane.
+        labels: Vec<String>,
+    },
+    /// A guardrail blocked the request. The caller preserves the original
+    /// wire behavior: `ErrorEnvelope::new("guardrail_violation", reason)`
+    /// with `code = name`, answered at `status`.
+    Block {
+        /// Guardrail name (or joined mesh security labels) for the envelope
+        /// `code` and the block-metric category.
+        name: String,
+        /// Block reason for the envelope message and span error.
+        reason: String,
+        /// HTTP status the caller must answer with.
+        status: u16,
+    },
+}
+
+/// Build an [`InputGuardrailDecision::Block`], adding the `rag_augmented`
+/// stage to tracing only; the response shape is identical across stages.
+fn blocked_input_decision(
+    stage: InputGuardrailStage,
+    name: String,
+    reason: String,
+    status: u16,
+) -> InputGuardrailDecision {
+    if stage.is_rag_augmented() {
+        warn!(
+            stage = stage.label(),
+            guardrail = %name,
+            "AI proxy: input guardrail blocked the RAG-augmented request"
+        );
+    }
+    InputGuardrailDecision::Block {
+        name,
+        reason,
+        status,
+    }
+}
+
+/// Run the complete input-guardrail pipeline over one canonical request body.
+///
+/// Behavior-preserving extraction of the input block that lived inline in
+/// [`handle_ai_proxy`]: external guardrails, mesh evaluation, message
+/// checks, body-aware checks, per-surface text checks, and configured mesh
+/// redaction, in the original order. The caller owns the response emission
+/// (span error, block metrics, envelope, status) so the original stage's
+/// wire behavior stays identical, and re-runs the evaluator with
+/// [`InputGuardrailStage::RagAugmented`] after RAG context injection.
+async fn evaluate_ai_input_guardrails(
+    config: &AiHandlerConfig,
+    guardrail_pipeline: Option<&std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
+    surface: &sbproxy_ai::handler::AiSurface,
+    model: &str,
+    body: &mut serde_json::Value,
+    principal: &sbproxy_plugin::Principal,
+    stage: InputGuardrailStage,
+) -> InputGuardrailDecision {
+    let mut flagged_count = 0_usize;
+    let mut labels: Vec<String> = Vec::new();
+    let extracted_prompt = extract_prompt_text(body);
+    if let Some(ref guardrails_config) = config.guardrails {
+        // WOR-1529: external HTTP guardrail providers (Presidio / Lakera /
+        // Aporia / custom) run before the built-in pipeline. Input-mode
+        // guardrails inspect the request content and block on a not-allowed
+        // verdict; `logging_only` records only, and errors honor each
+        // guardrail's `fail_open` flag.
+        if !guardrails_config.external.is_empty() {
+            let blocked = if extracted_prompt.is_empty() {
+                sbproxy_ai::external_guardrail::run_input_external_guardrails_without_content(
+                    &guardrails_config.external,
+                )
+            } else {
+                sbproxy_ai::external_guardrail::run_input_external_guardrails(
+                    &guardrails_config.external,
+                    &extracted_prompt,
+                    model,
+                )
+                .await
+            };
+            if let Some((name, reason)) = blocked {
+                warn!(
+                    guardrail = %name,
+                    reason = %reason,
+                    "AI proxy: guardrail blocked content"
+                );
+                return blocked_input_decision(stage, name, reason, 400);
+            }
+        }
+        if let Some(pipeline) = guardrail_pipeline {
+            if pipeline.has_input() {
+                // Parse messages from the body. WOR-1145: deserialize
+                // each element independently rather than the whole array
+                // at once. A single malformed entry (e.g. a numeric
+                // `role`) must not make `from_value::<Vec<Message>>` fail
+                // and yield an EMPTY vec, which would silently skip the
+                // input guardrails on the remaining valid messages. The
+                // body-aware `check_input_body` below still scans the raw
+                // body, so content in an unparseable element is not lost.
+                let messages: Vec<sbproxy_ai::Message> = body
+                    .get("messages")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| {
+                                serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                // WOR-1543: when a guardrail mesh is configured, run the
+                // messages-path detectors as a cascade, collect the full
+                // verdict set, and fuse it (block on a quorum, optional
+                // redact-and-continue). The label set is stashed on the
+                // context so the AI policy plane can reason over it.
+                // Otherwise fall back to the serial block-on-any check.
+                if let Some(mesh_cfg) = guardrails_config.mesh.clone() {
+                    let mesh = sbproxy_ai::guardrails::GuardrailMesh::new(mesh_cfg);
+                    let text = sbproxy_ai::guardrails::message_text(&messages);
+                    let decision = mesh.evaluate_input(pipeline, &messages, &text);
+                    flagged_count = decision.flagged_count();
+                    labels = decision.labels.clone();
+                    if decision.block {
+                        warn!(
+                            guardrails = ?decision.security_labels,
+                            "AI proxy: guardrail mesh blocked request"
+                        );
+                        let reason = decision.reasons.join("; ");
+                        return blocked_input_decision(
+                            stage,
+                            decision.security_labels.join(","),
+                            reason,
+                            400,
+                        );
+                    }
+                    if decision.redact {
+                        if let Some(redactor) = config.pii_redactor() {
+                            redactor.redact_json(body);
+                        }
+                    }
+                } else {
+                    if let Some(block) = pipeline.check_input(&messages) {
+                        warn!(
+                            guardrail = %block.name,
+                            reason = %block.reason,
+                            "AI proxy: input guardrail blocked request"
+                        );
+                        return blocked_input_decision(stage, block.name, block.reason, 400);
+                    }
+                    labels = pipeline
+                        .classify_input(&messages)
+                        .into_iter()
+                        .map(|label| label.name)
+                        .collect();
+                }
+
+                // WOR-801: body-aware input guardrails (today only
+                // `agent_alignment`, which reads `messages[].tool_calls`
+                // out of the raw body because the `Message` struct
+                // strips them). Runs after the text-shaped check so
+                // the cheap path short-circuits first.
+                // WOR-1645: pass the principal so the agent-alignment
+                // guardrail's shared MCP rbac_policy is evaluated
+                // against each model-emitted tool call, the same deny
+                // rule the mcp action enforces on tools/call.
+                if let Some(block) = pipeline.check_input_body_with_principal(body, Some(principal))
+                {
+                    warn!(
+                        guardrail = %block.name,
+                        reason = %block.reason,
+                        "AI proxy: body-aware input guardrail blocked request"
+                    );
+                    return blocked_input_decision(stage, block.name, block.reason, 400);
+                }
+
+                // Per-surface input guardrails: image generation,
+                // audio speech, reranking, and moderations carry user
+                // input in a non-messages field (`prompt`, `input`,
+                // `query`). The same guardrail pipeline applies to
+                // that text via check_input_text. Chat-shape surfaces
+                // are already covered by the messages check above.
+                if let Some(text) = sbproxy_ai::handler::extract_input_text(surface, body) {
+                    if let Some(block) = pipeline.check_input_text(&text) {
+                        warn!(
+                            ai.surface = surface.label(),
+                            guardrail = %block.name,
+                            reason = %block.reason,
+                            "AI proxy: per-surface input guardrail blocked request"
+                        );
+                        return blocked_input_decision(stage, block.name, block.reason, 400);
+                    }
+                }
+            }
+        }
+    }
+    InputGuardrailDecision::Allow {
+        flagged_count,
+        labels,
     }
 }
 
@@ -4387,7 +4638,6 @@ pub(super) async fn handle_ai_proxy(
     // WOR-1154: input guardrails run BEFORE the semantic-cache
     // lookup below, so a prompt a guardrail would block cannot be
     // served from a cache hit that short-circuits the request.
-    let mut guardrail_flagged_count = 0_usize;
     let guardrail_pipeline = match config.guardrail_pipeline() {
         Ok(pipeline) => pipeline,
         Err(error) => {
@@ -4417,188 +4667,243 @@ pub(super) async fn handle_ai_proxy(
     };
 
     // --- Input guardrails: check messages before forwarding ---
-    if let Some(ref guardrails_config) = config.guardrails {
-        // WOR-1529: external HTTP guardrail providers (Presidio / Lakera /
-        // Aporia / custom) run before the built-in pipeline. Input-mode
-        // guardrails inspect the request content and block on a not-allowed
-        // verdict; `logging_only` records only, and errors honor each
-        // guardrail's `fail_open` flag.
-        if !guardrails_config.external.is_empty() {
-            let blocked = if extracted_prompt.is_empty() {
-                sbproxy_ai::external_guardrail::run_input_external_guardrails_without_content(
-                    &guardrails_config.external,
-                )
-            } else {
-                sbproxy_ai::external_guardrail::run_input_external_guardrails(
-                    &guardrails_config.external,
-                    &extracted_prompt,
-                    &model,
-                )
-                .await
-            };
-            if let Some((name, reason)) = blocked {
-                send_guardrail_block_response(
-                    session,
-                    ctx,
-                    &ai_span,
-                    400,
-                    sbproxy_ai::guardrails::GuardrailBlock { name, reason },
-                )
-                .await?;
-                return Ok(());
-            }
+    // `mut` is exercised only when the rag feature compiles the augmented
+    // guardrail stage below; without it the original stage's value is final.
+    #[cfg_attr(not(feature = "rag"), allow(unused_mut))]
+    let mut guardrail_flagged_count = match evaluate_ai_input_guardrails(
+        config,
+        guardrail_pipeline.as_ref(),
+        &surface,
+        &model,
+        &mut body,
+        &ctx.principal,
+        InputGuardrailStage::Original,
+    )
+    .await
+    {
+        InputGuardrailDecision::Allow {
+            flagged_count,
+            labels,
+        } => {
+            ctx.ai_guardrail_labels = labels;
+            flagged_count
         }
-        if let Some(pipeline) = guardrail_pipeline.as_ref() {
-            if pipeline.has_input() {
-                // Parse messages from the body. WOR-1145: deserialize
-                // each element independently rather than the whole array
-                // at once. A single malformed entry (e.g. a numeric
-                // `role`) must not make `from_value::<Vec<Message>>` fail
-                // and yield an EMPTY vec, which would silently skip the
-                // input guardrails on the remaining valid messages. The
-                // body-aware `check_input_body` below still scans the raw
-                // body, so content in an unparseable element is not lost.
-                let messages: Vec<sbproxy_ai::Message> = body
-                    .get("messages")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|m| {
-                                serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok()
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+        InputGuardrailDecision::Block {
+            name,
+            reason,
+            status,
+        } => {
+            sbproxy_ai::tracing_spans::record_error(
+                &ai_span,
+                sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                &reason,
+            );
+            // WOR-1496: a guardrail block surfaces as a generic
+            // 400, so stamp the precise outcome for the
+            // value-vs-waste metric.
+            mark_guardrail_block(ctx, name.clone());
+            let body_bytes = ErrorEnvelope::new("guardrail_violation", &reason)
+                .code(&name)
+                .request_id(ctx.request_id.as_str())
+                .to_bytes();
+            send_response(session, status, "application/json", &body_bytes).await?;
+            return Ok(());
+        }
+    };
 
-                // WOR-1543: when a guardrail mesh is configured, run the
-                // messages-path detectors as a cascade, collect the full
-                // verdict set, and fuse it (block on a quorum, optional
-                // redact-and-continue). The label set is stashed on the
-                // context so the AI policy plane can reason over it.
-                // Otherwise fall back to the serial block-on-any check.
-                if let Some(mesh_cfg) = guardrails_config.mesh.clone() {
-                    let mesh = sbproxy_ai::guardrails::GuardrailMesh::new(mesh_cfg);
-                    let text = sbproxy_ai::guardrails::message_text(&messages);
-                    let decision = mesh.evaluate_input(pipeline, &messages, &text);
-                    guardrail_flagged_count = decision.flagged_count();
-                    ctx.ai_guardrail_labels = decision.labels.clone();
-                    if decision.block {
-                        warn!(
-                            guardrails = ?decision.security_labels,
-                            "AI proxy: guardrail mesh blocked request"
-                        );
-                        let reason = decision.reasons.join("; ");
-                        sbproxy_ai::tracing_spans::record_error(
-                            &ai_span,
-                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                            &reason,
-                        );
-                        mark_guardrail_block(ctx, decision.security_labels.join(","));
-                        let body_bytes = ErrorEnvelope::new("guardrail_violation", &reason)
-                            .code(&decision.security_labels.join(","))
+    // --- WOR-2098: retrieval-augmented generation ---
+    //
+    // Retrieval runs strictly after the original input guardrails (the
+    // embedding call is egress, so a blocked prompt must never leave the
+    // process) and before the AI policy plane, budgets, caches, and
+    // routing. A selected runtime pins the request to the canonical
+    // dispatch route for every retrieval outcome, so the augmented
+    // canonical body can never be replaced by a replay of the original
+    // native request bytes.
+    #[cfg(feature = "rag")]
+    let mut rag_requires_canonical_path = false;
+    #[cfg(not(feature = "rag"))]
+    let rag_requires_canonical_path = false;
+    #[cfg(feature = "rag")]
+    if matches!(
+        surface,
+        sbproxy_ai::handler::AiSurface::ChatCompletions
+            | sbproxy_ai::handler::AiSurface::Messages
+            | sbproxy_ai::handler::AiSurface::Responses
+    ) {
+        if let Some(runtime) =
+            origin_idx.and_then(|index| pipeline.rag_runtimes.get(index, ctx.forward_rule_idx))
+        {
+            rag_requires_canonical_path = true;
+            let embedding_provider = runtime.embedding_provider();
+            let vector_store_provider = runtime.vector_store_provider();
+            let retrieval_started = std::time::Instant::now();
+            let retrieval = runtime
+                .retrieve(sbproxy_rag::RetrievalRequest {
+                    body: &body,
+                    tenant_id: ctx.tenant_id.as_str(),
+                })
+                .await;
+            let retrieval_total_secs = retrieval_started.elapsed().as_secs_f64();
+            match retrieval {
+                Ok(result) => {
+                    let outcome_label = match &result.outcome {
+                        sbproxy_rag::RetrievalOutcome::Retrieved => "retrieved",
+                        sbproxy_rag::RetrievalOutcome::NoMatch => "no_match",
+                        sbproxy_rag::RetrievalOutcome::Continued => "continued",
+                        sbproxy_rag::RetrievalOutcome::Stale => "stale",
+                    };
+                    sbproxy_ai::ai_metrics::record_rag_request(
+                        embedding_provider,
+                        vector_store_provider,
+                        outcome_label,
+                    );
+                    sbproxy_ai::ai_metrics::record_rag_latency(
+                        "embedding",
+                        embedding_provider,
+                        result.stats.embedding_ms as f64 / 1_000.0,
+                    );
+                    sbproxy_ai::ai_metrics::record_rag_latency(
+                        "search",
+                        vector_store_provider,
+                        result.stats.search_ms as f64 / 1_000.0,
+                    );
+                    sbproxy_ai::ai_metrics::record_rag_latency(
+                        "total",
+                        embedding_provider,
+                        retrieval_total_secs,
+                    );
+                    sbproxy_ai::ai_metrics::record_rag_context_bytes(result.stats.context_bytes);
+                    // Safe tracing only: provider kinds, outcome, latency,
+                    // counts, and bounded source IDs. Never the query text,
+                    // chunk content, filter values, bodies, credentials, or
+                    // provider URLs.
+                    let source_ids: Vec<&str> = result
+                        .chunks
+                        .iter()
+                        .take(8)
+                        .map(|chunk| chunk.source_id.as_str())
+                        .collect();
+                    debug!(
+                        rag.embedding = embedding_provider,
+                        rag.vector_store = vector_store_provider,
+                        rag.outcome = outcome_label,
+                        rag.embedding_ms = result.stats.embedding_ms,
+                        rag.search_ms = result.stats.search_ms,
+                        rag.total_secs = retrieval_total_secs,
+                        rag.chunk_count = result.stats.chunk_count,
+                        rag.context_bytes = result.stats.context_bytes,
+                        rag.source_ids = ?source_ids,
+                        "AI proxy: RAG retrieval completed"
+                    );
+                    if result.rendered_context.is_some() {
+                        if let Err(error) = runtime.inject(&mut body, &result) {
+                            // The operator enabled RAG but the canonical body
+                            // cannot accept its context. Treat exactly like a
+                            // fail-closed retrieval error; the typed RagError
+                            // display carries a provider name and class, never
+                            // content or credentials, and the client only ever
+                            // sees the bounded envelope below.
+                            warn!(
+                                rag.embedding = embedding_provider,
+                                rag.vector_store = vector_store_provider,
+                                error = %error,
+                                "AI proxy: RAG context injection failed; failing closed"
+                            );
+                            sbproxy_ai::tracing_spans::record_error(
+                                &ai_span,
+                                sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR,
+                                "RAG context injection failed",
+                            );
+                            let body_bytes = ErrorEnvelope::new(
+                                "rag_retrieval_failed",
+                                "retrieval context was unavailable",
+                            )
+                            .code("rag_retrieval_failed")
                             .request_id(ctx.request_id.as_str())
                             .to_bytes();
-                        send_response(session, 400, "application/json", &body_bytes).await?;
-                        return Ok(());
-                    }
-                    if decision.redact {
-                        if let Some(redactor) = config.pii_redactor() {
-                            redactor.redact_json(&mut body);
+                            send_response(session, 502, "application/json", &body_bytes).await?;
+                            return Ok(());
+                        }
+                        // Retrieved context is untrusted text. Run the full
+                        // input pipeline once more over the augmented body
+                        // before AI policy, budgets, caches, routing, or any
+                        // provider dispatch can see it.
+                        match evaluate_ai_input_guardrails(
+                            config,
+                            guardrail_pipeline.as_ref(),
+                            &surface,
+                            &model,
+                            &mut body,
+                            &ctx.principal,
+                            InputGuardrailStage::RagAugmented,
+                        )
+                        .await
+                        {
+                            InputGuardrailDecision::Allow {
+                                flagged_count,
+                                labels,
+                            } => {
+                                guardrail_flagged_count = flagged_count;
+                                ctx.ai_guardrail_labels = labels;
+                            }
+                            InputGuardrailDecision::Block {
+                                name,
+                                reason,
+                                status,
+                            } => {
+                                sbproxy_ai::tracing_spans::record_error(
+                                    &ai_span,
+                                    sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                                    &reason,
+                                );
+                                mark_guardrail_block(ctx, name.clone());
+                                let body_bytes = ErrorEnvelope::new("guardrail_violation", &reason)
+                                    .code(&name)
+                                    .request_id(ctx.request_id.as_str())
+                                    .to_bytes();
+                                send_response(session, status, "application/json", &body_bytes)
+                                    .await?;
+                                return Ok(());
+                            }
                         }
                     }
-                } else {
-                    if let Some(block) = pipeline.check_input(&messages) {
-                        warn!(
-                            guardrail = %block.name,
-                            reason = %block.reason,
-                            "AI proxy: input guardrail blocked request"
-                        );
-                        sbproxy_ai::tracing_spans::record_error(
-                            &ai_span,
-                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                            &block.reason,
-                        );
-                        // WOR-1496: a guardrail block surfaces as a generic
-                        // 400, so stamp the precise outcome for the
-                        // value-vs-waste metric.
-                        mark_guardrail_block(ctx, block.name.clone());
-                        let body_bytes = ErrorEnvelope::new("guardrail_violation", &block.reason)
-                            .code(&block.name)
-                            .request_id(ctx.request_id.as_str())
-                            .to_bytes();
-                        send_response(session, 400, "application/json", &body_bytes).await?;
-                        return Ok(());
-                    }
-                    ctx.ai_guardrail_labels = pipeline
-                        .classify_input(&messages)
-                        .into_iter()
-                        .map(|label| label.name)
-                        .collect();
                 }
-
-                // WOR-801: body-aware input guardrails (today only
-                // `agent_alignment`, which reads `messages[].tool_calls`
-                // out of the raw body because the `Message` struct
-                // strips them). Runs after the text-shaped check so
-                // the cheap path short-circuits first.
-                // WOR-1645: pass the principal so the agent-alignment
-                // guardrail's shared MCP rbac_policy is evaluated
-                // against each model-emitted tool call, the same deny
-                // rule the mcp action enforces on tools/call.
-                if let Some(block) =
-                    pipeline.check_input_body_with_principal(&body, Some(&ctx.principal))
-                {
+                Err(error) => {
+                    sbproxy_ai::ai_metrics::record_rag_request(
+                        embedding_provider,
+                        vector_store_provider,
+                        "error",
+                    );
+                    sbproxy_ai::ai_metrics::record_rag_latency(
+                        "total",
+                        embedding_provider,
+                        retrieval_total_secs,
+                    );
+                    // The configured continue and stale policies already
+                    // resolved inside `retrieve`; an error here is the
+                    // fail-closed result. Answer with a bounded envelope
+                    // and never the provider's own error.
                     warn!(
-                        guardrail = %block.name,
-                        reason = %block.reason,
-                        "AI proxy: body-aware input guardrail blocked request"
+                        rag.embedding = embedding_provider,
+                        rag.vector_store = vector_store_provider,
+                        error = %error,
+                        "AI proxy: RAG retrieval failed; failing closed"
                     );
                     sbproxy_ai::tracing_spans::record_error(
                         &ai_span,
-                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                        &block.reason,
+                        sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR,
+                        "RAG retrieval failed",
                     );
-                    // WOR-1496: a guardrail block surfaces as a generic
-                    // 400, so stamp the precise outcome for the
-                    // value-vs-waste metric.
-                    mark_guardrail_block(ctx, block.name.clone());
-                    let body_bytes = ErrorEnvelope::new("guardrail_violation", &block.reason)
-                        .code(&block.name)
-                        .request_id(ctx.request_id.as_str())
-                        .to_bytes();
-                    send_response(session, 400, "application/json", &body_bytes).await?;
+                    let body_bytes = ErrorEnvelope::new(
+                        "rag_retrieval_failed",
+                        "retrieval context was unavailable",
+                    )
+                    .code("rag_retrieval_failed")
+                    .request_id(ctx.request_id.as_str())
+                    .to_bytes();
+                    send_response(session, 502, "application/json", &body_bytes).await?;
                     return Ok(());
-                }
-
-                // Per-surface input guardrails: image generation,
-                // audio speech, reranking, and moderations carry user
-                // input in a non-messages field (`prompt`, `input`,
-                // `query`). The same guardrail pipeline applies to
-                // that text via check_input_text. Chat-shape surfaces
-                // are already covered by the messages check above.
-                if let Some(text) = sbproxy_ai::handler::extract_input_text(&surface, &body) {
-                    if let Some(block) = pipeline.check_input_text(&text) {
-                        warn!(
-                            ai.surface = surface_label,
-                            guardrail = %block.name,
-                            reason = %block.reason,
-                            "AI proxy: per-surface input guardrail blocked request"
-                        );
-                        sbproxy_ai::tracing_spans::record_error(
-                            &ai_span,
-                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                            &block.reason,
-                        );
-                        // WOR-1496: stamp the precise outcome (the wire
-                        // status is a generic 400).
-                        mark_guardrail_block(ctx, block.name.clone());
-                        let body_bytes = ErrorEnvelope::new("guardrail_violation", &block.reason)
-                            .code(&block.name)
-                            .request_id(ctx.request_id.as_str())
-                            .to_bytes();
-                        send_response(session, 400, "application/json", &body_bytes).await?;
-                        return Ok(());
-                    }
                 }
             }
         }
@@ -6206,7 +6511,11 @@ pub(super) async fn handle_ai_proxy(
             || native_bypass_canonical_baseline
                 .as_ref()
                 .is_some_and(|baseline| native_bypass_body_changed(baseline, &attempt_body));
-        let bypass = if !native_bypass_is_safe(is_stream, request_transform_selected) {
+        let bypass = if !native_bypass_is_safe(
+            is_stream,
+            request_transform_selected,
+            rag_requires_canonical_path,
+        ) {
             None
         } else {
             sbproxy_ai::format::native_bypass_for(
@@ -13198,9 +13507,19 @@ mod compression_selection_tests {
 
     #[test]
     fn compression_disables_native_body_bypass() {
-        assert!(native_bypass_is_safe(false, false));
-        assert!(!native_bypass_is_safe(true, false));
-        assert!(!native_bypass_is_safe(false, true));
+        assert!(native_bypass_is_safe(false, false, false));
+        assert!(!native_bypass_is_safe(true, false, false));
+        assert!(!native_bypass_is_safe(false, true, false));
+    }
+
+    #[test]
+    fn rag_selection_disables_native_body_bypass() {
+        // A selected RAG runtime pins the request to the canonical route
+        // for every retrieval outcome, so the third argument alone must
+        // veto the bypass regardless of the other inputs.
+        assert!(!native_bypass_is_safe(false, false, true));
+        assert!(!native_bypass_is_safe(true, false, true));
+        assert!(!native_bypass_is_safe(false, true, true));
     }
 
     #[test]
