@@ -926,9 +926,11 @@ pub(crate) fn activate_key_plane(plane: Option<Arc<KeyPlane>>, cfg: Option<&KeyM
 
 /// Build, seed, and immediately install a key plane.
 ///
-/// Boot and reload use [`prepare_key_plane`] directly so the plane can be
-/// committed with its matching pipeline. This wrapper remains for callers and
-/// tests that intentionally manage only the process-global admin view.
+/// Boot and reload use the crate-internal `prepare_key_plane`,
+/// `seed_prepared_key_plane`, and `activate_key_plane` steps directly so the
+/// plane can be committed with its matching pipeline. This wrapper remains for
+/// callers and tests that intentionally manage only the process-global admin
+/// view.
 pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
     let plane = prepare_key_plane(Some(cfg))?;
     seed_prepared_key_plane(plane.as_ref(), Some(cfg))?;
