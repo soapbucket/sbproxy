@@ -256,7 +256,9 @@ commit:
    (README, docs/ai-gateway.md, every use-case doc, the comparison
    table, root `llms.txt`); check each hit's context before editing so
    an unrelated number is not caught.
-4. Regenerate `docs/llms-full.txt` via `scripts/regen-llms-full.sh`.
+4. Leave `docs/llms-full.txt` alone. CI regenerates it on `main`
+   after the merge (`.github/workflows/llms-full-refresh.yml`); a
+   branch that commits it fails the docs lane.
 5. The sbproxy.dev site keeps its own copy of the provider docs; flag
    the change for the site repo.
 
