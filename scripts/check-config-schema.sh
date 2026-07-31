@@ -13,6 +13,8 @@
 #       polymorphic node (see the generator's module docs).
 #   schemas/ai-compression.schema.json <- sbproxy-ai CompressionPolicy
 #   schemas/ai-external-guardrail.schema.json <- sbproxy-ai ExternalGuardrailConfig
+#   schemas/ai-rag.schema.json <- sbproxy-ai RagRouteConfig (the rag: block
+#       of an ai_proxy action)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -23,6 +25,7 @@ schemas=(
     "schemas/ai-proxy-provider.schema.json|-p sbproxy-ai --bin generate-ai-provider-schema"
     "schemas/ai-compression.schema.json|-p sbproxy-ai --bin generate-ai-compression-schema"
     "schemas/ai-external-guardrail.schema.json|-p sbproxy-ai --bin generate-ai-external-guardrail-schema"
+    "schemas/ai-rag.schema.json|-p sbproxy-ai --bin generate-ai-rag-schema"
 )
 
 GENERATED=$(mktemp)

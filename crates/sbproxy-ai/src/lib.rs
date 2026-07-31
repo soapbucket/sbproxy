@@ -41,6 +41,7 @@ pub mod provider;
 pub mod provider_ratelimit;
 pub mod providers;
 pub mod quota_pool;
+pub mod rag_config;
 pub mod ratelimit;
 pub mod realtime;
 pub mod reasoning;

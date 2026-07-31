@@ -193,6 +193,9 @@ pub struct AiHandlerConfig {
     /// exist. Process-local only unless a future atomic backend lands.
     #[serde(default)]
     pub quota_pool: Option<crate::quota_pool::QuotaPoolConfig>,
+    /// Optional route-scoped retrieval augmentation.
+    #[serde(default)]
+    pub rag: Option<crate::rag_config::RagRouteConfig>,
     /// Lazy-compiled guardrail pipeline, owned by this reload-managed
     /// handler config. Keeping the cache here makes its lifetime follow
     /// the published config: a reload cannot reuse a pipeline by recycled
@@ -847,6 +850,10 @@ impl AiHandlerConfig {
     /// Build from a generic JSON value.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
         let mut config: Self = serde_json::from_value(value)?;
+        if let Some(rag) = config.rag.as_ref() {
+            rag.validate()
+                .map_err(|error| anyhow::anyhow!("ai rag: {error}"))?;
+        }
         config
             .reasoning
             .validate()
@@ -1449,6 +1456,7 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             quota_pool: None,
+            rag: None,
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
@@ -1490,6 +1498,7 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             quota_pool: None,
+            rag: None,
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
@@ -1531,6 +1540,7 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             quota_pool: None,
+            rag: None,
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
@@ -1573,6 +1583,7 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             quota_pool: None,
+            rag: None,
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),

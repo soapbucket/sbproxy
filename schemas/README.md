@@ -32,3 +32,18 @@ origins:
 See [`docs/json-schema.md`](../docs/json-schema.md) for the
 full editor-setup walkthrough, the caveats, and the source-of-
 truth pointer.
+
+## AI `rag:` block schema
+
+`ai-rag.schema.json` is generated the same way from the
+`RagRouteConfig` type in
+[`crates/sbproxy-ai/src/rag_config.rs`](../crates/sbproxy-ai/src/rag_config.rs).
+It describes the optional `rag:` block of an `ai_proxy` action,
+which the main config schema leaves opaque:
+
+```bash
+cargo run -p sbproxy-ai --bin generate-ai-rag-schema > schemas/ai-rag.schema.json
+```
+
+The same CI gate (`scripts/check-config-schema.sh`) regenerates
+and diffs it on every PR.
