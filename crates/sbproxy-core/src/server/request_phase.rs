@@ -3358,10 +3358,9 @@ pub(super) async fn request_filter(
                 // credential, the 503 infrastructure refusal). The gate
                 // rendered every byte, including any Retry-After or
                 // problem+json content type; write it verbatim.
-                let rendered = ctx
-                    .crawl_challenge
-                    .take()
-                    .unwrap_or_else(|| crate::context::PaymentResponse::json(error_json_body(&msg)));
+                let rendered = ctx.crawl_challenge.take().unwrap_or_else(|| {
+                    crate::context::PaymentResponse::json(error_json_body(&msg))
+                });
                 let body = rendered.body;
                 let header_count = 2 + rendered.headers.len();
                 let mut header = pingora_http::ResponseHeader::build(status, Some(header_count))

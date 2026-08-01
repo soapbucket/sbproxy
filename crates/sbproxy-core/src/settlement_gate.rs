@@ -67,7 +67,9 @@ use sbproxy_billing::types::{
 use sbproxy_config::payments::{AdvertisedRailName, PaymentsConfig};
 use sbproxy_config::types::FailureMode;
 use sbproxy_modules::policy::ai_crawl::{resolve_agent_preferences, AiCrawlControlPolicy, Rail};
-use sbproxy_modules::policy::payment_requirement::{PaymentRequirementCompiler, RequirementContext};
+use sbproxy_modules::policy::payment_requirement::{
+    PaymentRequirementCompiler, RequirementContext,
+};
 use sbproxy_modules::policy::quote_token::NonceCheck;
 
 #[cfg(feature = "payment-mpp")]
@@ -743,9 +745,9 @@ async fn challenge_path(
         )));
     };
 
-    let price = deps
-        .policy
-        .resolve_price_for_request(request.path, request.agent_id, request.accept);
+    let price =
+        deps.policy
+            .resolve_price_for_request(request.path, request.agent_id, request.accept);
     if price.amount_micros == 0 {
         return Ok(ChallengeOutcome::KeepLegacy("route priced at zero"));
     }
@@ -798,25 +800,15 @@ fn advertisable_rails(payments: &PaymentsConfig) -> Vec<AdvertisedRailName> {
     if payments.protocols.payment_auth.is_some() && payments.rails.stripe.is_some() {
         rails.push(AdvertisedRailName::Mpp);
     }
-    if payments
-        .rails
-        .stripe
-        .as_ref()
-        .is_some_and(|stripe| {
-            stripe
-                .direct_payment_intent
-                .as_ref()
-                .is_some_and(|direct| direct.enabled)
-        })
-    {
+    if payments.rails.stripe.as_ref().is_some_and(|stripe| {
+        stripe
+            .direct_payment_intent
+            .as_ref()
+            .is_some_and(|direct| direct.enabled)
+    }) {
         rails.push(AdvertisedRailName::Stripe);
     }
-    if payments
-        .lightning_backend()
-        .ok()
-        .flatten()
-        .is_some()
-    {
+    if payments.lightning_backend().ok().flatten().is_some() {
         rails.push(AdvertisedRailName::Lightning);
     }
     rails
@@ -1245,6 +1237,7 @@ mod tests {
 
     use sbproxy_billing::dispatch::DispatchContext;
     use sbproxy_billing::payment_auth::{ChallengeBinder, PaymentChallenge};
+    use sbproxy_billing::registry::UsageEvent;
     use sbproxy_billing::registry::{
         AuthoritativePayment, ChallengeMaterial, ChallengePreparation, PaymentMethodAdapter,
         ProviderQueryResult, RailRegistry,
@@ -1260,7 +1253,6 @@ mod tests {
         AttemptOperation, PaymentRequirementDraft, RecoveryEnvelopeRecord, SafeFailure,
         SettlementRail, SettlementReceipt,
     };
-    use sbproxy_billing::registry::UsageEvent;
     use sbproxy_modules::policy::quote_token::{
         InMemoryNonceStore, NonceStore, QuoteTokenSigner, QuoteTokenVerifier,
     };
@@ -1320,8 +1312,7 @@ mod tests {
             _request: ChallengePreparation,
             _dispatch: &DispatchContext,
         ) -> Result<ChallengeMaterial, BillingError> {
-            let mut material =
-                ChallengeMaterial::new(self.provider_handle.map(str::to_string));
+            let mut material = ChallengeMaterial::new(self.provider_handle.map(str::to_string));
             if let Some(secret) = self.client_secret {
                 material.client_secret = Some(zeroize::Zeroizing::new(secret.to_string()));
             }
@@ -1608,8 +1599,7 @@ mod tests {
             let nonce_store: Arc<dyn NonceStore> = Arc::new(InMemoryNonceStore::new());
             let verifier =
                 QuoteTokenVerifier::single_key("kid-test", verifying, Arc::clone(&nonce_store));
-            let requirement_signer =
-                Arc::new(QuoteRequirementSigner::new(quote_signer, verifier));
+            let requirement_signer = Arc::new(QuoteRequirementSigner::new(quote_signer, verifier));
             let dyn_signer: Arc<dyn RequirementSigner> = requirement_signer.clone();
 
             let state = Arc::new(ScriptedState {
@@ -1922,7 +1912,10 @@ mod tests {
             GateDecision::Allow => panic!("expected a response, got Allow"),
             GateDecision::KeepLegacy => panic!("expected a response, got KeepLegacy"),
             GateDecision::Infrastructure(failure) => {
-                panic!("expected a response, got infra failure at {}", failure.stage)
+                panic!(
+                    "expected a response, got infra failure at {}",
+                    failure.stage
+                )
             }
         }
     }
@@ -1946,7 +1939,10 @@ mod tests {
             &x402_credential(&challenge.response.body),
         );
         let decision = gate.decide_with(&retry).await;
-        assert!(matches!(decision, GateDecision::Allow), "settled retry allows");
+        assert!(
+            matches!(decision, GateDecision::Allow),
+            "settled retry allows"
+        );
         assert_eq!(gate.settle_calls(), 1);
         assert!(gate.receipt_for_token(&token).await.is_some());
     }
@@ -1967,7 +1963,10 @@ mod tests {
             &mpp_credential(&www, "spt_test_12345"),
         );
         let decision = gate.decide_with(&retry).await;
-        assert!(matches!(decision, GateDecision::Allow), "settled retry allows");
+        assert!(
+            matches!(decision, GateDecision::Allow),
+            "settled retry allows"
+        );
         assert_eq!(gate.settle_calls(), 1);
     }
 
@@ -2004,7 +2003,10 @@ mod tests {
         let mut retry = crawler_headers();
         add_header(&mut retry, "crawler-payment", &token);
         let decision = gate.decide_with(&retry).await;
-        assert!(matches!(decision, GateDecision::Allow), "settled retry allows");
+        assert!(
+            matches!(decision, GateDecision::Allow),
+            "settled retry allows"
+        );
         assert_eq!(gate.settle_calls(), 1);
     }
 
@@ -2020,7 +2022,10 @@ mod tests {
         let mut retry = crawler_headers();
         add_header(&mut retry, "crawler-payment", &token);
         let decision = gate.decide_with(&retry).await;
-        assert!(matches!(decision, GateDecision::Allow), "settled retry allows");
+        assert!(
+            matches!(decision, GateDecision::Allow),
+            "settled retry allows"
+        );
         assert_eq!(gate.settle_calls(), 1);
     }
 
@@ -2083,7 +2088,11 @@ mod tests {
         let response = expect_respond(gate.decide_with(&retry).await);
         assert_eq!(response.status, 402);
         assert!(response.response.body.contains("challenge_expired"));
-        assert_eq!(gate.settle_calls(), 0, "an expired challenge dispatches nothing");
+        assert_eq!(
+            gate.settle_calls(),
+            0,
+            "an expired challenge dispatches nothing"
+        );
         assert!(gate.receipt_for_token(&token).await.is_none());
     }
 

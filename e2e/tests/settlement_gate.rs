@@ -82,7 +82,10 @@ impl ClnStub {
                         let Ok(request) = serde_json::from_slice::<serde_json::Value>(&raw) else {
                             continue;
                         };
-                        let id = request.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                        let id = request
+                            .get("id")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
                         let method = request
                             .get("method")
                             .and_then(serde_json::Value::as_str)
@@ -143,7 +146,9 @@ fn respond(
                 .get("label")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
-            node.amount_msat = params.get("amount_msat").and_then(serde_json::Value::as_u64);
+            node.amount_msat = params
+                .get("amount_msat")
+                .and_then(serde_json::Value::as_u64);
             serde_json::json!({
                 "payment_hash": PAYMENT_HASH,
                 "bolt11": BOLT11,
@@ -323,7 +328,11 @@ fn challenge_settle_allow_and_replay_refusal() {
         body.contains("\"rail\":\"lightning\""),
         "the 402 names the rail: {body}"
     );
-    assert_eq!(stack.origin.hits(), 0, "a challenge never touches the origin");
+    assert_eq!(
+        stack.origin.hits(),
+        0,
+        "a challenge never touches the origin"
+    );
 
     // 2. Settle out of band, then retry with the quote token: the gate
     //    proves the invoice paid through the real adapter and the real
@@ -390,7 +399,11 @@ fn an_unpaid_retry_never_reaches_the_origin() {
         unpaid.headers.contains_key("retry-after"),
         "the client is told when to retry"
     );
-    assert_eq!(stack.origin.hits(), 0, "no unpaid request reaches the origin");
+    assert_eq!(
+        stack.origin.hits(),
+        0,
+        "no unpaid request reaches the origin"
+    );
 }
 
 #[test]
