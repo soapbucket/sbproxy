@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-01*
 
 SBproxy can own model processes on one worker or place them across a managed
 cluster. Model-host control lives under `proxy.model_host`. Depending on its
@@ -792,7 +792,7 @@ Each entry accepts these settings.
 | `modality` | Task the model performs: `chat` (default), `embedding`, `rerank`, `speech_to_text`, `text_to_speech`, or `image`. It drives the engine's task flag (`embedding` serves `--task embed`, `rerank` serves `--task score`) and zeroes the KV-cache term in the fit. Set it to serve an embedding or rerank model from a raw `hf:` reference, which has no catalog entry to carry the modality. |
 | `max_context` | Context length to plan VRAM for and pass to the engine. |
 | `keep_alive` | Idle time before the engine unloads, as a duration like `30m` or `1h`. Omitting it keeps the engine resident until eviction. |
-| `kv_quant` | KV-cache quantization: `auto` (default), `f16`, `fp8`, `int8`, or `int4`. What each mode costs depends on the engine: vLLM and SGLang expose only fp8 KV, so `int8` and `int4` are both served as fp8 there, while llama.cpp quantizes for real (`q8_0`, `q4_0`). The fit planner sizes the mode the engine will actually run and logs any substitution. See the table in [gpu-fit-planning.md](gpu-fit-planning.md). |
+| `kv_quant` | KV-cache quantization: `auto` (default), `f16`, `fp8`, `int8`, or `int4`. What each mode costs depends on the engine: vLLM and SGLang expose only fp8 KV, so `int8` and `int4` are both served as fp8 there; llama.cpp quantizes for real (`q8_0`, `q4_0`); mistral.rs takes no KV dtype flag, so a low-precision request keeps the engine default and buys nothing. The fit planner sizes the mode the engine will actually run, and when that differs from the request it logs a warning naming the requested mode, the substituted dtype, and the engine. See the table in [gpu-fit-planning.md](gpu-fit-planning.md). |
 | `enable_prefix_caching` | Enable vLLM's automatic prefix caching, reusing KV blocks across requests that share a prompt prefix. |
 | `pinned` | Keep the model resident and never evict it to make room. |
 | `gguf_file` | Exact GGUF filename to serve from a multi-file llama.cpp repo. |

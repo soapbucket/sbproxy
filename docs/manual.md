@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-01*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -584,7 +584,7 @@ sbproxy service status
 sbproxy service uninstall
 ```
 
-`install` writes three things under `$HOME`:
+`install` writes four things under `$HOME`:
 
 - The config: `~/Library/Application Support/sbproxy/service/sb.yml`.
   Unlike `run`'s private temporary config, this one is not removed on
@@ -604,37 +604,72 @@ sbproxy service uninstall
   `launchd` agent inherits almost nothing from the shell that installed
   it, so an `HF_TOKEN` exported in a terminal is invisible to the agent
   and a gated model fails to pull with no obvious cause. Put it here
-  instead, one `KEY=value` per line. The file is created once with a
-  commented template and never rewritten, so a token set here survives
-  reinstalling to change the model or the port.
+  instead, one `KEY=value` per line. This is a declarative file, not a shell
+  script: values are literal, and `export`, quotes, expansion, commands, and
+  inline comments are rejected. Duplicate keys are rejected too, so startup
+  and cleanup cannot choose different values. The file is created once with
+  a commented template and never rewritten, so a token set here survives
+  reinstalling to change the model or the port. If you set
+  `SBPROXY_ENGINE_OWNERSHIP_DIR`, use an absolute path. Both the service and
+  `service uninstall` read that value from this file.
 
-The agent's program is `/bin/sh -c '... exec sbproxy serve <config>'`
-rather than the binary directly, which is how the environment file gets
-sourced. The `exec` means `launchd` still supervises the proxy's own
-pid, so `KeepAlive` restarts and signal delivery behave exactly as if
-the binary were the program. The plist also raises `ExitTimeOut` above
-the proxy's default shutdown grace, so `launchd` cannot SIGKILL a drain
-that is still in progress.
+The agent starts a small built-in bootstrap that parses this file as data,
+sets the validated values, and then replaces itself with `sbproxy serve`.
+Before that replacement, it takes the private
+`~/Library/Application Support/sbproxy/service/lifecycle.lock` and durably
+registers its exact process generation in `uninstall-state.json`. The state
+keeps bootstrap registrations separate from process generations observed
+later by uninstall, so an observation cannot be mistaken for proof that a
+gateway cooperates with the lock. Nothing in the environment file is evaluated
+by a shell, credentials stay out of the plist, and `launchd` supervises the
+proxy at the same pid. The plist also raises `ExitTimeOut` above the proxy's
+default shutdown grace, so `launchd` cannot SIGKILL a drain that is still in
+progress.
 
-**Stop the deployment before removing the agent.** A gateway that goes
-away without a prior `sbproxy models stop` leaves its engine process
-running; see the open defect recorded on the Apple Silicon lane in
-[model-host-certification.md](model-host-certification.md).
+Managed engine ownership is durable across gateway death. Each engine record
+contains the owner and engine PID plus their process-start fingerprints;
+the record reaches durable storage before the engine can execute.
+`service uninstall` takes the same lifecycle lock and captures the exact
+process-start identity of the gateway reported by `launchd`. Before it calls
+`launchctl unload`, that identity must already be in the bootstrap-registration
+set read under the lock; a current-looking plist on disk is not enough. After
+the job exits, uninstall reaps only the process groups tied to exact recorded
+gateway generations. It reads
+`SBPROXY_ENGINE_OWNERSHIP_DIR` from the service environment file, not from the
+shell running the uninstall command. The lock stays held while uninstall reads
+the registry, verifies the first launchd PID it sees, unloads the job, and
+confirms that the job is gone. A `KeepAlive` replacement therefore either
+registered before uninstall took the lock, or cannot execute while unload is
+in progress. The plist and retry record stay in place until exact-owner cleanup
+succeeds.
+A loaded job with no PID, an owner-registry overflow, or an unload that makes
+no bounded progress fails closed and leaves both retry handles in place. The
+stable lock file is deliberately retained after success; unlinking a lock path
+could let future processes lock different file objects.
 
-```bash
-sbproxy models stop local
-sbproxy service uninstall
-```
+An agent installed by an older release uses a shell command and never ran this
+registration bootstrap. A failed or interrupted reinstall can also leave an
+older generation running behind a newer plist. In either case, if the exact
+loaded generation is missing from the bootstrap-registration set, the current
+CLI stops before calling `launchctl` and keeps the plist and lifecycle state.
+Reinstall the intended model with the current
+`sbproxy service install <model>`, wait for `sbproxy service status` to report
+it running, then retry `service uninstall`.
+
+The reaper signals a process group only while the recorded engine PID still has
+the recorded start fingerprint. If the PID changed and the group is empty, the
+obsolete record can be removed. If the group is still occupied but the exact
+leader cannot be proved, cleanup fails closed and keeps the record for an
+operator to inspect. It never uses a process-name sweep.
 
 `--dry-run` (inherited from `run`'s flags) prints the plist and the
 generated config without installing or loading anything. `service
 status` asks `launchctl list` whether the agent is registered and
 running, and exits 0 when it is running, 1 otherwise (registered-but-
 stopped and never-installed alike), so it composes with
-`sbproxy service status || <restart it>` in a script. `service
-uninstall` unloads the agent and removes its plist; it is idempotent,
-reporting nothing removed rather than failing when no agent was
-installed. All three subcommands refuse to run on a non-macOS host,
+`sbproxy service status || <restart it>` in a script. `service uninstall`
+accepts an agent that is already unloaded and resumes an interrupted cleanup
+from its retry record. All three subcommands refuse to run on a non-macOS host,
 since `launchd` is macOS-only; use `run` or `serve` elsewhere.
 
 ### `models` - artifact and runtime lifecycle
