@@ -16,12 +16,46 @@
 //! own to participate.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Capability name for the per-key upstream credential binding.
 pub const CAP_CREDENTIAL_BINDING: &str = "credential_binding";
 
+/// Capability name for the bounded routed semantic-cache snapshot operation.
+///
+/// The snapshot operation is an appended postcard variant on the mesh cache
+/// wire. Postcard enum variants are not self-describing, so a node running an
+/// older binary cannot answer "I do not know that operation"; it would decode
+/// the appended discriminant as garbage. A node therefore has to say up front
+/// that it understands the operation, and the absence of that declaration is
+/// the fail-closed signal.
+pub const CAP_SEMANTIC_CACHE_SNAPSHOT_V1: &str = "semantic_cache_snapshot_v1";
+
 /// Node metadata key carrying the comma-separated capability list.
 pub const CAPS_METADATA_KEY: &str = "caps";
+
+/// Process-monotonic generation for capability publications.
+///
+/// Cluster state fences on generation, so two publications of different
+/// payloads at one generation are a conflict. Keeping the counter here rather
+/// than on the caller means an immediate preflight publication and the
+/// background announcer cannot collide at the same number.
+static CAPABILITY_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The one sorted source of truth for what this binary advertises.
+///
+/// Both the comma-separated node metadata and the typed announcement project
+/// from this list, so a later capability cannot be advertised on only one of
+/// the two paths.
+fn local_capability_names() -> Vec<String> {
+    let mut names = vec![
+        CAP_CREDENTIAL_BINDING.to_string(),
+        CAP_SEMANTIC_CACHE_SNAPSHOT_V1.to_string(),
+    ];
+    names.sort();
+    names.dedup();
+    names
+}
 
 /// Whether the fleet can safely hold records that use a given capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +76,7 @@ pub enum FleetCapability {
 pub fn local_capabilities() -> HashMap<String, String> {
     HashMap::from([(
         CAPS_METADATA_KEY.to_string(),
-        CAP_CREDENTIAL_BINDING.to_string(),
+        local_capability_names().join(","),
     )])
 }
 
@@ -106,7 +140,14 @@ pub struct CapabilityAnnouncement {
 ///
 /// A no-op when the process is not clustered, where the gate is satisfied
 /// without any announcement.
-pub async fn announce_local_capabilities(generation: u64) {
+///
+/// The publication generation comes from one process-wide counter rather than
+/// from the caller. The periodic announcer and an immediate preflight
+/// publication both go through this function, so they cannot race each other
+/// with two different payloads at one generation. Stale-generation and TTL
+/// behavior is unchanged: the counter only moves forward, and a node that
+/// stops publishing falls out of the set within one TTL.
+pub async fn announce_local_capabilities() {
     if !has_peers() {
         return;
     }
@@ -114,8 +155,11 @@ pub async fn announce_local_capabilities(generation: u64) {
         return;
     };
     let node_id = handle.identity().node_id.clone();
+    let generation = CAPABILITY_GENERATION
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
     let announcement = CapabilityAnnouncement {
-        caps: vec![CAP_CREDENTIAL_BINDING.to_string()],
+        caps: local_capability_names(),
     };
     if let Err(error) = handle
         .publish_state(
@@ -202,6 +246,7 @@ pub async fn check_fleet_capability(cap: &str) -> FleetCapability {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn node(id: &str, caps: Option<&str>) -> (String, HashMap<String, String>) {
         let mut metadata = HashMap::new();
@@ -283,7 +328,46 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(announce_local_capabilities(1));
+        rt.block_on(announce_local_capabilities());
+    }
+
+    #[test]
+    fn current_binary_advertises_semantic_cache_snapshot_v1() {
+        let local = local_capabilities();
+        assert!(declares(&local, CAP_SEMANTIC_CACHE_SNAPSHOT_V1));
+        assert!(
+            declares(&local, CAP_CREDENTIAL_BINDING),
+            "adding a capability must not drop an existing one"
+        );
+    }
+
+    #[test]
+    fn metadata_and_typed_announcement_use_the_same_capability_set() {
+        // Two publication paths, one source. If they ever diverge, a
+        // capability is advertised to one reader and not the other, and the
+        // gate silently answers a different question than the one it was
+        // asked.
+        let metadata = local_capabilities();
+        let from_metadata: BTreeSet<String> = metadata
+            .get(CAPS_METADATA_KEY)
+            .expect("caps metadata")
+            .split(',')
+            .map(|entry| entry.trim().to_string())
+            .collect();
+        let announcement = CapabilityAnnouncement {
+            caps: local_capability_names(),
+        };
+        let from_announcement: BTreeSet<String> = announcement.caps.into_iter().collect();
+        assert_eq!(from_metadata, from_announcement);
+    }
+
+    #[test]
+    fn the_local_capability_list_is_sorted_and_deduplicated() {
+        let names = local_capability_names();
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(names, sorted);
     }
 
     #[test]

@@ -604,7 +604,7 @@ pub const TRANSPORT_RPC_KIND_REMOTE: &str = "remote";
 ///
 /// Labels: `op` (`get` | `put` | `delete` | `purge_prefix` |
 /// `merge_versioned` | `replica_apply` | `replica_fetch` |
-/// `sync_digest`).
+/// `sync_digest` | `snapshot_prefix`).
 pub static MESH_TRANSPORT_RPC_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         HistogramOpts::new(

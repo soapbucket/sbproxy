@@ -2221,8 +2221,7 @@ pub(super) fn req_header_value(session: &Session, name: &str) -> Option<String> 
 }
 
 /// Build a redacted snapshot of the inbound request headers for the
-/// AI hook surface (`ClassifyRequest::headers`,
-/// `LookupRequest::request_headers`).
+/// AI hook surface (`ClassifyRequest::headers`).
 ///
 /// Names are lower-cased to match the HTTP/2 and HTTP/3 framing the
 /// rest of the hook surface assumes. Values that are not valid UTF-8
@@ -2761,6 +2760,783 @@ pub(super) fn make_native_bypass_body(
     parsed["model"] = serde_json::Value::String(resolved_model.to_string());
     let remapped = serde_json::to_vec(&parsed)?;
     Ok(bytes::Bytes::from(remapped))
+}
+
+// ============================================================================
+// Semantic cache request identity (WOR-2099)
+// ============================================================================
+//
+// `sbproxy-ai` owns the namespace, key, and configuration digests. Core owns
+// the three inputs only the request boundary can produce: the semantic prompt
+// and its non-prompt request context, the compiled static action policy, and
+// the safe credential identity. Every helper here returns a digest or an
+// already-safe label. A raw prompt, tenant id, credential, header value, or
+// policy body never leaves one of them.
+
+/// Fixed domain for the canonical non-prompt request context digest.
+const SEMANTIC_REQUEST_CONTEXT_DOMAIN: &str = "sbproxy-semcache-request-context-v2";
+
+/// Fixed domain for the compiled static action policy projection.
+const SEMANTIC_STATIC_POLICY_DOMAIN: &str = "sbproxy-semcache-static-policy-v2";
+
+/// Fixed domain for the request-time response policy fence.
+const SEMANTIC_RESPONSE_POLICY_DOMAIN: &str = "sbproxy-semcache-response-policy-v2";
+
+/// Typed sentinel written into the semantic query slot before the request
+/// context is hashed.
+///
+/// It keeps the slot's position and content-block shape inside the canonical
+/// context while the query text itself travels separately, so a paraphrase
+/// finds candidates but a changed system message, tool schema, sampling
+/// control, or asset reference does not.
+const SEMANTIC_QUERY_SENTINEL: &str = "\u{0}sbproxy-semantic-query\u{0}";
+
+/// Closed set of response headers a semantic cache may store and replay.
+///
+/// Everything else is dropped, including cookies, authentication
+/// challenges, request correlation, quota state, and any content coding
+/// that may no longer match the buffered response bytes.
+const SEMANTIC_CACHE_RETAINED_HEADERS: [&str; 2] = ["content-type", "content-language"];
+
+/// Why a semantic identity projection could not be built.
+///
+/// Closed and secret free: an operator sees only that the compiled action
+/// policy could not be canonicalized, never the policy text itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum SemanticIdentityError {
+    /// The compiled action policy for this slot could not be projected into
+    /// a canonical form, so no compatibility fence can be derived from it.
+    #[error("semantic action policy cannot be canonicalized")]
+    InvalidActionPolicy,
+}
+
+/// Deterministic domain-separated digest builder for core-side semantic
+/// identity projections.
+///
+/// The encoding mirrors the one `sbproxy-ai` uses for namespace identity:
+/// the literal domain bytes and one zero byte, then, for every ordered
+/// field, its length as one unsigned 64-bit big-endian integer, the field
+/// bytes, and one zero byte. That fixed framing rules out concatenation
+/// aliases. Nothing fed into it is ever formatted or retained, so a raw
+/// prompt, header, or credential cannot reach a log line from here.
+struct SemanticFieldDigest {
+    hasher: sha2::Sha256,
+}
+
+impl SemanticFieldDigest {
+    /// Open an encoding under one fixed domain label.
+    fn new(domain: &str) -> Self {
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(domain.as_bytes());
+        hasher.update([0u8]);
+        Self { hasher }
+    }
+
+    /// Append one length-delimited byte field.
+    fn bytes(&mut self, value: &[u8]) -> &mut Self {
+        use sha2::Digest as _;
+        // `usize` is never wider than 64 bits on a supported target, so the
+        // saturating widen is lossless there and keeps the encoder total on
+        // a wider hypothetical target instead of truncating a length prefix.
+        let width = u64::try_from(value.len()).unwrap_or(u64::MAX);
+        self.hasher.update(width.to_be_bytes());
+        self.hasher.update(value);
+        self.hasher.update([0u8]);
+        self
+    }
+
+    /// Append one length-delimited UTF-8 text field.
+    fn text(&mut self, value: &str) -> &mut Self {
+        self.bytes(value.as_bytes())
+    }
+
+    /// Append one 32-byte child digest as raw bytes, never as hexadecimal.
+    fn child(&mut self, value: &[u8; 32]) -> &mut Self {
+        self.bytes(value)
+    }
+
+    /// Append one host-sized count at the fixed 64-bit field width.
+    fn count(&mut self, value: usize) -> &mut Self {
+        let width = u64::try_from(value).unwrap_or(u64::MAX);
+        self.bytes(&width.to_be_bytes())
+    }
+
+    /// Close the encoding and return the digest.
+    fn finish(self) -> [u8; 32] {
+        use sha2::Digest as _;
+        self.hasher.finalize().into()
+    }
+}
+
+/// Feed one JSON value into a digest in a canonical, order-independent form.
+///
+/// Objects are visited in sorted key order, so a map that serializes its
+/// keys in a different order still digests identically. Every value carries
+/// a fixed type tag and every container carries its length, so a string, a
+/// number, and a boolean with the same rendering cannot alias each other and
+/// no nesting rearrangement can collide.
+fn digest_canonical_json(digest: &mut SemanticFieldDigest, value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Null => {
+            digest.text("null");
+        }
+        serde_json::Value::Bool(flag) => {
+            digest.text("bool").bytes(&[u8::from(*flag)]);
+        }
+        serde_json::Value::Number(number) => {
+            digest.text("number").text(&number.to_string());
+        }
+        serde_json::Value::String(text) => {
+            digest.text("string").text(text);
+        }
+        serde_json::Value::Array(items) => {
+            digest.text("array").count(items.len());
+            for item in items {
+                digest_canonical_json(digest, item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            digest.text("object").count(map.len());
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            for key in keys {
+                digest.text("key").text(key);
+                if let Some(child) = map.get(key) {
+                    digest_canonical_json(digest, child);
+                }
+            }
+        }
+    }
+}
+
+/// The semantic query plus a digest of everything else in the request.
+///
+/// `text` is the only value handed to the embedding source and to the prompt
+/// digest. `request_context_digest` fences reuse across different
+/// instructions, history, tools, sampling controls, or assets.
+pub(super) struct SemanticPromptInput {
+    /// Semantic query text, empty when the body has no unambiguous slot.
+    pub text: String,
+    /// Digest of the canonical request with the query slot replaced.
+    pub request_context_digest: [u8; 32],
+}
+
+/// Split one canonical AI request into its semantic query and its context.
+///
+/// Call this after canonical request translation, any retrieval context
+/// injection, and the final input guardrail pass, so retrieved context is
+/// part of the context digest while the final user query stays the text sent
+/// to the embedding source. `extract_prompt_text` keeps its full system,
+/// history, tool, and asset representation for guardrails, classifiers,
+/// tracing, and policy; this helper is only for semantic identity.
+///
+/// An ambiguous or batch-shaped body yields empty text and leaves the whole
+/// body in context, which the request path treats as "skip semantic
+/// caching" rather than as a body with no context.
+pub(super) fn extract_semantic_prompt(body: &serde_json::Value) -> SemanticPromptInput {
+    let mut normalized = body.clone();
+    let text = replace_semantic_query_slot(&mut normalized);
+    let mut digest = SemanticFieldDigest::new(SEMANTIC_REQUEST_CONTEXT_DOMAIN);
+    digest_canonical_json(&mut digest, &normalized);
+    SemanticPromptInput {
+        text,
+        request_context_digest: digest.finish(),
+    }
+}
+
+/// Replace the semantic query slot with the sentinel and return its text.
+///
+/// Returns an empty string, and leaves `body` untouched, when no single
+/// slot can be identified.
+fn replace_semantic_query_slot(body: &mut serde_json::Value) -> String {
+    if let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
+        if let Some(turn) = messages
+            .iter_mut()
+            .rev()
+            .find(|turn| turn.get("role").and_then(|r| r.as_str()) == Some("user"))
+        {
+            if let Some(content) = turn.get_mut("content") {
+                return replace_content_query_slot(content);
+            }
+        }
+        return String::new();
+    }
+    if let Some(input) = body.get_mut("input") {
+        if input.is_string() || input.is_array() {
+            return replace_responses_input_query_slot(input);
+        }
+        return String::new();
+    }
+    if let Some(prompt) = body.get_mut("prompt") {
+        if prompt.is_string() {
+            return replace_string_query_slot(prompt);
+        }
+    }
+    String::new()
+}
+
+/// Replace the query text inside one OpenAI Responses `input` field.
+fn replace_responses_input_query_slot(input: &mut serde_json::Value) -> String {
+    if input.is_string() {
+        return replace_string_query_slot(input);
+    }
+    let Some(items) = input.as_array_mut() else {
+        return String::new();
+    };
+    let Some(item) = items
+        .iter_mut()
+        .rev()
+        .find(|item| item.get("role").and_then(|r| r.as_str()) == Some("user"))
+    else {
+        return String::new();
+    };
+    match item.get_mut("content") {
+        Some(content) => replace_content_query_slot(content),
+        None => String::new(),
+    }
+}
+
+/// Replace every text-bearing part of one message content field.
+///
+/// A string content is replaced wholesale. An array content keeps its block
+/// shape, so a final-turn image, audio, or file reference stays in the
+/// canonical context while only its sibling text parts move to the query.
+fn replace_content_query_slot(content: &mut serde_json::Value) -> String {
+    if content.is_string() {
+        return replace_string_query_slot(content);
+    }
+    let Some(parts) = content.as_array_mut() else {
+        return String::new();
+    };
+    let mut collected: Vec<String> = Vec::new();
+    for part in parts.iter_mut() {
+        let Some(object) = part.as_object_mut() else {
+            continue;
+        };
+        let Some(text) = object.get_mut("text") else {
+            continue;
+        };
+        let replaced = replace_string_query_slot(text);
+        if !replaced.is_empty() {
+            collected.push(replaced);
+        }
+    }
+    collected.join("\n")
+}
+
+/// Take one string value and leave the typed sentinel behind.
+fn replace_string_query_slot(slot: &mut serde_json::Value) -> String {
+    let Some(text) = slot.as_str() else {
+        return String::new();
+    };
+    let text = text.to_string();
+    *slot = serde_json::Value::String(SEMANTIC_QUERY_SENTINEL.to_string());
+    text
+}
+
+/// Digest the compiled static action policy for one routed slot.
+///
+/// `forward_rule_idx: None` addresses the origin's main action; `Some(index)`
+/// addresses one of its forward rules and covers that rule's matchers,
+/// modifiers, and inline origin, so a forward rule can never share a fence
+/// with the origin it hangs off.
+///
+/// The selected action's own `semantic_cache` block is removed before the
+/// projection is hashed. `semantic_configuration_digest` already owns that
+/// block's behavior and does so without the credential values and
+/// memory-only tuning the raw action carries; leaving the raw block here
+/// would put both back into distributed compatibility identity.
+///
+/// The origin compression block stays in the projection even though a
+/// compressed session bypasses lookup, because a change to response
+/// representation policy must not share a static response fence.
+pub(crate) fn semantic_static_action_policy_digest(
+    origin: &sbproxy_config::CompiledOrigin,
+    forward_rule_idx: Option<usize>,
+) -> Result<[u8; 32], SemanticIdentityError> {
+    let (slot_tag, action) = match forward_rule_idx {
+        None => (
+            "main".to_string(),
+            action_without_semantic_cache(&origin.action_config),
+        ),
+        Some(index) => {
+            let rule = origin
+                .forward_rules
+                .get(index)
+                .ok_or(SemanticIdentityError::InvalidActionPolicy)?;
+            (
+                format!("forward_rule:{index}"),
+                forward_rule_without_semantic_cache(rule),
+            )
+        }
+    };
+    let response_modifiers = serde_json::to_value(origin.response_modifiers.as_slice())
+        .map_err(|_| SemanticIdentityError::InvalidActionPolicy)?;
+    let compression = serde_json::to_value(origin.compression.as_ref())
+        .map_err(|_| SemanticIdentityError::InvalidActionPolicy)?;
+    let auto_content_negotiate = origin
+        .auto_content_negotiate
+        .clone()
+        .unwrap_or(serde_json::Value::Null);
+
+    let mut digest = SemanticFieldDigest::new(SEMANTIC_STATIC_POLICY_DOMAIN);
+    digest.text(&slot_tag);
+    digest.text("action");
+    digest_canonical_json(&mut digest, &action);
+    digest.text("policies").count(origin.policy_configs.len());
+    for policy in &origin.policy_configs {
+        digest_canonical_json(&mut digest, policy);
+    }
+    digest
+        .text("transforms")
+        .count(origin.transform_configs.len());
+    for transform in &origin.transform_configs {
+        digest_canonical_json(&mut digest, transform);
+    }
+    digest.text("auth");
+    let auth = origin
+        .auth_config
+        .clone()
+        .unwrap_or(serde_json::Value::Null);
+    digest_canonical_json(&mut digest, &auth);
+    digest.text("response_modifiers");
+    digest_canonical_json(&mut digest, &response_modifiers);
+    digest.text("compression");
+    digest_canonical_json(&mut digest, &compression);
+    digest.text("auto_content_negotiate");
+    digest_canonical_json(&mut digest, &auto_content_negotiate);
+    digest
+        .text("content_signal")
+        .text(origin.content_signal.unwrap_or(""));
+    Ok(digest.finish())
+}
+
+/// One action projection with its own `semantic_cache` block removed.
+fn action_without_semantic_cache(action: &serde_json::Value) -> serde_json::Value {
+    let mut action = action.clone();
+    if let Some(object) = action.as_object_mut() {
+        object.remove("semantic_cache");
+    }
+    action
+}
+
+/// One forward rule with only its nested inline action's `semantic_cache`
+/// block removed.
+///
+/// Matchers, request and response modifiers, and every other
+/// behavior-bearing field of the rule stay in the projection.
+fn forward_rule_without_semantic_cache(rule: &serde_json::Value) -> serde_json::Value {
+    let mut rule = rule.clone();
+    if let Some(action) = rule
+        .get_mut("origin")
+        .and_then(|origin| origin.get_mut("action"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        action.remove("semantic_cache");
+    }
+    rule
+}
+
+/// Combine the compiled static fence with the request-pinned governed
+/// policy revision and the API surface.
+///
+/// Only the resulting digest reaches namespace construction, so a governed
+/// key's policy generation fences replay without the request path reparsing
+/// or rehashing the policy itself.
+pub(super) fn semantic_response_policy_digest(
+    static_action_policy_digest: &[u8; 32],
+    governed_policy_revision: &str,
+    api_surface: &str,
+) -> [u8; 32] {
+    let mut digest = SemanticFieldDigest::new(SEMANTIC_RESPONSE_POLICY_DOMAIN);
+    digest
+        .child(static_action_policy_digest)
+        .text(governed_policy_revision)
+        .text(api_surface);
+    digest.finish()
+}
+
+/// Build the safe credential identity for this request's scope digest.
+///
+/// Selection follows one fixed order: the API key identifier when it is
+/// nonempty, then the principal source with a nonempty subject, then the
+/// SHA-256 of the authorization value when a header exists, then the fixed
+/// anonymous marker. The raw authorization value is hashed before it leaves
+/// this function and is never returned, logged, or metered.
+pub(super) fn semantic_credential_identity(
+    session: &Session,
+    principal: &sbproxy_plugin::Principal,
+) -> String {
+    let authorization = req_header_value(session, "authorization");
+    sbproxy_ai::semantic_cache::semantic_credential_identity(
+        principal.api_key_id(),
+        principal.source.as_str(),
+        principal.sub.as_str(),
+        authorization.as_deref(),
+    )
+}
+
+/// Project upstream response headers down to the closed set a semantic
+/// cache may store and replay.
+///
+/// Names are matched case-insensitively and written back in their canonical
+/// lowercase form. Values are validated through the HTTP header parsers and
+/// capped by the semantic wire constants, and the result is deduplicated and
+/// sorted by name. Apply this both before storage and again to a decoded
+/// hit, so a tampered distributed value cannot turn an allowlisted name into
+/// an invalid response header.
+///
+/// A cached response must not replay a prior caller's cookie, challenge,
+/// request id, quota state, trace correlation, or a content encoding that no
+/// longer matches the buffered bytes, so everything outside the allowlist is
+/// dropped rather than sanitized.
+pub(super) fn semantic_cache_response_headers(
+    headers: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut retained: Vec<(String, String)> = Vec::new();
+    let mut total = 0usize;
+    for (name, value) in headers {
+        let Some(canonical) = SEMANTIC_CACHE_RETAINED_HEADERS
+            .iter()
+            .copied()
+            .find(|allowed| name.eq_ignore_ascii_case(allowed))
+        else {
+            continue;
+        };
+        if canonical.len() > sbproxy_ai::semantic_cache::MAX_SEMANTIC_HEADER_NAME_BYTES
+            || value.len() > sbproxy_ai::semantic_cache::MAX_SEMANTIC_HEADER_VALUE_BYTES
+        {
+            continue;
+        }
+        // A value carrying control bytes is rejected outright rather than
+        // trimmed, because a trimmed value is a different header.
+        if http::HeaderName::from_bytes(canonical.as_bytes()).is_err()
+            || http::HeaderValue::from_str(value).is_err()
+        {
+            continue;
+        }
+        if retained.iter().any(|(existing, _)| existing == canonical) {
+            continue;
+        }
+        let Some(next_total) = total
+            .checked_add(canonical.len())
+            .and_then(|sum| sum.checked_add(value.len()))
+        else {
+            continue;
+        };
+        if next_total > sbproxy_ai::semantic_cache::MAX_SEMANTIC_TOTAL_HEADER_BYTES
+            || retained.len() >= sbproxy_ai::semantic_cache::MAX_SEMANTIC_RESPONSE_HEADERS
+        {
+            continue;
+        }
+        total = next_total;
+        retained.push((canonical.to_string(), value.clone()));
+    }
+    retained.sort_by(|left, right| left.0.cmp(&right.0));
+    retained
+}
+
+#[cfg(test)]
+mod semantic_identity_tests {
+    use super::*;
+
+    /// Sentinels that must never survive the header projection.
+    const DROPPED_HEADERS: [&str; 19] = [
+        "connection",
+        "transfer-encoding",
+        "content-length",
+        "set-cookie",
+        "set-cookie2",
+        "www-authenticate",
+        "proxy-authenticate",
+        "authentication-info",
+        "retry-after",
+        "date",
+        "age",
+        "server",
+        "vary",
+        "etag",
+        "x-ratelimit-remaining",
+        "ratelimit-reset",
+        "x-request-id",
+        "traceparent",
+        "server-timing",
+    ];
+
+    fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn semantic_cache_response_headers_retains_only_the_closed_set() {
+        let retained = semantic_cache_response_headers(&pairs(&[
+            ("Content-Type", "application/json"),
+            ("content-language", "en-US"),
+        ]));
+        assert_eq!(
+            retained,
+            vec![
+                ("content-language".to_string(), "en-US".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn semantic_cache_response_headers_drops_every_unlisted_field() {
+        let mut headers: Vec<(String, String)> = DROPPED_HEADERS
+            .iter()
+            .map(|name| ((*name).to_string(), "sentinel".to_string()))
+            .collect();
+        headers.push((
+            "x-vendor-experiment".to_string(),
+            "unrecognized".to_string(),
+        ));
+        headers.push(("content-encoding".to_string(), "gzip".to_string()));
+        assert!(semantic_cache_response_headers(&headers).is_empty());
+    }
+
+    #[test]
+    fn semantic_cache_response_headers_deduplicates_and_rejects_control_bytes() {
+        let retained = semantic_cache_response_headers(&pairs(&[
+            ("content-type", "application/json"),
+            ("Content-Type", "text/plain"),
+            ("content-language", "en\u{0}US"),
+        ]));
+        assert_eq!(
+            retained,
+            vec![("content-type".to_string(), "application/json".to_string())],
+            "a duplicate keeps the first value and a control byte is dropped"
+        );
+    }
+
+    #[test]
+    fn semantic_cache_response_headers_rejects_an_oversized_value() {
+        let oversized = "a".repeat(sbproxy_ai::semantic_cache::MAX_SEMANTIC_HEADER_VALUE_BYTES + 1);
+        let retained = semantic_cache_response_headers(&[("content-type".to_string(), oversized)]);
+        assert!(retained.is_empty());
+    }
+
+    #[test]
+    fn semantic_credential_identity_prefers_the_api_key_id() {
+        let identity = sbproxy_ai::semantic_cache::semantic_credential_identity(
+            "key_01",
+            "virtual_key",
+            "subject-secret-a",
+            Some("Bearer secret-value"),
+        );
+        assert_eq!(identity, "api_key_id:key_01");
+        assert!(!identity.contains("secret-value"));
+    }
+
+    #[test]
+    fn semantic_credential_identity_falls_back_through_subject_then_authorization() {
+        let subject = sbproxy_ai::semantic_cache::semantic_credential_identity(
+            "",
+            "jwt",
+            "subject-secret-a",
+            Some("Bearer secret-value"),
+        );
+        assert_eq!(subject, "principal:jwt:subject-secret-a");
+
+        let authorization = sbproxy_ai::semantic_cache::semantic_credential_identity(
+            "",
+            "bearer",
+            "",
+            Some("Bearer secret-value"),
+        );
+        assert!(authorization.starts_with("authorization:"));
+        assert!(!authorization.contains("secret-value"));
+
+        let anonymous =
+            sbproxy_ai::semantic_cache::semantic_credential_identity("", "plugin", "", None);
+        assert_eq!(
+            anonymous,
+            sbproxy_ai::semantic_cache::SEMANTIC_ANONYMOUS_CREDENTIAL
+        );
+    }
+
+    #[test]
+    fn extract_semantic_prompt_takes_the_final_user_turn_and_keeps_the_rest_in_context() {
+        let base = serde_json::json!({
+            "model": "gpt-4o-mini",
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "what is the refund policy"}
+            ]
+        });
+        let extracted = extract_semantic_prompt(&base);
+        assert_eq!(extracted.text, "what is the refund policy");
+
+        let mut paraphrased = base.clone();
+        paraphrased["messages"][1]["content"] =
+            serde_json::json!("how do refunds work around here");
+        let paraphrase = extract_semantic_prompt(&paraphrased);
+        assert_ne!(paraphrase.text, extracted.text);
+        assert_eq!(
+            paraphrase.request_context_digest, extracted.request_context_digest,
+            "a paraphrase of the query must keep the same context"
+        );
+
+        let mut resystemed = base.clone();
+        resystemed["messages"][0]["content"] = serde_json::json!("be verbose");
+        let resystemed = extract_semantic_prompt(&resystemed);
+        assert_eq!(resystemed.text, extracted.text);
+        assert_ne!(
+            resystemed.request_context_digest, extracted.request_context_digest,
+            "a changed system message must fence reuse"
+        );
+
+        let mut sampled = base.clone();
+        sampled["temperature"] = serde_json::json!(0.9);
+        assert_ne!(
+            extract_semantic_prompt(&sampled).request_context_digest,
+            extracted.request_context_digest
+        );
+    }
+
+    #[test]
+    fn extract_semantic_prompt_keeps_a_final_turn_asset_in_context() {
+        let with_image = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image_url", "image_url": {"url": "https://example/a.png"}}
+                ]
+            }]
+        });
+        let first = extract_semantic_prompt(&with_image);
+        assert_eq!(first.text, "describe this");
+
+        let mut other_image = with_image.clone();
+        other_image["messages"][0]["content"][1]["image_url"]["url"] =
+            serde_json::json!("https://example/b.png");
+        assert_ne!(
+            extract_semantic_prompt(&other_image).request_context_digest,
+            first.request_context_digest
+        );
+    }
+
+    #[test]
+    fn extract_semantic_prompt_is_stable_across_object_key_order() {
+        let first = extract_semantic_prompt(&serde_json::json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+        let second = extract_semantic_prompt(&serde_json::json!({
+            "messages": [{"content": "hello", "role": "user"}],
+            "model": "gpt-4o-mini"
+        }));
+        assert_eq!(first.request_context_digest, second.request_context_digest);
+    }
+
+    #[test]
+    fn extract_semantic_prompt_skips_an_ambiguous_body() {
+        let extracted = extract_semantic_prompt(&serde_json::json!({
+            "model": "gpt-4o-mini",
+            "requests": [{"prompt": "batch one"}, {"prompt": "batch two"}]
+        }));
+        assert!(extracted.text.is_empty());
+    }
+
+    #[test]
+    fn semantic_request_context_ignores_the_query_text_entirely() {
+        let first = extract_semantic_prompt(&serde_json::json!({
+            "messages": [{"role": "user", "content": "refund policy"}]
+        }));
+        let second = extract_semantic_prompt(&serde_json::json!({
+            "messages": [{"role": "user", "content": "a completely different question"}]
+        }));
+        assert_ne!(first.text, second.text);
+        assert_eq!(
+            first.request_context_digest, second.request_context_digest,
+            "the context digest must be built from the sentinel, never the query"
+        );
+    }
+
+    fn origin_with(action: serde_json::Value) -> sbproxy_config::CompiledOrigin {
+        let source = serde_json::json!({
+            "origins": {"digest.test": {"action": action}}
+        });
+        let compiled =
+            sbproxy_config::compile_config(&source.to_string()).expect("compile digest origin");
+        compiled
+            .origins
+            .into_iter()
+            .next()
+            .expect("one compiled origin")
+    }
+
+    #[test]
+    fn static_action_policy_projection_excludes_the_semantic_cache_block() {
+        let without = origin_with(serde_json::json!({
+            "type": "ai_proxy",
+            "providers": []
+        }));
+        let with = origin_with(serde_json::json!({
+            "type": "ai_proxy",
+            "providers": [],
+            "semantic_cache": {
+                "enabled": true,
+                "threshold": 0.95,
+                "embedding": {"provider": "openai", "model": "text-embedding-3-small"}
+            }
+        }));
+        assert_eq!(
+            semantic_static_action_policy_digest(&without, None).expect("projection"),
+            semantic_static_action_policy_digest(&with, None).expect("projection"),
+            "semantic_configuration_digest owns the semantic block, not this fence"
+        );
+    }
+
+    #[test]
+    fn static_action_policy_digest_changes_with_action_behavior() {
+        let base = origin_with(serde_json::json!({
+            "type": "ai_proxy",
+            "providers": []
+        }));
+        let changed = origin_with(serde_json::json!({
+            "type": "ai_proxy",
+            "providers": [{"name": "openai", "api_key": "test"}]
+        }));
+        assert_ne!(
+            semantic_static_action_policy_digest(&base, None).expect("projection"),
+            semantic_static_action_policy_digest(&changed, None).expect("projection"),
+        );
+    }
+
+    #[test]
+    fn static_action_policy_digest_rejects_a_missing_forward_rule() {
+        let origin = origin_with(serde_json::json!({"type": "ai_proxy", "providers": []}));
+        assert_eq!(
+            semantic_static_action_policy_digest(&origin, Some(0)),
+            Err(SemanticIdentityError::InvalidActionPolicy)
+        );
+    }
+
+    #[test]
+    fn semantic_response_policy_digest_fences_revision_and_surface() {
+        let static_digest = [7u8; 32];
+        let base = semantic_response_policy_digest(&static_digest, "rev-1", "chat_completions");
+        assert_ne!(
+            base,
+            semantic_response_policy_digest(&static_digest, "rev-2", "chat_completions")
+        );
+        assert_ne!(
+            base,
+            semantic_response_policy_digest(&static_digest, "rev-1", "responses")
+        );
+        assert_ne!(
+            base,
+            semantic_response_policy_digest(&[8u8; 32], "rev-1", "chat_completions")
+        );
+    }
 }
 
 #[cfg(test)]

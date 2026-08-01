@@ -1134,6 +1134,14 @@ pub struct CompiledPipeline {
     /// runtime and never falls back to the origin's.
     #[cfg(feature = "rag")]
     pub rag_runtimes: crate::rag_runtime::RagRuntimeRegistry,
+    /// Immutable route-scoped semantic caches keyed by origin and optional
+    /// forward rule (WOR-2099). Populated only for `ai_proxy` actions that
+    /// configure `semantic_cache:`; a forward rule without its own block
+    /// has no cache and never falls back to the origin's. The registry
+    /// owns whichever memory, Redis, or mesh adapters this config
+    /// generation selected, so an in-flight request holding this snapshot
+    /// keeps reading the backend it started with across a reload.
+    pub semantic_caches: crate::semantic_cache_runtime::SemanticCacheRuntimeRegistry,
     /// Compiled auth for each origin (None if no auth configured).
     pub auths: Vec<Option<Auth>>,
     /// Compiled policies for each origin (may be empty).
@@ -1309,6 +1317,10 @@ impl Default for CompiledPipeline {
             compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry::default(),
             #[cfg(feature = "rag")]
             rag_runtimes: crate::rag_runtime::RagRuntimeRegistry::default(),
+            // Default construction must stay pure: no config read, no DNS
+            // resolution, no Redis dial, no cluster-state read, and no
+            // mesh binding. Test pipelines are built this way constantly.
+            semantic_caches: crate::semantic_cache_runtime::SemanticCacheRuntimeRegistry::default(),
             auths: Vec::new(),
             policies: Vec::new(),
             enforcers: Vec::new(),
@@ -1861,6 +1873,34 @@ impl CompiledPipeline {
         #[cfg(not(feature = "rag"))]
         reject_configured_rag(&actions, &forward_rules)?;
 
+        // WOR-2099: build the route-scoped semantic caches after both the
+        // main actions and the forward rules are compiled, because a
+        // forward rule carries its own `semantic_cache:` block and never
+        // inherits the origin's. Validation construction checks the same
+        // configuration and dependency declarations but binds stub stores,
+        // so validating a candidate config dials neither Redis nor the
+        // mesh.
+        let semantic_caches = match mode {
+            PipelineConstructionMode::Runtime => {
+                crate::semantic_cache_runtime::SemanticCacheRuntimeRegistry::from_process(
+                    &config.server,
+                    config.l2_store.as_deref(),
+                    &config.origins,
+                    &actions,
+                    &forward_rules,
+                )?
+            }
+            PipelineConstructionMode::Validation => {
+                crate::semantic_cache_runtime::SemanticCacheRuntimeRegistry::for_validation(
+                    &config.server,
+                    config.l2_store.as_deref(),
+                    &config.origins,
+                    &actions,
+                    &forward_rules,
+                )?
+            }
+        };
+
         let key_plane = match mode {
             PipelineConstructionMode::Runtime => {
                 crate::key_plane::prepare_key_plane(config.server.key_management.as_ref())?
@@ -1877,6 +1917,7 @@ impl CompiledPipeline {
             compression_runtimes,
             #[cfg(feature = "rag")]
             rag_runtimes,
+            semantic_caches,
             auths,
             policies,
             enforcers,
@@ -2813,8 +2854,23 @@ mod tests {
         assert!(pipeline.hooks.intent_detection.is_none());
         assert!(pipeline.hooks.quality_scoring.is_none());
         assert!(pipeline.hooks.stream_safety.is_none());
-        assert!(pipeline.hooks.semantic_lookup.is_none());
-        assert!(pipeline.hooks.stream_cache_recorder.is_none());
+    }
+
+    /// A default pipeline must carry an empty semantic-cache registry.
+    /// The default path is taken by hundreds of unit tests, so it must not
+    /// inspect config, resolve DNS, open Redis, read cluster state, or
+    /// bind a mesh store.
+    #[test]
+    fn compiled_pipeline_default_has_an_empty_semantic_cache_registry() {
+        let pipeline = CompiledPipeline::default();
+        assert!(pipeline.semantic_caches.get(0, None).is_none());
+        assert!(pipeline.semantic_caches.get(0, Some(0)).is_none());
+    }
+
+    #[test]
+    fn compiled_pipeline_default_semantic_registry_has_no_registrations() {
+        let pipeline = CompiledPipeline::default();
+        assert_eq!(pipeline.semantic_caches.registrations().count(), 0);
     }
 
     #[test]

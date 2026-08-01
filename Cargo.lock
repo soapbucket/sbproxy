@@ -8685,6 +8685,7 @@ dependencies = [
  "minijinja",
  "object_store",
  "parking_lot",
+ "postcard",
  "prometheus 0.14.0",
  "rand 0.8.6",
  "redb 2.6.3",

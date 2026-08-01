@@ -28,7 +28,7 @@ pub(crate) mod wire;
 // --- Re-exports for the cross-node cache RPC transport (J2) ---
 
 pub use client::{PeerClient, TransportClientPool};
-pub use frame::{CacheOp, CacheResult, Request, Response};
+pub use frame::{CacheOp, CacheResult, CacheSnapshot, Request, Response};
 pub use server::TransportServer;
 
 use serde::{Deserialize, Serialize};

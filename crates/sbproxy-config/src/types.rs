@@ -7828,7 +7828,7 @@ proxy:
   extensions:
     classifier:
       endpoint: "http://127.0.0.1:9500"
-    semantic_cache:
+    custom_metadata:
       enabled: true
 origins: {}
 "#;
@@ -7836,8 +7836,8 @@ origins: {}
         let ext = cfg.proxy.extensions;
         assert!(ext.contains_key("classifier"), "classifier ext present");
         assert!(
-            ext.contains_key("semantic_cache"),
-            "semantic_cache ext present"
+            ext.contains_key("custom_metadata"),
+            "custom_metadata ext present"
         );
         let cls = ext.get("classifier").unwrap();
         assert_eq!(
@@ -7859,8 +7859,9 @@ origins: {}
 
     #[test]
     fn origin_extensions_accepts_arbitrary_nested_yaml() {
-        // Per-origin enterprise extensions (e.g. semantic_cache) live in
-        // a sibling opaque map that OSS never inspects.
+        // Per-origin extensions live in a sibling opaque map that nothing
+        // in this workspace inspects. The map keeps arbitrary nested
+        // shapes intact for whoever reads it.
         let yaml = r#"
 origins:
   api.example.com:
@@ -7868,22 +7869,22 @@ origins:
       type: proxy
       url: http://localhost:3000
     extensions:
-      semantic_cache:
+      custom_metadata:
         enabled: true
         ttl_secs: 1200
-        key_template: "{embedding_model}:{lsh_bucket}"
+        label: "{team}:{tier}"
 "#;
         let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
         let origin = &cfg.origins["api.example.com"];
-        let sc = origin
+        let custom = origin
             .extensions
-            .get("semantic_cache")
-            .expect("semantic_cache extension parsed");
-        assert!(sc.get("enabled").unwrap().as_bool().unwrap());
-        assert_eq!(sc.get("ttl_secs").unwrap().as_u64().unwrap(), 1200);
+            .get("custom_metadata")
+            .expect("custom_metadata extension parsed");
+        assert!(custom.get("enabled").unwrap().as_bool().unwrap());
+        assert_eq!(custom.get("ttl_secs").unwrap().as_u64().unwrap(), 1200);
         assert_eq!(
-            sc.get("key_template").unwrap().as_str().unwrap(),
-            "{embedding_model}:{lsh_bucket}"
+            custom.get("label").unwrap().as_str().unwrap(),
+            "{team}:{tier}"
         );
     }
 

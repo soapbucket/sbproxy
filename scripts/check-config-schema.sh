@@ -15,6 +15,8 @@
 #   schemas/ai-external-guardrail.schema.json <- sbproxy-ai ExternalGuardrailConfig
 #   schemas/ai-rag.schema.json <- sbproxy-ai RagRouteConfig (the rag: block
 #       of an ai_proxy action)
+#   schemas/ai-semantic-cache.schema.json <- sbproxy-ai EmbeddingCacheConfig
+#       (the semantic_cache: block of an ai_proxy action)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -29,6 +31,7 @@ schemas=(
     "schemas/ai-compression.schema.json|-p sbproxy-ai --bin generate-ai-compression-schema"
     "schemas/ai-external-guardrail.schema.json|-p sbproxy-ai --bin generate-ai-external-guardrail-schema"
     "schemas/ai-rag.schema.json|-p sbproxy-ai --bin generate-ai-rag-schema"
+    "schemas/ai-semantic-cache.schema.json|-p sbproxy-ai --bin generate-ai-semantic-cache-schema"
 )
 
 GENERATED=$(mktemp)

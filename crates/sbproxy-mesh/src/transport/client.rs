@@ -32,7 +32,9 @@ use crate::metrics::{
 };
 use crate::state::register::VersionedLwwMergeOutcome;
 
-use super::frame::{read_frame, write_frame, CacheOp, CacheResult, Request, Response};
+use super::frame::{
+    read_frame, write_frame, CacheOp, CacheResult, CacheSnapshot, Request, Response,
+};
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -119,6 +121,7 @@ fn cache_op_label(op: &CacheOp) -> &'static str {
         CacheOp::ReplicaApply { .. } => "replica_apply",
         CacheOp::ReplicaFetch { .. } => "replica_fetch",
         CacheOp::SyncDigest { .. } => "sync_digest",
+        CacheOp::SnapshotPrefix { .. } => "snapshot_prefix",
     }
 }
 
@@ -345,6 +348,48 @@ impl PeerClient {
                 Err(anyhow::anyhow!("remote error: {error}"))
             }
             other => Err(anyhow::anyhow!("unexpected cache result: {other:?}")),
+        }
+    }
+
+    /// Read one bounded lexicographic page of `prefix` from the remote
+    /// peer's local shard.
+    ///
+    /// The request carries no routing key: the caller has already resolved
+    /// the consistent-hash owner and dialled it. `maximum` must be in
+    /// `1..=4096` and `prefix` must be non-empty and at most
+    /// [`crate::transport::frame::MAX_ROUTED_SNAPSHOT_PREFIX_BYTES`] bytes;
+    /// the peer answers an out-of-bounds request with a fixed non-secret
+    /// error that never echoes the prefix.
+    ///
+    /// Only [`CacheResult::Snapshot`] is accepted. Every other result,
+    /// including a remote error, is a transport-level failure for this call.
+    ///
+    /// A caller must verify the authenticated `semantic_cache_snapshot_v1`
+    /// fleet capability before sending this operation. Postcard enum
+    /// variants are not self-describing, so an older peer would decode the
+    /// appended discriminant as garbage rather than as an unknown operation.
+    pub async fn snapshot_prefix(
+        &self,
+        prefix: String,
+        maximum: u32,
+    ) -> anyhow::Result<CacheSnapshot> {
+        match self
+            .send_request(CacheOp::SnapshotPrefix { prefix, maximum })
+            .await?
+        {
+            CacheResult::Snapshot(snapshot) => Ok(snapshot),
+            CacheResult::Error(error) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {error}"))
+            }
+            CacheResult::Value(_) => Err(anyhow::anyhow!(
+                "unexpected cache result for snapshot_prefix"
+            )),
+            other => Err(anyhow::anyhow!(
+                "unexpected cache result for snapshot_prefix: {other:?}"
+            )),
         }
     }
 
@@ -810,6 +855,62 @@ mod tests {
         assert_eq!(stored.value(), Some("new"));
 
         server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn client_snapshot_prefix_maps_only_snapshot_result() {
+        let (server, cache, port) = spawn_server().await;
+        cache.put_local("member:b", Bytes::from_static(b"two"));
+        cache.put_local("member:a", Bytes::from_static(b"one"));
+        cache.put_local("other:a", Bytes::from_static(b"skip"));
+
+        let client = PeerClient::new(format!("127.0.0.1:{port}"));
+        let snapshot = client
+            .snapshot_prefix("member:".to_string(), 16)
+            .await
+            .expect("snapshot");
+        assert_eq!(
+            snapshot.entries,
+            vec![
+                ("member:a".to_string(), Bytes::from_static(b"one")),
+                ("member:b".to_string(), Bytes::from_static(b"two")),
+            ]
+        );
+        assert!(!snapshot.truncated);
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn client_snapshot_prefix_rejects_an_unexpected_result() {
+        // The server answers an out-of-bounds request with `CacheResult::Error`,
+        // which is not a snapshot. The client must surface that as an error
+        // rather than inventing an empty page.
+        let (server, _cache, port) = spawn_server().await;
+        let client = PeerClient::new(format!("127.0.0.1:{port}"));
+
+        let err = client
+            .snapshot_prefix("member:".to_string(), 0)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("remote error"), "{message}");
+        assert!(!message.contains("member:"), "{message}");
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn snapshot_prefix_uses_the_closed_transport_operation_label() {
+        // The transport duration metric labels on `op`, so the label set has
+        // to stay a fixed closed vocabulary.
+        assert_eq!(
+            cache_op_label(&CacheOp::SnapshotPrefix {
+                prefix: "member:".to_string(),
+                maximum: 16,
+            }),
+            "snapshot_prefix"
+        );
     }
 
     #[tokio::test]

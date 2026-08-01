@@ -5248,147 +5248,40 @@ pub(super) async fn handle_ai_proxy(
         ),
     };
 
-    // --- Semantic lookup hook (A21/F3+F4, fail-open) ---
+    // --- WOR-2099: compiled semantic cache (lookup) ---
     //
-    // When the enterprise semantic cache is wired, ask the hook whether
-    // an equivalent response is already cached. On HIT we short-circuit
-    // the upstream dispatch by replaying the cached status, headers, and
-    // body directly to the client. The return path here matches the OSS
-    // `response_cache` replay in `request_filter`: write the response
-    // header, then write the body with `end_of_stream = true`. Callers
-    // in `handle_action` treat a successful return from `handle_ai_proxy`
-    // as a short-circuit (Ok(true)), so no additional signaling is
-    // required.
+    // Selection is per origin and per forward rule, exactly like the RAG
+    // registry above. A forward rule without its own `semantic_cache:`
+    // block has no cache and never inherits the origin's, because it may
+    // route to a different model, guardrail set, response shape, or
+    // credential policy. Reversible PII clears the block during action
+    // compilation, so a redaction policy that can restore the original
+    // text leaves an unconfigured slot here and semantic caching stays off
+    // for that action.
     //
-    // On MISS, we remember the composed cache `miss_key` plus the per-
-    // origin gating policy (`cacheable_status`, `max_response_size`) so
-    // the write-on-miss branch further down can persist the upstream
-    // response into the cache without re-running the embedding + LSH
-    // pipeline.
+    // A streaming request skips embedding, lookup, and write outright. An
+    // SSE stream cannot be admitted as one buffered entry, and gating only
+    // the later response store would still pay for the embedding call and
+    // still touch the backend.
     //
-    // When populated, the relay path below dispatches a `hook.store`
-    // after the upstream call completes (subject to status + size gates).
-    let mut semcache_miss: Option<PendingSemcacheMiss> = None;
-    if !semantic_cache_bypass {
-        if let Some(hook) = pipeline.hooks.semantic_lookup.as_ref().cloned() {
-            if !extracted_prompt.is_empty() {
-                let model_id = if model.is_empty() {
-                    None
-                } else {
-                    Some(model.clone())
-                };
-                let lookup_req = crate::hooks::LookupRequest {
-                    origin: hostname.to_string(),
-                    model_id: model_id.clone(),
-                    prompt: extracted_prompt.clone(),
-                    request_headers: snapshot_request_headers(session, pipeline),
-                    request_body: body_bytes.clone(),
-                    method: method.as_str().to_string(),
-                    path: path.clone(),
-                };
-                let outcome = hook.lookup(&lookup_req).await;
-                ctx.admin_cache_status
-                    .record(crate::context::AdminCacheStatus::Miss);
-                if let Some(cached) = outcome.hit {
-                    ctx.admin_cache_status
-                        .record(crate::context::AdminCacheStatus::SemanticHit);
-                    debug!(
-                        origin = %hostname,
-                        status = cached.status,
-                        body_len = cached.body.len(),
-                        "AI proxy: semantic cache HIT; replaying cached response"
-                    );
-                    if let Some(block) = ai_output_guardrail_block(
-                        cached.status,
-                        guardrail_pipeline.as_deref(),
-                        output_external,
-                        cached.body.as_ref(),
-                        &model,
-                    )
-                    .await
-                    {
-                        send_guardrail_block_response(session, ctx, &ai_span, 403, block).await?;
-                        return Ok(());
-                    }
-
-                    // Build a Pingora ResponseHeader from the cached entry.
-                    // Size hint: cached headers + x-semcache marker.
-                    let mut header = pingora_http::ResponseHeader::build(
-                        cached.status,
-                        Some(cached.headers.len() + 1),
-                    )
-                    .map_err(|e| {
-                        Error::because(
-                            ErrorType::InternalError,
-                            "semantic cache: failed to build response header",
-                            e,
-                        )
-                    })?;
-                    for (name, value) in &cached.headers {
-                        // Skip hop-by-hop / framing headers that Pingora will
-                        // recompute for us. We intentionally preserve content-type
-                        // and any origin-provided response metadata.
-                        let lname = name.to_ascii_lowercase();
-                        if matches!(
-                            lname.as_str(),
-                            "transfer-encoding" | "connection" | "content-length"
-                        ) {
-                            continue;
-                        }
-                        let _ = header.insert_header(name.clone(), value.clone());
-                    }
-                    // Always emit the debug marker so operators and integration
-                    // tests can distinguish a replayed hit from an upstream
-                    // response. Matches OSS `x-sbproxy-cache: HIT` convention.
-                    let _ = header.insert_header("x-semcache", "HIT");
-
-                    let replay_body = bytes::Bytes::from(
-                        sbproxy_ai::format::rewrap_success_response_for_inbound(
-                            cached.status,
-                            ctx.ai_inbound_format.as_deref(),
-                            cached.body.as_ref(),
-                        ),
-                    );
-                    session
-                        .write_response_header(Box::new(header), false)
-                        .await?;
-                    session.write_response_body(Some(replay_body), true).await?;
-                    return Ok(());
-                }
-                // MISS with a usable key: remember enough state to populate the
-                // cache once we get the upstream response back.
-                if let Some(key) = outcome.miss_key {
-                    semcache_miss = Some((
-                        hook,
-                        key,
-                        outcome.cacheable_status,
-                        outcome.max_response_size,
-                        model_id,
-                        hostname.to_string(),
-                    ));
-                }
-            }
-        }
-    }
-
-    // --- WOR-796: OSS embedding semantic cache (lookup) ---
-    //
-    // Runs only when the enterprise `SemanticLookupHook` is absent, so
-    // the two never double-cache. On a miss we embed the prompt once,
-    // cosine-scan the cache, and replay the closest response that meets
-    // the configured threshold. A miss remembers the key + vector so
-    // the relay can store the upstream response. Embedding failures
-    // fail open (proceed to the upstream uncached).
+    // Every failure below is a cache miss. An unusable embedding, an
+    // unavailable backend, a malformed record, and an incompatible record
+    // all fall through to ordinary provider routing; none of them can fail
+    // the request.
     let mut embed_miss: Option<PendingEmbedMiss> = None;
-    if !semantic_cache_bypass && pipeline.hooks.semantic_lookup.is_none() {
-        if let Some(cache) = config.embedding_cache() {
-            // WOR-1142: scope cache entries to the caller so one
-            // tenant/credential never receives another's cached response.
-            let cache_scope = sbproxy_ai::EmbeddingCache::scope_key(
-                ctx.tenant_id.as_str(),
-                req_header_value(session, "authorization").as_deref(),
-            );
-            if !extracted_prompt.is_empty() {
+    if !semantic_cache_bypass && !is_stream {
+        if let Some((origin_index, selection)) = origin_idx.and_then(|index| {
+            pipeline
+                .semantic_caches
+                .get(index, ctx.forward_rule_idx)
+                .map(|selection| (index, selection))
+        }) {
+            let cache = selection.cache;
+            // The semantic query is split out only here. Every guardrail,
+            // classifier, intent, trace, and policy call site above keeps
+            // the full `extracted_prompt` value.
+            let semantic_prompt = extract_semantic_prompt(&body);
+            if !semantic_prompt.text.is_empty() {
                 // WOR-1223: vectorize the prompt via the configured source.
                 // Provider hits the embedding API (costs money, egresses the
                 // prompt); sidecar uses the local classifier sidecar (free, no
@@ -5425,7 +5318,7 @@ pub(super) async fn handle_ai_proxy(
                                     &ai_client,
                                     &resolved_provider,
                                     cache.model(),
-                                    &extracted_prompt,
+                                    &semantic_prompt.text,
                                     quota_attempt,
                                 )
                                 .await
@@ -5441,7 +5334,7 @@ pub(super) async fn handle_ai_proxy(
                             Some(sc) => {
                                 sbproxy_ai::semantic_cache::compute_embedding_sidecar(
                                     sc,
-                                    &extracted_prompt,
+                                    &semantic_prompt.text,
                                 )
                                 .await
                             }
@@ -5456,7 +5349,7 @@ pub(super) async fn handle_ai_proxy(
                             match cache.inprocess_config() {
                                 Some(cfg) => crate::server::ai_support::inprocess_embed(
                                     cfg,
-                                    &extracted_prompt,
+                                    &semantic_prompt.text,
                                 ),
                                 None => Err(anyhow::anyhow!(
                                     "inprocess embedding source has no inprocess config"
@@ -5494,7 +5387,7 @@ pub(super) async fn handle_ai_proxy(
                                 };
                                 sbproxy_ai::semantic_cache::compute_embedding_openai_with_quota(
                                     oc,
-                                    &extracted_prompt,
+                                    &semantic_prompt.text,
                                     quota_attempt,
                                 )
                                 .await
@@ -5518,11 +5411,69 @@ pub(super) async fn handle_ai_proxy(
                     sbproxy_ai::semantic_cache::EmbeddingSource::Inprocess => "inprocess",
                     sbproxy_ai::semantic_cache::EmbeddingSource::Openai => "openai",
                 };
-                match query_vec_result {
-                    Ok(query_vec) => {
-                        ctx.admin_cache_status
-                            .record(crate::context::AdminCacheStatus::Miss);
-                        if let Some(hit) = cache.lookup(&query_vec, &cache_scope) {
+                let query_vec = match query_vec_result {
+                    Ok(query_vec) => Some(query_vec),
+                    Err(_) => {
+                        sbproxy_observe::metrics::record_semantic_cache(
+                            ctx.tenant_id.as_str(),
+                            hostname,
+                            source_label,
+                            "error",
+                        );
+                        // A request-client error can carry an endpoint, so
+                        // only the closed source label and a fixed failure
+                        // class are logged from this path.
+                        warn!(
+                            tenant = %ctx.tenant_id,
+                            origin = %hostname,
+                            source = source_label,
+                            failure = "embedding_unavailable",
+                            "AI proxy: semantic cache embedding failed (fail-open)"
+                        );
+                        None
+                    }
+                };
+                // The namespace is derived only after embedding succeeds, so
+                // a failed embedding never touches the backend. Owned values
+                // are held in locals before they are borrowed, and none of
+                // them is ever traced.
+                let namespace = query_vec.as_ref().and_then(|query_vec| {
+                    let compiled_origin = pipeline.config.origins.get(origin_index)?;
+                    let response_policy_digest = semantic_response_policy_digest(
+                        selection.static_action_policy_digest,
+                        peer_policy_revision.as_str(),
+                        surface_label,
+                    );
+                    let credential_identity = semantic_credential_identity(session, &ctx.principal);
+                    Some(sbproxy_ai::SemanticNamespace::derive(
+                        sbproxy_ai::SemanticNamespaceInput {
+                            origin_route: compiled_origin.hostname.as_str(),
+                            request_host: ctx.hostname.as_str(),
+                            tenant_id: ctx.tenant_id.as_str(),
+                            credential_identity: credential_identity.as_str(),
+                            requested_model: model.as_str(),
+                            api_surface: surface_label,
+                            request_context_digest: &semantic_prompt.request_context_digest,
+                            embedding_identity: cache.embedding_identity(),
+                            embedding_dimensions: query_vec.len(),
+                            semantic_config_digest: cache.configuration_digest(),
+                            response_policy_digest: &response_policy_digest,
+                            schema_version: sbproxy_ai::SEMANTIC_CACHE_SCHEMA_VERSION,
+                        },
+                    ))
+                });
+                if let (Some(query_vec), Some(namespace)) = (query_vec, namespace) {
+                    ctx.admin_cache_status
+                        .record(crate::context::AdminCacheStatus::Miss);
+                    let outcome = cache
+                        .lookup(sbproxy_ai::SemanticLookupRequest {
+                            namespace,
+                            prompt: &semantic_prompt.text,
+                            embedding: &query_vec,
+                        })
+                        .await;
+                    match outcome {
+                        Ok(sbproxy_ai::SemanticLookupOutcome::Hit(hit)) => {
                             ctx.admin_cache_status
                                 .record(crate::context::AdminCacheStatus::SemanticHit);
                             sbproxy_ai::ai_metrics::record_cache_result(
@@ -5545,11 +5496,12 @@ pub(super) async fn handle_ai_proxy(
                                 origin = %hostname,
                                 score = hit.score,
                                 status = hit.response.status,
-                                "AI proxy: embedding semantic cache HIT; replaying"
+                                "AI proxy: semantic cache HIT; replaying"
                             );
-                            // Materialize and evaluate the shared response before
-                            // constructing or flushing replay headers.
-                            let body = bytes::Bytes::from(hit.response.body.clone());
+                            // The stored body is behind one reference count.
+                            // Cloning the handle here costs a refcount bump,
+                            // not a copy of the response.
+                            let body = hit.response.body.clone();
                             if let Some(block) = ai_output_guardrail_block(
                                 hit.response.status,
                                 guardrail_pipeline.as_deref(),
@@ -5563,33 +5515,30 @@ pub(super) async fn handle_ai_proxy(
                                     .await?;
                                 return Ok(());
                             }
-                            let mut header = pingora_http::ResponseHeader::build(
-                                hit.response.status,
-                                Some(hit.response.headers.len() + 1),
-                            )
-                            .map_err(|e| {
-                                Error::because(
-                                    ErrorType::InternalError,
-                                    "embedding cache: failed to build response header",
-                                    e,
-                                )
-                            })?;
-                            for (name, value) in &hit.response.headers {
-                                let lname = name.to_ascii_lowercase();
-                                if matches!(
-                                    lname.as_str(),
-                                    "transfer-encoding" | "connection" | "content-length"
-                                ) {
-                                    continue;
+                            // Re-run the allowlist over the decoded record so
+                            // a tampered distributed value cannot turn an
+                            // allowlisted name into an invalid header.
+                            let stored_headers =
+                                semantic_cache_response_headers(&hit.response.headers);
+                            let content_type = stored_headers
+                                .iter()
+                                .find(|(name, _)| name == "content-type")
+                                .map(|(_, value)| value.clone())
+                                .unwrap_or_else(|| "application/json".to_string());
+                            // Route metadata is rebuilt from the current
+                            // request. An earlier caller's route headers are
+                            // never stored and never replayed.
+                            let mut extras = public_route_headers(ctx);
+                            for (name, value) in &stored_headers {
+                                if name == "content-language" {
+                                    extras.push((name.clone(), value.clone()));
                                 }
-                                let _ = header.insert_header(name.clone(), value.clone());
                             }
-                            let _ = header.insert_header("x-semcache", "HIT");
-                            // WOR-1094: a cache hit is a zero-cost
-                            // ledger transaction, not an absent one.
-                            // Record the served tokens under the
-                            // cache_read dimension so the hit still
-                            // shows up as savings.
+                            extras.push(("x-semcache".to_string(), "HIT".to_string()));
+                            // WOR-1094: a cache hit is a zero-cost ledger
+                            // transaction, not an absent one. Record the
+                            // served tokens under the cache_read dimension so
+                            // the hit still shows up as savings.
                             crate::server::ai_support::record_cache_hit_savings(
                                 ctx.tenant_id.as_str(),
                                 ctx.principal.api_key_id(),
@@ -5600,50 +5549,54 @@ pub(super) async fn handle_ai_proxy(
                                 &body,
                                 &ctx.attribution_tags,
                             );
-                            let replay_body = bytes::Bytes::from(
+                            let replay_body =
                                 sbproxy_ai::format::rewrap_success_response_for_inbound(
                                     hit.response.status,
                                     ctx.ai_inbound_format.as_deref(),
                                     body.as_ref(),
-                                ),
-                            );
-                            session
-                                .write_response_header(Box::new(header), false)
-                                .await?;
-                            session.write_response_body(Some(replay_body), true).await?;
-                            return Ok(());
+                                );
+                            return send_response_with_extras(
+                                session,
+                                hit.response.status,
+                                &content_type,
+                                &replay_body,
+                                &extras,
+                            )
+                            .await;
                         }
-                        sbproxy_ai::ai_metrics::record_cache_result(
-                            cache.provider(),
-                            "semantic",
-                            false,
-                        );
-                        sbproxy_observe::metrics::record_semantic_cache(
-                            ctx.tenant_id.as_str(),
-                            hostname,
-                            source_label,
-                            "miss",
-                        );
-                        embed_miss = Some((
-                            std::sync::Arc::clone(cache),
-                            sbproxy_ai::EmbeddingCache::prompt_key(&cache_scope, &extracted_prompt),
-                            query_vec,
-                            cache_scope,
-                        ));
-                    }
-                    Err(e) => {
-                        sbproxy_observe::metrics::record_semantic_cache(
-                            ctx.tenant_id.as_str(),
-                            hostname,
-                            source_label,
-                            "error",
-                        );
-                        warn!(
-                            tenant = %ctx.tenant_id,
-                            origin = %hostname,
-                            error = %e,
-                            "AI proxy: embedding cache lookup failed (fail-open)"
-                        );
+                        Ok(sbproxy_ai::SemanticLookupOutcome::Miss(token)) => {
+                            sbproxy_ai::ai_metrics::record_cache_result(
+                                cache.provider(),
+                                "semantic",
+                                false,
+                            );
+                            sbproxy_observe::metrics::record_semantic_cache(
+                                ctx.tenant_id.as_str(),
+                                hostname,
+                                source_label,
+                                "miss",
+                            );
+                            embed_miss = Some((std::sync::Arc::clone(cache), *token));
+                        }
+                        Err(error) => {
+                            sbproxy_observe::metrics::record_semantic_cache(
+                                ctx.tenant_id.as_str(),
+                                hostname,
+                                source_label,
+                                "error",
+                            );
+                            // Backend, failure class, and nothing else. A key,
+                            // namespace digest, embedding, prompt, response
+                            // body, or Redis and mesh error must never reach a
+                            // log line from the request path.
+                            warn!(
+                                tenant = %ctx.tenant_id,
+                                origin = %hostname,
+                                backend = semantic_backend_label(cache.backend()),
+                                failure = semantic_lookup_failure_class(&error),
+                                "AI proxy: semantic cache lookup failed (fail-open)"
+                            );
+                        }
                     }
                 }
             }
@@ -7057,7 +7010,6 @@ pub(super) async fn handle_ai_proxy(
                     last_format,
                     hostname,
                     None,
-                    None,
                     Some(buffered_ai_response_body_limit(config.max_body_size)),
                     recorder,
                     router_sink,
@@ -7088,51 +7040,21 @@ pub(super) async fn handle_ai_proxy(
             } else {
                 Some(model.clone())
             };
-            // NOTE: semantic-cache write-on-miss is intentionally skipped
-            // for streaming responses. Accumulating an SSE stream into a
-            // single cache entry would change its delivery semantics;
-            // supporting it requires framing-aware capture that is out of
-            // scope for F4. Any stashed `semcache_miss` state is simply
-            // dropped here.
+            // NOTE: a streaming request never reaches the semantic cache.
+            // The lookup gate above skips embedding, lookup, and write for
+            // `stream: true`, so there is no pending admission to drop
+            // here. Accumulating an SSE stream into one buffered entry
+            // would change its delivery semantics, and framing-aware
+            // capture remains out of scope.
             //
-            // SSE event-shape translation for non-OpenAI providers
-            // (Anthropic `content_block_delta` to OpenAI `delta`) is
-            // also out of scope for the first translator landing; non-
-            // OpenAI streams pass through in their native shape today
-            // and this is documented as a known limitation in
-            // docs/providers.md.
-            // The semcache_miss tuple captures the key the lookup hook
-            // composed for a non-streaming MISS path. We do not write
-            // the assembled SSE body back into the literal semantic
-            // cache (framing-aware capture is out of scope here), but
-            // we do hand the same key to the streaming cache recorder
-            // so the enterprise impl can record the chunk stream
-            // against it.
-            let semcache_key: Option<String> = semcache_miss
-                .as_ref()
-                .map(|(_, key, _, _, _, _)| key.clone());
-            let _ = semcache_miss;
-            // SSE event-shape translation for non-OpenAI providers
-            //. When the upstream emits Anthropic
-            // `event: content_block_delta`, Gemini
-            // `streamGenerateContent`, or Bedrock Converse-stream
-            // payloads, the relay reframes them into the hub
-            // vocabulary and re-emits in the inbound format's wire
-            // shape so clients see a uniform stream. The
-            // OpenAI-in-OpenAI-out branch stays a pure byte forward.
+            // SSE event-shape translation for non-OpenAI providers. When
+            // the upstream emits Anthropic `event: content_block_delta`,
+            // Gemini `streamGenerateContent`, or Bedrock Converse-stream
+            // payloads, the relay reframes them into the hub vocabulary
+            // and re-emits in the inbound format's wire shape so clients
+            // see a uniform stream. The OpenAI-in-OpenAI-out branch stays
+            // a pure byte forward.
             let stream_inbound_format: Option<String> = ctx.ai_inbound_format.clone();
-            // Opaque pass-through of the AI handler's
-            // `semantic_cache.streaming` block. The OSS proxy never
-            // validates this; the enterprise recorder reads whatever
-            // shape it expects (e.g. `enabled`, `replay_pacing`).
-            let stream_policy = config
-                .semantic_cache
-                .as_ref()
-                .and_then(|sc| sc.get("streaming"))
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let request_id = ctx.request_id.to_string();
-            let origin_id = origin_idx.map(|i| i.to_string()).unwrap_or_default();
             // The streaming relay receives the same budget recorder the
             // non-streaming path does so a stream that emits a terminal
             // `usage` block (OpenAI) or a `message_delta` (Anthropic)
@@ -7190,13 +7112,6 @@ pub(super) async fn handle_ai_proxy(
                 hostname,
                 model_id,
                 origin_idx,
-                StreamCacheRecorderArgs {
-                    request_id,
-                    origin_id,
-                    semantic_key: semcache_key,
-                    policy: stream_policy,
-                    cache_bypass: semantic_cache_bypass,
-                },
                 stream_recorder,
                 stream_router_sink,
                 StreamUsageParserArgs {
@@ -7228,10 +7143,10 @@ pub(super) async fn handle_ai_proxy(
             )
             .await
         } else {
-            // Non-streaming: relay plus optional cache write on miss.
-            // When a miss_key was captured during the lookup phase and
-            // the upstream response passes the status + size gates, we
-            // dispatch `hook.store` best-effort (fail-open).
+            // Non-streaming: relay plus the semantic write on miss. When a
+            // write token was captured during the lookup phase and the
+            // upstream response passes the status gate and the output
+            // guardrails, the relay awaits `cache.store` and fails open.
             let recorder = effective_budget.as_deref().map(|b| BudgetRecorderArgs {
                 origin: hostname.to_string(),
                 config: b,
@@ -7258,7 +7173,6 @@ pub(super) async fn handle_ai_proxy(
                 resp,
                 last_format,
                 hostname,
-                semcache_miss,
                 embed_miss,
                 config.max_body_size,
                 recorder,
@@ -7612,6 +7526,36 @@ fn public_route_headers(ctx: &RequestContext) -> Vec<(String, String)> {
     )]
 }
 
+/// Closed operator-facing label for one semantic cache backend.
+fn semantic_backend_label(backend: sbproxy_ai::SemanticCacheBackend) -> &'static str {
+    match backend {
+        sbproxy_ai::SemanticCacheBackend::Memory => "memory",
+        sbproxy_ai::SemanticCacheBackend::Redis => "redis",
+        sbproxy_ai::SemanticCacheBackend::Mesh => "mesh",
+    }
+}
+
+/// Closed failure class for a semantic lookup that could not answer.
+///
+/// The concrete backend error is deliberately dropped: it can name a DSN, a
+/// peer address, or a key, and this value reaches an operator log line.
+fn semantic_lookup_failure_class(error: &sbproxy_ai::SemanticLookupError) -> &'static str {
+    match error {
+        sbproxy_ai::SemanticLookupError::InvalidEmbedding => "invalid_embedding",
+        sbproxy_ai::SemanticLookupError::Store(error) => semantic_store_failure_class(error),
+    }
+}
+
+/// Closed failure class for a semantic backend operation.
+fn semantic_store_failure_class(error: &sbproxy_ai::SemanticStoreError) -> &'static str {
+    match error {
+        sbproxy_ai::SemanticStoreError::Unavailable => "backend_unavailable",
+        sbproxy_ai::SemanticStoreError::InvalidWrite => "write_rejected",
+        sbproxy_ai::SemanticStoreError::InvalidState => "backend_invalid_state",
+        sbproxy_ai::SemanticStoreError::OperationFailed => "operation_failed",
+    }
+}
+
 fn public_logical_model_header(ctx: &RequestContext) -> Vec<(String, String)> {
     ctx.ai_serve_model
         .as_deref()
@@ -7820,27 +7764,24 @@ async fn send_guardrail_block_response(
     send_response(session, status, "application/json", &body).await
 }
 
-/// Relay a non-streaming AI response and, when `miss_info` is present,
-/// write the response back into the semantic cache on behalf of the hook.
+/// Relay a non-streaming AI response and, when `embed_miss` is present,
+/// admit that response into the semantic cache.
 ///
-/// `miss_info` is populated only when the preceding lookup missed and
-/// produced a usable key. The write is gated by:
+/// `embed_miss` is populated only when the preceding lookup missed and
+/// produced a write token. The write runs after output guardrails and
+/// response rewrapping, so a blocked or rewritten response is never
+/// admitted, and only a status 200 is cacheable.
 ///
-/// * `cacheable_status`: defaults to `[200]` when empty.
-/// * `max_response_size`: defaults to no cap when `None`.
-///
-/// All failures (read, encode, store) are logged and swallowed so that
-/// a cache write problem never turns into a client-visible error. The
-/// actual `store` call is dispatched on the existing async runtime; the
-/// underlying `RedisSemanticCacheStore` already performs its blocking
-/// I/O via `spawn_blocking`, so no additional wrapping is needed here.
+/// The write is awaited rather than detached: a fire-and-forget task could
+/// outlive its request-pinned pipeline and would hide a failed distributed
+/// write. Every failure is counted and swallowed so a cache problem never
+/// turns into a client-visible error.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn relay_ai_response_with_cache(
     session: &mut Session,
     resp: reqwest::Response,
     format: sbproxy_ai::providers::ProviderFormat,
     hostname: &str,
-    miss_info: Option<PendingSemcacheMiss>,
     embed_miss: Option<PendingEmbedMiss>,
     max_body_size: Option<usize>,
     budget_recorder: Option<BudgetRecorderArgs<'_>>,
@@ -7873,32 +7814,26 @@ pub(super) async fn relay_ai_response_with_cache(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
 
-    // Snapshot headers before we consume the response body.
-    let mut captured_headers: std::collections::HashMap<String, String> =
-        std::collections::HashMap::with_capacity(resp.headers().len());
-    for (name, value) in resp.headers() {
-        if let Ok(v) = value.to_str() {
-            let n = name.as_str().to_ascii_lowercase();
-            // Skip hop-by-hop / framing headers so replayed hits don't
-            // smuggle e.g. a stale `transfer-encoding: chunked` that no
-            // longer matches the replay body.
-            if matches!(
-                n.as_str(),
-                "connection"
-                    | "transfer-encoding"
-                    | "keep-alive"
-                    | "proxy-authenticate"
-                    | "proxy-authorization"
-                    | "content-length"
-                    | "te"
-                    | "trailer"
-                    | "upgrade"
-            ) {
-                continue;
-            }
-            captured_headers.insert(n, v.to_string());
-        }
-    }
+    // Snapshot the response headers before the body is consumed, then
+    // project them down to the closed set a semantic cache may store. A
+    // replayed hit must not carry a prior caller's cookie, challenge,
+    // request id, quota state, trace correlation, or a content coding that
+    // no longer matches the buffered bytes.
+    let cacheable_headers: Vec<(String, String)> = if embed_miss.is_some() {
+        let upstream_headers: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
+            })
+            .collect();
+        semantic_cache_response_headers(&upstream_headers)
+    } else {
+        Vec::new()
+    };
 
     let raw_body = read_capped_response_body(resp, max_body_size).await?;
     let inbound_format: Option<String> = ctx.as_ref().and_then(|c| c.ai_inbound_format.clone());
@@ -8057,85 +7992,50 @@ pub(super) async fn relay_ai_response_with_cache(
         return send_response(session, 403, "application/json", &body_bytes).await;
     }
 
-    // --- WOR-796: OSS embedding cache write on miss ---
+    // --- WOR-2099: semantic cache write on miss ---
     //
-    // Store the upstream response under the prompt's embedding so a
-    // future near-duplicate prompt replays it. Only 200 responses are
-    // cached. Mutually exclusive with the enterprise hook store below
-    // (the lookup gates on the hook being absent). `captured_headers`
-    // is cloned here so the enterprise branch can still move it.
-    if let Some((cache, key, embedding, cache_scope)) = embed_miss {
+    // Admit the canonical response under the token the lookup produced, so
+    // a later near-duplicate prompt in the same namespace replays it. The
+    // write runs after the output guardrails above, so a blocked response
+    // is never admitted, and it runs before the reversible-PII restore
+    // below, so masked text is what a hit would ever replay. Only a status
+    // 200 is cacheable.
+    //
+    // The write is awaited. A detached task could outlive its
+    // request-pinned pipeline and would hide a failed distributed write.
+    // The store timestamp is taken inside `store`, after the provider and
+    // the guardrails have finished, so provider latency never consumes the
+    // operator time-to-live.
+    if let Some((cache, token)) = embed_miss {
         if status == 200 {
-            let cached = sbproxy_ai::CachedHttpResponse {
+            let backend = semantic_backend_label(cache.backend());
+            let response = sbproxy_ai::CachedHttpResponse {
                 status,
-                headers: captured_headers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                body: resp_body.to_vec(),
-            };
-            cache.store(key, &embedding, cached, cache_scope);
-            debug!(
-                origin = %hostname,
-                body_len = resp_body.len(),
-                "AI proxy: embedding semantic cache write-on-miss stored"
-            );
-        }
-    }
-
-    // --- Semantic cache write on miss ---
-    //
-    // We write before relaying so the cache entry is durable even if
-    // the client disconnects mid-body. `store` is async but non-blocking
-    // for our purposes: the Redis-backed implementation already uses
-    // `spawn_blocking` internally.
-    if let Some((hook, key, cacheable_status, max_size, model_id, cache_origin)) = miss_info {
-        let status_ok = if cacheable_status.is_empty() {
-            status == 200
-        } else {
-            cacheable_status.contains(&status)
-        };
-        let size_ok = max_size.map(|cap| resp_body.len() <= cap).unwrap_or(true);
-        if status_ok && size_ok {
-            let cached = crate::hooks::CachedResponse {
-                status,
-                headers: captured_headers,
+                headers: cacheable_headers,
+                // A `Bytes` handle clone is a reference count bump, so the
+                // response body stays behind one allocation after admission.
                 body: resp_body.clone(),
-                cached_at: std::time::SystemTime::now(),
             };
-            let store_req = crate::hooks::StoreRequest {
-                origin: cache_origin,
-                model_id,
-                key: key.clone(),
-            };
-            // Fire-and-forget. Any error is logged and does not affect
-            // the client response.
-            match hook.store(store_req, cached).await {
+            match cache.store(token, response).await {
                 Ok(()) => {
                     debug!(
                         origin = %hostname,
-                        key = %key,
+                        backend,
                         body_len = resp_body.len(),
-                        "AI proxy: semantic cache write-on-miss succeeded"
+                        "AI proxy: semantic cache write-on-miss stored"
                     );
                 }
-                Err(e) => {
+                Err(error) => {
+                    // Backend and failure class only. The already approved
+                    // response still goes to the client.
                     warn!(
                         origin = %hostname,
-                        error = %e,
+                        backend,
+                        failure = semantic_store_failure_class(&error),
                         "AI proxy: semantic cache write-on-miss failed (fail-open)"
                     );
                 }
             }
-        } else {
-            debug!(
-                origin = %hostname,
-                status = %status,
-                body_len = resp_body.len(),
-                status_ok = %status_ok,
-                size_ok = %size_ok,
-                "AI proxy: semantic cache write-on-miss skipped (gate failed)"
-            );
         }
     }
 
@@ -8842,20 +8742,6 @@ fn record_router_tokens_from_response(
     }
 }
 
-/// Inputs to the streaming-cache recorder hook, bundled to keep
-/// [`relay_ai_stream`]'s parameter list short.
-///
-/// The OSS proxy never inspects these fields beyond passing them to
-/// [`crate::hooks::StreamCacheRecorderHook::start_session`]; all policy
-/// decisions live in the enterprise impl.
-pub(super) struct StreamCacheRecorderArgs {
-    request_id: String,
-    origin_id: String,
-    semantic_key: Option<String>,
-    policy: serde_json::Value,
-    cache_bypass: bool,
-}
-
 /// Inputs the streaming relay needs to construct the right
 /// [`sbproxy_ai::SseUsageParser`]. `configured` is the operator's
 /// `usage_parser` value (`auto`, `openai`, ...); the remaining
@@ -8911,21 +8797,11 @@ pub(super) struct StreamFormatArgs {
 ///   spec section 5 row 9) to avoid interrupting an in-flight user
 ///   response on a transient classifier hiccup.
 ///
-/// # Stream cache recorder integration
+/// # Semantic caching
 ///
-/// If the pipeline has a `StreamCacheRecorderHook` wired, a recorder
-/// session is opened at stream start. Every chunk forwarded to the
-/// client is also fanned into the recorder's channel; the terminal
-/// `End { complete }` event reports whether the stream finished
-/// cleanly (true) or aborted mid-stream (false). All caching policy
-/// decisions (deterministic tool calls only, image data by reference
-/// only, replay pacing) live in the enterprise impl. OSS just
-/// forwards.
-//
-// Eight inputs is one over Clippy's default limit but each is doing
-// real work: enterprise hooks (safety + cache recorder), OSS budget
-// recorder, and the per-request identifiers the recorder session
-// needs. Splitting them into a struct would just move the noise.
+/// A streaming response is never cached. The request-path gate skips
+/// embedding, lookup, and write for `stream: true`, so this relay has no
+/// cache state to carry and never touches a semantic backend.
 /// Build the native-stream translator + inbound emitter pair for a
 /// given `(upstream, inbound)` format combination.
 ///
@@ -9613,7 +9489,6 @@ pub(super) async fn relay_ai_stream(
     hostname: &str,
     model_id: Option<String>,
     origin_idx: Option<usize>,
-    recorder_args: StreamCacheRecorderArgs,
     budget_recorder: Option<BudgetRecorderArgs<'_>>,
     router_sink: RouterTokenSink<'_>,
     parser_args: StreamUsageParserArgs,
@@ -9699,36 +9574,6 @@ pub(super) async fn relay_ai_stream(
         None
     };
 
-    // --- Start stream-cache recorder session (fail-open on None) ---
-    //
-    // Gating on `hooks.stream_cache_recorder.is_some()` ties this
-    // feature to enterprise opt-in. The recorder decides per session
-    // whether it wants to record this stream (it returns `None` to
-    // skip, e.g. when the cache key cannot be derived). On accept we
-    // wrap the channel in a `StreamCacheGuard` so the terminal `End`
-    // event lands exactly once: either via `finish()` on a clean
-    // end-of-stream or via the guard's `Drop` impl on any other exit
-    // path (client cancel, upstream error, mid-stream abort).
-    let recorder_guard: Option<crate::hooks::StreamCacheGuard> = if !recorder_args.cache_bypass {
-        if let Some(hook) = pipeline.hooks.stream_cache_recorder.as_ref().cloned() {
-            let ctx = crate::hooks::StreamCacheCtx {
-                hostname: hostname.to_string(),
-                origin_id: recorder_args.origin_id.clone(),
-                request_id: recorder_args.request_id.clone(),
-                semantic_key: recorder_args.semantic_key.clone(),
-                model_id: model_id.clone(),
-                policy: recorder_args.policy.clone(),
-            };
-            hook.start_session(ctx)
-                .await
-                .map(crate::hooks::StreamCacheGuard::new)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     // Write SSE response headers.
     let route_headers = ctx.as_deref().map(public_route_headers).unwrap_or_default();
     let mut header = pingora_http::ResponseHeader::build(status, Some(3 + route_headers.len()))
@@ -9762,8 +9607,8 @@ pub(super) async fn relay_ai_stream(
     // `upstream_complete` tracks whether the upstream stream ran to
     // its natural end without an error. It is only set to `true`
     // when the chunk loop exits via the `None` arm (no `break` from
-    // an upstream error). The flag gates whether the recorder
-    // guard's terminal event reports `complete: true`.
+    // an upstream error). The flag classifies the waste marker the
+    // budget branch below records for a truncated stream.
     //
     // `usage_scanner` is materialised only when a budget recorder
     // is wired so the scan cost stays opt-in. Each chunk is fed to
@@ -9883,8 +9728,8 @@ pub(super) async fn relay_ai_stream(
         .then(AiTraceStreamContent::default);
     // WOR-1144: set when the stream-safety classifier rejects a chunk so
     // the relay stops forwarding (fail closed) instead of delivering
-    // flagged content. Leaves `upstream_complete` false so the recorder
-    // guard emits `End { complete: false }`.
+    // flagged content. Leaves `upstream_complete` false so the stream is
+    // accounted as a partial delivery.
     let mut safety_blocked = false;
     // WOR-1141: set when a streaming-safe output guardrail matches an
     // outbound chunk so the relay stops forwarding (the violating chunk
@@ -9933,16 +9778,6 @@ pub(super) async fn relay_ai_stream(
                             break 'relay;
                         }
                     }
-                }
-
-                // --- Per-chunk recorder fan-out (best-effort) ---
-                //
-                // Forward a copy of every chunk to the cache recorder
-                // before writing to the client. `chunk` swallows
-                // SendError, so a closed recorder channel (enterprise
-                // dropped early) is not fatal.
-                if let Some(g) = recorder_guard.as_ref() {
-                    g.chunk(chunk_bytes.clone());
                 }
 
                 // --- Per-chunk usage capture for budget recording ---
@@ -10357,16 +10192,16 @@ pub(super) async fn relay_ai_stream(
         }
     }
 
-    // Signal end of stream to the client. A failure here is treated
-    // as a partial recording: we let the guard drop emit
-    // `End { complete: false }`.
+    // Signal end of stream to the client. A failure here leaves
+    // `upstream_complete` false, which the budget branch below reports as
+    // a partial delivery.
     session.write_response_body(None, true).await?;
 
     if safety_blocked {
         // WOR-1144: the stream was cut short by an output-safety verdict.
-        // `upstream_complete` stayed false, so the recorder guard emits
-        // `End { complete: false }`. Budget is still recorded best-effort
-        // below for whatever the upstream produced before the cut.
+        // `upstream_complete` stayed false. Budget is still recorded
+        // best-effort below for whatever the upstream produced before the
+        // cut.
         debug!("AI proxy: streaming response terminated early by stream-safety enforcement");
     }
     if output_guard_blocked {
@@ -10549,15 +10384,6 @@ pub(super) async fn relay_ai_stream(
         }
     }
 
-    // Clean end-of-stream: emit terminal `End { complete: true }`
-    // to the recorder. If the upstream broke mid-stream (`break`
-    // above) we deliberately leave the guard untouched so its drop
-    // emits `complete: false`.
-    if upstream_complete {
-        if let Some(g) = recorder_guard {
-            g.finish();
-        }
-    }
     Ok(())
 }
 
@@ -10846,12 +10672,38 @@ mod external_guardrail_context_tests {
         assert!(!output.contains("provider-private-sentinel"), "{output}");
     }
 
-    #[derive(Default)]
-    struct RecordingSemanticCache {
-        lookups: AtomicUsize,
-        stores: AtomicUsize,
-        hit: std::sync::Mutex<Option<crate::hooks::CachedResponse>>,
-        stored: std::sync::Mutex<Option<crate::hooks::CachedResponse>>,
+    /// Counts every connection the semantic cache's embedding source
+    /// receives.
+    ///
+    /// Semantic caching is compiled per action now rather than registered as
+    /// a hook, so the request-path observable is the embedding call itself:
+    /// the dispatcher embeds the prompt before it may consult or populate any
+    /// backend. A probe that stays at zero proves the semantic path was never
+    /// entered; a probe at one proves it ran exactly once. The fixture never
+    /// answers with a usable vector, so every lookup fails open and the
+    /// request continues to the provider uncached.
+    struct EmbeddingProbe {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl EmbeddingProbe {
+        /// Embedding calls observed so far.
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Orchestration counters for one compiled slot's semantic cache.
+    fn semantic_stats(
+        pipeline: &crate::pipeline::CompiledPipeline,
+        origin_idx: usize,
+        forward_rule_idx: Option<usize>,
+    ) -> sbproxy_ai::EmbeddingCacheStats {
+        pipeline
+            .semantic_caches
+            .get(origin_idx, forward_rule_idx)
+            .map(|selection| selection.cache.stats())
+            .unwrap_or_default()
     }
 
     #[derive(Default)]
@@ -10883,51 +10735,59 @@ mod external_guardrail_context_tests {
         }
     }
 
-    #[async_trait::async_trait]
-    impl crate::hooks::SemanticLookupHook for RecordingSemanticCache {
-        async fn lookup(&self, _req: &crate::hooks::LookupRequest) -> crate::hooks::LookupOutcome {
-            self.lookups.fetch_add(1, Ordering::SeqCst);
-            let hit = self.hit.lock().expect("semantic hit lock").clone();
-            if hit.is_some() {
-                crate::hooks::LookupOutcome {
-                    hit,
-                    ..Default::default()
-                }
-            } else {
-                crate::hooks::LookupOutcome {
-                    miss_key: Some("recording-miss".to_string()),
-                    ..Default::default()
+    /// Bind a counting embedding endpoint that never returns a vector.
+    ///
+    /// Every accepted connection is counted and then dropped, so the
+    /// dispatcher's embedding call fails and semantic caching fails open.
+    /// That is exactly what the ordering assertions in this module need: an
+    /// observable that fires the moment the semantic path is entered without
+    /// changing what the client receives.
+    async fn embedding_probe() -> (String, EmbeddingProbe) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind embedding probe");
+        let address = listener.local_addr().expect("embedding probe address");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        drop(stream);
+                    }
+                    Err(_) => return,
                 }
             }
-        }
-
-        async fn store(
-            &self,
-            _req: crate::hooks::StoreRequest,
-            resp: crate::hooks::CachedResponse,
-        ) -> anyhow::Result<()> {
-            self.stores.fetch_add(1, Ordering::SeqCst);
-            *self.stored.lock().expect("semantic stored lock") = Some(resp);
-            Ok(())
-        }
-
-        async fn purge(&self, _scope: crate::hooks::PurgeScope) -> anyhow::Result<u64> {
-            Ok(0)
-        }
+        });
+        (format!("http://{address}/v1"), EmbeddingProbe { calls })
     }
 
-    fn pipeline_with_recording_caches() -> (
+    /// One `ai.test` origin with idempotency and a compiled memory semantic
+    /// cache whose embedding source is the counting probe.
+    async fn pipeline_with_recording_caches() -> (
         crate::pipeline::CompiledPipeline,
-        Arc<RecordingSemanticCache>,
+        EmbeddingProbe,
         Arc<RecordingIdempotencyCache>,
     ) {
+        let (embedding_url, probe) = embedding_probe().await;
         let source = serde_json::json!({
             "origins": {
                 "ai.test": {
                     "action": {
-                        "type": "static",
-                        "status": 200,
-                        "body": "fixture"
+                        "type": "ai_proxy",
+                        "providers": [],
+                        "semantic_cache": {
+                            "enabled": true,
+                            "backend": "memory",
+                            "source": "openai",
+                            "openai": {
+                                "base_url": embedding_url,
+                                "model": "text-embedding-3-small",
+                                "timeout_ms": 2000,
+                                "allow_private_base_url": true
+                            }
+                        }
                     },
                     "idempotency": {"enabled": true}
                 }
@@ -10937,8 +10797,10 @@ mod external_guardrail_context_tests {
             sbproxy_config::compile_config(&source.to_string()).expect("compile test origin");
         let mut pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
             .expect("construct test pipeline");
-        let recording_semantic = Arc::new(RecordingSemanticCache::default());
-        pipeline.hooks.semantic_lookup = Some(recording_semantic.clone());
+        assert!(
+            pipeline.semantic_caches.get(0, None).is_some(),
+            "the fixture origin must carry a live semantic cache"
+        );
 
         let configured = pipeline.idempotencies[0]
             .as_ref()
@@ -10955,7 +10817,7 @@ mod external_guardrail_context_tests {
         };
         pipeline.idempotencies[0] = Some(Arc::new(replacement));
 
-        (pipeline, recording_semantic, recording_idempotency)
+        (pipeline, probe, recording_idempotency)
     }
 
     async fn blocking_guardrail() -> (String, tokio::sync::oneshot::Receiver<serde_json::Value>) {
@@ -11791,7 +11653,7 @@ mod external_guardrail_context_tests {
         }))
         .await;
         let mut context = crate::context::RequestContext::new();
-        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
 
         super::handle_ai_proxy(
             &mut session,
@@ -11810,7 +11672,7 @@ mod external_guardrail_context_tests {
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
         assert!(response.contains("guardrail_violation"), "{response}");
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
-        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(semantic.calls(), 0);
         assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
     }
 
@@ -11836,18 +11698,7 @@ mod external_guardrail_context_tests {
         }))
         .await;
         let mut context = crate::context::RequestContext::new();
-        let (pipeline, semantic, _) = pipeline_with_recording_caches();
-        *semantic.hit.lock().expect("semantic hit lock") = Some(crate::hooks::CachedResponse {
-            status: 200,
-            headers: std::collections::HashMap::from([(
-                "content-type".to_string(),
-                "application/json".to_string(),
-            )]),
-            body: bytes::Bytes::from_static(
-                br#"{"choices":[{"message":{"content":"stale-over-budget"}}]}"#,
-            ),
-            cached_at: std::time::SystemTime::now(),
-        });
+        let (pipeline, semantic, _) = pipeline_with_recording_caches().await;
 
         super::handle_ai_proxy(
             &mut session,
@@ -11864,33 +11715,34 @@ mod external_guardrail_context_tests {
         let response =
             String::from_utf8(live_downstream_body(client).await).expect("response utf8");
         assert!(response.contains("fresh-under-budget"), "{response}");
-        assert!(!response.contains("stale-over-budget"), "{response}");
-        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        // A configured reasoning policy bypasses semantic caching entirely,
+        // so the dispatcher must not even embed the prompt.
+        assert_eq!(semantic.calls(), 0);
+        let stats = semantic_stats(&pipeline, 0, None);
+        assert_eq!(stats.lookups, 0);
+        assert_eq!(stats.writes, 0);
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
     }
 
+    /// A streaming request must never reach the semantic cache. The gate
+    /// runs before the embedding call, so neither the embedding source nor
+    /// the backend is touched.
     #[tokio::test]
-    async fn anthropic_messages_semantic_hit_rewraps_canonical_success() {
-        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
-        let config = openai_proxy_config(&upstream_url);
-        let request = anthropic_messages_request();
-        let (mut session, client) = downstream_bytes_session(
-            "/v1/messages",
+    async fn streaming_request_skips_embedding_lookup_and_store() {
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            canonical_chat_response("buffered stream"),
             "application/json",
-            serde_json::to_vec(&request).expect("request JSON"),
         )
         .await;
+        let config = openai_proxy_config(&upstream_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
         let mut context = crate::context::RequestContext::new();
-        let (pipeline, semantic, _) = pipeline_with_recording_caches();
-        *semantic.hit.lock().expect("semantic hit lock") = Some(crate::hooks::CachedResponse {
-            status: 200,
-            headers: std::collections::HashMap::from([
-                ("content-type".to_string(), "application/json".to_string()),
-                ("content-length".to_string(), "1".to_string()),
-            ]),
-            body: bytes::Bytes::from(canonical_chat_response("semantic replay")),
-            cached_at: std::time::SystemTime::now(),
-        });
+        let (pipeline, semantic, _) = pipeline_with_recording_caches().await;
 
         super::handle_ai_proxy(
             &mut session,
@@ -11901,16 +11753,59 @@ mod external_guardrail_context_tests {
             Some(0),
         )
         .await
-        .expect("semantic replay is handled");
+        .expect("streaming request is handled");
         drop(session);
 
         let response = live_downstream_body(client).await;
         assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
-        let body = response_json(&response);
-        assert_eq!(body["type"], "message");
-        assert_eq!(body["content"][0]["text"], "semantic replay");
-        assert!(body.get("choices").is_none(), "{body}");
-        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            semantic.calls(),
+            0,
+            "a streaming request must not pay for an embedding call"
+        );
+        let stats = semantic_stats(&pipeline, 0, None);
+        assert_eq!(stats.lookups, 0, "a streaming request must not look up");
+        assert_eq!(stats.writes, 0, "a streaming request must not be admitted");
+        assert_eq!(stats.write_errors, 0);
+    }
+
+    /// A non-streaming request does run the semantic path, which is what
+    /// makes the streaming assertions above meaningful.
+    #[tokio::test]
+    async fn buffered_request_enters_the_semantic_path_once() {
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(canonical_chat_response("fresh"), "application/json").await;
+        let config = openai_proxy_config(&upstream_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, _) = pipeline_with_recording_caches().await;
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("buffered request is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(semantic.calls(), 1);
+        // The probe never returns a vector, so the lookup fails open and the
+        // request is served from the provider uncached.
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        let stats = semantic_stats(&pipeline, 0, None);
+        assert_eq!(stats.lookups, 0);
+        assert_eq!(stats.writes, 0);
     }
 
     #[tokio::test]
@@ -11923,7 +11818,7 @@ mod external_guardrail_context_tests {
         let (mut session, client) =
             downstream_bytes_session("/v1/messages", "application/json", native_request).await;
         let mut context = crate::context::RequestContext::new();
-        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
         *idempotency.hit.lock().expect("idempotency hit lock") =
             Some(sbproxy_middleware::idempotency::CachedResponse {
                 status: 200,
@@ -11951,7 +11846,7 @@ mod external_guardrail_context_tests {
         assert_eq!(body["type"], "message");
         assert_eq!(body["content"][0]["text"], "idempotency replay");
         assert!(body.get("choices").is_none(), "{body}");
-        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(semantic.calls(), 0);
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
     }
 
@@ -11965,7 +11860,7 @@ mod external_guardrail_context_tests {
         let (mut session, client) =
             downstream_bytes_session("/v1/messages", "application/json", native_request).await;
         let mut context = crate::context::RequestContext::new();
-        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
         let cached_error = br#"{"error":{"type":"rate_limit_error","message":"try later"}}"#;
         *idempotency.hit.lock().expect("idempotency hit lock") =
             Some(sbproxy_middleware::idempotency::CachedResponse {
@@ -11995,7 +11890,7 @@ mod external_guardrail_context_tests {
             .position(|window| window == b"\r\n\r\n")
             .expect("HTTP response header terminator");
         assert_eq!(&response[header_end + 4..], cached_error);
-        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(semantic.calls(), 0);
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
     }
 
@@ -12008,7 +11903,7 @@ mod external_guardrail_context_tests {
         let config = anthropic_proxy_config(&upstream_url);
         let request = anthropic_messages_request();
         let request_bytes = serde_json::to_vec(&request).expect("request JSON");
-        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
 
         let (mut first_session, first_client) =
             downstream_bytes_session("/v1/messages", "application/json", request_bytes.clone())
@@ -12039,8 +11934,8 @@ mod external_guardrail_context_tests {
             .clone()
             .expect("error response stored");
         assert_eq!(stored.body, error);
-        let semantic_lookups_after_miss = semantic.lookups.load(Ordering::SeqCst);
-        assert_eq!(semantic_lookups_after_miss, 1);
+        let semantic_calls_after_miss = semantic.calls();
+        assert_eq!(semantic_calls_after_miss, 1);
         *idempotency.hit.lock().expect("idempotency hit lock") = Some(stored);
 
         let (mut replay_session, replay_client) =
@@ -12064,8 +11959,9 @@ mod external_guardrail_context_tests {
             .expect("replay HTTP response header terminator");
         assert_eq!(&replay_response[replay_header_end + 4..], error);
         assert_eq!(
-            semantic.lookups.load(Ordering::SeqCst),
-            semantic_lookups_after_miss
+            semantic.calls(),
+            semantic_calls_after_miss,
+            "an idempotency replay must short-circuit before the semantic path"
         );
         assert_eq!(idempotency.gets.load(Ordering::SeqCst), 2);
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
@@ -12080,7 +11976,7 @@ mod external_guardrail_context_tests {
         let mut request = anthropic_messages_request();
         request["stream"] = serde_json::Value::Bool(true);
         let request_bytes = serde_json::to_vec(&request).expect("request JSON");
-        let (pipeline, _, idempotency) = pipeline_with_recording_caches();
+        let (pipeline, _, idempotency) = pipeline_with_recording_caches().await;
 
         let (mut first_session, first_client) =
             downstream_bytes_session("/v1/messages", "application/json", request_bytes.clone())
@@ -12185,7 +12081,7 @@ mod external_guardrail_context_tests {
             .unwrap(),
             "the regression requires fields omitted by canonical translation"
         );
-        let (pipeline, _, idempotency) = pipeline_with_recording_caches();
+        let (pipeline, _, idempotency) = pipeline_with_recording_caches().await;
 
         let (mut first_session, first_client) =
             downstream_bytes_session("/v1/messages", "application/json", first_request).await;
@@ -12237,6 +12133,11 @@ mod external_guardrail_context_tests {
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
     }
 
+    /// The idempotency record holds the exact client wire bytes while the
+    /// semantic path stays on the canonical body. The canonical half is
+    /// pinned end to end by `semantic_cache_e2e`; here the observable is
+    /// that the semantic path ran exactly once and did not disturb the
+    /// idempotency record.
     #[tokio::test]
     async fn anthropic_messages_miss_keeps_semantic_canonical_and_idempotency_wire_exact() {
         let canonical_response = canonical_chat_response("fresh upstream");
@@ -12251,7 +12152,7 @@ mod external_guardrail_context_tests {
         )
         .await;
         let mut context = crate::context::RequestContext::new();
-        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
 
         super::handle_ai_proxy(
             &mut session,
@@ -12276,20 +12177,17 @@ mod external_guardrail_context_tests {
         assert_eq!(client_body["type"], "message");
         assert_eq!(client_body["content"][0]["text"], "fresh upstream");
 
-        let semantic_body = semantic
-            .stored
-            .lock()
-            .expect("semantic stored lock")
-            .clone()
-            .expect("semantic response stored")
-            .body;
+        assert_eq!(semantic.calls(), 1);
         let idempotency_response = idempotency
             .stored
             .lock()
             .expect("idempotency stored lock")
             .clone()
             .expect("idempotency response stored");
-        assert_eq!(semantic_body.as_ref(), canonical_response.as_slice());
+        assert_ne!(
+            idempotency_response.body, canonical_response,
+            "the idempotency record holds client wire bytes, not the canonical body"
+        );
         assert_eq!(idempotency_response.body, client_wire_body);
         assert!(ai_idempotency_body_is_wire(&idempotency_response.headers));
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
@@ -12303,7 +12201,7 @@ mod external_guardrail_context_tests {
         let config = anthropic_proxy_config(&upstream_url);
         let request_bytes =
             serde_json::to_vec(&anthropic_messages_request()).expect("request JSON");
-        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
 
         let (mut first_session, first_client) =
             downstream_bytes_session("/v1/messages", "application/json", request_bytes.clone())
@@ -12335,7 +12233,7 @@ mod external_guardrail_context_tests {
             .expect("native response stored");
         assert_eq!(stored.body, native_response);
         assert!(ai_idempotency_body_is_wire(&stored.headers));
-        let semantic_lookups_after_miss = semantic.lookups.load(Ordering::SeqCst);
+        let semantic_calls_after_miss = semantic.calls();
         *idempotency.hit.lock().expect("idempotency hit lock") = Some(stored.clone());
 
         let (mut replay_session, replay_client) =
@@ -12394,61 +12292,17 @@ mod external_guardrail_context_tests {
             .expect("legacy HTTP response header terminator");
         assert_eq!(&legacy_response[legacy_header_end + 4..], native_response);
         assert_eq!(
-            semantic.lookups.load(Ordering::SeqCst),
-            semantic_lookups_after_miss
+            semantic.calls(),
+            semantic_calls_after_miss,
+            "an idempotency replay must short-circuit before the semantic path"
         );
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
-    async fn external_output_guardrail_checks_semantic_hit_before_replay_headers() {
-        let (guardrail_url, received) = blocking_guardrail().await;
-        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
-        let config = proxy_config(&upstream_url, guardrail_url, "post_call");
-        let (mut session, client) = downstream_session(serde_json::json!({
-            "model": "requested-model",
-            "messages": [{"role": "user", "content": "fixture prompt"}]
-        }))
-        .await;
-        let mut context = crate::context::RequestContext::new();
-        let (pipeline, semantic, _) = pipeline_with_recording_caches();
-        *semantic.hit.lock().expect("semantic hit lock") = Some(crate::hooks::CachedResponse {
-            status: 200,
-            headers: std::collections::HashMap::from([(
-                "content-type".to_string(),
-                "application/json".to_string(),
-            )]),
-            body: bytes::Bytes::from_static(b"{\"cached\":\"provider-controlled\"}"),
-            cached_at: std::time::SystemTime::now(),
-        });
-
-        super::handle_ai_proxy(
-            &mut session,
-            &config,
-            &pipeline,
-            "ai.test",
-            &mut context,
-            Some(0),
-        )
-        .await
-        .expect("guarded semantic replay is handled");
-        drop(session);
-
-        let response =
-            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
-        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
-        assert!(!response.contains("provider-controlled"), "{response}");
-        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
-        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 1);
-        let payload = tokio::time::timeout(Duration::from_secs(1), received)
-            .await
-            .expect("guardrail request timed out")
-            .expect("guardrail fixture dropped");
-        assert_eq!(payload["phase"], "output");
-        assert!(payload["input"]
-            .as_str()
-            .is_some_and(|input| input.contains("provider-controlled")));
-    }
+    // A semantic hit is evaluated against today's output guardrails before
+    // any replay byte leaves. Seeding an entry now requires a real backend
+    // write under a derived namespace, so that contract is pinned end to
+    // end by `semantic_cache_e2e` instead of from a seeded hook here.
 
     #[tokio::test]
     async fn external_output_guardrail_checks_idempotency_hit_before_replay() {
@@ -12462,7 +12316,7 @@ mod external_guardrail_context_tests {
         let config = proxy_config(&upstream_url, guardrail_url, "post_call");
         let (mut session, client) = downstream_session(request).await;
         let mut context = crate::context::RequestContext::new();
-        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
         *idempotency.hit.lock().expect("idempotency hit lock") =
             Some(sbproxy_middleware::idempotency::CachedResponse {
                 status: 200,
@@ -12489,7 +12343,7 @@ mod external_guardrail_context_tests {
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
         assert!(!response.contains("provider-controlled"), "{response}");
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
-        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(semantic.calls(), 0);
         assert_eq!(idempotency.gets.load(Ordering::SeqCst), 1);
         let payload = tokio::time::timeout(Duration::from_secs(1), received)
             .await
@@ -12549,7 +12403,7 @@ mod external_guardrail_context_tests {
             "routing": "race"
         }))
         .expect("race proxy config");
-        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
         let (mut session, client) = downstream_session(serde_json::json!({
             "model": "requested-model",
             "messages": [{"role": "user", "content": "fixture prompt"}]
@@ -12578,7 +12432,7 @@ mod external_guardrail_context_tests {
             response.contains("native provider keys are unavailable for race routing"),
             "{response}"
         );
-        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(semantic.calls(), 0);
         assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
     }
@@ -12589,7 +12443,7 @@ mod external_guardrail_context_tests {
         let config = cascade_error_proxy_config(&upstream_url);
 
         // Idempotency hit: the early refusal must not even ask the cache.
-        let (idempotency_pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        let (idempotency_pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
         *idempotency.hit.lock().expect("idempotency hit lock") =
             Some(sbproxy_middleware::idempotency::CachedResponse {
                 status: 200,
@@ -12608,22 +12462,13 @@ mod external_guardrail_context_tests {
         )
         .await;
         assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
-        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(semantic.calls(), 0);
 
-        // Semantic hit and miss get independent passes with idempotency
-        // disabled, proving neither side of lookup runs.
-        for semantic_hit in [false, true] {
-            let (mut pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        // A pass with idempotency disabled, so nothing but the refusal can
+        // explain an untouched semantic path.
+        {
+            let (mut pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
             pipeline.idempotencies[0] = None;
-            if semantic_hit {
-                *semantic.hit.lock().expect("semantic hit lock") =
-                    Some(crate::hooks::CachedResponse {
-                        status: 200,
-                        headers: std::collections::HashMap::new(),
-                        body: bytes::Bytes::from_static(br#"{"cached":true}"#),
-                        cached_at: std::time::SystemTime::now(),
-                    });
-            }
             run_native_cascade_refusal(
                 &config,
                 &pipeline,
@@ -12633,14 +12478,16 @@ mod external_guardrail_context_tests {
                 }),
             )
             .await;
-            assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
-            assert_eq!(semantic.stores.load(Ordering::SeqCst), 0);
+            assert_eq!(semantic.calls(), 0);
+            let stats = semantic_stats(&pipeline, 0, None);
+            assert_eq!(stats.lookups, 0);
+            assert_eq!(stats.writes, 0);
             assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
         }
 
         // Streaming previously fell through to tier one; it now refuses at
         // the same pre-body seam.
-        let (stream_pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        let (stream_pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
         run_native_cascade_refusal(
             &config,
             &stream_pipeline,
@@ -12651,7 +12498,7 @@ mod external_guardrail_context_tests {
             }),
         )
         .await;
-        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(semantic.calls(), 0);
         assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
 
         // Managed-local routing must refuse before engine preparation.
@@ -12670,7 +12517,7 @@ mod external_guardrail_context_tests {
             }
         }))
         .expect("managed cascade config");
-        let (managed_pipeline, semantic, idempotency) = pipeline_with_recording_caches();
+        let (managed_pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
         run_native_cascade_refusal(
             &managed,
             &managed_pipeline,
@@ -12680,7 +12527,7 @@ mod external_guardrail_context_tests {
             }),
         )
         .await;
-        assert_eq!(semantic.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(semantic.calls(), 0);
         assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
         assert_eq!(
             upstream_hits.load(Ordering::SeqCst),
@@ -12823,7 +12670,7 @@ mod external_guardrail_context_tests {
         .await;
         let mut context = crate::context::RequestContext::new();
         let (pipeline, recording_semantic, recording_idempotency) =
-            pipeline_with_recording_caches();
+            pipeline_with_recording_caches().await;
 
         super::handle_ai_proxy(
             &mut session,
@@ -12856,9 +12703,9 @@ mod external_guardrail_context_tests {
             1,
             "buffered output guardrails run after exactly one upstream response"
         );
-        assert_eq!(recording_semantic.lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(recording_semantic.calls(), 1);
         assert_eq!(
-            recording_semantic.stores.load(Ordering::SeqCst),
+            semantic_stats(&pipeline, 0, None).writes,
             0,
             "blocked output must not be written to the semantic cache"
         );
@@ -12896,7 +12743,7 @@ mod external_guardrail_context_tests {
         .await;
         let mut context = crate::context::RequestContext::new();
         let (pipeline, recording_semantic, recording_idempotency) =
-            pipeline_with_recording_caches();
+            pipeline_with_recording_caches().await;
 
         super::handle_ai_proxy(
             &mut session,
@@ -12927,9 +12774,9 @@ mod external_guardrail_context_tests {
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
         assert_eq!(context.ai_model.as_deref(), Some("cascade-selected-model"));
         assert_eq!(context.ai_outcome.as_deref(), Some("guardrail_block"));
-        assert_eq!(recording_semantic.lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(recording_semantic.calls(), 1);
         assert_eq!(
-            recording_semantic.stores.load(Ordering::SeqCst),
+            semantic_stats(&pipeline, 0, None).writes,
             0,
             "blocked cascade output must not be written to the semantic cache"
         );

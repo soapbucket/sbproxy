@@ -28,6 +28,10 @@ sbproxy-classifier-client.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_json_canonicalizer.workspace = true
+# WOR-2099: bounded binary encoding for the distributed semantic-cache wire.
+# The same workspace declaration the mesh transport uses, so Redis, mesh, and
+# the mesh RPC frames all resolve one copy.
+postcard.workspace = true
 # WOR-1686: JsonSchema on ProviderConfig so a committed schema covers
 # the serve: block (editor autocomplete). ModelHostConfig already
 # derives it; this pulls the provider surface in.

@@ -153,7 +153,7 @@ jobs:
           unset tls_probe_output
           cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
             --run-ignored only -j1 \
-            -E 'binary(redis_secure) + test(compression_store::redis::tests::live_redis_) + test(storage::async_redis::tests::redis_connection_recovers_after_server_restart)'
+            -E 'binary(redis_secure) + test(compression_store::redis::tests::live_redis_) + test(storage::async_redis::tests::redis_connection_recovers_after_server_restart) + test(semantic_cache_runtime::redis::tests::live_redis_semantic_)'
 
       # nextest does not execute doctests, so they need their own pass.
       - name: doctests

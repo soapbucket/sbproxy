@@ -28,7 +28,7 @@ prometheus = { workspace = true }
 # Compact serde binary format for the internal mesh wire (RPC frames + gossip).
 # Maintained, unlike bincode (RUSTSEC-2025-0141). No on-disk persistence in this
 # format, so the encoding can change with a coordinated mesh-protocol bump.
-postcard = { version = "1", features = ["use-std"] }
+postcard = { workspace = true }
 # Async Redis client for the backend/redis.rs persistence + federation paths.
 redis = { workspace = true }
 # Durable replica shard for the replicated state substrate (WOR-1947). Same

@@ -1585,12 +1585,15 @@ fn start_cluster_metrics(handle: &ClusterHandle) {
 /// The generation is a monotonic tick rather than a timestamp, because cluster
 /// state fences on generation and a clock that moves backwards would make a
 /// republish look stale.
+///
+/// The counter itself lives in `key_capability` as one process-wide atomic, so
+/// this loop and an immediate preflight publication share it. Two publishers
+/// with two private counters could otherwise write different payloads at the
+/// same generation, which cluster state rejects as a conflict.
 async fn run_capability_announcer() {
     let period = crate::key_capability::CAPABILITY_TTL / 2;
-    let mut generation: u64 = 0;
     loop {
-        generation = generation.saturating_add(1);
-        crate::key_capability::announce_local_capabilities(generation).await;
+        crate::key_capability::announce_local_capabilities().await;
         tokio::time::sleep(period).await;
     }
 }
