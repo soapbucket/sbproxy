@@ -96,12 +96,45 @@ impl PolicyEnforcer for AiCrawlEnforcer {
             }
         }
 
+        // WOR-2143: when durable settlement is active for this pinned
+        // pipeline generation, the legacy path must never see the payment
+        // credential. The old ledger's verify consumes the nonce, so a
+        // settlement retry it happened to read would burn a quote the
+        // settlement store still needs to resume an interrupted payment.
+        // The gate at the `check_policies` call site owns redemption; here
+        // the credential header is stripped from a cloned view and the
+        // policy is stashed for the gate. One wasted legacy quote issuance
+        // per 402 is the accepted cost. Cloudflare interop mode keeps the
+        // legacy ledger contract and is exempt.
+        #[cfg(feature = "payments")]
+        let stripped_headers: Option<http::HeaderMap> = {
+            let settlement_active = ctx
+                .pipeline
+                .payments
+                .as_ref()
+                .is_some_and(|runtime| runtime.gate().is_some())
+                && !policy.cloudflare_compat();
+            if settlement_active {
+                ctx.crawl_settlement_policy = Some(Arc::clone(&policy));
+                let mut cloned = req.headers().clone();
+                // `remove` drops one value per call; loop so a repeated
+                // credential header cannot leave a copy behind.
+                while cloned.remove(policy.header_name()).is_some() {}
+                Some(cloned)
+            } else {
+                None
+            }
+        };
+        #[cfg(not(feature = "payments"))]
+        let stripped_headers: Option<http::HeaderMap> = None;
+        let effective_headers = stripped_headers.as_ref().unwrap_or_else(|| req.headers());
+
         let hostname = ctx.hostname.to_string();
         let decision = policy.check_with_pricing_exemption(
             method,
             &hostname,
             path,
-            req.headers(),
+            effective_headers,
             agent_id_param,
             verified_cap_pricing_exemption(&ctx.principal),
         );
