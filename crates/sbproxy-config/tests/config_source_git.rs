@@ -39,6 +39,21 @@ const REPO_CONFIG_V2: &str = "proxy:\n  http_bind_port: 9090\norigins:\n  \
                               \"edge.example.com\":\n    action:\n      type: proxy\n      \
                               url: https://test.sbproxy.dev\n";
 
+/// Assert that a `SB_TEST_UNSET_*` variable really is unset.
+///
+/// These names are reserved-unset: nothing in this workspace ever
+/// exports them, and the tests below rely on them resolving to
+/// nothing. Asserting is a read, so it cannot race a parallel test's
+/// `getenv` the way the `remove_var` it replaces could (WOR-646); a
+/// failure here means a shell or another process exported a reserved
+/// name, which deserves a loud message rather than a silent scrub.
+fn assert_env_unset(name: &str) {
+    assert!(
+        std::env::var_os(name).is_none(),
+        "{name} is reserved-unset for this suite; unset it in the invoking shell"
+    );
+}
+
 /// Whether `git` can be run here at all.
 fn git_available() -> bool {
     Command::new("git")
@@ -556,7 +571,7 @@ fn an_unresolved_node_local_reference_in_a_git_document_is_a_hard_error() {
         "source:\n  kind: git\n  repo: {}\n  revision: main\n  path: sb.yml\n",
         fixture.url()
     );
-    std::env::remove_var("SB_TEST_UNSET_NODE_ID");
+    assert_env_unset("SB_TEST_UNSET_NODE_ID");
 
     // `err().expect()` rather than `expect_err`: the latter needs Debug on the
     // Ok type and CompiledConfig does not implement it. Every other expect_err
@@ -585,7 +600,7 @@ fn an_unresolved_reference_outside_the_node_local_paths_still_only_warns() {
         "source:\n  kind: git\n  repo: {}\n  revision: main\n  path: sb.yml\n",
         fixture.url()
     );
-    std::env::remove_var("SB_TEST_UNSET_NOTE");
+    assert_env_unset("SB_TEST_UNSET_NOTE");
     sbproxy_config::compile_config_from_source_blocking(&pointer, &FetchContext::with_git_binary())
         .expect("a non-node-local unresolved reference still only warns");
 }
@@ -597,7 +612,7 @@ fn a_local_document_is_not_subject_to_the_node_local_hard_failure() {
     // is watching the log and tightening it would break existing
     // configs. The document may still be refused for other reasons; what
     // must not happen is a refusal from this check.
-    std::env::remove_var("SB_TEST_UNSET_NODE_ID");
+    assert_env_unset("SB_TEST_UNSET_NODE_ID");
     let result = sbproxy_config::compile_config_from_source_blocking(
         SHARED_FLEET_CONFIG,
         &FetchContext::with_git_binary(),

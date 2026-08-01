@@ -1611,7 +1611,10 @@ mod tests {
     fn env_credential_spelling_resolves_through_the_environment() {
         // Deliberately not `${VAR}`: the documented config spelling is
         // `env:NAME`, and it has to reach the same place.
-        std::env::set_var("SB_TEST_CONFIG_AUTHORITY_TOKEN", "token-value");
+        let env = crate::test_env::EnvVarGuard::set(&[(
+            "SB_TEST_CONFIG_AUTHORITY_TOKEN",
+            Some("token-value"),
+        )]);
         assert_eq!(
             resolve_credential("env:SB_TEST_CONFIG_AUTHORITY_TOKEN").expect("resolves"),
             "token-value",
@@ -1620,7 +1623,9 @@ mod tests {
             resolve_credential("${SB_TEST_CONFIG_AUTHORITY_TOKEN}").expect("resolves"),
             "token-value",
         );
-        std::env::remove_var("SB_TEST_CONFIG_AUTHORITY_TOKEN");
+        // Dropping the guard restores the variable to its previous
+        // (unset) state, so the miss branch is exercised too.
+        drop(env);
         assert!(resolve_credential("env:SB_TEST_CONFIG_AUTHORITY_TOKEN").is_err());
     }
 

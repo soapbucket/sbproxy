@@ -3855,8 +3855,13 @@ mod tests {
 
     #[tokio::test]
     async fn durable_spawn_resolves_path_and_keeps_the_typed_environment_boundary() {
+        // Lock first, then mutate: the guard restores the sentinel on
+        // drop (before the lock releases), panic included (WOR-646).
         let _guard = ENV_LOCK.lock().await;
-        std::env::set_var("SBPROXY_ENGINE_SECRET_SENTINEL", "must-not-leak");
+        let _env = crate::test_env::EnvVarGuard::set(&[(
+            "SBPROXY_ENGINE_SECRET_SENTINEL",
+            Some("must-not-leak"),
+        )]);
         let directory = tempfile::tempdir().unwrap();
         let store = ProcessOwnershipStore::at(directory.path().join("ownership"));
         let process = TokioCommandExecutor::spawn_with_store(
@@ -3875,7 +3880,6 @@ mod tests {
         )
         .await
         .expect("spawn through typed PATH");
-        std::env::remove_var("SBPROXY_ENGINE_SECRET_SENTINEL");
 
         tokio::time::timeout(Duration::from_secs(2), async {
             while !process.has_exited().await.unwrap() {
@@ -3890,8 +3894,13 @@ mod tests {
 
     #[tokio::test]
     async fn compatibility_process_receives_only_baseline_and_typed_environment() {
+        // Lock first, then mutate: the guard restores the sentinel on
+        // drop (before the lock releases), panic included (WOR-646).
         let _guard = ENV_LOCK.lock().await;
-        std::env::set_var("SBPROXY_ENGINE_SECRET_SENTINEL", "must-not-leak");
+        let _env = crate::test_env::EnvVarGuard::set(&[(
+            "SBPROXY_ENGINE_SECRET_SENTINEL",
+            Some("must-not-leak"),
+        )]);
         let output = TokioCommandExecutor
             .output(
                 Path::new("/usr/bin/env"),
@@ -3902,7 +3911,6 @@ mod tests {
             )
             .await
             .unwrap();
-        std::env::remove_var("SBPROXY_ENGINE_SECRET_SENTINEL");
 
         assert!(output.stdout.contains("SBPROXY_TYPED_VISIBLE=yes"));
         assert!(!output.stdout.contains("SBPROXY_ENGINE_SECRET_SENTINEL"));

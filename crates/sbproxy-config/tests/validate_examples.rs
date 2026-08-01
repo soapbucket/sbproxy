@@ -112,7 +112,21 @@ fn collect_yml_files(root: &Path) -> Vec<PathBuf> {
 /// interpolate. compile_config leaves an unset `${VAR}` literal (and
 /// hard-errors for admin credentials, WOR-1818), so the sweep exports
 /// placeholders the way a user following each README would.
+///
+/// The mutation runs exactly once per test binary, inside a `OnceLock`
+/// initializer, and every test calls this before its first environment
+/// read; concurrent callers block until the environment is fully
+/// populated, so a `set_var` can never race a parallel test's `getenv`
+/// (WOR-646). The values stay exported for the life of the process:
+/// they are this binary's fixture and every test reads them, so there
+/// is nothing to restore. This is the only place this binary mutates
+/// the environment.
 fn export_example_env_dummies() {
+    static EXPORTED: OnceLock<()> = OnceLock::new();
+    EXPORTED.get_or_init(export_example_env_dummies_once);
+}
+
+fn export_example_env_dummies_once() {
     const DUMMIES: &[(&str, &str)] = &[
         ("OPENAI_API_KEY", "sk-test-dummy-openai"),
         ("ANTHROPIC_API_KEY", "sk-ant-test-dummy"),
@@ -145,6 +159,10 @@ fn export_example_env_dummies() {
         ("ENV_VAR", "dummy"),
         ("VAR", "dummy"),
         ("REDIS_PASSWORD", "redis-example-dummy"),
+        // The config-authority subscriber example names its credential
+        // as a reference rather than an inline token, the way the
+        // README tells a reader to.
+        ("SB_CONFIG_AUTHORITY_TOKEN", "sbca1.example.dummy-token"),
     ];
     for (k, v) in DUMMIES {
         std::env::set_var(k, v);
@@ -207,10 +225,9 @@ fn every_oss_example_compiles() {
 /// something the authority would refuse.
 #[test]
 fn the_config_authority_example_compiles_on_both_sides_of_the_wire() {
+    // The subscriber's credential (`SB_CONFIG_AUTHORITY_TOKEN`) is
+    // part of the one-shot dummy export.
     export_example_env_dummies();
-    // The subscriber's credential is a reference rather than an inline
-    // token, so the sweep exports it the way the README does.
-    std::env::set_var("SB_CONFIG_AUTHORITY_TOKEN", "sbca1.example.dummy-token");
     let example = examples_root().join("config-authority");
     for name in ["sb.yml", "subscriber.yml", "bundle.yml"] {
         let file = example.join(name);

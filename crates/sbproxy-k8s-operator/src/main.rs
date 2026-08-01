@@ -1033,26 +1033,22 @@ enum HotReloadError {
 }
 
 #[cfg(test)]
+mod test_env;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::EnvVarGuard;
     use clap::Parser;
-
-    /// Serializes the tests that mutate the process-global
-    /// `SBPROXY_SHUTDOWN_GRACE_MS` env var. cargo runs tests in
-    /// parallel, so without this lock one test's `set_var`/`remove_var`
-    /// races another's read and the assertions flake.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Helper that strips the env-var bridge so `RUST_LOG` from the host
     /// shell does not leak into the parsed `Cli` and surprise the asserts.
     fn parse_cli(args: &[&str]) -> Cli {
-        // SAFETY: tests are single-threaded under default cargo test layout
-        // and the env vars are restored before the next test runs because we
-        // explicitly remove them.
-        // We cannot rely on the host env: clap reads `RUST_LOG`,
-        // `SBPROXY_NAMESPACE`. Wipe both for each parse.
-        std::env::remove_var("RUST_LOG");
-        std::env::remove_var("SBPROXY_NAMESPACE");
+        // We cannot rely on the host env: clap reads `RUST_LOG` and
+        // `SBPROXY_NAMESPACE`. Parse with both cleared; the guard
+        // serializes the mutation against the other env tests in this
+        // binary and restores the host values on return (WOR-646).
+        let _env = EnvVarGuard::set(&[("RUST_LOG", None), ("SBPROXY_NAMESPACE", None)]);
         Cli::try_parse_from(args).expect("parse Cli")
     }
 
@@ -1108,10 +1104,8 @@ mod tests {
     /// a non-negative integer.
     #[test]
     fn shutdown_grace_env_overrides_default() {
-        let _env = ENV_LOCK.lock().unwrap();
-        std::env::set_var("SBPROXY_SHUTDOWN_GRACE_MS", "12345");
+        let _env = EnvVarGuard::set(&[("SBPROXY_SHUTDOWN_GRACE_MS", Some("12345"))]);
         let got = resolve_shutdown_grace_ms();
-        std::env::remove_var("SBPROXY_SHUTDOWN_GRACE_MS");
         assert_eq!(got, 12_345);
     }
 
@@ -1120,10 +1114,8 @@ mod tests {
     /// drains in the documented 30s window.
     #[test]
     fn shutdown_grace_malformed_env_falls_back_to_default() {
-        let _env = ENV_LOCK.lock().unwrap();
-        std::env::set_var("SBPROXY_SHUTDOWN_GRACE_MS", "thirty-seconds");
+        let _env = EnvVarGuard::set(&[("SBPROXY_SHUTDOWN_GRACE_MS", Some("thirty-seconds"))]);
         let got = resolve_shutdown_grace_ms();
-        std::env::remove_var("SBPROXY_SHUTDOWN_GRACE_MS");
         assert_eq!(got, DEFAULT_SHUTDOWN_GRACE_MS);
     }
 
@@ -1131,8 +1123,7 @@ mod tests {
     /// documented default.
     #[test]
     fn shutdown_grace_unset_env_returns_default() {
-        let _env = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SBPROXY_SHUTDOWN_GRACE_MS");
+        let _env = EnvVarGuard::set(&[("SBPROXY_SHUTDOWN_GRACE_MS", None)]);
         assert_eq!(resolve_shutdown_grace_ms(), DEFAULT_SHUTDOWN_GRACE_MS);
     }
 }

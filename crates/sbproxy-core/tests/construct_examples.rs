@@ -113,6 +113,21 @@ fn collect_yml_files(root: &Path) -> Vec<PathBuf> {
 /// Constructor checks fail loud on unresolved credential references
 /// (WOR-1818), so the sweep provides placeholders.
 fn export_example_env_dummies() {
+    static EXPORTED: OnceLock<()> = OnceLock::new();
+    EXPORTED.get_or_init(export_example_env_dummies_once);
+}
+
+/// One-shot body of [`export_example_env_dummies`].
+///
+/// The mutation runs exactly once per test binary, inside a `OnceLock`
+/// initializer, and every test calls the wrapper before its first
+/// environment read; concurrent callers block until the environment is
+/// fully populated, so a `set_var` can never race a parallel test's
+/// `getenv` (WOR-646). The values stay exported for the life of the
+/// process: they are this binary's fixture and every test reads them,
+/// so there is nothing to restore. This is the only place this binary
+/// mutates the environment.
+fn export_example_env_dummies_once() {
     const DUMMIES: &[(&str, &str)] = &[
         ("OPENAI_API_KEY", "sk-test-dummy-openai"),
         ("ANTHROPIC_API_KEY", "sk-ant-test-dummy"),

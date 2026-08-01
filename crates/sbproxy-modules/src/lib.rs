@@ -14,6 +14,8 @@ pub mod compile;
 pub mod olp;
 pub mod policy;
 pub mod projections;
+#[cfg(test)]
+mod test_env;
 pub mod transform;
 
 pub use action::{

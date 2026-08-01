@@ -75,6 +75,8 @@ pub mod scheduling;
 pub mod sglang_driver;
 pub mod supervisor;
 pub mod supply_chain;
+#[cfg(test)]
+mod test_env;
 #[cfg(feature = "tokenizer")]
 pub mod tokenize;
 pub mod uv_release;

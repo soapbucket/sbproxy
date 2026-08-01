@@ -1067,13 +1067,16 @@ async fn the_real_subscriber_applies_what_the_real_authority_publishes() {
     std::fs::write(&config_path, &local).expect("write the local document");
 
     // The credential is a secret reference, not an inline literal, because
-    // that is the only shape the schema accepts.
-    std::env::set_var("SB_TEST_WIRE_CONFIG_AUTHORITY_TOKEN", &credential);
+    // that is the only shape the schema accepts. A `file:` reference keeps
+    // this test from mutating the process environment (WOR-646); the
+    // `env:` spelling has its own unit coverage in config_subscriber.rs.
+    let credential_path = dir.join("authority-credential");
+    std::fs::write(&credential_path, &credential).expect("write the credential file");
     let upstream = ConfigAuthorityUpstreamConfig {
         url: format!("http://{addr}"),
         mode: BundleMode::Overlay,
         subscriber_id: "edge-01".to_string(),
-        credential: Some("env:SB_TEST_WIRE_CONFIG_AUTHORITY_TOKEN".to_string()),
+        credential: Some(format!("file:{}", credential_path.display())),
         verifying_keys_file: keys_file.display().to_string(),
         poll_interval_secs: 5,
         cache_path: dir.join("config-bundle.json").display().to_string(),
@@ -1181,8 +1184,6 @@ async fn the_real_subscriber_applies_what_the_real_authority_publishes() {
         second.revision,
         "the cursor must not move on a refused fetch",
     );
-
-    std::env::remove_var("SB_TEST_WIRE_CONFIG_AUTHORITY_TOKEN");
 }
 
 // --- the admin surface ------------------------------------------------

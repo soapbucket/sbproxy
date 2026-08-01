@@ -38,6 +38,8 @@ pub mod raw;
 pub mod schema;
 pub mod snapshot;
 pub mod source;
+#[cfg(test)]
+mod test_env;
 pub mod types;
 pub mod validate;
 

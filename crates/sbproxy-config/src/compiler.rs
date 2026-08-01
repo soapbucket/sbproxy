@@ -2985,8 +2985,10 @@ flags:
     // WOR-1818: `${VAR:-default}` resolves with shell semantics.
     #[test]
     fn env_interpolation_supports_shell_defaults() {
-        std::env::remove_var("SBPROXY_TEST_UNSET_XYZ");
-        std::env::set_var("SBPROXY_TEST_SET_XYZ", "live");
+        let _env = crate::test_env::EnvVarGuard::set(&[
+            ("SBPROXY_TEST_UNSET_XYZ", None),
+            ("SBPROXY_TEST_SET_XYZ", Some("live")),
+        ]);
         assert_eq!(
             interpolate_env_vars("a ${SBPROXY_TEST_UNSET_XYZ:-fallback} b"),
             "a fallback b"
@@ -4361,7 +4363,10 @@ origins:
     #[test]
     fn compile_config_with_env_variables() {
         // Set a test environment variable.
-        std::env::set_var("TEST_ENV_VALUE_COMPILE", "from-env-42");
+        let _env = crate::test_env::EnvVarGuard::set(&[(
+            "TEST_ENV_VALUE_COMPILE",
+            Some("from-env-42"),
+        )]);
         let yaml = r#"
 origins:
   "envvar.test":
@@ -4385,7 +4390,6 @@ origins:
         );
         let headers = origin.request_modifiers[0].headers.as_ref().unwrap();
         assert_eq!(headers.set.get("X-Env-Test").unwrap(), "from-env-42");
-        std::env::remove_var("TEST_ENV_VALUE_COMPILE");
     }
 
     #[test]
@@ -4856,12 +4860,11 @@ origins:
 
     #[test]
     fn interpolate_env_in_json_string() {
-        std::env::set_var("SBPROXY_TEST_HOST", "env-backend");
+        let _env = crate::test_env::EnvVarGuard::set(&[("SBPROXY_TEST_HOST", Some("env-backend"))]);
         let vars: HashMap<String, serde_json::Value> = HashMap::new();
         let mut val = serde_json::json!("http://{{env.SBPROXY_TEST_HOST}}:8080");
         interpolate_config_vars(&mut val, &vars);
         assert_eq!(val.as_str().unwrap(), "http://env-backend:8080");
-        std::env::remove_var("SBPROXY_TEST_HOST");
     }
 
     #[test]
@@ -4894,7 +4897,7 @@ origins:
 
     #[test]
     fn interpolate_mixed_vars_and_env() {
-        std::env::set_var("SBPROXY_MIX_PORT", "9090");
+        let _env = crate::test_env::EnvVarGuard::set(&[("SBPROXY_MIX_PORT", Some("9090"))]);
         let vars: HashMap<String, serde_json::Value> =
             [("host".to_string(), serde_json::json!("api.local"))]
                 .into_iter()
@@ -4902,7 +4905,6 @@ origins:
         let mut val = serde_json::json!("http://{{vars.host}}:{{env.SBPROXY_MIX_PORT}}/api");
         interpolate_config_vars(&mut val, &vars);
         assert_eq!(val.as_str().unwrap(), "http://api.local:9090/api");
-        std::env::remove_var("SBPROXY_MIX_PORT");
     }
 
     #[test]

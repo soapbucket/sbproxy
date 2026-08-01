@@ -19,6 +19,8 @@ pub mod signatures;
 /// egress). Companion to [`signatures`], which implements the inbound
 /// verification half.
 pub mod signatures_egress;
+#[cfg(test)]
+mod test_env;
 /// Web Bot Auth hosted key directory: publish SBproxy's own Ed25519
 /// public keys as an HTTP Message Signatures directory (WOR-805).
 pub mod web_bot_auth;

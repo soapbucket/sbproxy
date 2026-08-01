@@ -9412,9 +9412,12 @@ fn handle_apply_from_plan_file(
 }
 
 #[cfg(test)]
+mod test_env;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use crate::test_env::EnvVarGuard;
 
     fn pull_catalog() -> sbproxy_model_host::Catalog {
         sbproxy_model_host::Catalog::from_yaml(
@@ -10259,7 +10262,6 @@ mod tests {
 
     #[test]
     fn service_uninstall_uses_the_service_env_ownership_directory() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let paths = service_temp_paths("ownership-env");
         let service_directory = paths.env_file.parent().unwrap().join("from-service-env");
         std::fs::write(
@@ -10270,14 +10272,15 @@ mod tests {
             ),
         )
         .unwrap();
-        std::env::set_var(
+        let caller_shell = paths.env_file.parent().unwrap().join("from-caller-shell");
+        let caller_shell = caller_shell.display().to_string();
+        let _env = EnvVarGuard::set(&[(
             "SBPROXY_ENGINE_OWNERSHIP_DIR",
-            paths.env_file.parent().unwrap().join("from-caller-shell"),
-        );
+            Some(caller_shell.as_str()),
+        )]);
 
         let selected = service_engine_ownership_directory(&paths).unwrap();
 
-        std::env::remove_var("SBPROXY_ENGINE_OWNERSHIP_DIR");
         assert_eq!(selected, service_directory);
         let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
     }
@@ -11255,10 +11258,6 @@ mod tests {
         assert_eq!(parse_open_files_soft_limit(""), None);
     }
 
-    // env::set_var / env::remove_var aren't safe to interleave across
-    // threads. Serialize the env-var tests through this lock.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     /// Parse `argv` with clap and return the resulting `Cli`. Each
     /// test owns its argv slice so clap's `try_get_matches_from` does
     /// not consume the process's real `std::env::args`.
@@ -11280,33 +11279,27 @@ mod tests {
 
     #[test]
     fn log_filter_cli_wins_over_env() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("RUST_LOG", "trace");
+        let _env = EnvVarGuard::set(&[("RUST_LOG", Some("trace"))]);
         let got = resolve_log_filter(&globals_with_log(Some("debug"), None));
-        env::remove_var("RUST_LOG");
         assert_eq!(got, "debug");
     }
 
     #[test]
     fn log_filter_falls_through_to_rust_log() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("RUST_LOG", "sbproxy=trace");
+        let _env = EnvVarGuard::set(&[("RUST_LOG", Some("sbproxy=trace"))]);
         let got = resolve_log_filter(&globals_with_log(None, None));
-        env::remove_var("RUST_LOG");
         assert_eq!(got, "sbproxy=trace");
     }
 
     #[test]
     fn log_filter_default_info() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::remove_var("RUST_LOG");
+        let _env = EnvVarGuard::set(&[("RUST_LOG", None)]);
         assert_eq!(resolve_log_filter(&globals_with_log(None, None)), "info");
     }
 
     #[test]
     fn request_log_level_cli_appends_access_log_target() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::remove_var("RUST_LOG");
+        let _env = EnvVarGuard::set(&[("RUST_LOG", None)]);
         let got = resolve_log_filter(&globals_with_log(Some("warn"), Some("debug")));
         assert_eq!(got, "warn,access_log=debug");
     }
@@ -11317,8 +11310,7 @@ mod tests {
         // absent. Drive that path by populating `GlobalArgs` the way
         // clap would: with the env value already folded into the
         // `request_log_level` field.
-        let _g = ENV_LOCK.lock().unwrap();
-        env::remove_var("RUST_LOG");
+        let _env = EnvVarGuard::set(&[("RUST_LOG", None)]);
         let got = resolve_log_filter(&globals_with_log(None, Some("trace")));
         assert_eq!(got, "info,access_log=trace");
     }
@@ -11327,46 +11319,36 @@ mod tests {
 
     #[test]
     fn clap_cli_log_level_wins_over_sb_log_level() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("SB_LOG_LEVEL", "warn");
+        let _env = EnvVarGuard::set(&[("SB_LOG_LEVEL", Some("warn"))]);
         let cli = parse(&["sbproxy", "--log-level", "debug", "/tmp/sb.yml"]);
-        env::remove_var("SB_LOG_LEVEL");
         assert_eq!(cli.globals.log_level.as_deref(), Some("debug"));
     }
 
     #[test]
     fn clap_sb_log_level_env_fills_the_gap() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("SB_LOG_LEVEL", "warn");
+        let _env = EnvVarGuard::set(&[("SB_LOG_LEVEL", Some("warn"))]);
         let cli = parse(&["sbproxy", "/tmp/sb.yml"]);
-        env::remove_var("SB_LOG_LEVEL");
         assert_eq!(cli.globals.log_level.as_deref(), Some("warn"));
     }
 
     #[test]
     fn clap_shutdown_grace_cli_wins_over_env() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("SBPROXY_SHUTDOWN_GRACE_MS", "5000");
+        let _env = EnvVarGuard::set(&[("SBPROXY_SHUTDOWN_GRACE_MS", Some("5000"))]);
         let cli = parse(&["sbproxy", "--shutdown-grace-ms", "12000", "/tmp/sb.yml"]);
-        env::remove_var("SBPROXY_SHUTDOWN_GRACE_MS");
         assert_eq!(cli.globals.shutdown_grace_ms, Some(12_000));
     }
 
     #[test]
     fn clap_shutdown_grace_env_only() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("SBPROXY_SHUTDOWN_GRACE_MS", "45000");
+        let _env = EnvVarGuard::set(&[("SBPROXY_SHUTDOWN_GRACE_MS", Some("45000"))]);
         let cli = parse(&["sbproxy", "/tmp/sb.yml"]);
-        env::remove_var("SBPROXY_SHUTDOWN_GRACE_MS");
         assert_eq!(cli.globals.shutdown_grace_ms, Some(45_000));
     }
 
     #[test]
     fn clap_grace_time_cli_wins_over_env() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("SB_GRACE_TIME", "30");
+        let _env = EnvVarGuard::set(&[("SB_GRACE_TIME", Some("30"))]);
         let cli = parse(&["sbproxy", "--grace-time", "5", "/tmp/sb.yml"]);
-        env::remove_var("SB_GRACE_TIME");
         assert_eq!(cli.globals.grace_time, Some(5));
     }
 
@@ -12074,17 +12056,14 @@ mod tests {
 
     #[test]
     fn log_format_env_fallback_works() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("SB_LOG_FORMAT", "json");
+        let _env = EnvVarGuard::set(&[("SB_LOG_FORMAT", Some("json"))]);
         let cli = Cli::try_parse_from(["sbproxy", "cfg.yml"]).expect("env fallback should parse");
         assert_eq!(cli.globals.log_format, Some(LogFormat::Json));
-        env::remove_var("SB_LOG_FORMAT");
     }
 
     #[test]
     fn log_format_unset_yields_compact_default() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::remove_var("SB_LOG_FORMAT");
+        let _env = EnvVarGuard::set(&[("SB_LOG_FORMAT", None)]);
         let cli = Cli::try_parse_from(["sbproxy", "cfg.yml"]).expect("parse should succeed");
         assert_eq!(cli.globals.log_format, None);
         // The defaulting happens at init_tracing's call site; verify the
@@ -12194,22 +12173,20 @@ mod tests {
 
     #[test]
     fn env_disable_sb_flags_accepts_truthy_values() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let env = EnvVarGuard::set(&[("SB_DISABLE_SB_FLAGS", None)]);
         for v in ["1", "true", "TRUE", "yes", "on", "YES", " On "] {
-            env::set_var("SB_DISABLE_SB_FLAGS", v);
+            env.update("SB_DISABLE_SB_FLAGS", v);
             assert!(env_disable_sb_flags(), "expected truthy for {v}");
         }
-        env::remove_var("SB_DISABLE_SB_FLAGS");
     }
 
     #[test]
     fn env_disable_sb_flags_rejects_other_values() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let env = EnvVarGuard::set(&[("SB_DISABLE_SB_FLAGS", None)]);
         for v in ["0", "false", "no", "off", ""] {
-            env::set_var("SB_DISABLE_SB_FLAGS", v);
+            env.update("SB_DISABLE_SB_FLAGS", v);
             assert!(!env_disable_sb_flags(), "expected falsy for '{v}'");
         }
-        env::remove_var("SB_DISABLE_SB_FLAGS");
     }
 
     // --- validate handler (regression coverage from the legacy parser tests) ---

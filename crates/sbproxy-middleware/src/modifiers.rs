@@ -477,7 +477,8 @@ mod tests {
 
     #[test]
     fn test_template_resolve_env_vars() {
-        std::env::set_var("SBPROXY_TEST_TMPL_VAR", "from-env");
+        let _env =
+            crate::test_env::EnvVarGuard::set(&[("SBPROXY_TEST_TMPL_VAR", Some("from-env"))]);
         let mut tmpl = TemplateContext::new();
         tmpl.allowed_env_vars
             .push("SBPROXY_TEST_TMPL_VAR".to_string());
@@ -485,7 +486,6 @@ mod tests {
             tmpl.resolve("Value: {{env.SBPROXY_TEST_TMPL_VAR}}"),
             "Value: from-env"
         );
-        std::env::remove_var("SBPROXY_TEST_TMPL_VAR");
     }
 
     #[test]
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn test_template_with_modifiers() {
-        std::env::set_var("SBPROXY_HDR_TEST", "env-value");
+        let _env = crate::test_env::EnvVarGuard::set(&[("SBPROXY_HDR_TEST", Some("env-value"))]);
         let mut tmpl = TemplateContext::new();
         tmpl.values
             .insert("vars.app".to_string(), "test-app".to_string());
@@ -534,7 +534,6 @@ mod tests {
 
         assert_eq!(headers.get("x-app").unwrap(), "test-app");
         assert_eq!(headers.get("x-env").unwrap(), "env-value");
-        std::env::remove_var("SBPROXY_HDR_TEST");
     }
 
     // --- H4 regression: env-var template injection (OPENSOURCE.md) ---
@@ -543,11 +542,10 @@ mod tests {
     fn test_template_env_blocked_by_default_allowlist_empty() {
         // Regression for OPENSOURCE.md H4. With the default empty
         // allowlist, even a real env var must NOT be resolved.
-        std::env::set_var("SBPROXY_H4_TEST_PUBLIC", "leaked");
+        let _env = crate::test_env::EnvVarGuard::set(&[("SBPROXY_H4_TEST_PUBLIC", Some("leaked"))]);
         let tmpl = TemplateContext::new();
         let out = tmpl.resolve("X={{env.SBPROXY_H4_TEST_PUBLIC}};");
         assert_eq!(out, "X=;");
-        std::env::remove_var("SBPROXY_H4_TEST_PUBLIC");
     }
 
     #[test]
@@ -555,8 +553,13 @@ mod tests {
         // Canonical "would have been a CVE" case from OPENSOURCE.md
         // H4: a tenant injects {{env.AWS_SECRET_ACCESS_KEY}} into a
         // header and ships it to an upstream they control. With no
-        // allowlist entry the template must expand to empty.
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "AKIA-pretend-secret");
+        // allowlist entry the template must expand to empty. The guard
+        // restores a developer's real AWS_SECRET_ACCESS_KEY afterwards
+        // instead of deleting it, panic included.
+        let _env = crate::test_env::EnvVarGuard::set(&[(
+            "AWS_SECRET_ACCESS_KEY",
+            Some("AKIA-pretend-secret"),
+        )]);
         let tmpl = TemplateContext::new();
         let out = tmpl.resolve("auth={{env.AWS_SECRET_ACCESS_KEY}}");
         assert_eq!(out, "auth=");
@@ -569,19 +572,18 @@ mod tests {
             .push("AWS_SECRET_ACCESS_KEY".to_string());
         let out = allowed.resolve("auth={{env.AWS_SECRET_ACCESS_KEY}}");
         assert_eq!(out, "auth=AKIA-pretend-secret");
-        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
     }
 
     #[test]
     fn test_template_env_partial_allowlist() {
         // Only the explicitly-named var is resolvable.
-        std::env::set_var("SBPROXY_H4_ALLOWED", "ok");
-        std::env::set_var("SBPROXY_H4_DENIED", "secret");
+        let _env = crate::test_env::EnvVarGuard::set(&[
+            ("SBPROXY_H4_ALLOWED", Some("ok")),
+            ("SBPROXY_H4_DENIED", Some("secret")),
+        ]);
         let mut tmpl = TemplateContext::new();
         tmpl.allowed_env_vars.push("SBPROXY_H4_ALLOWED".to_string());
         let out = tmpl.resolve("a={{env.SBPROXY_H4_ALLOWED}};b={{env.SBPROXY_H4_DENIED}}");
         assert_eq!(out, "a=ok;b=");
-        std::env::remove_var("SBPROXY_H4_ALLOWED");
-        std::env::remove_var("SBPROXY_H4_DENIED");
     }
 }

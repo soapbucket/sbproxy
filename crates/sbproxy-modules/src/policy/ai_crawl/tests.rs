@@ -604,7 +604,7 @@ fn ledger_yaml_block_rejects_plain_http() {
 #[cfg(feature = "http-ledger")]
 #[test]
 fn ledger_yaml_block_resolves_secret_ref_env() {
-    std::env::set_var("SBPROXY_TEST_LEDGER_HMAC", "deadbeef");
+    let _env = crate::test_env::EnvVarGuard::set(&[("SBPROXY_TEST_LEDGER_HMAC", Some("deadbeef"))]);
     let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
         "price": 0.001,
         "ledger": {
@@ -616,7 +616,6 @@ fn ledger_yaml_block_resolves_secret_ref_env() {
     .expect("policy compiles with secret_ref.env");
     let dbg = format!("{:?}", policy);
     assert!(dbg.contains("ledger.internal"), "{dbg}");
-    std::env::remove_var("SBPROXY_TEST_LEDGER_HMAC");
 }
 
 #[cfg(feature = "http-ledger")]
@@ -1000,10 +999,10 @@ fn jwks_endpoint_publishes_active_kid() {
 
 #[test]
 fn quote_token_yaml_resolves_secret_ref_secret_via_env_fallback() {
-    std::env::set_var(
+    let _env = crate::test_env::EnvVarGuard::set(&[(
         "SBPROXY_TEST_QUOTE_SEED",
-        "0001020304050607080910111213141516171819202122232425262728293031",
-    );
+        Some("0001020304050607080910111213141516171819202122232425262728293031"),
+    )]);
     let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
         "price": 0.001,
         "rails": {
@@ -1023,7 +1022,6 @@ fn quote_token_yaml_resolves_secret_ref_secret_via_env_fallback() {
 
     let jwks = policy.quote_token_jwks().expect("jwks");
     assert_eq!(jwks["keys"][0]["kid"], "quote-kid");
-    std::env::remove_var("SBPROXY_TEST_QUOTE_SEED");
 }
 
 #[test]

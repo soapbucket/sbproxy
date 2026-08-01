@@ -2,6 +2,24 @@
 
 use serde_yaml::Value;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// Dummy values for the env vars the compression examples interpolate.
+///
+/// The mutation runs exactly once per test binary, inside a `OnceLock`
+/// initializer, and every test that compiles an example calls this
+/// before its first environment read; concurrent callers block until
+/// the environment is populated, so a `set_var` can never race a
+/// parallel test's `getenv` (WOR-646). The values stay exported for
+/// the life of the process; this is the only place this binary mutates
+/// the environment.
+fn export_example_env_dummies() {
+    static EXPORTED: OnceLock<()> = OnceLock::new();
+    EXPORTED.get_or_init(|| {
+        std::env::set_var("OPENAI_API_KEY", "sk-test-compression-example");
+        std::env::set_var("ADMIN_PASSWORD", "admin-test-compression-example");
+    });
+}
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -38,8 +56,7 @@ fn compression_action(yaml: &str) -> Value {
 
 #[test]
 fn external_state_example_compiles_and_selects_redis() {
-    std::env::set_var("OPENAI_API_KEY", "sk-test-compression-example");
-    std::env::set_var("ADMIN_PASSWORD", "admin-test-compression-example");
+    export_example_env_dummies();
 
     let name = "ai-context-compression-redis";
     let (yaml, _) = example(name);
@@ -72,7 +89,7 @@ fn external_state_example_compiles_and_selects_redis() {
 
 #[test]
 fn mesh_state_example_compiles_selects_mesh_and_configures_replication() {
-    std::env::set_var("OPENAI_API_KEY", "sk-test-compression-example");
+    export_example_env_dummies();
 
     let name = "ai-context-compression-mesh";
     let (yaml, readme) = example(name);
