@@ -2,10 +2,10 @@
 
 mod peak_ewma;
 
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use sbproxy_platform::circuitbreaker::CircuitBreaker;
 use sbproxy_platform::outlier::{OutlierDetector, OutlierDetectorConfig};
 use serde::de::Error as _;
@@ -287,6 +287,15 @@ pub struct CascadeTier {
     pub cost_cap: Option<u64>,
 }
 
+/// Cap on the sticky session-affinity map (WOR-1693). Session keys are
+/// client-chosen, so without a bound the map gains one entry per unique
+/// key for the life of the process. 100,000 matches the cap
+/// [`crate::ratelimit::ModelRateLimiter`] uses for its entity buckets.
+/// Overflow evicts the least-recently-used session, whose only effect is
+/// that the evicted session re-pins on its next request, the same as
+/// after a restart.
+const MAX_STICKY_SESSIONS: usize = 100_000;
+
 /// Router that selects a provider for each request.
 pub struct Router {
     strategy: RoutingStrategy,
@@ -309,8 +318,10 @@ pub struct Router {
     replica_state: ReplicaRoutingState,
     /// Token-per-minute limits per provider.
     token_limits: Vec<u64>,
-    /// Session affinity map (session key -> provider index).
-    sticky_map: DashMap<String, usize>,
+    /// Session affinity map (session key -> provider index), bounded to
+    /// [`MAX_STICKY_SESSIONS`] entries so client-chosen keys cannot grow
+    /// it without limit (WOR-1693).
+    sticky_map: parking_lot::Mutex<lru::LruCache<String, usize>>,
     /// Per-provider circuit breakers. Empty when no resilience policy
     /// is configured; populated when the AI handler config carries a
     /// `resilience.circuit_breaker` block.
@@ -385,7 +396,9 @@ impl Router {
             tokens_used,
             replica_state,
             token_limits,
-            sticky_map: DashMap::new(),
+            sticky_map: parking_lot::Mutex::new(lru::LruCache::new(
+                NonZeroUsize::new(MAX_STICKY_SESSIONS).expect("cap is nonzero"),
+            )),
             breakers: Vec::new(),
             outlier: None,
             health,
@@ -616,22 +629,25 @@ impl Router {
             return None;
         }
 
-        // Check cache first
-        if let Some(cached) = self.sticky_map.get(session_key) {
-            let idx = *cached;
+        // Check cache first. `get` also marks the entry
+        // most-recently-used, so active sessions survive LRU eviction
+        // while idle ones age out (WOR-1693).
+        let mut sticky = self.sticky_map.lock();
+        if let Some(&idx) = sticky.get(session_key) {
             // Verify the cached provider is still enabled
             if providers.get(idx).is_some_and(|p| p.enabled) {
                 return Some(idx);
             }
             // Cached provider is gone or disabled, remove stale entry
-            drop(cached);
-            self.sticky_map.remove(session_key);
+            sticky.pop(session_key);
         }
 
-        // Fall back to round robin for new sessions
+        // Fall back to round robin for new sessions. At capacity, `put`
+        // evicts the least-recently-used session; that session re-pins
+        // on its next request, the same as after a restart.
         let counter = self.counter.fetch_add(1, Ordering::Relaxed);
         let selected = enabled[counter as usize % enabled.len()].0;
-        self.sticky_map.insert(session_key.to_string(), selected);
+        sticky.put(session_key.to_string(), selected);
         Some(selected)
     }
 
@@ -2351,6 +2367,29 @@ mod tests {
         ];
         let router = Router::new(RoutingStrategy::Sticky, providers.len());
         assert!(router.select_sticky(&providers, "user-1").is_none());
+    }
+
+    #[test]
+    fn sticky_map_is_bounded_under_unique_session_keys() {
+        // WOR-1693: session keys are client-chosen and unique in the
+        // worst case, so pinning far more sessions than the cap must not
+        // grow the map without bound.
+        let providers = vec![
+            make_provider("a", 1, None, true),
+            make_provider("b", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::Sticky, providers.len());
+        let total = MAX_STICKY_SESSIONS + 100;
+        for i in 0..total {
+            router.select_sticky(&providers, &format!("session-{i}"));
+        }
+        assert_eq!(router.sticky_map.lock().len(), MAX_STICKY_SESSIONS);
+        // The most recent session kept its pin; the oldest aged out and
+        // re-pins on its next request instead of failing.
+        let newest = format!("session-{}", total - 1);
+        assert!(router.sticky_map.lock().contains(&newest));
+        assert!(!router.sticky_map.lock().contains("session-0"));
+        assert!(router.select_sticky(&providers, "session-0").is_some());
     }
 
     // --- record_latency Tests ---
