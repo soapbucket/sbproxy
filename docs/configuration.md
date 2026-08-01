@@ -83,6 +83,16 @@ The config has two main sections: `proxy` (server-level settings) and `origins`
 (`l2_cache_settings`, `messenger_settings`) and process-owned
 `compression_state` live nested under `proxy`.
 
+Unknown keys are rejected. A misspelled key anywhere inside `proxy` or an
+origin (`force_ssl` typed as `forced_ssl`, `mtls` as `mtsl`, a stray field in
+a `credentials` policy) fails `serve`, `validate`, and hot reload with an
+error naming the key and the accepted alternatives, instead of being silently
+dropped while the setting takes its default. Two escape hatches stay open:
+out-of-tree blocks belong under `proxy.extensions:` (or an origin's
+`extensions:`), which accept arbitrary keys, and unknown keys at the very top
+level of the file only log a warning so flat schema-v1 configs from the
+archived Go line keep loading.
+
 The smallest runnable file is synced from
 [`examples/basic-proxy/sb.yml`](../examples/basic-proxy/sb.yml). CI compiles
 that canonical example and rejects this block if the two drift.
@@ -125,9 +135,11 @@ The schema describes the typed configuration envelope generated from
 `crates/sbproxy-config/src/types.rs`. Module payloads stay opaque at this
 layer: `action`, `authentication`, each `policies[]` entry, and each
 `transforms[]` entry are parsed by their runtime constructors after the
-envelope loads. Most envelope objects are also open, and serde aliases such as
-`auth` and `session_config` do not appear as separate schema properties.
-Those boundaries mean an editor cannot catch every misspelled key.
+envelope loads. Envelope objects are closed (`additionalProperties: false`),
+matching the runtime's unknown-key rejection, but serde aliases such as
+`auth` and `session_config` do not appear as separate schema properties, so
+an editor may flag an alias the proxy accepts. Module payloads and aliases
+are the boundaries an editor cannot check.
 
 Run `sbproxy validate <path>` for the authoritative check. It loads the same
 configuration and constructs the same runtime modules as `serve`.
