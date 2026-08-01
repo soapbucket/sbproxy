@@ -4216,9 +4216,10 @@ origins:
 
     #[test]
     fn compile_config_propagates_origin_extensions() {
-        // Opaque per-origin extensions must round-trip from the raw
-        // YAML into the compiled snapshot so extensions (e.g. the
-        // semantic-cache hook) can read their own keys.
+        // Opaque per-origin extensions must round-trip from the raw YAML
+        // into the compiled snapshot so an extension can read its own
+        // keys. The map stays generic: nothing in this workspace
+        // interprets it.
         let yaml = r#"
 origins:
   "api.example.com":
@@ -4226,18 +4227,18 @@ origins:
       type: proxy
       url: http://127.0.0.1:18888
     extensions:
-      semantic_cache:
+      custom_metadata:
         enabled: true
         ttl_secs: 600
 "#;
         let compiled = compile_config(yaml).expect("compile");
         let origin = compiled.resolve_origin("api.example.com").expect("origin");
-        let sc = origin
+        let custom = origin
             .extensions
-            .get("semantic_cache")
-            .expect("semantic_cache extension present after compile");
-        assert!(sc.get("enabled").unwrap().as_bool().unwrap());
-        assert_eq!(sc.get("ttl_secs").unwrap().as_u64().unwrap(), 600);
+            .get("custom_metadata")
+            .expect("custom_metadata extension present after compile");
+        assert!(custom.get("enabled").unwrap().as_bool().unwrap());
+        assert_eq!(custom.get("ttl_secs").unwrap().as_u64().unwrap(), 600);
     }
 
     #[test]

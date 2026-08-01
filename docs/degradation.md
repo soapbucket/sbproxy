@@ -1,6 +1,6 @@
 # Dependency degradation matrix
 
-*Last modified: 2026-07-29*
+*Last modified: 2026-07-31*
 
 What happens when each dependency that SBproxy talks to is unavailable, and how the proxy degrades while it heals.
 
@@ -10,6 +10,22 @@ What happens when each dependency that SBproxy talks to is unavailable, and how 
 2. Once active, the proxy MUST keep serving traffic during dependency outages where the feature contract is fail-open.
 3. Degradation must be visible in metrics and logs.
 4. Recovery is automatic. No manual intervention required.
+5. One word per decision. A control that cannot reach a verdict takes a
+   `failure_posture`, spelled the same everywhere it appears:
+
+   | Posture | The request | What is left behind |
+   |---|---|---|
+   | `closed` | Refused | The refusal |
+   | `degraded` | Admitted | An explicit record that the guarantee was not made |
+   | `open` | Admitted | Nothing |
+   | `observe` | Admitted | The verdict the control would have reached |
+
+   `degraded` and `open` do the same thing to the request and differ only in
+   what they leave behind, which is the part that matters six months later
+   when someone asks whether a control was protecting anything. Prefer
+   `degraded`. Sites where a posture is meaningless reject it at
+   config-compile time with a message naming the key, rather than accepting
+   it and picking something else for you.
 
 ## Matrix
 
@@ -20,7 +36,9 @@ What happens when each dependency that SBproxy talks to is unavailable, and how 
 | Redis (`proxy.l2_cache_settings`) | Connection, TLS, authentication, database selection, protocol, or command failure | A response-cache lookup failure bypasses the cache and does not arm write-back for that request. A shared rate-limit operation failure admits the request fail-open instead of switching to a local bucket. AI `summary_buffer` state never falls back to worker memory: that lever fails open, preserves the last committed message list, and lets later levers run. Other L2 consumers keep their feature-specific failure posture. | A later operation opens a fresh connection automatically; summary updates resume on a later request | `sbproxy_redis_kv_connections_total`, `sbproxy_redis_kv_operation_duration_seconds`, `sbproxy_redis_kv_operation_errors_total`, plus the compression state metrics |
 | Dedicated AI compression summarizer | Timeout, provider failure, invalid output, policy denial, or budget denial | `summary_buffer` skips safe admission denials or fails open on runtime errors. The primary AI request continues with the last committed messages, and a later `window_fit` lever still runs. | Next eligible request retries under the configured policy and timeout | `sbproxy_ai_compression_lever_total`, `sbproxy_ai_compression_requests_total`, `sbproxy_ai_compression_duration_seconds` |
 | Token-pruning classifier sidecar | Connection failure, timeout, unknown model, or invalid extractive output | `token_prune` fails open at its lever boundary. The primary request keeps the last committed messages, and later entries such as `window_fit` still run. | The route connects lazily again on the next eligible request | `sbproxy_ai_compression_lever_total{lever="token_prune"}`, `sbproxy_ai_compression_requests_total`, `sbproxy_ai_compression_duration_seconds` |
-| Governed-key budget backend (`key_management.governance.backend`, strict tier only) | Connection / command failure | Only affects keys governed under `consistency: strict`. The default `approximate` tier does not depend on this backend at all; its per-node counters keep disseminating over the cluster mesh. For a strict key, a reserve call that cannot reach the backend denies the request (`503`) by default (`failure_mode: closed`); `failure_mode: allow_unreserved` admits it instead without a reservation. A settle call on an already-admitted request is unaffected by `failure_mode` and stays best-effort. | Auto-reconnect; enforcement resumes on the next successful call | `sbproxy_governance_fail_open_total{key_id}` on `allow_unreserved`; also logged at WARN (fail-open/fail-closed) or DEBUG (other reserve/settle errors) |
+| Virtual key store (`key_management.store`) | Connection / read failure | `key_management.failure_posture` decides it, and all four inbound-key paths (header sweep, playground ticket, bearer token, OIDC claim map) read the same value. The default `closed` denies with `503`. `degraded` and `open` both fall through to the origin's own configured auth, which is not a blanket admit; they differ in whether the lost per-key policy, budget, and attribution are recorded as lost. | Auto on the next successful store read; the cache never caches an error | None dedicated; logged at WARN with `failure_posture` and `guarantee_waived` fields |
+| Governed-key budget backend (`key_management.governance.backend`, strict tier only) | Connection / command failure | Only affects keys governed under `consistency: strict`. The default `approximate` tier does not depend on this backend at all; its per-node counters keep disseminating over the cluster mesh. For a strict key, a reserve call that cannot reach the backend denies the request (`503`) by default (`failure_posture: closed`); `degraded` admits it without a reservation and audits the fact; `open` admits it and records nothing. A settle call on an already-admitted request is unaffected by the posture and stays best-effort. | Auto-reconnect; enforcement resumes on the next successful call | `sbproxy_governance_fail_open_total{key_id}` on `degraded`; also logged at WARN (admit/deny) or DEBUG (other reserve/settle errors) |
+| Fair-share quota accounting backend (`quota_pools[].consistency: approximate \| strong`) | Connection / command failure | `quota_pools[].failure_posture` decides it, on the AI dispatch path and the realtime WebSocket path alike. The default `closed` rejects with `503`. `degraded` admits the attempt with no reservation held and counts it; `open` admits and counts nothing. A real quota denial (`429`) and inconsistent pool state (`503`) never consult the posture. | Auto-reconnect; accounting resumes on the next successful call | `sbproxy_ai_quota_pool_fail_open_total{pool}` on `degraded` |
 | ACME CA (Let's Encrypt) | Renewal request fails | Existing cert keeps serving until expiry. With no usable cert, an HTTP-01 self-signed bootstrap is served and an `ERROR` is logged loudly. | Retry with exponential backoff (1m to 24h) | `sbproxy_acme_renewals_total{result}` |
 | Upstream DNS (`service_discovery`) | Resolver timeout / NXDOMAIN | The cached A/AAAA set keeps serving past TTL until the next refresh succeeds. New unseen hostnames fall back to Pingora's connect-time resolver. | Auto on next refresh | None dedicated; resolver failures are logged at WARN |
 | Vault / secrets backend (`proxy.secrets.backends`) | Fetch fails | Unresolved provider URI references fail startup; backend-local caches retain already resolved values where supported. | Backend reconnect/re-fetch behavior | `sbproxy_vault_resolution_total{backend,result}` |
@@ -263,11 +281,11 @@ on state errors or rejected Redis updates.
 
 **When down:** the dedicated Redis connection configured under `key_management.governance.backend` fails to connect, or a reserve, settle, or release script call errors.
 
-**Fallback:** this only affects keys governed under `consistency: strict`. The `approximate` tier (the default) never talks to this backend; its per-node counters keep disseminating over the cluster mesh instead, bounded by a staleness window rather than an outage. See [Governed admission: strict and approximate](key-management.md#governed-admission-strict-and-approximate) for both tiers. For a strict key, `key_management.governance.failure_mode` decides what a reserve call does when it cannot reach the backend: the default `closed` denies the request with `503` rather than let the governed limit go unenforced; `allow_unreserved` admits it instead without a reservation, and that decision is always recorded on the `security_audit` channel. A settle call that cannot reach the backend after a reservation already succeeded is unaffected by `failure_mode`; it stays best-effort, and the reservation's own drop-time repair reconciles it later.
+**Fallback:** this only affects keys governed under `consistency: strict`. The `approximate` tier (the default) never talks to this backend; its per-node counters keep disseminating over the cluster mesh instead, bounded by a staleness window rather than an outage. See [Governed admission: strict and approximate](key-management.md#governed-admission-strict-and-approximate) for both tiers. For a strict key, `key_management.governance.failure_posture` decides what a reserve call does when it cannot reach the backend: the default `closed` denies the request with `503` rather than let the governed limit go unenforced; `degraded` admits it without a reservation and records that decision on the `security_audit` channel; `open` admits it and records neither the audit event nor the counter. A settle call that cannot reach the backend after a reservation already succeeded is unaffected by the posture; it stays best-effort, and the reservation's own drop-time repair reconciles it later.
 
-**Log level:** `WARN` per fail-open or fail-closed decision on a reserve call; `DEBUG` for other reserve/settle errors.
+**Log level:** `WARN` per admit or deny decision on a reserve call; `DEBUG` for other reserve/settle errors.
 
-**Alert:** off by default. `sbproxy_governance_fail_open_total{key_id}` counts fail-open admissions when `failure_mode: allow_unreserved` is set.
+**Alert:** off by default. `sbproxy_governance_fail_open_total{key_id}` counts admissions when `failure_posture: degraded` is set. It stays flat under `open`, which is the reason to prefer `degraded`.
 
 **Config:**
 ```yaml
@@ -278,8 +296,61 @@ proxy:
       backend:
         type: redis
         url: rediss://governance.internal:6379/2
-      failure_mode: closed        # closed | allow_unreserved
+      failure_posture: closed     # closed | degraded | open
 ```
+
+The older `failure_mode: closed | allow_unreserved` still parses and is used only when `failure_posture` is absent, resolving to `closed` and `degraded` respectively. `observe` is rejected at config-compile time: a reserve call that never reached its backend produced no verdict to record.
+
+---
+
+### Virtual key store
+
+**When down:** the configured `key_management.store` backend (embedded redb, Redis, or a secrets manager) cannot be read.
+
+**Fallback:** `key_management.failure_posture` decides it, and all four inbound-key paths read the same value: the pre-auth header sweep, the playground impersonation ticket, the AI gateway's bearer path, and the OIDC claim map. The default `closed` denies with `503`. `degraded` and `open` fall through to the origin's own configured auth rather than admitting outright, so an origin with a `credentials:` block still authenticates the caller; what is lost is the per-key policy, budget, and attribution the virtual key would have carried. `degraded` says so in the log; `open` does not. `observe` is rejected at config-compile time: a store that could not be read produced no verdict to record.
+
+The policy cache in front of the store never caches an error and never decides admission. It propagates the failure so exactly one place applies the posture.
+
+**Log level:** `WARN` per admitted request, carrying `failure_posture` and `guarantee_waived` fields.
+
+**Alert:** yes if you run anything other than `closed`. A sustained stream of `guarantee_waived=true` means governed keys stopped being governed.
+
+**Config:**
+```yaml
+proxy:
+  key_management:
+    enabled: true
+    failure_posture: closed        # closed | degraded | open
+```
+
+The older `failure_mode_allow: bool` still parses and is used only when `failure_posture` is absent: `false` resolves to `closed` and `true` resolves to `degraded`.
+
+---
+
+### Fair-share quota accounting backend
+
+**When down:** a quota pool running `consistency: approximate` or `strong` cannot reach its shared accounting backend, so a reserve or settle call fails with a backend-unavailable error.
+
+**Fallback:** `quota_pools[].failure_posture` decides it, on the AI dispatch path and the realtime WebSocket path alike (both call one mapping, so they cannot drift apart). The default `closed` rejects with `503`. `degraded` admits the attempt with no reservation held and counts it on `sbproxy_ai_quota_pool_fail_open_total{pool}`; `open` admits and counts nothing. The posture applies only to backend unavailability: a real quota denial still returns `429`, and inconsistent reservation state still returns `503`, because a pool whose accounting is contradictory cannot be said to have admitted anything.
+
+**Log level:** none dedicated; the fail-open counter is the signal.
+
+**Alert:** off by default. Alert on `sbproxy_ai_quota_pool_fail_open_total{pool}` if you run `degraded`.
+
+**Config:**
+```yaml
+proxy:
+  ai:
+    quota_pools:
+      - name: shared-upstream
+        total_limit: 1000
+        weights: {team-a: 3, team-b: 1}
+        policy: burst
+        consistency: strong
+        failure_posture: closed    # closed | degraded | open
+```
+
+The older `failure_mode: closed | allow_unreserved` still parses and is used only when `failure_posture` is absent, resolving to `closed` and `degraded` respectively. `observe` is rejected at config-compile time.
 
 ---
 

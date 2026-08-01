@@ -153,7 +153,7 @@ jobs:
           unset tls_probe_output
           cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
             --run-ignored only -j1 \
-            -E 'binary(redis_secure) + test(compression_store::redis::tests::live_redis_) + test(storage::async_redis::tests::redis_connection_recovers_after_server_restart)'
+            -E 'binary(redis_secure) + test(compression_store::redis::tests::live_redis_) + test(storage::async_redis::tests::redis_connection_recovers_after_server_restart) + test(semantic_cache_runtime::redis::tests::live_redis_semantic_)'
 
       # nextest does not execute doctests, so they need their own pass.
       - name: doctests
@@ -220,17 +220,12 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
 
+      # Shares one script with scripts/check.sh so the local gate fails on
+      # the same drift, instead of this being the only place that looks.
+      # The script discovers the nested workspaces rather than listing
+      # them, so a new one is covered when it lands.
       - name: standalone workspace lockfiles are current
-        run: |
-          for manifest in \
-            bench-synthetic/Cargo.toml \
-            sbproxy-bench/harness/ai_crawl_tiers/Cargo.toml \
-            sbproxy-bench/harness/ai_lb_strategy/Cargo.toml \
-            sbproxy-bench/harness/context_compression_eval/Cargo.toml \
-            test/fixtures/refresh-tool/Cargo.toml
-          do
-            cargo metadata --manifest-path "${manifest}" --locked --format-version=1 >/dev/null
-          done
+        run: bash scripts/check-nested-lockfiles.sh
 
       # Reject internal tracker placeholders in source-available rustdoc.
       # A literal `WOR-XXX` is an unfinished TODO that announces incomplete

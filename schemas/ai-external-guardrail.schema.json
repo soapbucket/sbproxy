@@ -35,9 +35,23 @@
       "type": "boolean"
     },
     "fail_open": {
-      "description": "Allow traffic when this provider cannot be reached or returns an invalid response.",
-      "default": false,
-      "type": "boolean"
+      "description": "Allow traffic when this provider cannot be reached or returns an invalid response.\n\nLegacy spelling of the failure axis, kept because existing configurations use it. It still parses and still means exactly what it always did: `true` is [`FailureMode::Open`], `false` (and an omitted key) is [`FailureMode::Closed`]. Prefer `failure_posture`, because a boolean has no way to say `degraded`, which is what an admitted-but-unscanned request actually is.\n\nNever read this field directly; read `ExternalGuardrailConfig::failure_posture()`, which resolves the two spellings in one place. Setting both to values that disagree is a config-load error.",
+      "default": null,
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "failure_posture": {
+      "description": "Failure posture: what this guardrail does when its provider cannot be reached, answers with a non-success status, is too slow, or returns something that is not a verdict.\n\nThis is the failure axis only. The enforcement axis lives in `mode`: `logging_only` never refuses anything even when the provider answers and says block. The two are independent, so a guardrail can be rolled out in `mode: logging_only` while still declaring `failure_posture: closed` for the day it starts enforcing.\n\n- `closed` refuses the request. The default, and the right choice for a guardrail that is actually protecting something. - `open` admits the request and claims nothing. - `degraded` admits the request while recording that it was never scanned. Prefer this over `open`: the behavior is the same, and it is the truthful description of what happened. - `observe` is rejected here. There is no verdict to shadow-record when the provider never answered; the observe-shaped posture for this site is `mode: logging_only`, on the other axis.\n\nWhen absent, the posture comes from the legacy `fail_open` boolean.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/FailureMode"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "timeout_ms": {
       "description": "Per-request provider deadline in milliseconds, from 1 through 30000.",
@@ -204,6 +218,39 @@
         "post_call",
         "during_call",
         "logging_only"
+      ]
+    },
+    "FailureMode": {
+      "description": "What a control does when it cannot reach a decision.\n\nA \"control\" here is anything that gates a request and can itself fail: a policy whose backend is unreachable, a guardrail whose provider times out, a detector that never engaged, a store that cannot be read. The question is always the same, so the knob is too, and it is spelled `failure_posture` everywhere it appears:\n\n```yaml failure_posture: closed     # refuse the request failure_posture: open       # admit it failure_posture: degraded   # admit it, but record that the guarantee was not made failure_posture: observe    # admit it, and record what would have happened ```\n\n# The four postures\n\nOnly [`Closed`](Self::Closed) refuses. The other three all admit the request and differ in what they leave behind, which is the part that matters six months later when someone asks whether a control was actually protecting anything:\n\n- **`open`** admits and claims nothing. Cheapest, and the least recoverable after the fact. - **`degraded`** admits while explicitly marking the guarantee as not made. This is the posture behind the existing `AllowUnreserved` modes: the request proceeds, but no quota was reserved and no governance decision was recorded, and that fact is itself counted so it can be alerted on. - **`observe`** admits and records the decision the control *would* have taken. For rolling a control out against live traffic before letting it refuse anything.\n\n# Relationship to `test_mode` and tag actions\n\n`observe` is deliberately close in spirit to the WAF's `test_mode` and the prompt-injection `Tag` action, and the overlap is worth naming so the two do not drift into meaning different things. They are not the same axis:\n\n- `test_mode` / `Tag` describe what the control does when it **works** and finds a hit. - `failure_posture: observe` describes what it does when it **cannot run at all**.\n\nA control can legitimately be in `test_mode` and still need a failure posture, because \"the detector matched\" and \"the detector was unreachable\" are different events. Where a site already has `test_mode`, leave it alone and let `failure_posture` govern only the cannot-decide path.\n\n# Why this type exists\n\nThe same decision was previously spelled six different ways across the config surface: `fail_open: bool`, `fail_closed: bool`, `failure_mode_allow: bool`, two separately-declared `failure_mode` enums, an `on_failure` enum, and an unvalidated `on_error: String`. Two of those booleans carry **opposite** polarity, so `true` means \"admit\" in one struct and \"refuse\" in another. An operator had to re-derive the meaning at every site, and a reviewer had to check the field name before they could read a diff.\n\nNew and migrated controls take `failure_posture: FailureMode`. The name is deliberately not `failure_mode`: two blocks already declare a field by that exact name carrying a narrower enum, and a test pins that `failure_mode: open` must fail to parse there. One new word that works at every site beats one that collides at two.\n\nThe legacy fields still parse, because [`schema-v1` compatibility] is pinned by test, and each site's `failure_posture()` accessor converts from them when the new key is absent. They carry no `#[deprecated]` attribute on purpose: `-D warnings` would then turn every remaining read into a build failure, including the conversion itself. They are deprecated in prose and by having no other reader left.\n\n# Choosing a default\n\nDefault closed for anything that enforces a security boundary: a control that silently admits traffic when it breaks is worse than no control, because the config still advertises protection and the dashboard still reads green.\n\nDefault open only where refusing would take the gateway down over a non-security concern, and say so at the site. A policy-expression bug should not black-hole every request; an unreachable authorization backend should.\n\n[`schema-v1` compatibility]: https://github.com/soapbucket/sbproxy",
+      "oneOf": [
+        {
+          "description": "Refuse the request. The safe default for anything enforcing a security boundary: a control that silently admits traffic when it breaks is worse than no control, because the config still advertises protection and the dashboard still reads green.",
+          "type": "string",
+          "enum": [
+            "closed"
+          ]
+        },
+        {
+          "description": "Admit the request and claim nothing. Cheapest, and the least recoverable after the fact.",
+          "type": "string",
+          "enum": [
+            "open"
+          ]
+        },
+        {
+          "description": "Admit the request while explicitly marking the guarantee as not made. The posture behind the legacy `AllowUnreserved` modes: the call proceeds, but no quota was reserved and no governance decision was recorded, and that fact is counted so it can be alerted on.",
+          "type": "string",
+          "enum": [
+            "degraded"
+          ]
+        },
+        {
+          "description": "Admit the request and record the decision the control would have taken. For rolling a control out against live traffic before letting it refuse anything.",
+          "type": "string",
+          "enum": [
+            "observe"
+          ]
+        }
       ]
     },
     "GuardrailProvider": {

@@ -233,11 +233,58 @@ prompt contract.
 
 ### Failure policy
 
-| Mode | Behavior |
+There are two ways to spell what a route does when retrieval fails, and
+they are not alternatives to each other. `failure_posture` is the short
+form and uses the same words every other control in the gateway uses.
+`on_failure` is the longer form and is the only way to reach the stale
+cache.
+
+```yaml
+# Short form. Same vocabulary as every other control.
+failure_posture: degraded
+```
+
+| `failure_posture` | Behavior |
 |---|---|
-| `fail_closed` | Default. A retrieval failure returns 502 to the client and the model is never called |
-| `continue_without_context` | The original, unmodified request is forwarded to the model |
-| `use_stale` | A previously retrieved context for the same tenant and query is reused; when no unexpired entry exists, the request fails closed |
+| `closed` | Default. A retrieval failure returns 502 to the client and the model is never called |
+| `degraded` | The original, unmodified request is forwarded to the model |
+
+Only those two are accepted. `open` is rejected, because a request that
+skipped retrieval on a route that advertises it did not get the
+guarantee the route promised; `degraded` has exactly the same behavior
+and says so. `observe` is rejected too: retrieval either produced context
+or it did not, so there is no decision the route would have taken but did
+not, and nothing to shadow-record. Both rejections happen at config load
+with a message naming the key.
+
+```yaml
+# Long form. Required for use_stale.
+on_failure:
+  mode: use_stale
+  max_age_secs: 300
+  max_entries: 1024
+```
+
+| `on_failure.mode` | Equivalent posture | Behavior |
+|---|---|---|
+| `fail_closed` | `closed` | Default. A retrieval failure returns 502 to the client and the model is never called |
+| `continue_without_context` | `degraded` | The original, unmodified request is forwarded to the model |
+| `use_stale` | none | A previously retrieved context for the same tenant and query is reused; when no unexpired entry exists, the request fails closed |
+
+`use_stale` has no `failure_posture` spelling, and that is deliberate
+rather than an oversight. It is a third thing the four shared words
+cannot say: admit the request with an *older* guarantee, and refuse when
+even that is unavailable. It also carries `max_age_secs` and
+`max_entries` and owns a real per-route cache, neither of which a single
+word can hold. A route that wants stale context sets `on_failure` and
+leaves `failure_posture` unset.
+
+Setting both keys to values that disagree is a config-load error naming
+both of them. One case is accepted for a mechanical reason worth
+knowing: an `on_failure` written out as its own default
+(`mode: fail_closed`) is indistinguishable from an omitted key once the
+document is parsed, so `failure_posture: degraded` alongside it loads and
+the posture wins. Every disagreement that can be detected is refused.
 
 The fail-closed response body is stable and never exposes the provider
 error:
@@ -261,14 +308,9 @@ It stores derived context only and has no admin listing or purge surface;
 restart or reload the process to clear it. There is no silent downgrade
 from `use_stale` to `continue_without_context`; an expired cache fails
 closed so an operator sees the outage instead of quietly serving
-unaugmented answers.
-
-```yaml
-on_failure:
-  mode: use_stale
-  max_age_secs: 300
-  max_entries: 1024
-```
+unaugmented answers. A route that declares only `failure_posture` never
+builds the cache at all, so it continues without context on every
+failure rather than replaying an earlier answer.
 
 ### Credentials
 
@@ -327,7 +369,9 @@ provider is not compiled in.
 
 ### First checks
 
-**502 with `rag_retrieval_failed`.** The route is `fail_closed` and
+**502 with `rag_retrieval_failed`.** The route fails closed
+(`failure_posture: closed`, or the equivalent
+`on_failure: {mode: fail_closed}`, which is the default) and
 retrieval failed. Check reachability of the embedding and vector-store
 endpoints from the gateway host, whether a private address needs
 `allow_private_url: true`, and whether `timeout_ms` is large enough for

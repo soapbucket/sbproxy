@@ -63,6 +63,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_a2a_chain_depth` | Histogram | `stable` | `beta` | `route`, `spec` | Distribution of A2A chain depth observed at the proxy. |
 | `sbproxy_a2a_denied_total` | Counter | `stable` | `beta` | `route`, `reason` | A2A hops denied by the a2a policy, labelled by route and reason. |
 | `sbproxy_a2a_hops_total` | Counter | `stable` | `beta` | `route`, `spec`, `decision` | A2A hops observed by the proxy, labelled by route, spec, and policy decision. |
+| `sbproxy_a2a_methods_total` | Counter | `stable` | `beta` | `route`, `method` | A2A 1.0 JSON-RPC methods observed by the proxy, labelled by route and method. |
 | `sbproxy_acme_renewal_duration_seconds` | Histogram | `stable` | `beta` | `result` | ACME renewal full-flow duration, by outcome. |
 | `sbproxy_acme_renewals_total` | Counter | `stable` | `beta` | `result` | ACME certificate renewal attempts, by outcome. |
 | `sbproxy_active_connections` | Gauge | `stable` | `stable` | none | Current active connections. |
@@ -170,7 +171,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_errors_total` | Counter | `stable` | `beta` | `hostname`, `error_type` | Total errors. |
 | `sbproxy_governance_fail_open_total` | Counter | `stable` | `beta` | `key_id` | Governed admissions that bypassed reservation because the governance backend was unavailable and failure_mode is allow_unreserved. |
 | `sbproxy_grpc_status_total` | Counter | `stable` | `beta` | `code` | Observed gRPC status codes, by canonical name. |
-| `sbproxy_hooks_channel_dropped_total` | Counter | `stable` | `beta` | `reason` | Bounded channel sends dropped on the hot path, labelled by drop reason. |
+| `sbproxy_hooks_channel_dropped_total` | Counter | `config_only` (nothing emits this yet) | `beta` | `reason` | Bounded channel sends dropped on the hot path, labelled by drop reason. |
 | `sbproxy_http_framing_blocks_total` | Counter | `stable` | `beta` | `reason`, `tenant` | Requests rejected by the http_framing policy (request smuggling defense). |
 | `sbproxy_idempotency_cache_duration_seconds` | Histogram | `stable` | `beta` | `backend` | Idempotency cache lookup duration, by backend. |
 | `sbproxy_idempotency_cache_results_total` | Counter | `stable` | `beta` | `backend`, `result` | Idempotency cache outcomes, by backend and result. |

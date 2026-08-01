@@ -110,8 +110,21 @@ pub use routing_state::{
     ReplicaRoutingState,
 };
 pub use semantic_cache::{
-    CachedAiResponse, CachedHttpResponse, EmbeddingCache, EmbeddingCacheConfig, EmbeddingHit,
-    SemanticCache,
+    decode_entry, encode_entry, select_exact_hit, semantic_configuration_digest,
+    semantic_entry_key, semantic_entry_keys, semantic_origin_route_digest, semantic_prompt_digest,
+    semantic_purge_prefix, system_semantic_clock, CacheDecision, CachedAiResponse,
+    CachedHttpResponse, EmbeddingCache, EmbeddingCacheConfig, EmbeddingCacheStats, EmbeddingHit,
+    LshError, MemorySemanticCacheStore, RandomProjectionLsh, SemanticBucket, SemanticBucketIndex,
+    SemanticCache, SemanticCacheBackend, SemanticCacheConfigError, SemanticCacheStore,
+    SemanticClock, SemanticEntryKeys, SemanticExactMatch, SemanticExactSelector,
+    SemanticHealthState, SemanticLookupError, SemanticLookupOutcome, SemanticLookupRequest,
+    SemanticLshConfig, SemanticNamespace, SemanticNamespaceInput, SemanticPurgeReport,
+    SemanticPurgeScope, SemanticStoreCounters, SemanticStoreError, SemanticStoreHealth,
+    SemanticStoreLookup, SemanticStoreLookupQuery, SemanticStoreStats, SemanticStoreWrite,
+    SemanticWriteToken, StoredSemanticEntry, SystemSemanticClock, WireError,
+    MAX_EMBEDDING_DIMENSIONS, MAX_SEMANTIC_ENTRY_BYTES, MAX_SEMANTIC_HEADER_NAME_BYTES,
+    MAX_SEMANTIC_HEADER_VALUE_BYTES, MAX_SEMANTIC_RESPONSE_BYTES, MAX_SEMANTIC_RESPONSE_HEADERS,
+    MAX_SEMANTIC_TOTAL_HEADER_BYTES, SEMANTIC_CACHE_SCHEMA_VERSION,
 };
 pub use session::{ConversationSession, SessionStore};
 pub use token_estimate::{

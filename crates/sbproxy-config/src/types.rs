@@ -1669,15 +1669,45 @@ pub struct KeyGovernanceConfig {
     /// Retention for settled, released, and expired reservation outcomes.
     /// Must be at least the lease duration so retries remain idempotent.
     pub terminal_retention_secs: u64,
-    /// Behavior when the governance backend cannot serve a reserve call at
-    /// request time (`GovernanceError::BackendUnavailable`). The default
-    /// denies the request (fail closed): governed limits must not be
-    /// silently bypassed by a backend outage. Setting `allow_unreserved`
-    /// admits the request instead, but every such decision is always
-    /// audited on the `security_audit` channel and counted on
+    /// Superseded by `failure_posture`. Behavior when the governance
+    /// backend cannot serve a reserve call at request time
+    /// (`GovernanceError::BackendUnavailable`). The default denies the
+    /// request (fail closed): governed limits must not be silently
+    /// bypassed by a backend outage. Setting `allow_unreserved` admits the
+    /// request instead, but every such decision is always audited on the
+    /// `security_audit` channel and counted on
     /// `sbproxy_governance_fail_open_total`.
+    ///
+    ///
+    /// Still parsed, and still the value used when `failure_posture` is
+    /// absent, so an existing config keeps behaving exactly as it did.
+    /// Nothing in the runtime reads this field directly any more: the read
+    /// path goes through [`KeyGovernanceConfig::failure_posture`], which
+    /// reports `allow_unreserved` as `degraded` because the call proceeds
+    /// without the reservation this control exists to make.
     #[serde(default)]
     pub failure_mode: GovernanceFailureMode,
+    /// Failure posture for a governance backend outage, in the shared
+    /// [`FailureMode`] vocabulary.
+    ///
+    ///
+    /// Set this in preference to `failure_mode`. When present it wins;
+    /// when absent the legacy `failure_mode` value is converted
+    /// (`closed` stays `closed`, `allow_unreserved` becomes `degraded`).
+    /// It is `Option` on purpose, so "the operator said nothing" stays
+    /// distinguishable from "the operator explicitly asked for the
+    /// default".
+    ///
+    ///
+    /// `closed` denies with 503. `degraded` admits without a reservation
+    /// and records that fact on the `security_audit` channel and on
+    /// `sbproxy_governance_fail_open_total`. `open` also admits but
+    /// records neither, which is why `degraded` is the honest spelling of
+    /// the old `allow_unreserved`. `observe` is meaningless here and is
+    /// rejected at config-compile time: a reserve call that could not
+    /// reach its backend produced no counterfactual verdict to record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_posture: Option<FailureMode>,
     /// Behavior when a governed key carries a `total_micro_usd` limit but
     /// the resolved model has no rate to estimate a pre-request cost
     /// ceiling from. The default (`zero_cost`) admits with no monetary
@@ -1701,6 +1731,7 @@ impl Default for KeyGovernanceConfig {
             lease_ttl_secs: default_governance_lease_ttl_secs(),
             terminal_retention_secs: default_governance_terminal_retention_secs(),
             failure_mode: GovernanceFailureMode::default(),
+            failure_posture: None,
             missing_rate: GovernanceMissingRatePolicy::default(),
             key_introspection: false,
             require_governed_key: false,
@@ -1708,7 +1739,232 @@ impl Default for KeyGovernanceConfig {
     }
 }
 
-/// Behavior when the governance backend cannot serve a reserve call
+/// What a control does when it cannot reach a decision.
+///
+/// A "control" here is anything that gates a request and can itself
+/// fail: a policy whose backend is unreachable, a guardrail whose
+/// provider times out, a detector that never engaged, a store that
+/// cannot be read. The question is always the same, so the knob is too,
+/// and it is spelled `failure_posture` everywhere it appears:
+///
+/// ```yaml
+/// failure_posture: closed     # refuse the request
+/// failure_posture: open       # admit it
+/// failure_posture: degraded   # admit it, but record that the guarantee was not made
+/// failure_posture: observe    # admit it, and record what would have happened
+/// ```
+///
+/// # The four postures
+///
+/// Only [`Closed`](Self::Closed) refuses. The other three all admit the
+/// request and differ in what they leave behind, which is the part that
+/// matters six months later when someone asks whether a control was
+/// actually protecting anything:
+///
+/// - **`open`** admits and claims nothing. Cheapest, and the least
+///   recoverable after the fact.
+/// - **`degraded`** admits while explicitly marking the guarantee as
+///   not made. This is the posture behind the existing
+///   `AllowUnreserved` modes: the request proceeds, but no quota was
+///   reserved and no governance decision was recorded, and that fact is
+///   itself counted so it can be alerted on.
+/// - **`observe`** admits and records the decision the control *would*
+///   have taken. For rolling a control out against live traffic before
+///   letting it refuse anything.
+///
+/// # Relationship to `test_mode` and tag actions
+///
+/// `observe` is deliberately close in spirit to the WAF's `test_mode`
+/// and the prompt-injection `Tag` action, and the overlap is worth
+/// naming so the two do not drift into meaning different things. They
+/// are not the same axis:
+///
+/// - `test_mode` / `Tag` describe what the control does when it
+///   **works** and finds a hit.
+/// - `failure_posture: observe` describes what it does when it **cannot
+///   run at all**.
+///
+/// A control can legitimately be in `test_mode` and still need a
+/// failure posture, because "the detector matched" and "the detector
+/// was unreachable" are different events. Where a site already has
+/// `test_mode`, leave it alone and let `failure_posture` govern only the
+/// cannot-decide path.
+///
+/// # Why this type exists
+///
+/// The same decision was previously spelled six different ways across
+/// the config surface: `fail_open: bool`, `fail_closed: bool`,
+/// `failure_mode_allow: bool`, two separately-declared `failure_mode`
+/// enums, an `on_failure` enum, and an unvalidated `on_error: String`.
+/// Two of those booleans carry **opposite** polarity, so `true` means
+/// "admit" in one struct and "refuse" in another. An operator had to
+/// re-derive the meaning at every site, and a reviewer had to check the
+/// field name before they could read a diff.
+///
+/// New and migrated controls take `failure_posture: FailureMode`. The
+/// name is deliberately not `failure_mode`: two blocks already declare a
+/// field by that exact name carrying a narrower enum, and a test pins
+/// that `failure_mode: open` must fail to parse there. One new word that
+/// works at every site beats one that collides at two.
+///
+/// The legacy fields still parse, because [`schema-v1` compatibility] is
+/// pinned by test, and each site's `failure_posture()` accessor converts
+/// from them when the new key is absent. They carry no `#[deprecated]`
+/// attribute on purpose: `-D warnings` would then turn every remaining
+/// read into a build failure, including the conversion itself. They are
+/// deprecated in prose and by having no other reader left.
+///
+/// # Choosing a default
+///
+/// Default closed for anything that enforces a security boundary: a
+/// control that silently admits traffic when it breaks is worse than no
+/// control, because the config still advertises protection and the
+/// dashboard still reads green.
+///
+/// Default open only where refusing would take the gateway down over a
+/// non-security concern, and say so at the site. A policy-expression
+/// bug should not black-hole every request; an unreachable authorization
+/// backend should.
+///
+/// [`schema-v1` compatibility]: https://github.com/soapbucket/sbproxy
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureMode {
+    /// Refuse the request. The safe default for anything enforcing a
+    /// security boundary: a control that silently admits traffic when
+    /// it breaks is worse than no control, because the config still
+    /// advertises protection and the dashboard still reads green.
+    #[default]
+    Closed,
+    /// Admit the request and claim nothing. Cheapest, and the least
+    /// recoverable after the fact.
+    Open,
+    /// Admit the request while explicitly marking the guarantee as not
+    /// made. The posture behind the legacy `AllowUnreserved` modes: the
+    /// call proceeds, but no quota was reserved and no governance
+    /// decision was recorded, and that fact is counted so it can be
+    /// alerted on.
+    Degraded,
+    /// Admit the request and record the decision the control would have
+    /// taken. For rolling a control out against live traffic before
+    /// letting it refuse anything.
+    Observe,
+}
+
+impl FailureMode {
+    /// True when this posture lets the request proceed.
+    ///
+    /// Three of the four postures admit; they differ in what they leave
+    /// behind, not in whether traffic flows. Callers deciding "do I
+    /// return Deny" want this; callers deciding "what do I record" want
+    /// to match on the variant.
+    pub fn admits(self) -> bool {
+        !matches!(self, Self::Closed)
+    }
+
+    /// True when the control should record what it would have done.
+    pub fn records_counterfactual(self) -> bool {
+        matches!(self, Self::Observe)
+    }
+
+    /// True when the request proceeds without the guarantee this
+    /// control exists to provide. Separately countable from a plain
+    /// `Open` so an operator can alert on lost guarantees specifically.
+    pub fn guarantee_waived(self) -> bool {
+        matches!(self, Self::Degraded)
+    }
+
+    /// Build from a legacy `fail_open`-style boolean, where `true`
+    /// means admit. Use at call sites migrating off such a field so the
+    /// polarity conversion lives in one place rather than being
+    /// re-derived per site.
+    pub fn from_fail_open(fail_open: bool) -> Self {
+        if fail_open {
+            Self::Open
+        } else {
+            Self::Closed
+        }
+    }
+
+    /// Build from a legacy `fail_closed`-style boolean, where `true`
+    /// means refuse. The inverse polarity of [`Self::from_fail_open`],
+    /// and the reason both constructors are named rather than left to a
+    /// bare `if` at each site.
+    pub fn from_fail_closed(fail_closed: bool) -> Self {
+        if fail_closed {
+            Self::Closed
+        } else {
+            Self::Open
+        }
+    }
+
+    /// Stable label for metrics and audit events.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+            Self::Degraded => "degraded",
+            Self::Observe => "observe",
+        }
+    }
+}
+
+/// What a control does when it *does* reach a decision and that
+/// decision is "refuse".
+///
+/// This is the second of two axes, and keeping them apart is the point.
+/// [`FailureMode`] answers "the control could not run, now what".
+/// `EnforcementMode` answers "the control ran, it matched, now what".
+/// Those are different events and an operator needs both: a detector
+/// can reasonably be in `observe` while it is being tuned, and still
+/// need to fail closed when its backend disappears.
+///
+/// This type replaces the ad-hoc spellings of the same idea that grew
+/// per policy: the WAF's `test_mode: bool`, the prompt-injection
+/// `Tag` action, and similar. They all meant "match, but do not
+/// block". `observe` is spelled the same here as in [`FailureMode`] on
+/// purpose, so one word means one thing across the config surface.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementMode {
+    /// Refuse the request when the control matches.
+    #[default]
+    Block,
+    /// Admit the request but record the match. The rollout posture.
+    Observe,
+}
+
+impl EnforcementMode {
+    /// True when a match should refuse the request.
+    pub fn blocks(self) -> bool {
+        matches!(self, Self::Block)
+    }
+
+    /// Build from a legacy `test_mode`-style boolean, where `true`
+    /// means "log but do not block".
+    pub fn from_test_mode(test_mode: bool) -> Self {
+        if test_mode {
+            Self::Observe
+        } else {
+            Self::Block
+        }
+    }
+
+    /// Stable label for metrics and audit events.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Observe => "observe",
+        }
+    }
+}
+
+/// Superseded by [`FailureMode`]. Behavior when the governance backend
+/// cannot serve a reserve call
 /// (`sbproxy_ai::governance::GovernanceStore::reserve`).
 ///
 /// Applies only to a reserve call that fails with
@@ -1716,6 +1972,10 @@ impl Default for KeyGovernanceConfig {
 /// (invalid request shape, a reservation id reused with different input,
 /// a hit against a real governed limit, arithmetic overflow) is unrelated
 /// to backend availability and is not affected by this setting.
+///
+/// Kept because `failure_mode: closed | allow_unreserved` is pinned by
+/// test and by shipped configs. Read it through
+/// [`KeyGovernanceConfig::failure_posture`], never directly.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
 )]
@@ -1767,6 +2027,54 @@ impl KeyGovernanceConfigError {
 }
 
 impl KeyGovernanceConfig {
+    /// This control's posture expressed in the shared [`FailureMode`]
+    /// vocabulary. The one read path for a governance backend outage.
+    ///
+    /// Precedence: an explicit `failure_posture` wins; otherwise the
+    /// legacy `failure_mode` is converted. `closed` maps to
+    /// [`FailureMode::Closed`], and `allow_unreserved` maps to
+    /// [`FailureMode::Degraded`] rather than a plain open, because the
+    /// request proceeds without the reservation this control exists to
+    /// make and that fact is separately recorded.
+    ///
+    /// Reading the posture only here is the point of the whole exercise:
+    /// a config key that nothing reads reproduces the defect this key
+    /// exists to fix, so `failure_mode` has no other consumer left.
+    pub fn failure_posture(&self) -> FailureMode {
+        if let Some(explicit) = self.failure_posture {
+            return explicit;
+        }
+        match self.failure_mode {
+            GovernanceFailureMode::Closed => FailureMode::Closed,
+            GovernanceFailureMode::AllowUnreserved => FailureMode::Degraded,
+        }
+    }
+
+    /// Reject a posture that has no meaning for a governance reserve call.
+    ///
+    /// [`FailureMode::Observe`] records the decision a control *would*
+    /// have taken. A reserve call that never reached its backend produced
+    /// no such decision, so accepting `observe` here would mean silently
+    /// picking some other behaviour on the operator's behalf. Refusing at
+    /// config-compile time is the honest alternative.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operator-facing message, naming the exact config path,
+    /// when the posture cannot be honoured at this site.
+    pub fn validate_failure_posture(&self) -> Result<(), String> {
+        if self.failure_posture == Some(FailureMode::Observe) {
+            return Err(
+                "key_management.governance.failure_posture: `observe` is meaningless for a \
+                 governance backend outage, because a reserve call that never reached its \
+                 backend has no counterfactual verdict to record. Use `closed`, `degraded`, \
+                 or `open`."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Reservation lease duration converted to runtime milliseconds.
     pub fn lease_ttl_millis(&self) -> Result<u64, KeyGovernanceConfigError> {
         self.lease_ttl_secs.checked_mul(1_000).ok_or_else(|| {
@@ -1785,6 +2093,8 @@ impl KeyGovernanceConfig {
 
     /// Validate governance invariants before pipeline construction or reload.
     pub fn validate(&self) -> Result<(), KeyGovernanceConfigError> {
+        self.validate_failure_posture()
+            .map_err(KeyGovernanceConfigError::invalid)?;
         if self.lease_ttl_secs == 0 {
             return Err(KeyGovernanceConfigError::invalid(
                 "lease_ttl_secs must be positive",
@@ -2249,16 +2559,105 @@ pub struct KeyManagementConfig {
     /// on every reload.
     #[serde(default)]
     pub allow_api_override: bool,
-    /// When the store is unreachable, allow the request through in a degraded
-    /// mode. Default false: fail closed (deny).
+    /// Superseded by `failure_posture`. When the store is unreachable,
+    /// allow the request through in a degraded mode. Default false: fail
+    /// closed (deny).
+    ///
+    ///
+    /// Note the polarity this field is named into: `true` here means
+    /// ALLOW, that is, fail open. Other booleans in this config carry
+    /// the opposite sense, which is the inconsistency [`FailureMode`]
+    /// exists to retire.
+    ///
+    ///
+    /// Still parsed, and still the value used when `failure_posture` is
+    /// absent, so an existing config keeps behaving exactly as it did.
+    /// Nothing in the runtime reads this field directly any more: every
+    /// store-outage decision goes through
+    /// [`KeyManagementConfig::failure_posture`].
     #[serde(default)]
     pub failure_mode_allow: bool,
+    /// Failure posture for a key-store outage, in the shared
+    /// [`FailureMode`] vocabulary.
+    ///
+    ///
+    /// Set this in preference to `failure_mode_allow`. When present it
+    /// wins; when absent the legacy boolean is converted (`false` becomes
+    /// `closed`, `true` becomes `degraded`). It is `Option` on purpose,
+    /// so "the operator said nothing" stays distinguishable from "the
+    /// operator explicitly asked for the default".
+    ///
+    ///
+    /// `closed` refuses with 503. `degraded` and `open` both let the
+    /// request fall through to the origin's own configured auth, which is
+    /// what `failure_mode_allow: true` has always done: it is not a
+    /// blanket admit. `degraded` is the honest label for it, because the
+    /// request proceeds with no per-key policy, no budget, and no
+    /// attribution, and that fact is recorded rather than passed over in
+    /// silence. `observe` is meaningless here and is rejected at
+    /// config-compile time: an unreachable store produced no
+    /// counterfactual verdict to record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_posture: Option<FailureMode>,
     /// Optional OIDC/JWT claim to virtual-key mapping.
     #[serde(default)]
     pub oidc_claim_map: Option<OidcClaimMapConfig>,
     /// Optional declarative seed of keys and credentials.
     #[serde(default)]
     pub seed: KeySeedConfig,
+}
+
+impl KeyManagementConfig {
+    /// What the key plane does when the store cannot be reached, in the
+    /// shared [`FailureMode`] vocabulary. The one read path for a
+    /// key-store outage.
+    ///
+    /// Precedence: an explicit `failure_posture` wins; otherwise the
+    /// legacy `failure_mode_allow` boolean is converted. `false` maps to
+    /// [`FailureMode::Closed`], which is a 503. `true` maps to
+    /// [`FailureMode::Degraded`] rather than [`FailureMode::Open`]: the
+    /// request does proceed, but only by falling through to the origin's
+    /// own configured auth, with no per-key policy, no budget, and no
+    /// attribution. That is a guarantee waived, not a guarantee that was
+    /// never claimed, and it is worth being able to alert on separately.
+    ///
+    /// Both admitting postures behave identically at the four call sites
+    /// that read this. They differ in what they leave behind, which is
+    /// the whole distinction [`FailureMode`] exists to draw.
+    pub fn failure_posture(&self) -> FailureMode {
+        if let Some(explicit) = self.failure_posture {
+            return explicit;
+        }
+        if self.failure_mode_allow {
+            FailureMode::Degraded
+        } else {
+            FailureMode::Closed
+        }
+    }
+
+    /// Reject a posture that has no meaning for a key-store outage, at
+    /// this block or at the nested `governance:` block.
+    ///
+    /// [`FailureMode::Observe`] records the decision a control *would*
+    /// have taken. A store that could not be read produced no such
+    /// decision, so accepting `observe` would mean silently picking some
+    /// other behaviour on the operator's behalf.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operator-facing message, naming the exact config path,
+    /// when the posture cannot be honoured at the site that declares it.
+    pub fn validate_failure_posture(&self) -> Result<(), String> {
+        if self.failure_posture == Some(FailureMode::Observe) {
+            return Err(
+                "key_management.failure_posture: `observe` is meaningless for a key-store \
+                 outage, because a store that could not be read has no counterfactual verdict \
+                 to record. Use `closed`, `degraded`, or `open`."
+                    .to_string(),
+            );
+        }
+        self.governance.validate_failure_posture()
+    }
 }
 
 /// Which store backend backs the key plane.
@@ -7842,7 +8241,7 @@ proxy:
   extensions:
     classifier:
       endpoint: "http://127.0.0.1:9500"
-    semantic_cache:
+    custom_metadata:
       enabled: true
 origins: {}
 "#;
@@ -7850,8 +8249,8 @@ origins: {}
         let ext = cfg.proxy.extensions;
         assert!(ext.contains_key("classifier"), "classifier ext present");
         assert!(
-            ext.contains_key("semantic_cache"),
-            "semantic_cache ext present"
+            ext.contains_key("custom_metadata"),
+            "custom_metadata ext present"
         );
         let cls = ext.get("classifier").unwrap();
         assert_eq!(
@@ -7873,8 +8272,9 @@ origins: {}
 
     #[test]
     fn origin_extensions_accepts_arbitrary_nested_yaml() {
-        // Per-origin enterprise extensions (e.g. semantic_cache) live in
-        // a sibling opaque map that OSS never inspects.
+        // Per-origin extensions live in a sibling opaque map that nothing
+        // in this workspace inspects. The map keeps arbitrary nested
+        // shapes intact for whoever reads it.
         let yaml = r#"
 origins:
   api.example.com:
@@ -7882,22 +8282,22 @@ origins:
       type: proxy
       url: http://localhost:3000
     extensions:
-      semantic_cache:
+      custom_metadata:
         enabled: true
         ttl_secs: 1200
-        key_template: "{embedding_model}:{lsh_bucket}"
+        label: "{team}:{tier}"
 "#;
         let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
         let origin = &cfg.origins["api.example.com"];
-        let sc = origin
+        let custom = origin
             .extensions
-            .get("semantic_cache")
-            .expect("semantic_cache extension parsed");
-        assert!(sc.get("enabled").unwrap().as_bool().unwrap());
-        assert_eq!(sc.get("ttl_secs").unwrap().as_u64().unwrap(), 1200);
+            .get("custom_metadata")
+            .expect("custom_metadata extension parsed");
+        assert!(custom.get("enabled").unwrap().as_bool().unwrap());
+        assert_eq!(custom.get("ttl_secs").unwrap().as_u64().unwrap(), 1200);
         assert_eq!(
-            sc.get("key_template").unwrap().as_str().unwrap(),
-            "{embedding_model}:{lsh_bucket}"
+            custom.get("label").unwrap().as_str().unwrap(),
+            "{team}:{tier}"
         );
     }
 

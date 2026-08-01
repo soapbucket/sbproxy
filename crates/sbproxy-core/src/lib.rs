@@ -173,6 +173,10 @@ pub mod router;
 /// into a typed `sb_flags::RequestFlags` struct that the request
 /// pipeline reads to alter behavior on the current request only.
 pub mod sb_flags;
+/// WOR-2099: per-action semantic caches built once per compiled pipeline,
+/// keyed by origin and optional forward rule. The `backend` field selects
+/// memory, Redis, or mesh at runtime; no Cargo feature gates the choice.
+pub mod semantic_cache_runtime;
 pub mod server;
 /// Synthetic-transaction probe driver. Background task that
 /// fires an in-process request through the compiled handler chain

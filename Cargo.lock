@@ -8749,6 +8749,7 @@ dependencies = [
  "minijinja",
  "object_store",
  "parking_lot",
+ "postcard",
  "prometheus 0.14.0",
  "rand 0.8.6",
  "redb 2.6.3",
@@ -8759,6 +8760,7 @@ dependencies = [
  "sbproxy-config",
  "sbproxy-extension",
  "sbproxy-httpkit",
+ "sbproxy-meter",
  "sbproxy-model-host",
  "sbproxy-platform",
  "sbproxy-plugin",
@@ -8930,6 +8932,7 @@ dependencies = [
  "hmac",
  "http 1.4.0",
  "rcgen",
+ "rustix 0.38.44",
  "sbproxy-capability",
  "sbproxy-observe",
  "sbproxy-platform",
@@ -9210,6 +9213,21 @@ dependencies = [
  "url",
  "x509-parser",
  "yaml_serde",
+]
+
+[[package]]
+name = "sbproxy-meter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "ed25519-dalek",
+ "hex",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tracing",
 ]
 
 [[package]]

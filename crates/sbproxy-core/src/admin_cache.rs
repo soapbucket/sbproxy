@@ -35,12 +35,18 @@ pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<Resp> {
 }
 
 /// `GET /admin/cache/semantic`: recent semantic (embedding) cache lookup
-/// decisions per AI origin, so an operator can see why requests hit or
+/// decisions per AI route, so an operator can see why requests hit or
 /// missed (WOR-1756). Each decision carries the reason (`hit`,
-/// `no_entry`, `expired`, `below_threshold`, `cross_scope`), the score
-/// where relevant, and the threshold. `?limit=N` bounds the count.
+/// `no_entry`, `expired`, `below_threshold`, `incompatible`,
+/// `backend_error`), the score where relevant, and the threshold.
+/// `?limit=N` bounds the count.
+///
+/// Read from the compiled semantic-cache registry rather than from the
+/// action config. The registry owns the instance the request path
+/// actually uses, and it is keyed per origin *and* forward rule, so a
+/// forward rule with its own `semantic_cache:` block reports separately
+/// instead of being hidden behind its origin.
 fn semantic_debug(path: &str) -> Resp {
-    use sbproxy_modules::Action;
     let limit = path
         .split_once("limit=")
         .and_then(|(_, rest)| rest.split('&').next())
@@ -49,21 +55,25 @@ fn semantic_debug(path: &str) -> Resp {
         .min(100);
     let pipeline = crate::reload::current_pipeline();
     let mut caches = Vec::new();
-    for (idx, action) in pipeline.actions.iter().enumerate() {
-        if let Action::AiProxy(ai) = action {
-            if let Some(cache) = ai.config.embedding_cache() {
-                let origin = pipeline
-                    .config
-                    .origins
-                    .get(idx)
-                    .map(|o| o.hostname.to_string())
-                    .unwrap_or_default();
-                caches.push(json!({
-                    "origin": origin,
-                    "recent": cache.recent_decisions(limit),
-                }));
-            }
+    for registration in pipeline.semantic_caches.registrations() {
+        let Some(cache) = registration.cache else {
+            continue;
+        };
+        let origin = pipeline
+            .config
+            .origins
+            .get(registration.origin_idx)
+            .map(|o| o.hostname.to_string())
+            .unwrap_or_default();
+        let mut entry = json!({
+            "origin": origin,
+            "backend": registration.backend,
+            "recent": cache.recent_decisions(limit),
+        });
+        if let Some(rule) = registration.forward_rule_idx {
+            entry["forward_rule"] = json!(rule);
         }
+        caches.push(entry);
     }
     (
         200,

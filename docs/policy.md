@@ -180,6 +180,8 @@ Depth, cycles, and caller and callee lists are all enforced before the upstream 
 
 Per-route enforcement for agent-to-agent calls. Source: `crates/sbproxy-modules/src/policy/a2a.rs`. The policy fires after authentication and after the resolver chain has populated `caller_agent_id`. Detection runs automatically on two header signals (`Content-Type: application/a2a+json` and `MCP-Method: agents.invoke`); `route_glob` is the operator escape hatch.
 
+Both header signals are the caller's to send or withhold, and an undetected request is allowed, so **set `route_glob` on any route you intend to govern**. Likewise the envelope these checks read is only trusted when it comes from a signed token's RFC 8693 `act` chain or from a peer in `proxy.trusted_proxies`; from anyone else it is discarded and the policy evaluates an empty envelope that trips nothing. [A2A gateway](a2a-gateway.md) covers both in full. It is worth reading before relying on the knobs below.
+
 Knobs:
 
 - `max_chain_depth`: hard ceiling on hops. Capped at 32 regardless of the configured value. Exceeding it returns 429.

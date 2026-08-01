@@ -598,6 +598,8 @@ Input guardrails inspect the parsed prompt ahead of egress ([config](../examples
 
 The built-in pipeline supports ten guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, `context_poisoning`, `agent_alignment`, and `classifier`. Built-in guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. For HTTP policy services, use [external guardrail adapters](guardrails.md). For CEL-based request gating see the CEL section below, and [configuration.md](configuration.md#guardrails-guardrails) for the per-type field schema.
 
+An external guardrail entry carries two independent settings that are easy to confuse. `mode` picks when the adapter runs and, in the `logging_only` case, says it must never refuse; that is the enforcement axis. `failure_posture` says what happens when the adapter cannot be reached, is too slow, or returns something that is not a verdict; that is the failure axis. They compose: a guardrail can sit in `mode: logging_only` during rollout while already declaring `failure_posture: closed` for the day it starts enforcing. Accepted values are `closed` (refuse, the default), `open` (admit), and `degraded` (admit, and record that the content was never scanned; prefer this over `open`). `observe` is rejected on this axis, because a provider that never answered leaves no verdict to shadow-record; `mode: logging_only` is the observe-shaped setting, on the other axis. The older boolean spelling `fail_open: true|false` still parses and still means `open` and `closed`; setting both to values that disagree is a config-load error naming both keys. Field reference and the per-provider contracts are in [guardrails.md](guardrails.md).
+
 Input guardrails apply to whichever body field the surface carries user text in:
 
 | Surface | Field guarded |
@@ -970,6 +972,10 @@ action:
 ```
 
 The action table, the full `ai.*` namespace, and the fail-open semantics are in [ai-policy-cel.md](ai-policy-cel.md).
+
+`on_error` is the one failure setting in the AI gateway that does not use the shared `closed` / `open` / `degraded` / `observe` posture words, and that is deliberate. A posture answers a single question, does the request proceed. `on_error` is a whole fallback decision drawn from the same action set the expression itself emits, so it can route, redact, tag, and audit in one go: `on_error: redact route_to:gpt-4o-mini audit:high` is a real configuration that no posture word can express. Two of the seven tokens do line up, and it is worth knowing which: `block` is the shared `closed`, and `allow` is the shared `open`. Every token is parsed and validated when the policy is compiled at config load, so a bad `on_error` is a startup failure rather than a request-time surprise.
+
+The default is `allow`, and it is the one place in the gateway where defaulting open is correct. `on_error` fires when the operator's own expression could not be evaluated: a typo in a field path, a type error, a token outside the closed set. That is a bug in a rule, not evidence that the request is dangerous, and the guardrails, budgets, and rate limits that do enforce security boundaries have already run and are unaffected. Defaulting closed would let one malformed expression black-hole every request on the route. Set `on_error: block` for the strict reading, or `on_error: allow audit:high` to keep the failure visible without refusing traffic.
 
 ## Budgets
 

@@ -12,4 +12,11 @@
 # DNS resolver, address policy, fixture-pinned client builder, escape
 # helper, render probe) must be `pub` for `tests/` to reach them. All
 # are `#[doc(hidden)]` and most also have in-crate production callers.
-216
+#
+# Raised to 218 on WOR-2099, 2026-07-31: the distributed semantic cache
+# added `SemanticNamespace::origin_prefix` and
+# `SEMANTIC_ANONYMOUS_CREDENTIAL`, both in sbproxy-ai and both consumed
+# from sbproxy-core's test modules (the Redis purge-scope tests and the
+# credential-identity tests). Cross-crate test use requires `pub`, so
+# neither can be narrowed, and both have in-file production callers.
+218

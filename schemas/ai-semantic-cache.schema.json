@@ -1,0 +1,370 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EmbeddingCacheConfig",
+  "description": "Operator config for the OSS embedding semantic cache, parsed from an `ai_proxy` action's `semantic_cache:` block.\n\nUnknown keys are rejected, so a stale `streaming:` or `key_template:` entry fails the load instead of silently doing nothing.",
+  "type": "object",
+  "properties": {
+    "enabled": {
+      "description": "Opt-in switch. The cache is inert unless this is `true`.",
+      "default": false,
+      "type": "boolean"
+    },
+    "backend": {
+      "description": "Which store backs this cache. Defaults to `memory`.",
+      "default": "memory",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SemanticCacheBackend"
+        }
+      ]
+    },
+    "threshold": {
+      "description": "Minimum cosine similarity (`0.0..=1.0`) for a near-duplicate prompt to be served from cache. Defaults to 0.85.",
+      "default": 0.8500000238418579,
+      "type": "number",
+      "format": "float",
+      "maximum": 1.0,
+      "minimum": 0.0
+    },
+    "ttl_secs": {
+      "description": "Entry time-to-live in seconds. Defaults to 3600.",
+      "default": 3600,
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 1.0
+    },
+    "max_entries": {
+      "description": "Memory LRU capacity, 1 through [`MAX_SEMANTIC_CACHE_ENTRIES`]. Defaults to 1024. Redis and mesh accept the field for configuration compatibility and bound entries by TTL instead.",
+      "default": 1024,
+      "type": "integer",
+      "format": "uint",
+      "maximum": 1000000.0,
+      "minimum": 1.0
+    },
+    "max_response_bytes": {
+      "description": "Optional cap on a cached response body in bytes, 1 through [`MAX_SEMANTIC_RESPONSE_BYTES`]. Omitted preserves the current memory behavior; Redis and mesh still enforce the fixed wire-entry ceiling.",
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "maximum": 7340032.0,
+      "minimum": 1.0
+    },
+    "lsh": {
+      "description": "Candidate-generation bounds for the distributed backends.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SemanticLshConfig"
+        }
+      ]
+    },
+    "source": {
+      "description": "Where prompt embeddings come from. Defaults to `provider` so existing configs are unchanged.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/EmbeddingSource"
+        }
+      ]
+    },
+    "embedding": {
+      "description": "Embedding provider and model used to vectorize prompts (for `source: provider`).",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/EmbeddingProviderConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sidecar": {
+      "description": "Local classifier-sidecar embedding endpoint (for `source: sidecar`).",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SidecarEmbeddingConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "inprocess": {
+      "description": "In-process embedder (for `source: inprocess`).",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/InprocessEmbeddingConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "openai": {
+      "description": "Standalone OpenAI-compatible endpoint (for `source: openai`).",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/OpenAiEmbeddingConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "SemanticCacheBackend": {
+      "description": "Which store backs the semantic cache for this action.",
+      "oneOf": [
+        {
+          "description": "Process-local LRU with a full same-namespace cosine scan. The default, so an existing configuration keeps today's behavior.",
+          "type": "string",
+          "enum": [
+            "memory"
+          ]
+        },
+        {
+          "description": "Shared Redis, reusing the validated `proxy.l2_cache_settings` connection.",
+          "type": "string",
+          "enum": [
+            "redis"
+          ]
+        },
+        {
+          "description": "The current cluster mesh, routed by key prefix over the authenticated transport.",
+          "type": "string",
+          "enum": [
+            "mesh"
+          ]
+        }
+      ]
+    },
+    "SemanticLshConfig": {
+      "description": "Deterministic locality-sensitive hashing bounds used for candidate generation on the distributed backends.\n\nThe memory backend keeps its full same-namespace scan, so these values do not change the recall of an existing memory deployment.",
+      "type": "object",
+      "properties": {
+        "tables": {
+          "description": "Number of independent hash tables, 1 through [`MAX_LSH_TABLES`].",
+          "default": 8,
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 16.0,
+          "minimum": 1.0
+        },
+        "planes": {
+          "description": "Random projection planes per table, 1 through [`MAX_LSH_PLANES`].",
+          "default": 6,
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 63.0,
+          "minimum": 1.0
+        },
+        "candidates_per_bucket": {
+          "description": "Candidates read from one bucket, 1 through [`MAX_CANDIDATES_PER_BUCKET`].",
+          "default": 32,
+          "type": "integer",
+          "format": "uint",
+          "maximum": 256.0,
+          "minimum": 1.0
+        },
+        "seed": {
+          "description": "Seed for the deterministic projections, 1 through 128 bytes. Two nodes must share this value to agree on buckets.",
+          "default": "sbproxy-semantic-v2",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "EmbeddingSource": {
+      "description": "Where the semantic cache gets prompt embeddings.",
+      "oneOf": [
+        {
+          "description": "Call an AI embedding provider's `/v1/embeddings` API (default, back-compat). Costs money and egresses the prompt.",
+          "type": "string",
+          "enum": [
+            "provider"
+          ]
+        },
+        {
+          "description": "Call the local classifier sidecar's `Embed` RPC. Free, no egress.",
+          "type": "string",
+          "enum": [
+            "sidecar"
+          ]
+        },
+        {
+          "description": "Run an in-process tract embedder. Single-binary, but loads a model into the proxy address space (opt-in).",
+          "type": "string",
+          "enum": [
+            "inprocess"
+          ]
+        },
+        {
+          "description": "Call a standalone OpenAI-compatible `/v1/embeddings` endpoint that is not one of the origin's chat providers (another sbproxy, OpenRouter, ...). Decoupled from `providers`; carries its own URL and auth.",
+          "type": "string",
+          "enum": [
+            "openai"
+          ]
+        }
+      ]
+    },
+    "EmbeddingProviderConfig": {
+      "description": "Which provider and model computes prompt embeddings.",
+      "type": "object",
+      "required": [
+        "model",
+        "provider"
+      ],
+      "properties": {
+        "provider": {
+          "description": "Provider name (must match an entry in the handler's `providers`).",
+          "type": "string"
+        },
+        "model": {
+          "description": "Embedding model id, e.g. `text-embedding-3-small`.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SidecarEmbeddingConfig": {
+      "description": "Sidecar embedding endpoint config (for `source: sidecar`).\n\nThe sidecar is local by contract: `endpoint` must be an absolute HTTP or HTTPS URL whose host is a literal loopback address and whose port is explicit.",
+      "type": "object",
+      "required": [
+        "endpoint"
+      ],
+      "properties": {
+        "endpoint": {
+          "description": "gRPC endpoint, e.g. `http://127.0.0.1:9440`.",
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "description": "Embedding model id (empty selects the sidecar default).",
+          "default": "",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "Per-call timeout in milliseconds, 1 through [`MAX_EMBEDDING_TIMEOUT_MS`]. Defaults to 500.",
+          "default": 500,
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 60000.0,
+          "minimum": 1.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "InprocessEmbeddingConfig": {
+      "description": "In-process embedder config (for `source: inprocess`).\n\nProvide explicit `model_path` and `tokenizer_path`. Known-model auto-download for the in-process embedder is a follow-up; until then the operator points at on-disk ONNX and tokenizer files.",
+      "type": "object",
+      "properties": {
+        "model": {
+          "description": "Logical model id (informational; e.g. `all-MiniLM-L6-v2`).",
+          "default": "",
+          "type": "string"
+        },
+        "model_path": {
+          "description": "Path to the ONNX model file.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tokenizer_path": {
+          "description": "Path to the tokenizer.json file.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_model_bytes": {
+          "description": "Max model size in bytes (guard). None uses the engine default.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "OpenAiEmbeddingConfig": {
+      "description": "Standalone OpenAI-compatible embedding endpoint config (for `source: openai`).\n\nUnlike `source: provider`, this is not tied to the origin's chat `providers`: point `base_url` at any OpenAI-compatible `/v1/embeddings` route (another sbproxy, OpenRouter, ...). Auth defaults to `Authorization: Bearer <api_key>`; set `auth_header` and `auth_prefix` for `api-key` or `x-api-key` style endpoints, or omit `api_key` and carry the auth in `headers`.\n\nPublic destinations are the default. A private or loopback destination requires the explicit `allow_private_base_url` opt-in and is still resolved and pinned on every call.",
+      "type": "object",
+      "required": [
+        "base_url"
+      ],
+      "properties": {
+        "base_url": {
+          "description": "OpenAI-compatible base URL, e.g. `https://api.openai.com/v1`. `/v1/embeddings` is appended (an overlapping trailing `/v1` is collapsed, matching the chat-provider path join).",
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "description": "Embedding model id, e.g. `text-embedding-3-small`.",
+          "default": "",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "Per-call timeout in milliseconds, 1 through [`MAX_EMBEDDING_TIMEOUT_MS`]. Defaults to 2000.",
+          "default": 2000,
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 60000.0,
+          "minimum": 1.0
+        },
+        "api_key": {
+          "description": "API key. Interpolated (`${VAR}` or vault) by the config layer. When set, sent as `{auth_header}: {auth_prefix}{api_key}`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "auth_header": {
+          "description": "Auth header name. Defaults to `Authorization`.",
+          "default": "Authorization",
+          "type": "string"
+        },
+        "auth_prefix": {
+          "description": "Prefix prepended to the key in the auth header. Defaults to `Bearer `; set to `\"\"` for raw-key headers like `api-key` or `x-api-key`.",
+          "default": "Bearer ",
+          "type": "string"
+        },
+        "headers": {
+          "description": "Extra static headers, sent verbatim and applied after the auth header (e.g. OpenRouter `HTTP-Referer` and `X-Title`, or a custom auth header when `api_key` is omitted). Interpolated by the config layer.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "maxItems": 2,
+            "minItems": 2
+          }
+        },
+        "allow_private_base_url": {
+          "description": "Permit a private or loopback embedding destination. Public-only by default.",
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

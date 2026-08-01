@@ -1,8 +1,21 @@
 use sbproxy_ai::external_guardrail::{
     check_external_guardrail, CompiledGuardrailProvider, ExternalGuardrailConfig,
-    ExternalGuardrailRequest, GuardrailPhase, GuardrailProvider, GuardrailVerdict,
+    ExternalGuardrailRequest, FailureMode, GuardrailPhase, GuardrailProvider, GuardrailVerdict,
 };
 use std::time::Duration;
+
+/// Every provider adapter the failure axis has to behave identically
+/// across. The name doubles as the wire `provider` tag.
+const ALL_PROVIDERS: [&str; 8] = [
+    "lakera",
+    "aporia",
+    "mistral",
+    "patronus",
+    "crowd_strike",
+    "pangea",
+    "azure_content_safety",
+    "bedrock",
+];
 
 const TIMEOUT_FIXTURE_RESPONSE_DELAY: Duration = Duration::from_millis(500);
 const TIMEOUT_FIXTURE_CLIENT_TIMEOUT_MS: u64 = 250;
@@ -133,11 +146,10 @@ async fn check_fixture_case(
         check_external_guardrail(config, request(phase)).await
     } else {
         let verdict = check_after_fixture_reads_request(config, request(phase), request_read).await;
-        let expected_reason = if config.fail_open {
-            "external guardrail unavailable; fail-open"
-        } else {
-            "external guardrail unavailable; fail-closed"
-        };
+        // Read through the accessor, not the legacy boolean: a config
+        // that spells `failure_posture` directly reaches the same
+        // timeout path and must produce the matching reason.
+        let expected_reason = unavailable_reason(config.failure_posture());
         assert_eq!(
             verdict.reason.as_deref(),
             Some(expected_reason),
@@ -153,6 +165,69 @@ fn request(phase: GuardrailPhase) -> ExternalGuardrailRequest<'static> {
         model: "fixture-model",
         phase,
     }
+}
+
+/// The operator-safe reason each failure posture produces when the
+/// provider never returned a verdict.
+fn unavailable_reason(posture: FailureMode) -> &'static str {
+    match posture {
+        FailureMode::Open => "external guardrail unavailable; fail-open",
+        FailureMode::Degraded => "external guardrail unavailable; content was not scanned",
+        FailureMode::Closed | FailureMode::Observe => "external guardrail unavailable; fail-closed",
+    }
+}
+
+/// The provider-specific required fields each adapter needs before it
+/// will compile. Kept next to the posture sweep so a new provider is one
+/// entry away from being covered on the failure axis too.
+fn provider_required_fields(provider: &str) -> serde_json::Value {
+    match provider {
+        "aporia" => serde_json::json!({"project_id": "fixture-project"}),
+        "bedrock" => serde_json::json!({
+            "guardrail_id": "fixture-guardrail",
+            "guardrail_version": "1"
+        }),
+        "pangea" => serde_json::json!({
+            "input_recipe": "fixture-input-recipe",
+            "output_recipe": "fixture-output-recipe"
+        }),
+        "patronus" => serde_json::json!({"evaluator": "prompt-injection"}),
+        _ => serde_json::json!({}),
+    }
+}
+
+/// A config for `provider` carrying `extra` on top of the fields every
+/// adapter needs. The two failure-axis spellings differ only in `extra`,
+/// so the sweeps below compare like with like.
+fn provider_document(provider: &str, url: String, extra: serde_json::Value) -> serde_json::Value {
+    let mut document = serde_json::json!({
+        "name": provider,
+        "provider": provider,
+        "url": url,
+        "mode": "during_call",
+        "api_key": "fixture-key",
+        "allow_private_url": true,
+        "timeout_ms": 2_000
+    });
+    let fields = document.as_object_mut().expect("fixture is an object");
+    for source in [provider_required_fields(provider), extra] {
+        let source = source.as_object().expect("overlay is an object").clone();
+        fields.extend(source);
+    }
+    document
+}
+
+/// A config for `provider` that spells the failure axis with
+/// `failure_posture` instead of the legacy boolean.
+fn posture_config(provider: &str, url: String, posture: &str) -> ExternalGuardrailConfig {
+    let extra = serde_json::json!({ "failure_posture": posture });
+    serde_json::from_value(provider_document(provider, url, extra)).expect("posture fixture config")
+}
+
+/// A config for `provider` that spells the failure axis the legacy way.
+fn provider_legacy_config(provider: &str, url: String, fail_open: bool) -> ExternalGuardrailConfig {
+    let extra = serde_json::json!({ "fail_open": fail_open });
+    serde_json::from_value(provider_document(provider, url, extra)).expect("legacy fixture config")
 }
 
 fn provider_config(
@@ -1351,5 +1426,121 @@ async fn bedrock_guardrail_blocks_intervention_and_rejects_unknown_actions_safel
         assert!(finish_fixture(received)
             .await
             .starts_with("POST /guardrail/fixture-guardrail/version/1/apply HTTP/1.1\r\n"));
+    }
+}
+
+/// Every provider adapter honors an explicitly spelled failure posture,
+/// and reaches the same decision the legacy boolean reaches.
+///
+/// This is the boolean sweep run a second time on the new spelling. It
+/// does not replace it: `fail_open: true|false` is still exercised per
+/// provider above, so both wire forms stay pinned.
+#[tokio::test]
+async fn every_provider_honors_an_explicit_failure_posture() {
+    let cases = [("closed", false), ("open", true), ("degraded", true)];
+    for provider in ALL_PROVIDERS {
+        for (posture, expected_allowed) in cases {
+            let (base_url, received) = fixture_server(502, r#"{}"#, Duration::ZERO).await;
+            let config = posture_config(provider, base_url, posture);
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{provider} with {posture} must load: {error}"));
+
+            let verdict = check_external_guardrail(&config, request(GuardrailPhase::Input)).await;
+
+            assert_eq!(
+                verdict.allowed, expected_allowed,
+                "provider={provider} failure_posture={posture}"
+            );
+            assert_eq!(
+                verdict.reason.as_deref(),
+                Some(unavailable_reason(config.failure_posture())),
+                "provider={provider} failure_posture={posture}"
+            );
+            let _ = finish_fixture(received).await;
+        }
+    }
+}
+
+/// `degraded` admits exactly like `open` does, and says something
+/// different about why. That difference is the whole reason the posture
+/// exists: the request was not scanned, and the record should say so.
+#[tokio::test]
+async fn degraded_admits_like_open_but_records_the_waived_guarantee() {
+    let (open_url, open_received) = fixture_server(502, r#"{}"#, Duration::ZERO).await;
+    let open = posture_config("lakera", open_url, "open");
+    let open_verdict = check_external_guardrail(&open, request(GuardrailPhase::Input)).await;
+
+    let (degraded_url, degraded_received) = fixture_server(502, r#"{}"#, Duration::ZERO).await;
+    let degraded = posture_config("lakera", degraded_url, "degraded");
+    let degraded_verdict =
+        check_external_guardrail(&degraded, request(GuardrailPhase::Input)).await;
+
+    assert!(open_verdict.allowed);
+    assert!(degraded_verdict.allowed);
+    assert_ne!(open_verdict.reason, degraded_verdict.reason);
+    assert!(degraded.failure_posture().guarantee_waived());
+    assert!(!open.failure_posture().guarantee_waived());
+    let _ = finish_fixture(open_received).await;
+    let _ = finish_fixture(degraded_received).await;
+}
+
+/// A legacy document keeps its exact behavior, and an equivalent
+/// posture-spelled document reaches the same verdict on every provider.
+#[tokio::test]
+async fn legacy_boolean_and_equivalent_posture_agree_on_every_provider() {
+    for provider in ALL_PROVIDERS {
+        for (fail_open, posture) in [(false, "closed"), (true, "open")] {
+            let (legacy_url, legacy_received) = fixture_server(502, r#"{}"#, Duration::ZERO).await;
+            let legacy = provider_legacy_config(provider, legacy_url, fail_open);
+            let legacy_verdict =
+                check_external_guardrail(&legacy, request(GuardrailPhase::Input)).await;
+
+            let (modern_url, modern_received) = fixture_server(502, r#"{}"#, Duration::ZERO).await;
+            let modern = posture_config(provider, modern_url, posture);
+            let modern_verdict =
+                check_external_guardrail(&modern, request(GuardrailPhase::Input)).await;
+
+            assert_eq!(
+                legacy_verdict.allowed, modern_verdict.allowed,
+                "provider={provider} fail_open={fail_open} vs {posture}"
+            );
+            assert_eq!(
+                legacy_verdict.reason, modern_verdict.reason,
+                "provider={provider} fail_open={fail_open} vs {posture}"
+            );
+            let _ = finish_fixture(legacy_received).await;
+            let _ = finish_fixture(modern_received).await;
+        }
+    }
+}
+
+/// A document that spells the failure axis twice, and disagrees with
+/// itself, fails at config load with a message naming the site and both
+/// keys. `observe` is rejected outright: there is no verdict to
+/// shadow-record when the provider never answered.
+#[test]
+fn contradictory_and_meaningless_failure_axes_are_rejected_at_load() {
+    let endpoint = "https://8.8.8.8/check";
+    for provider in ALL_PROVIDERS {
+        let conflict = serde_json::json!({"fail_open": true, "failure_posture": "closed"});
+        let document = provider_document(provider, endpoint.to_owned(), conflict);
+        let config: ExternalGuardrailConfig =
+            serde_json::from_value(document).expect("conflicting document still deserializes");
+        let error = config
+            .validate()
+            .expect_err("a document that disagrees with itself must not load")
+            .to_string();
+        assert!(error.contains("external guardrail"), "{error}");
+        assert!(error.contains("fail_open"), "{error}");
+        assert!(error.contains("failure_posture"), "{error}");
+
+        let observe = posture_config(provider, endpoint.to_owned(), "observe");
+        let error = observe
+            .validate()
+            .expect_err("observe is meaningless on the failure axis")
+            .to_string();
+        assert!(error.contains("external guardrail"), "{error}");
+        assert!(error.contains("logging_only"), "{error}");
     }
 }

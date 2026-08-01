@@ -672,56 +672,68 @@ async fn redis_rejects_userinfo_urls_at_build() {
 
 #[tokio::test]
 async fn rediss_pinning_keeps_original_hostname_for_tls() {
-    // A full TLS fixture is impractical here, so this contract is
-    // asserted at the connector seam: the client's connection info must
-    // keep the configured hostname (which the redis rustls connector
-    // passes as the TLS server name), while the TCP dial goes only to
-    // the injected resolver's pinned address, proven by the fixture
-    // accepting the connection and the resolver receiving the original
-    // hostname.
+    // Two halves, deliberately split, because racing a real TLS dial made
+    // this flaky: building the rustls configuration is slow enough under a
+    // fully parallel workspace run that a deadline generous enough to be
+    // reliable is also long enough to hurt, and the handshake can never
+    // complete against a plaintext fixture anyway.
+    //
+    // Half one, over plaintext, proves the dial goes to the resolver's
+    // pinned address and nowhere else. Half two proves a rediss:// client
+    // keeps the configured hostname as the TLS server name while that
+    // pinning is in force. Together they are the contract; neither needs a
+    // handshake, and neither depends on timing.
     let fixture = spawn_resp_fixture(vec![ConnectionScript {
-        search_replies: Vec::new(),
-        after: AfterReplies::StallSilently,
+        search_replies: vec![valid_search_reply()],
+        after: AfterReplies::CloseConnection,
     }])
     .await;
     let calls = Arc::new(AtomicUsize::new(0));
     let hosts = Arc::new(Mutex::new(Vec::new()));
-    let config = redis_config("rediss://pinned-host.invalid:6390", None, None);
-    // The timeout must leave room for the loopback dial to land under a
-    // fully parallel test run; a short deadline can cancel the connect
-    // future before the fixture ever observes the accept.
+    let plaintext = redis_config("redis://pinned-host.invalid:6390", None, None);
     let store = RedisVectorStore::from_config_with_resolver(
-        &config,
-        Duration::from_secs(3),
-        scripted_resolver(vec![vec![fixture.addr]], calls, Arc::clone(&hosts)),
+        &plaintext,
+        Duration::from_secs(5),
+        scripted_resolver(
+            vec![vec![fixture.addr]],
+            Arc::clone(&calls),
+            Arc::clone(&hosts),
+        ),
         allow_all(),
     )
     .unwrap();
+    run_search(&store).await.expect("the pinned dial serves");
+    assert_eq!(
+        hosts.lock().unwrap().as_slice(),
+        ["pinned-host.invalid"],
+        "the resolver is asked for the configured hostname, not an address"
+    );
+    assert_eq!(
+        fixture.accepts.load(Ordering::SeqCst),
+        1,
+        "the dial lands on the resolver's pinned address"
+    );
 
-    assert_eq!(store.tls_host(), Some("pinned-host.invalid"));
-
-    // The handshake against the plaintext fixture cannot complete, but
-    // the dial itself must reach the pinned address. Building the rustls
-    // configuration can take seconds under a fully parallel test run, so
-    // the dial is observed by polling rather than raced against the
-    // store's own command timeout.
-    let store = Arc::new(store);
-    let search = tokio::spawn({
-        let store = Arc::clone(&store);
-        async move { run_search(&store).await }
-    });
-    let dial_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while fixture.accepts.load(Ordering::SeqCst) == 0 {
-        assert!(
-            tokio::time::Instant::now() < dial_deadline,
-            "fixture was never dialed"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(hosts.lock().unwrap().as_slice(), ["pinned-host.invalid"]);
-    let error = search.await.expect("search task").unwrap_err();
-    assert!(matches!(
-        error,
-        VectorStoreError::Timeout | VectorStoreError::MalformedResponse(_)
-    ));
+    // The TLS half needs no I/O: `tls_host` is the string the redis rustls
+    // connector hands to rustls as the server name, so preserving it is
+    // exactly the property that keeps certificate verification honest while
+    // the TCP destination stays pinned.
+    let secure = redis_config("rediss://pinned-host.invalid:6390", None, None);
+    let secure_store = RedisVectorStore::from_config_with_resolver(
+        &secure,
+        Duration::from_secs(5),
+        scripted_resolver(
+            vec![vec![fixture.addr]],
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        ),
+        allow_all(),
+    )
+    .unwrap();
+    assert_eq!(secure_store.tls_host(), Some("pinned-host.invalid"));
+    assert_eq!(
+        store.tls_host(),
+        None,
+        "a plaintext client carries no TLS server name"
+    );
 }

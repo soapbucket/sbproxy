@@ -5,6 +5,13 @@
 //! applies only around extraction, embedding, search, and rendering;
 //! injection failures always propagate because the operator enabled
 //! RAG and the canonical body cannot accept its context.
+//!
+//! A route spells its failure behavior either as a posture
+//! (`failure_posture: closed | degraded`) or as the wider `on_failure`
+//! block, which is the only way to reach `use_stale`. The runtime never
+//! reads either field directly: it takes
+//! [`sbproxy_ai::rag_config::RagRouteConfig::resolved_failure_policy`]
+//! once at build time.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -13,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 use sbproxy_ai::rag_config::{
-    RagEmbeddingConfig, RagFailurePolicy, RagFilterConfig, RagQueryConfig, RagRetrievalConfig,
-    RagRouteConfig, RagVectorStoreConfig,
+    FailureMode, RagEmbeddingConfig, RagFailurePolicy, RagFilterConfig, RagQueryConfig,
+    RagRetrievalConfig, RagRouteConfig, RagVectorStoreConfig,
 };
 use sha2::{Digest, Sha256};
 use tokio::time::timeout;
@@ -103,8 +110,11 @@ pub enum RetrievalOutcome {
     /// result carries no rendered context and injection leaves the
     /// body untouched.
     NoMatch,
-    /// A stage failed and the `continue_without_context` policy
-    /// downgraded the failure. No context is injected.
+    /// A stage failed and the route admitted the request anyway, having
+    /// waived the retrieval guarantee it advertises. Reached from
+    /// `failure_posture: degraded` or the equivalent
+    /// `on_failure: {mode: continue_without_context}`. No context is
+    /// injected.
     Continued,
     /// A stage failed and an unexpired stale entry was served instead.
     Stale,
@@ -166,7 +176,15 @@ pub struct RagRuntime {
     query_source: RagQueryConfig,
     filters: RagFilterConfig,
     retrieval: RagRetrievalConfig,
+    /// The failure behavior this route resolved to, with an explicit
+    /// `failure_posture` already desugared. `UseStale` is reachable only
+    /// through `on_failure`, so it can still appear here.
     on_failure: RagFailurePolicy,
+    /// The same decision in the shared vocabulary, for the two postures
+    /// it can express. Coherent with `on_failure` by construction:
+    /// `FailClosed` pairs with `Closed`, `ContinueWithoutContext` with
+    /// `Degraded`. The `UseStale` arm never reads it.
+    failure_posture: FailureMode,
     template: ContextTemplate,
     embedder: Arc<dyn Embedder>,
     vector_store: Arc<dyn VectorStore>,
@@ -233,7 +251,13 @@ impl RagRuntime {
         vector_store: Arc<dyn VectorStore>,
         clock: Clock,
     ) -> Self {
-        let stale = match &config.on_failure {
+        // One read path for both spellings. `failure_posture` desugars
+        // to a policy when set; otherwise `on_failure` is taken as
+        // written, which is the only way a route reaches `use_stale`.
+        // The stale cache is built for exactly that case, so a route
+        // that only declares a posture never allocates one.
+        let on_failure = config.resolved_failure_policy();
+        let stale = match &on_failure {
             RagFailurePolicy::UseStale {
                 max_age_secs,
                 max_entries,
@@ -248,7 +272,8 @@ impl RagRuntime {
             query_source: config.query.clone(),
             filters: config.filters.clone(),
             retrieval: config.retrieval.clone(),
-            on_failure: config.on_failure.clone(),
+            on_failure,
+            failure_posture: config.failure_posture(),
             template,
             embedder,
             vector_store,
@@ -404,35 +429,46 @@ impl RagRuntime {
         query: Option<&str>,
         error: RagError,
     ) -> Result<RetrievalResult, RagError> {
-        match &self.on_failure {
-            RagFailurePolicy::FailClosed => Err(error),
-            RagFailurePolicy::ContinueWithoutContext => Ok(RetrievalResult {
+        // `use_stale` keeps its own arm because it is the one posture
+        // the shared four-word vocabulary cannot say: admit with an
+        // older guarantee, and refuse when even that is missing. It also
+        // owns a cache, which no posture word can carry.
+        if matches!(self.on_failure, RagFailurePolicy::UseStale { .. }) {
+            let (Some(stale), Some(query)) = (self.stale.as_ref(), query) else {
+                return Err(error);
+            };
+            return match stale.lookup(tenant_id, query, (self.clock)()) {
+                Some(entry) => Ok(RetrievalResult {
+                    stats: RetrievalStats {
+                        chunk_count: entry.chunks.len(),
+                        context_bytes: entry.rendered_context.len(),
+                        embedding_ms: 0,
+                        search_ms: 0,
+                    },
+                    chunks: entry.chunks,
+                    rendered_context: Some(entry.rendered_context),
+                    outcome: RetrievalOutcome::Stale,
+                }),
+                // A miss or an expired entry serves the original
+                // provider error, never a cache error.
+                None => Err(error),
+            };
+        }
+
+        // Everything else is a plain posture, read through the shared
+        // vocabulary. `Closed` refuses. `Degraded` forwards the original
+        // request, which admits it without the retrieval this route
+        // advertises, and `RetrievalOutcome::Continued` is what records
+        // that the guarantee was waived.
+        if self.failure_posture.admits() {
+            Ok(RetrievalResult {
                 chunks: Vec::new(),
                 rendered_context: None,
                 outcome: RetrievalOutcome::Continued,
                 stats: RetrievalStats::default(),
-            }),
-            RagFailurePolicy::UseStale { .. } => {
-                let (Some(stale), Some(query)) = (self.stale.as_ref(), query) else {
-                    return Err(error);
-                };
-                match stale.lookup(tenant_id, query, (self.clock)()) {
-                    Some(entry) => Ok(RetrievalResult {
-                        stats: RetrievalStats {
-                            chunk_count: entry.chunks.len(),
-                            context_bytes: entry.rendered_context.len(),
-                            embedding_ms: 0,
-                            search_ms: 0,
-                        },
-                        chunks: entry.chunks,
-                        rendered_context: Some(entry.rendered_context),
-                        outcome: RetrievalOutcome::Stale,
-                    }),
-                    // A miss or an expired entry serves the original
-                    // provider error, never a cache error.
-                    None => Err(error),
-                }
-            }
+            })
+        } else {
+            Err(error)
         }
     }
 }

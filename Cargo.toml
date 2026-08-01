@@ -17,6 +17,7 @@ members = [
     "crates/sbproxy-keystore",
     "crates/sbproxy-storage",
     "crates/sbproxy-mesh",
+    "crates/sbproxy-meter",
     "crates/sbproxy-middleware",
     "crates/sbproxy-extension",
     "crates/sbproxy-ai",
@@ -56,6 +57,7 @@ default-members = [
     "crates/sbproxy-keystore",
     "crates/sbproxy-storage",
     "crates/sbproxy-mesh",
+    "crates/sbproxy-meter",
     "crates/sbproxy-middleware",
     "crates/sbproxy-extension",
     "crates/sbproxy-ai",
@@ -99,6 +101,11 @@ sbproxy-vault = { path = "crates/sbproxy-vault" }
 sbproxy-keystore = { path = "crates/sbproxy-keystore" }
 sbproxy-storage = { path = "crates/sbproxy-storage" }
 sbproxy-mesh = { path = "crates/sbproxy-mesh" }
+# WOR-2123: attested consumption metering, plus the hash chain and receipt
+# signing hoisted into it by WOR-2125. It takes third-party crates but no
+# workspace crate, so an operator metering a plain REST API never compiles the
+# AI stack to do it.
+sbproxy-meter = { path = "crates/sbproxy-meter" }
 sbproxy-middleware = { path = "crates/sbproxy-middleware" }
 sbproxy-extension = { path = "crates/sbproxy-extension" }
 sbproxy-model-host = { path = "crates/sbproxy-model-host" }
@@ -132,6 +139,10 @@ zeroize = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = { package = "yaml_serde", version = "0.10" }
+# Compact serde binary format shared by the internal mesh wire (RPC frames +
+# gossip) and the semantic-cache wire. Maintained, unlike bincode
+# (RUSTSEC-2025-0141). One declaration so both crates resolve the same copy.
+postcard = { version = "1", features = ["use-std"] }
 
 # Concurrency and data structures
 arc-swap = "1"

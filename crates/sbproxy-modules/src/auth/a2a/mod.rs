@@ -1,23 +1,31 @@
 //! A2A protocol envelope.
 //!
 //! The module exposes the shared `A2AContext` populated by the
-//! request filter and the detection function that runs before
-//! either spec parser. Parsers live behind feature flags so the
-//! default OSS build compiles detection only and treats matched
-//! requests as plain POSTs.
+//! request filter and the detection function that runs before any
+//! spec parser.
+//!
+//! The two `v0` draft parsers live behind feature flags, and nothing
+//! in the workspace enables them, so for those specs the default build
+//! compiles detection only and treats matched requests as plain POSTs.
+//! The ratified `v1` parser is **not** gated: gating it would leave
+//! the current standard in the same position the drafts are in, which
+//! is a parser nobody compiles and therefore no governance at all.
 
 #[cfg(feature = "a2a-anthropic")]
 pub mod anthropic;
 #[cfg(feature = "a2a-google")]
 pub mod google;
+pub mod v1;
 
 use serde::{Deserialize, Serialize};
 
 /// Closed enum of the A2A specs the proxy understands.
 ///
-/// New variants extend the wire envelope (closed-enum
-/// amendment rules). Today both variants carry the `v0` designation
-/// because the upstream drafts are unstable.
+/// New variants extend the wire envelope (closed-enum amendment
+/// rules). The two `v0` variants predate the standard and carry that
+/// designation because the drafts they model were unstable; A2A has
+/// since ratified 1.0, which is [`A2ASpec::V1_0`]. Prefer that for new
+/// work and treat the drafts as compatibility surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum A2ASpec {
     /// Anthropic A2A draft (`draft-anthropic-a2a-v0`). Modeled as an
@@ -26,6 +34,15 @@ pub enum A2ASpec {
     /// Google A2A draft (`draft-google-a2a-v0`). Dedicated content
     /// type `application/a2a+json`.
     GoogleV0,
+    /// Ratified [A2A 1.0](https://a2a-protocol.org/latest/specification/),
+    /// governed by the Linux Foundation.
+    ///
+    /// Unlike the two drafts above this one carries no distinguishing
+    /// content type: its JSON-RPC binding rides plain
+    /// `application/json`. Detection keys on the `A2A-Version` header
+    /// instead. Both drafts predate it and are kept only for peers that
+    /// have not migrated.
+    V1_0,
 }
 
 impl A2ASpec {
@@ -34,6 +51,7 @@ impl A2ASpec {
         match self {
             Self::AnthropicV0 => "anthropic-v0",
             Self::GoogleV0 => "google-v0",
+            Self::V1_0 => "v1.0",
         }
     }
 }
@@ -85,6 +103,20 @@ pub struct A2AContext {
     /// `"google-v0"`). Surfaced to the audit event verbatim so
     /// reconstructions across spec rev bumps stay debuggable.
     pub raw_envelope_version: String,
+    /// Whether the identity fields on this envelope came from a source
+    /// the proxy trusts.
+    ///
+    /// False means the fields were either absent or supplied by an
+    /// untrusted peer and therefore discarded. The distinction matters:
+    /// an untrusted caller that simply omits `x-a2a-chain` is
+    /// indistinguishable from a genuine chain root, so a policy that
+    /// wants to fail closed on unknown identity needs this flag rather
+    /// than inferring trust from `chain_depth == 1`.
+    ///
+    /// Set by [`envelope_from_headers`] from the caller's trust
+    /// decision; body parsers leave it false because a request body is
+    /// no more trustworthy than the headers that framed it.
+    pub identity_verified: bool,
 }
 
 impl A2AContext {
@@ -101,8 +133,138 @@ impl A2AContext {
             chain_depth: 1,
             chain: Vec::new(),
             raw_envelope_version: spec.as_label().to_string(),
+            identity_verified: false,
         }
     }
+}
+
+/// Build an [`A2AContext`] from the `x-a2a-*` request headers, honoring
+/// them only when the immediate peer is trusted.
+///
+/// `peer_trusted` MUST be the same trust decision the request filter
+/// makes from `proxy.trusted_proxies`. When it is false every
+/// `x-a2a-*` field is discarded and the returned envelope is the
+/// zero-default for `spec` with [`A2AContext::identity_verified`]
+/// clear.
+///
+/// This is the security boundary for the header transport. The fields
+/// feed `caller_denylist`, `callee_allowlist`, and cycle detection, so
+/// honoring them from an arbitrary client lets that client name itself,
+/// name its callee, and assert its own call chain.
+pub fn envelope_from_headers(
+    headers: &http::HeaderMap,
+    spec: A2ASpec,
+    peer_trusted: bool,
+) -> A2AContext {
+    let mut ctx = A2AContext::empty(spec);
+    if !peer_trusted {
+        return ctx;
+    }
+    ctx.identity_verified = true;
+
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+
+    if let Some(v) = get("x-a2a-caller-agent-id") {
+        ctx.caller_agent_id = v.to_string();
+    }
+    if let Some(v) = get("x-a2a-callee-agent-id") {
+        ctx.callee_agent_id = Some(v.to_string());
+    }
+    if let Some(v) = get("x-a2a-task-id") {
+        ctx.task_id = v.to_string();
+    }
+    if let Some(v) = get("x-a2a-parent-request-id") {
+        ctx.parent_request_id = Some(v.to_string());
+    }
+    if let Some(v) = get("x-a2a-chain-depth").and_then(|s| s.parse::<u32>().ok()) {
+        ctx.chain_depth = v.max(1);
+    }
+    if let Some(parsed) =
+        get("x-a2a-chain").and_then(|raw| serde_json::from_str::<Vec<ChainHop>>(raw).ok())
+    {
+        ctx.chain = parsed;
+    }
+
+    ctx
+}
+
+/// Walk the [RFC 8693] `act` (actor) delegation chain out of a set of
+/// already-verified token claims.
+///
+/// Returns the actor subjects **oldest first**, matching the ordering
+/// of [`A2AContext::chain`]. RFC 8693 nests the chain the other way
+/// round: the outermost `act` is the current actor and each nested
+/// `act` is a prior actor, so this reverses as it unwinds.
+///
+/// An actor level with no `sub` still counts as a hop. Skipping it
+/// would let a malformed token shorten its own apparent chain, which is
+/// the exact evasion the depth cap exists to stop.
+///
+/// The caller is responsible for having verified the token's signature;
+/// this reads claims and does not authenticate them.
+///
+/// [RFC 8693]: https://datatracker.ietf.org/doc/html/rfc8693#section-4.1
+pub fn chain_from_act_claims(claims: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    let mut newest_first = Vec::new();
+    let mut cur = claims.get("act");
+    while let Some(act) = cur {
+        newest_first.push(
+            act.get("sub")
+                .and_then(|s| s.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        );
+        cur = act.get("act");
+    }
+    newest_first.reverse();
+    newest_first
+}
+
+/// Overlay a verified [RFC 8693] `act` delegation chain onto an
+/// envelope, replacing whatever the transport claimed.
+///
+/// This is what makes `max_chain_depth` and cycle detection meaningful
+/// against a hostile caller. The header transport is forgeable in the
+/// shallow direction: a caller that asserts `x-a2a-chain-depth: 1`, or
+/// simply omits it, lands on depth 1 and clears any cap. A signed token
+/// cannot be flattened that way, so when the token carries a chain it
+/// overrides the envelope and marks the identity verified.
+///
+/// A token with no `act` chain is left alone rather than treated as an
+/// assertion of depth 1. "The token says nothing about delegation" and
+/// "the token says this is the first hop" are different facts, and
+/// collapsing them would reintroduce the evasion through the back door.
+///
+/// `claims` must already be signature-verified.
+///
+/// [RFC 8693]: https://datatracker.ietf.org/doc/html/rfc8693#section-4.1
+pub fn apply_verified_act_chain(
+    ctx: &mut A2AContext,
+    claims: &serde_json::Map<String, serde_json::Value>,
+) {
+    let actors = chain_from_act_claims(claims);
+    if actors.is_empty() {
+        return;
+    }
+
+    // The most recent actor is the agent making this call.
+    if let Some(current) = actors.last() {
+        ctx.caller_agent_id = current.clone();
+    }
+    // Depth counts the hops that led here plus this one, matching the
+    // `chain.len() + 1` convention the body parsers use.
+    ctx.chain_depth = (actors.len() as u32).saturating_add(1);
+    ctx.chain = actors
+        .into_iter()
+        .map(|agent_id| ChainHop {
+            agent_id,
+            // The token carries identity, not per-hop request ids or
+            // timestamps. Downstream reads empty / zero as unknown.
+            request_id: String::new(),
+            timestamp_ms: 0,
+        })
+        .collect();
+    ctx.identity_verified = true;
 }
 
 /// Detection signal: which spec a request appears to be A2A under.
@@ -117,6 +279,8 @@ pub enum DetectedSpec {
     /// Operator escape hatch (`a2a.route_glob`); the spec is
     /// indeterminate but the request is still A2A traffic.
     OperatorRoute,
+    /// Ratified A2A 1.0, matched on the `A2A-Version` header.
+    V1,
 }
 
 impl DetectedSpec {
@@ -127,6 +291,7 @@ impl DetectedSpec {
         match self {
             Self::Anthropic => A2ASpec::AnthropicV0,
             Self::Google | Self::OperatorRoute => A2ASpec::GoogleV0,
+            Self::V1 => A2ASpec::V1_0,
         }
     }
 }
@@ -140,15 +305,47 @@ impl DetectedSpec {
 ///
 /// Detection cases (per ADR § "Detection"):
 ///
-/// 1. `Content-Type: application/a2a+json` (with optional `; version=*`)
+/// 1. `A2A-Version` with major `1` triggers ratified 1.0 detection.
+/// 2. `Content-Type: application/a2a+json` (with optional `; version=*`)
 ///    triggers Google detection.
-/// 2. `MCP-Method: agents.invoke` triggers Anthropic detection.
-/// 3. The path matching `route_glob` is the operator escape hatch.
+/// 3. `MCP-Method: agents.invoke` triggers Anthropic detection.
+/// 4. The path matching `route_glob` is the operator escape hatch.
+///
+/// The checks are ordered but not exclusive: no signal short-circuits
+/// the ones after it with a negative answer. A header this build cannot
+/// interpret narrows what the request can be decoded as, and must never
+/// decide that the operator's `route_glob` no longer applies.
 pub fn detect(
     headers: &http::HeaderMap,
     path: &str,
     route_glob: Option<&str>,
 ) -> Option<DetectedSpec> {
+    // Ratified 1.0 first. It rides plain `application/json`, so it has
+    // no distinguishing content type and would otherwise fall through
+    // every check below and go ungoverned. A peer that sends both this
+    // and a draft signal is speaking the standard and labelling itself
+    // for a legacy intermediary, so the standard wins.
+    if let Some(version) = headers.get("a2a-version").and_then(|v| v.to_str().ok()) {
+        // Match on the major component only. The spec's service
+        // parameter carries `1.0`, but patch revisions are additive
+        // within a major and a build that understands 1.x understands
+        // 1.x.y. An unrecognised major is deliberately NOT decoded as
+        // 1.x: claiming to reason about a wire format this build has
+        // never seen is worse than declining to.
+        if version.trim().split('.').next() == Some("1") {
+            return Some(DetectedSpec::V1);
+        }
+        // Fall through rather than returning. This branch used to
+        // return `None`, which made a single caller-supplied header a
+        // bypass: `a2a-version: 2.0` skipped the content-type check,
+        // the MCP-method check, and, worst of all, the operator's
+        // `route_glob`, so a request on a route the operator had
+        // explicitly declared as A2A went ungoverned because the caller
+        // named a version nobody has shipped. Declining to decode an
+        // unknown major is right; declining to notice the request is
+        // not.
+    }
+
     if let Some(ct) = headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -206,6 +403,94 @@ mod tests {
             );
         }
         h
+    }
+
+    #[test]
+    fn detect_ratified_v1_via_version_header() {
+        // A2A reached 1.0 under the Linux Foundation. Its JSON-RPC
+        // binding rides plain `application/json`, so neither v0 signal
+        // fires and real 1.0 traffic went completely ungoverned.
+        let h = headers(&[("content-type", "application/json"), ("a2a-version", "1.0")]);
+        assert_eq!(detect(&h, "/", None), Some(DetectedSpec::V1));
+    }
+
+    #[test]
+    fn detect_v1_ignores_the_patch_component() {
+        let h = headers(&[("a2a-version", "1.0.2")]);
+        assert_eq!(detect(&h, "/", None), Some(DetectedSpec::V1));
+    }
+
+    #[test]
+    fn detect_v1_takes_precedence_over_the_v0_drafts() {
+        // A peer that sends both is speaking the ratified spec and
+        // labelling it for a legacy intermediary. Prefer the standard.
+        let h = headers(&[
+            ("content-type", "application/a2a+json"),
+            ("a2a-version", "1.0"),
+        ]);
+        assert_eq!(detect(&h, "/", None), Some(DetectedSpec::V1));
+    }
+
+    #[test]
+    fn detect_rejects_an_unknown_major_version() {
+        // A future 2.x is not something this build can reason about.
+        // Claiming to understand it would be worse than declining. With
+        // no other signal present the request is simply not A2A.
+        let h = headers(&[("a2a-version", "2.0")]);
+        assert_eq!(detect(&h, "/", None), None);
+    }
+
+    #[test]
+    fn an_unknown_major_version_does_not_bypass_the_operator_route() {
+        // The bypass this closes: `a2a-version` used to return early on
+        // any major it did not recognise, skipping every check after
+        // it. One caller-chosen header therefore removed a route the
+        // operator had declared as A2A from the policy's reach. Naming
+        // a version nobody has shipped must not be a way out.
+        let h = headers(&[("a2a-version", "2.0")]);
+        assert_eq!(
+            detect(&h, "/agents/invoke", Some("/agents/**")),
+            Some(DetectedSpec::OperatorRoute)
+        );
+    }
+
+    #[test]
+    fn an_unknown_major_version_does_not_bypass_content_type_detection() {
+        // Same bypass, reached through the other signals. A peer that
+        // sends a draft content type alongside a version this build
+        // cannot decode is still speaking something we recognise.
+        let h = headers(&[
+            ("a2a-version", "9.9"),
+            ("content-type", "application/a2a+json"),
+        ]);
+        assert_eq!(detect(&h, "/", None), Some(DetectedSpec::Google));
+    }
+
+    #[test]
+    fn an_unknown_major_version_does_not_bypass_mcp_method_detection() {
+        let h = headers(&[("a2a-version", "2.0"), ("mcp-method", "agents.invoke")]);
+        assert_eq!(detect(&h, "/", None), Some(DetectedSpec::Anthropic));
+    }
+
+    #[test]
+    fn a_garbage_version_header_does_not_bypass_the_operator_route() {
+        // Not just future majors: anything unparseable lands on the
+        // same fall-through. An attacker picks the value, so the
+        // contract has to hold for values nobody would write on purpose.
+        for value in ["", "not-a-version", "0", "1x"] {
+            let h = headers(&[("a2a-version", value)]);
+            assert_eq!(
+                detect(&h, "/agents/invoke", Some("/agents/**")),
+                Some(DetectedSpec::OperatorRoute),
+                "a2a-version: {value:?} must not skip the operator route"
+            );
+        }
+    }
+
+    #[test]
+    fn v1_spec_label_is_distinct_from_the_drafts() {
+        assert_eq!(A2ASpec::V1_0.as_label(), "v1.0");
+        assert_eq!(DetectedSpec::V1.to_spec(), A2ASpec::V1_0);
     }
 
     #[test]
@@ -287,6 +572,162 @@ mod tests {
         assert_eq!(ctx.chain_depth, 1);
         assert!(ctx.chain.is_empty());
         assert_eq!(ctx.raw_envelope_version, "google-v0");
+    }
+
+    /// Every `x-a2a-*` field an untrusted caller can set. Used by the
+    /// trust-gate tests below so both directions cover the same surface.
+    fn forged_envelope_headers() -> http::HeaderMap {
+        headers(&[
+            ("x-a2a-caller-agent-id", "billing-orchestrator"),
+            ("x-a2a-callee-agent-id", "payments-agent"),
+            ("x-a2a-task-id", "task-42"),
+            ("x-a2a-parent-request-id", "req-41"),
+            ("x-a2a-chain-depth", "1"),
+            (
+                "x-a2a-chain",
+                r#"[{"agent_id":"a","request_id":"r","timestamp_ms":1}]"#,
+            ),
+        ])
+    }
+
+    #[test]
+    fn envelope_from_untrusted_peer_ignores_forged_identity_headers() {
+        let ctx = envelope_from_headers(&forged_envelope_headers(), A2ASpec::GoogleV0, false);
+
+        // An untrusted caller must not be able to name itself, name its
+        // callee, or assert a chain. Those three feed `caller_denylist`,
+        // `callee_allowlist`, and cycle detection respectively.
+        assert_eq!(ctx.caller_agent_id, "");
+        assert_eq!(ctx.callee_agent_id, None);
+        assert!(ctx.chain.is_empty());
+    }
+
+    #[test]
+    fn envelope_from_trusted_peer_honors_identity_headers() {
+        let ctx = envelope_from_headers(&forged_envelope_headers(), A2ASpec::GoogleV0, true);
+
+        assert_eq!(ctx.caller_agent_id, "billing-orchestrator");
+        assert_eq!(ctx.callee_agent_id, Some("payments-agent".to_string()));
+        assert_eq!(ctx.task_id, "task-42");
+        assert_eq!(ctx.chain.len(), 1);
+    }
+
+    /// Claims for a token delegated twice: `orchestrator` acted for the
+    /// original subject, then `worker` acted on top of that.
+    ///
+    /// Per RFC 8693 the OUTERMOST `act` is the current actor and nested
+    /// `act` claims are prior actors, so this reads worker-then-
+    /// orchestrator on the wire and must come back oldest-first.
+    fn delegated_claims() -> serde_json::Map<String, serde_json::Value> {
+        match serde_json::json!({
+            "sub": "user-1",
+            "act": {
+                "sub": "worker",
+                "act": { "sub": "orchestrator" }
+            }
+        }) {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn act_chain_is_returned_oldest_first() {
+        // Oldest-first matches `A2AContext::chain` ordering, where
+        // chain[0] is the root. Reversing this silently breaks cycle
+        // detection, so the order is pinned here deliberately.
+        assert_eq!(
+            chain_from_act_claims(&delegated_claims()),
+            vec!["orchestrator".to_string(), "worker".to_string()]
+        );
+    }
+
+    #[test]
+    fn act_chain_is_empty_for_an_undelegated_token() {
+        let claims = match serde_json::json!({ "sub": "user-1" }) {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!(),
+        };
+        assert!(chain_from_act_claims(&claims).is_empty());
+    }
+
+    #[test]
+    fn act_chain_skips_actor_levels_with_no_subject() {
+        // A malformed actor level must not silently shorten the chain
+        // into a passing depth; it still counts as a hop.
+        let claims = match serde_json::json!({
+            "sub": "user-1",
+            "act": { "act": { "sub": "orchestrator" } }
+        }) {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!(),
+        };
+        assert_eq!(chain_from_act_claims(&claims).len(), 2);
+    }
+
+    #[test]
+    fn verified_act_chain_overrides_a_forged_shallow_depth() {
+        // The evasion this closes: an untrusted caller asserts depth 1
+        // (or omits the header entirely, which lands on the same
+        // default) and sails past `max_chain_depth`. The token says
+        // otherwise, and the token wins.
+        let mut ctx = A2AContext::empty(A2ASpec::GoogleV0);
+        ctx.chain_depth = 1;
+
+        apply_verified_act_chain(&mut ctx, &delegated_claims());
+
+        assert_eq!(ctx.chain_depth, 3, "two actors plus this hop");
+        assert!(ctx.identity_verified);
+    }
+
+    #[test]
+    fn verified_act_chain_populates_chain_for_cycle_detection() {
+        let mut ctx = A2AContext::empty(A2ASpec::GoogleV0);
+
+        apply_verified_act_chain(&mut ctx, &delegated_claims());
+
+        let ids: Vec<&str> = ctx.chain.iter().map(|h| h.agent_id.as_str()).collect();
+        assert_eq!(ids, vec!["orchestrator", "worker"]);
+    }
+
+    #[test]
+    fn verified_act_chain_sets_caller_to_the_most_recent_actor() {
+        let mut ctx = A2AContext::empty(A2ASpec::GoogleV0);
+        ctx.caller_agent_id = "spoofed".to_string();
+
+        apply_verified_act_chain(&mut ctx, &delegated_claims());
+
+        assert_eq!(ctx.caller_agent_id, "worker");
+    }
+
+    #[test]
+    fn undelegated_token_leaves_the_envelope_alone() {
+        let claims = match serde_json::json!({ "sub": "user-1" }) {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!(),
+        };
+        let mut ctx = A2AContext::empty(A2ASpec::GoogleV0);
+        ctx.chain_depth = 4;
+
+        apply_verified_act_chain(&mut ctx, &claims);
+
+        // No `act` chain means the token says nothing about delegation.
+        // It must not be read as an assertion that depth is 1.
+        assert_eq!(ctx.chain_depth, 4);
+        assert!(!ctx.identity_verified);
+    }
+
+    #[test]
+    fn envelope_from_untrusted_peer_marks_identity_unverified() {
+        let trusted = envelope_from_headers(&forged_envelope_headers(), A2ASpec::GoogleV0, true);
+        let untrusted = envelope_from_headers(&forged_envelope_headers(), A2ASpec::GoogleV0, false);
+
+        // The policy needs to tell "no chain was asserted" apart from
+        // "a chain was asserted but we do not trust it", so it can deny
+        // on unknown identity rather than silently treating the caller
+        // as a chain root.
+        assert!(trusted.identity_verified);
+        assert!(!untrusted.identity_verified);
     }
 
     #[test]

@@ -20,6 +20,20 @@ use crate::state::register::VersionedLwwMergeOutcome;
 /// are rejected on the read path to bound memory usage from a hostile peer.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
+/// Maximum accepted byte length of a routed snapshot key prefix.
+///
+/// A prefix is a generated key scope, never caller text, so a kilobyte is
+/// already generous. Bounding it keeps a hostile peer from forcing a large
+/// per-request allocation before any work is done.
+pub const MAX_ROUTED_SNAPSHOT_PREFIX_BYTES: usize = 1_024;
+
+/// Maximum aggregate key-plus-value bytes one routed snapshot page may carry.
+///
+/// The owner stops cloning values once the next entry would cross this bound
+/// and marks the page truncated, so one snapshot cannot copy an arbitrarily
+/// large shard into a single reply.
+pub const MAX_ROUTED_SNAPSHOT_BYTES: usize = 1024 * 1024;
+
 // --- Request / Response wire types ---
 
 /// Outbound cache operation from the client half of the RPC.
@@ -48,6 +62,14 @@ pub struct Request {
 /// all purges. The server scans its local shard, deletes every matching
 /// key, and replies with `CacheResult::Purged(n)`. An empty `prefix` means
 /// "purge every entry" and is how the caller expresses a `PurgeScope::All`.
+///
+/// `SnapshotPrefix` is appended after `SyncDigest`. Postcard enum variants
+/// are not self-describing. A caller must verify the authenticated
+/// `semantic_cache_snapshot_v1` fleet capability before sending this
+/// operation. Existing operations keep their discriminants, so operators may
+/// roll the binary while semantic caching stays disabled, but neither this
+/// note nor a binary-version string is the gate. The enforceable gate is the
+/// typed cluster-state capability declaration every live member must publish.
 ///
 /// postcard does **not** honor `#[serde(default)]` on enum variants, so
 /// every additive change to `CacheOp` is a wire-format break relative to
@@ -127,6 +149,20 @@ pub enum CacheOp {
         /// Maximum digest entries in the reply page.
         limit: u32,
     },
+    /// Request one bounded lexicographic page of the receiver's local cache
+    /// shard for a single generated key prefix. Replies with
+    /// [`CacheResult::Snapshot`].
+    ///
+    /// The request carries no routing key: the client resolves the owner
+    /// from the consistent hash ring before sending, and the server never
+    /// recurses into a routed method.
+    SnapshotPrefix {
+        /// Generated key prefix to page. Must be non-empty and at most
+        /// [`MAX_ROUTED_SNAPSHOT_PREFIX_BYTES`] bytes.
+        prefix: String,
+        /// Maximum entries in the reply page, in `1..=4096`.
+        maximum: u32,
+    },
 }
 
 /// Server reply to a [`Request`]. Carries the original `request_id` so the
@@ -161,6 +197,47 @@ pub enum CacheResult {
     /// One bounded page of a replica-shard digest, replying to
     /// [`CacheOp::SyncDigest`].
     DigestPage(DigestPage),
+    /// One bounded lexicographic page of the server's local cache shard,
+    /// replying to [`CacheOp::SnapshotPrefix`]. Appended after `DigestPage`
+    /// so existing result discriminants do not shift.
+    Snapshot(CacheSnapshot),
+}
+
+/// One bounded lexicographic page of a peer's local cache shard.
+///
+/// Values are operator data, so the [`std::fmt::Debug`] implementation is
+/// deliberately redacted: it reports entry count, aggregate key-plus-value
+/// bytes, and the truncation flag, never a key or a value.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CacheSnapshot {
+    /// Lexicographically ordered key/value pairs.
+    pub entries: Vec<(String, Bytes)>,
+    /// Whether additional matching keys were excluded by the entry or byte
+    /// bound.
+    pub truncated: bool,
+}
+
+impl CacheSnapshot {
+    /// Aggregate key-plus-value bytes carried by this page.
+    ///
+    /// Saturating rather than checked because this is only a diagnostic
+    /// measure; the storage and revalidation paths use checked arithmetic.
+    pub fn byte_len(&self) -> usize {
+        self.entries.iter().fold(0usize, |total, (key, value)| {
+            total.saturating_add(key.len()).saturating_add(value.len())
+        })
+    }
+}
+
+impl std::fmt::Debug for CacheSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CacheSnapshot")
+            .field("entries", &self.entries.len())
+            .field("bytes", &self.byte_len())
+            .field("truncated", &self.truncated)
+            .finish()
+    }
 }
 
 /// Compact per-key summary used by anti-entropy digest exchange. Carries
@@ -517,6 +594,104 @@ mod tests {
             }
             other => panic!("expected DigestPage, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn request_wire_roundtrip_snapshot_prefix() {
+        // The request carries only prefix and maximum. It never carries a
+        // routing key, because the client selects the owner before sending.
+        let req = Request {
+            request_id: 400,
+            op: CacheOp::SnapshotPrefix {
+                prefix: "sbproxy:semcache:v2:o:ab:m:".to_string(),
+                maximum: 64,
+            },
+        };
+        let bytes = crate::transport::wire::encode(&req).expect("serialize");
+        let back: Request = crate::transport::wire::decode(&bytes).expect("deserialize");
+        assert_eq!(back.request_id, 400);
+        match back.op {
+            CacheOp::SnapshotPrefix { prefix, maximum } => {
+                assert_eq!(prefix, "sbproxy:semcache:v2:o:ab:m:");
+                assert_eq!(maximum, 64);
+            }
+            other => panic!("expected SnapshotPrefix, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_wire_roundtrip_snapshot() {
+        let resp = Response {
+            request_id: 400,
+            result: CacheResult::Snapshot(CacheSnapshot {
+                entries: vec![
+                    ("prefix:a".to_string(), Bytes::from_static(b"one")),
+                    ("prefix:b".to_string(), Bytes::from_static(b"two")),
+                ],
+                truncated: true,
+            }),
+        };
+        let bytes = crate::transport::wire::encode(&resp).expect("serialize");
+        let back: Response = crate::transport::wire::decode(&bytes).expect("deserialize");
+        match back.result {
+            CacheResult::Snapshot(snapshot) => {
+                assert_eq!(snapshot.entries.len(), 2);
+                assert_eq!(snapshot.entries[0].0, "prefix:a");
+                assert_eq!(snapshot.entries[1].1, Bytes::from_static(b"two"));
+                assert!(snapshot.truncated);
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_response_above_the_frame_cap_is_rejected() {
+        // A hostile or buggy owner cannot push a page past the 16 MiB frame
+        // cap: the write path refuses it before it reaches the socket, so
+        // the peer never has to read it back.
+        let entries: Vec<(String, Bytes)> = (0..17)
+            .map(|index| {
+                (
+                    format!("prefix:{index}"),
+                    Bytes::from(vec![0u8; 1024 * 1024]),
+                )
+            })
+            .collect();
+        let resp = Response {
+            request_id: 401,
+            result: CacheResult::Snapshot(CacheSnapshot {
+                entries,
+                truncated: false,
+            }),
+        };
+        let bytes = crate::transport::wire::encode(&resp).expect("serialize");
+        assert!(bytes.len() > MAX_FRAME_BYTES);
+        let (mut a, _b) = duplex(64);
+        let err = write_frame(&mut a, &bytes).await.unwrap_err();
+        assert_eq!(err.kind(), tokio::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn snapshot_debug_reports_only_count_bytes_and_truncated() {
+        let snapshot = CacheSnapshot {
+            entries: vec![
+                (
+                    "prefix:secret-key-name".to_string(),
+                    Bytes::from_static(b"secret-response-body"),
+                ),
+                (
+                    "prefix:other-key-name".to_string(),
+                    Bytes::from_static(b"other-response-body"),
+                ),
+            ],
+            truncated: true,
+        };
+        let rendered = format!("{snapshot:?}");
+        assert!(rendered.contains("entries: 2"), "{rendered}");
+        assert!(rendered.contains("bytes: 82"), "{rendered}");
+        assert!(rendered.contains("truncated: true"), "{rendered}");
+        assert!(!rendered.contains("secret-key-name"), "{rendered}");
+        assert!(!rendered.contains("secret-response-body"), "{rendered}");
     }
 
     /// Writer that counts discrete `poll_write` calls while collecting the

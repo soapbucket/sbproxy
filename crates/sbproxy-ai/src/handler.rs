@@ -147,15 +147,17 @@ pub struct AiHandlerConfig {
     /// production-grade content path remains OTLP `trace_content`.
     #[serde(default)]
     pub capture_content: bool,
-    /// Opaque semantic-cache configuration block. The OSS proxy
-    /// stores this verbatim and surfaces it through the stream cache
-    /// recorder hook so the enterprise implementation can read its
-    /// `streaming` sub-block (`enabled`, `replay_pacing`, ...) without
-    /// the OSS pipeline having to validate or interpret any of those
-    /// fields. Shape contract lives in the enterprise crate; OSS only
-    /// passes the value through.
+    /// Typed semantic-cache configuration for this action.
+    ///
+    /// Parsed and bounds-checked at config load rather than carried as an
+    /// opaque value: WOR-2099 gave this block a backend selector, and a
+    /// misspelled or out-of-range field has to fail the load instead of
+    /// silently disabling the cache on first request. The compiled
+    /// runtime is built from this by
+    /// `sbproxy_core::semantic_cache_runtime`, which owns backend
+    /// selection per origin and forward rule.
     #[serde(default)]
-    pub semantic_cache: Option<serde_json::Value>,
+    pub semantic_cache: Option<crate::semantic_cache::EmbeddingCacheConfig>,
     /// WOR-800: per-origin versioned prompt store. Named prompts, each
     /// with one or more numbered versions and optional reusable
     /// `partials:` fragments, referenced from a request body as
@@ -226,15 +228,6 @@ pub struct AiHandlerConfig {
     /// the same way (skip redaction).
     #[serde(skip)]
     pub(crate) pii_redactor: OnceLock<Option<sbproxy_security::pii::PiiRedactor>>,
-    /// Lazy-built OSS embedding semantic cache (WOR-796), parsed from
-    /// the `semantic_cache` block on first use. `None` inside the
-    /// OnceLock means the cache is disabled or misconfigured; the
-    /// request path treats both as "no semantic layer". Held in an
-    /// `Arc` so the instance (and its entries) persist across requests
-    /// for the lifetime of this per-origin config.
-    #[serde(skip)]
-    pub(crate) embedding_cache:
-        OnceLock<Option<std::sync::Arc<crate::semantic_cache::EmbeddingCache>>>,
     /// Lazily-built provider router (WOR-798), held in an `Arc` so its
     /// per-provider latency / token / connection state persists across
     /// requests for the lifetime of this per-origin config (rebuilt only
@@ -326,35 +319,6 @@ impl AiHandlerConfig {
                         None
                     }
                 }
-            })
-            .as_ref()
-    }
-
-    /// Return the OSS embedding semantic cache for this handler,
-    /// building it on first call (WOR-796). `None` when the
-    /// `semantic_cache` block is absent, disabled, missing the
-    /// `embedding` provider sub-block, or fails to parse. The cache is
-    /// opt-in, so the common path returns `None` with no cost beyond
-    /// the one-time parse.
-    pub fn embedding_cache(
-        &self,
-    ) -> Option<&std::sync::Arc<crate::semantic_cache::EmbeddingCache>> {
-        self.embedding_cache
-            .get_or_init(|| {
-                let value = self.semantic_cache.as_ref()?;
-                let cfg: crate::semantic_cache::EmbeddingCacheConfig =
-                    match serde_json::from_value(value.clone()) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "AI handler: semantic_cache block did not parse as an embedding \
-                                 cache config; semantic caching disabled"
-                            );
-                            return None;
-                        }
-                    };
-                crate::semantic_cache::EmbeddingCache::from_config(&cfg).map(std::sync::Arc::new)
             })
             .as_ref()
     }
@@ -1460,7 +1424,6 @@ mod tests {
             prompts: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
-            embedding_cache: OnceLock::new(),
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
@@ -1503,7 +1466,6 @@ mod tests {
             prompts: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
-            embedding_cache: OnceLock::new(),
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
@@ -1546,7 +1508,6 @@ mod tests {
             prompts: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
-            embedding_cache: OnceLock::new(),
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
@@ -1590,7 +1551,6 @@ mod tests {
             prompts: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
-            embedding_cache: OnceLock::new(),
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),

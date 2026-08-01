@@ -179,35 +179,18 @@ pub async fn shutdown_cache_revalidate_tasks() {
     CACHE_REVALIDATE_TASKS.wait().await;
 }
 
-/// Pending semantic-cache write produced by a cache-miss path.
+/// Pending semantic-cache write produced by a lookup that missed
+/// (WOR-2099).
 ///
-/// Tuple components: (hook, prompt key, cacheable upstream statuses,
-/// max response size in bytes, model id, origin). When populated, the AI relay
-/// dispatches `hook.store` after the upstream response is forwarded,
-/// subject to the status and size gates.
-type PendingSemcacheMiss = (
-    std::sync::Arc<dyn crate::hooks::SemanticLookupHook>,
-    String,
-    Vec<u16>,
-    Option<usize>,
-    Option<String>,
-    String,
-);
-
-/// Pending OSS embedding-cache write produced by a semantic miss
-/// (WOR-796). Tuple components: (cache handle, prompt key, the prompt's
-/// embedding vector). When populated, the AI relay stores the upstream
-/// response under this key + vector after a successful (200) response.
-/// Mutually exclusive with [`PendingSemcacheMiss`]: the OSS cache only
-/// runs when the enterprise `SemanticLookupHook` is absent.
+/// Tuple components: the compiled cache for the routed action, and the
+/// private write token that lookup produced. The token carries the derived
+/// namespace, prompt digest, normalized embedding, and generated keys, so
+/// the eventual write cannot drift from the lookup that admitted it. When
+/// populated, the buffered AI relay awaits `cache.store` once the provider
+/// response has passed the status gate and the output guardrails.
 type PendingEmbedMiss = (
     std::sync::Arc<sbproxy_ai::EmbeddingCache>,
-    String,
-    Vec<f32>,
-    // WOR-1142: per-caller cache scope (hashed tenant + credential) so
-    // the write-on-miss store records the same scope the lookup filtered
-    // on.
-    String,
+    sbproxy_ai::SemanticWriteToken,
 );
 
 /// The main proxy implementation.
