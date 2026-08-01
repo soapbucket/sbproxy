@@ -293,24 +293,30 @@ impl Guardrail {
     /// literature ([SCM](https://arxiv.org/abs/2506.09996),
     /// [Guard Vector](https://arxiv.org/abs/2509.23381)): a guardrail
     /// is "streaming-safe" iff its decision is stable as soon as the
-    /// chunk it sees is decided. Per-chunk regex, PII, schema, and
+    /// chunk it sees is decided. Per-chunk regex, PII, and
     /// context-poisoning detectors satisfy that property; full-text
     /// classifiers (toxicity, jailbreak, content-safety, multi-token
     /// injection) do not because their score is meaningful only over
     /// the full text and a partial-window classification can produce
     /// both false positives (tripping on benign mid-stream substrings)
-    /// and false negatives (missing late-stream signal).
+    /// and false negatives (missing late-stream signal). Schema
+    /// validation is not prefix-stable either (WOR-2174): its subject
+    /// is complete JSON, which exists only once the stream closes, so
+    /// judging an intermediate delta would terminate valid streams.
     ///
-    /// `streaming_safe()` returns the conservative default: only the
-    /// four detectors listed above return `true`. Operators can layer
-    /// per-entry overrides on top of this default; the per-entry
-    /// override surface (`GuardrailEntry::streaming_safe`) lands with
-    /// the streaming-relay wiring in a follow-up.
+    /// `streaming_safe()` returns the conservative default. Operators
+    /// can layer per-entry overrides on top of this default; the
+    /// per-entry override surface (`GuardrailEntry::streaming_safe`)
+    /// lands with the streaming-relay wiring in a follow-up.
     pub fn streaming_safe(&self) -> bool {
         match self {
             Self::Regex(_) => true,
             Self::Pii(_) => true,
-            Self::Schema(_) => true,
+            // WOR-2174: schema joined the close-policy lane. A schema
+            // verdict is only meaningful over the complete accumulated
+            // result; the stream session routes it to close-time
+            // evaluation.
+            Self::Schema(_) => false,
             Self::ContextPoisoning(_) => true,
             // WOR-1810: these four are case-insensitive substring
             // matchers. Substring matching over an accumulating prefix
@@ -775,14 +781,21 @@ pub fn compile_pipeline(config: &GuardrailsConfig) -> Result<GuardrailPipeline> 
     }
     for guard_cfg in &config.output {
         let guardrail = compile_guardrail(guard_cfg)?;
-        let classifier_backed = matches!(guardrail, Guardrail::SafetyClassifier(_));
+        // WOR-2174: schema entries default to close-time evaluation
+        // alongside classifier-backed entries; an intermediate delta
+        // is rarely complete JSON, so a per-delta schema verdict would
+        // terminate valid streams.
+        let close_by_default = matches!(
+            guardrail,
+            Guardrail::SafetyClassifier(_) | Guardrail::Schema(_)
+        );
         pipeline.output.push(guardrail);
         // Per-entry streaming policy rides the same raw entry; unknown
         // to the individual guardrail structs (serde ignores it there).
         let policy = match guard_cfg.get("stream_policy") {
             Some(value) => serde_json::from_value::<StreamPolicy>(value.clone())
                 .map_err(|e| anyhow::anyhow!("invalid stream_policy: {e}"))?,
-            None if classifier_backed => StreamPolicy::Close,
+            None if close_by_default => StreamPolicy::Close,
             None => StreamPolicy::default(),
         };
         pipeline.output_policies.push(policy);
@@ -810,6 +823,18 @@ pub fn validate_pipeline_config(config: &GuardrailsConfig) -> Result<()> {
             .map(|v| serde_json::from_value::<StreamPolicy>(v.clone()))
             .transpose()
             .map_err(|e| anyhow::anyhow!("invalid stream_policy: {e}"))?;
+        // WOR-2174: an intermediate delta is not complete JSON, so a
+        // per-delta schema verdict would terminate valid streams. The
+        // same rule that keeps full-text classifiers off the per-delta
+        // path applies here.
+        if guard_cfg.get("type").and_then(|v| v.as_str()) == Some("schema")
+            && stream_policy == Some(StreamPolicy::Chunk)
+        {
+            bail!(
+                "the schema guardrail cannot evaluate partial deltas; use `stream_policy: close` \
+                 (the default) or `off` on output"
+            );
+        }
         if let Some(kind) = guard_cfg
             .get("type")
             .and_then(|value| value.as_str())
@@ -981,6 +1006,38 @@ mod tests {
     }
 
     #[test]
+    fn schema_output_defaults_to_close_time_evaluation() {
+        // WOR-2174: like classifier-backed entries, schema entries
+        // without an explicit stream_policy evaluate at stream close.
+        let cfg: GuardrailsConfig = serde_json::from_value(serde_json::json!({
+            "output": [{"type": "schema", "schema": {"type": "object"}}]
+        }))
+        .expect("config parses");
+        let pipeline = compile_pipeline(&cfg).expect("compiles");
+        assert!(matches!(pipeline.output.as_slice(), [Guardrail::Schema(_)]));
+        assert_eq!(pipeline.output_policies.as_slice(), [StreamPolicy::Close]);
+    }
+
+    #[test]
+    fn schema_output_rejects_per_chunk_streaming() {
+        let cfg: GuardrailsConfig = serde_json::from_value(serde_json::json!({
+            "output": [{
+                "type": "schema",
+                "schema": {"type": "object"},
+                "stream_policy": "chunk"
+            }]
+        }))
+        .expect("config parses");
+        let error = validate_pipeline_config(&cfg)
+            .expect_err("schema must not run per delta")
+            .to_string();
+        assert!(
+            error.contains("stream_policy") && error.contains("close"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
     fn classifier_output_rejects_per_chunk_streaming() {
         let cfg = GuardrailsConfig {
             input: Vec::new(),
@@ -1131,10 +1188,13 @@ mod tests {
                 serde_json::json!({"type": "regex", "patterns": ["foo"]}),
                 true,
             ),
+            // WOR-2174: schema flipped to false. Complete JSON exists
+            // only at stream close, so the session routes it to
+            // close-time evaluation instead of per-delta checks.
             (
                 "schema",
                 serde_json::json!({"type": "schema", "schema": {"type": "object"}}),
-                true,
+                false,
             ),
             (
                 "context_poisoning",
