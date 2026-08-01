@@ -1189,6 +1189,67 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_writers_never_fork_the_chain() {
+        // The sequential test above cannot see the defect this one exists
+        // for. Reading the head and then appending is two operations, and
+        // without the sequencing lock two requests that read the same head
+        // both write that sequence number, leaving a file with two entries
+        // claiming the same position and two claiming the same predecessor.
+        //
+        // That is a forked chain, and it is the precise failure the whole
+        // design exists to prevent: once two entries share a sequence, the
+        // chain no longer proves an absence, so "I made calls you never
+        // credited" stops being answerable.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger_path = dir.path().join("receipts.ndjson");
+        let attestation = runtime(&ledger_path, FailureMode::Degraded);
+
+        const WRITERS: u32 = 24;
+        std::thread::scope(|scope| {
+            for index in 0..WRITERS {
+                let attestation = Arc::clone(&attestation);
+                scope.spawn(move || {
+                    let mut ctx = context(attestation);
+                    ctx.request_id = compact_str::CompactString::new(format!("claim-{index}"));
+                    record_response(&ctx, METHOD, PATH, 200, false);
+                });
+            }
+        });
+
+        let written = entries(&ledger_path);
+        assert_eq!(
+            written.len(),
+            WRITERS as usize,
+            "every writer must land exactly one entry"
+        );
+
+        // Sequences are a permutation of 0..WRITERS with no repeats, and
+        // each entry's own claims agree with the slot it occupies.
+        let mut seen: Vec<u64> = written.iter().map(|entry| entry.seq).collect();
+        seen.sort_unstable();
+        let expected: Vec<u64> = (0..u64::from(WRITERS)).collect();
+        assert_eq!(
+            seen, expected,
+            "a repeated sequence number is a forked chain"
+        );
+
+        let mut running = "0".repeat(64);
+        for (position, entry) in written.iter().enumerate() {
+            assert_eq!(entry.event.0.seq, entry.seq, "entry {position}");
+            assert_eq!(entry.event.0.prev, running, "entry {position}");
+            assert_eq!(entry.prev_hash, running, "entry {position}");
+            running.clone_from(&entry.entry_hash);
+        }
+
+        // And the shipped verifier agrees, which is the only opinion that
+        // matters to a buyer holding the file.
+        let verdict = sbproxy_meter::verify_ledger::<ChainedReceipt>(&ledger_path, None)
+            .expect("the chain is readable");
+        assert!(verdict.ok, "chain must verify: {verdict:?}");
+        assert_eq!(verdict.entries, u64::from(WRITERS));
+    }
+
+    #[test]
     fn a_free_outcome_still_gets_a_receipt_with_no_billed_units() {
         // The operator's table says `origin_5xx` is free. "Not billed,
         // because the table says so" is the evidence a dispute needs; an

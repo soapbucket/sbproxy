@@ -150,6 +150,54 @@ fn wait_for_entries(ledger: &Path, want: usize) -> Vec<serde_json::Value> {
     }
 }
 
+/// Poll until the chain carries an entry with `outcome`, and return it.
+///
+/// Waiting on an entry count instead would be waiting for the wrong thing.
+/// The receipt is cut after the response has been written, so the number of
+/// entries reaches any given total before the interesting one has
+/// necessarily been appended, and a test that counted would read an
+/// incomplete chain and report a missing outcome that was merely late.
+fn wait_for_outcome(ledger: &Path, outcome: &str) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if ledger.exists() {
+            if let Some(entry) = read_chain(ledger)
+                .into_iter()
+                .find(|entry| entry["event"]["outcome"] == outcome)
+            {
+                return entry;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no entry with outcome {outcome} appeared in {} within ten seconds; chain was {:?}",
+            ledger.display(),
+            ledger.exists().then(|| read_chain(ledger)),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Drive requests until the response cache serves one, and return it.
+fn wait_for_cache_hit(proxy: &ProxyHarness) -> sbproxy_e2e::Response {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let response = proxy.get("/cached", "meter.localhost").expect("cache poll");
+        if response
+            .headers
+            .get("x-sbproxy-cache")
+            .is_some_and(|value| value == "HIT")
+        {
+            return response;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the response cache never served a hit; last response: {response:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn admin_request(port: u16, method: &str, path: &str) -> (u16, String) {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -254,11 +302,19 @@ fn a_metered_request_writes_one_verifiable_receipt() {
         "no request body was buffered, so claiming a digest over one would be a lie: {receipt}"
     );
 
-    // And the proxy's own verifier agrees.
+    // And the proxy's own verifier agrees. The route reports a verdict as
+    // `outcome` plus the sequence it broke at, rather than a bare boolean,
+    // so that a caller learns where a chain stopped verifying and not only
+    // that it did.
     let (status, body) = admin_request(admin_port, "POST", "/api/meter/verify");
     assert_eq!(status, 200, "verify route: {body}");
     let verdict: serde_json::Value = serde_json::from_str(&body).expect("verify JSON");
-    assert_eq!(verdict["ok"], true, "chain must verify: {verdict}");
+    assert_eq!(verdict["outcome"], "ok", "chain must verify: {verdict}");
+    assert!(
+        verdict["broken_seq"].is_null(),
+        "a verifying chain has no broken link: {verdict}"
+    );
+    assert_eq!(verdict["entries"], 1, "one request, one entry: {verdict}");
 }
 
 #[test]
@@ -354,27 +410,10 @@ fn a_cache_hit_bills_when_the_table_says_yes() {
 
     // Warm, then hit.
     proxy.get("/cached", "meter.localhost").expect("warm");
-    let entries = wait_for_entries(&state.ledger(), 1);
-    let first_seq = entries.len();
-
-    let hit = loop {
-        let response = proxy.get("/cached", "meter.localhost").expect("cache poll");
-        if response
-            .headers
-            .get("x-sbproxy-cache")
-            .is_some_and(|value| value == "HIT")
-        {
-            break response;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
+    let hit = wait_for_cache_hit(&proxy);
     assert_eq!(hit.status, 200);
 
-    let entries = wait_for_entries(&state.ledger(), first_seq + 1);
-    let cached = entries
-        .iter()
-        .find(|entry| entry["event"]["outcome"] == "cache_hit")
-        .unwrap_or_else(|| panic!("a cache hit must be recorded as one: {entries:?}"));
+    let cached = wait_for_outcome(&state.ledger(), "cache_hit");
     let units = cached["event"]["units"]
         .as_array()
         .expect("units is an array");
@@ -400,25 +439,9 @@ fn a_cache_hit_bills_nothing_when_the_table_says_no() {
     .expect("start proxy");
 
     proxy.get("/cached", "meter.localhost").expect("warm");
-    let warmed = wait_for_entries(&state.ledger(), 1).len();
+    wait_for_cache_hit(&proxy);
 
-    loop {
-        let response = proxy.get("/cached", "meter.localhost").expect("cache poll");
-        if response
-            .headers
-            .get("x-sbproxy-cache")
-            .is_some_and(|value| value == "HIT")
-        {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-
-    let entries = wait_for_entries(&state.ledger(), warmed + 1);
-    let cached = entries
-        .iter()
-        .find(|entry| entry["event"]["outcome"] == "cache_hit")
-        .unwrap_or_else(|| panic!("a free call is still recorded: {entries:?}"));
+    let cached = wait_for_outcome(&state.ledger(), "cache_hit");
 
     // Recorded, and billed nothing. Omitting the receipt entirely would
     // leave the chain unreconcilable against a request log, which is the
