@@ -81,13 +81,25 @@ const MAX_CUSTOMER_ID_LEN: usize = 255;
 /// Required prefix on a Stripe customer identifier.
 const CUSTOMER_ID_PREFIX: &str = "cus_";
 
-/// The Stripe error code that means this identifier was already accepted.
-///
-/// Stripe deduplicates meter events on `identifier`, so a replay of an
-/// already-accepted event is not a second unit of usage. Treating that answer
-/// as accepted is what keeps a retry from queueing forever. This constant is
-/// the single place to change if Stripe renames the code.
-pub const DUPLICATE_IDENTIFIER_CODE: &str = "duplicate_identifier";
+// A duplicate identifier is deliberately not special-cased by error code.
+//
+// Stripe publishes no error code for one. Its documented meter codes are
+// namespaced (`meter_event_no_customer_defined`,
+// `meter_event_value_too_many_digits`), the v1 endpoint this module calls
+// enforces identifier uniqueness by deduplicating server-side rather than by
+// refusing, and its published error-code list contains nothing for the case.
+// An earlier revision matched a guessed `duplicate_identifier` string, which
+// could only ever be wrong in the expensive direction: a guess that
+// accidentally matched some other refusal would record a usage report that
+// genuinely failed as accepted, and under-bill silently.
+//
+// Nothing is lost by dropping it, because every retry this reporter issues
+// carries the same durable `Idempotency-Key`. Stripe's idempotency contract
+// replays the original response for a repeated key, so a retried event comes
+// back as the original 200 and takes the success path before any
+// deduplication error could arise. A duplicate identifier reaching a 4xx
+// therefore means a different request reused an identifier, which is a bug
+// worth surfacing rather than an outcome worth accepting.
 
 // --- Errors ---
 
@@ -292,8 +304,6 @@ pub fn parse_meter_ack(body: &[u8]) -> Result<MeterEventAck, StripeMeterError> {
 /// What a non-2xx meter answer means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeterFailure {
-    /// Stripe already accepted this identifier, so the usage is recorded.
-    AlreadyAccepted,
     /// The call may succeed later.
     Retry,
     /// The call will never succeed as written.
@@ -303,15 +313,16 @@ pub enum MeterFailure {
 /// Reads a non-2xx meter answer.
 ///
 /// A 429 and a 5xx are retried, because usage accounting is allowed to be
-/// eventually consistent in a way a charge is not. A duplicate identifier is
-/// already recorded, so it is accepted rather than retried forever. Every
-/// other 4xx is a request this reporter will never fix by repeating it.
+/// eventually consistent in a way a charge is not. Every other status is a
+/// request this reporter will never fix by repeating it, so it stops rather
+/// than queueing forever.
+///
+/// The classification is by status alone. Stripe's meter error codes are not
+/// enumerated in a contract this crate can pin, and guessing one would make a
+/// refusal readable as an acceptance. See the note beside the constants above
+/// for why a duplicate identifier needs no branch of its own.
 #[must_use]
-pub fn classify_meter_failure(status: u16, body: &[u8]) -> MeterFailure {
-    let error = crate::stripe_payment::parse_api_error(body);
-    if error.code.as_deref() == Some(DUPLICATE_IDENTIFIER_CODE) {
-        return MeterFailure::AlreadyAccepted;
-    }
+pub const fn classify_meter_failure(status: u16) -> MeterFailure {
     match status {
         429 | 500..=599 => MeterFailure::Retry,
         _ => MeterFailure::Terminal,
@@ -462,17 +473,7 @@ impl<T: StripeMeterTransport> UsageReporter for StripeMeterReporter<T> {
                     .map_err(meter_transport_error)?;
 
                 if !(200..300).contains(&response.status) {
-                    return match classify_meter_failure(response.status, &response.body) {
-                        // Stripe already has this identifier, so the usage is
-                        // recorded exactly once. There is no provider
-                        // reference to quote for an answer that was a refusal
-                        // to double count.
-                        MeterFailure::AlreadyAccepted => Ok(UsageReportReceipt {
-                            reporter: event.reporter.clone(),
-                            usage_identifier: event.usage_identifier.clone(),
-                            provider_reference: None,
-                            reported_at_ms,
-                        }),
+                    return match classify_meter_failure(response.status) {
                         MeterFailure::Retry => Err(BillingError::ProviderUnavailable),
                         MeterFailure::Terminal => Err(BillingError::ProviderRejected),
                     };
@@ -597,16 +598,39 @@ mod tests {
 
     #[test]
     fn retryable_and_terminal_answers_are_told_apart() {
-        assert_eq!(classify_meter_failure(429, b"{}"), MeterFailure::Retry);
-        assert_eq!(classify_meter_failure(503, b"{}"), MeterFailure::Retry);
-        assert_eq!(classify_meter_failure(400, b"{}"), MeterFailure::Terminal);
-        assert_eq!(
-            classify_meter_failure(
-                400,
-                br#"{"error":{"type":"invalid_request_error","code":"duplicate_identifier"}}"#
-            ),
-            MeterFailure::AlreadyAccepted
-        );
+        assert_eq!(classify_meter_failure(429), MeterFailure::Retry);
+        assert_eq!(classify_meter_failure(503), MeterFailure::Retry);
+        assert_eq!(classify_meter_failure(500), MeterFailure::Retry);
+        assert_eq!(classify_meter_failure(400), MeterFailure::Terminal);
+        assert_eq!(classify_meter_failure(401), MeterFailure::Terminal);
+        assert_eq!(classify_meter_failure(404), MeterFailure::Terminal);
+    }
+
+    /// A refusal this crate cannot name must never read as an acceptance.
+    ///
+    /// The guard is on the enum rather than on any one code: `MeterFailure`
+    /// has no variant that turns a non-2xx into a recorded unit of usage, so
+    /// there is no error body Stripe could send that silently under-bills.
+    /// An earlier revision matched a guessed `duplicate_identifier` string
+    /// that Stripe does not publish, and its test built the fixture from the
+    /// same constant, so it asserted only that the code agreed with itself.
+    #[test]
+    fn no_error_body_can_be_read_as_recorded_usage() {
+        for body in [
+            &br#"{"error":{"type":"invalid_request_error","code":"duplicate_identifier"}}"#[..],
+            &br#"{"error":{"type":"invalid_request_error","code":"meter_event_no_customer_defined"}}"#[..],
+            &br#"{"error":{"type":"invalid_request_error","code":"anything_at_all"}}"#[..],
+            &b"{}"[..],
+        ] {
+            // The body is parseable and carries a code, and none of it can
+            // change the verdict: only the status decides.
+            let _ = crate::stripe_payment::parse_api_error(body);
+            assert_eq!(
+                classify_meter_failure(400),
+                MeterFailure::Terminal,
+                "a 400 stays terminal whatever the error body claims"
+            );
+        }
     }
 
     #[test]

@@ -3,8 +3,10 @@
 //! [`BillingService::authorize`] is the only function in this crate that can
 //! return permission to reach the origin, and it returns
 //! [`AuthorizationDecision::Settled`] from exactly one place: a receipt that
-//! [`SettlementStore::mark_succeeded`] committed and that
-//! [`SettlementStore::load_access_receipt`] read back. Not the adapter's
+//! [`SettlementStore::mark_succeeded`](crate::store::SettlementStore::mark_succeeded)
+//! committed and that
+//! [`SettlementStore::load_access_receipt`](crate::store::SettlementStore::load_access_receipt)
+//! read back. Not the adapter's
 //! return value, not a verification result, and not an optimistic guess.
 //!
 //! # Ordering
@@ -50,7 +52,7 @@ use crate::registry::{
 };
 use crate::store::{
     BillingClock, ClaimedAttempt, ClaimedUsageEvent, IntentRecord, LeaseRecovery, ProofReservation,
-    ReconciliationOutcome, SettlementStore, SharedSettlementStore, SystemClock, UsageOutcome,
+    ReconciliationOutcome, SharedSettlementStore, SystemClock, UsageOutcome,
 };
 use crate::types::{
     digests_equal, provider_idempotency_key, AttemptOperation, FailureCategory, IntentStatus,
@@ -694,6 +696,7 @@ impl BillingService {
             intent_id: intent_id.clone(),
             requirement: signed.requirement.clone(),
             requirement_digest: signed.requirement_digest,
+            quote_token: signed.quote_token.clone(),
             proof,
             now_ms,
         };

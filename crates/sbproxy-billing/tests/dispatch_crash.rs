@@ -15,9 +15,7 @@ use sbproxy_billing::dispatch::{DispatchContext, DispatchOutcome};
 use sbproxy_billing::registry::{AuthoritativePayment, PaymentMethodAdapter, RailRegistry};
 use sbproxy_billing::service::BillingService;
 use sbproxy_billing::sqlite::SqliteSettlementStore;
-use sbproxy_billing::store::{
-    BillingClock, ReconciliationOutcome, SettlementStore, SharedSettlementStore,
-};
+use sbproxy_billing::store::{BillingClock, ReconciliationOutcome, SharedSettlementStore};
 use sbproxy_billing::types::{
     provider_idempotency_key, AttemptOperation, AttemptStatus, IntentStatus, PaymentProof,
     SettlementRail,
@@ -120,6 +118,7 @@ async fn crash_after_dispatch(
         intent_id: created.intent_id.clone(),
         requirement: signed.requirement.clone(),
         requirement_digest: signed.requirement_digest,
+        quote_token: signed.quote_token.clone(),
         proof,
         now_ms: START_MS,
     };

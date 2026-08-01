@@ -78,6 +78,14 @@ use crate::types::{
 /// provider's rolling default cannot keep a pinned contract test honest.
 pub const STRIPE_API_VERSION: &str = "2026-06-24.dahlia";
 
+/// The Stripe API root both Stripe surfaces are built from.
+///
+/// Not configurable. An operator-supplied API root would be a way to point
+/// settlement at a host the operator does not control, and the only
+/// legitimate reason to change it is a local fixture, which reaches the same
+/// place through the explicit loopback constructors instead.
+pub const STRIPE_API_ROOT: &str = "https://api.stripe.com";
+
 /// The header carrying [`STRIPE_API_VERSION`].
 pub const STRIPE_VERSION_HEADER: &str = "Stripe-Version";
 

@@ -777,7 +777,7 @@ pub fn settlement_amount(
     const MICRO_DECIMALS: u8 = 6;
     let units = if decimals <= MICRO_DECIMALS {
         let divisor = 10u64.pow(u32::from(MICRO_DECIMALS - decimals));
-        if amount_micros % divisor != 0 {
+        if !amount_micros.is_multiple_of(divisor) {
             return Err(AmountConversionError::Inexact {
                 amount_micros,
                 decimals,

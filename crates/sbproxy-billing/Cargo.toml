@@ -23,7 +23,11 @@ publish = false
 [features]
 default = []
 runtime = ["dep:rusqlite", "dep:tokio", "dep:rand"]
-x402 = ["runtime", "dep:sbproxy-httpkit"]
+# `dep:reqwest` is the client type the shared HTTP kit hands back. The kit
+# builds it and owns the outbound policy; this crate only needs to name the
+# type and drive a request, which is why reqwest is pulled in beside it rather
+# than instead of it.
+x402 = ["runtime", "dep:sbproxy-httpkit", "dep:reqwest"]
 mpp = []
 # Envelope nonces must never repeat under one key, so the cipher needs a real
 # entropy source of its own rather than inheriting one from `runtime`.
@@ -35,7 +39,7 @@ recovery-crypto = ["dep:aes-gcm", "dep:rand"]
 # The Payment Auth charge path additionally needs `mpp` for the pinned
 # credential codec; with `stripe` alone the direct PaymentIntent rail works
 # and the Payment Auth path refuses rather than guessing a token shape.
-stripe = ["runtime", "dep:sbproxy-httpkit", "recovery-crypto"]
+stripe = ["runtime", "dep:sbproxy-httpkit", "dep:reqwest", "recovery-crypto"]
 # The two Lightning backends are separately gated so a build carries exactly
 # the node client it talks to.
 lightning-cln = ["runtime"]
@@ -50,6 +54,7 @@ lightning-lnd = ["runtime"]
 rusqlite = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 sbproxy-httpkit = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 aes-gcm = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }

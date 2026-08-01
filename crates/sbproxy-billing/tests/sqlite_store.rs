@@ -11,9 +11,7 @@ use std::sync::Arc;
 use sbproxy_billing::error::BillingError;
 use sbproxy_billing::registry::{RailRegistry, UsageEvent};
 use sbproxy_billing::sqlite::{SqliteSettlementStore, SqliteStoreConfig};
-use sbproxy_billing::store::{
-    BillingClock, ProofReservation, SettlementStore, SharedSettlementStore,
-};
+use sbproxy_billing::store::{BillingClock, ProofReservation, SharedSettlementStore};
 use sbproxy_billing::types::{
     provider_idempotency_key, AttemptOperation, AttemptStatus, FailureCategory, IntentStatus,
     PaymentProof, SafeFailure, SettlementRail, SettlementReceipt, SignedPaymentRequirement,

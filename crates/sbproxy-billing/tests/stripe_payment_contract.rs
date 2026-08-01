@@ -524,10 +524,15 @@ fn a_client_secret_never_reaches_a_request_or_a_binding() {
 
 // --- Transport shape ---
 
+/// One request as the recording transport saw it.
+///
+/// Method, URL, API version, idempotency key, and body length, in that order.
+type SeenRequest = (String, String, String, Option<String>, usize);
+
 /// Records the exact requests a transport is handed.
 #[derive(Default)]
 struct RecordingTransport {
-    seen: Mutex<Vec<(String, String, String, Option<String>, usize)>>,
+    seen: Mutex<Vec<SeenRequest>>,
 }
 
 #[async_trait::async_trait]

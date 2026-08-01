@@ -26,9 +26,7 @@ use sbproxy_billing::error::BillingError;
 use sbproxy_billing::registry::RailRegistry;
 use sbproxy_billing::service::{AuthorizationDecision, BillingService, RedemptionRequest};
 use sbproxy_billing::sqlite::SqliteSettlementStore;
-use sbproxy_billing::store::{
-    BillingClock, PreparedAttempt, SettlementStore, SharedSettlementStore,
-};
+use sbproxy_billing::store::{BillingClock, PreparedAttempt, SharedSettlementStore};
 use sbproxy_billing::types::{
     provider_idempotency_key, AttemptOperation, IntentStatus, PaymentProof,
     PaymentRequirementDraft, SettlementRail,

@@ -66,6 +66,11 @@ pub struct UsageDispatch {
 
 /// What one dispatch context is guarding.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Boxing the large variant would put an allocation and an indirection on the
+// settlement path to save stack bytes that are never the bottleneck: exactly
+// one of these exists per provider interaction, and that interaction is a
+// network round trip.
+#[allow(clippy::large_enum_variant)]
 pub enum DispatchSubject {
     /// A payment attempt against a settlement rail.
     Attempt(PreparedAttempt),
@@ -247,6 +252,34 @@ impl DispatchContext {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, BillingError>>,
     {
+        self.stamp_write().await?;
+        let result = operation().await;
+        self.conclude_write(&result);
+        result
+    }
+
+    /// Commits the dispatch stamp for a write the caller performs itself.
+    ///
+    /// The two halves of [`Self::run_write`], exposed separately for the one
+    /// shape a closure cannot express: a rail whose protocol requires a read
+    /// before its write. x402 must call `verify` and inspect the answer
+    /// before it may call `settle`, and only `settle` moves money. Wrapping
+    /// both in `run_write` would stamp a dispatch before the read, which
+    /// would put an attempt into reconciliation every time a facilitator
+    /// merely declined to verify.
+    ///
+    /// A caller that uses this owes the matching [`Self::conclude_write`].
+    /// Between the two calls the attempt reads as ambiguous, which is the
+    /// correct state for a write that is genuinely in flight: a process that
+    /// dies in that window leaves a record saying the write may have landed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BillingError::AlreadyDispatched`] when this context already
+    /// stamped a write, and whatever the store returns from the stamp
+    /// transaction. A stamp that fails to commit rolls the conclusion back,
+    /// because nothing was sent and the caller may still retry safely.
+    pub async fn stamp_write(&self) -> Result<(), BillingError> {
         self.outcome
             .compare_exchange(
                 OUTCOME_NEVER_DISPATCHED,
@@ -263,19 +296,38 @@ impl DispatchContext {
                 .store(OUTCOME_NEVER_DISPATCHED, Ordering::Release);
             return Err(error);
         }
+        Ok(())
+    }
 
-        match operation().await {
-            Ok(value) => {
-                self.outcome.store(OUTCOME_RESOLVED, Ordering::Release);
-                Ok(value)
-            }
+    /// Records what a completed write proved.
+    ///
+    /// Success resolves the attempt. A failure resolves it only when the
+    /// error proves the provider refused, which is what
+    /// [`is_authoritative_negative`] decides; anything else leaves the
+    /// attempt ambiguous and therefore bound for reconciliation.
+    ///
+    /// Calling this without a preceding [`Self::stamp_write`] is harmless: a
+    /// context that never dispatched stays never-dispatched, because the
+    /// conclusion only moves off ambiguous.
+    pub fn conclude_write<T>(&self, result: &Result<T, BillingError>) {
+        match result {
+            Ok(_) => self.resolve_if_dispatched(),
             Err(error) => {
-                if is_authoritative_negative(&error) {
-                    self.outcome.store(OUTCOME_RESOLVED, Ordering::Release);
+                if is_authoritative_negative(error) {
+                    self.resolve_if_dispatched();
                 }
-                Err(error)
             }
         }
+    }
+
+    /// Moves an ambiguous conclusion to resolved, and nothing else.
+    fn resolve_if_dispatched(&self) {
+        let _ = self.outcome.compare_exchange(
+            OUTCOME_AMBIGUOUS,
+            OUTCOME_RESOLVED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     /// Runs one read-only provider call.

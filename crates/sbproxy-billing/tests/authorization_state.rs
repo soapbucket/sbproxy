@@ -17,7 +17,7 @@ use sbproxy_billing::service::{
     AuthorizationDecision, BillingService, PaymentProblemCode, RedemptionRequest,
 };
 use sbproxy_billing::sqlite::SqliteSettlementStore;
-use sbproxy_billing::store::{BillingClock, SettlementStore, SharedSettlementStore};
+use sbproxy_billing::store::{BillingClock, SharedSettlementStore};
 use sbproxy_billing::types::{
     IntentStatus, PaymentProof, PaymentRequirement, SettlementRail, SignedPaymentRequirement,
 };

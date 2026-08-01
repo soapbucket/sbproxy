@@ -91,6 +91,10 @@ pub mod recovery_crypto;
 pub mod payment_auth;
 #[cfg(feature = "x402")]
 pub mod x402;
+// The x402 settler is written against x402's vocabulary; this is the only
+// translation between it and the crate's normalized requirement.
+#[cfg(feature = "x402")]
+pub mod x402_adapter;
 
 #[cfg(feature = "stripe")]
 pub mod stripe_meter;
@@ -102,6 +106,12 @@ pub mod stripe_payment;
 // behind their own gates.
 #[cfg(any(feature = "lightning-cln", feature = "lightning-lnd"))]
 pub mod lightning;
+
+// The production implementations of the adapter transport traits. Each one
+// sits behind the same gate as the adapter it serves, so a build carries
+// exactly the sockets its rails need.
+#[cfg(any(feature = "x402", feature = "stripe", feature = "lightning-cln"))]
+pub mod transport;
 
 pub use error::BillingError;
 pub use money::{CurrencyCode, Money};
@@ -149,6 +159,17 @@ pub use stripe_payment::{
     PaymentIntent, PaymentIntentStatus, StripeEndpoints, StripeError, StripeHttpResponse,
     StripePaymentIntentSettler, StripeRequest, StripeSettlerConfig, StripeTransport,
     STRIPE_API_VERSION,
+};
+
+#[cfg(feature = "x402")]
+pub use transport::HttpFacilitatorTransport;
+#[cfg(feature = "stripe")]
+pub use transport::HttpStripeTransport;
+#[cfg(all(feature = "lightning-cln", unix))]
+pub use transport::UnixClnTransport;
+#[cfg(feature = "x402")]
+pub use x402_adapter::{
+    x402_accepted, x402_extensions, x402_payment_required, x402_resource, X402Adapter,
 };
 
 #[cfg(feature = "lightning-cln")]

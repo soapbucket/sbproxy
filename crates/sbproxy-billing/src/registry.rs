@@ -92,6 +92,17 @@ pub struct AuthoritativePayment {
     pub requirement: PaymentRequirement,
     /// Digest of the finalized requirement.
     pub requirement_digest: [u8; 32],
+    /// The quote token the proxy signed over that requirement.
+    ///
+    /// Present because one rail puts it on the wire: the x402 envelope
+    /// carries it inside the `sbproxy-requirement` extension, and the payer
+    /// echoes that extension back unchanged. The adapter has to rebuild the
+    /// exact extension map to compare against what arrived, and the token is
+    /// the one part of it that is not derivable from the requirement.
+    ///
+    /// It is the proxy's own signature over an obligation it already
+    /// published in a 402, not a payer secret.
+    pub quote_token: String,
     /// The client's credential.
     pub proof: PaymentProof,
     /// Current time, in milliseconds since the epoch.

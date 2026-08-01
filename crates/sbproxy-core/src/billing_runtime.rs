@@ -65,7 +65,7 @@ use sbproxy_billing::error::BillingError;
 use sbproxy_billing::registry::RailRegistry;
 use sbproxy_billing::service::{BillingService, RequirementSigner};
 use sbproxy_billing::sqlite::{SqliteSettlementStore, SCHEMA_VERSION};
-use sbproxy_billing::store::{BillingClock, ReconciliationOutcome, SettlementStore};
+use sbproxy_billing::store::{BillingClock, ReconciliationOutcome};
 use sbproxy_billing::types::{AttemptOperation, SettlementRail};
 use sbproxy_billing::worker::{
     SettlementWorker, SettlementWorkerHandle, WorkerConfig, WorkerStatus,
@@ -109,6 +109,15 @@ const ALL_RAILS: [SettlementRail; 4] = [
 /// Deliberately not a real identifier shape. The probe proves the database
 /// answers a read; it must not be able to observe a real payment.
 const HEALTH_PROBE_INTENT_ID: &str = "sbproxy-settlement-store-health-probe";
+
+/// The description Core Lightning invoices are created with.
+///
+/// Fixed rather than configurable, and deliberately says nothing about the
+/// request. An invoice description is visible to the payer and to anyone who
+/// can read the node's invoice list, so a route, a tenant, or a quote in this
+/// string would put request metadata somewhere the proxy does not control.
+#[cfg(all(feature = "payment-lightning-cln", unix))]
+const CLN_INVOICE_DESCRIPTION: &str = "SBProxy metered request";
 
 /// Every way settlement can refuse to start.
 ///
@@ -154,6 +163,14 @@ pub enum PaymentsRuntimeError {
     #[error("proxy.payments.recovery_encryption.key names a secret that was not resolved before runtime assembly; the Stripe rail cannot seal a recovery envelope without it, so it cannot accept a payment")]
     RecoveryKeyMissing,
 
+    /// The Stripe key was named in configuration but never resolved.
+    #[error("proxy.payments.rails.stripe.api_key names a secret that resolved to nothing usable before runtime assembly; the Stripe rail cannot authenticate a PaymentIntent call without it, so it cannot accept a payment")]
+    StripeKeyMissing,
+
+    /// Usage reporting was configured without the rail it reports through.
+    #[error("proxy.payments.usage_reporters.stripe_meter is configured but proxy.payments.rails.stripe is not; the reporter authenticates with that rail's api_key and api_version, so there is no account to report usage against. Configure the stripe rail, or remove the reporter")]
+    MeterWithoutStripeRail,
+
     /// A configured rail compiled in but registered no adapter.
     #[error("proxy.payments.rails.{rail} is configured and the `{feature}` cargo feature is compiled in, but no adapter registered for it; refusing to publish a runtime that would answer a payer's credential with an unsupported rail")]
     AdapterMissing {
@@ -170,6 +187,10 @@ pub enum PaymentsRuntimeError {
 /// that `sbproxy validate` reads the same document on every build. This is
 /// the other half of that contract, and it is a plain function rather than
 /// a constant because the list depends on the compilation.
+// `vec![]` cannot express this: which entries exist is decided by `cfg`, and
+// an attribute on a macro element is not the same thing as an attribute on a
+// statement.
+#[allow(clippy::vec_init_then_push)]
 #[must_use]
 pub fn compiled_payment_features() -> Vec<&'static str> {
     let mut features: Vec<&'static str> = Vec::new();
@@ -204,6 +225,19 @@ pub struct PaymentsRuntimeInputs {
     pub signer: SharedRequirementSigner,
     /// The resolved recovery encryption key, when configuration set one.
     pub recovery_key: Option<Zeroizing<Vec<u8>>>,
+    /// The resolved Stripe secret key, when a Stripe rail is configured.
+    ///
+    /// Required by both Stripe surfaces, which is why it is one value: the
+    /// settlement rail and the usage reporter address the same account, and
+    /// letting them carry different keys would let usage be billed to one
+    /// account while payment settles on another.
+    pub stripe_api_key: Option<Zeroizing<String>>,
+    /// The resolved Core Lightning rune, when one is configured.
+    ///
+    /// Optional even when the CLN rail is: a node without rune
+    /// authentication accepts an unadorned request, and the settler puts the
+    /// rune in the JSON-RPC object only when it has one.
+    pub cln_rune: Option<Zeroizing<String>>,
     /// The clock every durable stamp is read from. `None` uses the process
     /// clock; tests inject one so expiry and lease recovery can be driven
     /// without sleeping.
@@ -275,7 +309,7 @@ impl PaymentsRuntimeCandidate {
         }
         let store = store.shared();
 
-        let registry = compiled_registry()?;
+        let registry = compiled_registry(config, inputs)?;
         // Every rail the operator configured has to have an adapter here,
         // not at first request. The feature check above catches a rail this
         // build never compiled; this catches a rail it compiled and did not
@@ -315,13 +349,7 @@ impl PaymentsRuntimeCandidate {
             recovery.validate_resolved_key(key)?;
             #[cfg(feature = "payment-stripe")]
             {
-                let cipher = RecoveryCipher::new(&recovery.key_id, key).map_err(|source| {
-                    PaymentsRuntimeError::Billing {
-                        surface: "recovery_encryption.key",
-                        source,
-                    }
-                })?;
-                builder = builder.recovery_cipher(cipher);
+                builder = builder.recovery_cipher(recovery_cipher(config, inputs)?);
             }
         }
 
@@ -704,11 +732,330 @@ fn configured_rails(config: &PaymentsConfig) -> Vec<SettlementRail> {
 
 /// Build the registry of rail adapters this binary compiled.
 ///
-/// Each rail registers behind its own cargo feature. The caller then checks
-/// that every configured rail is present, so an empty registry beside a
-/// configured rail is a startup failure rather than a request-time one.
-fn compiled_registry() -> Result<RailRegistry, PaymentsRuntimeError> {
-    Ok(RailRegistry::new())
+/// Each rail registers behind its own cargo feature and only when the
+/// operator configured it. The caller then checks that every configured rail
+/// is present, so a rail this build compiled but could not construct is a
+/// startup failure rather than a request-time one.
+///
+/// # Every bound comes from the document
+///
+/// Nothing here invents a timeout, a breaker threshold, a capture mode, or a
+/// mode switch. The values an operator wrote are lowered onto each adapter's
+/// own configuration struct, and where an adapter has a bound the
+/// configuration crate also validates, the adapter re-checks it: the
+/// constructors are the runtime backstop for the loader, not a second source
+/// of truth.
+///
+/// `direct_payment_intent.enabled` in particular is threaded through to
+/// [`StripeSettlerConfig`] rather than defaulted. Direct mode charges a card
+/// the proxy holds no credential for, so it has to arrive because an operator
+/// asked for it and never because a struct filled in a field.
+///
+/// # LND is compiled but has no transport
+///
+/// The LND settler and its contract tests are complete, but the generated
+/// gRPC client is a separate slice, so there is nothing to give
+/// [`LndSettler`](sbproxy_billing::lightning::lnd::LndSettler) to talk
+/// through. A build that compiles `payment-lightning-lnd` and configures
+/// `proxy.payments.rails.lightning_lnd` therefore registers no adapter and
+/// fails startup through [`PaymentsRuntimeError::AdapterMissing`], naming the
+/// rail. Failing there is the point: the alternative is a proxy that
+/// advertises a Lightning challenge it has no way to settle.
+// A build with `payments` and no rail feature reads neither argument. That
+// is a real configuration: the store, the service, and the recovery worker
+// all work, and every configured rail then fails the coverage check by name.
+#[allow(unused_variables)]
+fn compiled_registry(
+    config: &PaymentsConfig,
+    inputs: &PaymentsRuntimeInputs,
+) -> Result<RailRegistry, PaymentsRuntimeError> {
+    let mut registry = RailRegistry::new();
+
+    #[cfg(feature = "payment-x402")]
+    if let Some(rail) = &config.rails.x402 {
+        registry
+            .register_adapter(build_x402_adapter(rail, config.authorization_timeout_ms)?)
+            .map_err(billing_error("rails.x402"))?;
+    }
+
+    #[cfg(feature = "payment-stripe")]
+    if let Some(rail) = &config.rails.stripe {
+        registry
+            .register_adapter(build_stripe_adapter(rail, config, inputs)?)
+            .map_err(billing_error("rails.stripe"))?;
+    }
+
+    #[cfg(all(feature = "payment-lightning-cln", unix))]
+    if let Some(rail) = &config.rails.lightning_cln {
+        registry
+            .register_adapter(build_cln_adapter(rail, config, inputs)?)
+            .map_err(billing_error("rails.lightning_cln"))?;
+    }
+
+    #[cfg(feature = "payment-stripe")]
+    if let Some(reporter) = &config.usage_reporters.stripe_meter {
+        let stripe = config
+            .rails
+            .stripe
+            .as_ref()
+            .ok_or(PaymentsRuntimeError::MeterWithoutStripeRail)?;
+        registry
+            .register_reporter(build_stripe_meter_reporter(
+                reporter, stripe, config, inputs,
+            )?)
+            .map_err(billing_error("usage_reporters.stripe_meter"))?;
+    }
+
+    Ok(registry)
+}
+
+/// Curries a configuration surface onto the billing failure wrapper.
+///
+/// Every construction below names the block an operator would go and edit,
+/// because a startup failure that says only "payments failed" makes them diff
+/// their whole document to find out what this build objected to.
+#[cfg(any(
+    feature = "payment-x402",
+    feature = "payment-stripe",
+    all(feature = "payment-lightning-cln", unix)
+))]
+fn billing_error(surface: &'static str) -> impl Fn(BillingError) -> PaymentsRuntimeError {
+    move |source| PaymentsRuntimeError::Billing { surface, source }
+}
+
+/// Build the x402 rail, one settler per configured facilitator.
+///
+/// The facilitators are an ordered list and each keeps its own breaker, so
+/// one unhealthy facilitator cannot open the breaker guarding another. Which
+/// one a payment uses was decided when its requirement was signed; this only
+/// makes each of them reachable.
+#[cfg(feature = "payment-x402")]
+fn build_x402_adapter(
+    rail: &sbproxy_config::payments::X402RailConfig,
+    authorization_timeout_ms: u32,
+) -> Result<Arc<dyn sbproxy_billing::registry::PaymentMethodAdapter>, PaymentsRuntimeError> {
+    use sbproxy_billing::transport::HttpFacilitatorTransport;
+    use sbproxy_billing::x402::{FacilitatorBreaker, FacilitatorEndpoints, X402ExactSettler};
+    use sbproxy_billing::x402_adapter::X402Adapter;
+
+    let surface = billing_error("rails.x402");
+    // One client, cloned per facilitator, so the connection pool is shared
+    // while the breakers stay independent.
+    let transport = HttpFacilitatorTransport::new().map_err(&surface)?;
+
+    let mut settlers = Vec::with_capacity(rail.facilitators.len());
+    for facilitator in &rail.facilitators {
+        let endpoints =
+            FacilitatorEndpoints::from_api_root(&facilitator.facilitator_url).map_err(|error| {
+                PaymentsRuntimeError::Billing {
+                    surface: "rails.x402.facilitators",
+                    source: error.into(),
+                }
+            })?;
+        let breaker = FacilitatorBreaker::new(
+            rail.breaker.failure_threshold,
+            rail.breaker.open_ms,
+            rail.breaker.half_open_max,
+        )
+        .map_err(|error| PaymentsRuntimeError::Billing {
+            surface: "rails.x402.breaker",
+            source: error.into(),
+        })?;
+        let settler = X402ExactSettler::new(
+            endpoints,
+            transport.clone(),
+            Arc::new(breaker),
+            u64::from(rail.verify_timeout_ms),
+            u64::from(rail.settle_timeout_ms),
+            u64::from(authorization_timeout_ms),
+        )
+        .map_err(|error| PaymentsRuntimeError::Billing {
+            surface: "rails.x402",
+            source: error.into(),
+        })?;
+        settlers.push(Arc::new(settler));
+    }
+
+    let adapter = X402Adapter::new(settlers).map_err(|error| PaymentsRuntimeError::Billing {
+        surface: "rails.x402.facilitators",
+        source: error.into(),
+    })?;
+    Ok(Arc::new(adapter))
+}
+
+/// Build the Stripe settlement rail.
+///
+/// The recovery cipher is required rather than optional here. A Stripe create
+/// that is dispatched and then lost is recoverable only by replaying its
+/// exact sealed bytes under the same idempotency key, so a Stripe rail
+/// without a cipher would have one unrecoverable failure mode by
+/// construction. The configuration crate already requires the block; this
+/// turns the resolved key into the cipher that uses it.
+#[cfg(feature = "payment-stripe")]
+fn build_stripe_adapter(
+    rail: &sbproxy_config::payments::StripeRailConfig,
+    config: &PaymentsConfig,
+    inputs: &PaymentsRuntimeInputs,
+) -> Result<Arc<dyn sbproxy_billing::registry::PaymentMethodAdapter>, PaymentsRuntimeError> {
+    use sbproxy_billing::stripe_payment::{
+        StripeEndpoints, StripePaymentIntentSettler, StripeSettlerConfig, STRIPE_API_ROOT,
+    };
+    use sbproxy_billing::transport::HttpStripeTransport;
+
+    let surface = billing_error("rails.stripe");
+    let transport = HttpStripeTransport::new(stripe_api_key(inputs)?).map_err(&surface)?;
+    let endpoints = StripeEndpoints::from_api_root(STRIPE_API_ROOT).map_err(|error| {
+        PaymentsRuntimeError::Billing {
+            surface: "rails.stripe",
+            source: error.into(),
+        }
+    })?;
+
+    let settler = StripePaymentIntentSettler::new(
+        endpoints,
+        transport,
+        recovery_cipher(config, inputs)?,
+        &rail.api_version,
+        StripeSettlerConfig {
+            call_timeout_ms: u64::from(config.authorization_timeout_ms),
+            total_deadline_ms: u64::from(config.authorization_timeout_ms),
+            recovery_ttl_ms: recovery_ttl_ms(config),
+            // The operator's switch, carried to the one place that can
+            // honor it. Absent means off, which matches the config default.
+            direct_payment_intent_enabled: rail
+                .direct_payment_intent
+                .as_ref()
+                .is_some_and(|direct| direct.enabled),
+        },
+    )
+    .map_err(|error| PaymentsRuntimeError::Billing {
+        surface: "rails.stripe",
+        source: error.into(),
+    })?;
+    Ok(Arc::new(settler))
+}
+
+/// Build the Stripe usage reporter.
+///
+/// It shares the settlement rail's key and API version, because it is the
+/// same account, and shares nothing else. It registers in the reporter
+/// namespace, cannot build a receipt, and cannot move an intent to
+/// `Succeeded`.
+#[cfg(feature = "payment-stripe")]
+fn build_stripe_meter_reporter(
+    reporter: &sbproxy_config::payments::StripeMeterReporterConfig,
+    rail: &sbproxy_config::payments::StripeRailConfig,
+    config: &PaymentsConfig,
+    inputs: &PaymentsRuntimeInputs,
+) -> Result<Arc<dyn sbproxy_billing::registry::UsageReporter>, PaymentsRuntimeError> {
+    use sbproxy_billing::stripe_meter::{StripeMeterEndpoints, StripeMeterReporter};
+    use sbproxy_billing::stripe_payment::STRIPE_API_ROOT;
+    use sbproxy_billing::transport::HttpStripeTransport;
+
+    let _ = reporter;
+    let surface = billing_error("usage_reporters.stripe_meter");
+    let transport = HttpStripeTransport::new(stripe_api_key(inputs)?).map_err(&surface)?;
+    let endpoints = StripeMeterEndpoints::from_api_root(STRIPE_API_ROOT).map_err(|error| {
+        PaymentsRuntimeError::Billing {
+            surface: "usage_reporters.stripe_meter",
+            source: error.into(),
+        }
+    })?;
+
+    let built = StripeMeterReporter::new(
+        endpoints,
+        transport,
+        &rail.api_version,
+        u64::from(config.authorization_timeout_ms),
+    )
+    .map_err(|error| PaymentsRuntimeError::Billing {
+        surface: "usage_reporters.stripe_meter",
+        source: error.into(),
+    })?;
+    Ok(Arc::new(built))
+}
+
+/// Build the Core Lightning rail.
+///
+/// The socket is not dialed here. `check_health` proves the node answers and
+/// meets the pinned version floor before anything is published, so a node
+/// that is down or too old fails the whole runtime rather than one paid
+/// request.
+#[cfg(all(feature = "payment-lightning-cln", unix))]
+fn build_cln_adapter(
+    rail: &sbproxy_config::payments::LightningClnRailConfig,
+    config: &PaymentsConfig,
+    inputs: &PaymentsRuntimeInputs,
+) -> Result<Arc<dyn sbproxy_billing::registry::PaymentMethodAdapter>, PaymentsRuntimeError> {
+    use sbproxy_billing::lightning::cln::ClnSettler;
+    use sbproxy_billing::transport::UnixClnTransport;
+
+    let surface = billing_error("rails.lightning_cln");
+    let transport = UnixClnTransport::new(Path::new(&rail.socket_path)).map_err(&surface)?;
+    let settler = ClnSettler::new(
+        transport,
+        inputs
+            .cln_rune
+            .as_ref()
+            .map(|rune| rune.as_str().to_owned()),
+        CLN_INVOICE_DESCRIPTION,
+        u64::from(config.authorization_timeout_ms),
+        u64::from(config.authorization_timeout_ms),
+    )
+    .map_err(|error| PaymentsRuntimeError::Billing {
+        surface: "rails.lightning_cln",
+        source: error.into(),
+    })?;
+    Ok(Arc::new(settler))
+}
+
+/// The resolved Stripe secret key, or the error naming what is missing.
+#[cfg(feature = "payment-stripe")]
+fn stripe_api_key(
+    inputs: &PaymentsRuntimeInputs,
+) -> Result<Zeroizing<String>, PaymentsRuntimeError> {
+    let key = inputs
+        .stripe_api_key
+        .as_ref()
+        .ok_or(PaymentsRuntimeError::StripeKeyMissing)?;
+    if key.trim().is_empty() {
+        return Err(PaymentsRuntimeError::StripeKeyMissing);
+    }
+    Ok(key.clone())
+}
+
+/// The recovery cipher the Stripe rail seals its replay envelopes with.
+#[cfg(feature = "payment-stripe")]
+fn recovery_cipher(
+    config: &PaymentsConfig,
+    inputs: &PaymentsRuntimeInputs,
+) -> Result<RecoveryCipher, PaymentsRuntimeError> {
+    let recovery = config
+        .recovery_encryption
+        .as_ref()
+        .ok_or(PaymentsRuntimeError::RecoveryKeyMissing)?;
+    let key = inputs
+        .recovery_key
+        .as_ref()
+        .ok_or(PaymentsRuntimeError::RecoveryKeyMissing)?;
+    recovery.validate_resolved_key(key)?;
+    RecoveryCipher::new(&recovery.key_id, key).map_err(|source| PaymentsRuntimeError::Billing {
+        surface: "recovery_encryption.key",
+        source,
+    })
+}
+
+/// How long a sealed envelope stays replayable, in milliseconds.
+///
+/// Configuration bounds `max_age_hours` at 23, below Stripe's documented
+/// 24-hour idempotency retention, so the arithmetic cannot overflow and the
+/// window cannot outlive the provider's memory of the original request.
+#[cfg(feature = "payment-stripe")]
+fn recovery_ttl_ms(config: &PaymentsConfig) -> i64 {
+    config
+        .recovery_encryption
+        .as_ref()
+        .map_or(0, |recovery| i64::from(recovery.max_age_hours) * 3_600_000)
 }
 
 /// Lower the configured worker cadence onto the worker's own shape.
@@ -968,6 +1315,8 @@ mod tests {
         PaymentsRuntimeInputs {
             signer: Arc::new(StubSigner),
             recovery_key: None,
+            stripe_api_key: None,
+            cln_rune: None,
             clock: None,
             clustered: false,
         }

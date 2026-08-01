@@ -1125,7 +1125,10 @@ pub fn parse_accept_payment(value: &str) -> Vec<PaymentPreference> {
             preferences.push(preference);
         }
     }
-    preferences.sort_by(|left, right| right.quality.cmp(&left.quality));
+    // Highest quality first. `sort_by_key` with `Reverse` keeps the sort
+    // stable, so equal-quality preferences stay in the order the client
+    // listed them, which is what decides the tie.
+    preferences.sort_by_key(|preference| std::cmp::Reverse(preference.quality));
     preferences
 }
 
@@ -1665,7 +1668,7 @@ mod tests {
 
     #[test]
     fn the_credential_cap_covers_the_draft_minimum() {
-        assert!(MAX_CREDENTIAL_BYTES >= MIN_SUPPORTED_CREDENTIAL_BYTES);
+        const { assert!(MAX_CREDENTIAL_BYTES >= MIN_SUPPORTED_CREDENTIAL_BYTES) };
     }
 
     #[test]

@@ -15,8 +15,8 @@ use sbproxy_billing::registry::{UsageEvent, UsageReportReceipt};
 use sbproxy_billing::stripe_meter::{
     build_meter_body, classify_meter_failure, parse_meter_ack, MeterFailure, StripeMeterEndpoints,
     StripeMeterError, StripeMeterReporter, StripeMeterRequest, StripeMeterTransport,
-    ATTRIBUTE_STRIPE_CUSTOMER_ID, DUPLICATE_IDENTIFIER_CODE, MAX_METER_RESPONSE_BYTES,
-    METER_EVENTS_PATH, PAYLOAD_CUSTOMER_ID, PAYLOAD_VALUE, STRIPE_METER_REPORTER,
+    ATTRIBUTE_STRIPE_CUSTOMER_ID, MAX_METER_RESPONSE_BYTES, METER_EVENTS_PATH, PAYLOAD_CUSTOMER_ID,
+    PAYLOAD_VALUE, STRIPE_METER_REPORTER,
 };
 use sbproxy_billing::stripe_payment::{
     StripeHttpMethod, StripeHttpResponse, StripeTransportFailure, STRIPE_API_VERSION,
@@ -133,19 +133,15 @@ fn an_event_that_cannot_be_billed_is_refused_before_a_byte_leaves() {
 }
 
 #[test]
-fn rate_limits_and_server_errors_retry_and_duplicates_are_accepted() {
-    assert_eq!(classify_meter_failure(429, b"{}"), MeterFailure::Retry);
-    assert_eq!(classify_meter_failure(500, b"{}"), MeterFailure::Retry);
-    assert_eq!(classify_meter_failure(503, b"{}"), MeterFailure::Retry);
-    assert_eq!(classify_meter_failure(400, b"{}"), MeterFailure::Terminal);
-
-    let duplicate = format!(
-        r#"{{"error":{{"type":"invalid_request_error","code":"{DUPLICATE_IDENTIFIER_CODE}"}}}}"#
-    );
+fn rate_limits_and_server_errors_retry_while_client_errors_stop() {
+    assert_eq!(classify_meter_failure(429), MeterFailure::Retry);
+    assert_eq!(classify_meter_failure(500), MeterFailure::Retry);
+    assert_eq!(classify_meter_failure(503), MeterFailure::Retry);
+    assert_eq!(classify_meter_failure(400), MeterFailure::Terminal);
     assert_eq!(
-        classify_meter_failure(400, duplicate.as_bytes()),
-        MeterFailure::AlreadyAccepted,
-        "an already-accepted identifier is not a second unit of usage"
+        classify_meter_failure(402),
+        MeterFailure::Terminal,
+        "a refusal this reporter cannot fix by repeating it must stop"
     );
 }
 

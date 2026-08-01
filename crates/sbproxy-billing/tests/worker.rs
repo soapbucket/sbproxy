@@ -13,7 +13,7 @@ use std::time::Duration;
 use sbproxy_billing::registry::{RailRegistry, UsageEvent};
 use sbproxy_billing::service::BillingService;
 use sbproxy_billing::sqlite::SqliteSettlementStore;
-use sbproxy_billing::store::{BillingClock, SettlementStore, SharedSettlementStore};
+use sbproxy_billing::store::{BillingClock, SharedSettlementStore};
 use sbproxy_billing::types::{
     provider_idempotency_key, AttemptOperation, AttemptStatus, IntentStatus, PaymentProof,
     SettlementRail,
