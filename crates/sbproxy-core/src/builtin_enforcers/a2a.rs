@@ -112,7 +112,7 @@ impl PolicyEnforcer for A2AEnforcer {
                                  itself as A2A; admitted because failure_posture is observe, \
                                  and closed would have refused it",
                                 counterfactual.http_status(),
-                                ctx.hostname.as_ref().map(|h| h.to_string()),
+                                Some(ctx.hostname.to_string()),
                                 ctx.client_ip,
                                 Some(ctx.request_id.to_string()),
                                 Some(req.method().as_str().to_string()),

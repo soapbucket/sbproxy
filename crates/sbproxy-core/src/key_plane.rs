@@ -1372,7 +1372,9 @@ mod tests {
         let mut cfg = base_cfg(&path);
         cfg.failure_posture = Some(FailureMode::Observe);
 
-        let error = prepare_key_plane(Some(&cfg)).expect_err("observe must not build a plane");
+        let error = prepare_key_plane(Some(&cfg))
+            .map(|_| ())
+            .expect_err("observe must not build a plane");
         assert!(
             error
                 .to_string()
@@ -1381,8 +1383,9 @@ mod tests {
         );
 
         cfg.enabled = false;
-        let error =
-            prepare_key_plane(Some(&cfg)).expect_err("a disabled block still rejects the typo");
+        let error = prepare_key_plane(Some(&cfg))
+            .map(|_| ())
+            .expect_err("a disabled block still rejects the typo");
         assert!(
             error.to_string().contains("key_management.failure_posture"),
             "unexpected error: {error}"
@@ -1391,6 +1394,7 @@ mod tests {
         let mut governed = base_cfg(&path);
         governed.governance.failure_posture = Some(FailureMode::Observe);
         let error = prepare_key_plane(Some(&governed))
+            .map(|_| ())
             .expect_err("observe must not build a governance store either");
         assert!(
             error

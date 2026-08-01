@@ -6167,7 +6167,7 @@ pub(super) async fn handle_ai_proxy(
                         config.quota_pool.as_ref(),
                     ) {
                         if let QuotaPoolErrorDisposition::Reject { status, message } =
-                            quota_pool_error_disposition(pool, error)
+                            sbproxy_ai::quota_pool::pool_error_disposition(Some(pool), error)
                         {
                             send_error(session, status, message).await?;
                             return Ok(());
