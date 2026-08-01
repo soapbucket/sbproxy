@@ -843,7 +843,10 @@ mod tests {
             .await
             .expect_err("plaintext must not replicate");
         let message = format!("{error:#}");
-        assert!(message.contains("raw-cred"), "names the credential: {message}");
+        assert!(
+            message.contains("raw-cred"),
+            "names the credential: {message}"
+        );
         assert!(
             message.contains("envelope") && message.contains("vault"),
             "points at the sealed alternatives: {message}"
@@ -941,7 +944,10 @@ mod tests {
             .expect("keys route");
         assert_eq!(resp.0, 201, "{}", resp.2);
         let created: serde_json::Value = serde_json::from_str(&resp.2).expect("mint response");
-        let key_id = created["key"]["key_id"].as_str().expect("key id").to_string();
+        let key_id = created["key"]["key_id"]
+            .as_str()
+            .expect("key id")
+            .to_string();
 
         // Warm the cache on the minting node.
         let warmed = crate::key_plane::block_on_keystore(plane.cache().resolve_key(&key_id))

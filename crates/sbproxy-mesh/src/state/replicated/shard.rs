@@ -77,8 +77,9 @@ pub type MeshClock = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
 /// record whose status is terminal must never merge back to a usable one,
 /// even against a higher logical version, because the substrate's plain
 /// version ordering would otherwise resurrect it.
-pub type MergeFenceFn =
-    std::sync::Arc<dyn Fn(&VersionedLwwRegister, &VersionedLwwRegister) -> Option<bool> + Send + Sync>;
+pub type MergeFenceFn = std::sync::Arc<
+    dyn Fn(&VersionedLwwRegister, &VersionedLwwRegister) -> Option<bool> + Send + Sync,
+>;
 
 /// Capacity and value-size bounds enforced by the shard.
 #[derive(Debug, Clone, Copy)]

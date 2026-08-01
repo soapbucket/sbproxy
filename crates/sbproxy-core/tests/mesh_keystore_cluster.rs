@@ -225,7 +225,10 @@ async fn a_minority_partition_can_still_revoke_and_peers_deny_after_heal() {
     let mesh_a = MeshKeyStore::new(substrate_a.clone());
     let mesh_b = MeshKeyStore::new(substrate_for(&b, &addrs, cluster_settings(0)));
 
-    mesh_a.put_key(key_record("compromised")).await.expect("mint");
+    mesh_a
+        .put_key(key_record("compromised"))
+        .await
+        .expect("mint");
     let before_partition = mesh_a
         .get_key("compromised")
         .await
@@ -298,13 +301,19 @@ async fn a_minority_partition_can_still_revoke_and_peers_deny_after_heal() {
     let mut healed = false;
     for _ in 0..10 {
         substrate_a.maintenance_round().await;
-        let delivered = b.shard.fetch(state_key).is_some_and(|r| r.logical_version() >= 2);
+        let delivered = b
+            .shard
+            .fetch(state_key)
+            .is_some_and(|r| r.logical_version() >= 2);
         if delivered {
             healed = true;
             break;
         }
     }
-    assert!(healed, "anti-entropy must deliver the revocation to the peer");
+    assert!(
+        healed,
+        "anti-entropy must deliver the revocation to the peer"
+    );
     for (name, store) in [("A", &mesh_a), ("B", &mesh_b)] {
         let resolved = store
             .get_key("compromised")
