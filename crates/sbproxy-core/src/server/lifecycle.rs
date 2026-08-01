@@ -3652,6 +3652,7 @@ origins:
             agents_json: None,
             outbound_credential: None,
             outbound_web_bot_auth: false,
+            attestation: None,
             observability: Some(OriginObservabilityConfig {
                 log: OriginObservabilityLogConfig {
                     sinks: Vec::new(),
