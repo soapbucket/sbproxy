@@ -10,7 +10,8 @@
 //! (`failure_posture: closed | degraded`) or as the wider `on_failure`
 //! block, which is the only way to reach `use_stale`. The runtime never
 //! reads either field directly: it takes
-//! [`RagRouteConfig::resolved_failure_policy`] once at build time.
+//! [`sbproxy_ai::rag_config::RagRouteConfig::resolved_failure_policy`]
+//! once at build time.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
