@@ -1,6 +1,6 @@
 # RAG integration
 
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-01*
 
 SBproxy supports retrieval-augmented generation on two surfaces, and they
 answer different questions.
