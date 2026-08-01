@@ -9121,6 +9121,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbproxy-meter"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sbproxy-middleware"
 version = "0.1.0"
 dependencies = [

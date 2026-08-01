@@ -17,6 +17,7 @@ members = [
     "crates/sbproxy-keystore",
     "crates/sbproxy-storage",
     "crates/sbproxy-mesh",
+    "crates/sbproxy-meter",
     "crates/sbproxy-middleware",
     "crates/sbproxy-extension",
     "crates/sbproxy-ai",
@@ -55,6 +56,7 @@ default-members = [
     "crates/sbproxy-keystore",
     "crates/sbproxy-storage",
     "crates/sbproxy-mesh",
+    "crates/sbproxy-meter",
     "crates/sbproxy-middleware",
     "crates/sbproxy-extension",
     "crates/sbproxy-ai",
@@ -97,6 +99,9 @@ sbproxy-vault = { path = "crates/sbproxy-vault" }
 sbproxy-keystore = { path = "crates/sbproxy-keystore" }
 sbproxy-storage = { path = "crates/sbproxy-storage" }
 sbproxy-mesh = { path = "crates/sbproxy-mesh" }
+# WOR-2123: attested consumption metering. A true leaf (serde only) so an
+# operator metering a plain REST API never compiles the AI stack to do it.
+sbproxy-meter = { path = "crates/sbproxy-meter" }
 sbproxy-middleware = { path = "crates/sbproxy-middleware" }
 sbproxy-extension = { path = "crates/sbproxy-extension" }
 sbproxy-model-host = { path = "crates/sbproxy-model-host" }
