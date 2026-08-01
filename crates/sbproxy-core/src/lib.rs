@@ -47,6 +47,12 @@ pub mod admin_ui;
 pub mod agent_class;
 /// Boot wiring for the alert evaluation loop (dispatcher + engine + drain).
 pub mod alerting;
+/// Lowering `proxy.attestation` into the metering vocabulary the
+/// request path runs on: the resolved role, the two posture axes, the
+/// queue and ledger locations, and the operator's complete position on
+/// what they charge for.
+pub mod attestation;
+
 /// WOR-2100: runtime assembly for authoritative payment settlement.
 ///
 /// Opens the durable settlement store, registers the rail adapters this

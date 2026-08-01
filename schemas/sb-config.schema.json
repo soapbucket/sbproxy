@@ -23,6 +23,7 @@
         "admin": null,
         "ai_providers_file": null,
         "alerting": null,
+        "attestation": null,
         "cache_reserve": null,
         "cluster": null,
         "compression_state": null,
@@ -631,6 +632,18 @@
           "anyOf": [
             {
               "$ref": "#/definitions/WebBotAuthConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "attestation": {
+          "description": "Consumption attestation (WOR-2127): whether this proxy asserts what a call is going to cost, records what it actually consumed, and what it charges for. Absent leaves the whole mechanism off, so an existing config is unaffected. See [`AttestationConfig`].",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AttestationConfig"
             },
             {
               "type": "null"
@@ -5718,6 +5731,307 @@
         }
       }
     },
+    "AttestationConfig": {
+      "description": "`proxy.attestation`: the proxy-wide consumption attestation block.\n\nOff unless [`Self::role`] says otherwise, and inert in every config that does not mention it. When a role is set, the queue, the ledger, and a complete [`AttestationBillableConfig`] all become required, because a role with any of them missing is a proxy that claims to meter and does not.",
+      "type": "object",
+      "properties": {
+        "role": {
+          "description": "Which halves of attestation this proxy performs. See [`AttestationRole`]. Individual origins may narrow or widen this through `origins.<host>.attestation.role`.",
+          "default": "off",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AttestationRole"
+            }
+          ]
+        },
+        "failure_mode": {
+          "description": "What happens when attestation itself cannot run: the queue is full, the ledger will not accept an append, the signing identity is unusable.\n\nDefaults to [`FailureMode::Degraded`], which departs from the `closed` default the rest of this config surface takes, and the departure is the point. Fail-closed is right for a control that enforces a security boundary, because a control that silently admits traffic when it breaks is worse than no control at all. Billing is not a security boundary. A full ledger disk taking the whole API down is a worse outcome than a provable hole in the record, and `degraded` is precisely the posture that leaves the hole detectable: the call proceeds, the guarantee is marked as not made, and the gap is countable so an operator can alert on it and reconcile afterwards. An operator who genuinely cannot serve unbilled traffic sets `closed` and means it.",
+          "default": "degraded",
+          "allOf": [
+            {
+              "$ref": "#/definitions/FailureMode"
+            }
+          ]
+        },
+        "enforcement_mode": {
+          "description": "What happens when attestation *does* reach a verdict and that verdict is \"refuse\": a claim that exceeds an agreement's ceiling, for instance. [`EnforcementMode::Observe`] is the rollout posture, and it is a different question from [`Self::failure_mode`]: a control can reasonably observe while it is being tuned and still need to fail closed when its backend disappears.",
+          "default": "block",
+          "allOf": [
+            {
+              "$ref": "#/definitions/EnforcementMode"
+            }
+          ]
+        },
+        "sign_with": {
+          "description": "Which existing signing identity signs receipts, as the config path that declares it. The only accepted value today is [`ATTESTATION_SIGN_WITH_WEB_BOT_AUTH`], and that block must actually be configured. Required whenever the role writes receipts.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "queue": {
+          "description": "Where unsettled claims wait. Required when the role is not [`AttestationRole::Off`].",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AttestationQueueConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ledger": {
+          "description": "Where settled records are chained. Required when the role is not [`AttestationRole::Off`].",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AttestationLedgerConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "billable": {
+          "description": "What the operator charges for. Required, and required complete, when the role is not [`AttestationRole::Off`].",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AttestationBillableConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "AttestationRole": {
+      "description": "What part this proxy plays in attesting to consumption.\n\nThe two halves answer the two halves of a billing dispute and are independently useful, which is why this is four values rather than a boolean. A claim is made before the call and says what it is going to cost; a receipt is written after it and says what it actually consumed. A gateway in front of somebody else's metered API wants [`Self::Claim`] alone. A proxy selling its own upstream wants [`Self::Receipt`] alone. An operator reselling metered capacity wants [`Self::Both`], because they have to answer to a buyer and a supplier at once.",
+      "oneOf": [
+        {
+          "description": "Attest to nothing. The default, and what every config that does not mention the block gets.",
+          "type": "string",
+          "enum": [
+            "off"
+          ]
+        },
+        {
+          "description": "Assert what a call is going to cost, before it is served.",
+          "type": "string",
+          "enum": [
+            "claim"
+          ]
+        },
+        {
+          "description": "Record what a call actually consumed, after it is served.",
+          "type": "string",
+          "enum": [
+            "receipt"
+          ]
+        },
+        {
+          "description": "Both halves. The posture for reselling metered capacity.",
+          "type": "string",
+          "enum": [
+            "both"
+          ]
+        }
+      ]
+    },
+    "EnforcementMode": {
+      "description": "What a control does when it *does* reach a decision and that decision is \"refuse\".\n\nThis is the second of two axes, and keeping them apart is the point. [`FailureMode`] answers \"the control could not run, now what\". `EnforcementMode` answers \"the control ran, it matched, now what\". Those are different events and an operator needs both: a detector can reasonably be in `observe` while it is being tuned, and still need to fail closed when its backend disappears.\n\nThis type replaces the ad-hoc spellings of the same idea that grew per policy: the WAF's `test_mode: bool`, the prompt-injection `Tag` action, and similar. They all meant \"match, but do not block\". `observe` is spelled the same here as in [`FailureMode`] on purpose, so one word means one thing across the config surface.",
+      "oneOf": [
+        {
+          "description": "Refuse the request when the control matches.",
+          "type": "string",
+          "enum": [
+            "block"
+          ]
+        },
+        {
+          "description": "Admit the request but record the match. The rollout posture.",
+          "type": "string",
+          "enum": [
+            "observe"
+          ]
+        }
+      ]
+    },
+    "AttestationQueueConfig": {
+      "description": "`proxy.attestation.queue`: where claims wait until they settle.\n\nA claim is written when the call starts and settled when it finishes, and the gap between those is where a crash loses money. The queue is that gap made durable.",
+      "type": "object",
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "path": {
+          "description": "Filesystem path of the queue. Required: an attestation role with nowhere to hold unsettled claims silently drops them on restart, which is the failure the whole mechanism exists to prevent.",
+          "type": "string"
+        },
+        "max_entries": {
+          "description": "How many unsettled claims to hold before the configured [`AttestationConfig::failure_mode`] applies. Defaults to 100,000, which is roughly a minute of unsettled work at a thousand requests a second.",
+          "default": 100000,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "AttestationLedgerConfig": {
+      "description": "`proxy.attestation.ledger`: where settled records are chained.\n\nThe ledger answers the half of a billing dispute a signature cannot: \"I made calls you never credited\". Each record is hash-chained to the one before it, so a gap is visible rather than merely absent.",
+      "type": "object",
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "path": {
+          "description": "Filesystem path of the append-only ledger file.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AttestationBillableConfig": {
+      "description": "`proxy.attestation.billable`: what the operator charges for.\n\nEvery field is `Option` so that an incomplete block is a config error this crate can describe rather than a serde error that names one missing field at a time. The operator owes an answer for all eight, and [`Self::missing_outcomes`] hands them the whole list in one message. Nothing is defaulted: an unstated billing rule still runs, it just runs as whatever the code happened to do, and nobody discovers what that was until a buyer asks.\n\n`cache_hit` is the case that proves the rule. A vendor selling compute can argue a cache hit cost them nothing; a vendor selling answers can argue the answer is what was bought and where it came from is their business. Both are positions real companies hold, so this surface holds neither.",
+      "type": "object",
+      "properties": {
+        "delivered": {
+          "description": "The response was served to the client in full.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BillableRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_disconnected": {
+          "description": "The client went away before the response finished.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BillableRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin_4xx": {
+          "description": "The origin rejected the request as the caller's fault.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BillableRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin_5xx": {
+          "description": "The origin failed.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BillableRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "policy_blocked": {
+          "description": "A policy refused the call before it reached the origin.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BillableRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rate_limited": {
+          "description": "A rate limit rejected the call.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BillableRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cache_hit": {
+          "description": "The response was served from cache without touching the origin.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BillableRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retry": {
+          "description": "One attempt of a call that was retried.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BillableRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "BillableRule": {
+      "description": "The billing answer for one outcome, in the configuration vocabulary.\n\nA deliberate mirror of `sbproxy_meter::Billable` rather than a re-export. The meter crate depends on no other crate in this workspace, which is what lets an operator metering a plain REST API compile it without the AI stack; deriving [`schemars::JsonSchema`] on its types would end that. So the wire vocabulary lives here, the billing vocabulary lives there, and `sbproxy-core` converts between them. The two are kept in step by `sbproxy_meter::BillableOutcome::ALL`: adding an outcome there stops the conversion compiling until this surface answers for it.",
+      "oneOf": [
+        {
+          "description": "Bill every unit the call produced.",
+          "type": "string",
+          "enum": [
+            "yes"
+          ]
+        },
+        {
+          "description": "Bill nothing. The call is still recorded, because a receipt that omits the free calls cannot be reconciled against a request log.",
+          "type": "string",
+          "enum": [
+            "no"
+          ]
+        },
+        {
+          "description": "Bill the work the origin actually performed, even though the request was cut short.",
+          "type": "string",
+          "enum": [
+            "partial"
+          ]
+        },
+        {
+          "description": "Fold this attempt into the invoice line its claim names, so a flaky origin costs the buyer once rather than once per attempt.",
+          "type": "string",
+          "enum": [
+            "collapse"
+          ]
+        }
+      ]
+    },
     "ProxyTenantConfig": {
       "description": "WOR-1053: declared tenant. PR1 only carries the `id`; PR2+ adds per-tenant `credentials`, `policies`, `vault`, and `observability` blocks alongside the multi-tenant inheritance fan-out.\n\nA reserved tenant id of `__default__` is the synthetic default every origin resolves to when `origin.tenant_id` is absent. The operator never declares `__default__` explicitly; doing so fails config compile.",
       "type": "object",
@@ -7231,6 +7545,17 @@
           "description": "Opt this origin into outbound Web Bot Auth signing (WOR-805). When `true` and `proxy.web_bot_auth` is configured, the proxy signs the request it sends upstream with the proxy's Ed25519 key (RFC 9421, `tag=web-bot-auth`), so an upstream that demands Web Bot Auth accepts SBproxy as a verified agent. Default `false`.",
           "default": false,
           "type": "boolean"
+        },
+        "attestation": {
+          "description": "Per-origin consumption attestation overrides (WOR-2127). Absent leaves the origin on the proxy-wide role with no agreement named. Authoring this block without a `proxy.attestation` block fails config compile: a per-origin role with no queue, ledger, or billing table behind it can never produce a record. See [`OriginAttestationConfig`].",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OriginAttestationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "observability": {
           "description": "Origin-scope observability block. Today the only nested surface is `log.redact.pii`, which composes against the tenant-scope block (or proxy-scope when the origin has no tenant). See [`OriginObservabilityConfig`].",
@@ -9146,6 +9471,33 @@
         "PS512",
         "EdDSA"
       ]
+    },
+    "OriginAttestationConfig": {
+      "description": "`origins.<host>.attestation`: per-origin attestation overrides.\n\nTwo fields, and they are here for different reasons. `role` is an override, because one gateway commonly fronts both a partner API it resells (claims) and its own service (receipts). `agreement_id` has no proxy-wide equivalent at all: it names the commercial agreement the units are billed under, and that is a property of who is on the other end of the connection, never of the proxy.",
+      "type": "object",
+      "properties": {
+        "role": {
+          "description": "Narrows or widens `proxy.attestation.role` for this origin. Absent inherits the proxy-wide role.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AttestationRole"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "agreement_id": {
+          "description": "The commercial agreement this origin's units are billed under. Without it a receipt says how much was consumed but not which contract turns that into money.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "OriginObservabilityConfig": {
       "description": "Origin-scope observability sub-tree. The `log.redact` block, `log.sinks` (origin-scoped fan-out, filtered by the stamped `route`), and `log.custom_fields` (the most-specific access-log fields, which override tenant- and proxy-scope fields of the same name) are all consumed at runtime.",

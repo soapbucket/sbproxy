@@ -137,6 +137,12 @@ sbproxy-middleware.workspace = true
 sbproxy-observe.workspace = true
 sbproxy-extension.workspace = true
 sbproxy-ai.workspace = true
+# WOR-2127: the metering vocabulary the `proxy.attestation` block lowers
+# into. The conversion lives here rather than in sbproxy-meter, which
+# depends on no workspace crate so an operator metering a plain REST API
+# can compile it without the gateway; deriving JsonSchema on its types
+# would end that. Acyclic: the edge only runs this way.
+sbproxy-meter.workspace = true
 # WOR-2098: route-scoped RAG runtime construction, pulled in only by the
 # `rag` feature. The workspace entry ships `default-features = false`, so
 # provider adapters activate solely through the `rag-*` forwards above.

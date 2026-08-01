@@ -22,7 +22,12 @@ use sbproxy_platform::storage::{
 use smallvec::SmallVec;
 
 use crate::snapshot::{CompiledConfig, CompiledOrigin};
-use crate::types::{ConfigFile, L2CacheConfig, L2CacheParams, MessengerSettings, RawOriginConfig};
+use crate::types::{
+    AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig, AttestationQueueConfig,
+    AttestationRole, ConfigFile, EnforcementMode, FailureMode, L2CacheConfig, L2CacheParams,
+    MessengerSettings, OriginAttestationConfig, RawOriginConfig, WebBotAuthConfig,
+    ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, MAX_ATTESTATION_QUEUE_ENTRIES,
+};
 
 const MAX_REDIS_TLS_FILE_BYTES: u64 = 1_048_576;
 
@@ -1564,6 +1569,30 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         }
     }
 
+    // WOR-2127: consumption attestation. Validated here rather than in
+    // the pipeline because `sbproxy validate` has to reject a broken
+    // block without touching the filesystem, and because a proxy that
+    // announces a metering role it cannot honour should not start.
+    if let Some(attestation) = &config_file.proxy.attestation {
+        validate_attestation(attestation, config_file.proxy.web_bot_auth.as_ref())?;
+        for origin in &origins {
+            if let Some(origin_attestation) = &origin.attestation {
+                validate_origin_attestation(&origin.hostname, attestation, origin_attestation)?;
+            }
+        }
+    } else {
+        for origin in &origins {
+            if origin.attestation.is_some() {
+                anyhow::bail!(
+                    "origin `{}` declares an `attestation:` block but `proxy.attestation` is \
+                     absent. A per-origin role has no queue, no ledger, and no billing table \
+                     behind it, so it could never produce a record.",
+                    origin.hostname,
+                );
+            }
+        }
+    }
+
     // A clustered node whose keystore is node-local mints keys its peers may
     // not resolve. How bad that is depends on whether a shared cache tier
     // propagates records, so classify rather than blanket-reject.
@@ -1720,6 +1749,185 @@ pub fn ensure_node_local_refs_resolved(resolved_text: &str) -> Result<()> {
          identify this node, so the literal placeholder text cannot be used as a value: export \
          the environment variable(s) on this host, or move the value into a node-local overlay"
     )
+}
+
+/// Validate `proxy.attestation` before anything is built from it.
+///
+/// Runs on every compile, including the one behind `sbproxy validate`,
+/// which is why it lives here and not in the pipeline: the pipeline is
+/// allowed to touch the filesystem and this is not, and an operator
+/// checking a candidate config deserves the same answer the server
+/// would give them.
+///
+/// The rule the whole block turns on is that a declared role has to be
+/// honourable. A role with no queue drops unsettled claims on restart,
+/// a role with no ledger cannot prove a gap, a role with an incomplete
+/// billing table charges by accident, and a receipt with no signing
+/// identity is a log line. Each of those fails here rather than at the
+/// moment somebody disputes an invoice.
+fn validate_attestation(
+    attestation: &AttestationConfig,
+    web_bot_auth: Option<&WebBotAuthConfig>,
+) -> Result<()> {
+    let role: AttestationRole = attestation.role;
+    let failure_mode: FailureMode = attestation.failure_mode;
+    let enforcement_mode: EnforcementMode = attestation.enforcement_mode;
+    let engaged = role.makes_claims() || role.writes_receipts();
+
+    if engaged && !failure_mode.admits() {
+        tracing::warn!(
+            failure_mode = failure_mode.as_label(),
+            "proxy.attestation.failure_mode refuses traffic when metering itself breaks. \
+             That is the right call for an operator who cannot serve unbilled traffic, and \
+             the wrong one for everybody else: a full ledger disk then takes the API down."
+        );
+    }
+    if engaged && !enforcement_mode.blocks() {
+        tracing::info!(
+            enforcement_mode = enforcement_mode.as_label(),
+            "proxy.attestation records attestation verdicts without acting on them"
+        );
+    }
+
+    match attestation.sign_with.as_deref() {
+        None if role.writes_receipts() => anyhow::bail!(
+            "proxy.attestation.role writes receipts, so proxy.attestation.sign_with is \
+             required: an unsigned receipt is a log line, not evidence. Set it to \
+             `{ATTESTATION_SIGN_WITH_WEB_BOT_AUTH}`."
+        ),
+        None => {}
+        Some(identity)
+            if identity == ATTESTATION_SIGN_WITH_WEB_BOT_AUTH && web_bot_auth.is_none() =>
+        {
+            anyhow::bail!(
+                "proxy.attestation.sign_with names `{ATTESTATION_SIGN_WITH_WEB_BOT_AUTH}`, \
+                 but that block is not configured, so there is no key to sign with"
+            )
+        }
+        Some(identity) if identity == ATTESTATION_SIGN_WITH_WEB_BOT_AUTH => {}
+        Some(other) => anyhow::bail!(
+            "proxy.attestation.sign_with `{other}` is not a signing identity this build can \
+             resolve; the only accepted value is `{ATTESTATION_SIGN_WITH_WEB_BOT_AUTH}`"
+        ),
+    }
+
+    match &attestation.queue {
+        Some(queue) => validate_attestation_queue(queue)?,
+        None if engaged => anyhow::bail!(
+            "proxy.attestation declares a role, so proxy.attestation.queue is required: a \
+             claim is written when a call starts and settled when it finishes, and with \
+             nowhere to hold the gap a restart loses every claim in flight"
+        ),
+        None => {}
+    }
+
+    match &attestation.ledger {
+        Some(ledger) => validate_attestation_ledger(ledger)?,
+        None if engaged => anyhow::bail!(
+            "proxy.attestation declares a role, so proxy.attestation.ledger is required: a \
+             signature on each record says nothing about records that were never written, \
+             and the chain is what makes a gap visible"
+        ),
+        None => {}
+    }
+
+    match &attestation.billable {
+        Some(billable) => validate_attestation_billable(billable)?,
+        None if engaged => anyhow::bail!(
+            "proxy.attestation declares a role, so proxy.attestation.billable is required, \
+             with an answer for all eight outcomes. There is no default, on purpose: an \
+             unstated billing rule still runs, it just runs as whatever the code happened \
+             to do."
+        ),
+        None => {}
+    }
+
+    Ok(())
+}
+
+/// Reject a claim queue that could not hold a claim.
+fn validate_attestation_queue(queue: &AttestationQueueConfig) -> Result<()> {
+    if queue.path.trim().is_empty() {
+        anyhow::bail!("proxy.attestation.queue.path must be non-empty");
+    }
+    let max_entries: usize = queue.max_entries;
+    if max_entries == 0 {
+        anyhow::bail!(
+            "proxy.attestation.queue.max_entries must be at least 1; a queue of zero drops \
+             every claim at the moment it is made, which is silently not metering"
+        );
+    }
+    if max_entries > MAX_ATTESTATION_QUEUE_ENTRIES {
+        anyhow::bail!(
+            "proxy.attestation.queue.max_entries {max_entries} exceeds the cap of \
+             {MAX_ATTESTATION_QUEUE_ENTRIES}; past that an operator is describing a \
+             database rather than a hold buffer, and an extra zero should not be the way \
+             they find out"
+        );
+    }
+    Ok(())
+}
+
+/// Reject a ledger path that names nothing.
+fn validate_attestation_ledger(ledger: &AttestationLedgerConfig) -> Result<()> {
+    if ledger.path.trim().is_empty() {
+        anyhow::bail!("proxy.attestation.ledger.path must be non-empty");
+    }
+    Ok(())
+}
+
+/// Refuse a billing table that leaves any outcome unanswered, naming
+/// every one that is missing rather than the first.
+///
+/// Serde would reject a missing required field on its own, one field per
+/// compile. That is the wrong shape for this block: an operator who left
+/// three outcomes blank should see all three, because the point of the
+/// exercise is to make them decide, not to make them guess.
+fn validate_attestation_billable(billable: &AttestationBillableConfig) -> Result<()> {
+    let missing: Vec<&'static str> = billable.missing_outcomes();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "proxy.attestation.billable has no answer for {}. Every outcome needs one, \
+             because a billing rule left implicit is a billing rule nobody agreed to. Each \
+             takes one of yes, no, partial, collapse.",
+            missing.join(", "),
+        );
+    }
+    Ok(())
+}
+
+/// Validate one origin's attestation override against the proxy block
+/// it inherits from.
+///
+/// The check worth having is the widening one. `proxy.attestation` only
+/// has to declare a signing identity when the proxy-wide role writes
+/// receipts, so an origin that widens `claim` to `both` can reach a
+/// receipt with nothing to sign it. That hole is invisible in either
+/// block on its own, which is why this runs where both are in scope.
+fn validate_origin_attestation(
+    hostname: &str,
+    proxy: &AttestationConfig,
+    attestation: &OriginAttestationConfig,
+) -> Result<()> {
+    let role: Option<AttestationRole> = attestation.role;
+    let agreement_id: Option<&str> = attestation.agreement_id.as_deref();
+    let resolved: AttestationRole = role.unwrap_or(proxy.role);
+
+    if resolved.writes_receipts() && proxy.sign_with.is_none() {
+        anyhow::bail!(
+            "origin `{hostname}`: attestation.role writes receipts, but \
+             proxy.attestation.sign_with is unset, so nothing could sign them. An unsigned \
+             receipt is a log line, not evidence."
+        );
+    }
+    if resolved.writes_receipts() && agreement_id.is_none() {
+        tracing::warn!(
+            hostname = %hostname,
+            "origin writes receipts but names no attestation.agreement_id, so its receipts \
+             will record how much was consumed without naming the contract that prices it"
+        );
+    }
+    Ok(())
 }
 
 /// Compile a single origin from its raw config.
@@ -1988,6 +2196,21 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         }
     }
 
+    // WOR-2127: shape-check the per-origin attestation override. An
+    // empty `agreement_id` is worse than an absent one: it parses, it
+    // reaches a receipt, and it names no contract, so the buyer holds a
+    // signed document that cannot be priced.
+    if let Some(attestation) = &config.attestation {
+        if let Some(agreement_id) = &attestation.agreement_id {
+            if agreement_id.trim().is_empty() {
+                anyhow::bail!(
+                    "origin {hostname}: attestation.agreement_id must be non-empty when set; \
+                     omit the key to name no agreement"
+                );
+            }
+        }
+    }
+
     // WOR-1053: resolve the origin's declared tenant against the
     // `proxy.tenants[]` list. Absent declarations fall back to the
     // synthetic `__default__` tenant so existing single-tenant
@@ -2070,6 +2293,11 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         outbound_credential: config.outbound_credential,
         // WOR-805: opt-in for outbound Web Bot Auth signing.
         outbound_web_bot_auth: config.outbound_web_bot_auth,
+        // WOR-2127: per-origin attestation role override + agreement id.
+        // Shape-checked above; the cross-block requirement (there has to
+        // be a `proxy.attestation` for this to mean anything) is checked
+        // in `compile_config`, which can see both.
+        attestation: config.attestation,
         // WOR-1043 PR3: origin-scope observability overrides.
         observability: config.observability,
     })
@@ -4787,6 +5015,293 @@ origins:
             Ok(_) => panic!("empty key_id must fail config load"),
             Err(e) => assert!(e.to_string().contains("key_id"), "got: {e}"),
         }
+    }
+
+    // --- WOR-2127: consumption attestation ---
+
+    /// The signing identity every attestation fixture below points at.
+    const ATTESTATION_SIGNER: &str = r#"
+  web_bot_auth:
+    key_id: sbproxy-2026
+    ed25519_seed_hex: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef""#;
+
+    /// A complete billing table, indented to sit under `attestation:`.
+    const ATTESTATION_BILLABLE: &str = r#"
+    billable:
+      delivered: yes
+      client_disconnected: partial
+      origin_4xx: no
+      origin_5xx: no
+      policy_blocked: no
+      rate_limited: no
+      cache_hit: yes
+      retry: collapse"#;
+
+    /// One static origin, so a fixture only has to say what it is
+    /// testing.
+    const ATTESTATION_ORIGIN: &str = r#"
+origins:
+  api.partner.example:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#;
+
+    /// A config whose `attestation:` body is the caller's, with the
+    /// signer, queue, ledger, and billing table already in place.
+    fn attestation_yaml(body: &str) -> String {
+        format!(
+            "proxy:{ATTESTATION_SIGNER}\n  attestation:{body}\n    sign_with: proxy.web_bot_auth\
+             \n    queue:\n      path: /tmp/sbproxy-attestation/claims.q\n      max_entries: 100000\
+             \n    ledger:\n      path: /tmp/sbproxy-attestation/receipts.ndjson\
+             {ATTESTATION_BILLABLE}\n{ATTESTATION_ORIGIN}"
+        )
+    }
+
+    #[test]
+    fn attestation_valid_config_compiles() {
+        let compiled = compile_config(&attestation_yaml("\n    role: both")).expect("compile");
+        let attestation = compiled
+            .server
+            .attestation
+            .expect("the attestation block survives compilation");
+
+        assert_eq!(attestation.role, AttestationRole::Both);
+        // The whole reason this key departs from the surface-wide
+        // `closed`: billing is not a security boundary, so an unwritable
+        // ledger must not take the API down.
+        assert_eq!(attestation.failure_mode, FailureMode::Degraded);
+        assert_eq!(attestation.enforcement_mode, EnforcementMode::Block);
+        assert_eq!(
+            attestation.sign_with.as_deref(),
+            Some(ATTESTATION_SIGN_WITH_WEB_BOT_AUTH)
+        );
+        let queue = attestation.queue.expect("queue present");
+        assert_eq!(queue.max_entries, 100_000);
+        assert!(attestation.ledger.is_some());
+        assert!(attestation
+            .billable
+            .expect("billable present")
+            .missing_outcomes()
+            .is_empty());
+    }
+
+    #[test]
+    fn attestation_absent_block_still_compiles() {
+        let yaml = r#"
+origins:
+  api.partner.example:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#;
+        let compiled = compile_config(yaml).expect("a config with no attestation block compiles");
+        assert!(compiled.server.attestation.is_none());
+        assert!(compiled
+            .resolve_origin("api.partner.example")
+            .expect("origin compiled")
+            .attestation
+            .is_none());
+    }
+
+    #[test]
+    fn attestation_every_failure_mode_parses() {
+        for (spelling, expected) in [
+            ("closed", FailureMode::Closed),
+            ("open", FailureMode::Open),
+            ("degraded", FailureMode::Degraded),
+            ("observe", FailureMode::Observe),
+        ] {
+            let yaml =
+                attestation_yaml(&format!("\n    role: claim\n    failure_mode: {spelling}"));
+            let compiled =
+                compile_config(&yaml).unwrap_or_else(|e| panic!("{spelling} must compile: {e}"));
+            assert_eq!(
+                compiled
+                    .server
+                    .attestation
+                    .expect("attestation present")
+                    .failure_mode,
+                expected,
+                "failure_mode: {spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn attestation_incomplete_billable_names_every_missing_outcome() {
+        let yaml = format!(
+            "proxy:{ATTESTATION_SIGNER}\n  attestation:\n    role: claim\
+             \n    sign_with: proxy.web_bot_auth\
+             \n    queue:\n      path: /tmp/sbproxy-attestation/claims.q\
+             \n    ledger:\n      path: /tmp/sbproxy-attestation/receipts.ndjson\
+             \n    billable:\n      delivered: yes\n      client_disconnected: partial\
+             \n      origin_4xx: no\n      origin_5xx: no\n      policy_blocked: no\
+             \n      rate_limited: no\n{ATTESTATION_ORIGIN}"
+        );
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("an incomplete billing table is not a table");
+        let rendered = error.to_string();
+
+        // Both, in one message. An operator who left two outcomes blank
+        // should not have to compile twice to find that out.
+        assert!(rendered.contains("cache_hit"), "{rendered}");
+        assert!(rendered.contains("retry"), "{rendered}");
+    }
+
+    #[test]
+    fn attestation_role_without_a_billing_table_fails_config_load() {
+        let yaml = format!(
+            "proxy:{ATTESTATION_SIGNER}\n  attestation:\n    role: claim\
+             \n    sign_with: proxy.web_bot_auth\
+             \n    queue:\n      path: /tmp/sbproxy-attestation/claims.q\
+             \n    ledger:\n      path: /tmp/sbproxy-attestation/receipts.ndjson\
+             \n{ATTESTATION_ORIGIN}"
+        );
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("a role with no billing table must fail");
+        assert!(
+            error.to_string().contains("billable"),
+            "the error names the key the operator has to author: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_role_without_a_queue_fails_config_load() {
+        let yaml = format!(
+            "proxy:{ATTESTATION_SIGNER}\n  attestation:\n    role: claim\
+             \n    sign_with: proxy.web_bot_auth\
+             \n    ledger:\n      path: /tmp/sbproxy-attestation/receipts.ndjson\
+             {ATTESTATION_BILLABLE}\n{ATTESTATION_ORIGIN}"
+        );
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("a role with nowhere to hold claims fails");
+        assert!(error.to_string().contains("queue"), "got: {error}");
+    }
+
+    #[test]
+    fn attestation_zero_queue_capacity_fails_config_load() {
+        let yaml =
+            attestation_yaml("\n    role: claim").replace("max_entries: 100000", "max_entries: 0");
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("a queue of zero is not a queue");
+        assert!(error.to_string().contains("max_entries"), "got: {error}");
+    }
+
+    #[test]
+    fn attestation_unknown_signing_identity_fails_config_load() {
+        let yaml = attestation_yaml("\n    role: receipt")
+            .replace("sign_with: proxy.web_bot_auth", "sign_with: proxy.mtls");
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("an unresolvable signer must fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("sign_with"), "{rendered}");
+        assert!(
+            rendered.contains(ATTESTATION_SIGN_WITH_WEB_BOT_AUTH),
+            "the error tells the operator what is on offer: {rendered}"
+        );
+    }
+
+    #[test]
+    fn attestation_receipt_role_without_a_signer_fails_config_load() {
+        let yaml = attestation_yaml("\n    role: receipt")
+            .replace("\n    sign_with: proxy.web_bot_auth", "");
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("an unsigned receipt is not evidence");
+        assert!(error.to_string().contains("sign_with"), "got: {error}");
+    }
+
+    #[test]
+    fn attestation_origin_override_survives_compilation() {
+        let override_block =
+            "      body: \"ok\"\n    attestation:\n      role: claim\n      agreement_id: acme-2026\n";
+        let yaml =
+            attestation_yaml("\n    role: both").replace("      body: \"ok\"\n", override_block);
+
+        let compiled = compile_config(&yaml).expect("a per-origin override compiles");
+        let origin = compiled
+            .resolve_origin("api.partner.example")
+            .expect("origin compiled");
+        let attestation = origin
+            .attestation
+            .as_ref()
+            .expect("the override survives compilation");
+
+        assert_eq!(attestation.role, Some(AttestationRole::Claim));
+        assert_eq!(attestation.agreement_id.as_deref(), Some("acme-2026"));
+    }
+
+    #[test]
+    fn attestation_origin_block_without_a_proxy_block_fails_config_load() {
+        let yaml = r#"
+origins:
+  api.partner.example:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    attestation:
+      role: claim
+      agreement_id: acme-2026
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("a per-origin role with nothing behind it must fail");
+        assert!(
+            error.to_string().contains("proxy.attestation"),
+            "the error points at the block the operator is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_origin_widening_past_the_signer_fails_config_load() {
+        // `proxy.attestation` only has to name a signer when the
+        // proxy-wide role writes receipts. An origin that widens `claim`
+        // to `both` reaches a receipt with nothing to sign it, and that
+        // hole is invisible in either block on its own.
+        let yaml = attestation_yaml("\n    role: claim")
+            .replace("\n    sign_with: proxy.web_bot_auth", "")
+            .replace(
+                "      body: \"ok\"\n",
+                "      body: \"ok\"\n    attestation:\n      role: both\n",
+            );
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("widening past the signer must fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("sign_with"), "{rendered}");
+        assert!(rendered.contains("api.partner.example"), "{rendered}");
+    }
+
+    #[test]
+    fn attestation_empty_agreement_id_fails_config_load() {
+        let yaml = attestation_yaml("\n    role: both").replace(
+            "      body: \"ok\"\n",
+            "      body: \"ok\"\n    attestation:\n      agreement_id: \"\"\n",
+        );
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("an empty agreement names no contract");
+        assert!(error.to_string().contains("agreement_id"), "got: {error}");
     }
 
     // --- WOR-193: agent_skills schema validation ---

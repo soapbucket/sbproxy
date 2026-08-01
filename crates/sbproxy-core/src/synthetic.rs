@@ -235,6 +235,7 @@ mod tests {
             outbound_credential: None,
             outbound_web_bot_auth: false,
             observability: None,
+            attestation: None,
         };
         let mut host_map = HashMap::new();
         host_map.insert(CompactString::new(hostname), 0);

@@ -8999,6 +8999,7 @@ dependencies = [
  "sbproxy-extension",
  "sbproxy-keystore",
  "sbproxy-mesh",
+ "sbproxy-meter",
  "sbproxy-middleware",
  "sbproxy-model-host",
  "sbproxy-modules",

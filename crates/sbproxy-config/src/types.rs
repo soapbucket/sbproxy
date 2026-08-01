@@ -816,6 +816,13 @@ pub struct ProxyServerConfig {
     /// configs are unaffected.
     #[serde(default)]
     pub web_bot_auth: Option<WebBotAuthConfig>,
+    /// Consumption attestation (WOR-2127): whether this proxy asserts
+    /// what a call is going to cost, records what it actually
+    /// consumed, and what it charges for. Absent leaves the whole
+    /// mechanism off, so an existing config is unaffected. See
+    /// [`AttestationConfig`].
+    #[serde(default)]
+    pub attestation: Option<AttestationConfig>,
     /// WOR-1053: declared tenants. Each entry carries an `id`
     /// referenced by `origin.tenant_id`. Future PRs add per-tenant
     /// `credentials`, `policies`, and `vault` blocks; PR1 lands the
@@ -882,6 +889,290 @@ pub struct WebBotAuthConfig {
     pub directory_url: Option<String>,
 }
 
+// --- Consumption attestation (WOR-2127) ---
+
+/// The one `sign_with` target this build knows how to resolve.
+///
+/// A config path rather than a key name, because the operator is
+/// pointing at an identity that already exists in their document rather
+/// than declaring a second one. Kept as a validated string so the day a
+/// second signing identity ships, an old config still parses and the
+/// error tells the operator what is on offer.
+pub const ATTESTATION_SIGN_WITH_WEB_BOT_AUTH: &str = "proxy.web_bot_auth";
+
+/// Largest `queue.max_entries` this build accepts.
+///
+/// The queue is an in-process hold for claims that have not settled
+/// yet. Past ten million entries an operator is describing a database,
+/// and sizing one by accident (an extra zero) should fail at config
+/// compile rather than at the memory ceiling.
+pub const MAX_ATTESTATION_QUEUE_ENTRIES: usize = 10_000_000;
+
+const fn default_attestation_queue_max_entries() -> usize {
+    100_000
+}
+
+const fn default_attestation_failure_mode() -> FailureMode {
+    FailureMode::Degraded
+}
+
+/// What part this proxy plays in attesting to consumption.
+///
+/// The two halves answer the two halves of a billing dispute and are
+/// independently useful, which is why this is four values rather than a
+/// boolean. A claim is made before the call and says what it is going
+/// to cost; a receipt is written after it and says what it actually
+/// consumed. A gateway in front of somebody else's metered API wants
+/// [`Self::Claim`] alone. A proxy selling its own upstream wants
+/// [`Self::Receipt`] alone. An operator reselling metered capacity
+/// wants [`Self::Both`], because they have to answer to a buyer and a
+/// supplier at once.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationRole {
+    /// Attest to nothing. The default, and what every config that does
+    /// not mention the block gets.
+    #[default]
+    Off,
+    /// Assert what a call is going to cost, before it is served.
+    Claim,
+    /// Record what a call actually consumed, after it is served.
+    Receipt,
+    /// Both halves. The posture for reselling metered capacity.
+    Both,
+}
+
+impl AttestationRole {
+    /// True when this role asserts a cost before the call is served.
+    pub fn makes_claims(self) -> bool {
+        matches!(self, Self::Claim | Self::Both)
+    }
+
+    /// True when this role records consumption after the call is
+    /// served. The half that needs a signing identity, because a
+    /// receipt nobody can verify is a log line.
+    pub fn writes_receipts(self) -> bool {
+        matches!(self, Self::Receipt | Self::Both)
+    }
+}
+
+/// The billing answer for one outcome, in the configuration
+/// vocabulary.
+///
+/// A deliberate mirror of `sbproxy_meter::Billable` rather than a
+/// re-export. The meter crate depends on no other crate in this
+/// workspace, which is what lets an operator metering a plain REST API
+/// compile it without the AI stack; deriving [`schemars::JsonSchema`]
+/// on its types would end that. So the wire vocabulary lives here, the
+/// billing vocabulary lives there, and `sbproxy-core` converts between
+/// them. The two are kept in step by
+/// `sbproxy_meter::BillableOutcome::ALL`: adding an outcome there stops
+/// the conversion compiling until this surface answers for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BillableRule {
+    /// Bill every unit the call produced.
+    Yes,
+    /// Bill nothing. The call is still recorded, because a receipt that
+    /// omits the free calls cannot be reconciled against a request log.
+    No,
+    /// Bill the work the origin actually performed, even though the
+    /// request was cut short.
+    Partial,
+    /// Fold this attempt into the invoice line its claim names, so a
+    /// flaky origin costs the buyer once rather than once per attempt.
+    Collapse,
+}
+
+/// `proxy.attestation.billable`: what the operator charges for.
+///
+/// Every field is `Option` so that an incomplete block is a config
+/// error this crate can describe rather than a serde error that names
+/// one missing field at a time. The operator owes an answer for all
+/// eight, and [`Self::missing_outcomes`] hands them the whole list in
+/// one message. Nothing is defaulted: an unstated billing rule still
+/// runs, it just runs as whatever the code happened to do, and nobody
+/// discovers what that was until a buyer asks.
+///
+/// `cache_hit` is the case that proves the rule. A vendor selling
+/// compute can argue a cache hit cost them nothing; a vendor selling
+/// answers can argue the answer is what was bought and where it came
+/// from is their business. Both are positions real companies hold, so
+/// this surface holds neither.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AttestationBillableConfig {
+    /// The response was served to the client in full.
+    pub delivered: Option<BillableRule>,
+    /// The client went away before the response finished.
+    pub client_disconnected: Option<BillableRule>,
+    /// The origin rejected the request as the caller's fault.
+    pub origin_4xx: Option<BillableRule>,
+    /// The origin failed.
+    pub origin_5xx: Option<BillableRule>,
+    /// A policy refused the call before it reached the origin.
+    pub policy_blocked: Option<BillableRule>,
+    /// A rate limit rejected the call.
+    pub rate_limited: Option<BillableRule>,
+    /// The response was served from cache without touching the origin.
+    pub cache_hit: Option<BillableRule>,
+    /// One attempt of a call that was retried.
+    pub retry: Option<BillableRule>,
+}
+
+impl AttestationBillableConfig {
+    /// Every outcome the operator has not answered, in the order
+    /// `sbproxy_meter::BillableOutcome::ALL` declares them.
+    ///
+    /// Returned rather than checked so the caller can name the whole
+    /// set in one error. An operator who left three outcomes blank
+    /// should not have to compile three times to find that out.
+    pub fn missing_outcomes(&self) -> Vec<&'static str> {
+        let answered: [(&'static str, bool); 8] = [
+            ("delivered", self.delivered.is_some()),
+            ("client_disconnected", self.client_disconnected.is_some()),
+            ("origin_4xx", self.origin_4xx.is_some()),
+            ("origin_5xx", self.origin_5xx.is_some()),
+            ("policy_blocked", self.policy_blocked.is_some()),
+            ("rate_limited", self.rate_limited.is_some()),
+            ("cache_hit", self.cache_hit.is_some()),
+            ("retry", self.retry.is_some()),
+        ];
+        answered
+            .into_iter()
+            .filter_map(|(name, given)| (!given).then_some(name))
+            .collect()
+    }
+}
+
+/// `proxy.attestation.queue`: where claims wait until they settle.
+///
+/// A claim is written when the call starts and settled when it
+/// finishes, and the gap between those is where a crash loses money.
+/// The queue is that gap made durable.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationQueueConfig {
+    /// Filesystem path of the queue. Required: an attestation role with
+    /// nowhere to hold unsettled claims silently drops them on restart,
+    /// which is the failure the whole mechanism exists to prevent.
+    pub path: String,
+    /// How many unsettled claims to hold before the configured
+    /// [`AttestationConfig::failure_mode`] applies. Defaults to
+    /// 100,000, which is roughly a minute of unsettled work at a
+    /// thousand requests a second.
+    #[serde(default = "default_attestation_queue_max_entries")]
+    pub max_entries: usize,
+}
+
+/// `proxy.attestation.ledger`: where settled records are chained.
+///
+/// The ledger answers the half of a billing dispute a signature cannot:
+/// "I made calls you never credited". Each record is hash-chained to
+/// the one before it, so a gap is visible rather than merely absent.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationLedgerConfig {
+    /// Filesystem path of the append-only ledger file.
+    pub path: String,
+}
+
+/// `proxy.attestation`: the proxy-wide consumption attestation block.
+///
+/// Off unless [`Self::role`] says otherwise, and inert in every config
+/// that does not mention it. When a role is set, the queue, the ledger,
+/// and a complete [`AttestationBillableConfig`] all become required,
+/// because a role with any of them missing is a proxy that claims to
+/// meter and does not.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AttestationConfig {
+    /// Which halves of attestation this proxy performs. See
+    /// [`AttestationRole`]. Individual origins may narrow or widen this
+    /// through `origins.<host>.attestation.role`.
+    pub role: AttestationRole,
+    /// What happens when attestation itself cannot run: the queue is
+    /// full, the ledger will not accept an append, the signing identity
+    /// is unusable.
+    ///
+    /// Defaults to [`FailureMode::Degraded`], which departs from the
+    /// `closed` default the rest of this config surface takes, and the
+    /// departure is the point. Fail-closed is right for a control that
+    /// enforces a security boundary, because a control that silently
+    /// admits traffic when it breaks is worse than no control at all.
+    /// Billing is not a security boundary. A full ledger disk taking
+    /// the whole API down is a worse outcome than a provable hole in
+    /// the record, and `degraded` is precisely the posture that leaves
+    /// the hole detectable: the call proceeds, the guarantee is marked
+    /// as not made, and the gap is countable so an operator can alert
+    /// on it and reconcile afterwards. An operator who genuinely cannot
+    /// serve unbilled traffic sets `closed` and means it.
+    #[serde(default = "default_attestation_failure_mode")]
+    pub failure_mode: FailureMode,
+    /// What happens when attestation *does* reach a verdict and that
+    /// verdict is "refuse": a claim that exceeds an agreement's ceiling,
+    /// for instance. [`EnforcementMode::Observe`] is the rollout
+    /// posture, and it is a different question from
+    /// [`Self::failure_mode`]: a control can reasonably observe while it
+    /// is being tuned and still need to fail closed when its backend
+    /// disappears.
+    pub enforcement_mode: EnforcementMode,
+    /// Which existing signing identity signs receipts, as the config
+    /// path that declares it. The only accepted value today is
+    /// [`ATTESTATION_SIGN_WITH_WEB_BOT_AUTH`], and that block must
+    /// actually be configured. Required whenever the role writes
+    /// receipts.
+    pub sign_with: Option<String>,
+    /// Where unsettled claims wait. Required when the role is not
+    /// [`AttestationRole::Off`].
+    pub queue: Option<AttestationQueueConfig>,
+    /// Where settled records are chained. Required when the role is not
+    /// [`AttestationRole::Off`].
+    pub ledger: Option<AttestationLedgerConfig>,
+    /// What the operator charges for. Required, and required complete,
+    /// when the role is not [`AttestationRole::Off`].
+    pub billable: Option<AttestationBillableConfig>,
+}
+
+impl Default for AttestationConfig {
+    fn default() -> Self {
+        Self {
+            role: AttestationRole::Off,
+            // Not `FailureMode::default()`. See the field's rustdoc:
+            // billing is not a security boundary, so this one control
+            // defaults away from the surface-wide `closed`.
+            failure_mode: default_attestation_failure_mode(),
+            enforcement_mode: EnforcementMode::Block,
+            sign_with: None,
+            queue: None,
+            ledger: None,
+            billable: None,
+        }
+    }
+}
+
+/// `origins.<host>.attestation`: per-origin attestation overrides.
+///
+/// Two fields, and they are here for different reasons. `role` is an
+/// override, because one gateway commonly fronts both a partner API it
+/// resells (claims) and its own service (receipts). `agreement_id` has
+/// no proxy-wide equivalent at all: it names the commercial agreement
+/// the units are billed under, and that is a property of who is on the
+/// other end of the connection, never of the proxy.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct OriginAttestationConfig {
+    /// Narrows or widens `proxy.attestation.role` for this origin.
+    /// Absent inherits the proxy-wide role.
+    pub role: Option<AttestationRole>,
+    /// The commercial agreement this origin's units are billed under.
+    /// Without it a receipt says how much was consumed but not which
+    /// contract turns that into money.
+    pub agreement_id: Option<String>,
+}
+
 impl Default for ProxyServerConfig {
     fn default() -> Self {
         Self {
@@ -916,6 +1207,7 @@ impl Default for ProxyServerConfig {
             extensions: HashMap::new(),
             http_client_timeouts: HttpClientTimeoutsConfig::default(),
             web_bot_auth: None,
+            attestation: None,
             tenants: Vec::new(),
             credentials: Vec::new(),
             payments: None,
@@ -6043,6 +6335,14 @@ pub struct RawOriginConfig {
     /// Bot Auth accepts SBproxy as a verified agent. Default `false`.
     #[serde(default)]
     pub outbound_web_bot_auth: bool,
+    /// Per-origin consumption attestation overrides (WOR-2127). Absent
+    /// leaves the origin on the proxy-wide role with no agreement named.
+    /// Authoring this block without a `proxy.attestation` block fails
+    /// config compile: a per-origin role with no queue, ledger, or
+    /// billing table behind it can never produce a record. See
+    /// [`OriginAttestationConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<OriginAttestationConfig>,
     /// Origin-scope observability block. Today the only nested surface
     /// is `log.redact.pii`, which composes against the tenant-scope
     /// block (or proxy-scope when the origin has no tenant). See
