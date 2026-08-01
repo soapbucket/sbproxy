@@ -232,6 +232,70 @@ pub(crate) struct LoadBalancerAttemptToken {
     pub(crate) observed_upstream_status: Option<u16>,
 }
 
+/// A payment-shaped response the policy rendered locally.
+///
+/// Replaces the `(header_name, value, body)` tuple this slot used to hold.
+/// That tuple could carry exactly one header, which forced two workarounds:
+/// a `Content-Type` sentinel in the name position to mean "stamp this as the
+/// content type instead", and no way at all to emit the repeated
+/// `WWW-Authenticate` field Payment HTTP Authentication requires, which is
+/// one field per offered challenge rather than one field listing several.
+///
+/// Every field is already final. The request phase writes what is here and
+/// composes nothing, so the policy that decided the outcome is the only thing
+/// that decides how it looks on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentResponse {
+    /// The exact `Content-Type` to stamp.
+    pub content_type: String,
+    /// Additional headers, in order.
+    ///
+    /// A name may repeat. `WWW-Authenticate` does, and the writer appends
+    /// rather than replaces, so two offered challenges produce two fields.
+    pub headers: Vec<(String, String)>,
+    /// The exact body bytes.
+    pub body: String,
+}
+
+impl PaymentResponse {
+    /// A JSON response carrying no extra headers.
+    #[must_use]
+    pub fn json(body: String) -> Self {
+        Self {
+            content_type: "application/json".to_string(),
+            headers: Vec::new(),
+            body,
+        }
+    }
+
+    /// A JSON response carrying one challenge header.
+    #[must_use]
+    pub fn json_with_header(name: &str, value: String, body: String) -> Self {
+        Self {
+            content_type: "application/json".to_string(),
+            headers: vec![(name.to_string(), value)],
+            body,
+        }
+    }
+
+    /// A response whose content type the policy chose.
+    #[must_use]
+    pub fn typed(content_type: String, body: String) -> Self {
+        Self {
+            content_type,
+            headers: Vec::new(),
+            body,
+        }
+    }
+
+    /// Adds one header, keeping any already present under that name.
+    #[must_use]
+    pub fn with_header(mut self, name: &str, value: String) -> Self {
+        self.headers.push((name.to_string(), value));
+        self
+    }
+}
+
 /// Per-request state threaded through all Pingora phases as CTX.
 pub struct RequestContext {
     // --- Identity ---
@@ -644,11 +708,12 @@ pub struct RequestContext {
     pub transform_error_attribution: Option<String>,
 
     // --- AI Crawl Control challenge ---
-    /// Set by an `ai_crawl_control` policy when a request must be
-    /// charged. Tuple is `(header_name, challenge_value, json_body)`.
-    /// The 402 response handler reads this to stamp the configured
-    /// header and write the JSON body.
-    pub crawl_challenge: Option<(String, String, String)>,
+    /// The locally rendered response an `ai_crawl_control` policy
+    /// produced, when a request was charged, refused, or blocked.
+    ///
+    /// The request phase writes this verbatim rather than reassembling
+    /// it, so every payment-shaped response has exactly one author.
+    pub crawl_challenge: Option<PaymentResponse>,
     /// Set by an `ai_crawl_control` policy in Cloudflare Pay Per Crawl
     /// interop mode when a request settled through the ledger. Carries
     /// the `crawler-charged` header value (`<currency> <amount>`, e.g.
