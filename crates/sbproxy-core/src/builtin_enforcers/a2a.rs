@@ -31,7 +31,8 @@
 //! `http::Request<Bytes>` it is handed always has an empty body.
 //! Body-dependent A2A governance (the push-notification SSRF check, the
 //! prompt-injection scan of message parts) lives in
-//! [`crate::server::a2a_body_phase`]. This enforcer's job for those is
+//! `crate::server::a2a_body_phase`, which is private, so this is a
+//! plain reference rather than an intra-doc link. This enforcer's job for those is
 //! to set `RequestContext::validate_request_body` so the body is
 //! buffered, and to publish the envelope it resolved on
 //! `RequestContext::a2a` so the body phase sees the same one.
