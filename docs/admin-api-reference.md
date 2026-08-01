@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-07-31*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -191,13 +191,6 @@ Served unauthenticated because the keys themselves are public. The
 document aggregates keys across every `ai_crawl_control` policy so a
 multi-tenant deployment publishes one document for all of its
 issuers.
-
-There are two unrelated reasons the `keys` array holds more than one
-entry, so read it by `kid` rather than by position. Several issuers is
-the multi-tenant case above. Two entries for one issuer is a rotation
-window: the key that origin signs under now, plus the
-`quote_token.previous_key_id` it keeps verifying until the last quote
-signed under the old key has passed its TTL.
 
 ---
 

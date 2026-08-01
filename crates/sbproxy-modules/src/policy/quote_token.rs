@@ -13,12 +13,6 @@
 //! both for the rotation window. The payload claims are pinned in
 //! [`QuoteClaims`].
 //!
-//! The operator opens that window with
-//! `ai_crawl_control.quote_token.previous_key_id`, which is the only thing
-//! that makes changing `key_id` on a reload survivable: the retired kid
-//! keeps verifying, and the active kid is still the only one that signs.
-//! See [`crate::policy::ai_crawl::QuoteTokenYamlConfig`].
-//!
 //! ## Layering
 //!
 //! The proxy hot path is sync. Signing

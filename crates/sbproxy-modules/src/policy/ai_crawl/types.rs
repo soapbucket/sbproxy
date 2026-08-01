@@ -1235,11 +1235,6 @@ pub struct RailsYamlConfig {
 
 /// Operator-supplied quote-token signing material. The proxy needs the
 /// active key to sign tokens; the JWKS endpoint serves the public half.
-///
-/// The `previous_*` fields describe a rotation window. They are the only
-/// way to change `key_id` without invalidating work already in flight:
-/// without them a reload swaps the single trusted kid, and every quote
-/// issued before it stops verifying at once.
 #[derive(Debug, Clone, Deserialize)]
 pub struct QuoteTokenYamlConfig {
     /// Key id stamped into the JWS header. The verifier looks up the
@@ -1252,31 +1247,6 @@ pub struct QuoteTokenYamlConfig {
     /// Reference to an env var that holds the hex-encoded seed.
     #[serde(default)]
     pub secret_ref: Option<LedgerSecretRef>,
-    /// Key id of the key that signed tokens before the last rotation.
-    ///
-    /// The previous key verifies and never signs. Every token this proxy
-    /// mints carries [`Self::key_id`]; this kid exists so that tokens
-    /// issued before the rotation keep verifying for the rest of their
-    /// TTL, and it is removed on the reload after that window closes.
-    ///
-    /// Leaving it unset is what a steady-state config looks like. Setting
-    /// it is what makes a reload that changes `key_id` survivable: the
-    /// default TTL is 300 seconds, so without a previous key every quote
-    /// issued in the five minutes before the reload is dead the moment the
-    /// new config lands.
-    #[serde(default)]
-    pub previous_key_id: Option<String>,
-    /// 32-byte Ed25519 seed for [`Self::previous_key_id`], hex-encoded.
-    /// The dev / test spelling, exactly as [`Self::seed_hex`] is for the
-    /// active key.
-    #[serde(default)]
-    pub previous_seed_hex: Option<String>,
-    /// Reference to an env var that holds the hex-encoded seed for
-    /// [`Self::previous_key_id`]. The production spelling, exactly as
-    /// [`Self::secret_ref`] is for the active key, and resolved through
-    /// the same code path.
-    #[serde(default)]
-    pub previous_secret_ref: Option<LedgerSecretRef>,
     /// Issuer URL stamped into every token's `iss` claim. Defaults to a
     /// generic `sbproxy://` URI when absent so unit tests do not have to
     /// thread the proxy's external base URL.
@@ -1464,28 +1434,17 @@ pub struct LedgerSecretRef {
     pub secret: Option<String>,
 }
 
-/// Read the secret a [`LedgerSecretRef`] points at.
-///
-/// `field_path` is the full config path of the reference itself, for
-/// example `ai_crawl_control.quote_token.previous_secret_ref`, because an
-/// operator with a failing config needs the key they wrote rather than the
-/// block it sits in. Every reference in this policy resolves here,
-/// including the rotation window's previous key: a second implementation
-/// for the rotation path would agree with this one everywhere except the
-/// one reload that depended on it, in production.
-pub(super) fn resolve_secret_ref(
-    sref: &LedgerSecretRef,
-    field_path: &str,
-) -> anyhow::Result<String> {
+pub(super) fn resolve_secret_ref(sref: &LedgerSecretRef, context: &str) -> anyhow::Result<String> {
     if let Some(env) = sref.env.as_deref() {
         return std::env::var(env)
-            .map_err(|_| anyhow::anyhow!("{field_path}.env: env var '{env}' not set"));
+            .map_err(|_| anyhow::anyhow!("{context}.secret_ref.env: env var '{env}' not set"));
     }
     if let Some(secret) = sref.secret.as_deref() {
-        return std::env::var(secret)
-            .map_err(|_| anyhow::anyhow!("{field_path}.secret: env var '{secret}' not set"));
+        return std::env::var(secret).map_err(|_| {
+            anyhow::anyhow!("{context}.secret_ref.secret: env var '{secret}' not set")
+        });
     }
-    anyhow::bail!("{field_path} requires either env or secret")
+    anyhow::bail!("{context}.secret_ref requires either env or secret")
 }
 
 /// Retry-policy override for the HTTP ledger client.

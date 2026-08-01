@@ -16,10 +16,9 @@
 //! free-preview byte budget, and a paywall position hint per
 //! `docs/AIGOVERNANCE-BUILD.md`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -76,15 +75,8 @@ struct MultiRailPlan {
     /// agent's `Accept-Payment` filter runs over this list to pick the
     /// rail entries actually emitted.
     configured_rails: Vec<ConfiguredRail>,
-    /// Signer for the per-rail quote tokens. Always the active key: a
-    /// rotation window widens what this origin verifies, never what it
-    /// signs.
+    /// Signer for the per-rail quote tokens.
     signer: super::quote_token::QuoteTokenSigner,
-    /// Every key id this origin trusts, keyed by `kid`. The signer's own
-    /// key, plus the previous key while a rotation window is open. This is
-    /// the map the JWKS publishes and the map a verifier is built from, so
-    /// the two can never disagree about which kids are good.
-    trusted_keys: HashMap<String, VerifyingKey>,
     /// Nonce store the issuer pre-registers nonces against. The local
     /// ledger consumes from the same store on redeem.
     nonce_store: Arc<dyn super::quote_token::NonceStore>,
@@ -92,14 +84,9 @@ struct MultiRailPlan {
 
 impl std::fmt::Debug for MultiRailPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Kids are safe to print; the keys themselves are public and the
-        // seeds never reach this struct.
-        let mut kids: Vec<&str> = self.trusted_keys.keys().map(String::as_str).collect();
-        kids.sort_unstable();
         f.debug_struct("MultiRailPlan")
             .field("rails", &self.configured_rails)
             .field("signer", &self.signer)
-            .field("trusted_kids", &kids)
             .finish()
     }
 }
@@ -250,11 +237,9 @@ impl AiCrawlControlPolicy {
             .into_iter()
             .map(ConfiguredRailForTest::into_inner)
             .collect();
-        let trusted_keys = HashMap::from([(signer.key_id().to_string(), signer.verifying_key())]);
         self.multi_rail = Some(Arc::new(MultiRailPlan {
             configured_rails,
             signer,
-            trusted_keys,
             nonce_store,
         }));
         self
@@ -265,31 +250,22 @@ impl AiCrawlControlPolicy {
         self.multi_rail.is_some()
     }
 
-    /// JWKS shape for this origin's quote-token keys. Returns `None` when
-    /// no multi-rail plan is configured. The proxy admin server serves
-    /// this body at `/.well-known/sbproxy/quote-keys.json`.
-    ///
-    /// One entry in steady state, two while a rotation window is open: the
-    /// active signing key and the `previous_key_id` that still verifies
-    /// tokens issued before the reload. Both have to be published, because
-    /// a holder of a pre-rotation token resolves it by `kid` against this
-    /// document and gets `unknown signing key id` if the old kid is gone.
-    ///
-    /// This is a different thing from the several kids the admin endpoint
-    /// can return. That document is a union across origins, so a
-    /// multi-tenant deployment publishes one key set for all of its
-    /// issuers; two kids there usually means two origins, not one origin
-    /// mid-rotation. Rotation is per-origin and lives here.
+    /// JWKS shape for the active quote-token verifier (matches the
+    /// signer's public key). Returns `None` when no multi-rail plan is
+    /// configured. The proxy admin server serves this body at
+    /// `/.well-known/sbproxy/quote-keys.json`.
     pub fn quote_token_jwks(&self) -> Option<serde_json::Value> {
         let plan = self.multi_rail.as_ref()?;
+        let mut keys = std::collections::HashMap::new();
+        keys.insert(
+            plan.signer.key_id().to_string(),
+            plan.signer.verifying_key(),
+        );
         // Build a throwaway verifier just for the JWKS shape; the verifier
         // does not need a real nonce store for that purpose.
         let dummy_store: Arc<dyn super::quote_token::NonceStore> =
             Arc::new(super::quote_token::InMemoryNonceStore::new());
-        let verifier = super::quote_token::QuoteTokenVerifier::with_keys(
-            plan.trusted_keys.clone(),
-            dummy_store,
-        );
+        let verifier = super::quote_token::QuoteTokenVerifier::with_keys(keys, dummy_store);
         Some(verifier.jwks_json())
     }
 
@@ -1029,8 +1005,7 @@ impl ConfiguredRailForTest {
 ///
 /// Returns `Ok(None)` when neither block is present (the policy stays on
 /// the single-rail path); returns `Err` when `rails:` is present without a
-/// `quote_token:` to sign with, when key resolution fails, or when the
-/// rotation window is half written (see [`validate_rotation_window`]).
+/// `quote_token:` to sign with, or when key resolution fails.
 ///
 /// A `quote_token:` block on its own is a valid configuration and compiles
 /// to a plan with an empty rail list. The key is what an operator signs
@@ -1085,19 +1060,26 @@ fn build_multi_rail_plan(
         );
     };
 
-    // --- Rotation window ---
-    //
-    // Checked before either seed is resolved so a half-written rotation
-    // fails on the field the operator got wrong, not on an env var that
-    // was never going to be read.
-    validate_rotation_window(&qt_yaml)?;
-
     // --- Quote-token signer ---
-    let seed = resolve_quote_seed(
-        qt_yaml.secret_ref.as_ref(),
-        qt_yaml.seed_hex.as_deref(),
-        ACTIVE_QUOTE_SEED,
-    )?;
+    let seed_hex = if let Some(sref) = &qt_yaml.secret_ref {
+        resolve_secret_ref(sref, "ai_crawl_control.quote_token")?
+    } else if let Some(inline) = &qt_yaml.seed_hex {
+        inline.clone()
+    } else {
+        anyhow::bail!(
+            "ai_crawl_control.quote_token requires either secret_ref.env, secret_ref.secret, or seed_hex (32-byte ed25519 seed, hex-encoded)"
+        );
+    };
+    let seed_bytes = hex::decode(seed_hex.trim())
+        .map_err(|e| anyhow::anyhow!("ai_crawl_control.quote_token seed is not valid hex: {e}"))?;
+    if seed_bytes.len() != 32 {
+        anyhow::bail!(
+            "ai_crawl_control.quote_token seed must be exactly 32 bytes (got {})",
+            seed_bytes.len()
+        );
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&seed_bytes);
 
     let signer = super::quote_token::QuoteTokenSigner::from_seed_bytes(
         &seed,
@@ -1105,145 +1087,14 @@ fn build_multi_rail_plan(
         qt_yaml.issuer,
         std::time::Duration::from_secs(qt_yaml.default_ttl_seconds),
     );
-
-    // The active key is always trusted. The previous key joins it for the
-    // length of the rotation window and only ever verifies: nothing here
-    // builds a signer for it, so no code path can mint a token under the
-    // retired kid.
-    let mut trusted_keys = HashMap::with_capacity(2);
-    trusted_keys.insert(signer.key_id().to_string(), signer.verifying_key());
-    if let Some(previous_key_id) = qt_yaml.previous_key_id {
-        let previous_seed = resolve_quote_seed(
-            qt_yaml.previous_secret_ref.as_ref(),
-            qt_yaml.previous_seed_hex.as_deref(),
-            PREVIOUS_QUOTE_SEED,
-        )?;
-        let previous_public = SigningKey::from_bytes(&previous_seed).verifying_key();
-        trusted_keys.insert(previous_key_id, previous_public);
-    }
-
     let nonce_store: Arc<dyn super::quote_token::NonceStore> =
         Arc::new(super::quote_token::InMemoryNonceStore::new());
 
     Ok(Some(Arc::new(MultiRailPlan {
         configured_rails,
         signer,
-        trusted_keys,
         nonce_store,
     })))
-}
-
-/// Config path of the block these errors are about, so every message
-/// reads as the key an operator would search their `sb.yml` for.
-const QUOTE_TOKEN_KEY: &str = "ai_crawl_control.quote_token";
-
-/// Which of `quote_token:`'s two key slots a seed is being resolved for.
-///
-/// Only error text differs between the slots. The resolution is one
-/// function for both on purpose: see [`resolve_quote_seed`].
-#[derive(Debug, Clone, Copy)]
-struct QuoteSeedSlot {
-    /// How the seed is named in prose, for error text.
-    label: &'static str,
-    /// Name of the secret-reference field inside `quote_token:`.
-    secret_ref_field: &'static str,
-    /// Name of the inline hex field inside `quote_token:`.
-    seed_hex_field: &'static str,
-}
-
-/// The key that signs. Every token this proxy mints is signed under it.
-const ACTIVE_QUOTE_SEED: QuoteSeedSlot = QuoteSeedSlot {
-    label: "seed",
-    secret_ref_field: "secret_ref",
-    seed_hex_field: "seed_hex",
-};
-
-/// The key that only verifies, for the length of a rotation window.
-const PREVIOUS_QUOTE_SEED: QuoteSeedSlot = QuoteSeedSlot {
-    label: "previous seed",
-    secret_ref_field: "previous_secret_ref",
-    seed_hex_field: "previous_seed_hex",
-};
-
-/// Resolve one 32-byte Ed25519 seed from the two ways an operator can
-/// supply it: a secret reference, or inline hex for dev and test. The
-/// reference wins when both are set, matching the `ledger:` block.
-///
-/// Both the active key and the rotation window's previous key come through
-/// here. That is the point: a previous key resolved by its own code would
-/// agree with the active key everywhere except the reload that depended on
-/// it, and that reload only ever happens in production.
-fn resolve_quote_seed(
-    secret_ref: Option<&LedgerSecretRef>,
-    seed_hex: Option<&str>,
-    slot: QuoteSeedSlot,
-) -> anyhow::Result<[u8; 32]> {
-    let QuoteSeedSlot {
-        label,
-        secret_ref_field,
-        seed_hex_field,
-    } = slot;
-
-    let seed_hex = if let Some(sref) = secret_ref {
-        resolve_secret_ref(sref, &format!("{QUOTE_TOKEN_KEY}.{secret_ref_field}"))?
-    } else if let Some(inline) = seed_hex {
-        inline.to_string()
-    } else {
-        anyhow::bail!(
-            "{QUOTE_TOKEN_KEY} requires either {secret_ref_field}.env, {secret_ref_field}.secret, or {seed_hex_field} (32-byte ed25519 seed, hex-encoded)"
-        );
-    };
-    let seed_bytes = hex::decode(seed_hex.trim())
-        .map_err(|e| anyhow::anyhow!("{QUOTE_TOKEN_KEY} {label} is not valid hex: {e}"))?;
-    if seed_bytes.len() != 32 {
-        anyhow::bail!(
-            "{QUOTE_TOKEN_KEY} {label} must be exactly 32 bytes (got {})",
-            seed_bytes.len()
-        );
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&seed_bytes);
-    Ok(seed)
-}
-
-/// Reject the three ways a rotation window can be written down wrong.
-///
-/// A rotation is two things that have to agree: an id a verifier resolves
-/// by, and the key material behind it. Each of these failures produces a
-/// config that loads and then silently does not rotate, which is the worst
-/// available outcome: the operator believes tokens in flight are covered
-/// and finds out otherwise one TTL later, from the agents.
-fn validate_rotation_window(qt_yaml: &QuoteTokenYamlConfig) -> anyhow::Result<()> {
-    let has_previous_material =
-        qt_yaml.previous_seed_hex.is_some() || qt_yaml.previous_secret_ref.is_some();
-
-    match (qt_yaml.previous_key_id.as_deref(), has_previous_material) {
-        (Some(previous_key_id), false) => anyhow::bail!(
-            "{QUOTE_TOKEN_KEY}.previous_key_id is '{previous_key_id}' but no key material for it \
-             is configured: set previous_secret_ref or previous_seed_hex, or drop \
-             previous_key_id. A kid with no key behind it publishes nothing and verifies nothing"
-        ),
-        (None, true) => anyhow::bail!(
-            "{QUOTE_TOKEN_KEY}.previous_seed_hex / previous_secret_ref is set without \
-             {QUOTE_TOKEN_KEY}.previous_key_id: a verifier resolves a token by the kid in its \
-             header, so a previous key with no id is a key nothing can select"
-        ),
-        _ => {}
-    }
-
-    if let Some(previous_key_id) = qt_yaml.previous_key_id.as_deref() {
-        if previous_key_id == qt_yaml.key_id {
-            anyhow::bail!(
-                "{QUOTE_TOKEN_KEY}.previous_key_id is '{previous_key_id}', the same id as \
-                 {QUOTE_TOKEN_KEY}.key_id: that is not a rotation. The JWKS is keyed by kid, so \
-                 the two entries would collapse into one and every token signed under the older \
-                 key would stop verifying, which is the exact failure the previous key exists to \
-                 prevent"
-            );
-        }
-    }
-
-    Ok(())
 }
 
 /// Convert a unix-seconds timestamp to RFC 3339 in UTC. Used for the
@@ -1279,7 +1130,7 @@ fn build_http_ledger(yaml: LedgerYamlConfig) -> anyhow::Result<HttpLedger> {
     let client = build_http_ledger_client(&yaml.trust_roots, per_attempt_timeout)?;
 
     let key_hex = if let Some(ref sref) = yaml.secret_ref {
-        resolve_secret_ref(sref, "ai_crawl_control.ledger.secret_ref")?
+        resolve_secret_ref(sref, "ai_crawl_control.ledger")?
     } else if let Some(ref inline) = yaml.key_hex {
         inline.clone()
     } else {

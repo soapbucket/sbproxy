@@ -65,23 +65,14 @@
 //! signature checks out. Settlement is then an explicit call at the call
 //! site rather than a side effect of verifying, and it defaults to absent.
 //!
-//! ## Key rotation is expressed in configuration, not here
+//! ## Key rotation is not implemented here
 //!
-//! [`ReceiptTokenVerifier::with_keys`] accepts a map because the JWKS
-//! shape is a map, and a second entry in it is now something an operator
-//! can actually ask for. The quote half of this key family takes
-//! `previous_key_id`: it names the key an origin has rotated away from,
-//! the policy keeps trusting it alongside the active key, both kids are
-//! published, and an artifact signed before the reload keeps verifying
-//! until it ages out. The field and the window it opens are documented on
-//! [`crate::policy::ai_crawl::QuoteTokenYamlConfig`].
-//!
-//! Receipts reach their signing identity by a different route
-//! (`proxy.attestation.sign_with` selects one the proxy already holds),
-//! and that route carries no previous-key field of its own yet. This map
-//! is the seam it would arrive through when it does. Either way nothing in
-//! this module decides which key signs: it is handed a signer and a key
-//! set, and a rotation window is only ever a wider key set.
+//! [`ReceiptTokenVerifier::with_keys`] accepts a map because the JWKS shape
+//! is a map, not because anything rotates keys today. Nothing in this
+//! workspace adds a second key or retires a first one, so there is no
+//! rotation window to describe and this module does not pretend to offer
+//! one. Rotation for the shared quote and receipt key family is tracked as
+//! WOR-2135.
 
 use std::collections::HashMap;
 use std::sync::Arc;

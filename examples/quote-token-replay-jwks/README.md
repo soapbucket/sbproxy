@@ -1,5 +1,5 @@
 # Quote token JWKS verification with replay protection
-*Last modified: 2026-08-01*
+*Last modified: 2026-07-09*
 
 Demonstrates the quote-token JWKS endpoint, end-to-end JWS
 verification, and single-use replay protection.
@@ -119,82 +119,11 @@ its issuers; the verifier cache key is the body hash, so the proxy
 keeps the document stable across calls (BTreeMap-ordered) so a
 verifier on the other side does not re-fetch on every cache miss.
 
-The kid is stamped into both the JWS header and the JWKS entry, which
-is what makes rotation expressible. See the next section.
-
-## Rotating the signing key
-
-A quote is good for `default_ttl_seconds`, which defaults to 300. So
-at any moment there are up to five minutes of issued quotes in flight,
-and a reload that only swapped `key_id` would kill all of them at
-once: their `kid` would stop resolving against the published JWKS and
-every agent holding one would get `unknown signing key id` back.
-
-`previous_key_id` is what avoids that. The previous key verifies and
-never signs.
-
-Step 1 is the config this example ships. One key, no window open:
-
-```yaml
-quote_token:
-  key_id: replay-demo-2026
-  seed_hex: "4444444444444444444444444444444444444444444444444444444444444444"
-  issuer: "https://blog.test.sbproxy.dev"
-  default_ttl_seconds: 300
-```
-
-Step 2 is the rotation. The new key becomes `key_id`, the old key
-moves to `previous_key_id` beside it, and the file is hot-reloaded:
-
-```yaml
-quote_token:
-  key_id: replay-demo-2027
-  seed_hex: "5555555555555555555555555555555555555555555555555555555555555555"
-  previous_key_id: replay-demo-2026
-  previous_seed_hex: "4444444444444444444444444444444444444444444444444444444444444444"
-  issuer: "https://blog.test.sbproxy.dev"
-  default_ttl_seconds: 300
-```
-
-From here every new quote is signed under `replay-demo-2027`, and a
-quote issued a minute before the reload still verifies, because
-`replay-demo-2026` is still published. The JWKS carries two entries
-for the length of the window, so resolve a token by the `kid` in its
-JWS header rather than by reading `keys[0]`. (`verify-quote.sh` takes
-the `keys[0]` shortcut, which is only correct outside a window.)
-
-Step 3, once the longest plausible TTL has passed, drops the two
-`previous_*` lines and reloads again. Nothing signed under the old key
-can still be in flight by then, so nothing is lost:
-
-```yaml
-quote_token:
-  key_id: replay-demo-2027
-  seed_hex: "5555555555555555555555555555555555555555555555555555555555555555"
-  issuer: "https://blog.test.sbproxy.dev"
-  default_ttl_seconds: 300
-```
-
-In production both seeds come from the environment instead of the
-file. `previous_secret_ref` resolves exactly the way `secret_ref`
-does:
-
-```yaml
-quote_token:
-  key_id: replay-demo-2027
-  secret_ref:
-    env: SBPROXY_QUOTE_SEED_2027
-  previous_key_id: replay-demo-2026
-  previous_secret_ref:
-    env: SBPROXY_QUOTE_SEED_2026
-```
-
-Three ways of writing the window down wrong are refused at config load
-rather than at reload time: a `previous_key_id` with no seed behind
-it, a previous seed with no `previous_key_id` to select it, and a
-`previous_key_id` equal to `key_id`. The last one is not a rotation at
-all, and because the JWKS is keyed by kid it would collapse the two
-entries into one.
+The kid is stamped into both the JWS header and the JWKS entry. To
+rotate, the operator adds a new key alongside the old one (so
+existing issued tokens continue to verify), bumps the
+`quote_token.key_id` in `sb.yml`, hot-reloads, and removes the old
+key once the longest plausible TTL has passed.
 
 ## End-to-end walkthrough
 

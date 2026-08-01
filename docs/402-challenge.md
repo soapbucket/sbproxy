@@ -447,16 +447,9 @@ tier, which is what the client should choose from on its retry.
 
 Each advertised rail carries its own `quote_token`, a JWS signed by the
 proxy under a key whose JWKS the operator publishes at
-`/.well-known/sbproxy/quote-keys.json`. The token binds the rail, the
-amount, the route, and a per-rail nonce, so a client cannot replay a quote
-across rails or reuse it after expiry.
-
-The document can carry more than one key, so resolve a token by the `kid`
-in its header rather than by taking the first entry. An origin
-mid-rotation publishes two: the key it signs under now, and the
-`previous_key_id` it still verifies for the length of the rotation window.
-A multi-tenant deployment publishes one document covering every origin's
-issuer, which is a different reason for the same shape.
+`/.well-known/sbproxy-quote-jwks`. The token binds the rail, the amount,
+the route, and a per-rail nonce, so a client cannot replay a quote across
+rails or reuse it after expiry.
 
 On the retry the token is authenticated and its claims validated without
 consuming the nonce. The durable transaction that reserves the intent and
