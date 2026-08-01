@@ -1,0 +1,85 @@
+# WOR-2100: authoritative payment settlement. The default build compiles
+# only the feature-independent domain contract: normalized money, payment
+# requirements, intent state, proofs, and receipts. The durable store, the
+# dispatch gate, the authoritative service, the recovery worker, and every
+# rail adapter sit behind cargo features.
+#
+# This crate deliberately depends on no other sbproxy crate except the
+# shared HTTP client kit, and never on sbproxy-core, sbproxy-modules,
+# sbproxy-ai, or sbproxy-config. Core translates its existing 402 policy
+# output into billing-owned settlement intents, which keeps the crate
+# graph acyclic.
+
+[package]
+name = "sbproxy-billing"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = []
+runtime = ["dep:rusqlite", "dep:tokio", "dep:rand"]
+x402 = ["runtime", "dep:sbproxy-httpkit"]
+mpp = []
+# Envelope nonces must never repeat under one key, so the cipher needs a real
+# entropy source of its own rather than inheriting one from `runtime`.
+recovery-crypto = ["dep:aes-gcm", "dep:rand"]
+# Stripe settlement and Stripe usage reporting are separate surfaces behind
+# one gate: `stripe_payment` can authorize origin access, `stripe_meter`
+# cannot. The recovery cipher is not optional here, because a lost
+# PaymentIntent create is only resolvable by replaying its exact sealed bytes.
+# The Payment Auth charge path additionally needs `mpp` for the pinned
+# credential codec; with `stripe` alone the direct PaymentIntent rail works
+# and the Payment Auth path refuses rather than guessing a token shape.
+stripe = ["runtime", "dep:sbproxy-httpkit", "recovery-crypto"]
+# The two Lightning backends are separately gated so a build carries exactly
+# the node client it talks to.
+lightning-cln = ["runtime"]
+# The LND adapter reaches its node through an injectable transport, the same
+# shape the x402 rail uses for its facilitator. The generated gRPC client and
+# the vendored upstream protobufs are a separate slice; `tonic`, `prost`,
+# `tonic-build`, and the exactly pinned `protoc-bin-vendored` stay declared
+# below so that slice can wire them up without touching the lockfile.
+lightning-lnd = ["runtime"]
+
+[dependencies]
+rusqlite = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+sbproxy-httpkit = { workspace = true, optional = true }
+aes-gcm = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+# Two callers need real entropy: lease tokens, which must be unguessable so a
+# stale holder cannot resume a claim it lost, and recovery envelope nonces,
+# which must never repeat under one key.
+rand = { workspace = true, optional = true }
+
+async-trait.workspace = true
+base64.workspace = true
+hex.workspace = true
+# The Payment HTTP Authentication challenge identifier is an HMAC over the
+# draft's seven binding slots. Kept unconditional rather than behind `mpp` so
+# the pinned feature table stays exactly as specified.
+hmac.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_json_canonicalizer.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[build-dependencies]
+tonic-build = { workspace = true, optional = true }
+protoc-bin-vendored = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
+# Crash and lease tests need two independent handles on one database file,
+# which an in-memory database cannot provide.
+tempfile = "3"

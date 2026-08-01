@@ -840,6 +840,19 @@ pub struct ProxyServerConfig {
     /// `docs/migration-credentials.md`.
     #[serde(default)]
     pub credentials: Vec<CredentialBlock>,
+    /// Durable payment settlement. When absent, the proxy keeps its
+    /// existing non-settlement crawl-ledger behaviour exactly. When
+    /// present, a paid request reaches the origin only after its
+    /// durable intent has committed `Succeeded`.
+    ///
+    /// The block is always parsed, on every build, so `sbproxy
+    /// validate` reads the same document everywhere. The consumer
+    /// compares [`crate::payments::PaymentsConfig::required_features`]
+    /// against its own compiled feature set and fails startup naming
+    /// the missing feature, so a configured rail that was not compiled
+    /// in never reaches a first request.
+    #[serde(default)]
+    pub payments: Option<crate::payments::PaymentsConfig>,
 }
 
 /// Web Bot Auth signing identity for the proxy. See the
@@ -905,6 +918,7 @@ impl Default for ProxyServerConfig {
             web_bot_auth: None,
             tenants: Vec::new(),
             credentials: Vec::new(),
+            payments: None,
         }
     }
 }
@@ -1502,7 +1516,7 @@ pub enum ConfigAuthorityConfigError {
 /// Mirrors the forms the process secret resolver accepts. Deliberately a
 /// shape check only: `sbproxy validate` must not need the environment
 /// variable to be exported or the secret backend to be reachable.
-fn is_secret_reference(value: &str) -> bool {
+pub(crate) fn is_secret_reference(value: &str) -> bool {
     let trimmed = value.trim();
     for prefix in ["env:", "file:"] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {

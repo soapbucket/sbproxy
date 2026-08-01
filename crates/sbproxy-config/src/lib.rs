@@ -14,6 +14,8 @@
 //!   ([`config_merge`])
 //! - Resolving a `source:` block, including a git repository, into the
 //!   config document that actually compiles ([`source`])
+//! - The exact, typed settlement configuration under `proxy.payments`
+//!   ([`payments`])
 //! - The JSON Schema for the config file, generated from the same types
 //!   the binary parses with ([`schema`])
 
@@ -30,6 +32,7 @@ pub mod key_registry;
 pub mod listing;
 pub mod litellm;
 pub mod model_host;
+pub mod payments;
 pub mod plan;
 pub mod raw;
 pub mod schema;
@@ -63,6 +66,16 @@ pub use listing::{
     StaticRevisionResolver, LISTINGS_DIRNAME, LISTING_API_VERSION, LISTING_KIND,
 };
 pub use model_host::*;
+pub use payments::{
+    iso_4217_decimals, settlement_amount, AdvertisedRailName, AmountConversionError, BreakerConfig,
+    DirectPaymentIntentConfig, LightningBackend, LightningClnRailConfig, LightningLndRailConfig,
+    PaymentAuthProtocolConfig, PaymentProtocolsConfig, PaymentRailsConfig, PaymentsConfig,
+    PaymentsConfigError, PaymentsWorkerConfig, RecoveryEncryptionConfig, StripeMeterReporterConfig,
+    StripeRailConfig, UsageReportersConfig, X402FacilitatorConfig, X402RailConfig,
+    MAX_AUTHORIZATION_TIMEOUT_MS, MAX_PAYMENT_BODY_BYTES, MAX_SETTLEMENT_DECIMALS,
+    MAX_X402_EXTRA_JCS_BYTES, PAYMENT_AUTH_DRAFT, PAYMENT_AUTH_INTENT, PAYMENT_AUTH_METHOD,
+    STRIPE_API_VERSION, X402_SCHEME,
+};
 pub use plan::{
     compute_baseline_revision, plan, plan_with_options, render_text, BlastRadius, BlastRadiusRule,
     PlanEntry, PlanFile, PlanKind, PlanReport, PlanSummary, BLAST_RADIUS_MATRIX,

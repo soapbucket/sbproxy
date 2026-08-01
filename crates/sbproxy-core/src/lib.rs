@@ -42,6 +42,13 @@ pub mod admin_ui;
 pub mod agent_class;
 /// Boot wiring for the alert evaluation loop (dispatcher + engine + drain).
 pub mod alerting;
+/// WOR-2100: runtime assembly for authoritative payment settlement.
+///
+/// Opens the durable settlement store, registers the rail adapters this
+/// build compiled, and owns the recovery worker's lifecycle. Feature-gated
+/// by `payments`, so a build without settlement carries none of it.
+#[cfg(feature = "payments")]
+pub mod billing_runtime;
 /// Empty-shell registry for built-in policy
 /// enforcer wrappers.
 ///

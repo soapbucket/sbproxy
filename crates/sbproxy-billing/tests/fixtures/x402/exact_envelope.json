@@ -1,0 +1,137 @@
+{
+  "_comment": "Frozen x402 v2 exact wire shapes at the pinned revision. Every address, transaction, and quote token here is a fixture value; nothing in this file came from a live facilitator or a live chain.",
+  "payment_required": {
+    "x402Version": 2,
+    "resource": {
+      "url": "https://api.example.com/v1/search",
+      "description": "One search request",
+      "mimeType": "application/json"
+    },
+    "accepts": [
+      {
+        "scheme": "exact",
+        "network": "eip155:84532",
+        "amount": "1000",
+        "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+        "payTo": "0x1111111111111111111111111111111111111111",
+        "maxTimeoutSeconds": 60,
+        "extra": {
+          "name": "USDC",
+          "version": "2"
+        }
+      }
+    ],
+    "extensions": {
+      "sbproxy-requirement": {
+        "info": {
+          "id": "sbpr_fixture_requirement_0001",
+          "quote": "eyJhbGciOiJFZERTQSJ9.ZmluZ2VycHJpbnQ.c2lnbmF0dXJl"
+        },
+        "schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "pattern": "^[A-Za-z0-9_-]{16,128}$",
+              "type": "string"
+            },
+            "quote": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "quote"
+          ],
+          "title": "sbproxy-requirement",
+          "type": "object"
+        }
+      }
+    }
+  },
+  "payment_payload": {
+    "x402Version": 2,
+    "resource": {
+      "url": "https://api.example.com/v1/search",
+      "description": "One search request",
+      "mimeType": "application/json"
+    },
+    "accepted": {
+      "scheme": "exact",
+      "network": "eip155:84532",
+      "amount": "1000",
+      "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+      "payTo": "0x1111111111111111111111111111111111111111",
+      "maxTimeoutSeconds": 60,
+      "extra": {
+        "name": "USDC",
+        "version": "2"
+      }
+    },
+    "payload": {
+      "signature": "0xfixturesignature",
+      "authorization": {
+        "from": "0x2222222222222222222222222222222222222222",
+        "to": "0x1111111111111111111111111111111111111111",
+        "value": "1000",
+        "validAfter": "0",
+        "validBefore": "1900000000",
+        "nonce": "0x0000000000000000000000000000000000000000000000000000000000000001"
+      }
+    },
+    "extensions": {
+      "sbproxy-requirement": {
+        "info": {
+          "id": "sbpr_fixture_requirement_0001",
+          "quote": "eyJhbGciOiJFZERTQSJ9.ZmluZ2VycHJpbnQ.c2lnbmF0dXJl"
+        },
+        "schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "pattern": "^[A-Za-z0-9_-]{16,128}$",
+              "type": "string"
+            },
+            "quote": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "quote"
+          ],
+          "title": "sbproxy-requirement",
+          "type": "object"
+        }
+      }
+    }
+  },
+  "verify_response": {
+    "isValid": true,
+    "payer": "0x2222222222222222222222222222222222222222"
+  },
+  "verify_rejection": {
+    "isValid": false,
+    "invalidReason": "insufficient_funds"
+  },
+  "settle_response": {
+    "success": true,
+    "transaction": "0x3333333333333333333333333333333333333333333333333333333333333333",
+    "network": "eip155:84532",
+    "amount": "1000",
+    "payer": "0x2222222222222222222222222222222222222222"
+  },
+  "settle_ambiguous": {
+    "transaction": "0x3333333333333333333333333333333333333333333333333333333333333333",
+    "network": "eip155:84532"
+  },
+  "settle_rejection": {
+    "success": false,
+    "errorReason": "settlement_failed"
+  }
+}

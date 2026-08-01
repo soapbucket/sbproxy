@@ -395,6 +395,21 @@ pub struct AccessLogEntry {
     /// rails or unsettled traffic.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub txhash: Option<String>,
+    /// One-way correlation digest for the settlement receipt that
+    /// authorized this request. Hex, and derived under a domain
+    /// separator from the receipt key, so two log lines for the same
+    /// settled payment carry the same value and nothing in the value
+    /// can be turned back into an intent id, a provider reference, or
+    /// a payer. `None` for unsettled traffic and for every rail that
+    /// did not commit a receipt.
+    ///
+    /// This is the join key an operator uses to go from an access log
+    /// line to a settlement record, and it is deliberately the only
+    /// settlement identifier on the line. `txhash` above is the rail's
+    /// own public hash and is present only where the rail publishes
+    /// one; this field is present for every settled request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement_receipt_digest: Option<String>,
     /// `jti` of the OLP license token presented. `None` when
     /// no license token was presented.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -642,6 +657,7 @@ impl Default for AccessLogEntry {
             rail: None,
             redeemed_token_id: None,
             txhash: None,
+            settlement_receipt_digest: None,
             license_token_id: None,
             cap_token_id: None,
             upstream_host: None,
@@ -821,6 +837,16 @@ impl AccessLogEntryBuilder {
         self.inner.txhash = Some(hash.into());
         self
     }
+    /// Set the one-way settlement receipt correlation digest.
+    ///
+    /// The caller passes an already-derived digest. This stamper does
+    /// no hashing of its own, because a builder that accepted a raw
+    /// receipt key and hashed it would be one refactor away from
+    /// accepting the key and forgetting to.
+    pub fn settlement_receipt_digest(mut self, digest: impl Into<String>) -> Self {
+        self.inner.settlement_receipt_digest = Some(digest.into());
+        self
+    }
     /// Set the OLP license-token jti.
     pub fn license_token_id(mut self, jti: impl Into<String>) -> Self {
         self.inner.license_token_id = Some(jti.into());
@@ -948,6 +974,7 @@ mod tests {
             rail: None,
             redeemed_token_id: None,
             txhash: None,
+            settlement_receipt_digest: None,
             license_token_id: None,
             cap_token_id: None,
             upstream_host: None,
@@ -1209,6 +1236,64 @@ mod tests {
         assert!(v.get("agent_vendor").is_none());
         assert!(v.get("payment_rail").is_none());
         assert!(v.get("content_shape").is_none());
+    }
+
+    #[test]
+    fn settlement_receipt_digest_serializes_and_omits() {
+        // The receipt correlation digest is the only settlement
+        // identifier the access log carries. It has to round-trip under
+        // its exact key, and it has to vanish entirely for unsettled
+        // traffic rather than serializing as null, because a null here
+        // reads as "settled, digest missing".
+        let digest = "a3f1".repeat(16);
+        let mut entry = minimal_entry();
+        entry.rail = Some("x402".to_string());
+        entry.settlement_receipt_digest = Some(digest.clone());
+        let json = serde_json::to_string(&entry).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["rail"], "x402");
+        assert_eq!(v["settlement_receipt_digest"], digest);
+
+        let unsettled = minimal_entry();
+        let json = serde_json::to_string(&unsettled).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("settlement_receipt_digest").is_none());
+    }
+
+    #[test]
+    fn the_settlement_line_carries_no_credential_or_provider_reference() {
+        // Task 9's privacy assertion, pinned where the shape lives. A
+        // settled line carries the rail and a one-way digest. There is no
+        // field for the credential that paid, the provider object that
+        // moved the funds, or the customer the usage was billed to, so
+        // the assertion is about the serialized key set rather than about
+        // one carefully chosen fixture value.
+        let mut entry = minimal_entry();
+        entry.rail = Some("stripe".to_string());
+        entry.settlement_receipt_digest = Some("0".repeat(64));
+        let json = serde_json::to_string(&entry).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let object = value.as_object().unwrap();
+
+        for forbidden in [
+            "client_secret",
+            "macaroon",
+            "rune",
+            "payment_credential",
+            "payment_proof",
+            "spt",
+            "payment_intent_id",
+            "provider_reference",
+            "usage_customer_id",
+            "payer",
+        ] {
+            assert!(
+                !object.contains_key(forbidden),
+                "the access log grew a {forbidden} field"
+            );
+        }
+        assert_eq!(object["rail"], "stripe");
+        assert_eq!(object["settlement_receipt_digest"], "0".repeat(64));
     }
 
     #[test]
