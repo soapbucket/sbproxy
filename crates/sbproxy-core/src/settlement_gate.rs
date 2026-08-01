@@ -946,6 +946,10 @@ fn generic_challenge_body(
 }
 
 /// Rebuilds the signed requirement a finalized intent committed.
+///
+/// Gated with its only caller, the x402 refusal renderer, so a build
+/// without that rail does not carry a helper nothing names.
+#[cfg(feature = "payment-x402")]
 fn stored_signed(intent: &IntentRecord) -> Option<SignedPaymentRequirement> {
     Some(SignedPaymentRequirement {
         requirement: intent.requirement.clone()?,
@@ -1214,5 +1218,1063 @@ fn infra_msg(stage: &'static str, detail: &str) -> GateFailure {
     GateFailure {
         stage,
         detail: detail.to_string(),
+    }
+}
+
+/// The origin-count matrix and the per-rail happy paths.
+///
+/// Run with every payment rail feature on, which is how the gate ships:
+///
+/// ```text
+/// cargo nextest run -p sbproxy-core --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln settlement_gate
+/// ```
+///
+/// The rail wire contracts (x402 v2, Payment Auth draft-01, Stripe
+/// PaymentIntents, CLN) are pinned by sbproxy-billing's own contract
+/// tests; these stub at the adapter seam and assert the gate's contract:
+/// for every non-success authorization state the decision is not `Allow`,
+/// the provider settle count does not move past what the state implies,
+/// and no access receipt exists.
+#[cfg(all(test, feature = "payment-x402", feature = "payment-mpp"))]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use sbproxy_billing::dispatch::DispatchContext;
+    use sbproxy_billing::payment_auth::{ChallengeBinder, PaymentChallenge};
+    use sbproxy_billing::registry::{
+        AuthoritativePayment, ChallengeMaterial, ChallengePreparation, PaymentMethodAdapter,
+        ProviderQueryResult, RailRegistry,
+    };
+    use sbproxy_billing::service::RequirementSigner;
+    use sbproxy_billing::sqlite::SqliteSettlementStore;
+    use sbproxy_billing::store::{
+        BillingClock, ClaimedAttempt, ClaimedUsageEvent, CreateIntent, LeaseRecovery,
+        PreparedAttempt, ProofReservation, ProviderAttempt, ReconciliationOutcome, SettlementStore,
+        SharedSettlementStore, SystemClock, UsageOutcome,
+    };
+    use sbproxy_billing::types::{
+        AttemptOperation, PaymentRequirementDraft, RecoveryEnvelopeRecord, SafeFailure,
+        SettlementRail, SettlementReceipt,
+    };
+    use sbproxy_billing::registry::UsageEvent;
+    use sbproxy_modules::policy::quote_token::{
+        InMemoryNonceStore, NonceStore, QuoteTokenSigner, QuoteTokenVerifier,
+    };
+
+    use crate::payment_signer::QuoteRequirementSigner;
+
+    /// A clock the test moves by hand, anchored to the real wall clock so
+    /// quote-token `exp` claims (verified against real time) stay live.
+    struct TestClock(AtomicI64);
+
+    impl TestClock {
+        fn anchored() -> Arc<Self> {
+            Arc::new(Self(AtomicI64::new(SystemClock.now_ms())))
+        }
+
+        fn advance(&self, delta_ms: i64) {
+            self.0.fetch_add(delta_ms, Ordering::SeqCst);
+        }
+    }
+
+    impl BillingClock for TestClock {
+        fn now_ms(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    /// What the scripted rail does when asked to settle.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Script {
+        Settle,
+        Reject,
+        NotSettled,
+    }
+
+    struct ScriptedState {
+        script: Mutex<Script>,
+        settle_calls: AtomicUsize,
+    }
+
+    /// A rail adapter the test scripts, following the dispatch-gate
+    /// protocol exactly as the billing fixtures do.
+    struct ScriptedAdapter {
+        rail: SettlementRail,
+        state: Arc<ScriptedState>,
+        provider_handle: Option<&'static str>,
+        client_secret: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl PaymentMethodAdapter for ScriptedAdapter {
+        fn rail(&self) -> SettlementRail {
+            self.rail
+        }
+
+        async fn prepare_challenge(
+            &self,
+            _request: ChallengePreparation,
+            _dispatch: &DispatchContext,
+        ) -> Result<ChallengeMaterial, BillingError> {
+            let mut material =
+                ChallengeMaterial::new(self.provider_handle.map(str::to_string));
+            if let Some(secret) = self.client_secret {
+                material.client_secret = Some(zeroize::Zeroizing::new(secret.to_string()));
+            }
+            Ok(material.with_field("provider", "scripted"))
+        }
+
+        async fn authorize_and_settle(
+            &self,
+            request: AuthoritativePayment,
+            dispatch: &DispatchContext,
+        ) -> Result<SettlementReceipt, BillingError> {
+            self.state.settle_calls.fetch_add(1, Ordering::SeqCst);
+            let script = *self.state.script.lock().expect("script lock");
+            let intent_id = request.intent_id.clone();
+            let rail = self.rail;
+            let now_ms = request.now_ms;
+            dispatch
+                .run_write(|| async move {
+                    match script {
+                        Script::Settle => SettlementReceipt::new(
+                            &intent_id,
+                            rail,
+                            "exact",
+                            "provider_ref_1",
+                            now_ms,
+                        ),
+                        Script::Reject => Err(BillingError::ProviderRejected),
+                        Script::NotSettled => Err(BillingError::NotSettled),
+                    }
+                })
+                .await
+        }
+
+        async fn query_attempt(
+            &self,
+            _attempt: &ProviderAttempt,
+            _dispatch: &DispatchContext,
+        ) -> Result<ProviderQueryResult, BillingError> {
+            Ok(ProviderQueryResult::Unsupported)
+        }
+    }
+
+    /// A store that cannot answer, for the infrastructure row of the
+    /// matrix.
+    struct FailingStore;
+
+    #[async_trait::async_trait]
+    impl SettlementStore for FailingStore {
+        async fn create_or_get_challenge(
+            &self,
+            _draft: &PaymentRequirementDraft,
+            _draft_digest: [u8; 32],
+            _request_idempotency_key: &str,
+        ) -> Result<CreateIntent, BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn finalize_requirement(
+            &self,
+            _intent_id: &str,
+            _signed: &SignedPaymentRequirement,
+        ) -> Result<(), BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn latest_attempt(
+            &self,
+            _intent_id: &str,
+            _operation: AttemptOperation,
+        ) -> Result<Option<ProviderAttempt>, BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn prepare_attempt(
+            &self,
+            _intent_id: &str,
+            _operation: AttemptOperation,
+            _provider_idempotency_key: &str,
+            _known_provider_handle: Option<&str>,
+            _now_ms: i64,
+        ) -> Result<PreparedAttempt, BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn mark_dispatch_started(
+            &self,
+            _attempt_id: &str,
+            _lease_token: &str,
+            _now_ms: i64,
+        ) -> Result<(), BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn mark_succeeded(
+            &self,
+            _attempt_id: &str,
+            _lease_token: &str,
+            _receipt: SettlementReceipt,
+        ) -> Result<(), BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn mark_retry_wait_before_dispatch(
+            &self,
+            _attempt_id: &str,
+            _lease_token: &str,
+            _retry_at_ms: i64,
+            _failure: SafeFailure,
+        ) -> Result<(), BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn mark_terminal(
+            &self,
+            _attempt_id: &str,
+            _lease_token: &str,
+            _failure: SafeFailure,
+        ) -> Result<(), BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn mark_needs_reconciliation(
+            &self,
+            _attempt_id: &str,
+            _lease_token: &str,
+            _failure: SafeFailure,
+        ) -> Result<(), BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn mark_challenge_prepared(
+            &self,
+            _attempt_id: &str,
+            _lease_token: &str,
+            _provider_handle: Option<&str>,
+            _now_ms: i64,
+        ) -> Result<(), BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn load_intent(
+            &self,
+            _intent_id: &str,
+        ) -> Result<Option<IntentRecord>, BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn load_attempt(
+            &self,
+            _attempt_id: &str,
+        ) -> Result<Option<ProviderAttempt>, BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn load_access_receipt(
+            &self,
+            _intent_id: &str,
+        ) -> Result<Option<SettlementReceipt>, BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn reserve_proof(
+            &self,
+            _intent_id: &str,
+            _proof_digest: [u8; 32],
+            _now_ms: i64,
+        ) -> Result<ProofReservation, BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn put_recovery_envelope(
+            &self,
+            _envelope: &RecoveryEnvelopeRecord,
+        ) -> Result<(), BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn load_recovery_envelope(
+            &self,
+            _attempt_id: &str,
+        ) -> Result<Option<RecoveryEnvelopeRecord>, BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn purge_recovery_envelope(&self, _attempt_id: &str) -> Result<(), BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn purge_expired_recovery_envelopes(
+            &self,
+            _now_ms: i64,
+        ) -> Result<u64, BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn expire_stale_challenges(
+            &self,
+            _now_ms: i64,
+            _limit: u32,
+        ) -> Result<u64, BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn recover_stale_leases(
+            &self,
+            _now_ms: i64,
+            _limit: u32,
+        ) -> Result<LeaseRecovery, BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn claim_reconciliation(
+            &self,
+            _now_ms: i64,
+            _lease_ttl_ms: i64,
+            _limit: u32,
+        ) -> Result<Vec<ClaimedAttempt>, BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn record_reconciliation(
+            &self,
+            _attempt_id: &str,
+            _lease_token: &str,
+            _outcome: ReconciliationOutcome,
+            _now_ms: i64,
+        ) -> Result<(), BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn enqueue_usage_event(&self, _event: &UsageEvent) -> Result<bool, BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn claim_usage_events(
+            &self,
+            _now_ms: i64,
+            _lease_ttl_ms: i64,
+            _limit: u32,
+        ) -> Result<Vec<ClaimedUsageEvent>, BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn mark_usage_dispatch_started(
+            &self,
+            _reporter: &str,
+            _usage_identifier: &str,
+            _lease_token: &str,
+            _now_ms: i64,
+        ) -> Result<(), BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn record_usage_outcome(
+            &self,
+            _reporter: &str,
+            _usage_identifier: &str,
+            _lease_token: &str,
+            _outcome: UsageOutcome,
+            _now_ms: i64,
+        ) -> Result<(), BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+    }
+
+    /// The gate wired to a real SQLite store and one scripted rail.
+    struct Gate {
+        _dir: Option<tempfile::TempDir>,
+        service: BillingService,
+        seam: SettlementGateSeam,
+        payments: PaymentsConfig,
+        policy: AiCrawlControlPolicy,
+        state: Arc<ScriptedState>,
+        clock: Arc<TestClock>,
+    }
+
+    impl Gate {
+        fn build(
+            rail: SettlementRail,
+            payments: PaymentsConfig,
+            policy: AiCrawlControlPolicy,
+            provider_handle: Option<&'static str>,
+            client_secret: Option<&'static str>,
+            store_override: Option<SharedSettlementStore>,
+        ) -> Self {
+            payments.validate().expect("payments fixture validates");
+            let clock = TestClock::anchored();
+            let dyn_clock: Arc<dyn BillingClock> = clock.clone();
+            let (dir, store): (Option<tempfile::TempDir>, SharedSettlementStore) =
+                match store_override {
+                    Some(store) => (None, store),
+                    None => {
+                        let dir = tempfile::tempdir().expect("tempdir");
+                        let store = SqliteSettlementStore::open(&dir.path().join("s.sqlite3"))
+                            .expect("open settlement store")
+                            .with_clock(Arc::clone(&dyn_clock))
+                            .shared();
+                        (Some(dir), store)
+                    }
+                };
+
+            let quote_signer = QuoteTokenSigner::from_seed_bytes(
+                &[7_u8; 32],
+                "kid-test",
+                "https://proxy.example",
+                Duration::from_secs(600),
+            );
+            let verifying = quote_signer.verifying_key();
+            let nonce_store: Arc<dyn NonceStore> = Arc::new(InMemoryNonceStore::new());
+            let verifier =
+                QuoteTokenVerifier::single_key("kid-test", verifying, Arc::clone(&nonce_store));
+            let requirement_signer =
+                Arc::new(QuoteRequirementSigner::new(quote_signer, verifier));
+            let dyn_signer: Arc<dyn RequirementSigner> = Arc::clone(&requirement_signer);
+
+            let state = Arc::new(ScriptedState {
+                script: Mutex::new(Script::Settle),
+                settle_calls: AtomicUsize::new(0),
+            });
+            let mut registry = RailRegistry::new();
+            registry
+                .register_adapter(Arc::new(ScriptedAdapter {
+                    rail,
+                    state: Arc::clone(&state),
+                    provider_handle,
+                    client_secret,
+                }))
+                .expect("register scripted adapter");
+
+            let service = BillingService::builder(store)
+                .adapters(registry)
+                .signer(dyn_signer)
+                .clock(dyn_clock)
+                .build();
+
+            let binder =
+                ChallengeBinder::new("crawl", b"test-binding-key-material").expect("binder");
+            let seam = SettlementGateSeam {
+                quote_signer: requirement_signer,
+                nonce_store,
+                challenge_binder: Some(Arc::new(binder)),
+                failure_mode: FailureMode::Closed,
+            };
+
+            Self {
+                _dir: dir,
+                service,
+                seam,
+                payments,
+                policy,
+                state,
+                clock,
+            }
+        }
+
+        fn x402() -> Self {
+            Self::build(
+                SettlementRail::X402,
+                x402_payments(),
+                crawl_policy(0.001, "USD"),
+                None,
+                None,
+                None,
+            )
+        }
+
+        fn mpp() -> Self {
+            Self::build(
+                SettlementRail::Stripe,
+                mpp_payments(),
+                crawl_policy(0.01, "USD"),
+                None,
+                None,
+                None,
+            )
+        }
+
+        fn stripe_direct() -> Self {
+            Self::build(
+                SettlementRail::Stripe,
+                stripe_direct_payments(),
+                crawl_policy(0.01, "USD"),
+                Some("pi_test_1"),
+                Some("cs_test_secret"),
+                None,
+            )
+        }
+
+        fn lightning() -> Self {
+            /// A syntactically valid payment-hash handle: 64 hex chars.
+            const CLN_PAYMENT_HASH: &str =
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            Self::build(
+                SettlementRail::LightningCln,
+                lightning_payments(),
+                crawl_policy(0.0001, "BTC"),
+                Some(CLN_PAYMENT_HASH),
+                None,
+                None,
+            )
+        }
+
+        fn failing_store() -> Self {
+            Self::build(
+                SettlementRail::X402,
+                x402_payments(),
+                crawl_policy(0.001, "USD"),
+                None,
+                None,
+                Some(Arc::new(FailingStore)),
+            )
+        }
+
+        fn script(&self, script: Script) {
+            *self.state.script.lock().expect("script lock") = script;
+        }
+
+        fn settle_calls(&self) -> usize {
+            self.state.settle_calls.load(Ordering::SeqCst)
+        }
+
+        async fn decide_with(&self, headers: &http::HeaderMap) -> GateDecision {
+            let accept = headers
+                .get(http::header::ACCEPT)
+                .and_then(|value| value.to_str().ok());
+            let accept_payment = headers
+                .get("accept-payment")
+                .and_then(|value| value.to_str().ok());
+            let request = GateRequest {
+                headers,
+                host: "blog.test",
+                path: "/article",
+                tenant: "tenant-1",
+                origin_id: "origin-1",
+                agent_id: "",
+                accept,
+                accept_payment,
+            };
+            let deps = GateDeps {
+                service: &self.service,
+                seam: &self.seam,
+                payments: &self.payments,
+                policy: &self.policy,
+            };
+            decide(&request, &deps).await
+        }
+
+        /// Issues one challenge and returns its rendered response.
+        async fn challenge(&self, headers: &http::HeaderMap) -> GateResponse {
+            match self.decide_with(headers).await {
+                GateDecision::Respond(response) => {
+                    assert_eq!(response.status, 402, "a challenge is a 402");
+                    response
+                }
+                GateDecision::Allow => panic!("a challenge must not allow"),
+                GateDecision::KeepLegacy => panic!("settlement should own this challenge"),
+                GateDecision::Infrastructure(failure) => {
+                    panic!("challenge failed at {}: {}", failure.stage, failure.detail)
+                }
+            }
+        }
+
+        /// The receipt the store would authorize a request with, if any.
+        async fn receipt_for_token(&self, token: &str) -> Option<SettlementReceipt> {
+            let claims = self
+                .seam
+                .quote_signer
+                .verify_claims(token)
+                .expect("token authenticates");
+            let requirement_id = claims.requirement_id.expect("requirement id claim");
+            let intent_id = derive_intent_id("tenant-1", &requirement_id);
+            self.service
+                .store()
+                .load_access_receipt(&intent_id)
+                .await
+                .expect("store answers")
+        }
+    }
+
+    fn crawl_policy(price: f64, currency: &str) -> AiCrawlControlPolicy {
+        AiCrawlControlPolicy::from_config(serde_json::json!({
+            "price": price,
+            "currency": currency,
+            "header": "crawler-payment",
+            "crawler_user_agents": ["GPTBot"],
+        }))
+        .expect("policy compiles")
+    }
+
+    fn payments_fixture(value: serde_json::Value) -> PaymentsConfig {
+        serde_json::from_value(value).expect("payments fixture parses")
+    }
+
+    fn x402_payments() -> PaymentsConfig {
+        payments_fixture(serde_json::json!({
+            "state_path": "/var/lib/sbproxy/test-settlement.sqlite3",
+            "challenge_binding_key": "secret://env/SB_TEST_BINDING_KEY",
+            "rails": {"x402": {
+                "network": "eip155:84532",
+                "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+                "quote_currency": "USD",
+                "asset_decimals": 6,
+                "pay_to": "0x1111111111111111111111111111111111111111",
+                "max_timeout_seconds": 60,
+                "facilitators": [
+                    {"facilitator_url": "https://facilitator.test.sbproxy.dev/api"}
+                ]
+            }}
+        }))
+    }
+
+    fn mpp_payments() -> PaymentsConfig {
+        payments_fixture(serde_json::json!({
+            "state_path": "/var/lib/sbproxy/test-settlement.sqlite3",
+            "challenge_binding_key": "secret://env/SB_TEST_BINDING_KEY",
+            "recovery_encryption": {
+                "key_id": "rk1",
+                "key": "secret://env/SB_TEST_RECOVERY_KEY"
+            },
+            "protocols": {"payment_auth": {"realm": "crawl"}},
+            "rails": {"stripe": {
+                "api_key": "secret://env/SB_TEST_STRIPE_KEY",
+                "business_network_id": "bn_test",
+                "quote_currency": "USD",
+                "currency_decimals": 2,
+                "payment_method_types": ["card"]
+            }}
+        }))
+    }
+
+    fn stripe_direct_payments() -> PaymentsConfig {
+        payments_fixture(serde_json::json!({
+            "state_path": "/var/lib/sbproxy/test-settlement.sqlite3",
+            "challenge_binding_key": "secret://env/SB_TEST_BINDING_KEY",
+            "recovery_encryption": {
+                "key_id": "rk1",
+                "key": "secret://env/SB_TEST_RECOVERY_KEY"
+            },
+            "rails": {"stripe": {
+                "api_key": "secret://env/SB_TEST_STRIPE_KEY",
+                "business_network_id": "bn_test",
+                "quote_currency": "USD",
+                "currency_decimals": 2,
+                "payment_method_types": ["card"],
+                "direct_payment_intent": {"enabled": true}
+            }}
+        }))
+    }
+
+    fn lightning_payments() -> PaymentsConfig {
+        payments_fixture(serde_json::json!({
+            "state_path": "/var/lib/sbproxy/test-settlement.sqlite3",
+            "challenge_binding_key": "secret://env/SB_TEST_BINDING_KEY",
+            "rails": {"lightning_cln": {
+                "socket_path": "/var/run/lightning/lightning-rpc",
+                "rune": "secret://env/SB_TEST_CLN_RUNE",
+                "quote_currency": "BTC",
+                "settlement_decimals": 11
+            }}
+        }))
+    }
+
+    fn crawler_headers() -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            http::HeaderValue::from_static("GPTBot/1.0"),
+        );
+        headers
+    }
+
+    fn add_header(headers: &mut http::HeaderMap, name: &str, value: &str) {
+        headers.append(
+            http::header::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+            http::HeaderValue::from_str(value).expect("header value"),
+        );
+    }
+
+    fn header_value(response: &GateResponse, name: &str) -> String {
+        response
+            .response
+            .headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| panic!("response carries {name}"))
+    }
+
+    fn quote_token_of(response: &GateResponse) -> String {
+        header_value(response, "crawler-payment")
+    }
+
+    /// Builds a syntactically valid x402 credential from a challenge body.
+    fn x402_credential(body: &str) -> String {
+        let required: serde_json::Value = serde_json::from_str(body).expect("x402 body is JSON");
+        let envelope = serde_json::json!({
+            "x402Version": required["x402Version"],
+            "resource": required["resource"],
+            "accepted": required["accepts"][0],
+            "payload": {"signature": "0xdeadbeef"},
+            "extensions": required["extensions"],
+        });
+        encode_x402_header(&envelope).expect("encode x402 credential")
+    }
+
+    /// Builds a Payment Auth credential echoing one challenge header.
+    fn mpp_credential(challenge_header: &str, spt: &str) -> String {
+        let challenge =
+            PaymentChallenge::parse_header_value(challenge_header).expect("challenge parses");
+        let credential = serde_json::json!({
+            "challenge": challenge,
+            "payload": {"spt": spt},
+        });
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&credential).expect("credential serializes"));
+        format!("Payment {encoded}")
+    }
+
+    fn expect_respond(decision: GateDecision) -> GateResponse {
+        match decision {
+            GateDecision::Respond(response) => response,
+            GateDecision::Allow => panic!("expected a response, got Allow"),
+            GateDecision::KeepLegacy => panic!("expected a response, got KeepLegacy"),
+            GateDecision::Infrastructure(failure) => {
+                panic!("expected a response, got infra failure at {}", failure.stage)
+            }
+        }
+    }
+
+    // --- Happy paths ---
+
+    #[tokio::test]
+    async fn x402_challenge_settle_allow() {
+        let gate = Gate::x402();
+        let challenge = gate.challenge(&crawler_headers()).await;
+        assert!(challenge.response.body.contains("x402Version"));
+        assert!(challenge.response.body.contains("accepts"));
+        header_value(&challenge, "PAYMENT-REQUIRED");
+        let token = quote_token_of(&challenge);
+
+        let mut retry = crawler_headers();
+        add_header(&mut retry, "crawler-payment", &token);
+        add_header(
+            &mut retry,
+            "PAYMENT-SIGNATURE",
+            &x402_credential(&challenge.response.body),
+        );
+        let decision = gate.decide_with(&retry).await;
+        assert!(matches!(decision, GateDecision::Allow), "settled retry allows");
+        assert_eq!(gate.settle_calls(), 1);
+        assert!(gate.receipt_for_token(&token).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn mpp_challenge_settle_allow() {
+        let gate = Gate::mpp();
+        let challenge = gate.challenge(&crawler_headers()).await;
+        let www = header_value(&challenge, "WWW-Authenticate");
+        assert!(www.starts_with("Payment "), "challenge is a Payment scheme");
+        let token = quote_token_of(&challenge);
+
+        let mut retry = crawler_headers();
+        add_header(&mut retry, "crawler-payment", &token);
+        add_header(
+            &mut retry,
+            "authorization",
+            &mpp_credential(&www, "spt_test_12345"),
+        );
+        let decision = gate.decide_with(&retry).await;
+        assert!(matches!(decision, GateDecision::Allow), "settled retry allows");
+        assert_eq!(gate.settle_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn mpp_duplicate_credential_is_a_400_problem() {
+        let gate = Gate::mpp();
+        let challenge = gate.challenge(&crawler_headers()).await;
+        let www = header_value(&challenge, "WWW-Authenticate");
+        let token = quote_token_of(&challenge);
+
+        let mut retry = crawler_headers();
+        add_header(&mut retry, "crawler-payment", &token);
+        let credential = mpp_credential(&www, "spt_test_12345");
+        add_header(&mut retry, "authorization", &credential);
+        add_header(&mut retry, "authorization", &credential);
+        let response = expect_respond(gate.decide_with(&retry).await);
+        assert_eq!(response.status, 400);
+        assert_eq!(response.response.content_type, PROBLEM_CONTENT_TYPE);
+        assert!(response.response.body.contains("malformed-credential"));
+        assert_eq!(gate.settle_calls(), 0, "a 400 dispatches nothing");
+        assert!(gate.receipt_for_token(&token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stripe_direct_challenge_settle_allow() {
+        let gate = Gate::stripe_direct();
+        let challenge = gate.challenge(&crawler_headers()).await;
+        assert!(
+            challenge.response.body.contains("cs_test_secret"),
+            "the one-shot client secret rides the immediate 402"
+        );
+        let token = quote_token_of(&challenge);
+
+        let mut retry = crawler_headers();
+        add_header(&mut retry, "crawler-payment", &token);
+        let decision = gate.decide_with(&retry).await;
+        assert!(matches!(decision, GateDecision::Allow), "settled retry allows");
+        assert_eq!(gate.settle_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn lightning_challenge_settle_allow() {
+        let gate = Gate::lightning();
+        let mut headers = crawler_headers();
+        add_header(&mut headers, "accept-payment", "lightning");
+        let challenge = gate.challenge(&headers).await;
+        assert!(challenge.response.body.contains("\"rail\":\"lightning\""));
+        let token = quote_token_of(&challenge);
+
+        let mut retry = crawler_headers();
+        add_header(&mut retry, "crawler-payment", &token);
+        let decision = gate.decide_with(&retry).await;
+        assert!(matches!(decision, GateDecision::Allow), "settled retry allows");
+        assert_eq!(gate.settle_calls(), 1);
+    }
+
+    // --- The origin-count matrix: every non-success state stays denied ---
+
+    #[tokio::test]
+    async fn pending_payment_never_reaches_the_origin() {
+        let gate = Gate::x402();
+        gate.script(Script::NotSettled);
+        let challenge = gate.challenge(&crawler_headers()).await;
+        let token = quote_token_of(&challenge);
+
+        let mut retry = crawler_headers();
+        add_header(&mut retry, "crawler-payment", &token);
+        add_header(
+            &mut retry,
+            "PAYMENT-SIGNATURE",
+            &x402_credential(&challenge.response.body),
+        );
+        let response = expect_respond(gate.decide_with(&retry).await);
+        assert_eq!(response.status, 503, "verified-not-settled is unavailable");
+        header_value(&response, "Retry-After");
+        assert!(gate.receipt_for_token(&token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn rejected_payment_never_reaches_the_origin() {
+        let gate = Gate::x402();
+        gate.script(Script::Reject);
+        let challenge = gate.challenge(&crawler_headers()).await;
+        let token = quote_token_of(&challenge);
+
+        let mut retry = crawler_headers();
+        add_header(&mut retry, "crawler-payment", &token);
+        add_header(
+            &mut retry,
+            "PAYMENT-SIGNATURE",
+            &x402_credential(&challenge.response.body),
+        );
+        let response = expect_respond(gate.decide_with(&retry).await);
+        assert_eq!(response.status, 402);
+        assert!(response.response.body.contains("rejected"));
+        assert!(gate.receipt_for_token(&token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_challenge_never_reaches_the_origin() {
+        let gate = Gate::x402();
+        let challenge = gate.challenge(&crawler_headers()).await;
+        let token = quote_token_of(&challenge);
+        gate.clock.advance(CHALLENGE_TTL_MS + 1_000);
+
+        let mut retry = crawler_headers();
+        add_header(&mut retry, "crawler-payment", &token);
+        add_header(
+            &mut retry,
+            "PAYMENT-SIGNATURE",
+            &x402_credential(&challenge.response.body),
+        );
+        let response = expect_respond(gate.decide_with(&retry).await);
+        assert_eq!(response.status, 402);
+        assert!(response.response.body.contains("challenge_expired"));
+        assert_eq!(gate.settle_calls(), 0, "an expired challenge dispatches nothing");
+        assert!(gate.receipt_for_token(&token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn replayed_credential_never_settles_a_second_intent() {
+        let gate = Gate::x402();
+        let first = gate.challenge(&crawler_headers()).await;
+        let first_token = quote_token_of(&first);
+        let credential = x402_credential(&first.response.body);
+
+        let mut retry = crawler_headers();
+        add_header(&mut retry, "crawler-payment", &first_token);
+        add_header(&mut retry, "PAYMENT-SIGNATURE", &credential);
+        assert!(matches!(
+            gate.decide_with(&retry).await,
+            GateDecision::Allow
+        ));
+        assert_eq!(gate.settle_calls(), 1);
+
+        // A second challenge, and the settled credential presented
+        // against it: the proof digest is already bound to the first
+        // intent.
+        let second = gate.challenge(&crawler_headers()).await;
+        let second_token = quote_token_of(&second);
+        let mut replay = crawler_headers();
+        add_header(&mut replay, "crawler-payment", &second_token);
+        add_header(&mut replay, "PAYMENT-SIGNATURE", &credential);
+        let response = expect_respond(gate.decide_with(&replay).await);
+        assert_eq!(response.status, 402);
+        assert!(response.response.body.contains("proof_replayed"));
+        assert_eq!(gate.settle_calls(), 1, "a replay dispatches nothing");
+        assert!(gate.receipt_for_token(&second_token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_settled_credential_authorizes_exactly_once() {
+        let gate = Gate::x402();
+        let challenge = gate.challenge(&crawler_headers()).await;
+        let token = quote_token_of(&challenge);
+        let credential = x402_credential(&challenge.response.body);
+
+        let mut retry = crawler_headers();
+        add_header(&mut retry, "crawler-payment", &token);
+        add_header(&mut retry, "PAYMENT-SIGNATURE", &credential);
+        assert!(matches!(
+            gate.decide_with(&retry).await,
+            GateDecision::Allow
+        ));
+
+        // Same token, same credential, second presentation: the durable
+        // intent still holds its receipt (a resumable retry by design),
+        // and the request-path nonce burn is what makes serving happen
+        // exactly once.
+        let response = expect_respond(gate.decide_with(&retry).await);
+        assert_eq!(response.status, 402);
+        assert!(response.response.body.contains("proof_replayed"));
+        assert_eq!(gate.settle_calls(), 1, "the payment settled exactly once");
+    }
+
+    #[tokio::test]
+    async fn wrong_rail_preference_is_a_406_with_no_intent() {
+        let gate = Gate::x402();
+        let mut headers = crawler_headers();
+        add_header(&mut headers, "accept-payment", "lightning");
+        let response = expect_respond(gate.decide_with(&headers).await);
+        assert_eq!(response.status, 406);
+        assert_eq!(response.label, "ai_crawl_settlement");
+        assert!(response.response.body.contains("no_acceptable_rail"));
+        assert!(response.response.body.contains("x402"));
+        assert_eq!(gate.settle_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn garbage_quote_token_gets_a_fresh_challenge() {
+        let gate = Gate::x402();
+        let mut headers = crawler_headers();
+        add_header(&mut headers, "crawler-payment", "not-a-quote-token");
+        let response = expect_respond(gate.decide_with(&headers).await);
+        assert_eq!(response.status, 402, "a fresh challenge is issued");
+        let fresh = quote_token_of(&response);
+        assert_ne!(fresh, "not-a-quote-token");
+        assert_eq!(gate.settle_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_x402_credential_never_dispatches() {
+        let gate = Gate::x402();
+        let challenge = gate.challenge(&crawler_headers()).await;
+        let token = quote_token_of(&challenge);
+
+        let mut retry = crawler_headers();
+        add_header(&mut retry, "crawler-payment", &token);
+        add_header(&mut retry, "PAYMENT-SIGNATURE", "!!!not-base64!!!");
+        let response = expect_respond(gate.decide_with(&retry).await);
+        assert_eq!(response.status, 402);
+        assert!(response.response.body.contains("proof_invalid"));
+        assert_eq!(gate.settle_calls(), 0);
+        assert!(gate.receipt_for_token(&token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_x402_credential_never_dispatches() {
+        let gate = Gate::x402();
+        let challenge = gate.challenge(&crawler_headers()).await;
+        let token = quote_token_of(&challenge);
+
+        let mut retry = crawler_headers();
+        add_header(&mut retry, "crawler-payment", &token);
+        let response = expect_respond(gate.decide_with(&retry).await);
+        assert_eq!(response.status, 402);
+        assert!(response.response.body.contains("proof_invalid"));
+        assert_eq!(gate.settle_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_store_error_is_infrastructure_not_a_payment_outcome() {
+        let gate = Gate::failing_store();
+        let decision = gate.decide_with(&crawler_headers()).await;
+        assert!(
+            matches!(decision, GateDecision::Infrastructure(_)),
+            "a store error is never a payment refusal and never an allow"
+        );
+        assert_eq!(gate.settle_calls(), 0);
+    }
+
+    // --- Negotiation and configuration edges ---
+
+    #[tokio::test]
+    async fn no_advertisable_rail_keeps_the_legacy_challenge() {
+        let payments = payments_fixture(serde_json::json!({
+            "state_path": "/var/lib/sbproxy/test-settlement.sqlite3",
+            "challenge_binding_key": "secret://env/SB_TEST_BINDING_KEY",
+        }));
+        let gate = Gate::build(
+            SettlementRail::X402,
+            payments,
+            crawl_policy(0.001, "USD"),
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(
+            gate.decide_with(&crawler_headers()).await,
+            GateDecision::KeepLegacy
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_zero_price_keeps_the_legacy_challenge() {
+        let gate = Gate::build(
+            SettlementRail::X402,
+            x402_payments(),
+            crawl_policy(0.0, "USD"),
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(
+            gate.decide_with(&crawler_headers()).await,
+            GateDecision::KeepLegacy
+        ));
+    }
+
+    // --- The failure posture is exhaustive and payment-independent ---
+
+    #[test]
+    fn only_the_closed_posture_refuses_on_infrastructure_failure() {
+        assert!(matches!(
+            failure_action(FailureMode::Closed),
+            FailureAction::Refuse { .. }
+        ));
+        assert!(matches!(
+            failure_action(FailureMode::Open),
+            FailureAction::Admit {
+                waived: false,
+                counterfactual: false
+            }
+        ));
+        assert!(matches!(
+            failure_action(FailureMode::Degraded),
+            FailureAction::Admit {
+                waived: true,
+                counterfactual: false
+            }
+        ));
+        assert!(matches!(
+            failure_action(FailureMode::Observe),
+            FailureAction::Admit {
+                waived: false,
+                counterfactual: true
+            }
+        ));
     }
 }
