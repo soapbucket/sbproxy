@@ -27,38 +27,47 @@
 //!
 //! # The resolvers are lowered, never merged
 //!
-//! `proxy.attestation.route_weights` and
-//! `proxy.attestation.origin_headers` become two independent collections
-//! on [`crate::attestation::AttestationRuntime`], and they stay
-//! independent. A route matched
-//! by both contributes two entries to a receipt's units, one per source,
-//! because the sources have different provenance and summing them
-//! produces a number whose parts can no longer be checked separately.
-//! See [`sbproxy_meter`].
+//! `proxy.attestation.measured`, `proxy.attestation.route_weights`, and
+//! `proxy.attestation.origin_headers` become three independent
+//! collections on [`crate::attestation::AttestationRuntime`], and they
+//! stay independent. A route matched by more than one contributes one
+//! entry to a receipt's units per source, because the sources have
+//! different provenance and summing them produces a number whose parts
+//! can no longer be checked separately. See [`sbproxy_meter`].
 //!
 //! # Validation mode never touches the disk
 //!
 //! `prepare_attestation` creates the directories the queue and the
-//! ledger live in, which is a real side effect and exactly the reason
-//! the pipeline calls it only under
-//! `PipelineConstructionMode::Runtime`. `sbproxy validate` must be able
-//! to check a candidate config on an operator's laptop without leaving
-//! ledger directories behind. Everything that can be decided without a
-//! filesystem is decided earlier, at config compile, so validation still
-//! rejects a broken block.
+//! ledger live in, and opens the receipt chain for a role that writes
+//! receipts. Those are real side effects and exactly the reason the
+//! pipeline calls it only under `PipelineConstructionMode::Runtime`.
+//! `sbproxy validate` must be able to check a candidate config on an
+//! operator's laptop without leaving ledger files behind. Everything
+//! that can be decided without a filesystem is decided earlier, at
+//! config compile, so validation still rejects a broken block.
+//!
+//! Opening the chain is the one side effect that cannot fail the boot.
+//! A ledger that will not open becomes an unwritable
+//! [`crate::meter_runtime::ReceiptChain`] and
+//! [`crate::attestation::AttestationRuntime::failure_mode`] decides what
+//! happens to traffic, because a full disk taking the API down is
+//! precisely the outcome the `degraded` default exists to prevent.
 
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use sbproxy_config::types::{
     AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig,
-    AttestationOriginHeaderConfig, AttestationQueueConfig, AttestationRole,
-    AttestationRouteWeightConfig, BillableRule, EnforcementMode, FailureMode,
-    OriginAttestationConfig, WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH,
+    AttestationMeasuredConfig, AttestationMeasuredQuantity, AttestationOriginHeaderConfig,
+    AttestationQueueConfig, AttestationRole, AttestationRouteWeightConfig, BillableRule,
+    EnforcementMode, FailureMode, OriginAttestationConfig, WebBotAuthConfig,
+    ATTESTATION_SIGN_WITH_WEB_BOT_AUTH,
 };
 use sbproxy_meter::{
-    Billable, BillableOutcome, OriginHeaderRule, OutcomeTable, RouteWeightRule, RouteWeightTable,
+    Billable, BillableOutcome, MeasuredQuantity, MeasuredRule, OriginHeaderRule, OutcomeTable,
+    RouteWeightRule, RouteWeightTable,
 };
 
 /// The attestation posture one pipeline generation runs under.
@@ -67,12 +76,15 @@ use sbproxy_meter::{
 /// request path never re-reads YAML and a reload swaps the whole object
 /// rather than mutating it underneath in-flight requests.
 ///
-/// `Debug` is derived rather than hand-written because nothing here is
-/// secret. `signing_key_id` is the `kid` that gets published in the
-/// JWKS, and the rest is paths, counts, and postures. Should this ever
-/// gain the seed itself rather than a name for it, replace the derive
-/// with a manual impl that omits the key, the way the receipt and quote
-/// signers do.
+/// `Debug` is derived rather than hand-written because nothing at this
+/// level is secret. `signing_key_id` is the `kid` that gets published in
+/// the JWKS, and the rest is paths, counts, and postures. The seed is
+/// held one level down, inside
+/// [`crate::meter_runtime::ReceiptChain`], which carries a hand-written
+/// [`std::fmt::Debug`] that prints only the kid, the way the receipt and
+/// quote signers do. Should anything secret ever land on this struct
+/// directly, replace the derive rather than trusting the field below to
+/// keep containing it.
 #[derive(Debug)]
 pub struct AttestationRuntime {
     /// Which halves of attestation this proxy performs proxy-wide.
@@ -104,6 +116,14 @@ pub struct AttestationRuntime {
     pub ledger_path: PathBuf,
     /// The operator's complete position on what they charge for.
     pub outcomes: OutcomeTable,
+    /// Units this generation counts for itself.
+    ///
+    /// Listed first because it is the resolver with nothing outside the
+    /// process in it: the proxy saw the bytes and held the clock, so
+    /// nobody else contributed to the number. A receipt is easier to
+    /// argue about when an unarguable line is sitting next to the
+    /// contested ones.
+    pub measured: Vec<MeasuredRule>,
     /// Routes this generation prices, bound to the revision that priced
     /// them.
     ///
@@ -120,6 +140,15 @@ pub struct AttestationRuntime {
     /// which is why the resolver attests to what arrived rather than
     /// vouching for it. See `sbproxy_meter::origin_header`.
     pub origin_headers: Vec<OriginHeaderRule>,
+    /// This node's receipt chain, opened once per generation.
+    ///
+    /// `None` when the role writes no receipts, which is every posture
+    /// that only makes claims. `Some` with an unwritable chain inside is
+    /// a different statement and a deliberate one: the ledger could not
+    /// be opened, and [`Self::failure_mode`] rather than a boot failure
+    /// decides what happens to traffic. See
+    /// `crate::meter_runtime::ReceiptChain::open`.
+    pub chain: Option<Arc<crate::meter_runtime::ReceiptChain>>,
 }
 
 /// The attestation posture one origin runs under, after the proxy-wide
@@ -151,22 +180,35 @@ pub struct ResolvedOriginAttestation {
 /// weight is worse than a receipt with no evidence at all, because it
 /// reads as proof.
 ///
-/// The queue and ledger directories are created here. That is the side
-/// effect the caller gates on construction mode; see the module docs.
+/// The queue and ledger directories are created here, and a role that
+/// writes receipts also opens its chain here. Those are the side effects
+/// the caller gates on construction mode; see the module docs. Opening
+/// the chain cannot fail: a ledger that will not open is a runtime
+/// condition that [`AttestationRuntime::failure_mode`] answers, not a
+/// reason to refuse to boot.
+///
+/// `node_id` is the identity the chain's entries are attributed to, and
+/// it has to be the same id the mesh gather keys segments by, or this
+/// node's chain is one nobody can attribute. It is a parameter for the
+/// same reason `config_revision` is: reading it from a global here would
+/// let a generation be built against one identity and report under
+/// another.
 ///
 /// # Errors
 ///
 /// Returns an error when a declared role has no queue, no ledger, or an
 /// incomplete billing table, when `sign_with` names an identity this
-/// build cannot resolve, or when a state directory cannot be created.
-/// `compile_config` rejects the first three earlier, so reaching them
-/// here means a pipeline was built from something other than a compiled
+/// build cannot resolve, when a receipt-writing role resolves no signing
+/// identity at all, or when a state directory cannot be created.
+/// `compile_config` rejects all of those earlier, so reaching them here
+/// means a pipeline was built from something other than a compiled
 /// config; the checks stay because a runtime that assumes its input was
 /// validated elsewhere is a runtime that panics when it was not.
 pub(crate) fn prepare_attestation(
     cfg: Option<&AttestationConfig>,
     web_bot_auth: Option<&WebBotAuthConfig>,
     config_revision: &str,
+    node_id: &str,
 ) -> Result<Option<Arc<AttestationRuntime>>> {
     let attestation: &AttestationConfig = match cfg {
         Some(attestation) => attestation,
@@ -222,6 +264,7 @@ pub(crate) fn prepare_attestation(
         ),
     };
 
+    let measured: Vec<MeasuredRule> = attestation.measured.iter().map(measured_rule).collect();
     let route_weights: RouteWeightTable = RouteWeightTable::new(
         config_revision,
         attestation
@@ -243,6 +286,32 @@ pub(crate) fn prepare_attestation(
     ensure_state_dir(&queue_path, "proxy.attestation.queue.path")?;
     ensure_state_dir(&ledger_path, "proxy.attestation.ledger.path")?;
 
+    // The chain is opened here, once, and pinned to this generation, so a
+    // request that started under one configuration keeps writing to the
+    // chain that configuration opened. Only a role that writes receipts
+    // gets one: a proxy that only makes claims has nothing to chain, and
+    // opening a ledger it will never write to would create a file an
+    // operator then has to explain.
+    let chain: Option<Arc<crate::meter_runtime::ReceiptChain>> = match (
+        role.writes_receipts(),
+        signing_key_id.as_deref(),
+        web_bot_auth,
+    ) {
+        (false, _, _) => None,
+        (true, Some(key_id), Some(signer)) => {
+            Some(Arc::new(crate::meter_runtime::ReceiptChain::open(
+                &ledger_path,
+                &signer.ed25519_seed_hex,
+                key_id,
+                node_id,
+            )))
+        }
+        (true, _, _) => anyhow::bail!(
+            "proxy.attestation.role writes receipts but no signing identity resolved, so every \
+             receipt would be an unsigned log line"
+        ),
+    };
+
     Ok(Some(Arc::new(AttestationRuntime {
         role,
         failure_mode,
@@ -252,9 +321,38 @@ pub(crate) fn prepare_attestation(
         queue_max_entries,
         ledger_path,
         outcomes,
+        measured,
         route_weights,
         origin_headers,
+        chain,
     })))
+}
+
+/// Lower one configured measured unit into the meter's rule.
+///
+/// The quantity is matched exhaustively with no wildcard arm, the same
+/// way `meter_billable` is, because the two enums are two vocabularies
+/// that must agree and this is the only place they meet. Adding a
+/// quantity on either side stops the build here rather than silently
+/// metering the new one as whatever the wildcard happened to pick.
+fn measured_rule(entry: &AttestationMeasuredConfig) -> MeasuredRule {
+    let quantity: MeasuredQuantity = match entry.quantity {
+        AttestationMeasuredQuantity::Requests => MeasuredQuantity::Requests,
+        AttestationMeasuredQuantity::BytesIn => MeasuredQuantity::BytesIn,
+        AttestationMeasuredQuantity::BytesOut => MeasuredQuantity::BytesOut,
+        AttestationMeasuredQuantity::DurationMs => MeasuredQuantity::DurationMs,
+    };
+    // `per` is a plain `u64` in config and a `NonZeroU64` here, so the
+    // zero has to go somewhere. `compile_config` rejects it, which makes
+    // this fallback unreachable through the supported path, and it is a
+    // fallback rather than an `expect` for the same reason the bails
+    // above are checks rather than assumptions: this is a runtime, and a
+    // runtime that panics on input it was told had been validated is a
+    // runtime that takes the process down over somebody else's bug.
+    // Billing one unit per observed item is the reading an operator who
+    // omitted the key would have got anyway.
+    let per: NonZeroU64 = NonZeroU64::new(entry.per).unwrap_or(NonZeroU64::MIN);
+    MeasuredRule::new(entry.name.clone(), quantity, per)
 }
 
 /// Lower one configured route weight into the meter's rule.
@@ -395,6 +493,9 @@ mod tests {
     /// pipeline computes over the serialized document.
     const REVISION: &str = "9f2c41a0be77";
 
+    /// The node every test chain is attributed to.
+    const NODE: &str = "node-a";
+
     fn complete_billable() -> AttestationBillableConfig {
         AttestationBillableConfig {
             delivered: Some(BillableRule::Yes),
@@ -437,13 +538,13 @@ mod tests {
 
     #[test]
     fn an_absent_or_off_block_builds_no_runtime() {
-        assert!(prepare_attestation(None, None, REVISION)
+        assert!(prepare_attestation(None, None, REVISION, NODE)
             .expect("absent block is not an error")
             .is_none());
 
         let off = AttestationConfig::default();
         assert_eq!(off.role, AttestationRole::Off);
-        assert!(prepare_attestation(Some(&off), None, REVISION)
+        assert!(prepare_attestation(Some(&off), None, REVISION, NODE)
             .expect("an off role is not an error")
             .is_none());
     }
@@ -530,7 +631,7 @@ mod tests {
             directory_url: None,
         };
 
-        let runtime = prepare_attestation(Some(&cfg), Some(&signer), REVISION)
+        let runtime = prepare_attestation(Some(&cfg), Some(&signer), REVISION, NODE)
             .expect("a complete block builds")
             .expect("a declared role yields a runtime");
 
@@ -550,25 +651,42 @@ mod tests {
                 .is_dir(),
             "boot creates the state directory so the first claim is not the first failure"
         );
+        let chain = runtime
+            .chain
+            .as_deref()
+            .expect("a role that writes receipts opens a chain");
+        assert!(chain.is_writable());
+        assert_eq!(chain.node_id(), NODE);
+    }
+
+    #[test]
+    fn a_role_that_makes_claims_and_writes_none_opens_no_chain() {
+        // Opening a ledger the role will never write to would leave a file
+        // an operator then has to explain.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = AttestationConfig {
+            role: AttestationRole::Claim,
+            ..metering_config(dir.path(), Vec::new(), Vec::new())
+        };
+
+        let runtime = prepare_attestation(Some(&cfg), Some(&signer()), REVISION, NODE)
+            .expect("a complete block builds")
+            .expect("a declared role yields a runtime");
+
+        assert!(runtime.chain.is_none());
+        assert!(!runtime.ledger_path.exists());
     }
 
     #[test]
     fn a_receipt_role_without_its_named_signer_fails_loud() {
-        let cfg = AttestationConfig {
-            role: AttestationRole::Receipt,
-            sign_with: Some(ATTESTATION_SIGN_WITH_WEB_BOT_AUTH.to_string()),
-            queue: Some(AttestationQueueConfig {
-                path: "claims.q".to_string(),
-                max_entries: 16,
-            }),
-            ledger: Some(AttestationLedgerConfig {
-                path: "receipts.ndjson".to_string(),
-            }),
-            billable: Some(complete_billable()),
-            ..AttestationConfig::default()
-        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = metering_config(dir.path(), Vec::new(), Vec::new());
+        assert_eq!(
+            cfg.sign_with.as_deref(),
+            Some(ATTESTATION_SIGN_WITH_WEB_BOT_AUTH)
+        );
 
-        let error = prepare_attestation(Some(&cfg), None, REVISION)
+        let error = prepare_attestation(Some(&cfg), None, REVISION, NODE)
             .expect_err("a receipt with nothing to sign it is not a receipt");
         assert!(
             error.to_string().contains("sign_with"),
@@ -576,8 +694,30 @@ mod tests {
         );
     }
 
-    /// A complete block with whatever resolvers a test wants on it.
+    #[test]
+    fn a_receipt_role_with_no_signing_identity_at_all_fails_loud() {
+        // `compile_config` rejects this earlier, so reaching it means a
+        // pipeline was built from something other than a compiled config.
+        // The check stays because an unsigned receipt is a log line.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = AttestationConfig {
+            sign_with: None,
+            ..metering_config(dir.path(), Vec::new(), Vec::new())
+        };
+
+        let error = prepare_attestation(Some(&cfg), Some(&signer()), REVISION, NODE)
+            .expect_err("a receipt nobody signed is not a receipt");
+        assert!(error.to_string().contains("signing identity"), "{error}");
+    }
+
+    /// A complete block with whatever resolvers a test wants on it, with
+    /// its state under `dir`.
+    ///
+    /// The paths are absolute on purpose. A receipt role opens its chain
+    /// during lowering, so a relative path here would leave a ledger file
+    /// in whatever directory the test runner happened to start in.
     fn metering_config(
+        dir: &Path,
         route_weights: Vec<AttestationRouteWeightConfig>,
         origin_headers: Vec<AttestationOriginHeaderConfig>,
     ) -> AttestationConfig {
@@ -585,11 +725,11 @@ mod tests {
             role: AttestationRole::Receipt,
             sign_with: Some(ATTESTATION_SIGN_WITH_WEB_BOT_AUTH.to_string()),
             queue: Some(AttestationQueueConfig {
-                path: "claims.q".to_string(),
+                path: dir.join("claims.q").display().to_string(),
                 max_entries: 16,
             }),
             ledger: Some(AttestationLedgerConfig {
-                path: "receipts.ndjson".to_string(),
+                path: dir.join("receipts.ndjson").display().to_string(),
             }),
             billable: Some(complete_billable()),
             route_weights,
@@ -608,7 +748,9 @@ mod tests {
 
     #[test]
     fn declared_resolvers_lower_into_the_metering_vocabulary() {
+        let dir = tempfile::tempdir().expect("temp dir");
         let cfg = metering_config(
+            dir.path(),
             vec![AttestationRouteWeightConfig {
                 name: "search_call".to_string(),
                 method: Some("POST".to_string()),
@@ -621,7 +763,7 @@ mod tests {
             }],
         );
 
-        let runtime = prepare_attestation(Some(&cfg), Some(&signer()), REVISION)
+        let runtime = prepare_attestation(Some(&cfg), Some(&signer()), REVISION, NODE)
             .expect("a complete block builds")
             .expect("a declared role yields a runtime");
 
@@ -644,7 +786,9 @@ mod tests {
         // from one document citing the revision of another. A generation
         // gets its revision when it is built, so an in-flight request
         // holding an older runtime keeps the older tag.
+        let dir = tempfile::tempdir().expect("temp dir");
         let cfg = metering_config(
+            dir.path(),
             vec![AttestationRouteWeightConfig {
                 name: "search_call".to_string(),
                 method: None,
@@ -654,10 +798,10 @@ mod tests {
             Vec::new(),
         );
 
-        let old = prepare_attestation(Some(&cfg), Some(&signer()), REVISION)
+        let old = prepare_attestation(Some(&cfg), Some(&signer()), REVISION, NODE)
             .expect("builds")
             .expect("a declared role yields a runtime");
-        let new = prepare_attestation(Some(&cfg), Some(&signer()), "0011223344ff")
+        let new = prepare_attestation(Some(&cfg), Some(&signer()), "0011223344ff", NODE)
             .expect("builds")
             .expect("a declared role yields a runtime");
 
@@ -680,12 +824,14 @@ mod tests {
         // Recording the call without pricing it is a legitimate posture,
         // so this is not an error. The table is empty rather than absent
         // so the request path has one shape to handle.
-        let cfg = metering_config(Vec::new(), Vec::new());
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = metering_config(dir.path(), Vec::new(), Vec::new());
 
-        let runtime = prepare_attestation(Some(&cfg), Some(&signer()), REVISION)
+        let runtime = prepare_attestation(Some(&cfg), Some(&signer()), REVISION, NODE)
             .expect("builds")
             .expect("a declared role yields a runtime");
 
+        assert!(runtime.measured.is_empty());
         assert!(runtime.route_weights.is_empty());
         assert!(runtime.origin_headers.is_empty());
         assert_eq!(runtime.route_weights.config_revision(), REVISION);
@@ -693,23 +839,40 @@ mod tests {
 
     #[test]
     fn a_route_priced_and_reported_at_once_yields_one_unit_per_source() {
-        let cfg = metering_config(
-            vec![AttestationRouteWeightConfig {
-                name: "search_call".to_string(),
-                method: None,
-                path: "/v1/search".to_string(),
-                weight: 1,
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = AttestationConfig {
+            measured: vec![AttestationMeasuredConfig {
+                name: "egress_kib".to_string(),
+                quantity: AttestationMeasuredQuantity::BytesOut,
+                per: 1024,
             }],
-            vec![AttestationOriginHeaderConfig {
-                name: "result_row".to_string(),
-                header: "X-Rows-Returned".to_string(),
-            }],
-        );
-        let runtime = prepare_attestation(Some(&cfg), Some(&signer()), REVISION)
+            ..metering_config(
+                dir.path(),
+                vec![AttestationRouteWeightConfig {
+                    name: "search_call".to_string(),
+                    method: None,
+                    path: "/v1/search".to_string(),
+                    weight: 1,
+                }],
+                vec![AttestationOriginHeaderConfig {
+                    name: "result_row".to_string(),
+                    header: "X-Rows-Returned".to_string(),
+                }],
+            )
+        };
+        let runtime = prepare_attestation(Some(&cfg), Some(&signer()), REVISION, NODE)
             .expect("builds")
             .expect("a declared role yields a runtime");
 
-        let mut units = runtime.route_weights.resolve("POST", "/v1/search");
+        let mut units = sbproxy_meter::resolve_measured(
+            &runtime.measured,
+            &sbproxy_meter::Measurement {
+                bytes_in: 512,
+                bytes_out: 12_043,
+                duration_ms: 91,
+            },
+        );
+        units.extend(runtime.route_weights.resolve("POST", "/v1/search"));
         units.extend(
             runtime
                 .origin_headers
@@ -720,8 +883,90 @@ mod tests {
         let sources: Vec<UnitSource> = units.iter().map(|unit| unit.source).collect();
         assert_eq!(
             sources,
-            vec![UnitSource::RouteWeight, UnitSource::OriginHeader],
-            "two provenances stay two lines; 41 would be one number nobody can check"
+            vec![
+                UnitSource::Measured,
+                UnitSource::RouteWeight,
+                UnitSource::OriginHeader
+            ],
+            "three provenances stay three lines; 53 would be one number nobody can check"
+        );
+    }
+
+    #[test]
+    fn a_measured_entry_lowers_with_the_divisor_that_makes_its_unit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = AttestationConfig {
+            measured: vec![
+                AttestationMeasuredConfig {
+                    name: "egress_kib".to_string(),
+                    quantity: AttestationMeasuredQuantity::BytesOut,
+                    per: 1024,
+                },
+                AttestationMeasuredConfig {
+                    name: "compute_second".to_string(),
+                    quantity: AttestationMeasuredQuantity::DurationMs,
+                    per: 1000,
+                },
+                AttestationMeasuredConfig {
+                    name: "api_call".to_string(),
+                    quantity: AttestationMeasuredQuantity::Requests,
+                    per: 1,
+                },
+                AttestationMeasuredConfig {
+                    name: "ingress_kib".to_string(),
+                    quantity: AttestationMeasuredQuantity::BytesIn,
+                    per: 1024,
+                },
+            ],
+            ..metering_config(dir.path(), Vec::new(), Vec::new())
+        };
+
+        let runtime = prepare_attestation(Some(&cfg), Some(&signer()), REVISION, NODE)
+            .expect("builds")
+            .expect("a declared role yields a runtime");
+
+        let units = sbproxy_meter::resolve_measured(
+            &runtime.measured,
+            &sbproxy_meter::Measurement {
+                bytes_in: 2_048,
+                bytes_out: 12_043,
+                duration_ms: 1_500,
+            },
+        );
+        let counts: Vec<(&str, u64)> = units
+            .iter()
+            .map(|unit| (unit.name.as_str(), unit.count))
+            .collect();
+        assert_eq!(
+            counts,
+            vec![
+                ("egress_kib", 12),
+                ("compute_second", 2),
+                ("api_call", 1),
+                ("ingress_kib", 2),
+            ],
+            "a partial unit is billed as a whole one"
+        );
+        assert!(units.iter().all(|unit| unit.source == UnitSource::Measured));
+    }
+
+    #[test]
+    fn a_divisor_of_zero_falls_back_to_one_rather_than_panicking() {
+        // `compile_config` rejects a zero divisor, so this is unreachable
+        // through the supported path. It is a fallback anyway because this
+        // is a runtime, and a runtime that panics on input it was told had
+        // been validated takes the process down over somebody else's bug.
+        let rule = measured_rule(&AttestationMeasuredConfig {
+            name: "api_call".to_string(),
+            quantity: AttestationMeasuredQuantity::Requests,
+            per: 0,
+        });
+
+        assert_eq!(rule.per, NonZeroU64::MIN);
+        assert_eq!(
+            rule.resolve(&sbproxy_meter::Measurement::default()).count,
+            1,
+            "one unit per observed item is the reading an omitted key would have got"
         );
     }
 }

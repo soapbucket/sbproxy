@@ -141,6 +141,13 @@ pub mod mesh_cache;
 /// exactly that. Deliberately not built on `cluster_metrics`; see the
 /// module docs for why receipts cannot use a live-view-retaining aggregator.
 pub mod meter_cluster;
+/// WOR-2145: the seam where a served request becomes a signed, chained
+/// receipt. Holds the chain, the sequencing lock that keeps a receipt's
+/// sequence equal to the entry carrying it, and the two phases the work is
+/// split across: a cheap preflight in `response_filter`, which is the only
+/// place a receipt failure can still refuse anything, and the receipt
+/// itself in `logging`, where the final status and byte counts are known.
+pub mod meter_runtime;
 /// WOR-1563: distributed per-key spend + rate counters via mesh CRDTs.
 pub mod model_discovery;
 /// Authenticated private model-plane dispatch primitives.
