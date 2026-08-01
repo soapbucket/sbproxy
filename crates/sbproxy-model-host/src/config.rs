@@ -413,17 +413,13 @@ impl EffectiveKvCache {
 ///   the engine half the cache it needs.
 /// - **llama.cpp** quantizes the K and V caches for real, so `int8` maps
 ///   to `q8_0` and `int4` to `q4_0` and the savings are genuine.
-/// - **The embedded engine** takes no KV flag at all, so every request
-///   follows the weight quant's default. Reported as `Auto` rather than
-///   as the requested mode, so the planner never books a saving the
-///   engine will not deliver.
 /// - **mistral.rs** is driven without a KV dtype flag (the subprocess
-///   lane passes no cache-quant argument), so it gets the same no-flag
-///   treatment as the embedded engine: requested low-precision modes
-///   report `Auto` and book no saving.
+///   lane passes no cache-quant argument), so requested low-precision
+///   modes report `Auto`, follow the weight quant's default, and never
+///   book a saving the engine will not deliver.
 pub fn effective_kv_cache(kv: KvCacheQuant, engine: EngineKind) -> EffectiveKvCache {
-    // No flag, engine default. Shared by `Auto` everywhere and by every
-    // mode on the embedded engine.
+    // No flag, engine default. Shared by `Auto` everywhere and by the
+    // low-precision modes on mistral.rs.
     const DEFAULT: EffectiveKvCache = EffectiveKvCache {
         flag_value: None,
         bytes_per_element: None,
@@ -476,6 +472,32 @@ pub fn effective_kv_cache(kv: KvCacheQuant, engine: EngineKind) -> EffectiveKvCa
         // planner books no saving.
         (_, EngineKind::MistralRs) => DEFAULT,
     }
+}
+
+/// Say so when an engine cannot run the KV mode that was configured.
+///
+/// The fit planner sizes the substitute, so nothing is mis-planned, but
+/// an operator who wrote `kv_quant: int4` expecting to halve their cache
+/// is getting fp8 on vLLM and SGLang and would otherwise have no way to
+/// find that out (WOR-2069). Lives next to [`effective_kv_cache`] so
+/// every plan-time call site emits the same warning.
+pub(crate) fn warn_on_kv_substitution(
+    requested: KvCacheQuant,
+    effective: EffectiveKvCache,
+    engine: EngineKind,
+    model: &str,
+) {
+    if !effective.is_substituted(requested) {
+        return;
+    }
+    tracing::warn!(
+        model = %model,
+        engine = ?engine,
+        requested = ?requested,
+        effective = ?effective.effective,
+        "engine has no kernel for the configured kv_quant; serving the nearest mode it supports \
+         and sizing the fit for that"
+    );
 }
 
 /// How a model does speculative decoding (WOR-1674). Speculation
@@ -1566,6 +1588,32 @@ mod kv_cache_contract {
         KvCacheQuant::Int8,
         KvCacheQuant::Int4,
     ];
+
+    #[test]
+    fn the_contract_covers_every_mode_and_engine() {
+        // Both matches have no wildcard arm, deliberately. Adding a
+        // KvCacheQuant variant or an EngineKind fails compilation right
+        // here, forcing the new row into MODES / ENGINES above so every
+        // contract test in this module sweeps it. Do not "fix" a build
+        // break in this test with a `_` arm.
+        for mode in MODES {
+            match mode {
+                KvCacheQuant::Auto => {}
+                KvCacheQuant::F16 => {}
+                KvCacheQuant::Fp8 => {}
+                KvCacheQuant::Int8 => {}
+                KvCacheQuant::Int4 => {}
+            }
+        }
+        for engine in ENGINES {
+            match engine {
+                EngineKind::Vllm => {}
+                EngineKind::SGLang => {}
+                EngineKind::LlamaCpp => {}
+                EngineKind::MistralRs => {}
+            }
+        }
+    }
 
     /// Bytes per element each dtype string really costs. This is the
     /// independent half of the check: if the table ever claims a saving
