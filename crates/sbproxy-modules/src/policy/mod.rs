@@ -33,6 +33,7 @@ pub mod quote_token;
 pub mod rate_limit;
 pub mod rate_limit_budget;
 pub mod rate_limit_cluster;
+pub mod receipt_token;
 pub mod request_limit;
 pub mod request_validator;
 pub mod sec_headers;
@@ -95,6 +96,11 @@ pub use quote_token::{
     QuoteTokenSigner, QuoteTokenVerifier, SignError, VerifyError, MAX_IAT_SKEW,
 };
 pub use rate_limit::{RateLimitInfo, RateLimitPolicy};
+pub use receipt_token::{
+    outcome_wire_name, receipt_content_digest, ReceiptClaims, ReceiptEvidence, ReceiptSignError,
+    ReceiptSubject, ReceiptTokenSigner, ReceiptTokenVerifier, ReceiptUnit, ReceiptVerifyError,
+    RECEIPT_JWS_TYP,
+};
 pub use request_limit::{RequestLimitPolicy, SizeValue};
 pub use request_validator::RequestValidatorPolicy;
 pub use sec_headers::{

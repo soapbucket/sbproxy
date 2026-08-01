@@ -63,6 +63,14 @@ a2a = ["a2a-anthropic", "a2a-google"]
 sbproxy-plugin.workspace = true
 sbproxy-util.workspace = true
 sbproxy-config.workspace = true
+# The metering vocabulary the receipt token is written in. Depended on for
+# the conversions in `policy/receipt_token.rs`, which match exhaustively over
+# every meter enum so that adding a variant there stops this crate compiling
+# until the signed wire format is updated deliberately.
+#
+# Acyclic and safe: sbproxy-meter depends on no workspace crate, and nothing
+# about that leaf property is affected by other crates depending on it.
+sbproxy-meter.workspace = true
 sbproxy-middleware.workspace = true
 sbproxy-extension.workspace = true
 sbproxy-ai.workspace = true
