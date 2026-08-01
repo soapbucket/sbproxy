@@ -1,6 +1,6 @@
 # Dependency degradation matrix
 
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-01*
 
 What happens when each dependency that SBproxy talks to is unavailable, and how the proxy degrades while it heals.
 
@@ -305,7 +305,7 @@ The older `failure_mode: closed | allow_unreserved` still parses and is used onl
 
 ### Virtual key store
 
-**When down:** the configured `key_management.store` backend (embedded redb, Redis, or a secrets manager) cannot be read.
+**When down:** the configured `key_management.store` backend (embedded redb, Redis, a secrets manager, or the cluster mesh) cannot be read. For the mesh backend this includes a lost read quorum during a partition and the hold a node applies to itself after rejoining from a long absence, until its first complete anti-entropy round; both surface as store errors and read the same posture below.
 
 **Fallback:** `key_management.failure_posture` decides it, and all four inbound-key paths read the same value: the pre-auth header sweep, the playground impersonation ticket, the AI gateway's bearer path, and the OIDC claim map. The default `closed` denies with `503`. `degraded` and `open` fall through to the origin's own configured auth rather than admitting outright, so an origin with a `credentials:` block still authenticates the caller; what is lost is the per-key policy, budget, and attribution the virtual key would have carried. `degraded` says so in the log; `open` does not. `observe` is rejected at config-compile time: a store that could not be read produced no verdict to record.
 
