@@ -1,0 +1,18 @@
+[package]
+name = "sbproxy-meter"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[features]
+default = []
+
+# Deliberately just serde. This crate must stay compilable by an operator who
+# meters a plain REST API and has no interest in the AI stack, so it depends on
+# none of sbproxy-core, sbproxy-modules, sbproxy-ai, or sbproxy-config.
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
