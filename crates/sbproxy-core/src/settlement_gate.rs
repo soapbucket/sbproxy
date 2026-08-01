@@ -1610,7 +1610,7 @@ mod tests {
                 QuoteTokenVerifier::single_key("kid-test", verifying, Arc::clone(&nonce_store));
             let requirement_signer =
                 Arc::new(QuoteRequirementSigner::new(quote_signer, verifier));
-            let dyn_signer: Arc<dyn RequirementSigner> = Arc::clone(&requirement_signer);
+            let dyn_signer: Arc<dyn RequirementSigner> = requirement_signer.clone();
 
             let state = Arc::new(ScriptedState {
                 script: Mutex::new(Script::Settle),
