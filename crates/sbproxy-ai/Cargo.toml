@@ -32,6 +32,12 @@ sbproxy-meter.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_json_canonicalizer.workspace = true
+# WOR-2174: the schema output guardrail compiles a real JSON Schema
+# validator once at config publication. Same workspace declaration the
+# json_schema transform, request_validator policy, and OpenAPI
+# validator already resolve (remote $ref resolution stays disabled:
+# no resolve-http feature). Promoted from dev-dependencies.
+jsonschema.workspace = true
 # WOR-2099: bounded binary encoding for the distributed semantic-cache wire.
 # The same workspace declaration the mesh transport uses, so Redis, mesh, and
 # the mesh RPC frames all resolve one copy.
@@ -90,6 +96,5 @@ serde_yaml.workspace = true
 tiktoken-rs = "0.11"
 
 [dev-dependencies]
-jsonschema.workspace = true
 tempfile = "3"
 tracing-subscriber.workspace = true
