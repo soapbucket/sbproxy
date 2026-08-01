@@ -1,5 +1,5 @@
 # sbproxy (Rust workspace)
-*Last modified: 2026-07-14*
+*Last modified: 2026-07-31*
 
 The active implementation of sbproxy. Cargo workspace with ~20
 crates under `crates/`, an e2e suite under `e2e/`, examples under
@@ -8,45 +8,97 @@ crates under `crates/`, an e2e suite under `e2e/`, examples under
 ## Pre-commit checks
 
 Before committing any change, run all checks. Each one corresponds to a
-required CI gate; if any fails locally, CI will fail too.
+required CI gate; if any fails locally, CI will fail too. The table is
+ordered the way `scripts/check.sh` runs them, cheapest first, so a
+failure that takes seconds to find is not discovered behind a
+ten-minute build.
 
 | Check | Command |
 |---|---|
+| Tracker placeholders | `grep -rn 'WOR-XXX' crates/ --include='*.rs' --include='*.toml'` (any hit fails) |
+| pub-item ratchet | `bash scripts/check-pub-item-ratchet.sh` |
+| Spec citations | `bash scripts/check-spec-citations.sh` |
+| Doc drift | `bash scripts/check-doc-drift.sh` |
+| Tapes + GIF wiring | `make tapes-check` |
+| Doc configs | `python3 scripts/sync-doc-configs.py --check` |
+| Installer | `sh scripts/tests/install_verify.sh` |
 | Format | `cargo fmt --all -- --check` |
-| Build | `cargo build --workspace` |
+| Nested lockfiles | `bash scripts/check-nested-lockfiles.sh` |
+| Supply chain | `cargo deny --all-features check` |
+| UI | `cd ui && npm ci && npm run typecheck && npm run test -- --run` |
+| Build | `cargo build --workspace --exclude sbproxy-e2e --locked` |
 | Test | `cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci` |
 | Doctest | `cargo test --workspace --exclude sbproxy-e2e --locked --doc` |
 | Clippy | `cargo clippy --workspace --all-targets -- -D warnings` |
-| Docs | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items` |
+| Docs | `RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --workspace --no-deps --locked` |
+
+Two rows in that table are easy to get subtly wrong.
+
+`-D missing_docs` appears in exactly one other place in this repository,
+`.github/workflows/ci.yml`, and it is the flag that bites. Do not pair
+it with `--document-private-items`: that combination demands rustdoc on
+private items too, which is stricter than CI and produces failures CI
+will never report. If you want the private-items pass anyway, run
+`scripts/check.sh` with `SBPROXY_CHECK_PRIVATE_DOCS=1`, which runs it
+as its own phase under plain `-D warnings`.
+
+`--locked` on the build is equally load bearing. Without it, `cargo
+build` silently rewrites the root `Cargo.lock` in place, and the
+`--locked` test step that follows then passes against the file the build
+just regenerated. Lockfile drift gets quietly repaired instead of
+reported.
 
 Fix the issue before pushing. Do not paper over with `#[allow(...)]`
 unless you also write a one-line comment explaining the deliberate
 exception.
 
-The equivalent local runner is `scripts/check.sh`. It uses
-`cargo-nextest` when installed (`cargo install cargo-nextest --locked`)
-and falls back to plain `cargo test` otherwise. The default path mirrors
-the required PR lane: non-e2e workspace tests in the dev profile plus
+### The gate validates the working tree; `git push` ships HEAD
+
+`scripts/check.sh` records the working-tree state before the first phase
+and re-checks it after the last one. An uncommitted file at the end
+fails the run, and the message separates work that was already dirty
+from files a generator rewrote during the gate. A green gate on a dirty
+tree is a claim about a tree nobody is going to push: PR #837 shipped a
+broken commit exactly that way, behind a gate that had passed against an
+uncommitted fix.
+
+Commit first, then run the gate. For a deliberate work-in-progress run,
+set `SBPROXY_ALLOW_DIRTY_TREE=1`; the run then prints that the guard was
+bypassed and lists the paths.
+
+### Running the gate
+
+The local runner is `scripts/check.sh`. The default path mirrors the
+required PR lane: non-e2e workspace tests in the dev profile plus
 doctests. This keeps the local target directory materially smaller than
-full release/e2e runs. Set `SBPROXY_RELEASE_TESTS=1` to compile test
-binaries in release mode, and `SBPROXY_CHECK_E2E=1` to include the
-`sbproxy-e2e` package.
+full release/e2e runs.
+
+| Variable | Effect |
+|---|---|
+| `SBPROXY_RELEASE_TESTS=1` | compile test binaries in release mode |
+| `SBPROXY_CHECK_E2E=1` | include the `sbproxy-e2e` package |
+| `SBPROXY_CLEAN_AFTER_BUILD=0` | keep every build artifact after the run |
+| `SBPROXY_ALLOW_DIRTY_TREE=1` | do not fail on an uncommitted working tree |
+| `SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1` | permit the serial `cargo test` fallback |
+| `SBPROXY_CHECK_PRIVATE_DOCS=1` | extra rustdoc pass over private items |
+
+Anything the runner could not run is reprinted as a `SKIPPED PHASES`
+block just before the final result, so "All checks passed" cannot hide a
+lane that never executed. `promtool` and `cargo-deny` are the two
+optional tools; install prometheus, and `cargo install cargo-deny --locked`,
+to close those two gaps.
 
 **Always run the test lane through nextest.** `cargo-nextest` is
 already installed at `~/.cargo/bin/cargo-nextest`. `check.sh` probes
-`cargo nextest --version` and, if it fails, silently falls back to
-serial `cargo test`, which turns a few-minute test lane into a ~90-minute
-one. If `~/.cargo/bin` is not already on your `PATH`, export it before
+`cargo nextest --version` and treats a miss as a hard error, because
+serial `cargo test` turns a few-minute test lane into a ~90-minute one
+and a local fallback is a misconfigured shell rather than an intended
+path. If `~/.cargo/bin` is not already on your `PATH`, export it before
 running the gate:
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 ```
-
-Then confirm the run prints the nextest banner, not the
-`cargo-nextest not installed, falling back to cargo test` line. CI always
-uses nextest; a local fallback is a misconfigured shell, never the
-intended path.
 
 By default, `scripts/check.sh` runs `scripts/cleanup-build-artifacts.sh`
 on exit to prune `target/doc`, nextest output, incremental directories,
