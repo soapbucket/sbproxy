@@ -2125,6 +2125,33 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                 },
             )));
 
+        // keystore (WOR-2064): the mesh keystore's post-quarantine
+        // readiness. NotConfigured when the mesh backend is not active;
+        // Unhealthy while a node whose shard was quarantined after a
+        // long absence has not completed its first full anti-entropy
+        // round, because the backend refuses to serve authentication
+        // from an unrepopulated shard in that window.
+        admin_state_inner
+            .health_registry
+            .register(std::sync::Arc::new(sbproxy_observe::SyntheticProbe::new(
+                "keystore",
+                || match crate::mesh_keystore::current_readiness() {
+                    None => (
+                        sbproxy_observe::ComponentStatus::NotConfigured,
+                        Some("mesh keystore backend not active".to_string()),
+                    ),
+                    Some(readiness) if !readiness.ready() => (
+                        sbproxy_observe::ComponentStatus::Unhealthy,
+                        Some(
+                            "replica shard quarantined after long absence; holding \
+                             authentication until the first complete anti-entropy round"
+                                .to_string(),
+                        ),
+                    ),
+                    Some(_) => (sbproxy_observe::ComponentStatus::Healthy, None),
+                },
+            )));
+
         let admin_state = std::sync::Arc::new(admin_state_inner);
         // WOR-1718: install the global handle so the pipeline's logging
         // hook can feed the request-log ring buffer + SSE tail.

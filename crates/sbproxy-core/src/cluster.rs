@@ -1295,6 +1295,15 @@ impl ClusterBootstrap for SystemClusterBootstrap {
                 anyhow::bail!("canonical cluster typed-state transport failed to bind");
             }
         }
+        // WOR-2064: install the keystore revocation fence on the replica
+        // shard as soon as the substrate exists, before any key plane
+        // binds to it, so records the transport applies in the boot
+        // window are already fenced. Harmless when the mesh keystore
+        // backend is not configured: the fence only matches its own key
+        // namespace.
+        if let Some(replicated) = node.replicated_store() {
+            crate::mesh_keystore::install_revocation_fence(&replicated.shard());
+        }
         ClusterHandle::distributed(identity, Arc::new(node)).map_err(anyhow::Error::from)
     }
 }

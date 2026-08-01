@@ -1139,6 +1139,12 @@ pub enum ClusteredKeystoreVerdict {
 /// because minting keys which silently do not work on the rest of the cluster
 /// is worse than not starting.
 ///
+/// Every backend other than `embedded` shares records by construction and is
+/// never `Broken` here: `redis` and `secrets_manager` are external shared
+/// stores, and `mesh` (WOR-2064) stores records on the cluster's own
+/// replicated substrate. The mesh backend's converse requirement, that a
+/// cluster actually exists, is checked separately at config compile.
+///
 /// Gated on `seeds` being non-empty rather than on the cluster block merely
 /// being present. A node with seeds is explicitly joining other nodes; a
 /// seedless node may legitimately be a single-node deployment that happens to
@@ -1230,7 +1236,14 @@ mod keystore_sharing_tests {
 
     #[test]
     fn a_shared_backend_is_fine_on_any_tier() {
-        for backend in [KeyStoreBackend::Redis, KeyStoreBackend::SecretsManager] {
+        // WOR-2064: `mesh` joins the not-Broken set. Its records live on
+        // the cluster's replicated substrate, which is exactly the
+        // sharing this check exists to demand.
+        for backend in [
+            KeyStoreBackend::Redis,
+            KeyStoreBackend::SecretsManager,
+            KeyStoreBackend::Mesh,
+        ] {
             assert_eq!(
                 classify(&seeds(), true, backend, KeyCacheTier::None),
                 V::Fine

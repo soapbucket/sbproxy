@@ -95,6 +95,11 @@ pub trait KeyStore: Send + Sync {
     /// the same atomic operation as the record write and global revision bump.
     /// Backends without a safe primitive return
     /// [`KeyPolicyCasResult::Unsupported`] without writing.
+    ///
+    /// `Applied` means this write won; `Conflict` means the backend did not
+    /// observe a win, which on write-then-verify backends (such as the mesh
+    /// store) is not proof the write failed, only that the caller must
+    /// re-read and retry.
     async fn put_key_if_revision(
         &self,
         record: KeyRecord,

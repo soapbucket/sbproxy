@@ -3141,6 +3141,15 @@ pub enum KeyStoreBackend {
     Redis,
     /// Secrets-manager-direct: a configured vault backend is the system of record.
     SecretsManager,
+    /// Cluster mesh replicated store (WOR-2064): records live on the
+    /// durable replicated state substrate configured by
+    /// `proxy.cluster.replication`, so a key minted on one node resolves
+    /// on its peers with no external store. Requires `proxy.cluster` with
+    /// a `replication` block. Consistency is pinned by the backend
+    /// (quorum writes, quorum reads, revocation written at one) and is
+    /// not operator-configurable; the replication factor comes from the
+    /// cluster's replication block.
+    Mesh,
 }
 
 /// `key_management.store:` block.

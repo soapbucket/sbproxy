@@ -1615,6 +1615,31 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         }
     }
 
+    // WOR-2064: the mesh keystore stores its records on the cluster's
+    // replicated state substrate, so it needs a cluster and that
+    // cluster's replication block. Checked here so `sbproxy validate`
+    // rejects the combination without booting anything.
+    if let Some(km) = config_file.proxy.key_management.as_ref() {
+        if km.enabled && km.store.backend == crate::types::KeyStoreBackend::Mesh {
+            match &config_file.proxy.cluster {
+                None => anyhow::bail!(
+                    "config compile: proxy.key_management.store.backend is 'mesh' but \
+                     proxy.cluster is not configured. A mesh keystore on a node with no mesh is \
+                     an embedded keystore with extra steps. Configure proxy.cluster with a \
+                     replication block, or use the embedded backend."
+                ),
+                Some(cluster) if cluster.replication.is_none() => anyhow::bail!(
+                    "config compile: proxy.key_management.store.backend is 'mesh' but \
+                     proxy.cluster has no replication block. The mesh keystore stores its \
+                     records on the cluster's replicated state substrate and takes its \
+                     replication factor from proxy.cluster.replication; add that block (an \
+                     empty 'replication:' mapping uses the defaults)."
+                ),
+                Some(_) => {}
+            }
+        }
+    }
+
     Ok(CompiledConfig {
         origins,
         host_map,

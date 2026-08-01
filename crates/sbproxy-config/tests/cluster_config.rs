@@ -947,3 +947,116 @@ cluster:
         );
     }
 }
+
+// --- WOR-2064: the mesh keystore backend's boot guard ---
+
+/// A minimal origin block so a compile-level test exercises the guard
+/// rather than tripping over an empty config.
+const MESH_KEYSTORE_ORIGINS: &str = r#"
+origins:
+  test.local:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+"#;
+
+#[test]
+fn mesh_keystore_without_a_cluster_fails_at_compile() {
+    let config = format!(
+        r#"
+proxy:
+  key_management:
+    enabled: true
+    store:
+      backend: mesh
+{MESH_KEYSTORE_ORIGINS}"#
+    );
+    let error = compile_config(&config)
+        .err()
+        .expect("a mesh keystore with no mesh must not boot");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("an embedded keystore with extra steps"),
+        "the refusal names what the operator actually built: {message}"
+    );
+    assert!(
+        message.contains("proxy.cluster"),
+        "the refusal points at the missing block: {message}"
+    );
+}
+
+#[test]
+fn mesh_keystore_without_cluster_replication_fails_at_compile() {
+    let config = format!(
+        r#"
+proxy:
+  cluster:
+    cluster_id: dev-a
+    node_id: worker-a
+    roles: [gateway]
+    seeds: [10.0.0.11:7946]
+    state_dir: /var/lib/sbproxy/cluster
+    security:
+      mode: shared_key
+      development: true
+      shared_key: local-development-secret
+  key_management:
+    enabled: true
+    store:
+      backend: mesh
+{MESH_KEYSTORE_ORIGINS}"#
+    );
+    let error = compile_config(&config)
+        .err()
+        .expect("the mesh keystore needs the replicated substrate");
+    assert!(
+        format!("{error:#}").contains("proxy.cluster.replication"),
+        "the refusal names the missing replication block: {error:#}"
+    );
+}
+
+#[test]
+fn mesh_keystore_with_a_replicated_cluster_is_accepted() {
+    // The WOR-2062 guard classifies every non-embedded backend as
+    // shared, so `mesh` on a clustered node compiles: this is the
+    // relaxed half of the guard.
+    let config = format!(
+        r#"
+proxy:
+  cluster:
+    cluster_id: dev-a
+    node_id: worker-a
+    roles: [gateway]
+    seeds: [10.0.0.11:7946]
+    state_dir: /var/lib/sbproxy/cluster
+    security:
+      mode: shared_key
+      development: true
+      shared_key: local-development-secret
+    replication: {{}}
+  key_management:
+    enabled: true
+    store:
+      backend: mesh
+{MESH_KEYSTORE_ORIGINS}"#
+    );
+    compile_config(&config).expect("backend mesh plus a replicated cluster is a valid deployment");
+}
+
+#[test]
+fn disabled_key_management_does_not_trip_the_mesh_guard() {
+    // The block is inert when disabled, so a config that carries
+    // `backend: mesh` with `enabled: false` still compiles standalone.
+    let config = format!(
+        r#"
+proxy:
+  key_management:
+    enabled: false
+    store:
+      backend: mesh
+{MESH_KEYSTORE_ORIGINS}"#
+    );
+    compile_config(&config).expect("a disabled key plane leaves the backend moot");
+}

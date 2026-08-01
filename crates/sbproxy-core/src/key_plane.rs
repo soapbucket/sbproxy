@@ -548,6 +548,28 @@ fn build_store(cfg: &KeyManagementConfig) -> Result<Arc<dyn KeyStore>> {
                     .context("build secrets-manager keystore")?,
             ))
         }
+        KeyStoreBackend::Mesh => {
+            // WOR-2064: the cluster's replicated state substrate is the
+            // system of record. Config compile already refuses this
+            // backend without proxy.cluster and its replication block;
+            // this is the runtime end of the same guard, for the case
+            // where the substrate failed to come up.
+            let substrate = crate::cluster::current_cluster_handle()
+                .and_then(|handle| handle.mesh_node())
+                .and_then(|node| node.replicated_store())
+                .context(
+                    "key_management.store.backend is 'mesh' but no cluster replication \
+                     substrate is running. A mesh keystore on a node with no mesh is an \
+                     embedded keystore with extra steps; configure proxy.cluster with a \
+                     replication block",
+                )?;
+            let store = crate::mesh_keystore::MeshKeyStore::new(substrate);
+            // Publish the readiness view the `keystore` health probe
+            // reads; a later committed generation without the mesh
+            // backend clears it again in activate_key_plane.
+            crate::mesh_keystore::install_readiness(store.readiness());
+            Ok(Arc::new(store))
+        }
     }
 }
 
@@ -916,6 +938,17 @@ pub(crate) fn seed_prepared_key_plane(
 /// control-plane swap cannot change an in-flight request.
 pub(crate) fn activate_key_plane(plane: Option<Arc<KeyPlane>>, cfg: Option<&KeyManagementConfig>) {
     plane_slot().store(plane.clone());
+
+    // WOR-2064: the `keystore` readiness probe follows the committed
+    // generation. Clear the published view when this generation does not
+    // run the mesh backend, so /readyz stops reporting a backend that is
+    // gone. (Installation happens when the backend is built, in
+    // `build_store`.)
+    let mesh_active =
+        cfg.is_some_and(|cfg| cfg.enabled && cfg.store.backend == KeyStoreBackend::Mesh);
+    if !mesh_active {
+        crate::mesh_keystore::clear_readiness();
+    }
 
     let Some((plane, cfg)) = plane.zip(cfg.filter(|cfg| cfg.enabled)) else {
         return;
