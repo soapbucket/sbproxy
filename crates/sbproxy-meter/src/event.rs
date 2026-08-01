@@ -65,7 +65,14 @@ pub struct Subject {
 /// polices: a resolver cannot claim a provenance that does not exist, and a
 /// new resolver cannot be added without every consumer of this enum being
 /// told about it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// The ordering is declaration order, and declaration order is trust order:
+/// what the proxy counted itself, then what the operator's own config
+/// asserted, then what the upstream claimed. Sorting a summary by source
+/// therefore puts the lines a buyer can check hardest first, and
+/// [`crate::segment::SegmentRecorder`] relies on the ordering to emit its
+/// totals in a form that is stable between two readings of the same node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnitSource {
     /// Counted by the proxy from bytes and time it observed itself.

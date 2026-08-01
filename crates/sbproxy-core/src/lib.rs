@@ -129,6 +129,11 @@ pub mod key_plane;
 pub mod key_policy;
 /// WOR-1562: mesh distributed-cache tier for the key plane.
 pub mod mesh_cache;
+/// WOR-2130: mesh-wide meter reporting. One receipt chain per node, and a
+/// scatter-gather that labels a total assembled from an incomplete set as
+/// exactly that. Deliberately not built on `cluster_metrics`; see the
+/// module docs for why receipts cannot use a live-view-retaining aggregator.
+pub mod meter_cluster;
 /// WOR-1563: distributed per-key spend + rate counters via mesh CRDTs.
 pub mod model_discovery;
 /// Authenticated private model-plane dispatch primitives.

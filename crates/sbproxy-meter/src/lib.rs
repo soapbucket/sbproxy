@@ -69,6 +69,24 @@
 //! The breakdown is the product, so nothing in this crate adds unit counts
 //! together and nothing should.
 //!
+//! # One chain per node, and totals that say what they cover
+//!
+//! A proxy is usually more than one process, and the chain is what makes
+//! completeness provable, so the two facts have to be reconciled somewhere.
+//! They are reconciled by refusing to merge: each node writes, verifies,
+//! and advances its own chain, [`segment::ChainSegment`] describes one of
+//! them whole, and a cluster-wide figure is a sum over whole segments.
+//! Interleaving entries from two writers would mean re-linking them, and a
+//! re-linked chain proves only that somebody re-linked it.
+//!
+//! [`coverage`] is the other half of that bargain. A total assembled while
+//! a node was unreachable is a partial total and says so through
+//! [`coverage::ClusterUsageSummary::is_partial`], and the node that did not
+//! answer is named next to it with the last chain head it was seen at
+//! rather than dropped or counted as zero. A number gathered from a subset
+//! and presented as the whole is the one failure that hides for a quarter,
+//! because every individual figure on the dashboard still looks plausible.
+//!
 //! # The metrics are not the record
 //!
 //! [`metrics`] carries what the meter says about its own health: units
@@ -90,6 +108,7 @@
 
 #![deny(missing_docs)]
 
+pub mod coverage;
 pub mod event;
 pub mod ledger;
 pub mod measured;
@@ -97,7 +116,11 @@ pub mod metrics;
 pub mod origin_header;
 pub mod outcome;
 pub mod route_weight;
+pub mod segment;
 
+pub use coverage::{
+    ClusterUsageSummary, CoverageGap, LastKnownHead, LastKnownHeads, MeterCoverage, UncoveredNode,
+};
 pub use event::{Evidence, MeteredEvent, Subject, Unit, UnitSource};
 pub use ledger::{
     ledger_health, verify_ledger, verifying_key_from_seed_hex, LedgerEntry, LedgerHealth,
@@ -110,6 +133,7 @@ pub use origin_header::{
 };
 pub use outcome::{Billable, BillableOutcome, Claim, OutcomeTable, OutcomeTableError};
 pub use route_weight::{RouteWeightRule, RouteWeightTable};
+pub use segment::{ChainSegment, ClaimKey, RecordOutcome, SegmentRecorder, UnitTotal};
 
 #[cfg(test)]
 mod tests {

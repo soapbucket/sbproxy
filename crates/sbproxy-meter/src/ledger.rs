@@ -776,4 +776,52 @@ mod tests {
         assert_eq!(res.broken_seq, Some(2));
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn two_nodes_chains_verify_independently_and_are_never_interleaved() {
+        // Chains are per node and are never merged (WOR-2130), because
+        // merging means re-linking and a re-linked chain proves only that
+        // somebody re-linked it. The two files below are written with
+        // identical claim ids on purpose: that is the case a merged chain
+        // would silently collapse, and two chains keyed by
+        // `crate::segment::ClaimKey` cannot, because the node that minted a
+        // claim is part of the claim's identity.
+        let dir = std::env::temp_dir().join(format!("sb-meter-nodes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let paths = [dir.join("node-a.jsonl"), dir.join("node-b.jsonl")];
+        for path in &paths {
+            let _ = std::fs::remove_file(path);
+        }
+
+        for (node_id, path) in ["node-a", "node-b"].iter().zip(paths.iter()) {
+            let ledger = UsageLedger::<TestPayload>::open(path, None).unwrap();
+            for index in 0..5 {
+                let claim = crate::segment::ClaimKey::new(*node_id, format!("claim-{index}"));
+                let claim_id = claim.to_string();
+                ledger
+                    .append_checked(&event(Some(&claim_id), index as f64))
+                    .unwrap();
+            }
+            let (count, _head) = ledger.head();
+            assert_eq!(count, 5, "{node_id} recorded exactly its own five entries");
+        }
+
+        // Each chain verifies against its own genesis, with no reference to
+        // the other and no shared state anywhere between them.
+        let mut contents = Vec::new();
+        for path in &paths {
+            let result = verify_ledger::<TestPayload>(path, None).unwrap();
+            assert!(result.ok, "each node's chain verifies alone: {result:?}");
+            assert_eq!(result.entries, 5);
+            contents.push(std::fs::read_to_string(path).unwrap());
+        }
+        assert_ne!(
+            contents[0], contents[1],
+            "identical claim ids on two nodes still produce two distinct chains"
+        );
+
+        for path in &paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
