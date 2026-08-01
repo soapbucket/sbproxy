@@ -413,11 +413,13 @@ via the existing trust-headers channel before
 (`Authorization`, `Cookie`, `Set-Cookie`) are excluded so tokens
 carried by design don't self-flag.
 
-Body-aware detection (the prompt typically lives in the JSON body of
-an `ai_proxy` request) is available through `enable_body_aware: true`.
-It is disabled by default so operators can measure false positives
-before adding it to the AI hot path. URI and header scanning remains
-the generic policy path.
+Body-aware detection (the prompt typically lives in the JSON body) is
+available through `enable_body_aware: true`, on `ai_proxy` origins and
+on plain proxy origins alike. It is disabled by default so operators
+can measure false positives before adding it to the hot path, and
+without it the body streams through unbuffered and unscanned. On a
+plain proxy origin pair it with `block` or `log`; see the phase table
+below for why `tag` does not combine with it there.
 
 Real-world patterns the scaffold catches today:
 
@@ -449,19 +451,19 @@ curl -sS -i -H 'Host: block.local' -H 'Content-Type: application/json' \
 
 ```http
 HTTP/1.1 403 Forbidden
-content-type: text/plain; charset=utf-8
+content-type: application/json
 content-length: 37
 
 {"error":"prompt injection detected"}
 ```
 
-The body is the configured `block_body`. The content type is **not** the
-configured `block_content_type`. That origin sets
-`block_content_type: application/json` and the response says
-`text/plain; charset=utf-8`, because a body-phase block hardcodes that value.
-`block_content_type` is honoured on the `ai_proxy` and A2A dispatch paths, not
-on a body-borne hit against a plain proxy origin. If you are matching on
-content type downstream, check which path produced the block.
+The body is the configured `block_body` and the content type is the
+configured `block_content_type`. A body-borne block honours it the same way
+the `ai_proxy` and A2A dispatch paths always have. Two settings on that
+origin make this exchange work: `block_content_type: application/json`
+shapes the response, and `enable_body_aware: true` is what makes the body
+scan run at all. Without it the payload above would stream to the upstream
+unscanned, because the policy reads only the URI and headers by default.
 
 ### Which phase caught it decides what you get
 
@@ -472,26 +474,36 @@ upstream request is built. A hit there can stamp the score and label headers,
 so `action: tag` works.
 
 The body scan reads the buffered request body, which is later: by then the
-upstream request has already been assembled. A hit there can still `block`,
-because the request has not been forwarded, but it cannot tag. Tag and log
-both degrade to an advisory log line at that phase, and the code says so
-directly:
+upstream request has already been assembled. It runs only when
+`enable_body_aware: true` is set; without it the body streams through
+unbuffered and unscanned. A hit there can still `block`, because the request
+has not been forwarded, but it cannot tag. Tag and log both degrade to an
+advisory log line at that phase, and the code says so directly:
 
 ```
 prompt injection detected in request body (advisory; upstream already dispatched)
 ```
 
-This is worth internalising before trusting `action: tag`. Sending the example
-payload above to `tag.local` in the JSON body stamps nothing: the upstream
-request carries no `x-prompt-injection-score` and no
-`x-prompt-injection-label`, because the body hit arrived too late. The same
-policy tags normally when the injection is in a query parameter or a custom
-header, which is exactly the traffic shape the section above lists.
+| Action | URI + header phase | Body phase (`enable_body_aware: true`) |
+|--------|--------------------|----------------------------------------|
+| `tag` | Stamps the score and label headers on the upstream request | Nothing left to stamp; advisory log only. Refused at config compile on non-`ai_proxy` origins |
+| `block` | Rejects with `403` before the upstream is contacted | Rejects with `403`; the buffered body never reaches the upstream |
+| `log` | Structured warn, request forwarded | Structured warn, request forwarded |
+
+The body scan buffers at most 8 MiB of request body. A body past that cap is
+rejected with `413` before any scan runs, with a log line carrying the
+received size and the cap, so proxy memory for the request is bounded by the
+cap rather than by the body. This is the same posture as the
+threat-protection JSON scan, which shares the 8 MiB default.
+
+Because a body-borne hit cannot tag, a config that combines `action: tag`
+with `enable_body_aware: true` on anything but an `ai_proxy` origin is
+refused at compile; the error names `block` and `log`, the two actions that
+do work at the body phase. `ai_proxy` origins are exempt: that path reads
+the body before dispatch and can tag.
 
 So `tag` is a URI-and-header mechanism, and `block` is the one that covers
-both. An origin that expects to tag body-borne prompts will silently see
-nothing, with the request forwarded and a warning in the log as the only
-trace.
+both phases.
 
 ## The agent boundary
 
@@ -509,7 +521,7 @@ policies:
   - type: prompt_injection_v2
     detector: heuristic-v1
     threshold: 0.5
-    action: tag
+    action: log
     enable_body_aware: true
     a2a:
       root_action: log
@@ -585,9 +597,12 @@ upstream request header has been assembled and its trust-header slot
 drained, so a hit found in the body has nowhere to write. Offering `tag`
 would be offering a setting that reads as enforcing and only logs.
 
-A top-level `action: tag` therefore resolves to `log` here, and
-`action: block` resolves to `block`. Set `a2a.root_action` explicitly
-when you want the two boundaries to differ.
+A top-level `action: tag` resolves to `log` here, and `action: block`
+resolves to `block`. Set `a2a.root_action` explicitly when you want the
+two boundaries to differ. In practice the projection only applies on
+`ai_proxy` origins: on a plain proxy origin, `action: tag` together
+with `enable_body_aware: true` is refused at config compile, so spell
+the baseline as `log` there, the way the worked example does.
 
 ### Failure posture
 

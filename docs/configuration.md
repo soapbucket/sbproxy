@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-01*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -2574,7 +2574,7 @@ policies:
 | `error_body` | string | structured JSON | Optional rejection body. Default is `{"error":"...","detail":"<location>"}` with no echoed payload. |
 | `error_content_type` | string | `application/json` | Content-Type for the rejection body. |
 
-The proxy buffers the request body locally until validation completes, then either releases it as one chunk to the upstream or aborts with the configured rejection. Remote `$ref` resolution in schemas is disabled at the workspace level so a malicious schema cannot become an SSRF primitive. The rejection body never echoes the offending payload back to the caller, only the JSON path where validation failed.
+The proxy buffers the request body locally until validation completes, then either releases it as one chunk to the upstream or aborts with the configured rejection. The validation buffer is capped at 8 MiB; a body past the cap is rejected with `413` before validation runs. Remote `$ref` resolution in schemas is disabled at the workspace level so a malicious schema cannot become an SSRF primitive. The rejection body never echoes the offending payload back to the caller, only the JSON path where validation failed.
 
 See [example 81](../examples/request-validator/sb.yml).
 
@@ -2790,11 +2790,11 @@ policies:
 | `label_header` | string | `x-prompt-injection-label` | Header carrying `clean` / `suspicious` / `injection` on `action: tag`. |
 | `block_body` | string | `prompt injection detected` | Response body returned on `action: block`. |
 | `block_content_type` | string | `text/plain` | Content-Type for the block body. |
-| `enable_body_aware` | boolean | `false` | Scan parsed message bodies as independent segments (worst-of-N, per-segment caching) rather than as one string. Applies to `ai_proxy` prompts and to A2A message parts. |
+| `enable_body_aware` | boolean | `false` | Scan the request body as well as the URI + headers. `ai_proxy` prompts and A2A message parts are scored as independent segments (worst-of-N, per-segment caching); on plain origins the buffered body is scanned at the body phase. Off means the body streams through unbuffered and unscanned. The body buffer is capped at 8 MiB; a larger body is rejected with `413` before the scan. Combining with `action: tag` on a non-`ai_proxy` origin fails config compile, because a body hit cannot stamp the tag headers. |
 | `a2a.root_action` | string | inherit | `log` or `block`, applied to an agent-to-agent hit at delegation depth 0. Omitted follows `action`, with `tag` resolving to `log`. |
 | `a2a.block_above_delegation_depth` | integer or null | `0` | Delegation depth above which an agent-to-agent hit blocks regardless of `a2a.root_action`. Depth 0 is the chain root, so the default blocks any delegated hop. `null` disables the escalation. |
 
-The generic policy scans the request URI + non-auth headers (`Authorization`, `Cookie`, `Set-Cookie` are excluded so tokens carried by design don't self-flag) at request-filter time. Tag mode stamps the score / label headers via the existing trust-headers channel before `upstream_request_filter` builds the upstream request; block mode rejects with `403` immediately. Set `enable_body_aware: true` on an AI origin after measuring false positives to scan parsed prompt bodies as well. See [prompt-injection-v2.md](prompt-injection-v2.md) for auto-selection failure boundaries, the eval harness, and custom detector registration.
+The generic policy scans the request URI + non-auth headers (`Authorization`, `Cookie`, `Set-Cookie` are excluded so tokens carried by design don't self-flag) at request-filter time. Tag mode stamps the score / label headers via the existing trust-headers channel before `upstream_request_filter` builds the upstream request; block mode rejects with `403` immediately. Set `enable_body_aware: true` after measuring false positives to scan buffered request bodies as well; on a plain origin pair it with `block` or `log`, since a body hit arrives after the upstream request is assembled and cannot tag (`tag` + body-aware is refused at config compile there). A body-borne block honours `block_content_type`. See [prompt-injection-v2.md](prompt-injection-v2.md) for the phase table, auto-selection failure boundaries, the eval harness, and custom detector registration.
 
 The `a2a.*` keys apply only when an `a2a` policy is configured on the same origin and the request is detected as A2A 1.0. There is no `tag` in the agent-boundary vocabulary: the scan runs at the request-body phase, after the upstream request header has been built, so there is no header left to stamp. See [prompt-injection-v2.md](prompt-injection-v2.md#the-agent-boundary).
 
@@ -3943,7 +3943,7 @@ origins:
 | `json.max_keys` | int | unlimited | Maximum number of keys in any single object. |
 | `json.max_string_length` | int | unlimited | Maximum length of any single string value. |
 | `json.max_array_size` | int | unlimited | Maximum length of any single array. |
-| `json.max_total_size` | int | unlimited | Maximum total body size in bytes, checked before parsing. |
+| `json.max_total_size` | int | `8388608` | Maximum total body size in bytes, enforced while the body streams in and before parsing. A body past the cap is rejected with `413`, so proxy memory for the scan is bounded by the cap. Unset takes the proxy's 8 MiB buffering hard cap; the same bound applies to the body-validation buffer used by `request_validator`, `openapi_validation`, `content_digest`, and body-aware `prompt_injection_v2`. |
 
 ---
 
