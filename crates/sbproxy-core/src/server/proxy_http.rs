@@ -47,6 +47,22 @@ fn emit_graphql_validated_request_body(
     }
 }
 
+/// Hold a consumed request-body chunk back from the upstream without
+/// ending the stream.
+///
+/// This is the one place the `Some(Bytes::new())`-vs-`None` rule lives:
+/// Pingora treats `None` from `request_body_filter` as end-of-body on
+/// both HTTP/1.1 and HTTP/2, so a branch that moved a mid-stream chunk
+/// into a local buffer must leave an empty chunk in the slot. Leaving
+/// `None` ends the upstream body at whatever bytes were already
+/// forwarded and the upstream sees a silently truncated request
+/// (WOR-2138). Every buffering branch that consumes a chunk before
+/// end-of-stream goes through this function rather than writing the
+/// slot directly.
+fn hold_request_body_chunk(body: &mut Option<Bytes>) {
+    *body = Some(Bytes::new());
+}
+
 /// Complete a deferred body-bound authentication proof against the bytes the
 /// client actually sent.
 ///
@@ -3739,11 +3755,11 @@ impl ProxyHttp for SbProxy {
                     }
                 } else {
                     // Hold JSON candidates until the complete body can be
-                    // scanned. Pingora treats `None` as upstream end-of-body,
-                    // so use an empty chunk to pause forwarding without
-                    // terminating the stream. Other body consumers receive
-                    // the released representation after this branch completes.
-                    *body = Some(Bytes::new());
+                    // scanned; `hold_request_body_chunk` documents why the
+                    // slot must not be left `None`. Other body consumers
+                    // receive the released representation after this branch
+                    // completes.
+                    hold_request_body_chunk(body);
                     return Ok(());
                 }
             } else {
@@ -3932,14 +3948,15 @@ impl ProxyHttp for SbProxy {
         // --- Accumulate body for the request validator ---
         //
         // While `validate_request_body` is set we buffer every chunk
-        // locally and emit `None` to Pingora, so the upstream does
-        // not see a partial body until validation passes. On
-        // end-of-stream we run all matching `RequestValidator`
-        // policies; on success we release the buffered bytes as a
-        // single chunk to the upstream. On failure we record a
-        // status + body for the response phase, signal the validator
-        // failure via `validator_failed`, and emit `None` so the
-        // upstream is not contacted.
+        // locally and emit an empty chunk to Pingora (see
+        // `hold_request_body_chunk`), so the upstream does not see a
+        // partial body until validation passes. On end-of-stream we
+        // run all matching `RequestValidator` policies; on success we
+        // release the buffered bytes as a single chunk to the
+        // upstream. On failure we record a status + body for the
+        // response phase, signal the validator failure via
+        // `validator_failed`, and emit `None` so the upstream is not
+        // contacted.
         if ctx.validate_request_body {
             let buf = ctx
                 .request_body_buf
@@ -4378,8 +4395,13 @@ impl ProxyHttp for SbProxy {
                     }
                 }
             }
+            if !end_of_stream {
+                // The chunk above was consumed into the accumulator;
+                // `hold_request_body_chunk` documents why the slot must
+                // carry an empty chunk here rather than `None`.
+                hold_request_body_chunk(body);
+            }
             emit_graphql_validated_request_body(body, end_of_stream, ctx);
-            // Mid-stream chunks: hold off forwarding until end_of_stream.
             return Ok(());
         }
 
