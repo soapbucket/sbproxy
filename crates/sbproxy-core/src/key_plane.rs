@@ -23,8 +23,9 @@ use sbproxy_ai::governance::{
 };
 use sbproxy_ai::governance_redis::{RedisGovernanceConfig, RedisGovernanceStore};
 use sbproxy_config::types::{
-    GovernanceBackendConfig, GovernanceConsistency as ConfigGovernanceConsistency, KeyCacheTier,
-    KeyGovernanceConfig, KeyManagementConfig, KeyStoreBackend, SeedCredentialConfig, SeedKeyConfig,
+    FailureMode, GovernanceBackendConfig, GovernanceConsistency as ConfigGovernanceConsistency,
+    KeyCacheTier, KeyGovernanceConfig, KeyManagementConfig, KeyStoreBackend, SeedCredentialConfig,
+    SeedKeyConfig,
 };
 use sbproxy_keystore::crypto::KeyCrypto;
 use sbproxy_keystore::record::{
@@ -37,7 +38,7 @@ pub struct KeyPlane {
     crypto: KeyCrypto,
     cache: Arc<TtlCache>,
     resolved_credentials: ResolvedCredentialCache,
-    failure_mode_allow: bool,
+    failure_posture: FailureMode,
     allow_api_override: bool,
     oidc_claim_field: Option<String>,
     governance: KeyGovernanceConfig,
@@ -95,7 +96,18 @@ impl KeyPlane {
             crypto,
             cache,
             resolved_credentials: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            failure_mode_allow,
+            // The legacy boolean's own conversion, kept identical to
+            // `KeyManagementConfig::failure_posture`: `true` admits, but it
+            // admits by falling through with no per-key policy, budget, or
+            // attribution, which is a waived guarantee rather than an open
+            // door. `prepare_key_plane` overrides this with the resolved
+            // posture; the bool parameter stays so callers that only have
+            // the legacy value keep compiling.
+            failure_posture: if failure_mode_allow {
+                FailureMode::Degraded
+            } else {
+                FailureMode::Closed
+            },
             allow_api_override,
             oidc_claim_field,
             governance,
@@ -103,6 +115,13 @@ impl KeyPlane {
             approximate_store,
             inbound: sbproxy_config::types::KeyInboundConfig::default(),
         }
+    }
+
+    /// Pin the posture resolved from `key_management.failure_posture`,
+    /// replacing whatever the legacy `failure_mode_allow` boolean implied.
+    pub(crate) fn with_failure_posture(mut self, posture: FailureMode) -> Self {
+        self.failure_posture = posture;
+        self
     }
 
     /// Attach the inbound header-sweep settings.
@@ -130,10 +149,20 @@ impl KeyPlane {
         &self.cache
     }
 
-    /// When true, a store outage allows the request through (degraded) instead
-    /// of denying. Default false.
-    pub fn failure_mode_allow(&self) -> bool {
-        self.failure_mode_allow
+    /// What this plane does when the key store cannot be reached.
+    ///
+    /// Resolved once at plane construction from
+    /// `key_management.failure_posture`, falling back to the legacy
+    /// `failure_mode_allow` boolean. Every store-outage decision in the
+    /// request path reads this and nothing else.
+    ///
+    /// [`FailureMode::Closed`] (the default) denies with 503.
+    /// [`FailureMode::Degraded`] and [`FailureMode::Open`] both fall
+    /// through to the origin's configured auth, which is not a blanket
+    /// admit; they differ only in whether the lost per-key policy, budget,
+    /// and attribution are recorded as lost.
+    pub fn failure_posture(&self) -> FailureMode {
+        self.failure_posture
     }
 
     /// When true, the admin API may override config-seeded records on reload.
@@ -567,11 +596,15 @@ fn build_secrets_manager_spec(
 /// Build the `TtlCache` wrapping `store`, attaching a Redis L2 tier when
 /// configured.
 fn build_cache(cfg: &KeyManagementConfig, store: Arc<dyn KeyStore>) -> Arc<TtlCache> {
+    // No `fail_closed` here any more (WOR-2121). It was `!failure_mode_allow`,
+    // an inverted second spelling of the same operator knob that nothing ever
+    // read: the cache propagates a store error unconditionally and the
+    // admission decision belongs to the request path, which reads
+    // `KeyPlane::failure_posture`.
     let cache_cfg = TtlCacheConfig {
         ttl: std::time::Duration::from_secs(cfg.cache.ttl_secs),
         negative_ttl: std::time::Duration::from_secs(cfg.cache.negative_ttl_secs),
         max_entries: cfg.cache.max_entries,
-        fail_closed: !cfg.failure_mode_allow,
     };
     let mut cache = TtlCache::new(store, cache_cfg);
     match cfg.cache.tier {
@@ -817,6 +850,14 @@ async fn seed_records(
 pub(crate) fn prepare_key_plane(
     cfg: Option<&KeyManagementConfig>,
 ) -> Result<Option<Arc<KeyPlane>>> {
+    // Checked before the `enabled` filter on purpose: a posture this site
+    // cannot honour is an operator mistake whether or not the block is
+    // switched on, and finding out at the moment it is switched on is the
+    // worst time to find out.
+    if let Some(cfg) = cfg {
+        cfg.validate_failure_posture()
+            .map_err(|error| anyhow::anyhow!("config compile: {error}"))?;
+    }
     let Some(cfg) = cfg.filter(|cfg| cfg.enabled) else {
         return Ok(None);
     };
@@ -836,6 +877,7 @@ pub(crate) fn prepare_key_plane(
             governance_store,
             approximate_store,
         )
+        .with_failure_posture(cfg.failure_posture())
         .with_inbound(cfg.inbound.clone()),
     );
     Ok(Some(plane))
@@ -1240,6 +1282,122 @@ mod tests {
             }
             other => panic!("expected envelope material, got {other:?}"),
         }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A config written before `failure_posture` existed must reach the
+    /// plane with exactly the behaviour it always had. That is the whole
+    /// promise of this migration, so it is pinned in both directions.
+    #[test]
+    fn a_legacy_failure_mode_allow_config_resolves_to_the_same_admission() {
+        let _guard = test_plane_guard();
+        // A separate store file per plane: redb takes an exclusive lock, so
+        // two live planes cannot share one path.
+        let closed_path = temp_db();
+        let admitting_path = temp_db();
+
+        let closed_cfg = base_cfg(&closed_path);
+        assert!(!closed_cfg.failure_mode_allow, "the legacy default is deny");
+        let closed = prepare_key_plane(Some(&closed_cfg))
+            .expect("prepare closed plane")
+            .expect("enabled plane");
+        assert_eq!(closed.failure_posture(), FailureMode::Closed);
+        assert!(!closed.failure_posture().admits());
+        drop(closed);
+
+        let mut admitting_cfg = base_cfg(&admitting_path);
+        admitting_cfg.failure_mode_allow = true;
+        let admitting = prepare_key_plane(Some(&admitting_cfg))
+            .expect("prepare admitting plane")
+            .expect("enabled plane");
+        assert!(admitting.failure_posture().admits());
+        // `true` has always meant "fall through with no per-key policy,
+        // budget, or attribution". That is a waived guarantee, and it is
+        // recorded as one rather than as a plain open.
+        assert_eq!(admitting.failure_posture(), FailureMode::Degraded);
+        assert!(admitting.failure_posture().guarantee_waived());
+        drop(admitting);
+
+        std::fs::remove_file(&closed_path).ok();
+        std::fs::remove_file(&admitting_path).ok();
+    }
+
+    /// An explicit posture wins over the legacy boolean, including when the
+    /// two disagree, and `degraded` stays distinguishable from `open`.
+    #[test]
+    fn an_explicit_failure_posture_overrides_the_legacy_boolean() {
+        let _guard = test_plane_guard();
+        let closed_path = temp_db();
+        let open_path = temp_db();
+
+        let mut closed_cfg = base_cfg(&closed_path);
+        closed_cfg.failure_mode_allow = true;
+        closed_cfg.failure_posture = Some(FailureMode::Closed);
+        let plane = prepare_key_plane(Some(&closed_cfg))
+            .expect("prepare plane")
+            .expect("enabled plane");
+        assert_eq!(
+            plane.failure_posture(),
+            FailureMode::Closed,
+            "the explicit key wins even when the legacy boolean says admit"
+        );
+        drop(plane);
+
+        let mut open_cfg = base_cfg(&open_path);
+        open_cfg.failure_mode_allow = false;
+        open_cfg.failure_posture = Some(FailureMode::Open);
+        let plane = prepare_key_plane(Some(&open_cfg))
+            .expect("prepare plane")
+            .expect("enabled plane");
+        assert_eq!(plane.failure_posture(), FailureMode::Open);
+        assert!(plane.failure_posture().admits());
+        assert!(
+            !plane.failure_posture().guarantee_waived(),
+            "a plain open claims nothing, which is what separates it from degraded"
+        );
+        assert_eq!(plane.failure_posture().as_label(), "open");
+        drop(plane);
+
+        std::fs::remove_file(&closed_path).ok();
+        std::fs::remove_file(&open_path).ok();
+    }
+
+    /// `observe` has no meaning for an unreachable store, so it is refused
+    /// before anything is built, and refused even with the block disabled.
+    #[test]
+    fn an_observe_posture_is_refused_before_the_plane_is_built() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let mut cfg = base_cfg(&path);
+        cfg.failure_posture = Some(FailureMode::Observe);
+
+        let error = prepare_key_plane(Some(&cfg)).expect_err("observe must not build a plane");
+        assert!(
+            error
+                .to_string()
+                .contains("key_management.failure_posture: `observe` is meaningless"),
+            "the error must name the site: {error}"
+        );
+
+        cfg.enabled = false;
+        let error =
+            prepare_key_plane(Some(&cfg)).expect_err("a disabled block still rejects the typo");
+        assert!(
+            error.to_string().contains("key_management.failure_posture"),
+            "unexpected error: {error}"
+        );
+
+        let mut governed = base_cfg(&path);
+        governed.governance.failure_posture = Some(FailureMode::Observe);
+        let error = prepare_key_plane(Some(&governed))
+            .expect_err("observe must not build a governance store either");
+        assert!(
+            error
+                .to_string()
+                .contains("key_management.governance.failure_posture"),
+            "the nested site names itself: {error}"
+        );
 
         std::fs::remove_file(&path).ok();
     }

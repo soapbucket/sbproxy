@@ -305,10 +305,16 @@ impl DetectedSpec {
 ///
 /// Detection cases (per ADR § "Detection"):
 ///
-/// 1. `Content-Type: application/a2a+json` (with optional `; version=*`)
+/// 1. `A2A-Version` with major `1` triggers ratified 1.0 detection.
+/// 2. `Content-Type: application/a2a+json` (with optional `; version=*`)
 ///    triggers Google detection.
-/// 2. `MCP-Method: agents.invoke` triggers Anthropic detection.
-/// 3. The path matching `route_glob` is the operator escape hatch.
+/// 3. `MCP-Method: agents.invoke` triggers Anthropic detection.
+/// 4. The path matching `route_glob` is the operator escape hatch.
+///
+/// The checks are ordered but not exclusive: no signal short-circuits
+/// the ones after it with a negative answer. A header this build cannot
+/// interpret narrows what the request can be decoded as, and must never
+/// decide that the operator's `route_glob` no longer applies.
 pub fn detect(
     headers: &http::HeaderMap,
     path: &str,
@@ -323,13 +329,21 @@ pub fn detect(
         // Match on the major component only. The spec's service
         // parameter carries `1.0`, but patch revisions are additive
         // within a major and a build that understands 1.x understands
-        // 1.x.y. An unrecognised major is deliberately NOT treated as
-        // A2A: claiming to reason about a wire format this build has
+        // 1.x.y. An unrecognised major is deliberately NOT decoded as
+        // 1.x: claiming to reason about a wire format this build has
         // never seen is worse than declining to.
         if version.trim().split('.').next() == Some("1") {
             return Some(DetectedSpec::V1);
         }
-        return None;
+        // Fall through rather than returning. This branch used to
+        // return `None`, which made a single caller-supplied header a
+        // bypass: `a2a-version: 2.0` skipped the content-type check,
+        // the MCP-method check, and, worst of all, the operator's
+        // `route_glob`, so a request on a route the operator had
+        // explicitly declared as A2A went ungoverned because the caller
+        // named a version nobody has shipped. Declining to decode an
+        // unknown major is right; declining to notice the request is
+        // not.
     }
 
     if let Some(ct) = headers
@@ -420,9 +434,57 @@ mod tests {
     #[test]
     fn detect_rejects_an_unknown_major_version() {
         // A future 2.x is not something this build can reason about.
-        // Claiming to understand it would be worse than declining.
+        // Claiming to understand it would be worse than declining. With
+        // no other signal present the request is simply not A2A.
         let h = headers(&[("a2a-version", "2.0")]);
         assert_eq!(detect(&h, "/", None), None);
+    }
+
+    #[test]
+    fn an_unknown_major_version_does_not_bypass_the_operator_route() {
+        // The bypass this closes: `a2a-version` used to return early on
+        // any major it did not recognise, skipping every check after
+        // it. One caller-chosen header therefore removed a route the
+        // operator had declared as A2A from the policy's reach. Naming
+        // a version nobody has shipped must not be a way out.
+        let h = headers(&[("a2a-version", "2.0")]);
+        assert_eq!(
+            detect(&h, "/agents/invoke", Some("/agents/**")),
+            Some(DetectedSpec::OperatorRoute)
+        );
+    }
+
+    #[test]
+    fn an_unknown_major_version_does_not_bypass_content_type_detection() {
+        // Same bypass, reached through the other signals. A peer that
+        // sends a draft content type alongside a version this build
+        // cannot decode is still speaking something we recognise.
+        let h = headers(&[
+            ("a2a-version", "9.9"),
+            ("content-type", "application/a2a+json"),
+        ]);
+        assert_eq!(detect(&h, "/", None), Some(DetectedSpec::Google));
+    }
+
+    #[test]
+    fn an_unknown_major_version_does_not_bypass_mcp_method_detection() {
+        let h = headers(&[("a2a-version", "2.0"), ("mcp-method", "agents.invoke")]);
+        assert_eq!(detect(&h, "/", None), Some(DetectedSpec::Anthropic));
+    }
+
+    #[test]
+    fn a_garbage_version_header_does_not_bypass_the_operator_route() {
+        // Not just future majors: anything unparseable lands on the
+        // same fall-through. An attacker picks the value, so the
+        // contract has to hold for values nobody would write on purpose.
+        for value in ["", "not-a-version", "0", "1x"] {
+            let h = headers(&[("a2a-version", value)]);
+            assert_eq!(
+                detect(&h, "/agents/invoke", Some("/agents/**")),
+                Some(DetectedSpec::OperatorRoute),
+                "a2a-version: {value:?} must not skip the operator route"
+            );
+        }
     }
 
     #[test]

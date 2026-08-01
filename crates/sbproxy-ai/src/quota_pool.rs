@@ -9,6 +9,7 @@ use crate::governance::{
 };
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use sbproxy_config::types::FailureMode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -49,7 +50,22 @@ pub enum QuotaPoolConsistency {
     Strong,
 }
 
-/// Behavior when a configured shared accounting backend is unavailable.
+/// Superseded by [`FailureMode`]. Behavior when a configured shared
+/// accounting backend is unavailable.
+///
+/// This enum was written independently of
+/// [`sbproxy_config::types::GovernanceFailureMode`] and turned out to be
+/// structurally identical to it: same two variants, same wire spelling,
+/// same default, and both gate exactly one `BackendUnavailable` error.
+/// Two spellings of one idea is the defect WOR-2121 exists to retire, so
+/// this one is retired as a read path: nothing branches on it any more,
+/// and [`QuotaPoolConfig::failure_posture`] is the only thing that reads
+/// it.
+///
+/// It still parses, because shipped configs say
+/// `failure_mode: allow_unreserved` and must keep working unchanged. It
+/// carries no `#[deprecated]` attribute because the conversion itself
+/// would then fail the build under `-D warnings`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotaPoolFailureMode {
@@ -80,9 +96,53 @@ pub struct QuotaPoolConfig {
     /// Consistency mode.
     #[serde(default)]
     pub consistency: QuotaPoolConsistency,
-    /// Behavior when a shared backend cannot execute an operation.
+    /// Superseded by `failure_posture`. Behavior when a shared backend
+    /// cannot execute an operation.
+    ///
+    /// Still parsed, and still the value used when `failure_posture` is
+    /// absent, so an existing pool keeps behaving exactly as it did.
+    /// Read it through [`QuotaPoolConfig::failure_posture`], never
+    /// directly.
     #[serde(default)]
     pub failure_mode: QuotaPoolFailureMode,
+    /// Failure posture for an unavailable accounting backend, in the
+    /// shared [`FailureMode`] vocabulary.
+    ///
+    /// Set this in preference to `failure_mode`. When present it wins;
+    /// when absent the legacy value is converted (`closed` stays
+    /// `closed`, `allow_unreserved` becomes `degraded`). It is `Option`
+    /// on purpose, so "the operator said nothing" stays distinguishable
+    /// from "the operator explicitly asked for the default".
+    ///
+    /// `closed` rejects with 503. `degraded` admits the attempt with no
+    /// reservation held and counts it on
+    /// `sbproxy_ai_quota_pool_fail_open_total`, which is what makes a sick
+    /// backend visible. `open` admits and counts nothing. `observe` is
+    /// meaningless here and is rejected by
+    /// [`validate_quota_pool_config`]: a reservation that could not be
+    /// taken has no counterfactual verdict to record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_posture: Option<FailureMode>,
+}
+
+impl QuotaPoolConfig {
+    /// This pool's posture for an unavailable accounting backend, in the
+    /// shared [`FailureMode`] vocabulary. The one read path for it.
+    ///
+    /// Precedence: an explicit `failure_posture` wins; otherwise the
+    /// legacy `failure_mode` is converted. `allow_unreserved` maps to
+    /// [`FailureMode::Degraded`] rather than [`FailureMode::Open`],
+    /// because the attempt proceeds without the reservation the pool
+    /// exists to take and that fact is separately counted.
+    pub fn failure_posture(&self) -> FailureMode {
+        if let Some(explicit) = self.failure_posture {
+            return explicit;
+        }
+        match self.failure_mode {
+            QuotaPoolFailureMode::Closed => FailureMode::Closed,
+            QuotaPoolFailureMode::AllowUnreserved => FailureMode::Degraded,
+        }
+    }
 }
 
 fn default_window() -> Duration {
@@ -190,6 +250,11 @@ pub enum QuotaPoolConfigError {
         /// Requested dimension label.
         dimension: &'static str,
     },
+    /// A failure posture that has no meaning for this control.
+    MeaninglessFailurePosture {
+        /// Requested posture label.
+        posture: &'static str,
+    },
 }
 
 impl std::fmt::Display for QuotaPoolConfigError {
@@ -205,6 +270,12 @@ impl std::fmt::Display for QuotaPoolConfigError {
             Self::DimensionNotEnabled { dimension } => {
                 write!(f, "quota pool dimension {dimension} is not enabled yet")
             }
+            Self::MeaninglessFailurePosture { posture } => write!(
+                f,
+                "quota_pool.failure_posture: `{posture}` is meaningless for an unavailable \
+                 quota accounting backend, because a reservation that could not be taken has \
+                 no counterfactual verdict to record. Use `closed`, `degraded`, or `open`."
+            ),
         }
     }
 }
@@ -237,7 +308,72 @@ pub fn validate_quota_pool_config(config: &QuotaPoolConfig) -> Result<(), QuotaP
     match config.dimension {
         QuotaPoolDimension::Request => {}
     }
+    // `observe` records the decision a control would have taken. A
+    // reservation that never reached its backend produced no such
+    // decision, so accepting it would mean silently choosing some other
+    // behaviour on the operator's behalf. Refuse it here, at config
+    // compile time (WOR-2121).
+    if config.failure_posture == Some(FailureMode::Observe) {
+        return Err(QuotaPoolConfigError::MeaninglessFailurePosture {
+            posture: FailureMode::Observe.as_label(),
+        });
+    }
     Ok(())
+}
+
+/// What a caller should do about a [`PoolError`], resolved against the
+/// pool's failure posture.
+///
+/// The HTTP mapping used to exist three times: once in the AI dispatch
+/// path, once again in the realtime/websocket path, and a third time
+/// inside the reserve helpers here. Those copies had already drifted
+/// (a denial with no resolvable pool config produced a 429 on one path
+/// and a 503 on another). One function, one answer (WOR-2121).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolErrorDisposition {
+    /// Admit the attempt with no reservation held.
+    Admit,
+    /// Refuse the request with this status and message.
+    Reject {
+        /// HTTP status to return to the caller.
+        status: u16,
+        /// Stable, secret-free client-facing message.
+        message: &'static str,
+    },
+}
+
+/// Map a pool failure to the response it earns, under `config`'s posture.
+///
+/// Only [`PoolError::BackendUnavailable`] consults the posture. A denial
+/// is a real quota decision and always rejects with 429; invalid state is
+/// never fail-open, because a pool whose accounting is inconsistent
+/// cannot be said to have admitted anything. `config` is optional because
+/// a pool error can surface on a path that never resolved a pool config;
+/// a posture that cannot be read is treated as closed.
+pub fn pool_error_disposition(
+    config: Option<&QuotaPoolConfig>,
+    error: &PoolError,
+) -> PoolErrorDisposition {
+    match error {
+        PoolError::Denied(_) => PoolErrorDisposition::Reject {
+            status: 429,
+            message: "fair-share quota pool exhausted",
+        },
+        PoolError::BackendUnavailable => {
+            if config.is_some_and(|config| config.failure_posture().admits()) {
+                PoolErrorDisposition::Admit
+            } else {
+                PoolErrorDisposition::Reject {
+                    status: 503,
+                    message: "fair-share quota backend unavailable",
+                }
+            }
+        }
+        PoolError::InvalidState => PoolErrorDisposition::Reject {
+            status: 503,
+            message: "fair-share quota state unavailable",
+        },
+    }
 }
 
 /// Reservation store for a fair-share pool.
@@ -1174,8 +1310,9 @@ impl QuotaPoolAdmission {
     /// Reserve one request attempt without settling it.
     ///
     /// The returned guard releases its reservation when dropped before
-    /// [`QuotaPoolAttemptGuard::commit`]. Disabled admission and an
-    /// `allow_unreserved` backend failure return a no-op guard.
+    /// [`QuotaPoolAttemptGuard::commit`]. Disabled admission returns a
+    /// no-op guard, as does a backend failure under an admitting
+    /// [`QuotaPoolConfig::failure_posture`].
     pub async fn reserve_attempt(
         &self,
         reservation_id: &str,
@@ -1213,7 +1350,7 @@ impl QuotaPoolAdmission {
 
     /// Reserve and settle one request attempt under the pinned pool policy.
     ///
-    /// Disabled admission is a no-op. An enabled `allow_unreserved` pool only
+    /// Disabled admission is a no-op. An admitting failure posture only
     /// bypasses a [`PoolError::BackendUnavailable`]; denials and invalid state
     /// remain closed.
     pub async fn consume(&self, reservation_id: &str) -> Result<(), PoolError> {
@@ -1225,61 +1362,73 @@ impl QuotaPoolAdmission {
         config: &QuotaPoolConfig,
         error: PoolError,
     ) -> Result<QuotaPoolAttemptGuard, PoolError> {
-        if error == PoolError::BackendUnavailable
-            && config.failure_mode == QuotaPoolFailureMode::AllowUnreserved
-        {
-            crate::ai_metrics::record_quota_pool_fail_open(&config.name);
-            Ok(QuotaPoolAttemptGuard::no_op())
-        } else {
-            Err(error)
+        if error != PoolError::BackendUnavailable {
+            return Err(error);
         }
+        let posture = config.failure_posture();
+        if !posture.admits() {
+            return Err(error);
+        }
+        // `degraded` (what the legacy `allow_unreserved` resolves to) says
+        // the fair-share guarantee was not made for this attempt, so it is
+        // counted. A plain `open` admits and claims nothing, so it counts
+        // nothing. That is the whole observable difference between them.
+        if posture.guarantee_waived() {
+            crate::ai_metrics::record_quota_pool_fail_open(&config.name);
+        }
+        Ok(QuotaPoolAttemptGuard::no_op())
     }
 }
 
 /// One reserved quota unit that settles only when the transport commits.
 ///
 /// Dropping the guard before [`Self::commit`] releases the underlying
-/// reservation. A no-op guard represents disabled admission or a configured
-/// `allow_unreserved` backend failure.
+/// reservation. A no-op guard represents disabled admission, or a backend
+/// failure under an admitting [`QuotaPoolConfig::failure_posture`].
 pub struct QuotaPoolAttemptGuard {
     reservation: Option<QuotaReservationGuard>,
-    fail_open_pool: Option<String>,
+    /// Posture and pool name to apply if the settle call finds the backend
+    /// gone, resolved once at reserve time so `commit` reads no config.
+    settle_posture: Option<(FailureMode, String)>,
 }
 
 impl QuotaPoolAttemptGuard {
     fn no_op() -> Self {
         Self {
             reservation: None,
-            fail_open_pool: None,
+            settle_posture: None,
         }
     }
 
     fn reserved(reservation: QuotaReservationGuard, config: &QuotaPoolConfig) -> Self {
+        let posture = config.failure_posture();
         Self {
             reservation: Some(reservation),
-            fail_open_pool: (config.failure_mode == QuotaPoolFailureMode::AllowUnreserved)
-                .then(|| config.name.clone()),
+            settle_posture: posture.admits().then(|| (posture, config.name.clone())),
         }
     }
 
     /// Settle one unit immediately and disarm drop-time release.
     ///
-    /// Only a backend-unavailable settle error may follow the configured
-    /// `allow_unreserved` path. Denials and invalid state remain closed.
+    /// Only a backend-unavailable settle error may follow an admitting
+    /// posture. Denials and invalid state remain closed.
     pub async fn commit(mut self) -> Result<(), PoolError> {
         let Some(reservation) = self.reservation.take() else {
             return Ok(());
         };
         match reservation.settle(PoolUsage { units: 1 }).await {
             Ok(()) => Ok(()),
-            Err(PoolError::BackendUnavailable) if self.fail_open_pool.is_some() => {
-                crate::ai_metrics::record_quota_pool_fail_open(
-                    self.fail_open_pool
-                        .as_deref()
-                        .expect("fail-open pool was checked"),
-                );
-                Ok(())
-            }
+            Err(PoolError::BackendUnavailable) => match self.settle_posture.as_ref() {
+                Some((posture, pool)) => {
+                    // Same split as the reserve path: `degraded` counts the
+                    // waived guarantee, `open` admits and says nothing.
+                    if posture.guarantee_waived() {
+                        crate::ai_metrics::record_quota_pool_fail_open(pool);
+                    }
+                    Ok(())
+                }
+                None => Err(PoolError::BackendUnavailable),
+            },
             Err(error) => Err(error),
         }
     }
@@ -1413,6 +1562,7 @@ mod tests {
             dimension: QuotaPoolDimension::Request,
             consistency: QuotaPoolConsistency::Local,
             failure_mode: QuotaPoolFailureMode::Closed,
+            failure_posture: None,
         }
     }
 
@@ -1457,6 +1607,208 @@ mod tests {
         );
         assert_eq!(strong.consistency, QuotaPoolConsistency::Strong);
         assert_eq!(strong.failure_mode, QuotaPoolFailureMode::Closed);
+    }
+
+    /// The wire key is `failure_posture`, not `failure_mode`. It has to be
+    /// a new word: `failure_mode` already exists here and in the
+    /// governance block carrying a narrower enum, and a config test pins
+    /// that `failure_mode: open` must fail to parse there.
+    #[test]
+    fn failure_posture_parses_and_defaults_to_absent() {
+        let absent: QuotaPoolConfig = serde_json::from_value(serde_json::json!({
+            "name": "absent",
+            "total_limit": 10,
+            "weights": {"virtual-key-a": 1},
+            "policy": "hard"
+        }))
+        .expect("quota config parses without the new key");
+        assert_eq!(
+            absent.failure_posture, None,
+            "absent must stay distinguishable from an explicit default"
+        );
+        assert_eq!(absent.failure_posture(), FailureMode::Closed);
+
+        for (wire, expected) in [
+            ("closed", FailureMode::Closed),
+            ("open", FailureMode::Open),
+            ("degraded", FailureMode::Degraded),
+        ] {
+            let config: QuotaPoolConfig = serde_json::from_value(serde_json::json!({
+                "name": "explicit",
+                "total_limit": 10,
+                "weights": {"virtual-key-a": 1},
+                "policy": "hard",
+                "failure_posture": wire
+            }))
+            .expect("explicit posture parses");
+            assert_eq!(config.failure_posture, Some(expected));
+            assert_eq!(config.failure_posture(), expected);
+        }
+    }
+
+    /// A pool written before `failure_posture` existed resolves to exactly
+    /// the behaviour it always had, and an explicit posture wins when both
+    /// keys are present.
+    #[test]
+    fn the_legacy_failure_mode_converts_and_the_explicit_key_wins() {
+        let mut legacy = hard_pool_config();
+        assert_eq!(legacy.failure_posture(), FailureMode::Closed);
+        assert!(!legacy.failure_posture().admits());
+
+        legacy.failure_mode = QuotaPoolFailureMode::AllowUnreserved;
+        assert_eq!(
+            legacy.failure_posture(),
+            FailureMode::Degraded,
+            "allow_unreserved admits without the reservation the pool exists to take, \
+             which is a waived guarantee rather than a plain open"
+        );
+        assert!(legacy.failure_posture().admits());
+        assert!(legacy.failure_posture().guarantee_waived());
+
+        // Both keys present: the explicit one wins, in both directions.
+        let mut both = hard_pool_config();
+        both.failure_mode = QuotaPoolFailureMode::AllowUnreserved;
+        both.failure_posture = Some(FailureMode::Closed);
+        assert_eq!(both.failure_posture(), FailureMode::Closed);
+
+        both.failure_mode = QuotaPoolFailureMode::Closed;
+        both.failure_posture = Some(FailureMode::Open);
+        assert_eq!(both.failure_posture(), FailureMode::Open);
+        assert!(both.failure_posture().admits());
+        assert!(
+            !both.failure_posture().guarantee_waived(),
+            "a plain open claims nothing, so nothing is counted for it"
+        );
+    }
+
+    /// `observe` is refused at config-compile time, with a message naming
+    /// the site rather than a silently substituted behaviour.
+    #[test]
+    fn an_observe_posture_is_rejected_with_a_message_naming_the_site() {
+        let mut config = hard_pool_config();
+        config.failure_posture = Some(FailureMode::Observe);
+
+        let error = validate_quota_pool_config(&config).expect_err("observe must not validate");
+        assert_eq!(
+            error,
+            QuotaPoolConfigError::MeaninglessFailurePosture { posture: "observe" }
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("quota_pool.failure_posture"),
+            "the message must name the site: {rendered}"
+        );
+
+        // The three meaningful postures all validate.
+        for posture in [
+            FailureMode::Closed,
+            FailureMode::Open,
+            FailureMode::Degraded,
+        ] {
+            let mut config = hard_pool_config();
+            config.failure_posture = Some(posture);
+            validate_quota_pool_config(&config).expect("a meaningful posture validates");
+        }
+    }
+
+    /// The one status mapping, shared with the realtime path, reads the
+    /// posture and nothing else.
+    #[test]
+    fn pool_error_disposition_reads_the_resolved_posture() {
+        let closed = hard_pool_config();
+        assert_eq!(
+            pool_error_disposition(Some(&closed), &PoolError::BackendUnavailable),
+            PoolErrorDisposition::Reject {
+                status: 503,
+                message: "fair-share quota backend unavailable",
+            }
+        );
+
+        for posture in [FailureMode::Degraded, FailureMode::Open] {
+            let mut admitting = hard_pool_config();
+            admitting.failure_posture = Some(posture);
+            assert_eq!(
+                pool_error_disposition(Some(&admitting), &PoolError::BackendUnavailable),
+                PoolErrorDisposition::Admit
+            );
+            // An admitting posture never rescues a real denial or an
+            // inconsistent pool. Only the backend-outage arm consults it.
+            assert_eq!(
+                pool_error_disposition(
+                    Some(&admitting),
+                    &PoolError::Denied(PoolDeny::PoolExhausted {
+                        total_load: 10,
+                        total_limit: 10,
+                    })
+                ),
+                PoolErrorDisposition::Reject {
+                    status: 429,
+                    message: "fair-share quota pool exhausted",
+                }
+            );
+            assert_eq!(
+                pool_error_disposition(Some(&admitting), &PoolError::InvalidState),
+                PoolErrorDisposition::Reject {
+                    status: 503,
+                    message: "fair-share quota state unavailable",
+                }
+            );
+        }
+
+        // No resolvable config is treated as closed for a backend outage.
+        assert_eq!(
+            pool_error_disposition(None, &PoolError::BackendUnavailable),
+            PoolErrorDisposition::Reject {
+                status: 503,
+                message: "fair-share quota backend unavailable",
+            }
+        );
+    }
+
+    /// `degraded` and `open` admit the same attempt. The counter is what
+    /// tells them apart, and it is the only thing that does.
+    #[tokio::test]
+    async fn degraded_counts_the_waived_guarantee_and_open_does_not() {
+        fn fail_open_count(pool: &str) -> f64 {
+            prometheus::gather()
+                .iter()
+                .find(|family| family.name() == "sbproxy_ai_quota_pool_fail_open_total")
+                .and_then(|family| {
+                    family
+                        .get_metric()
+                        .iter()
+                        .find(|metric| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == "pool" && label.value() == pool)
+                        })
+                        .map(|metric| metric.get_counter().value())
+                })
+                .unwrap_or(0.0)
+        }
+
+        for (posture, expected_delta) in [(FailureMode::Degraded, 1.0), (FailureMode::Open, 0.0)] {
+            let mut config = hard_pool_config();
+            config.name = format!("posture-{}", posture.as_label());
+            config.failure_posture = Some(posture);
+
+            let before = fail_open_count(&config.name);
+            let admission = QuotaPoolAdmission::new(
+                Some(config.clone()),
+                Err(PoolError::BackendUnavailable),
+                Ok("alpha".to_string()),
+            );
+            admission
+                .consume("request:0")
+                .await
+                .expect("an admitting posture admits");
+            assert_eq!(
+                fail_open_count(&config.name) - before,
+                expected_delta,
+                "{posture:?} must be distinguishable from the other admitting posture"
+            );
+        }
     }
 
     #[test]
@@ -1694,6 +2046,7 @@ mod tests {
             dimension: QuotaPoolDimension::Request,
             consistency: QuotaPoolConsistency::Local,
             failure_mode: QuotaPoolFailureMode::Closed,
+            failure_posture: None,
         };
         let pool = LocalQuotaPool::new(vec![config]).expect("valid burst pool");
 
@@ -1742,6 +2095,7 @@ mod tests {
             dimension: QuotaPoolDimension::Request,
             consistency: QuotaPoolConsistency::Local,
             failure_mode: QuotaPoolFailureMode::Closed,
+            failure_posture: None,
         };
         let pool = LocalQuotaPool::new(vec![config]).expect("valid soft pool");
 

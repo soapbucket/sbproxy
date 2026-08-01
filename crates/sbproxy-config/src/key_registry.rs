@@ -449,9 +449,21 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "proxy.key_management.governance.backend.type",
         "sbproxy_core::key_plane::build_governance_store",
     ),
+    // Both `failure_mode` keys below are read only through the
+    // `failure_posture()` accessor on their owning config struct, so the
+    // scanner sees a method call rather than a field read at the site that
+    // acts on the value. WOR-2121.
     stable(
         "proxy.key_management.governance.failure_mode",
         "sbproxy_core::server::ai_dispatch::handle_ai_proxy",
+    ),
+    stable(
+        "proxy.key_management.governance.failure_posture",
+        "sbproxy_core::server::ai_dispatch::handle_ai_proxy",
+    ),
+    stable(
+        "proxy.key_management.failure_posture",
+        "sbproxy_core::key_plane::prepare_key_plane",
     ),
     config_only(
         "proxy.key_management.governance.key_introspection",

@@ -14,6 +14,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
+/// The shared failure vocabulary, re-exported so the retrieval runtime
+/// crate can name a posture without depending on the config crate.
+pub use sbproxy_config::FailureMode;
+
 /// Default cap on the extracted query text in bytes.
 pub const DEFAULT_MAX_QUERY_BYTES: usize = 8 * 1024;
 /// Hard cap on the extracted query text in bytes.
@@ -105,8 +109,52 @@ pub struct RagRouteConfig {
     #[serde(default)]
     pub injection: RagInjectionConfig,
     /// What happens when retrieval fails. The default fails closed.
+    ///
+    /// The older and wider of the two spellings, and the only one that
+    /// can reach `use_stale`. It still parses and still means exactly
+    /// what it did. Prefer `failure_posture` for the two postures both
+    /// can express; reach for this when the route wants a stale cache.
+    ///
+    /// Never read this field directly on the request path; read
+    /// `RagRouteConfig::resolved_failure_policy()`, which applies
+    /// `failure_posture` first.
     #[serde(default)]
     pub on_failure: RagFailurePolicy,
+    /// What happens when retrieval fails, in the shared posture
+    /// vocabulary.
+    ///
+    /// A retrieval route can express two of the four postures, and the
+    /// other two are rejected at config load rather than quietly given a
+    /// behavior:
+    ///
+    /// - `closed` refuses the request, the same as
+    ///   `on_failure: {mode: fail_closed}`. The default.
+    /// - `degraded` forwards the original request without retrieved
+    ///   context, the same as
+    ///   `on_failure: {mode: continue_without_context}`. It is spelled
+    ///   `degraded` rather than `open` because the route advertises
+    ///   retrieval, and a request that skipped it did not get the
+    ///   guarantee the route promised.
+    /// - `open` is rejected, because there is no open here that is not
+    ///   the degraded case dressed up as a clean one.
+    /// - `observe` is rejected. Retrieval either produced context or it
+    ///   did not; there is no decision this route would have taken but
+    ///   did not, so there is nothing to shadow-record.
+    ///
+    /// ## The `use_stale` carve-out
+    ///
+    /// [`RagFailurePolicy::UseStale`] has no spelling here, and that is
+    /// deliberate rather than an omission. It is a third posture the
+    /// four-word vocabulary cannot say: admit the request with an
+    /// *older* guarantee, and refuse when even that is unavailable. It
+    /// also carries payload (`max_age_secs`, `max_entries`) and owns a
+    /// real per-route cache, neither of which a posture word can hold.
+    /// A route that wants stale context sets `on_failure` and leaves
+    /// this key unset; setting both is a config-load error.
+    ///
+    /// When absent, the posture is read off `on_failure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_posture: Option<FailureMode>,
 }
 
 /// Where the retrieval query text comes from.
@@ -554,8 +602,50 @@ impl RagRouteConfig {
         validate_filters(&self.filters)?;
         validate_retrieval(&self.retrieval)?;
         validate_injection(&self.injection)?;
-        validate_failure_policy(&self.on_failure)?;
+        validate_failure_policy(self)?;
         Ok(())
+    }
+
+    /// This route's failure posture in the shared vocabulary.
+    ///
+    /// An explicit `failure_posture` wins; otherwise the posture is read
+    /// off `on_failure`. `use_stale` reports as
+    /// [`FailureMode::Degraded`], because a served stale entry admits a
+    /// request that never got the fresh retrieval the route advertises.
+    /// That is an approximation and the reason `use_stale` keeps its own
+    /// spelling: a stale miss still refuses, and no single posture word
+    /// says "admit if the cache holds something, otherwise refuse".
+    /// Callers that need the exact behavior read
+    /// [`RagRouteConfig::resolved_failure_policy`].
+    pub fn failure_posture(&self) -> FailureMode {
+        if let Some(posture) = self.failure_posture {
+            return posture;
+        }
+        match self.on_failure {
+            RagFailurePolicy::FailClosed => FailureMode::Closed,
+            RagFailurePolicy::ContinueWithoutContext | RagFailurePolicy::UseStale { .. } => {
+                FailureMode::Degraded
+            }
+        }
+    }
+
+    /// The failure behavior the retrieval runtime executes.
+    ///
+    /// The single read path for both spellings. An explicit
+    /// `failure_posture` is desugared to the policy it names; otherwise
+    /// `on_failure` is returned as written, which is the only way to
+    /// reach [`RagFailurePolicy::UseStale`].
+    pub fn resolved_failure_policy(&self) -> RagFailurePolicy {
+        match self.failure_posture {
+            Some(FailureMode::Degraded) => RagFailurePolicy::ContinueWithoutContext,
+            // `open` and `observe` never survive `validate`. A config
+            // built by hand and never validated gets the safe posture
+            // rather than an invented behavior.
+            Some(FailureMode::Closed | FailureMode::Open | FailureMode::Observe) => {
+                RagFailurePolicy::FailClosed
+            }
+            None => self.on_failure.clone(),
+        }
     }
 
     /// Visit every field that contains credential material, mutably.
@@ -946,11 +1036,21 @@ fn validate_injection(injection: &RagInjectionConfig) -> Result<(), RagConfigErr
     Ok(())
 }
 
-fn validate_failure_policy(policy: &RagFailurePolicy) -> Result<(), RagConfigError> {
+/// The wire spelling of an `on_failure` mode, for error messages that
+/// tell an operator exactly which two keys disagree.
+fn failure_policy_mode(policy: &RagFailurePolicy) -> &'static str {
+    match policy {
+        RagFailurePolicy::FailClosed => "fail_closed",
+        RagFailurePolicy::ContinueWithoutContext => "continue_without_context",
+        RagFailurePolicy::UseStale { .. } => "use_stale",
+    }
+}
+
+fn validate_failure_policy(config: &RagRouteConfig) -> Result<(), RagConfigError> {
     if let RagFailurePolicy::UseStale {
         max_age_secs,
         max_entries,
-    } = policy
+    } = &config.on_failure
     {
         if *max_age_secs > MAX_STALE_MAX_AGE_SECS {
             return Err(invalid(
@@ -964,6 +1064,55 @@ fn validate_failure_policy(policy: &RagFailurePolicy) -> Result<(), RagConfigErr
                 format!("must be between 1 and {MAX_STALE_MAX_ENTRIES}"),
             ));
         }
+    }
+    validate_failure_posture(config)
+}
+
+/// Reject a failure axis that says two things at once, or that says
+/// something a retrieval route cannot mean.
+///
+/// One asymmetry is worth stating plainly: an `on_failure` left at its
+/// default is indistinguishable from an absent key after
+/// deserialization, so `failure_posture: degraded` alongside an explicit
+/// `on_failure: {mode: fail_closed}` is accepted and the posture wins.
+/// Every disagreement that can actually be detected is refused.
+fn validate_failure_posture(config: &RagRouteConfig) -> Result<(), RagConfigError> {
+    let Some(posture) = config.failure_posture else {
+        return Ok(());
+    };
+    let expected = match posture {
+        FailureMode::Closed => RagFailurePolicy::FailClosed,
+        FailureMode::Degraded => RagFailurePolicy::ContinueWithoutContext,
+        FailureMode::Open => {
+            return Err(invalid(
+                "failure_posture",
+                "a rag route has no open posture: forwarding a request without the context \
+                 it advertises always waives the retrieval guarantee. Use `degraded`, which \
+                 has the same behavior and records what was lost",
+            ));
+        }
+        FailureMode::Observe => {
+            return Err(invalid(
+                "failure_posture",
+                "`observe` is not meaningful on a rag route: retrieval either produced \
+                 context or it did not, so there is no decision to shadow-record. Use \
+                 `closed` or `degraded`",
+            ));
+        }
+    };
+    if config.on_failure != RagFailurePolicy::default() && config.on_failure != expected {
+        return Err(invalid(
+            "failure_posture",
+            format!(
+                "conflicts with on_failure on this rag route: failure_posture: {} means \
+                 on_failure.mode: {}, but on_failure.mode is {}. `use_stale` has no \
+                 failure_posture spelling at all, because the shared vocabulary cannot say \
+                 \"admit with an older guarantee\"; set on_failure alone to reach it",
+                posture.as_label(),
+                failure_policy_mode(&expected),
+                failure_policy_mode(&config.on_failure),
+            ),
+        ));
     }
     Ok(())
 }
@@ -1411,6 +1560,136 @@ mod tests {
             RagFailurePolicy::UseStale {
                 max_age_secs: DEFAULT_STALE_MAX_AGE_SECS,
                 max_entries: DEFAULT_STALE_MAX_ENTRIES,
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_on_failure_still_selects_the_posture_and_the_policy() {
+        // Absent, and each of the three modes, keep exactly the behavior
+        // they had before `failure_posture` existed.
+        let absent = parse_rag(serde_json::json!({})).unwrap().rag.unwrap();
+        assert_eq!(absent.failure_posture, None);
+        assert_eq!(absent.failure_posture(), FailureMode::Closed);
+        assert_eq!(
+            absent.resolved_failure_policy(),
+            RagFailurePolicy::FailClosed
+        );
+
+        for (mode, posture, policy) in [
+            (
+                "fail_closed",
+                FailureMode::Closed,
+                RagFailurePolicy::FailClosed,
+            ),
+            (
+                "continue_without_context",
+                FailureMode::Degraded,
+                RagFailurePolicy::ContinueWithoutContext,
+            ),
+        ] {
+            let config = parse_rag(serde_json::json!({"on_failure": {"mode": mode}}))
+                .unwrap()
+                .rag
+                .unwrap();
+            assert_eq!(config.failure_posture(), posture, "{mode}");
+            assert_eq!(config.resolved_failure_policy(), policy, "{mode}");
+        }
+    }
+
+    #[test]
+    fn explicit_failure_posture_overrides_on_failure() {
+        // Precedence: `degraded` wins over an `on_failure` left at its
+        // default, and the legacy field is still readable as written.
+        let config = parse_rag(serde_json::json!({"failure_posture": "degraded"}))
+            .unwrap()
+            .rag
+            .unwrap();
+        assert_eq!(config.on_failure, RagFailurePolicy::FailClosed);
+        assert_eq!(config.failure_posture(), FailureMode::Degraded);
+        assert_eq!(
+            config.resolved_failure_policy(),
+            RagFailurePolicy::ContinueWithoutContext
+        );
+
+        let config = parse_rag(serde_json::json!({"failure_posture": "closed"}))
+            .unwrap()
+            .rag
+            .unwrap();
+        assert_eq!(config.failure_posture(), FailureMode::Closed);
+        assert_eq!(
+            config.resolved_failure_policy(),
+            RagFailurePolicy::FailClosed
+        );
+    }
+
+    #[test]
+    fn conflicting_failure_posture_and_on_failure_are_rejected() {
+        for (posture, mode) in [
+            ("closed", "continue_without_context"),
+            ("closed", "use_stale"),
+            ("degraded", "use_stale"),
+        ] {
+            let error = parse_rag(serde_json::json!({
+                "failure_posture": posture,
+                "on_failure": {"mode": mode}
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("failure_posture"), "{error}");
+            assert!(error.contains("on_failure"), "{error}");
+            assert!(error.contains("rag route"), "{error}");
+        }
+
+        // Agreeing pairs stay valid, and so does the one disagreement
+        // that cannot be detected: a default `on_failure` is
+        // indistinguishable from an absent key.
+        for (posture, mode) in [
+            ("closed", "fail_closed"),
+            ("degraded", "continue_without_context"),
+            ("degraded", "fail_closed"),
+        ] {
+            parse_rag(serde_json::json!({
+                "failure_posture": posture,
+                "on_failure": {"mode": mode}
+            }))
+            .unwrap_or_else(|error| panic!("{posture} with {mode} must load: {error}"));
+        }
+    }
+
+    #[test]
+    fn open_and_observe_are_rejected_on_a_rag_route() {
+        let error = parse_rag(serde_json::json!({"failure_posture": "open"}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failure_posture"), "{error}");
+        assert!(error.contains("degraded"), "{error}");
+
+        let error = parse_rag(serde_json::json!({"failure_posture": "observe"}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failure_posture"), "{error}");
+        assert!(error.contains("shadow-record"), "{error}");
+    }
+
+    #[test]
+    fn use_stale_keeps_its_own_spelling() {
+        // The carve-out: `use_stale` carries payload and a real cache,
+        // so it stays reachable only through `on_failure`. It still
+        // reports a posture, because callers need a total mapping.
+        let config = parse_rag(serde_json::json!({
+            "on_failure": {"mode": "use_stale", "max_age_secs": 120, "max_entries": 4}
+        }))
+        .unwrap()
+        .rag
+        .unwrap();
+        assert_eq!(config.failure_posture, None);
+        assert_eq!(config.failure_posture(), FailureMode::Degraded);
+        assert_eq!(
+            config.resolved_failure_policy(),
+            RagFailurePolicy::UseStale {
+                max_age_secs: 120,
+                max_entries: 4,
             }
         );
     }

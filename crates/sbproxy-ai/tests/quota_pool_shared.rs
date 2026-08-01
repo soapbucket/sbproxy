@@ -128,6 +128,7 @@ fn config(
         dimension: QuotaPoolDimension::Request,
         consistency: QuotaPoolConsistency::Approximate,
         failure_mode: QuotaPoolFailureMode::Closed,
+        failure_posture: None,
     }
 }
 
