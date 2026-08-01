@@ -584,6 +584,13 @@ pub(super) fn emit_access_log(
         user_id_source: ctx.user_id_source,
         session_id: ctx.session_id.map(|u| u.to_string()),
         parent_session_id: ctx.parent_session_id.map(|u| u.to_string()),
+        // WOR-2139: the run correlation key and the trust flag that
+        // qualifies it. Both come straight off the context: the id was
+        // capped when `request_body_filter` read it out of the JSON-RPC
+        // body, and the flag is the same trust decision the A2A hop
+        // metric partitions on.
+        a2a_context_id: ctx.a2a_context_id.clone(),
+        a2a_identity_verified: ctx.a2a.as_ref().map(|a2a| a2a.identity_verified),
         properties: ctx.properties.clone(),
         workspace_id,
         tenant_id: ctx.tenant_id.to_string(),
@@ -778,6 +785,17 @@ pub(super) struct AccessLogContext {
     pub(super) user_id_source: Option<sbproxy_observe::UserIdSource>,
     pub(super) session_id: Option<String>,
     pub(super) parent_session_id: Option<String>,
+    /// WOR-2139: A2A `contextId` for this hop, from
+    /// `RequestContext::a2a_context_id`. The run-scoped grouping key;
+    /// `session_id` above is the caller-scoped one. `None` for traffic
+    /// that carried no A2A envelope, and for A2A hops whose origin never
+    /// buffered the request body the id lives in.
+    pub(super) a2a_context_id: Option<String>,
+    /// WOR-2139: whether the A2A envelope's identity fields came from a
+    /// trusted source, from `A2AContext::identity_verified`. `None` for
+    /// non-A2A traffic. Travels with `a2a_context_id` because an
+    /// untrusted caller picks its own run id.
+    pub(super) a2a_identity_verified: Option<bool>,
     pub(super) properties: std::collections::BTreeMap<String, String>,
     pub(super) workspace_id: String,
     /// WOR-1053: resolved tenant from `origin.tenant_id`. `__default__`
@@ -913,6 +931,8 @@ impl AccessLogContext {
             user_id_source: None,
             session_id: None,
             parent_session_id: None,
+            a2a_context_id: None,
+            a2a_identity_verified: None,
             properties: std::collections::BTreeMap::new(),
             workspace_id: String::new(),
             tenant_id: String::new(),
@@ -1106,6 +1126,8 @@ pub(super) fn emit_access_log_entry(
         user_id_source: context.user_id_source,
         session_id: context.session_id,
         parent_session_id: context.parent_session_id,
+        a2a_context_id: context.a2a_context_id,
+        a2a_identity_verified: context.a2a_identity_verified,
         properties: context.properties,
         workspace_id: context.workspace_id,
         tenant_id: context.tenant_id,
@@ -1213,6 +1235,90 @@ pub(super) fn emit_access_log_entry(
             }
         }
         _ => entry.emit(),
+    }
+}
+
+/// WOR-2139: the run correlation key survives the whole terminal
+/// stamping path, from `AccessLogContext` through serialization and
+/// redaction to the bytes an operator actually reads.
+///
+/// Driven through the file sink rather than a captured tracing
+/// subscriber because that is the shortest route to the emitted line
+/// with no subscriber machinery in the way; the two sinks share
+/// `redacted_json_line`, so the assertion covers both.
+#[cfg(test)]
+mod run_identity_tests {
+    use super::{emit_access_log_entry, AccessLogContext, HttpFields};
+
+    fn file_cfg(path: &std::path::Path) -> sbproxy_config::AccessLogConfig {
+        sbproxy_config::AccessLogConfig {
+            enabled: true,
+            sample_rate: 1.0,
+            output: sbproxy_config::AccessLogOutputConfig {
+                output_type: "file".to_string(),
+                path: Some(path.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn emit(context: AccessLogContext) -> serde_json::Value {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("access.log");
+        emit_access_log_entry(
+            &file_cfg(&path),
+            200,
+            "POST",
+            "agent.localhost",
+            "/a2a",
+            0.004,
+            "req-child".to_string(),
+            "10.0.0.1".to_string(),
+            None,
+            HttpFields::empty(),
+            context,
+        );
+        let line = std::fs::read_to_string(&path).expect("the access log line was written");
+        serde_json::from_str(line.trim()).expect("the emitted line is JSON")
+    }
+
+    #[test]
+    fn a_run_id_read_from_the_body_reaches_the_access_log() {
+        let mut context = AccessLogContext::empty();
+        context.session_id = Some("01JBX0000000000000000CAPT".to_string());
+        context.a2a_context_id = Some("run-7".to_string());
+        context.a2a_identity_verified = Some(true);
+
+        let line = emit(context);
+
+        assert_eq!(line["a2a_context_id"], "run-7");
+        assert_eq!(line["a2a_identity_verified"], true);
+        // The caller-scoped key keeps its own column rather than being
+        // displaced by the run-scoped one.
+        assert_eq!(line["session_id"], "01JBX0000000000000000CAPT");
+    }
+
+    #[test]
+    fn an_unverified_run_id_is_marked_on_the_same_line() {
+        let mut context = AccessLogContext::empty();
+        context.a2a_context_id = Some("run-7".to_string());
+        context.a2a_identity_verified = Some(false);
+
+        let line = emit(context);
+
+        assert_eq!(line["a2a_context_id"], "run-7");
+        assert_eq!(
+            line["a2a_identity_verified"], false,
+            "a run id the proxy did not authenticate must say so where it is read"
+        );
+    }
+
+    #[test]
+    fn non_a2a_traffic_carries_neither_run_column() {
+        let line = emit(AccessLogContext::empty());
+        assert!(line.get("a2a_context_id").is_none());
+        assert!(line.get("a2a_identity_verified").is_none());
     }
 }
 

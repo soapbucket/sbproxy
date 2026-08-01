@@ -38,4 +38,22 @@
 # This number comes back down when the origin gate lands and the
 # request path starts calling the service, the registry, and the
 # requirement types. Do not raise it again for this crate.
-319
+#
+# Raised to 321 on WOR-2139, 2026-08-01, for two items that cannot be
+# narrowed without defeating what they are for.
+#
+# `run_scoped_label_gaps` (sbproxy-observe/src/metric_registry.rs) is
+# the static guard that forbids a run, task, context, or trace id from
+# becoming a Prometheus label. Its consumer is
+# `tests/metric_drift.rs`, a separate integration-test crate, so `pub`
+# is the only way to reach it. `tenant_label_gaps` sits beside it for
+# exactly the same reason and has since it was written. The guard has
+# to run against the same public table a caller sees; asserting against
+# a private copy would prove nothing.
+#
+# `MAX_RUN_ID_BYTES` (sbproxy-ai/src/tracing_spans.rs) is the cap
+# applied to a caller-supplied run identifier before it reaches a span
+# attribute. It crosses into sbproxy-core, where the body phase caps at
+# capture so the span and the access log agree on one value. A cap that
+# two crates must agree on is a contract, not an implementation detail.
+321

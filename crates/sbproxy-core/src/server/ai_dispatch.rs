@@ -2629,9 +2629,40 @@ pub(super) async fn handle_ai_proxy(
     ai_span.record("sbproxy.tenant_id", ctx.tenant_id.as_str());
     // WOR-2093: session linkage on the exported span, so key, session,
     // and trace join in the collector.
-    if let Some(session_id) = ctx.session_id.as_ref() {
-        ai_span.record("sbproxy.session_id", session_id.to_string().as_str());
+    let capture_session_id = ctx.session_id.map(|session_id| session_id.to_string());
+    if let Some(session_id) = capture_session_id.as_deref() {
+        ai_span.record("sbproxy.session_id", session_id);
     }
+    // WOR-2139: run identity, so a fan-out of agent hops reconstructs as
+    // one tree instead of a pile of unrelated traces. `session.id` takes
+    // the A2A `contextId` when the hop carried one and the capture
+    // session otherwise; `graph.node.id` / `graph.node.parent_id` carry
+    // this hop and its caller; the trust flag rides alongside because an
+    // untrusted caller names its own run. The capture session keeps its
+    // own `sbproxy.session_id` slot above and is not overwritten: it is
+    // a validated ULID that also keys the semantic cache.
+    //
+    // Phase note. The A2A `contextId` lives in the JSON-RPC request body
+    // and is stamped on the context by `request_body_filter`. This
+    // handler completes inside `request_filter`, which runs earlier, so
+    // on the AI-gateway surface `session.id` normally resolves to the
+    // capture session and `sbproxy.run.id_source` says so. The A2A run
+    // id reaches the terminal access-log line rather than this span.
+    // See the run-identity section of `docs/observability.md`.
+    sbproxy_ai::tracing_spans::record_run_identity(
+        &ai_span,
+        sbproxy_ai::tracing_spans::RunIdentity {
+            a2a_context_id: ctx.a2a_context_id.as_deref(),
+            capture_session_id: capture_session_id.as_deref(),
+            node_id: Some(ctx.request_id.as_str()),
+            parent_node_id: ctx
+                .a2a
+                .as_ref()
+                .and_then(|a2a| a2a.parent_request_id.as_deref()),
+            task_id: ctx.a2a.as_ref().map(|a2a| a2a.task_id.as_str()),
+            identity_verified: ctx.a2a.as_ref().map(|a2a| a2a.identity_verified),
+        },
+    );
 
     // Increment the per-surface request counter and start the latency
     // clock. The latency guard records elapsed time at function exit

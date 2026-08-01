@@ -1215,6 +1215,38 @@ pub struct RequestContext {
     /// verbatim instead of falling through to the generic
     /// `send_error` template.
     pub a2a_denial_body: Option<String>,
+    /// WOR-2139: the A2A `contextId` this hop carried, already capped to
+    /// the span-attribute identifier limit.
+    ///
+    /// This is the run correlation key. A2A task ids nest under a
+    /// context id, so it is the identifier that lets a fan-out of agent
+    /// hops reconstruct as one tree rather than a pile of unrelated
+    /// traces. It is read from `params.contextId` in the A2A 1.0
+    /// JSON-RPC body, which means `request_body_filter` is the first
+    /// phase that can see it, and that phase runs *after*
+    /// `upstream_request_filter` has already assembled the upstream
+    /// request. A run id therefore cannot be stamped onto an outbound
+    /// header on this hop; run correlation rides the W3C trace context
+    /// the upstream request filter already injects. The same phase
+    /// boundary is why the A2A injection vocabulary has no `tag` action
+    /// and why the push-notification check had to move to the body
+    /// phase.
+    ///
+    /// Deliberately not a field on `A2AContext`. That struct is built in
+    /// the request filter from headers, one phase earlier, and it
+    /// derives `Serialize` / `Deserialize` with no `serde(default)`, so
+    /// widening it would break deserialization of any already-serialized
+    /// envelope. Keeping the two apart also preserves a trust asymmetry
+    /// worth naming: `A2AContext::task_id` comes from the
+    /// `x-a2a-task-id` header and is honoured only behind the
+    /// trusted-peer gate, while this value comes from the request body
+    /// and is honoured from any caller. Read
+    /// `A2AContext::identity_verified` before treating either as an
+    /// authoritative name for a run.
+    ///
+    /// `None` for non-A2A traffic, for the two `v0` drafts, and for A2A
+    /// 1.0 hops on origins that never buffer the request body.
+    pub a2a_context_id: Option<String>,
 
     // --- WOR-114: per-request feature flags ---
     /// Parsed `x-sb-flags` header + `?_sb.<key>` query params.
@@ -1566,6 +1598,7 @@ impl RequestContext {
             headless_signal: None,
             a2a: None,
             a2a_denial_body: None,
+            a2a_context_id: None,
             flags: crate::sb_flags::RequestFlags::default(),
             policy_response_headers: Vec::new(),
             deny_policy_type: None,

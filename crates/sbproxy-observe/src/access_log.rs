@@ -214,6 +214,33 @@ pub struct AccessLogEntry {
     /// Parent session identifier; never auto-generated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// WOR-2139: the A2A `contextId` this hop carried, capped at
+    /// capture. Absent for traffic that carried no A2A envelope.
+    ///
+    /// This is the run-scoped grouping key: A2A task ids nest under a
+    /// context id, so joining log lines on it reassembles one
+    /// multi-agent run. `session_id` above is the caller-scoped key.
+    /// A consumer that wants "the key that groups related traffic"
+    /// should prefer this and fall back to `session_id`, which is the
+    /// same precedence the `session.id` span attribute uses.
+    ///
+    /// Read from the JSON-RPC request body, so it is only present on
+    /// hops whose origin buffers that body (an `a2a` policy on A2A 1.0
+    /// does). It is never a metric label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a2a_context_id: Option<String>,
+    /// WOR-2139: whether the A2A envelope's identity fields came from a
+    /// source the proxy trusts. `None` for non-A2A traffic.
+    ///
+    /// Ships beside `a2a_context_id` on purpose. An untrusted caller
+    /// picks its own `contextId`, so it can merge its usage into another
+    /// caller's run or shard one run across unbounded distinct ids. A
+    /// report that sums by run without filtering on this column is
+    /// summing a number the caller chose. The `sbproxy_a2a_hops_total`
+    /// metric partitions hops the same way through its `allow:verified`
+    /// and `allow:unverified` decision labels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a2a_identity_verified: Option<bool>,
     /// Caller-supplied custom properties from `X-Sb-Property-*`
     /// headers, after caps and redaction. Empty when capture is off
     /// or no headers were sent.
@@ -626,6 +653,8 @@ impl Default for AccessLogEntry {
             user_id_source: None,
             session_id: None,
             parent_session_id: None,
+            a2a_context_id: None,
+            a2a_identity_verified: None,
             properties: BTreeMap::new(),
             workspace_id: String::new(),
             tenant_id: String::new(),
@@ -943,6 +972,8 @@ mod tests {
             user_id_source: None,
             session_id: None,
             parent_session_id: None,
+            a2a_context_id: None,
+            a2a_identity_verified: None,
             properties: BTreeMap::new(),
             workspace_id: String::new(),
             tenant_id: String::new(),
@@ -1031,6 +1062,37 @@ mod tests {
         assert!(b.get("cost_usd_micros").is_none());
         assert!(b.get("guardrail_category").is_none());
         assert!(b.get("guardrail_action").is_none());
+    }
+
+    /// WOR-2139: the run correlation key reaches the log line, and the
+    /// trust flag reaches it with the key rather than somewhere else.
+    #[test]
+    fn run_identity_columns_serialize_with_their_trust_flag() {
+        let mut entry = minimal_entry();
+        entry.session_id = Some("01JBX0000000000000000CAPT".to_string());
+        entry.a2a_context_id = Some("run-7".to_string());
+        entry.a2a_identity_verified = Some(false);
+        let json = serde_json::to_string(&entry).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(v["a2a_context_id"], "run-7");
+        // An unverified envelope is marked as such wherever the run id
+        // appears: the caller chose this id, so a report that sums by it
+        // without reading this column sums an attacker-chosen number.
+        assert_eq!(v["a2a_identity_verified"], false);
+        // The capture session keeps its own column. The two group
+        // different things (one run vs one caller) and both are needed.
+        assert_eq!(v["session_id"], "01JBX0000000000000000CAPT");
+    }
+
+    /// Non-A2A traffic carries neither column, so an absent trust flag
+    /// is never confused with an asserted-and-unverified one.
+    #[test]
+    fn run_identity_columns_are_omitted_for_non_a2a_traffic() {
+        let json = serde_json::to_string(&minimal_entry()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("a2a_context_id").is_none());
+        assert!(v.get("a2a_identity_verified").is_none());
     }
 
     #[test]

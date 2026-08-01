@@ -13,8 +13,11 @@
 //!    `tracing-subscriber` stack.
 //! 3. **W3C TraceContext propagator** ([`init_propagator`]): registers
 //!    the OTel-default propagator as the global text-map propagator so
-//!    every outbound HTTP client that goes through
-//!    [`inject_into_headers`] picks up the current trace.
+//!    every carrier that goes through [`propagation_pairs`] picks up
+//!    the current trace. [`inject_into_headers`] and
+//!    [`inject_into_reqwest`] turn those pairs into HTTP headers;
+//!    carriers that are not headers (a JSON body, a queue envelope)
+//!    consume the pairs directly.
 //! 4. **Span-naming helper** ([`span`]): every pillar emits spans
 //!    named `sbproxy.<pillar>.<verb>` so dashboards group cleanly.
 
@@ -1053,63 +1056,53 @@ pub fn init_propagator() {
     global::set_text_map_propagator(TraceContextPropagator::new());
 }
 
-/// Inject the active OTel context into outbound HTTP headers.
+/// Resolve which OTel context the propagator should read.
 ///
-/// Propagation invariant: every HTTP request leaving
-/// the proxy MUST carry `traceparent`. Outbound clients (ledger, Stripe,
-/// facilitators, registry feeds, KYA token verifier, OAuth) call this
-/// to satisfy that invariant in one line.
+/// Two layers: the per-`tracing::Span` OTel context that the
+/// `tracing-opentelemetry` layer maintains (the one
+/// [`parent_span_on_remote_trace_context`] seeds), and the task-local
+/// `opentelemetry::Context::current()` as a fallback. The span layer
+/// wins whenever it carries an active span.
 ///
-/// Reads the OTel context from the current `tracing::Span` when the
-/// `tracing-opentelemetry` layer is installed and the span's parent was
-/// seeded (see [`parent_span_on_remote_trace_context`]). Falls back to
-/// the global `opentelemetry::Context::current()`, a defensive fallback
-/// for any future caller of `Context::attach`; nothing in this crate
-/// populates it today (see [`extract_from_headers`]'s doc for why it no
-/// longer does).
-///
-/// Quietly does nothing when no propagator has been registered (the
-/// global default is a no-op propagator).
-pub fn inject_into_headers(headers: &mut http::HeaderMap) {
-    use opentelemetry::propagation::Injector;
-
-    struct HeaderInjector<'a>(&'a mut http::HeaderMap);
-    impl Injector for HeaderInjector<'_> {
-        fn set(&mut self, key: &str, value: String) {
-            if let (Ok(name), Ok(val)) = (
-                http::header::HeaderName::from_bytes(key.as_bytes()),
-                http::header::HeaderValue::from_str(&value),
-            ) {
-                self.0.insert(name, val);
-            }
-        }
-    }
-
-    // Two layers of context: the per-`tracing::Span` OTel context that
-    // the `tracing-opentelemetry` layer maintains (the one
-    // parent_span_on_remote_trace_context seeds), and the task-local
-    // OTel context as a defensive fallback for callers that attach
-    // their own scoped Context directly.
+/// The fallback is deliberate. It only runs when the span layer had
+/// nothing, so it costs a clone on a path that was about to propagate
+/// nothing at all, and it is the only thing that keeps working for a
+/// caller that attaches a scoped `Context` without a `tracing::Span`
+/// wrapped around it. Nothing in this crate populates it today; see
+/// [`extract_from_headers`]'s doc for why it no longer does.
+fn context_to_propagate() -> Context {
     let cx_from_span =
         tracing_opentelemetry::OpenTelemetrySpanExt::context(&tracing::Span::current());
-    let cx_from_global = opentelemetry::Context::current();
-    // Prefer the span context when it carries a non-default span, else
-    // the task-local one.
-    let cx = if opentelemetry::trace::TraceContextExt::has_active_span(&cx_from_span) {
+    if opentelemetry::trace::TraceContextExt::has_active_span(&cx_from_span) {
         cx_from_span
     } else {
-        cx_from_global
-    };
-
-    global::get_text_map_propagator(|prop| {
-        prop.inject_context(&cx, &mut HeaderInjector(headers));
-    });
+        Context::current()
+    }
 }
 
-/// Inject the active OTel context into a `reqwest::RequestBuilder`'s
-/// headers. Convenience wrapper around [`inject_into_headers`] for the
-/// outbound clients that are built on top of `reqwest`.
-pub fn inject_into_reqwest(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+/// The trace-context key/value pairs the registered propagator emits
+/// for the currently active context.
+///
+/// This is the carrier-agnostic shape, and the single implementation
+/// every other injector in this module is built on.
+/// [`inject_into_headers`] and [`inject_into_reqwest`] turn these pairs
+/// into HTTP headers. A caller whose carrier is not a header set (a
+/// JSON body, a queue envelope, a message attribute map) consumes the
+/// pairs directly. The MCP gateway does exactly that: MCP carries
+/// trace context in the JSON-RPC body's `params._meta` block, which is
+/// the one carrier that also works on the stdio transport, where there
+/// is no header surface to inject into at all.
+///
+/// Keys are whatever the registered propagator emits. With the W3C
+/// TraceContext propagator this crate installs, that means
+/// `traceparent` plus `tracestate` when the trace carries one.
+///
+/// Returns an empty vector when no trace context is active, or when no
+/// propagator has been registered (the global default is a no-op
+/// propagator). Treat empty as "attach no carrier", not "attach an
+/// empty one": a reader downstream can then tell an untraced request
+/// from a malformed one.
+pub fn propagation_pairs() -> Vec<(String, String)> {
     use opentelemetry::propagation::Injector;
 
     struct VecInjector(Vec<(String, String)>);
@@ -1119,12 +1112,52 @@ pub fn inject_into_reqwest(req: reqwest::RequestBuilder) -> reqwest::RequestBuil
         }
     }
 
-    let cx = tracing_opentelemetry::OpenTelemetrySpanExt::context(&tracing::Span::current());
+    let cx = context_to_propagate();
     let mut sink = VecInjector(Vec::new());
     global::get_text_map_propagator(|prop| prop.inject_context(&cx, &mut sink));
+    sink.0
+}
+
+/// Inject the active OTel context into outbound HTTP headers.
+///
+/// The intended propagation invariant is that every HTTP request
+/// leaving the proxy carries `traceparent`, and this is the one-line
+/// way for an outbound client to satisfy it. The invariant is not met
+/// yet. Before WOR-2139 wired [`inject_into_reqwest`] into the MCP
+/// gateway's OpenAPI-backed tool dispatch, neither function had a
+/// single production caller, and the outbound clients this doc used to
+/// name on the invariant's behalf (ledger, Stripe, facilitators,
+/// registry feeds, KYA token verifier, OAuth) still leave without one.
+/// Wiring them is open work, not a claim this doc gets to make for
+/// them.
+///
+/// Pairs come from [`propagation_pairs`], so the header path and every
+/// non-header carrier propagate the same context from the same code. A
+/// key or value that is not a legal HTTP header is skipped rather than
+/// panicking; the W3C propagator emits neither.
+pub fn inject_into_headers(headers: &mut http::HeaderMap) {
+    for (key, value) in propagation_pairs() {
+        if let (Ok(name), Ok(val)) = (
+            http::header::HeaderName::from_bytes(key.as_bytes()),
+            http::header::HeaderValue::from_str(&value),
+        ) {
+            headers.insert(name, val);
+        }
+    }
+}
+
+/// Inject the active OTel context into a `reqwest::RequestBuilder`'s
+/// headers. The [`inject_into_headers`] equivalent for the outbound
+/// clients that are built on top of `reqwest`, reading the same
+/// [`propagation_pairs`].
+///
+/// The MCP gateway calls this on the REST dispatch for an
+/// OpenAPI-backed tool, where the outbound request is plain HTTP and
+/// has no JSON-RPC body to carry `params._meta` instead.
+pub fn inject_into_reqwest(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     let mut req = req;
-    for (k, v) in sink.0 {
-        req = req.header(k, v);
+    for (key, value) in propagation_pairs() {
+        req = req.header(key, value);
     }
     req
 }
@@ -2018,6 +2051,126 @@ mod tests {
                 .get(opentelemetry::Key::from_static_str("service.version"))
                 .map(|v| v.to_string()),
             Some(env!("CARGO_PKG_VERSION").to_string())
+        );
+    }
+
+    // --- WOR-2139: carrier-agnostic propagation pairs ---
+
+    /// Run `body` with a real `tracing-opentelemetry` layer installed
+    /// and one entered span, which is the only shape in which the
+    /// per-span OTel context exists at all. `remote_parent` seeds that
+    /// span's parent so the propagated trace id is a known value
+    /// instead of a fresh random root. Mirrors the setup in
+    /// `propagator_round_trip_preserves_traceparent`, including the
+    /// interest-cache rebuild that keeps a callsite cached as `Never`
+    /// by an earlier subscriber-less test from silently skipping this
+    /// subscriber.
+    fn with_active_span<T>(
+        remote_parent: Option<&crate::trace_ctx::w3c::TraceContext>,
+        body: impl FnOnce() -> T,
+    ) -> T {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        init_propagator();
+        let provider = sdktrace::TracerProvider::builder().build();
+        let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let span = tracing::info_span!("wor2139_propagation");
+            parent_span_on_remote_trace_context(&span, remote_parent, remote_parent.is_some());
+            let _guard = span.enter();
+            body()
+        })
+    }
+
+    /// The refactor's whole point: the header path is now a thin
+    /// rendering of the pairs, so the two can never disagree about
+    /// which context, which keys, or which values get propagated.
+    #[test]
+    fn propagation_pairs_match_the_header_injection_path() {
+        with_active_span(None, || {
+            let pairs = propagation_pairs();
+            assert!(
+                !pairs.is_empty(),
+                "an active span must propagate at least traceparent"
+            );
+
+            let mut headers = http::HeaderMap::new();
+            inject_into_headers(&mut headers);
+
+            assert_eq!(
+                headers.len(),
+                pairs.len(),
+                "header path emitted a different number of keys than the pairs: \
+                 {headers:?} vs {pairs:?}"
+            );
+            for (key, value) in &pairs {
+                assert_eq!(
+                    headers.get(key.as_str()).and_then(|v| v.to_str().ok()),
+                    Some(value.as_str()),
+                    "header {key} disagrees with the pair the JSON carrier would use"
+                );
+            }
+        });
+    }
+
+    /// The value a non-header carrier writes has to be a real W3C
+    /// traceparent, and it has to name the trace that is actually
+    /// active rather than a fresh root, or the correlation it exists
+    /// for does not happen.
+    #[test]
+    fn propagation_pairs_carry_a_wellformed_traceparent_for_the_active_trace() {
+        let known = crate::trace_ctx::w3c::TraceContext::parse(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        )
+        .expect("fixture traceparent parses");
+
+        with_active_span(Some(&known), || {
+            let pairs = propagation_pairs();
+            let traceparent = pairs
+                .iter()
+                .find(|(key, _)| key == "traceparent")
+                .map(|(_, value)| value.as_str())
+                .expect("an active span must propagate traceparent");
+
+            // W3C shape: version "-" 32-hex trace-id "-" 16-hex
+            // parent-id "-" 2-hex flags.
+            let fields: Vec<&str> = traceparent.split('-').collect();
+            assert_eq!(
+                fields.len(),
+                4,
+                "traceparent must have four fields: {traceparent}"
+            );
+            assert_eq!(fields[0], "00", "unexpected version: {traceparent}");
+            assert_eq!(fields[1].len(), 32, "trace id width: {traceparent}");
+            assert_eq!(fields[2].len(), 16, "span id width: {traceparent}");
+            assert_eq!(fields[3].len(), 2, "flags width: {traceparent}");
+            assert!(
+                traceparent
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() || b == b'-'),
+                "traceparent must be hex and dashes only: {traceparent}"
+            );
+            assert_eq!(
+                fields[1], "0af7651916cd43dd8448eb211c80319c",
+                "traceparent must name the active trace, not a fresh root: {traceparent}"
+            );
+        });
+    }
+
+    /// No trace, no carrier. A caller reading these pairs decides
+    /// whether to attach anything at all from the emptiness, so an
+    /// empty-but-present pair would turn "this request was not traced"
+    /// into "this request carries a broken trace".
+    #[test]
+    fn propagation_pairs_are_empty_with_no_active_trace_context() {
+        init_propagator();
+        assert!(
+            propagation_pairs().is_empty(),
+            "with no active context there is nothing to propagate"
         );
     }
 }

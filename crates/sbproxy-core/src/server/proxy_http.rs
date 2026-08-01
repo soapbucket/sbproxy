@@ -3960,6 +3960,21 @@ impl ProxyHttp for SbProxy {
                         ctx.tenant_id.to_string(),
                     )
                 });
+                // WOR-2139: capture the run correlation id off the same
+                // parse. `params.contextId` groups every hop of one
+                // multi-agent run, and this is the first phase where it
+                // exists: the request filter builds the A2A envelope
+                // from headers, which do not carry it. Stamped on the
+                // context so the terminal surfaces (access log, and any
+                // span opened later in the request) all read one bounded
+                // value. Nothing is added to the upstream request here,
+                // because `upstream_request_filter` already ran.
+                if let Some(context_id) = a2a_v1
+                    .as_ref()
+                    .and_then(crate::server::a2a_body_phase::run_context_id)
+                {
+                    ctx.a2a_context_id = Some(context_id);
+                }
                 if let Some(origin_idx) = ctx.origin_idx {
                     if let Some(policies) = pipeline.policies.get(origin_idx) {
                         for policy in policies {
