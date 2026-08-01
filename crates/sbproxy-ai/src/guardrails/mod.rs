@@ -480,7 +480,7 @@ impl GuardrailPipeline {
     ///
     /// Classifier-backed guards and the schema guardrail judge the
     /// canonical assistant payload extracted by
-    /// [`assistant_response_text`]; every other guard inspects the raw
+    /// `assistant_response_text`; every other guard inspects the raw
     /// body.
     pub fn check_output(&self, content: &str) -> Option<GuardrailBlock> {
         let canonical_subject = assistant_response_text(content);
