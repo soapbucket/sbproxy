@@ -197,3 +197,42 @@ models:
           min_memory_bytes: 1073741824
         stability: preview
         certification: bootstrap-metadata-2026-07-10
+      # The mistral.rs subprocess lane (WOR-1861): the official bf16
+      # safetensors snapshot, every byte pinned. Listed after the GGUF
+      # variant so `auto` keeps preferring llama.cpp; engine: mistralrs
+      # selects it explicitly. Dense-and-quantized is mistral.rs's lane
+      # (its MoE BF16 prefill measured 7 to 9x behind vLLM upstream), so
+      # only dense models declare it.
+      - id: bf16
+        format: safetensors
+        quant: BF16
+        engines: [mistralrs]
+        source: hf:Qwen/Qwen2.5-0.5B-Instruct
+        revision: 7ae557604adf67be50417f59c2c2f167def9a775
+        files:
+          - path: config.json
+            sha256: 18e18afcaccafade98daf13a54092927904649e1dd4eba8299ab717d5d94ff45
+            size_bytes: 659
+          - path: generation_config.json
+            sha256: e558847a8b4402616f1273797b015104dc266fe4b520056fca88823ba8f8ebe6
+            size_bytes: 242
+          - path: merges.txt
+            sha256: 599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3
+            size_bytes: 1671839
+          - path: model.safetensors
+            sha256: fdf756fa7fcbe7404d5c60e26bff1a0c8b8aa1f72ced49e7dd0210fe288fb7fe
+            size_bytes: 988097824
+          - path: tokenizer.json
+            sha256: c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539
+            size_bytes: 7031645
+          - path: tokenizer_config.json
+            sha256: 5b5d4f65d0acd3b2d56a35b56d374a36cbc1c8fa5cf3b3febbbfabf22f359583
+            size_bytes: 7305
+          - path: vocab.json
+            sha256: ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910
+            size_bytes: 2776833
+        requirements:
+          accelerators: [cpu, metal, cuda]
+          min_memory_bytes: 2147483648
+        stability: preview
+        certification: bootstrap-metadata-2026-07-31

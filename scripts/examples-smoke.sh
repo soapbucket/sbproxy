@@ -396,8 +396,14 @@ for case in cases:
     for key, value in (request.get("headers") or {}).items():
         cmd.extend(["-H", f"{key}: {value}"])
     if "body" in request:
+        # Compact separators keep the wire bytes canonical, and
+        # allow_nan=False rejects NaN/Infinity floats (which Python's
+        # json.load accepts, e.g. 1e1000) before curl runs instead of
+        # sending invalid JSON upstream.
         try:
-            request_body = json.dumps(request["body"], separators=(",", ":"))
+            request_body = json.dumps(
+                request["body"], separators=(",", ":"), allow_nan=False
+            )
         except (TypeError, ValueError) as exc:
             fail(f"case '{name}' request.body must be JSON-serializable: {exc}")
         cmd.extend(["--data-binary", request_body])

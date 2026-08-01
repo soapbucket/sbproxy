@@ -92,6 +92,15 @@ pub struct AdminOperator {
     pub password_hash: String,
     /// Role governing which admin actions this operator may perform.
     pub role: AdminRole,
+    /// Billing tenant whose metered consumption this operator may read
+    /// (WOR-2131). `None` is the whole deployment.
+    ///
+    /// Orthogonal to [`AdminOperator::role`], and deliberately so: the role
+    /// answers "may they change anything", and this answers "whose numbers
+    /// are they allowed to see". A full-access operator pinned to one tenant
+    /// is a normal arrangement for a reseller, and collapsing the two
+    /// questions into one field would make it unexpressible.
+    pub tenant: Option<String>,
 }
 
 impl Default for AdminConfig {
@@ -389,6 +398,48 @@ pub struct RequestLogEntry {
     /// What the intervening guardrail did (`block` today; WOR-1874).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guardrail_action: Option<String>,
+    /// Canonical public id of the key that governed this request, when
+    /// one resolved (WOR-2093). Matches the access log column, the
+    /// `sbproxy_inbound_key_requests_total{api_key_id}` label, and the
+    /// `sbproxy.key_id` span attribute. Never the raw secret.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_id: Option<String>,
+    /// Inbound credential mode: `none`, `minted`, or `native` (WOR-2093).
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub key_mode: String,
+    /// Recognized native provider label; never credential material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_provider: Option<String>,
+    /// Origin-scoped tenant label (`__default__` when unset).
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub tenant_id: String,
+    /// Resolved end-user identifier, when user capture resolved one.
+    /// Already length-capped and redaction-applied by capture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// Coarse machine-readable failure class (`auth_denied`,
+    /// `rate_limited`, `upstream_5xx`, ...), absent on success
+    /// (WOR-2094).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    /// Config revision of the pipeline generation that served this
+    /// request (WOR-2094): every row names the config that governed it.
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub config_revision: String,
+    /// Governed key-policy revision that applied, when a key policy
+    /// resolved (WOR-2094). Same `r{rev}:{digest}` / `c:{rev}:{digest}`
+    /// vocabulary as the `sbproxy.policy_version` span attribute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<String>,
+    /// Bounded, ordered summary of policy decisions on this request as
+    /// `policy_type:verdict` pairs (WOR-2094). Explains why the gateway
+    /// acted, not just that it did.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub policy_decisions: Vec<String>,
+    /// Machine-readable reason from the policy or auth layer that
+    /// denied this request, when one did (WOR-2094).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deny_reason: Option<String>,
 }
 
 /// Filters for [`AdminState::query_requests`] (WOR-1718 / WOR-1874).
@@ -414,6 +465,12 @@ pub struct RequestLogFilter<'a> {
     pub property_key: Option<&'a str>,
     /// Exact redacted property value. Requires `property_key`.
     pub property_value: Option<&'a str>,
+    /// Exact canonical key id match (WOR-2093).
+    pub api_key_id: Option<&'a str>,
+    /// Exact inbound key mode match: `none`, `minted`, or `native`.
+    pub key_mode: Option<&'a str>,
+    /// Exact session id match (WOR-2093; previously client-side only).
+    pub session_id: Option<&'a str>,
 }
 
 // --- Admin State ---
@@ -560,11 +617,13 @@ impl AdminState {
                         .map(|s| s.contains(&sess.nonce))
                         .unwrap_or(false);
                     if !revoked {
+                        let tenant = self.operator_tenant(&sess.username);
                         return Some(AdminPrincipal {
                             username: sess.username,
                             role: sess.role,
                             via_session: true,
                             csrf: Some(sess.nonce),
+                            tenant,
                         });
                     }
                 }
@@ -578,10 +637,28 @@ impl AdminState {
                     role: AdminRole::Admin,
                     via_session: false,
                     csrf: None,
+                    // The top-level credential is the deployment's own
+                    // operator, not a tenant's, so it is never narrowed.
+                    // A reseller who wants a scoped login configures one
+                    // under `proxy.admin.operators`.
+                    tenant: None,
                 });
             }
         }
         None
+    }
+
+    /// The billing tenant `username` is narrowed to, if any (WOR-2131).
+    ///
+    /// Looks the operator up by name in the live config rather than trusting
+    /// anything the caller presented, so a scope can only ever come from the
+    /// document an operator edits and reloads.
+    fn operator_tenant(&self, username: &str) -> Option<String> {
+        self.config
+            .operators
+            .iter()
+            .find(|operator| operator.username == username)
+            .and_then(|operator| operator.tenant.clone())
     }
 
     /// Verify login credentials against the top-level admin and the
@@ -755,6 +832,20 @@ impl AdminState {
                 (Some(key), None) => e.properties.contains_key(key),
                 (Some(key), Some(value)) => e.properties.get(key).is_some_and(|v| v == value),
             })
+            // WOR-2093: key-accountability filters so the Keys view can
+            // deep-link to one credential's traffic, and session rows
+            // resolve server-side instead of client-side.
+            .filter(|e| {
+                filter
+                    .api_key_id
+                    .is_none_or(|id| e.api_key_id.as_deref() == Some(id))
+            })
+            .filter(|e| filter.key_mode.is_none_or(|mode| e.key_mode == mode))
+            .filter(|e| {
+                filter
+                    .session_id
+                    .is_none_or(|id| e.session_id.as_deref() == Some(id))
+            })
             .skip(offset)
             .take(limit)
             .cloned()
@@ -787,6 +878,14 @@ pub struct AdminPrincipal {
     /// The session nonce, which the client must echo in `X-CSRF-Token`
     /// on state-changing requests. `None` for Basic auth.
     pub csrf: Option<String>,
+    /// The single billing tenant this operator may read metered
+    /// consumption for, or `None` for the whole deployment (WOR-2131).
+    ///
+    /// Resolved from `proxy.admin.operators` on every request rather than
+    /// decoded from the session token. A token minted before the operator
+    /// was narrowed would otherwise keep the old, wider scope until it
+    /// expired, which turns a config change into a delayed one.
+    pub tenant: Option<String>,
 }
 
 /// WOR-1777: the `Set-Cookie` + `X-CSRF-Token` headers that upgrade a
@@ -1022,6 +1121,14 @@ fn render_openapi(state: &AdminState, yaml: bool) -> Result<String, String> {
 /// kids land once: the first occurrence wins so two origins sharing
 /// a signer key (operator-managed) do not produce a duplicate entry.
 ///
+/// This aggregation is multi-tenancy, not key rotation, and the two
+/// are easy to mistake for each other because both widen the same
+/// array. Rotation is per-origin and lives in the policy: an origin
+/// with `quote_token.previous_key_id` set hands back two kids of its
+/// own, and that is what keeps a quote issued before a reload
+/// verifying after it. Nothing at this level knows a rotation window
+/// is open, so nothing here can substitute for one.
+///
 /// Served unauthenticated because the published keys are public; the
 /// admin server gates this route ahead of the basic-auth check.
 pub(crate) fn render_quote_keys_jwks() -> (u16, &'static str, String) {
@@ -1124,6 +1231,17 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
     }
     let _guard = Guard(&state.reload_in_progress);
 
+    // WOR-2094: snapshot the outgoing generation so the config audit
+    // event can name the revision pair and the origin delta.
+    let prior_pipeline = crate::reload::current_pipeline();
+    let prior_revision = prior_pipeline.config_revision.clone();
+    let prior_origins: std::collections::BTreeSet<String> = prior_pipeline
+        .config
+        .origins
+        .iter()
+        .map(|origin| origin.hostname.to_string())
+        .collect();
+
     // --- Read + compile + load ---
     let yaml = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -1185,6 +1303,29 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
         loaded_at = %loaded_at,
         "admin reload: pipeline swapped"
     );
+
+    // WOR-2094: config changes are audited with the actor (when the
+    // reload came through an authenticated admin request), the revision
+    // pair, and the origin delta. This is the previously-dead
+    // ConfigAuditEntry channel's first production emitter.
+    let next_pipeline = crate::reload::current_pipeline();
+    let next_origins: std::collections::BTreeSet<String> = next_pipeline
+        .config
+        .origins
+        .iter()
+        .map(|origin| origin.hostname.to_string())
+        .collect();
+    let mut entry = sbproxy_observe::ConfigAuditEntry::new(
+        "api",
+        next_origins.difference(&prior_origins).cloned().collect(),
+        prior_origins.difference(&next_origins).cloned().collect(),
+        Vec::new(),
+    )
+    .with_revisions(Some(prior_revision.as_str()), Some(revision.as_str()));
+    if let Some(actor) = current_admin_actor() {
+        entry = entry.with_actor(actor);
+    }
+    entry.emit();
 
     // A reload can succeed while one subsystem stayed on prior state.
     // The caller (often an unattended config authority) needs to see
@@ -2006,6 +2147,15 @@ fn escape_json(s: &str) -> String {
 struct OperatorSummary {
     username: String,
     role: AdminRole,
+    /// The billing tenant this login is narrowed to on the meter routes
+    /// (WOR-2131), omitted when it may read the whole deployment.
+    ///
+    /// Worth surfacing rather than leaving implicit: a scoped operator who
+    /// gets a `403` from `/api/meter/*` needs somewhere in the console that
+    /// says why, and the answer is a line in config they cannot see from
+    /// the page that refused them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tenant: Option<String>,
 }
 
 // --- Request Handler ---
@@ -2129,6 +2279,12 @@ pub fn handle_admin_request(
     }
     // WOR-1721: fleet metrics aggregated over the mesh.
     if let Some(response) = crate::admin_cluster::dispatch(method, path, body) {
+        return response;
+    }
+    // WOR-2100: settlement status and the reconciliation trigger. Takes no
+    // body: the only input is a bounded claim limit in the query string, and
+    // there is no route here that can mark an attempt settled.
+    if let Some(response) = crate::admin_payments::dispatch(method, path) {
         return response;
     }
     // Config-authority publication, status, and subscriber management.
@@ -2363,6 +2519,7 @@ pub fn handle_admin_request(
             .map(|o| OperatorSummary {
                 username: o.username.clone(),
                 role: o.role,
+                tenant: o.tenant.clone(),
             })
             .collect();
         return match serde_json::to_string(&summaries) {
@@ -2382,6 +2539,103 @@ pub fn handle_admin_request(
             .map(|reg| reg.recent_audit(limit))
             .unwrap_or_default();
         return match serde_json::to_string(&rows) {
+            Ok(body) => (200, "application/json", body),
+            Err(e) => (
+                500,
+                "application/json",
+                format!(r#"{{"error":"serialization failed: {e}"}}"#),
+            ),
+        };
+    }
+    // WOR-2094: unified audit sample across the security, key, config,
+    // admin, and policy channels. A bounded in-memory ring; the durable
+    // trail is whatever the OTel collector ships the tracing targets to.
+    if path_only == "/api/audit/events" {
+        let limit: usize = rl_query_param(path, "limit")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100)
+            .min(1_000);
+        let channel = decoded_query_param(path, "channel");
+        if channel
+            .as_deref()
+            .is_some_and(|c| !matches!(c, "security" | "key" | "config" | "admin" | "policy"))
+        {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"channel must be security, key, config, admin, or policy"}"#
+                    .to_string(),
+            );
+        }
+        let kind = decoded_query_param(path, "kind");
+        let key_id = decoded_query_param(path, "key_id");
+        let events = sbproxy_observe::audit_ring::recent_audit_events(
+            limit,
+            channel.as_deref(),
+            kind.as_deref(),
+            key_id.as_deref(),
+        );
+        return match serde_json::to_string(&events) {
+            Ok(body) => (200, "application/json", body),
+            Err(e) => (
+                500,
+                "application/json",
+                format!(r#"{{"error":"serialization failed: {e}"}}"#),
+            ),
+        };
+    }
+    // WOR-2096: fetch one request's redacted content sample. Admin role
+    // only, and every read is audited before the content is returned.
+    if let Some(request_id) = path_only
+        .strip_prefix("/api/requests/")
+        .and_then(|rest| rest.strip_suffix("/content"))
+    {
+        if !method.eq_ignore_ascii_case("GET") {
+            return (
+                405,
+                "application/json",
+                r#"{"error":"method not allowed"}"#.to_string(),
+            );
+        }
+        if current_admin_role() != Some(AdminRole::Admin) {
+            return (
+                403,
+                "application/json",
+                r#"{"error":"forbidden: content inspection requires the admin role"}"#.to_string(),
+            );
+        }
+        let Some(sample) = crate::content_capture::sample_for(request_id) else {
+            return (
+                404,
+                "application/json",
+                r#"{"error":"no content sample for that request id; capture requires the origin's capture_content flag AND the key policy's allow_content_capture consent"}"#
+                    .to_string(),
+            );
+        };
+        // Audit BEFORE returning content, mirroring the compression
+        // content endpoint's posture: an operator reading caller
+        // content is itself a security-relevant event.
+        let operator = current_admin_actor().unwrap_or_default();
+        tracing::info!(
+            target: "sbproxy::admin::audit",
+            operator = %operator,
+            request_id = %request_id,
+            tenant_id = %sample.tenant_id,
+            action = "inspect_request_content",
+            "admin content inspection"
+        );
+        sbproxy_observe::audit_ring::push_audit_event(
+            sbproxy_observe::audit_ring::AuditRingEvent::new(
+                "admin",
+                "inspect_request_content",
+                Some(operator),
+                Some(sample.tenant_id.clone()),
+                sample.api_key_id.clone(),
+                Some(request_id.to_string()),
+                None,
+            ),
+        );
+        return match serde_json::to_string(&sample) {
             Ok(body) => (200, "application/json", body),
             Err(e) => (
                 500,
@@ -2434,6 +2688,20 @@ pub fn handle_admin_request(
                 r#"{"error":"property_value requires property_key"}"#.to_string(),
             );
         }
+        // WOR-2093: key-accountability filters.
+        let api_key_id_f = decoded_query_param(path, "api_key_id");
+        let key_mode_f = decoded_query_param(path, "key_mode");
+        if key_mode_f
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "none" | "minted" | "native"))
+        {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"key_mode must be none, minted, or native"}"#.to_string(),
+            );
+        }
+        let session_id_f = decoded_query_param(path, "session_id");
         let offset = rl_query_param(path, "offset")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
@@ -2452,6 +2720,9 @@ pub fn handle_admin_request(
                 retried: retried_f,
                 property_key: property_key_f.as_deref(),
                 property_value: property_value_f.as_deref(),
+                api_key_id: api_key_id_f.as_deref(),
+                key_mode: key_mode_f.as_deref(),
+                session_id: session_id_f.as_deref(),
             },
             offset,
             limit,
@@ -2802,7 +3073,7 @@ fn windowed_spend_response(
         return (
             400,
             "application/json",
-            r#"{"error":"unknown group_by (provider|model|tenant|team|api_key|project|origin|property:<key>|total)"}"#.to_string(),
+            r#"{"error":"unknown group_by (provider|model|tenant|team|api_key|project|origin|agent|property:<key>|total)"}"#.to_string(),
         );
     };
     let requested_property_key = match &group {
@@ -2932,6 +3203,45 @@ pub fn install_admin_log_sink(state: Arc<AdminState>) {
 /// pipeline's logging hook to record each completed request.
 pub fn admin_log_sink() -> Option<&'static Arc<AdminState>> {
     ADMIN_LOG_SINK.get()
+}
+
+thread_local! {
+    /// Operator username for the admin request currently dispatching on
+    /// this blocking thread (WOR-2094). The blocking dispatcher runs one
+    /// request end-to-end on one pooled thread, so a scoped slot is
+    /// sound; the guard clears it before the thread returns to the pool.
+    static CURRENT_ADMIN_ACTOR: std::cell::RefCell<Option<(String, AdminRole)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The authenticated operator for the admin request currently being
+/// dispatched on this thread, when one resolved (WOR-2094). Read by
+/// audit emitters below the sync dispatcher so mutations name their
+/// actor without threading a parameter through every handler.
+pub(crate) fn current_admin_actor() -> Option<String> {
+    CURRENT_ADMIN_ACTOR.with(|slot| slot.borrow().as_ref().map(|(name, _)| name.clone()))
+}
+
+/// Role of the operator dispatching on this thread (WOR-2096), for
+/// handlers below the sync dispatcher that gate on admin-only reads.
+pub(crate) fn current_admin_role() -> Option<AdminRole> {
+    CURRENT_ADMIN_ACTOR.with(|slot| slot.borrow().as_ref().map(|(_, role)| *role))
+}
+
+/// Clears the actor slot when the dispatch scope ends.
+struct AdminActorGuard;
+
+impl Drop for AdminActorGuard {
+    fn drop(&mut self) {
+        CURRENT_ADMIN_ACTOR.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Install `actor` as the dispatching operator for this thread and
+/// return a guard that clears it on scope exit.
+fn set_current_admin_actor(actor: Option<(String, AdminRole)>) -> AdminActorGuard {
+    CURRENT_ADMIN_ACTOR.with(|slot| *slot.borrow_mut() = actor);
+    AdminActorGuard
 }
 
 /// Record the raw-bytes hash of a config the process just loaded, so
@@ -3392,6 +3702,18 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                 path = %path,
                 "admin action"
             );
+            // WOR-2094: same event on the console's audit sample.
+            sbproxy_observe::audit_ring::push_audit_event(
+                sbproxy_observe::audit_ring::AuditRingEvent::new(
+                    "admin",
+                    "admin_action",
+                    Some(p.username.clone()),
+                    None,
+                    None,
+                    None,
+                    Some(format!("{method} {path}")),
+                ),
+            );
         }
     }
     // A session-authenticated request synthesizes a Basic header so
@@ -3519,6 +3841,20 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             .await;
             return;
         }
+    }
+
+    // WOR-2131: the meter's operator surface. Dispatched here rather than
+    // in `handle_admin_request` for two reasons that both matter. The
+    // cluster-wide gather is asynchronous, and the routes are tenant-scoped
+    // from the resolved principal, which the synchronous handler is not
+    // given: it receives an auth header that a session-authenticated
+    // request has already had rewritten to the top-level admin credential,
+    // so scoping there would read every operator as unscoped.
+    if let Some(response) = crate::admin_meter::dispatch(method, path, principal.as_ref()).await {
+        let _ =
+            write_admin_response_headed(sock, response.0, response.1, response.2.as_bytes(), &cors)
+                .await;
+        return;
     }
 
     // WOR-1753: chat playground. Handled here (not in
@@ -3752,7 +4088,12 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     let auth_owned = auth_for_dispatch;
     let body_for_task = body_owned.clone();
     let state_for_task = state.clone();
+    // WOR-2094: carry the authenticated operator onto the dispatch
+    // thread so audit emitters below the sync dispatcher can name the
+    // actor of a mutation.
+    let actor_for_task = principal.as_ref().map(|p| (p.username.clone(), p.role));
     let (status, content_type, body) = match tokio::task::spawn_blocking(move || {
+        let _actor_guard = set_current_admin_actor(actor_for_task);
         handle_admin_request(
             &method_owned,
             &path_owned,
@@ -3958,6 +4299,19 @@ async fn handle_admin_login<S: tokio::io::AsyncWrite + Unpin>(
         Some(r) => r,
         None => {
             tracing::warn!(target: "sbproxy::admin::audit", operator = %user, "admin login failed");
+            // WOR-2094: failed sign-ins are first-class security
+            // events on the console's audit sample.
+            sbproxy_observe::audit_ring::push_audit_event(
+                sbproxy_observe::audit_ring::AuditRingEvent::new(
+                    "admin",
+                    "login_failed",
+                    Some(user.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            );
             let _ = write_admin_response_headed(
                 sock,
                 401,
@@ -3972,6 +4326,17 @@ async fn handle_admin_login<S: tokio::io::AsyncWrite + Unpin>(
     let ttl_secs = 8 * 3600;
     let (token, csrf) = state.session_signer.mint(&user, role, ttl_secs, unix_now());
     tracing::info!(target: "sbproxy::admin::audit", operator = %user, role = %role_label(role), "admin login");
+    sbproxy_observe::audit_ring::push_audit_event(
+        sbproxy_observe::audit_ring::AuditRingEvent::new(
+            "admin",
+            "login",
+            Some(user.clone()),
+            None,
+            None,
+            None,
+            Some(format!("role: {}", role_label(role))),
+        ),
+    );
     let secure_attr = if secure { "; Secure" } else { "" };
     let cookie = format!(
         "{}={token}; HttpOnly; SameSite=Strict; Path=/{secure_attr}; Max-Age={ttl_secs}",
@@ -4037,6 +4402,7 @@ mod tests {
             role: AdminRole::Admin,
             via_session: false,
             csrf: None,
+            tenant: None,
         };
         let headers = basic_session_upgrade_headers(&signer, &basic, false, now);
 
@@ -4072,6 +4438,7 @@ mod tests {
             role: AdminRole::Admin,
             via_session: true,
             csrf: Some("n".into()),
+            tenant: None,
         };
         assert!(basic_session_upgrade_headers(&signer, &via_session, false, now).is_empty());
 
@@ -4766,6 +5133,97 @@ mod tests {
     }
 
     #[test]
+    fn query_requests_filters_on_key_attribution_columns() {
+        // WOR-2093: the ring answers "what did this key do" server-side.
+        let state = make_state();
+        state.log_request(RequestLogEntry {
+            timestamp: "t0".to_string(),
+            origin: "o".to_string(),
+            method: "GET".to_string(),
+            path: "/governed".to_string(),
+            status: 200,
+            latency_ms: 1.0,
+            client_ip: "127.0.0.1".to_string(),
+            api_key_id: Some("sbp_key_a".to_string()),
+            key_mode: "minted".to_string(),
+            tenant_id: "tenant-a".to_string(),
+            session_id: Some("01JAT3S6Q0V4X5Y6Z7A8B9C0D1".to_string()),
+            config_revision: "rev-1".to_string(),
+            ..Default::default()
+        });
+        state.log_request(RequestLogEntry {
+            timestamp: "t1".to_string(),
+            origin: "o".to_string(),
+            method: "GET".to_string(),
+            path: "/native".to_string(),
+            status: 200,
+            latency_ms: 1.0,
+            client_ip: "127.0.0.1".to_string(),
+            api_key_id: Some("native:tenant-a:api:openai".to_string()),
+            key_mode: "native".to_string(),
+            key_provider: Some("openai".to_string()),
+            ..Default::default()
+        });
+        state.log_request(RequestLogEntry {
+            timestamp: "t2".to_string(),
+            origin: "o".to_string(),
+            method: "GET".to_string(),
+            path: "/unkeyed".to_string(),
+            status: 200,
+            latency_ms: 1.0,
+            client_ip: "127.0.0.1".to_string(),
+            key_mode: "none".to_string(),
+            ..Default::default()
+        });
+
+        let by_key = state.query_requests(
+            &RequestLogFilter {
+                api_key_id: Some("sbp_key_a"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert_eq!(by_key.len(), 1);
+        assert_eq!(by_key[0].path, "/governed");
+        assert_eq!(by_key[0].config_revision, "rev-1");
+
+        let native = state.query_requests(
+            &RequestLogFilter {
+                key_mode: Some("native"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].key_provider.as_deref(), Some("openai"));
+
+        let by_session = state.query_requests(
+            &RequestLogFilter {
+                session_id: Some("01JAT3S6Q0V4X5Y6Z7A8B9C0D1"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert_eq!(by_session.len(), 1);
+        assert_eq!(by_session[0].api_key_id.as_deref(), Some("sbp_key_a"));
+
+        // Combined: key AND mode narrows to the intersection.
+        let combined = state.query_requests(
+            &RequestLogFilter {
+                api_key_id: Some("sbp_key_a"),
+                key_mode: Some("native"),
+                ..Default::default()
+            },
+            0,
+            10,
+        );
+        assert!(combined.is_empty());
+    }
+
+    #[test]
     fn requests_endpoint_validates_observability_filters() {
         let state = make_state();
         state.log_request(RequestLogEntry {
@@ -4891,6 +5349,7 @@ mod tests {
                     team: "growth".to_string(),
                     api_key_id: "sk1".to_string(),
                     project: "p".to_string(),
+                    agent_id: String::new(),
                     properties: std::collections::BTreeMap::from([(
                         "feature".to_string(),
                         "assistant".to_string(),
@@ -5047,6 +5506,7 @@ mod tests {
                     &crate::key_plane::default_admin_operator_pepper(),
                 ),
                 role: AdminRole::ReadOnly,
+                tenant: None,
             }],
             ..AdminConfig::default()
         });
@@ -5537,6 +5997,7 @@ mod tests {
                     &crate::key_plane::default_admin_operator_pepper(),
                 ),
                 role: AdminRole::ReadOnly,
+                tenant: None,
             }],
             ..AdminConfig::default()
         });
@@ -5568,6 +6029,7 @@ mod tests {
                     &crate::key_plane::default_admin_operator_pepper(),
                 ),
                 role: AdminRole::ReadOnly,
+                tenant: None,
             }],
             ..AdminConfig::default()
         });
@@ -6540,6 +7002,7 @@ origins:
                 username: "ro".to_string(),
                 password_hash: hash,
                 role: AdminRole::ReadOnly,
+                tenant: None,
             }],
             ..AdminConfig::default()
         };
@@ -6565,6 +7028,7 @@ origins:
                 username: "ro".to_string(),
                 password_hash: String::new(),
                 role: AdminRole::ReadOnly,
+                tenant: None,
             }],
             ..AdminConfig::default()
         };
@@ -6582,6 +7046,7 @@ origins:
                 username: "ro".to_string(),
                 password_hash: "not-valid-hex-zzz".to_string(),
                 role: AdminRole::ReadOnly,
+                tenant: None,
             }],
             ..AdminConfig::default()
         };
@@ -6828,6 +7293,7 @@ origins:
                 outbound_credential: None,
                 outbound_web_bot_auth: false,
                 observability: None,
+                attestation: None,
             }
         };
 
@@ -7129,11 +7595,13 @@ origins:
                 username: "viewer".to_string(),
                 password_hash: sbproxy_keystore::crypto::hash_secret("viewer-secret", &pepper),
                 role: AdminRole::ReadOnly,
+                tenant: None,
             },
             AdminOperator {
                 username: "oncall".to_string(),
                 password_hash: sbproxy_keystore::crypto::hash_secret("oncall-secret", &pepper),
                 role: AdminRole::Admin,
+                tenant: None,
             },
         ];
         let state = AdminState::new(cfg);
@@ -7159,6 +7627,78 @@ origins:
         assert_eq!(users[2]["role"], "admin");
     }
 
+    /// A configured tenant scope has to survive as far as the resolved
+    /// principal, because that is the only thing the meter routes read.
+    ///
+    /// It is looked up by username on every request rather than decoded
+    /// from the session token, so narrowing an operator takes effect on
+    /// the next reload rather than whenever their token happens to
+    /// expire. The two assertions below are that lookup working and the
+    /// top-level admin credential staying unscoped.
+    #[test]
+    fn a_configured_operator_tenant_reaches_the_resolved_principal() {
+        let mut cfg = make_state().config.clone();
+        cfg.operators = vec![AdminOperator {
+            username: "acme-billing".to_string(),
+            password_hash: "deadbeef".to_string(),
+            role: AdminRole::ReadOnly,
+            tenant: Some("acme".to_string()),
+        }];
+        let state = AdminState::new(cfg);
+
+        let (token, _) =
+            state
+                .session_signer
+                .mint("acme-billing", AdminRole::ReadOnly, 3600, unix_now());
+        let scoped = state
+            .resolve_principal(None, Some(&format!("sb_admin_session={token}")))
+            .expect("the session resolves");
+        assert_eq!(scoped.username, "acme-billing");
+        assert_eq!(scoped.tenant.as_deref(), Some("acme"));
+
+        let admin = state
+            .resolve_principal(Some(&basic_auth("admin", "secret")), None)
+            .expect("the top-level credential resolves");
+        assert_eq!(
+            admin.tenant, None,
+            "the deployment's own operator is not a tenant's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_scoped_operator_is_refused_another_tenants_meter() {
+        // End to end through the connection handler, because the scope is
+        // resolved there and a route that read it from the query string
+        // instead would pass a unit test and leak in production.
+        let mut cfg = make_state().config.clone();
+        cfg.operators = vec![AdminOperator {
+            username: "acme-billing".to_string(),
+            password_hash: "deadbeef".to_string(),
+            role: AdminRole::ReadOnly,
+            tenant: Some("acme".to_string()),
+        }];
+        let state = AdminState::new(cfg);
+        let (token, _) =
+            state
+                .session_signer
+                .mint("acme-billing", AdminRole::ReadOnly, 3600, unix_now());
+
+        let response = send_admin_request(
+            state,
+            format!(
+                "GET /api/meter/summary?tenant=globex HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"
+            ),
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+        assert!(response.contains("acme"), "{response}");
+        assert!(
+            !response.contains("globex"),
+            "the refusal must not echo the tenant they asked about: {response}"
+        );
+    }
+
     #[test]
     fn operators_route_lists_usernames_and_roles_without_hashes() {
         let mut cfg = make_state().config.clone();
@@ -7166,6 +7706,7 @@ origins:
             username: "ro".to_string(),
             password_hash: "deadbeef".to_string(),
             role: AdminRole::ReadOnly,
+            tenant: None,
         }];
         let state = AdminState::new(cfg);
         let auth = basic_auth("admin", "secret");

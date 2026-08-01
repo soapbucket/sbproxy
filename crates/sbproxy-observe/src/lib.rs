@@ -8,6 +8,7 @@ pub mod access_log;
 pub mod agent_labels;
 pub mod alerting;
 pub mod audit;
+pub mod audit_ring;
 /// P0 edge capture helpers: custom properties, session IDs,
 /// and user IDs.
 pub mod capture;
@@ -28,6 +29,10 @@ pub mod golden_signals;
 pub mod health;
 /// Global tracing subscriber configuration (log level and format).
 pub mod logging;
+/// The `sbproxy_meter_*` families: what the attested meter reports about
+/// its own health, on both the OTLP push path and the Prometheus scrape.
+/// None of it is the billing record; the signed chain is.
+pub mod meter_metrics;
 /// The executable metric registry: every family, its writer, and its stability.
 pub mod metric_registry;
 /// Prometheus metrics registry, helpers, and per-origin recorders.

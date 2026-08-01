@@ -788,7 +788,7 @@ Each entry accepts these settings.
 | `model` | Catalog id (`qwen3-32b`) or a raw `hf:Org/Repo[:QUANT]` reference. Required. |
 | `name` | Client-facing model id that routing, budgets, and the ledger see. Defaults to the catalog id, and is required for a raw `hf:` reference. |
 | `variant` | Exact catalog v2 artifact variant to run. Omitting it lets the worker select a compatible variant. |
-| `engine` | Engine to serve with: `auto` (default), `vllm`, `sglang`, `llama_cpp`, or `embedded`. |
+| `engine` | Engine to serve with: `auto` (default), `vllm`, `sglang`, `llama_cpp`, or `mistralrs`. |
 | `modality` | Task the model performs: `chat` (default), `embedding`, `rerank`, `speech_to_text`, `text_to_speech`, or `image`. It drives the engine's task flag (`embedding` serves `--task embed`, `rerank` serves `--task score`) and zeroes the KV-cache term in the fit. Set it to serve an embedding or rerank model from a raw `hf:` reference, which has no catalog entry to carry the modality. |
 | `max_context` | Context length to plan VRAM for and pass to the engine. |
 | `keep_alive` | Idle time before the engine unloads, as a duration like `30m` or `1h`. Omitting it keeps the engine resident until eviction. |
@@ -1066,6 +1066,41 @@ vLLM stays the default. SGLang is an explicit opt-in: `engine: auto` never
 resolves to it, and you name `engine: sglang` on a model or an `sglang` block
 under `engines:` to select it. It ships at preview support until it is certified
 on real NVIDIA hardware, and it targets CUDA only for now.
+
+### mistral.rs
+
+mistral.rs is the pure-Rust engine, driven as a supervised subprocess over its
+OpenAI-compatible surface (`mistralrs serve`). It is a single-binary engine
+acquired exactly like llama.cpp: an operator-installed `mistralrs` on PATH wins,
+and otherwise the runtime fetches the pinned upstream release for the host and
+verifies its sha256 against a checked-in digest. Upstream publishes a Metal
+build for Apple Silicon and, on Linux x86-64, a CPU build plus CUDA builds per
+GPU compute capability; the runtime selects the CUDA asset from the probed GPU
+and it needs an NVIDIA driver supporting CUDA 12.8 or newer. There is no
+Intel-mac or Vulkan asset, and no container or uv path.
+
+```yaml
+engines:
+  mistralrs:
+    launch: binary
+    version: v0.9.0
+models:
+  - model: qwen2.5-0.5b-instruct
+    engine: mistralrs
+```
+
+The lane serves safetensors weights; GGUF stays llama.cpp's lane. Tool calls
+are native to the server, so no parser flag is involved. The runtime owns
+`-m`, `--host`, `--port`, `--max-seq-len`, `--max-seqs`, and `--cpu`; the
+stable extra-argument allowlist is `--no-kv-cache` and `--prefix-cache-n`.
+A configured `kv_quant` is not passed through (the lane emits no KV dtype
+flag), so the fit planner books no cache saving for it.
+
+vLLM and llama.cpp stay the defaults. mistral.rs is an explicit opt-in:
+`engine: auto` never resolves to it, and the placement planner ranks it behind
+the certified lanes. Prefer it for dense and quantized models; upstream's own
+benchmarks put its MoE BF16 prefill well behind vLLM, so large MoE serving
+belongs on vLLM or SGLang.
 
 ## Admission and residency
 

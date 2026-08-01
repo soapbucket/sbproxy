@@ -173,13 +173,65 @@ pub(super) enum InboundKeyPhase {
     },
 }
 
+/// Turn a key-store outage into a phase outcome, under the plane's
+/// configured failure posture.
+///
+/// Both inbound-key entry points below (the ordinary header sweep and the
+/// playground impersonation ticket) had their own copy of this decision.
+/// One copy, reading `key_management.failure_posture` through
+/// [`crate::key_plane::KeyPlane::failure_posture`], is the point of
+/// WOR-2121: a posture that only some of its call sites honour is a
+/// posture the operator cannot reason about.
+///
+/// An admitting posture returns [`InboundKeyPhase::NotPresent`], which
+/// falls through to the origin's own configured auth. It is deliberately
+/// not a blanket admit, and never has been.
+///
+/// [`Degraded`](sbproxy_config::types::FailureMode::Degraded) and
+/// [`Open`](sbproxy_config::types::FailureMode::Open) take the same
+/// branch and differ in what they leave behind: `degraded` says the
+/// per-key policy, budget, and attribution this request should have had
+/// were lost, and is logged as such so it can be alerted on. A plain
+/// `open` claims nothing.
+fn inbound_key_store_outage(
+    plane: &crate::key_plane::KeyPlane,
+    error: &anyhow::Error,
+) -> InboundKeyPhase {
+    let posture = plane.failure_posture();
+    if !posture.admits() {
+        return InboundKeyPhase::Deny {
+            status: 503,
+            message: "key store unavailable".to_string(),
+            trust_outcome: AuthTrustOutcome::BackendFailure,
+        };
+    }
+    if posture.guarantee_waived() {
+        tracing::warn!(
+            error = %error,
+            failure_posture = posture.as_label(),
+            guarantee_waived = true,
+            "key store unavailable; falling through to configured auth with no per-key \
+             policy, budget, or attribution"
+        );
+    } else {
+        tracing::warn!(
+            error = %error,
+            failure_posture = posture.as_label(),
+            guarantee_waived = false,
+            "key store unavailable; falling through to configured auth"
+        );
+    }
+    InboundKeyPhase::NotPresent
+}
+
 /// Resolve a minted virtual key out of the configured inbound headers, before
 /// the origin's configured auth provider runs.
 ///
 /// `raw_peer_ip` must come directly from `Session::client_addr`, before trusted
 /// forwarding headers can replace `ctx.client_ip`.
 ///
-/// Fail-closed on a store outage unless `failure_mode_allow` is set. An unknown
+/// A store outage is resolved by [`inbound_key_store_outage`] against
+/// `key_management.failure_posture`, which defaults to closed. An unknown
 /// id and a wrong secret return the same status so neither is an existence
 /// oracle.
 pub(super) async fn resolve_inbound_key(
@@ -204,13 +256,20 @@ pub(super) async fn resolve_inbound_key(
     let (header, token) = match crate::inbound_key::sweep_headers(headers, plane.inbound()) {
         crate::inbound_key::SweepOutcome::None => return InboundKeyPhase::NotPresent,
         crate::inbound_key::SweepOutcome::Ambiguous => {
+            // Observability describes the credential path the caller attempted,
+            // including denials. Keep provider empty: these are proxy-minted
+            // tokens, not caller-owned provider credentials.
+            ctx.inbound_key_mode = crate::context::InboundKeyMode::Minted;
             return InboundKeyPhase::Deny {
                 status: 400,
                 message: "conflicting api keys in more than one header".to_string(),
                 trust_outcome: AuthTrustOutcome::InvalidProof,
             };
         }
-        crate::inbound_key::SweepOutcome::Found { header, token } => (header, token),
+        crate::inbound_key::SweepOutcome::Found { header, token } => {
+            ctx.inbound_key_mode = crate::context::InboundKeyMode::Minted;
+            (header, token)
+        }
     };
 
     // Shape already proven by the sweep; this only re-splits the halves.
@@ -220,21 +279,7 @@ pub(super) async fn resolve_inbound_key(
 
     let now = chrono::Utc::now();
     match plane.cache().resolve_key(key_id).await {
-        Err(e) => {
-            if plane.failure_mode_allow() {
-                tracing::warn!(
-                    error = %e,
-                    "key store unavailable; failure_mode_allow set, falling through to configured auth"
-                );
-                InboundKeyPhase::NotPresent
-            } else {
-                InboundKeyPhase::Deny {
-                    status: 503,
-                    message: "key store unavailable".to_string(),
-                    trust_outcome: AuthTrustOutcome::BackendFailure,
-                }
-            }
-        }
+        Err(e) => inbound_key_store_outage(plane, &e),
         Ok(None) => InboundKeyPhase::Deny {
             status: 401,
             message: "invalid key".to_string(),
@@ -315,21 +360,7 @@ async fn resolve_impersonation_ticket(
     };
     let now = chrono::Utc::now();
     Some(match plane.cache().resolve_key(&key_id).await {
-        Err(e) => {
-            if plane.failure_mode_allow() {
-                tracing::warn!(
-                    error = %e,
-                    "key store unavailable; failure_mode_allow set, falling through to configured auth"
-                );
-                InboundKeyPhase::NotPresent
-            } else {
-                InboundKeyPhase::Deny {
-                    status: 503,
-                    message: "key store unavailable".to_string(),
-                    trust_outcome: AuthTrustOutcome::BackendFailure,
-                }
-            }
-        }
+        Err(e) => inbound_key_store_outage(plane, &e),
         Ok(None) => InboundKeyPhase::Deny {
             status: 401,
             message: "invalid key".to_string(),
@@ -489,6 +520,20 @@ pub(super) async fn request_filter(
             req.remove_header("x-sbproxy-tls-ja4");
             req.remove_header("x-sbproxy-tls-ja4h");
             req.remove_header("x-sbproxy-tls-trustworthy");
+            // WOR-2120: strip the A2A envelope headers from untrusted
+            // peers. These feed `caller_denylist`, `callee_allowlist`,
+            // and cycle detection, so honoring them from an arbitrary
+            // client lets that client name itself, name its callee, and
+            // assert its own call chain. `envelope_from_headers` also
+            // gates on the same trust decision; removing them here
+            // additionally keeps a forged value from reaching the
+            // upstream, which would re-introduce the forgery one hop in.
+            req.remove_header("x-a2a-caller-agent-id");
+            req.remove_header("x-a2a-callee-agent-id");
+            req.remove_header("x-a2a-task-id");
+            req.remove_header("x-a2a-parent-request-id");
+            req.remove_header("x-a2a-chain-depth");
+            req.remove_header("x-a2a-chain");
         }
     }
 
@@ -719,36 +764,18 @@ pub(super) async fn request_filter(
             None, // operator route_glob is per-policy; consulted later
         );
         if let Some(signal) = detected {
-            let spec = signal.to_spec();
-            let mut a2a_ctx = sbproxy_modules::A2AContext::empty(spec);
-            let h = &session.req_header().headers;
-            if let Some(v) = h.get("x-a2a-caller-agent-id").and_then(|v| v.to_str().ok()) {
-                a2a_ctx.caller_agent_id = v.to_string();
-            }
-            if let Some(v) = h.get("x-a2a-callee-agent-id").and_then(|v| v.to_str().ok()) {
-                a2a_ctx.callee_agent_id = Some(v.to_string());
-            }
-            if let Some(v) = h.get("x-a2a-task-id").and_then(|v| v.to_str().ok()) {
-                a2a_ctx.task_id = v.to_string();
-            }
-            if let Some(v) = h
-                .get("x-a2a-parent-request-id")
-                .and_then(|v| v.to_str().ok())
-            {
-                a2a_ctx.parent_request_id = Some(v.to_string());
-            }
-            if let Some(v) = h
-                .get("x-a2a-chain-depth")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u32>().ok())
-            {
-                a2a_ctx.chain_depth = v.max(1);
-            }
-            if let Some(raw) = h.get("x-a2a-chain").and_then(|v| v.to_str().ok()) {
-                if let Ok(parsed) = serde_json::from_str::<Vec<sbproxy_modules::ChainHop>>(raw) {
-                    a2a_ctx.chain = parsed;
-                }
-            }
+            // WOR-2120: the envelope is only populated from headers when
+            // the immediate peer is in `proxy.trusted_proxies`. An
+            // untrusted caller gets the zero-default envelope with
+            // `identity_verified` clear, so the policy can tell "no
+            // identity asserted" apart from "identity asserted by
+            // someone we trust" instead of treating a forged
+            // `x-a2a-chain-depth: 1` as a genuine chain root.
+            let a2a_ctx = sbproxy_modules::envelope_from_headers(
+                &session.req_header().headers,
+                signal.to_spec(),
+                peer_trusted,
+            );
             ctx.a2a = Some(a2a_ctx);
         }
     }
@@ -2385,25 +2412,111 @@ pub(super) async fn request_filter(
     // minted keys and its existing JWT / OIDC / mTLS auth. Running first, and
     // short-circuiting only on success, is what lets a minted key work in
     // parallel with credentials the proxy does not own.
-    if let Some(plane) = crate::key_plane::current_key_plane() {
+    //
+    // AI actions have two additional credential sources whose `sk-...` shape
+    // overlaps provider-native keys: legacy stored virtual keys and exact
+    // `ai_provider` credentials from origin config. Let the AI resolver check
+    // those sources before it falls back to native-key admission. Generic
+    // proxy actions have no later resolver and remain fully governed here.
+    let ai_action_resolves_overlapping_credentials = ai_proxy_owns_replay_paths;
+    if let Some(plane) = pipeline.key_plane() {
         let origin_label = ctx.hostname.to_string();
         // Bind the outcome before matching so the immutable borrow of
         // `session` ends here rather than spanning the arms, which need it
         // mutably to write an error response.
         let outcome =
-            resolve_inbound_key(&plane, &session.req_header().headers, raw_peer_ip, ctx).await;
+            resolve_inbound_key(plane, &session.req_header().headers, raw_peer_ip, ctx).await;
         match outcome {
             InboundKeyPhase::Resolved => {
+                ctx.inbound_key_mode = crate::context::InboundKeyMode::Minted;
                 sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", true);
             }
             InboundKeyPhase::NotPresent => {
-                // No minted key: attribute a native provider credential, if
-                // one is recognizable, so this traffic stops being invisible
-                // to metrics, audit, and policy. Attribution never refuses.
-                ctx.native_key_provider = crate::inbound_key::resolve_provider_hint(
-                    &session.req_header().headers,
-                    &plane.inbound().provider_hints,
-                );
+                if !ai_action_resolves_overlapping_credentials {
+                    // No minted key: recognize and govern a caller-owned native
+                    // provider credential. The explicit default policy is what
+                    // prevents this path from silently spending an operator key.
+                    match crate::inbound_key::resolve_native_key_policy(
+                        &session.req_header().headers,
+                        plane.inbound(),
+                    ) {
+                        crate::inbound_key::NativeKeyPolicyDecision::NotPresent => {}
+                        crate::inbound_key::NativeKeyPolicyDecision::Allowed { provider } => {
+                            let policy = plane
+                                .inbound()
+                                .native_key_policy
+                                .as_ref()
+                                .expect("allowed native key decision requires a policy");
+                            let record = crate::inbound_key::native_policy_record(
+                                policy,
+                                ctx.tenant_id.as_str(),
+                                ctx.hostname.as_str(),
+                                &provider,
+                            );
+                            ctx.native_key_provider = Some(provider);
+                            ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
+                            let within_rpm = record.max_requests_per_minute.is_none()
+                                || super::ai_dispatch::key_rate_limiter().check_request_rate(
+                                    &record.key_id,
+                                    record.max_requests_per_minute,
+                                );
+                            ctx.native_key_policy_record = Some(Box::new(record));
+                            if !within_rpm {
+                                sbproxy_observe::metrics::record_policy(
+                                    &origin_label,
+                                    "rate_limit",
+                                    "deny",
+                                );
+                                sbproxy_observe::SecurityAuditEntry::policy_violation(
+                                    "rate_limit",
+                                    "native provider key request rate exceeded",
+                                    429,
+                                    Some(origin_label.clone()),
+                                    ctx.client_ip,
+                                    Some(ctx.request_id.to_string()),
+                                    Some(session.req_header().method.as_str().to_string()),
+                                )
+                                .with_tenant_id(ctx.tenant_id.to_string())
+                                .with_key_context(
+                                    ctx.native_key_provider.clone(),
+                                    ctx.inbound_key_mode.as_str(),
+                                )
+                                .with_api_key_id(ctx.accountable_key_id())
+                                .emit();
+                                send_error(session, 429, "rate limit exceeded for this key")
+                                    .await?;
+                                return Ok(true);
+                            }
+                        }
+                        crate::inbound_key::NativeKeyPolicyDecision::PolicyMissing { provider }
+                        | crate::inbound_key::NativeKeyPolicyDecision::ProviderDenied {
+                            provider,
+                        } => {
+                            ctx.native_key_provider = Some(provider);
+                            ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
+                            // WOR-2094: the ring row names the denial.
+                            ctx.record_policy_decision("native_key_policy", "deny");
+                            ctx.deny_reason =
+                                Some("native_key_policy: provider not allowed".to_string());
+                            finalize_inbound_key_trust(ctx, AuthTrustOutcome::Missing);
+                            sbproxy_observe::metrics::record_auth(
+                                &origin_label,
+                                "native_provider_key",
+                                false,
+                            );
+                            emit_auth_audit(
+                                "auth_denied",
+                                "native_provider_key",
+                                403,
+                                &origin_label,
+                                ctx,
+                                session,
+                            );
+                            send_error(session, 403, "native provider key is not allowed").await?;
+                            return Ok(true);
+                        }
+                    }
+                }
                 if crate::inbound_key::requires_minted_key(plane.inbound()) {
                     finalize_inbound_key_trust(ctx, AuthTrustOutcome::Missing);
                     sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", false);
@@ -3002,6 +3115,13 @@ pub(super) async fn request_filter(
             // dashboards and SIEM rules can break down by module
             // instead of inferring from the response status.
             sbproxy_observe::metrics::record_policy(&policy_origin, policy_type, "deny");
+            // WOR-2094: mirror the denial onto the ring row's
+            // explainability columns. Enforcers that already recorded a
+            // more specific reason keep it.
+            ctx.record_policy_decision(policy_type, "deny");
+            if ctx.deny_reason.is_none() {
+                ctx.deny_reason = Some(format!("{policy_type}: {msg}"));
+            }
             // Audit-log the denial alongside the metric. Policy
             // metrics roll up to dashboards; the audit channel
             // feeds the SIEM with structured per-event records so
@@ -3017,6 +3137,11 @@ pub(super) async fn request_filter(
                 Some(session.req_header().method.as_str().to_string()),
             )
             .with_tenant_id(ctx.tenant_id.to_string())
+            .with_key_context(
+                ctx.native_key_provider.clone(),
+                ctx.inbound_key_mode.as_str(),
+            )
+            .with_api_key_id(ctx.accountable_key_id())
             .emit();
             if let Some(response) =
                 take_concurrent_limit_denial_response(ctx, status, &msg, policy_type)
@@ -3096,14 +3221,14 @@ pub(super) async fn request_filter(
                 // AI crawl control: 402 with the configured
                 // challenge header and a JSON body the crawler
                 // can introspect for price + retry instructions.
-                let (header_name, challenge, body) =
-                    ctx.crawl_challenge.take().unwrap_or_else(|| {
-                        (
-                            "crawler-payment".to_string(),
-                            "Crawler-Payment realm=\"ai-crawl\"".to_string(),
-                            error_json_body(&msg),
-                        )
-                    });
+                let rendered = ctx.crawl_challenge.take().unwrap_or_else(|| {
+                    crate::context::PaymentResponse::json_with_header(
+                        "crawler-payment",
+                        "Crawler-Payment realm=\"ai-crawl\"".to_string(),
+                        error_json_body(&msg),
+                    )
+                });
+                let body = rendered.body;
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(3)).map_err(|e| {
                         Error::because(
@@ -3112,18 +3237,14 @@ pub(super) async fn request_filter(
                             e,
                         )
                     })?;
-                // G3.4 multi-rail emits the response via the same
-                // crawl_challenge slot but uses the sentinel
-                // header_name `Content-Type` to signal "stamp this
-                // value as Content-Type, skip the Crawler-Payment
-                // header". Wave 1 single-rail keeps the original
-                // behaviour: Content-Type is application/json and
-                // header_name carries the Crawler-Payment value.
-                if header_name.eq_ignore_ascii_case("content-type") {
-                    let _ = header.insert_header("content-type", &challenge);
-                } else {
-                    let _ = header.insert_header("content-type", "application/json");
-                    let _ = header.insert_header(header_name, &challenge);
+                // The policy already decided the exact content type and
+                // every header. Repeated names are appended rather than
+                // replaced, because Payment HTTP Authentication offers one
+                // `WWW-Authenticate` field per challenge and collapsing them
+                // into one field is a different, non-conforming message.
+                let _ = header.insert_header("content-type", &rendered.content_type);
+                for (name, value) in &rendered.headers {
+                    let _ = header.append_header(name.clone(), value);
                 }
                 // Content-Length is required so HTTP/1.1 keep-alive
                 // clients know where the body ends without waiting
@@ -3144,7 +3265,7 @@ pub(super) async fn request_filter(
                 let body = ctx
                     .crawl_challenge
                     .take()
-                    .map(|(_, _, body)| body)
+                    .map(|rendered| rendered.body)
                     .unwrap_or_else(|| error_json_body(&msg));
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(2)).map_err(|e| {
@@ -3170,7 +3291,7 @@ pub(super) async fn request_filter(
                 let body = ctx
                     .crawl_challenge
                     .take()
-                    .map(|(_, _, body)| body)
+                    .map(|rendered| rendered.body)
                     .unwrap_or_else(|| error_json_body(&msg));
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(2)).map_err(|e| {
@@ -3195,7 +3316,7 @@ pub(super) async fn request_filter(
                 let body = ctx
                     .crawl_challenge
                     .take()
-                    .map(|(_, _, body)| body)
+                    .map(|rendered| rendered.body)
                     .unwrap_or_else(|| error_json_body(&msg));
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(3)).map_err(|e| {
@@ -5626,6 +5747,15 @@ mod inbound_key_phase_tests {
         let outcome =
             resolve_inbound_key(&plane, &headers(&[("x-api-key", &revoked)]), None, &mut c).await;
         assert_denial(outcome, 403, AuthTrustOutcome::InvalidProof);
+        assert_eq!(
+            c.inbound_key_mode,
+            crate::context::InboundKeyMode::Minted,
+            "a recognized minted attempt must retain its mode on denial"
+        );
+        assert!(
+            c.native_key_provider.is_none(),
+            "a minted denial must not invent provider attribution"
+        );
         assert!(
             c.resolved_inbound_key.is_none(),
             "a denied key is not stamped"
@@ -5640,6 +5770,12 @@ mod inbound_key_phase_tests {
         let outcome =
             resolve_inbound_key(&plane, &headers(&[("x-api-key", &unknown)]), None, &mut c).await;
         assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
+        assert_eq!(
+            c.inbound_key_mode,
+            crate::context::InboundKeyMode::Minted,
+            "an unknown minted-shaped key must still be observable as minted"
+        );
+        assert!(c.native_key_provider.is_none());
     }
 
     #[tokio::test]
@@ -5652,6 +5788,12 @@ mod inbound_key_phase_tests {
         let outcome =
             resolve_inbound_key(&plane, &headers(&[("x-api-key", &wrong)]), None, &mut c).await;
         assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
+        assert_eq!(
+            c.inbound_key_mode,
+            crate::context::InboundKeyMode::Minted,
+            "a wrong minted secret must still be observable as minted"
+        );
+        assert!(c.native_key_provider.is_none());
     }
 
     #[tokio::test]
@@ -5661,6 +5803,12 @@ mod inbound_key_phase_tests {
         let h = headers(&[("x-api-key", &token), ("x-sb-api", &revoked)]);
         let outcome = resolve_inbound_key(&plane, &h, None, &mut c).await;
         assert_denial(outcome, 400, AuthTrustOutcome::InvalidProof);
+        assert_eq!(
+            c.inbound_key_mode,
+            crate::context::InboundKeyMode::Minted,
+            "conflicting minted-shaped credentials are still a minted attempt"
+        );
+        assert!(c.native_key_provider.is_none());
     }
 
     #[tokio::test]
@@ -5678,6 +5826,93 @@ mod inbound_key_phase_tests {
             resolve_inbound_key(&plane, &headers(&[("x-api-key", &token)]), None, &mut c).await;
 
         assert_denial(outcome, 503, AuthTrustOutcome::BackendFailure);
+    }
+
+    /// A plane over a store that always fails key reads, pinned to `posture`.
+    fn broken_store_plane(
+        posture: sbproxy_config::types::FailureMode,
+    ) -> (crate::key_plane::KeyPlane, String) {
+        let crypto = KeyCrypto::new(b"pep".to_vec(), b"mas".to_vec());
+        let token = crypto.mint_key().token;
+        let store: Arc<dyn KeyStore> = Arc::new(BrokenKeyReadStore {
+            inner: MemoryKeyStore::new(),
+        });
+        let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
+        let plane = crate::key_plane::KeyPlane::from_parts(crypto, cache, false, false, None)
+            .with_failure_posture(posture);
+        (plane, token)
+    }
+
+    /// Every posture, at both inbound-key entry points, from one accessor.
+    ///
+    /// The legacy `failure_mode_allow: false` and `true` resolve to
+    /// `closed` and `degraded`, so the first two rows below are also the
+    /// legacy behaviour, unchanged. An admitting posture returns
+    /// `NotPresent`, which falls through to the origin's configured auth;
+    /// it has never been a blanket admit and still is not.
+    #[tokio::test]
+    async fn the_failure_posture_governs_both_inbound_key_outage_paths() {
+        use sbproxy_config::types::FailureMode;
+
+        for (posture, admits) in [
+            (FailureMode::Closed, false),
+            (FailureMode::Degraded, true),
+            (FailureMode::Open, true),
+        ] {
+            let (plane, token) = broken_store_plane(posture);
+
+            let mut swept = ctx();
+            let outcome =
+                resolve_inbound_key(&plane, &headers(&[("x-api-key", &token)]), None, &mut swept)
+                    .await;
+            if admits {
+                assert!(
+                    matches!(outcome, InboundKeyPhase::NotPresent),
+                    "{posture:?} must fall through, not deny: {outcome:?}"
+                );
+            } else {
+                assert_denial(outcome, 503, AuthTrustOutcome::BackendFailure);
+            }
+
+            // Same decision on the playground impersonation ticket path,
+            // which used to carry its own copy of it.
+            let ticket = crate::admin_playground::ticket::mint("some-key-id");
+            let mut ticketed = loopback_ctx();
+            let outcome = resolve_inbound_key(
+                &plane,
+                &headers(&[("authorization", &format!("Bearer {ticket}"))]),
+                Some(loopback_ip()),
+                &mut ticketed,
+            )
+            .await;
+            if admits {
+                assert!(
+                    matches!(outcome, InboundKeyPhase::NotPresent),
+                    "{posture:?} must fall through on the ticket path too: {outcome:?}"
+                );
+            } else {
+                assert_denial(outcome, 503, AuthTrustOutcome::BackendFailure);
+            }
+        }
+    }
+
+    /// `degraded` and `open` admit the same request and are still not the
+    /// same answer. The difference is what the plane reports about the
+    /// guarantee it did not make, which is what an operator alerts on.
+    #[test]
+    fn degraded_is_distinguishable_from_open_on_the_admitting_path() {
+        use sbproxy_config::types::FailureMode;
+
+        let (degraded, _) = broken_store_plane(FailureMode::Degraded);
+        let (open, _) = broken_store_plane(FailureMode::Open);
+
+        assert!(degraded.failure_posture().admits());
+        assert!(open.failure_posture().admits());
+
+        assert!(degraded.failure_posture().guarantee_waived());
+        assert!(!open.failure_posture().guarantee_waived());
+        assert_eq!(degraded.failure_posture().as_label(), "degraded");
+        assert_eq!(open.failure_posture().as_label(), "open");
     }
 
     #[tokio::test]

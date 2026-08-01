@@ -22,15 +22,19 @@ pub use action::{
     ProxyAction, RoutingOutcome, RoutingRequest, RoutingStrategy, RoutingStrategyRegistration,
     TargetState, VersionSource,
 };
-pub use auth::a2a::{detect as detect_a2a, A2AContext, A2ASpec, ChainHop, DetectedSpec};
+pub use auth::a2a::v1 as a2a_v1;
+pub use auth::a2a::{
+    apply_verified_act_chain, chain_from_act_claims, detect as detect_a2a, envelope_from_headers,
+    A2AContext, A2ASpec, ChainHop, DetectedSpec,
+};
 pub use auth::{ApiKeyAuth, Auth};
 pub use compile::*;
 pub use policy::{
     classification_cache_stats, evaluate_body, evaluate_body_with_audit, parse_aipref,
-    reset_classification_cache, AgentBudgetDecision, AgentBudgetExceedReason, AgentBudgetGuard,
-    AgentBudgetOnAnonymous, AgentBudgetOnExceed, AgentBudgetPolicy, AiCrawlControlPolicy,
-    AiCrawlDecision, AiCrawlLedger, AiprefParseError, AiprefSignal, AssertionPolicy,
-    BodyAwareAuditContext, BodyAwareConfig, BodyAwareOutcome, BotDetection,
+    reset_classification_cache, A2AInjectionAction, AgentBudgetDecision, AgentBudgetExceedReason,
+    AgentBudgetGuard, AgentBudgetOnAnonymous, AgentBudgetOnExceed, AgentBudgetPolicy,
+    AiCrawlControlPolicy, AiCrawlDecision, AiCrawlLedger, AiprefParseError, AiprefSignal,
+    AssertionPolicy, BodyAwareAuditContext, BodyAwareConfig, BodyAwareOutcome, BotDetection,
     ClassificationCacheStats, ContentDigestOnMissing, ContentDigestPolicy,
     ContentDigestVerifyOutcome, ContentShape, ContentSignal, ContentSignalParseError,
     DdosCheckResult, DdosPolicy, DetectionLabel, DetectionResult, Detector, DlpAction,
@@ -38,10 +42,11 @@ pub use policy::{
     ExposedCredsResult, ExpressionPolicy, ExpressionViews, InMemoryLedger, LedgerError, Money,
     ObjectAuthzPolicy, ObjectAuthzPrincipal, ObjectAuthzViolation, ObjectAuthzViolationKind,
     OpenApiValidationMode, OpenApiValidationPolicy, OpenApiValidationResult, OwnerSource,
-    PageShieldMode, PageShieldPolicy, PaywallPosition, Policy, PricingModel, PromptInjectionAction,
-    PromptInjectionV2Outcome, PromptInjectionV2Policy, RateLimitInfo, RateLimitPolicy,
-    RedeemResult, SecHeadersPolicy, SecurityHeader, SriCheckResult, SriPolicy, SriViolation,
-    SriViolationReason, ThreatProtection, Tier, WafResult, HEURISTIC_DETECTOR_NAME,
+    PageShieldMode, PageShieldPolicy, PaywallPosition, Policy, PricingModel,
+    PromptInjectionA2AConfig, PromptInjectionAction, PromptInjectionV2Outcome,
+    PromptInjectionV2Policy, RateLimitInfo, RateLimitPolicy, RedeemResult, SecHeadersPolicy,
+    SecurityHeader, SriCheckResult, SriPolicy, SriViolation, SriViolationReason, ThreatProtection,
+    Tier, WafResult, DEFAULT_BLOCK_ABOVE_DELEGATION_DEPTH, HEURISTIC_DETECTOR_NAME,
 };
 #[cfg(feature = "http-ledger")]
 pub use policy::{HttpLedger, HttpLedgerConfig};

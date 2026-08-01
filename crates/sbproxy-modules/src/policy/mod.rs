@@ -28,11 +28,15 @@ pub mod ip_filter;
 pub mod object_authz;
 pub mod openapi_validation;
 pub mod page_shield;
+/// Compiles one priced route into one signed payment requirement.
+#[cfg(feature = "payments")]
+pub mod payment_requirement;
 pub mod prompt_injection_v2;
 pub mod quote_token;
 pub mod rate_limit;
 pub mod rate_limit_budget;
 pub mod rate_limit_cluster;
+pub mod receipt_token;
 pub mod request_limit;
 pub mod request_validator;
 pub mod sec_headers;
@@ -86,15 +90,21 @@ pub use openapi_validation::{
 pub use page_shield::{PageShieldMode, PageShieldPolicy, DEFAULT_REPORT_PATH};
 pub use prompt_injection_v2::{
     classification_cache_stats, evaluate_body, evaluate_body_with_audit,
-    reset_classification_cache, BodyAwareAuditContext, BodyAwareConfig, BodyAwareOutcome,
-    ClassificationCacheStats, DetectionLabel, DetectionResult, Detector, PromptInjectionAction,
-    PromptInjectionV2Outcome, PromptInjectionV2Policy, HEURISTIC_DETECTOR_NAME,
+    reset_classification_cache, A2AInjectionAction, BodyAwareAuditContext, BodyAwareConfig,
+    BodyAwareOutcome, ClassificationCacheStats, DetectionLabel, DetectionResult, Detector,
+    PromptInjectionA2AConfig, PromptInjectionAction, PromptInjectionV2Outcome,
+    PromptInjectionV2Policy, DEFAULT_BLOCK_ABOVE_DELEGATION_DEPTH, HEURISTIC_DETECTOR_NAME,
 };
 pub use quote_token::{
     InMemoryNonceStore, IssuedQuote, NonceCheck, NonceContext, NonceError, NonceStore, QuoteClaims,
     QuoteTokenSigner, QuoteTokenVerifier, SignError, VerifyError, MAX_IAT_SKEW,
 };
 pub use rate_limit::{RateLimitInfo, RateLimitPolicy};
+pub use receipt_token::{
+    outcome_wire_name, receipt_content_digest, ReceiptClaims, ReceiptEvidence, ReceiptSignError,
+    ReceiptSubject, ReceiptTokenSigner, ReceiptTokenVerifier, ReceiptUnit, ReceiptVerifyError,
+    RECEIPT_JWS_TYP,
+};
 pub use request_limit::{RequestLimitPolicy, SizeValue};
 pub use request_validator::RequestValidatorPolicy;
 pub use sec_headers::{

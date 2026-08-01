@@ -12,10 +12,11 @@ use sbproxy_model_host::{
     EngineCapabilities, EngineCommand, EngineDetection, EngineDriver, EngineDriverError,
     EngineFailureReason, EngineHealth, EngineKind, EngineProcess, EngineProcessRunner,
     EngineProvisioning, EngineReadinessProbe, EngineSupervisor, FileJobStore, FitPlan,
-    KvCacheQuant, LaunchRequest, LlamaBinarySource, LlamaCppDriver, OperationJob, OperationKind,
-    OperationProgress, OperationState, ProvisionRequest, ProvisionedEngine, Quant, ReadyArtifact,
-    ResolvedArtifact, RunningEngine, SGLangDriver, SupervisorClock, SupportLevel, VllmDriver,
-    VllmHost, VllmLaunchMode, WorkerProfile,
+    KvCacheQuant, LaunchRequest, LlamaBinarySource, LlamaCppDriver, MistralRsBinarySource,
+    MistralRsDriver, OperationJob, OperationKind, OperationProgress, OperationState,
+    ProvisionRequest, ProvisionedEngine, Quant, ReadyArtifact, ResolvedArtifact, RunningEngine,
+    SGLangDriver, SupervisorClock, SupportLevel, VllmDriver, VllmHost, VllmLaunchMode,
+    WorkerProfile,
 };
 use tempfile::tempdir;
 
@@ -60,7 +61,7 @@ impl EngineDriver for FixtureDriver {
                 EngineKind::LlamaCpp => vec![ArtifactFormat::Gguf],
                 EngineKind::Vllm => vec![ArtifactFormat::Safetensors],
                 EngineKind::SGLang => vec![ArtifactFormat::Safetensors],
-                EngineKind::Embedded => Vec::new(),
+                EngineKind::MistralRs => vec![ArtifactFormat::Safetensors],
             },
             accelerators: vec![sbproxy_model_host::AcceleratorKind::Cpu],
             supports_container: self.kind == EngineKind::Vllm,
@@ -238,6 +239,7 @@ async fn driver_contract_is_complete_and_object_safe() {
     for (kind, format) in [
         (EngineKind::LlamaCpp, ArtifactFormat::Gguf),
         (EngineKind::Vllm, ArtifactFormat::Safetensors),
+        (EngineKind::MistralRs, ArtifactFormat::Safetensors),
     ] {
         let driver: Arc<dyn EngineDriver> = Arc::new(FixtureDriver { kind });
         let provisioning = EngineProvisioning::default();
@@ -579,6 +581,14 @@ fn unsafe_arguments_cannot_override_runtime_owned_launch_fields() {
             EngineKind::SGLang,
             vec!["--schedule-conservativeness", "-1"],
         ),
+        // WOR-1861: mistral.rs keeps model, host, port, sequence length,
+        // concurrency, and device placement runtime-owned.
+        (EngineKind::MistralRs, vec!["-m", "/tmp/other"]),
+        (EngineKind::MistralRs, vec!["--host", "0.0.0.0"]),
+        (EngineKind::MistralRs, vec!["--port=9000"]),
+        (EngineKind::MistralRs, vec!["--max-seq-len", "999999"]),
+        (EngineKind::MistralRs, vec!["--max-seqs", "9999"]),
+        (EngineKind::MistralRs, vec!["--cpu"]),
     ] {
         let arguments = arguments
             .into_iter()
@@ -629,6 +639,19 @@ fn unsafe_arguments_cannot_override_runtime_owned_launch_fields() {
             "--schedule-conservativeness",
             "1.3",
         ]
+    );
+    // WOR-1861: mistral.rs's stable allowlist accepts its safe tuning
+    // knobs; everything runtime-owned is in the rejected set above.
+    assert_eq!(
+        validate_engine_args(
+            EngineKind::MistralRs,
+            &[
+                "--no-kv-cache".to_string(),
+                "--prefix-cache-n=32".to_string()
+            ]
+        )
+        .expect("allowlisted mistralrs arguments"),
+        vec!["--no-kv-cache", "--prefix-cache-n=32"]
     );
 }
 
@@ -1187,6 +1210,255 @@ async fn llama_launch_uses_one_verified_gguf_and_runtime_owned_network_and_devic
     assert_eq!(flag_value(arguments, "--cache-type-k"), "q4_0");
     assert_eq!(flag_value(arguments, "--cache-type-v"), "q4_0");
     assert_eq!(captured[0].environment["CUDA_VISIBLE_DEVICES"], "2");
+}
+
+type MistralRsFetchRecord = (String, String, Option<String>);
+
+#[derive(Clone)]
+struct FixtureMistralRsSource {
+    on_path: Option<PathBuf>,
+    executable: bool,
+    fetched: Result<PathBuf, String>,
+    fetches: Arc<Mutex<Vec<MistralRsFetchRecord>>>,
+}
+
+#[async_trait]
+impl MistralRsBinarySource for FixtureMistralRsSource {
+    fn resolve_on_path(&self) -> Option<PathBuf> {
+        self.on_path.clone()
+    }
+
+    fn is_executable(&self, _path: &std::path::Path) -> bool {
+        self.executable
+    }
+
+    async fn fetch_release(
+        &self,
+        _cache_dir: &std::path::Path,
+        tag: &str,
+        asset: &str,
+        sha256: Option<&str>,
+    ) -> Result<PathBuf, String> {
+        self.fetches.lock().unwrap().push((
+            tag.to_string(),
+            asset.to_string(),
+            sha256.map(str::to_string),
+        ));
+        self.fetched.clone()
+    }
+}
+
+fn mistralrs_source(on_path: Option<&str>, executable: bool) -> Arc<FixtureMistralRsSource> {
+    Arc::new(FixtureMistralRsSource {
+        on_path: on_path.map(PathBuf::from),
+        executable,
+        fetched: Ok(PathBuf::from("/engines/mistralrs")),
+        fetches: Arc::new(Mutex::new(Vec::new())),
+    })
+}
+
+fn mistralrs_worker() -> WorkerProfile {
+    WorkerProfile {
+        accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
+        compute_capability: None,
+        memory_bytes: 8 * 1024 * 1024 * 1024,
+        engines: BTreeSet::from([EngineKind::MistralRs]),
+    }
+}
+
+#[test]
+fn mistralrs_detection_distinguishes_available_acquirable_and_incompatible() {
+    let runner = fixture_runner(Arc::new(Mutex::new(Vec::new())));
+    let available = MistralRsDriver::new(
+        runner.clone(),
+        mistralrs_source(Some("/usr/local/bin/mistralrs"), true),
+    );
+    assert_eq!(
+        available
+            .detect(&mistralrs_worker(), &EngineProvisioning::default())
+            .availability,
+        EngineAvailability::Available
+    );
+
+    // Off PATH on a CPU worker: the pinned release asset for this host
+    // platform (metal on macOS arm64, cpu on Linux x86-64) is acquirable
+    // and carries a built-in digest, so no digest remediation is needed.
+    let acquirable = MistralRsDriver::new(runner.clone(), mistralrs_source(None, true));
+    let detection = acquirable.detect(&mistralrs_worker(), &EngineProvisioning::default());
+    assert_eq!(detection.availability, EngineAvailability::Acquirable);
+    assert_eq!(
+        detection.version.as_deref(),
+        Some(sbproxy_model_host::DEFAULT_MISTRALRS_RELEASE_TAG)
+    );
+    assert!(
+        detection.reason.contains("digest-pinned"),
+        "{}",
+        detection.reason
+    );
+
+    // A worker profile that does not permit mistral.rs is incompatible.
+    let excluded = WorkerProfile {
+        engines: BTreeSet::from([EngineKind::Vllm]),
+        ..mistralrs_worker()
+    };
+    assert_eq!(
+        acquirable
+            .detect(&excluded, &EngineProvisioning::default())
+            .availability,
+        EngineAvailability::Incompatible
+    );
+}
+
+#[tokio::test]
+async fn mistralrs_provision_fetches_the_pinned_release_with_a_builtin_digest() {
+    let source = mistralrs_source(None, true);
+    let driver = MistralRsDriver::new(
+        fixture_runner(Arc::new(Mutex::new(Vec::new()))),
+        source.clone(),
+    );
+    let provisioned = driver
+        .provision(&ProvisionRequest {
+            artifact: resolved(EngineKind::MistralRs, ArtifactFormat::Safetensors),
+            worker: mistralrs_worker(),
+            provisioning: EngineProvisioning::default(),
+            engine_cache_dir: PathBuf::from("/engines"),
+            job_store: None,
+        })
+        .await
+        .expect("mistralrs provision");
+    assert_eq!(provisioned.kind, EngineKind::MistralRs);
+    assert_eq!(
+        provisioned.version.as_deref(),
+        Some(sbproxy_model_host::DEFAULT_MISTRALRS_RELEASE_TAG)
+    );
+    assert!(
+        provisioned.fingerprint.starts_with("sha256:"),
+        "{}",
+        provisioned.fingerprint
+    );
+
+    let fetches = source.fetches.lock().unwrap();
+    assert_eq!(fetches.len(), 1);
+    let (tag, asset, sha256) = &fetches[0];
+    assert_eq!(tag, sbproxy_model_host::DEFAULT_MISTRALRS_RELEASE_TAG);
+    assert!(asset.starts_with("mistralrs-"), "{asset}");
+    // The CPU-worker asset for every supported dev/CI host has a
+    // checked-in digest, and provisioning must pass it for verification.
+    assert_eq!(sha256.as_deref().map(str::len), Some(64));
+}
+
+#[tokio::test]
+async fn mistralrs_launch_serves_the_verified_snapshot_with_runtime_owned_flags() {
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let driver = MistralRsDriver::new(
+        fixture_runner(commands.clone()),
+        mistralrs_source(Some("/usr/local/bin/mistralrs"), true),
+    );
+    let provisioned = ProvisionedEngine {
+        kind: EngineKind::MistralRs,
+        executable: PathBuf::from("/usr/local/bin/mistralrs"),
+        version: Some("v0.9.0".to_string()),
+        fingerprint: "fixture".to_string(),
+        provisioning: EngineProvisioning::default(),
+    };
+    let request = LaunchRequest {
+        deployment: "coder".to_string(),
+        generation: 3,
+        artifact: ready(EngineKind::MistralRs, ArtifactFormat::Safetensors),
+        fit: fit(),
+        port: 18082,
+        accelerator: sbproxy_model_host::AcceleratorKind::Cuda,
+        selected_devices: vec![1],
+        kv_quant: KvCacheQuant::Auto,
+        extra_args: vec!["--no-kv-cache".to_string()],
+        engine_tuning: Default::default(),
+        max_concurrency: 4,
+        modality: Default::default(),
+        ready_timeout: Duration::from_secs(1),
+    };
+
+    let running = driver
+        .launch(&provisioned, &request)
+        .await
+        .expect("mistralrs launch");
+    assert_eq!(running.port, 18082);
+    assert_eq!(driver.health(&running).await.unwrap(), EngineHealth::Ready);
+
+    let captured = commands.lock().unwrap();
+    let arguments = &captured[0].arguments;
+    assert_eq!(arguments[0], "serve");
+    assert_eq!(flag_value(arguments, "-m"), "/verified/fixture");
+    assert_eq!(flag_value(arguments, "--host"), "127.0.0.1");
+    assert_eq!(flag_value(arguments, "--port"), "18082");
+    assert_eq!(flag_value(arguments, "--max-seq-len"), "4096");
+    assert_eq!(flag_value(arguments, "--max-seqs"), "4");
+    assert!(arguments.iter().any(|value| value == "--no-ui"));
+    assert!(arguments.iter().any(|value| value == "--no-kv-cache"));
+    assert!(!arguments.iter().any(|value| value == "--cpu"));
+    assert_eq!(captured[0].environment["CUDA_VISIBLE_DEVICES"], "1");
+    // The FlashInfer decode kernel fails live on GQA shapes (L4,
+    // status 999), so CUDA launches pin the fallback decode path.
+    assert_eq!(captured[0].environment["MISTRALRS_FLASHINFER_DECODE"], "0");
+}
+
+#[tokio::test]
+async fn mistralrs_cpu_launch_forces_cpu_without_exporting_a_cuda_device() {
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let driver = MistralRsDriver::new(
+        fixture_runner(commands.clone()),
+        mistralrs_source(Some("/usr/local/bin/mistralrs"), true),
+    );
+    let provisioned = ProvisionedEngine {
+        kind: EngineKind::MistralRs,
+        executable: PathBuf::from("/usr/local/bin/mistralrs"),
+        version: Some("v0.9.0".to_string()),
+        fingerprint: "fixture".to_string(),
+        provisioning: EngineProvisioning::default(),
+    };
+    driver
+        .launch(
+            &provisioned,
+            &LaunchRequest {
+                deployment: "cpu-coder".to_string(),
+                generation: 1,
+                artifact: ready(EngineKind::MistralRs, ArtifactFormat::Safetensors),
+                fit: fit(),
+                port: 18083,
+                accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
+                selected_devices: Vec::new(),
+                kv_quant: KvCacheQuant::Auto,
+                extra_args: Vec::new(),
+                engine_tuning: Default::default(),
+                max_concurrency: 1,
+                modality: Default::default(),
+                ready_timeout: Duration::from_secs(1),
+            },
+        )
+        .await
+        .unwrap();
+
+    let captured = commands.lock().unwrap();
+    assert!(captured[0].arguments.iter().any(|value| value == "--cpu"));
+    assert!(!captured[0].environment.contains_key("CUDA_VISIBLE_DEVICES"));
+}
+
+#[tokio::test]
+async fn mistralrs_rejects_gguf_artifacts() {
+    let driver = MistralRsDriver::new(
+        fixture_runner(Arc::new(Mutex::new(Vec::new()))),
+        mistralrs_source(Some("/usr/local/bin/mistralrs"), true),
+    );
+    let error = driver
+        .provision(&ProvisionRequest {
+            artifact: resolved(EngineKind::MistralRs, ArtifactFormat::Gguf),
+            worker: mistralrs_worker(),
+            provisioning: EngineProvisioning::default(),
+            engine_cache_dir: PathBuf::from("/engines"),
+            job_store: None,
+        })
+        .await
+        .expect_err("gguf must be rejected: llama.cpp owns that lane");
+    assert_eq!(error.reason(), EngineFailureReason::EngineIncompatible);
 }
 
 #[tokio::test]

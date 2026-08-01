@@ -453,7 +453,7 @@ pub(crate) fn validate_legacy_managed_compatibility(
         Some(kind) => kind == EngineKind::Vllm,
         None => !matches!(
             entry.engine,
-            EngineChoice::LlamaCpp | EngineChoice::Embedded | EngineChoice::SGLang
+            EngineChoice::LlamaCpp | EngineChoice::SGLang | EngineChoice::MistralRs
         ),
     };
 
@@ -544,7 +544,9 @@ fn validate_canonical_engine_tuning(
     // defers to the resolved engine, which ignores them when it is not vLLM.
     if matches!(
         config.engine,
-        ManagedEngineChoice::LlamaCpp | ManagedEngineChoice::SGLang
+        ManagedEngineChoice::LlamaCpp
+            | ManagedEngineChoice::SGLang
+            | ManagedEngineChoice::MistralRs
     ) {
         let mut unsupported = Vec::new();
         if config.chunked_prefill.is_some() {
@@ -573,6 +575,7 @@ fn validate_canonical_engine_tuning(
         ManagedEngineChoice::Vllm => &[EngineKind::Vllm],
         ManagedEngineChoice::SGLang => &[EngineKind::SGLang],
         ManagedEngineChoice::LlamaCpp => &[EngineKind::LlamaCpp],
+        ManagedEngineChoice::MistralRs => &[EngineKind::MistralRs],
         ManagedEngineChoice::Auto => &[EngineKind::LlamaCpp, EngineKind::Vllm],
     };
     for engine in engines {
@@ -640,6 +643,7 @@ fn lower_canonical_deployment(config: &ManagedDeploymentConfig) -> ModelDeployme
             ManagedEngineChoice::Vllm => EngineChoice::Vllm,
             ManagedEngineChoice::SGLang => EngineChoice::SGLang,
             ManagedEngineChoice::LlamaCpp => EngineChoice::LlamaCpp,
+            ManagedEngineChoice::MistralRs => EngineChoice::MistralRs,
         },
         rollout: match config.rollout {
             ManagedRolloutPolicy::Rolling => RolloutPolicy::Rolling,

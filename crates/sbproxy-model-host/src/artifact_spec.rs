@@ -139,7 +139,7 @@ impl WorkerProfile {
                 EngineKind::Vllm,
                 EngineKind::SGLang,
                 EngineKind::LlamaCpp,
-                EngineKind::Embedded,
+                EngineKind::MistralRs,
             ]),
         })
     }
@@ -320,7 +320,7 @@ pub(crate) fn forced_engine(choice: EngineChoice) -> Option<EngineKind> {
         EngineChoice::Vllm => Some(EngineKind::Vllm),
         EngineChoice::SGLang => Some(EngineKind::SGLang),
         EngineChoice::LlamaCpp => Some(EngineKind::LlamaCpp),
-        EngineChoice::Embedded => Some(EngineKind::Embedded),
+        EngineChoice::MistralRs => Some(EngineKind::MistralRs),
     }
 }
 

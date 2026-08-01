@@ -156,28 +156,24 @@ pub(super) async fn handle_action(
                     }
                 }
 
-                // 501 gate: pick the first provider that supports realtime.
-                let provider = ai
-                    .config
-                    .providers
-                    .iter()
-                    .find(|p| sbproxy_ai::api_routes::provider_supports_realtime(&p.name));
-                let provider = match provider {
-                    Some(p) => p,
-                    None => {
-                        warn!(
-                            ai.surface = surface_label,
-                            "AI realtime: no configured provider supports realtime; returning 501"
-                        );
-                        send_error(session, 501, "no configured AI provider supports realtime")
-                            .await?;
-                        return Ok(true);
-                    }
-                };
+                // 501 gate: at least one configured provider must support
+                // realtime. Identity-specific provider selection happens
+                // after credential policy is resolved below.
+                let any_realtime_provider = ai.config.providers.iter().any(|p| {
+                    p.enabled && sbproxy_ai::api_routes::provider_supports_realtime(&p.name)
+                });
+                if !any_realtime_provider {
+                    warn!(
+                        ai.surface = surface_label,
+                        "AI realtime: no configured provider supports realtime; returning 501"
+                    );
+                    send_error(session, 501, "no configured AI provider supports realtime").await?;
+                    return Ok(true);
+                }
 
                 let requested_model = realtime_model_from_uri(&session.req_header().uri);
                 let budget_model = requested_model.as_deref().filter(|model| !model.is_empty());
-                let model_override = match realtime_budget_gate(
+                let admission = match realtime_budget_gate(
                     session,
                     &ai.config,
                     pipeline,
@@ -187,17 +183,26 @@ pub(super) async fn handle_action(
                 )
                 .await
                 {
-                    Ok(BudgetGate::Allow) => None,
-                    Ok(BudgetGate::Block { status, body }) => {
-                        send_response(session, status, "application/json", &body).await?;
-                        return Ok(true);
-                    }
-                    Ok(BudgetGate::Downgrade { model }) => Some(model),
+                    Ok(admission) => admission,
                     Err((status, message)) => {
                         send_error(session, status, &message).await?;
                         return Ok(true);
                     }
                 };
+                let model_override = match admission.budget_gate {
+                    BudgetGate::Allow => None,
+                    BudgetGate::Block { status, body } => {
+                        send_response(session, status, "application/json", &body).await?;
+                        return Ok(true);
+                    }
+                    BudgetGate::Downgrade { model } => Some(model),
+                };
+                let provider = ai
+                    .config
+                    .providers
+                    .iter()
+                    .find(|provider| provider.name == admission.provider_name)
+                    .expect("realtime admission selected a configured provider");
                 if let Some(model) = model_override
                     .as_deref()
                     .or(requested_model.as_deref())
@@ -236,12 +241,12 @@ pub(super) async fn handle_action(
                 // passed. Settlement is deferred until the final outbound
                 // request seam so peer validation and credential preparation
                 // cannot consume quota for a request that never leaves.
-                let key_plane = crate::key_plane::current_key_plane();
+                let key_plane = pipeline.key_plane();
                 let quota_pool_config = ai.config.quota_pool.clone();
                 let quota_pool_admission =
                     sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
                         quota_pool_config.clone(),
-                        ai.config.quota_pool_store(key_plane.as_ref().map(|plane| {
+                        ai.config.quota_pool_store(key_plane.map(|plane| {
                             (plane.governance_store(), plane.governance_consistency())
                         })),
                         super::ai_dispatch::quota_pool_member_id_for_request(ctx),
@@ -2499,6 +2504,12 @@ fn emit_mcp_prompt_audit(
         .unwrap_or_default();
     #[cfg(not(feature = "agent-class"))]
     let agent_id = String::new();
+    // WOR-2095: tool arguments and the sponsoring prompt are caller
+    // content. Redact known secret shapes and cap the size before they
+    // reach any subscriber; an audit line must never be the channel
+    // that exfiltrates a credential pasted into a prompt.
+    let tool_arguments = bound_mcp_audit_field(&cap.args_json);
+    let prompt = bound_mcp_audit_field(&cap.prompt);
     tracing::info!(
         target: "mcp_audit",
         workspace_id = %ctx.tenant_id,
@@ -2507,12 +2518,29 @@ fn emit_mcp_prompt_audit(
         human_sponsor = %ctx.principal.sub,
         mcp_server = %cap.server,
         tool_name = %tool_name,
-        tool_arguments = %cap.args_json,
-        prompt = %cap.prompt,
+        tool_arguments = %tool_arguments,
+        prompt = %prompt,
         upstream_status = upstream_status,
         duration_ms = cap.started.elapsed().as_millis() as u64,
         "mcp prompt-linked tool-call audit",
     );
+}
+
+/// Upper bound on one mcp_audit content field, matching the capture
+/// layer's per-property payload cap.
+const MCP_AUDIT_FIELD_MAX_BYTES: usize = 8 * 1024;
+
+/// Secret-redact and size-cap one mcp_audit content field (WOR-2095).
+fn bound_mcp_audit_field(value: &str) -> String {
+    let redacted = sbproxy_observe::redact::redact_secrets(value);
+    if redacted.len() <= MCP_AUDIT_FIELD_MAX_BYTES {
+        return redacted;
+    }
+    let mut end = MCP_AUDIT_FIELD_MAX_BYTES;
+    while end > 0 && !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[truncated]", &redacted[..end])
 }
 
 fn emit_tool_call_ledger(
@@ -2634,8 +2662,9 @@ fn emit_mcp_tool_attribution(
         cost_usd: cost.unwrap_or(0.0),
         latency_ms: duration.as_millis() as u64,
         status: if is_error { 500 } else { 200 },
-        key_id: (!ctx.principal.api_key_id().is_empty())
-            .then(|| ctx.principal.api_key_id().to_string()),
+        // WOR-2093: the canonical accountability id, matching every
+        // other per-request surface.
+        key_id: ctx.accountable_key_id().map(str::to_string),
         tenant_id: (!ctx.tenant_id.is_empty()).then(|| ctx.tenant_id.to_string()),
         project: ctx.principal.attrs.project.clone(),
         user: ctx.principal.attrs.user.clone(),
@@ -2643,10 +2672,27 @@ fn emit_mcp_tool_attribution(
         tags: ctx.principal.attrs.tags.clone(),
         metadata: ctx.principal.attrs.metadata.clone(),
         request_id: Some(ctx.request_id.to_string()),
+        session_id: ctx.session_id.map(|id| id.to_string()),
         tag: Some(format!("mcp_tool:{tool_name}")),
         priority: ctx.ai_lane_priority.map(|p| p.as_str().to_string()),
         // An MCP tool call never runs on a managed local engine.
         engine_version: None,
+        // WOR-2140: a tool call is spend an agent caused, so it carries
+        // the same attribution the model call does. Without this a run's
+        // blast radius would count its model calls and silently omit the
+        // tools those calls invoked, which is the larger number on a
+        // fan-out step.
+        agent_id: ctx.a2a.as_ref().and_then(|a2a| {
+            let id = sbproxy_ai::tracing_spans::cap_agent_id(a2a.caller_agent_id.as_str());
+            (!id.is_empty()).then(|| id.to_string())
+        }),
+        a2a_context_id: ctx.a2a_context_id.clone(),
+        a2a_identity_verified: ctx.a2a.as_ref().map(|a2a| a2a.identity_verified),
+        workflow_id: ctx
+            .attribution_tags
+            .trace_id
+            .clone()
+            .filter(|id| !id.is_empty()),
     };
     for sink in &mcp.usage_sinks {
         sink.record(&event);
@@ -2923,6 +2969,30 @@ async fn mcp_apply_tool_output_quarantine(
     let output =
         sbproxy_extension::mcp::quarantine::UntrustedToolOutput::from_tool_result_value(value);
     judge.judge(&output).await
+}
+
+#[cfg(test)]
+mod mcp_audit_redaction_tests {
+    use super::{bound_mcp_audit_field, MCP_AUDIT_FIELD_MAX_BYTES};
+
+    #[test]
+    fn a_planted_secret_never_survives_into_the_audit_field() {
+        let args = r#"{"api_url":"https://api.anthropic.com","key":"sk-ant-api03-planted-secret-value-that-must-not-leak-0123456789abcdef"}"#;
+        let bounded = bound_mcp_audit_field(args);
+        assert!(
+            !bounded.contains("sk-ant-api03-planted"),
+            "mcp_audit must redact provider secrets: {bounded}"
+        );
+    }
+
+    #[test]
+    fn oversize_fields_are_capped_on_a_char_boundary() {
+        let oversize = "รับข้อมูล".repeat(2_000);
+        let bounded = bound_mcp_audit_field(&oversize);
+        assert!(bounded.len() <= MCP_AUDIT_FIELD_MAX_BYTES + "...[truncated]".len());
+        assert!(bounded.ends_with("...[truncated]"));
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+    }
 }
 
 #[cfg(test)]

@@ -17,7 +17,7 @@
 //! This struct lives in `sbproxy-core` to avoid a circular dependency:
 //! config -> modules -> config would be circular, but core depends on both.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::builtin_enforcers::{compile_builtin_enforcers, CompiledEnforcer};
@@ -1110,12 +1110,53 @@ pub struct CompiledIdempotency {
 pub struct CompiledPipeline {
     /// The underlying compiled config (origins, host_map, server settings).
     pub config: CompiledConfig,
+    /// Dynamic key plane built from the same immutable config generation.
+    ///
+    /// Request contexts pin the pipeline at ingress, so keeping the plane here
+    /// prevents a reload from changing key resolution, governance, or bound
+    /// upstream credentials underneath an in-flight request.
+    pub(crate) key_plane: Option<Arc<crate::key_plane::KeyPlane>>,
+    /// Sensitive request-header names for this exact config generation.
+    ///
+    /// Requests pin a pipeline at ingress. Keeping custom credential carriers
+    /// here prevents a concurrent reload from changing redaction or outbound
+    /// scrubbing semantics for requests that are still in flight.
+    pub(crate) sensitive_header_names: HashSet<String>,
     /// Bloom filter + HashMap router for fast hostname lookup.
     pub router: HostRouter,
     /// Compiled action for each origin (parallel to config.origins).
     pub actions: Vec<Action>,
     /// Immutable per-origin AI compression dependencies and policies.
     pub compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry,
+    /// Immutable route-scoped RAG runtimes keyed by origin and optional
+    /// forward rule (WOR-2098). Populated only for `ai_proxy` actions that
+    /// configure `rag:`; a forward rule without its own `rag:` block has no
+    /// runtime and never falls back to the origin's.
+    #[cfg(feature = "rag")]
+    pub rag_runtimes: crate::rag_runtime::RagRuntimeRegistry,
+    /// The published settlement runtime for this config generation, when
+    /// `proxy.payments` is configured (WOR-2100).
+    ///
+    /// Attached after construction rather than built inside it, because
+    /// publishing is async and proving the store answers has to happen while
+    /// the previous generation is still serving. `None` means settlement is
+    /// not configured, which is the default and leaves the existing
+    /// non-settlement ledger behaviour exactly as it was.
+    ///
+    /// Pinned to the pipeline for the same reason the key plane is: a
+    /// request pins a pipeline at ingress, so a reload cannot move a paid
+    /// request onto a different settlement store than the one that issued
+    /// its challenge.
+    #[cfg(feature = "payments")]
+    pub payments: Option<Arc<crate::billing_runtime::PaymentsRuntime>>,
+    /// Immutable route-scoped semantic caches keyed by origin and optional
+    /// forward rule (WOR-2099). Populated only for `ai_proxy` actions that
+    /// configure `semantic_cache:`; a forward rule without its own block
+    /// has no cache and never falls back to the origin's. The registry
+    /// owns whichever memory, Redis, or mesh adapters this config
+    /// generation selected, so an in-flight request holding this snapshot
+    /// keeps reading the backend it started with across a reload.
+    pub semantic_caches: crate::semantic_cache_runtime::SemanticCacheRuntimeRegistry,
     /// Compiled auth for each origin (None if no auth configured).
     pub auths: Vec<Option<Auth>>,
     /// Compiled policies for each origin (may be empty).
@@ -1159,6 +1200,17 @@ pub struct CompiledPipeline {
     /// URL) stamped alongside an outbound Web Bot Auth signature when
     /// `proxy.web_bot_auth.directory_url` is set.
     pub web_bot_auth_signature_agent: Option<String>,
+    /// Consumption attestation for this pipeline generation (WOR-2127),
+    /// built once from `proxy.attestation`. `None` when the block is
+    /// absent, when its role is `off`, and always under validation
+    /// construction, which must not create the queue or ledger
+    /// directories on an operator's laptop.
+    pub attestation: Option<Arc<crate::attestation::AttestationRuntime>>,
+    /// Per-origin attestation posture, composed once from the
+    /// proxy-wide role and each origin's override. Parallel to
+    /// [`Self::config`].`origins`, so the request path indexes rather
+    /// than re-deriving precedence per request.
+    pub origin_attestations: Vec<crate::attestation::ResolvedOriginAttestation>,
     /// Compiled idempotency middleware for each origin (None when the
     /// origin has no `idempotency:` block or `enabled = false`).
     /// Parallel to [`Self::config`].`origins`.
@@ -1266,15 +1318,39 @@ pub struct CompiledPipeline {
     pub listings: sbproxy_config::ListingRegistry,
 }
 
+fn compile_sensitive_header_names(config: &CompiledConfig) -> HashSet<String> {
+    let mut names = sbproxy_config::types::SENSITIVE_HEADER_DENYLIST
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<HashSet<_>>();
+    if let Some(key_management) = config.server.key_management.as_ref() {
+        names.extend(key_management.inbound.credential_carrier_names());
+    }
+    names
+}
+
 impl Default for CompiledPipeline {
     fn default() -> Self {
         let config = CompiledConfig::default();
         let router = HostRouter::new(&config);
+        let sensitive_header_names = compile_sensitive_header_names(&config);
         Self {
             config,
+            key_plane: None,
+            sensitive_header_names,
             router,
             actions: Vec::new(),
             compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry::default(),
+            #[cfg(feature = "rag")]
+            rag_runtimes: crate::rag_runtime::RagRuntimeRegistry::default(),
+            // Attached by the lifecycle after an async health check, never
+            // by construction. A default pipeline has no settlement.
+            #[cfg(feature = "payments")]
+            payments: None,
+            // Default construction must stay pure: no config read, no DNS
+            // resolution, no Redis dial, no cluster-state read, and no
+            // mesh binding. Test pipelines are built this way constantly.
+            semantic_caches: crate::semantic_cache_runtime::SemanticCacheRuntimeRegistry::default(),
             auths: Vec::new(),
             policies: Vec::new(),
             enforcers: Vec::new(),
@@ -1287,6 +1363,8 @@ impl Default for CompiledPipeline {
             outbound_wba: Vec::new(),
             web_bot_auth_signer: None,
             web_bot_auth_signature_agent: None,
+            attestation: None,
+            origin_attestations: Vec::new(),
             idempotencies: Vec::new(),
             cache_store: None,
             origin_cache_stores: HashMap::new(),
@@ -1315,11 +1393,49 @@ fn parse_outbound_credential_config(
     origin_id: &str,
     config: &serde_json::Value,
 ) -> anyhow::Result<sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig> {
-    serde_json::from_value(config.clone())
-        .map_err(|error| anyhow::anyhow!("origin {origin_id}: outbound_credential: {error}"))
+    let parsed: sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig =
+        serde_json::from_value(config.clone())
+            .map_err(|error| anyhow::anyhow!("origin {origin_id}: outbound_credential: {error}"))?;
+    if let sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig::VaultSecret(
+        vault,
+    ) = &parsed
+    {
+        if sbproxy_config::types::credential_header_is_reserved(&vault.header) {
+            anyhow::bail!(
+                "origin {origin_id}: outbound_credential: header may not carry a credential"
+            );
+        }
+    }
+    Ok(parsed)
 }
 
 impl CompiledPipeline {
+    /// Dynamic key plane for this exact pipeline generation.
+    pub fn key_plane(&self) -> Option<&Arc<crate::key_plane::KeyPlane>> {
+        self.key_plane.as_ref()
+    }
+
+    /// Whether a request header is sensitive for this pipeline generation.
+    pub(crate) fn is_sensitive_header(&self, header_name: &str) -> bool {
+        self.sensitive_header_names.contains(header_name)
+    }
+
+    /// Immutable inbound key configuration pinned to this pipeline.
+    pub(crate) fn inbound_key_config(&self) -> Option<&sbproxy_config::KeyInboundConfig> {
+        self.config
+            .server
+            .key_management
+            .as_ref()
+            .map(|config| &config.inbound)
+    }
+
+    /// Whether a header is a primary credential carrier for this exact
+    /// pipeline generation.
+    pub(crate) fn is_credential_carrier(&self, header_name: &str) -> bool {
+        self.inbound_key_config()
+            .is_some_and(|inbound| inbound.is_credential_carrier(header_name))
+    }
+
     /// The response-cache handle the data path must use for `origin_id`.
     ///
     /// With at-rest encryption on, this is the handle bound to that
@@ -1371,6 +1487,23 @@ impl CompiledPipeline {
         config: CompiledConfig,
         mode: PipelineConstructionMode,
     ) -> anyhow::Result<Self> {
+        // WOR-2084: async twin of the shared L2 store. The rate-limit
+        // policy's hot path awaits `AsyncKVStore::incr_with_ttl`
+        // directly when this is attached, instead of bridging every
+        // shared-counter decision through `spawn_blocking`. Built once
+        // and shared across origins; the sync handle stays attached too
+        // as the fallback and for callers that have not migrated.
+        let l2_async_store: Option<Arc<dyn sbproxy_platform::storage::AsyncKVStore>> = config
+            .l2_store
+            .as_deref()
+            .and_then(|kv| kv.validated_redis_connection())
+            .map(|connection| {
+                sbproxy_platform::storage::AsyncRedisKVStore::new(
+                    sbproxy_platform::storage::AsyncRedisConfig::from_connection(connection),
+                ) as Arc<dyn sbproxy_platform::storage::AsyncKVStore>
+            });
+
+        let sensitive_header_names = compile_sensitive_header_names(&config);
         let mut actions = Vec::with_capacity(config.origins.len());
         let mut auths = Vec::with_capacity(config.origins.len());
         let mut policies = Vec::with_capacity(config.origins.len());
@@ -1382,6 +1515,8 @@ impl CompiledPipeline {
         let mut threat_protections = Vec::with_capacity(config.origins.len());
         let mut outbound_creds = Vec::with_capacity(config.origins.len());
         let mut outbound_wba = Vec::with_capacity(config.origins.len());
+        let mut origin_attestations: Vec<crate::attestation::ResolvedOriginAttestation> =
+            Vec::with_capacity(config.origins.len());
 
         for origin in &config.origins {
             // Compile action (required for every origin).
@@ -1418,11 +1553,13 @@ impl CompiledPipeline {
             let origin_policies = compile_origin_policy_chain(
                 &origin.policy_configs,
                 config.l2_store.clone(),
+                l2_async_store.clone(),
                 origin.origin_id.as_str(),
             )?;
             let policies_for_enforcers = compile_origin_policy_chain(
                 &origin.policy_configs,
                 config.l2_store.clone(),
+                l2_async_store.clone(),
                 origin.origin_id.as_str(),
             )?;
             enforcers.push(compile_builtin_enforcers(
@@ -1523,6 +1660,16 @@ impl CompiledPipeline {
             };
             outbound_creds.push(outbound_cred);
             outbound_wba.push(origin.outbound_web_bot_auth);
+
+            // WOR-2127: compose the proxy-wide attestation role with
+            // this origin's override once, here, rather than per
+            // request. Resolved even when the block is absent, so the
+            // vector stays index-parallel with `config.origins` and the
+            // request path can index it without a bounds dance.
+            origin_attestations.push(crate::attestation::resolve_origin_attestation(
+                config.server.attestation.as_ref(),
+                origin.attestation.as_ref(),
+            ));
         }
 
         // --- Compile per-origin idempotency middleware ---
@@ -1751,11 +1898,110 @@ impl CompiledPipeline {
             }
         };
 
+        // WOR-2098: build the route-scoped RAG runtimes after both the
+        // main actions and the forward rules are compiled. Validation
+        // construction maps to `RagBuildMode::Validation`, which checks
+        // every configured provider without dialing.
+        #[cfg(feature = "rag")]
+        let rag_runtimes = crate::rag_runtime::RagRuntimeRegistry::build(
+            &actions,
+            &forward_rules,
+            match mode {
+                PipelineConstructionMode::Runtime => sbproxy_rag::RagBuildMode::Runtime,
+                PipelineConstructionMode::Validation => sbproxy_rag::RagBuildMode::Validation,
+            },
+        )?;
+        // Without the `rag` feature a configured `rag:` block must fail
+        // loud at construction rather than silently proxying unaugmented
+        // traffic.
+        #[cfg(not(feature = "rag"))]
+        reject_configured_rag(&actions, &forward_rules)?;
+
+        // WOR-2099: build the route-scoped semantic caches after both the
+        // main actions and the forward rules are compiled, because a
+        // forward rule carries its own `semantic_cache:` block and never
+        // inherits the origin's. Validation construction checks the same
+        // configuration and dependency declarations but binds stub stores,
+        // so validating a candidate config dials neither Redis nor the
+        // mesh.
+        let semantic_caches = match mode {
+            PipelineConstructionMode::Runtime => {
+                crate::semantic_cache_runtime::SemanticCacheRuntimeRegistry::from_process(
+                    &config.server,
+                    config.l2_store.as_deref(),
+                    &config.origins,
+                    &actions,
+                    &forward_rules,
+                )?
+            }
+            PipelineConstructionMode::Validation => {
+                crate::semantic_cache_runtime::SemanticCacheRuntimeRegistry::for_validation(
+                    &config.server,
+                    config.l2_store.as_deref(),
+                    &config.origins,
+                    &actions,
+                    &forward_rules,
+                )?
+            }
+        };
+
+        let key_plane = match mode {
+            PipelineConstructionMode::Runtime => {
+                crate::key_plane::prepare_key_plane(config.server.key_management.as_ref())?
+            }
+            PipelineConstructionMode::Validation => None,
+        };
+
+        // WOR-2127: lower `proxy.attestation` into the metering
+        // vocabulary. Runtime only, because the queue and the ledger are
+        // filesystem state and `sbproxy validate` must be able to check
+        // a candidate config without creating directories for a proxy
+        // that is not going to run. Everything decidable without a
+        // filesystem was already decided at config compile, so
+        // validation still rejects a broken block.
+        // WOR-2128: the revision goes in here rather than being read at
+        // resolve time. Every route weight this generation produces cites
+        // it, and a weight that cited whatever config happened to be live
+        // when the receipt was written would name a document that did not
+        // price the call.
+        // WOR-2145: the receipt chain is opened here too, under the same
+        // runtime-only gate and for the same reason. `node_id` is the mesh
+        // identity when a mesh is configured, because that is the key a
+        // cluster-wide gather files chain segments under; with no mesh
+        // there is one chain and the per-process instance id names it.
+        // Matching `admin_meter`'s derivation is load bearing: a chain
+        // written under one id and reported under another is a chain
+        // nobody can attribute.
+        let attestation = match mode {
+            PipelineConstructionMode::Runtime => {
+                let node_id = crate::cluster::current_cluster_handle()
+                    .map(|handle| handle.identity().node_id.clone())
+                    .unwrap_or_else(|| crate::identity::instance_id().to_string());
+                crate::attestation::prepare_attestation(
+                    config.server.attestation.as_ref(),
+                    config.server.web_bot_auth.as_ref(),
+                    &config_revision,
+                    &node_id,
+                )?
+            }
+            PipelineConstructionMode::Validation => None,
+        };
+
         let pipeline = Self {
             config,
+            key_plane,
+            sensitive_header_names,
             router,
             actions,
             compression_runtimes,
+            #[cfg(feature = "rag")]
+            rag_runtimes,
+            // Attached by the lifecycle after an async health check, never
+            // by construction: publishing starts a worker, and a candidate
+            // that is then discarded must not leave one claiming leases.
+            #[cfg(feature = "payments")]
+            payments: None,
+            semantic_caches,
             auths,
             policies,
             enforcers,
@@ -1768,6 +2014,8 @@ impl CompiledPipeline {
             outbound_wba,
             web_bot_auth_signer,
             web_bot_auth_signature_agent,
+            attestation,
+            origin_attestations,
             idempotencies,
             cache_store,
             origin_cache_stores,
@@ -1923,6 +2171,7 @@ fn compile_origin_idempotency(
 fn compile_origin_policy_chain(
     policy_configs: &[serde_json::Value],
     l2_store: Option<Arc<dyn sbproxy_platform::storage::KVStore>>,
+    l2_async_store: Option<Arc<dyn sbproxy_platform::storage::AsyncKVStore>>,
     origin_id: &str,
 ) -> anyhow::Result<Vec<Policy>> {
     let mut chain: Vec<Policy> = policy_configs
@@ -1940,7 +2189,16 @@ fn compile_origin_policy_chain(
                             "requests_per_second": 10.0
                         }))?,
                     );
-                    *rl = taken.with_store(l2_store.clone(), origin_id);
+                    // WOR-2084: attach the async handle alongside the
+                    // sync one. `allow_with_info_async` prefers it and
+                    // skips the spawn_blocking bridge; the sync handle
+                    // remains the fallback. Both setters derive the same
+                    // counter-key prefix, so attach order cannot split
+                    // counters across keyspaces (pinned by a test in
+                    // sbproxy-modules).
+                    *rl = taken
+                        .with_store(l2_store.clone(), origin_id)
+                        .with_async_store(l2_async_store.clone(), origin_id);
                 }
                 Policy::Waf(waf) => {
                     // Attach the same shared L2 store to the WAF
@@ -2271,6 +2529,41 @@ fn compile_fallback(
     }))
 }
 
+/// Reject any main or forward-rule `ai_proxy` action that configures
+/// `rag:` when this binary was built without the `rag` feature (WOR-2098).
+///
+/// Dropping the block silently would proxy unaugmented traffic that the
+/// operator believes carries retrieved context, so the mismatch fails
+/// construction with a pointer at the rebuild flag instead.
+#[cfg(not(feature = "rag"))]
+fn reject_configured_rag(
+    actions: &[Action],
+    forward_rules: &[Vec<CompiledForwardRule>],
+) -> anyhow::Result<()> {
+    fn has_rag(action: &Action) -> bool {
+        matches!(action, Action::AiProxy(action) if action.config.rag.is_some())
+    }
+    for (origin_idx, action) in actions.iter().enumerate() {
+        if has_rag(action) {
+            anyhow::bail!(
+                "origin {origin_idx}: ai_proxy configures `rag:` but this build does not \
+                 include RAG support; rebuild with feature 'rag'"
+            );
+        }
+    }
+    for (origin_idx, rules) in forward_rules.iter().enumerate() {
+        for (rule_idx, rule) in rules.iter().enumerate() {
+            if has_rag(&rule.action) {
+                anyhow::bail!(
+                    "origin {origin_idx}: forward rule {rule_idx}: ai_proxy configures `rag:` \
+                     but this build does not include RAG support; rebuild with feature 'rag'"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Normalize a request modifier from either Go format or Rust format.
 ///
 /// Go format: `{ type: "header", set: { "X-Foo": "bar" } }`
@@ -2395,6 +2688,7 @@ mod tests {
                 outbound_credential: None,
                 outbound_web_bot_auth: false,
                 observability: None,
+                attestation: None,
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),
@@ -2548,6 +2842,7 @@ mod tests {
                 outbound_credential: None,
                 outbound_web_bot_auth: false,
                 observability: None,
+                attestation: None,
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),
@@ -2647,8 +2942,23 @@ mod tests {
         assert!(pipeline.hooks.intent_detection.is_none());
         assert!(pipeline.hooks.quality_scoring.is_none());
         assert!(pipeline.hooks.stream_safety.is_none());
-        assert!(pipeline.hooks.semantic_lookup.is_none());
-        assert!(pipeline.hooks.stream_cache_recorder.is_none());
+    }
+
+    /// A default pipeline must carry an empty semantic-cache registry.
+    /// The default path is taken by hundreds of unit tests, so it must not
+    /// inspect config, resolve DNS, open Redis, read cluster state, or
+    /// bind a mesh store.
+    #[test]
+    fn compiled_pipeline_default_has_an_empty_semantic_cache_registry() {
+        let pipeline = CompiledPipeline::default();
+        assert!(pipeline.semantic_caches.get(0, None).is_none());
+        assert!(pipeline.semantic_caches.get(0, Some(0)).is_none());
+    }
+
+    #[test]
+    fn compiled_pipeline_default_semantic_registry_has_no_registrations() {
+        let pipeline = CompiledPipeline::default();
+        assert_eq!(pipeline.semantic_caches.registrations().count(), 0);
     }
 
     #[test]
@@ -3208,6 +3518,38 @@ origins:
         assert!(error
             .to_string()
             .contains("not supported with load-balanced actions"));
+    }
+
+    #[test]
+    fn validation_rejects_hop_by_hop_outbound_credential_headers() {
+        for header in ["keep-alive", "proxy-connection", "te", "trailer"] {
+            let yaml = format!(
+                r#"
+proxy:
+  http_bind_port: 18080
+origins:
+  "credential.test":
+    action:
+      type: proxy
+      url: https://upstream.example.test
+    outbound_credential:
+      type: vault_secret
+      secret: operator-secret
+      header: {header}
+"#
+            );
+            let config = sbproxy_config::compile_config(&yaml).unwrap();
+            let error = match CompiledPipeline::from_config_for_validation(config) {
+                Ok(_) => panic!("{header} must not be an outbound credential carrier"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("header may not carry a credential"),
+                "unexpected {header} validation error: {error}"
+            );
+        }
     }
 }
 

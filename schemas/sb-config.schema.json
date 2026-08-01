@@ -23,6 +23,7 @@
         "admin": null,
         "ai_providers_file": null,
         "alerting": null,
+        "attestation": null,
         "cache_reserve": null,
         "cluster": null,
         "compression_state": null,
@@ -53,6 +54,7 @@
         "model_host": null,
         "mtls": null,
         "observability": null,
+        "payments": null,
         "response_cache_store": null,
         "scripting": {
           "javascript": {
@@ -636,6 +638,18 @@
             }
           ]
         },
+        "attestation": {
+          "description": "Consumption attestation (WOR-2127): whether this proxy asserts what a call is going to cost, records what it actually consumed, and what it charges for. Absent leaves the whole mechanism off, so an existing config is unaffected. See [`AttestationConfig`].",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AttestationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "tenants": {
           "description": "WOR-1053: declared tenants. Each entry carries an `id` referenced by `origin.tenant_id`. Future PRs add per-tenant `credentials`, `policies`, and `vault` blocks; PR1 lands the scope so the rest of the credentials epic can land against a stable tenant resolver.\n\nWhen empty, every origin resolves to the synthetic `__default__` tenant. Existing single-tenant configs see no behaviour change. An origin that names a tenant not declared here fails config compile.",
           "default": [],
@@ -651,6 +665,18 @@
           "items": {
             "$ref": "#/definitions/CredentialBlock"
           }
+        },
+        "payments": {
+          "description": "Durable payment settlement. When absent, the proxy keeps its existing non-settlement crawl-ledger behaviour exactly. When present, a paid request reaches the origin only after its durable intent has committed `Succeeded`.\n\nThe block is always parsed, on every build, so `sbproxy validate` reads the same document everywhere. The consumer compares [`crate::payments::PaymentsConfig::required_features`] against its own compiled feature set and fails startup naming the missing feature, so a configured rail that was not compiled in never reaches a first request.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PaymentsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -1565,6 +1591,14 @@
               "$ref": "#/definitions/AdminRole"
             }
           ]
+        },
+        "tenant": {
+          "description": "Billing tenant whose metered consumption this operator may read (WOR-2131). Absent means the whole deployment, which is what every operator written before this field existed keeps getting.\n\nA receipt names one buyer's traffic, so the meter routes treat a cross-tenant read as a disclosure rather than a reporting mistake: naming a tenant here narrows `/api/meter/*` to that tenant and refuses a request for any other. The scope is read from this document on every request rather than carried in the session token, so revoking it is a config reload rather than a wait for tokens to expire.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -2155,6 +2189,13 @@
           "type": "string",
           "enum": [
             "llama_cpp"
+          ]
+        },
+        {
+          "description": "Use mistral.rs (WOR-1861). An explicit opt-in that `Auto` never selects; the pure-Rust subprocess lane over the upstream pinned prebuilt binary, serving safetensors weights.",
+          "type": "string",
+          "enum": [
+            "mistralrs"
           ]
         }
       ]
@@ -3782,6 +3823,7 @@
                 "scheme": ""
               }
             ],
+            "native_key_policy": null,
             "provider_hints": [
               {
                 "also_header": null,
@@ -3847,9 +3889,20 @@
           "type": "boolean"
         },
         "failure_mode_allow": {
-          "description": "When the store is unreachable, allow the request through in a degraded mode. Default false: fail closed (deny).",
+          "description": "Superseded by `failure_posture`. When the store is unreachable, allow the request through in a degraded mode. Default false: fail closed (deny).\n\nNote the polarity this field is named into: `true` here means ALLOW, that is, fail open. Other booleans in this config carry the opposite sense, which is the inconsistency [`FailureMode`] exists to retire.\n\nStill parsed, and still the value used when `failure_posture` is absent, so an existing config keeps behaving exactly as it did. Nothing in the runtime reads this field directly any more: every store-outage decision goes through [`KeyManagementConfig::failure_posture`].",
           "default": false,
           "type": "boolean"
+        },
+        "failure_posture": {
+          "description": "Failure posture for a key-store outage, in the shared [`FailureMode`] vocabulary.\n\nSet this in preference to `failure_mode_allow`. When present it wins; when absent the legacy boolean is converted (`false` becomes `closed`, `true` becomes `degraded`). It is `Option` on purpose, so \"the operator said nothing\" stays distinguishable from \"the operator explicitly asked for the default\".\n\n`closed` refuses with 503. `degraded` and `open` both let the request fall through to the origin's own configured auth, which is what `failure_mode_allow: true` has always done: it is not a blanket admit. `degraded` is the honest label for it, because the request proceeds with no per-key policy, no budget, and no attribution, and that fact is recorded rather than passed over in silence. `observe` is meaningless here and is rejected at config-compile time: an unreachable store produced no counterfactual verdict to record.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FailureMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "oidc_claim_map": {
           "description": "Optional OIDC/JWT claim to virtual-key mapping.",
@@ -4272,11 +4325,22 @@
           "minimum": 0.0
         },
         "failure_mode": {
-          "description": "Behavior when the governance backend cannot serve a reserve call at request time (`GovernanceError::BackendUnavailable`). The default denies the request (fail closed): governed limits must not be silently bypassed by a backend outage. Setting `allow_unreserved` admits the request instead, but every such decision is always audited on the `security_audit` channel and counted on `sbproxy_governance_fail_open_total`.",
+          "description": "Superseded by `failure_posture`. Behavior when the governance backend cannot serve a reserve call at request time (`GovernanceError::BackendUnavailable`). The default denies the request (fail closed): governed limits must not be silently bypassed by a backend outage. Setting `allow_unreserved` admits the request instead, but every such decision is always audited on the `security_audit` channel and counted on `sbproxy_governance_fail_open_total`.\n\nStill parsed, and still the value used when `failure_posture` is absent, so an existing config keeps behaving exactly as it did. Nothing in the runtime reads this field directly any more: the read path goes through [`KeyGovernanceConfig::failure_posture`], which reports `allow_unreserved` as `degraded` because the call proceeds without the reservation this control exists to make.",
           "default": "closed",
           "allOf": [
             {
               "$ref": "#/definitions/GovernanceFailureMode"
+            }
+          ]
+        },
+        "failure_posture": {
+          "description": "Failure posture for a governance backend outage, in the shared [`FailureMode`] vocabulary.\n\nSet this in preference to `failure_mode`. When present it wins; when absent the legacy `failure_mode` value is converted (`closed` stays `closed`, `allow_unreserved` becomes `degraded`). It is `Option` on purpose, so \"the operator said nothing\" stays distinguishable from \"the operator explicitly asked for the default\".\n\n`closed` denies with 503. `degraded` admits without a reservation and records that fact on the `security_audit` channel and on `sbproxy_governance_fail_open_total`. `open` also admits but records neither, which is why `degraded` is the honest spelling of the old `allow_unreserved`. `observe` is meaningless here and is rejected at config-compile time: a reserve call that could not reach its backend produced no counterfactual verdict to record.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FailureMode"
+            },
+            {
+              "type": "null"
             }
           ]
         },
@@ -4348,7 +4412,7 @@
       ]
     },
     "GovernanceFailureMode": {
-      "description": "Behavior when the governance backend cannot serve a reserve call (`sbproxy_ai::governance::GovernanceStore::reserve`).\n\nApplies only to a reserve call that fails with `GovernanceError::BackendUnavailable`. Every other reserve error (invalid request shape, a reservation id reused with different input, a hit against a real governed limit, arithmetic overflow) is unrelated to backend availability and is not affected by this setting.",
+      "description": "Superseded by [`FailureMode`]. Behavior when the governance backend cannot serve a reserve call (`sbproxy_ai::governance::GovernanceStore::reserve`).\n\nApplies only to a reserve call that fails with `GovernanceError::BackendUnavailable`. Every other reserve error (invalid request shape, a reservation id reused with different input, a hit against a real governed limit, arithmetic overflow) is unrelated to backend availability and is not affected by this setting.\n\nKept because `failure_mode: closed | allow_unreserved` is pinned by test and by shipped configs. Read it through [`KeyGovernanceConfig::failure_posture`], never directly.",
       "oneOf": [
         {
           "description": "Deny the request (`503`) when the governance backend is unavailable.",
@@ -4362,6 +4426,39 @@
           "type": "string",
           "enum": [
             "allow_unreserved"
+          ]
+        }
+      ]
+    },
+    "FailureMode": {
+      "description": "What a control does when it cannot reach a decision.\n\nA \"control\" here is anything that gates a request and can itself fail: a policy whose backend is unreachable, a guardrail whose provider times out, a detector that never engaged, a store that cannot be read. The question is always the same, so the knob is too, and it is spelled `failure_posture` everywhere it appears:\n\n```yaml failure_posture: closed     # refuse the request failure_posture: open       # admit it failure_posture: degraded   # admit it, but record that the guarantee was not made failure_posture: observe    # admit it, and record what would have happened ```\n\n# The four postures\n\nOnly [`Closed`](Self::Closed) refuses. The other three all admit the request and differ in what they leave behind, which is the part that matters six months later when someone asks whether a control was actually protecting anything:\n\n- **`open`** admits and claims nothing. Cheapest, and the least recoverable after the fact. - **`degraded`** admits while explicitly marking the guarantee as not made. This is the posture behind the existing `AllowUnreserved` modes: the request proceeds, but no quota was reserved and no governance decision was recorded, and that fact is itself counted so it can be alerted on. - **`observe`** admits and records the decision the control *would* have taken. For rolling a control out against live traffic before letting it refuse anything.\n\n# Relationship to `test_mode` and tag actions\n\n`observe` is deliberately close in spirit to the WAF's `test_mode` and the prompt-injection `Tag` action, and the overlap is worth naming so the two do not drift into meaning different things. They are not the same axis:\n\n- `test_mode` / `Tag` describe what the control does when it **works** and finds a hit. - `failure_posture: observe` describes what it does when it **cannot run at all**.\n\nA control can legitimately be in `test_mode` and still need a failure posture, because \"the detector matched\" and \"the detector was unreachable\" are different events. Where a site already has `test_mode`, leave it alone and let `failure_posture` govern only the cannot-decide path.\n\n# Why this type exists\n\nThe same decision was previously spelled six different ways across the config surface: `fail_open: bool`, `fail_closed: bool`, `failure_mode_allow: bool`, two separately-declared `failure_mode` enums, an `on_failure` enum, and an unvalidated `on_error: String`. Two of those booleans carry **opposite** polarity, so `true` means \"admit\" in one struct and \"refuse\" in another. An operator had to re-derive the meaning at every site, and a reviewer had to check the field name before they could read a diff.\n\nNew and migrated controls take `failure_posture: FailureMode`. The name is deliberately not `failure_mode`: two blocks already declare a field by that exact name carrying a narrower enum, and a test pins that `failure_mode: open` must fail to parse there. One new word that works at every site beats one that collides at two.\n\nThe legacy fields still parse, because [`schema-v1` compatibility] is pinned by test, and each site's `failure_posture()` accessor converts from them when the new key is absent. They carry no `#[deprecated]` attribute on purpose: `-D warnings` would then turn every remaining read into a build failure, including the conversion itself. They are deprecated in prose and by having no other reader left.\n\n# Choosing a default\n\nDefault closed for anything that enforces a security boundary: a control that silently admits traffic when it breaks is worse than no control, because the config still advertises protection and the dashboard still reads green.\n\nDefault open only where refusing would take the gateway down over a non-security concern, and say so at the site. A policy-expression bug should not black-hole every request; an unreachable authorization backend should.\n\n[`schema-v1` compatibility]: https://github.com/soapbucket/sbproxy",
+      "oneOf": [
+        {
+          "description": "Refuse the request. The safe default for anything enforcing a security boundary: a control that silently admits traffic when it breaks is worse than no control, because the config still advertises protection and the dashboard still reads green.",
+          "type": "string",
+          "enum": [
+            "closed"
+          ]
+        },
+        {
+          "description": "Admit the request and claim nothing. Cheapest, and the least recoverable after the fact.",
+          "type": "string",
+          "enum": [
+            "open"
+          ]
+        },
+        {
+          "description": "Admit the request while explicitly marking the guarantee as not made. The posture behind the legacy `AllowUnreserved` modes: the call proceeds, but no quota was reserved and no governance decision was recorded, and that fact is counted so it can be alerted on.",
+          "type": "string",
+          "enum": [
+            "degraded"
+          ]
+        },
+        {
+          "description": "Admit the request and record the decision the control would have taken. For rolling a control out against live traffic before letting it refuse anything.",
+          "type": "string",
+          "enum": [
+            "observe"
           ]
         }
       ]
@@ -4412,7 +4509,7 @@
       "type": "object",
       "properties": {
         "headers": {
-          "description": "Ordered candidate headers. The first value whose shape parses wins. An empty list disables the sweep and leaves the legacy `authorization` path as the only front door.",
+          "description": "Ordered candidate headers. One well-shaped minted token resolves; two distinct tokens are ambiguous and fail closed. An empty list disables the sweep and leaves the legacy `authorization` path as the only front door.",
           "default": [
             {
               "name": "authorization",
@@ -4438,7 +4535,7 @@
           "type": "boolean"
         },
         "provider_hints": {
-          "description": "Ordered rules attributing a native (non-minted) inbound credential to a provider. First match wins, so more specific value prefixes belong before general ones. Attribution never refuses a request: a credential matching no rule is admitted unattributed.",
+          "description": "Ordered rules attributing a native (non-minted) inbound credential to a provider. First matching hint wins, so more specific value prefixes belong before general ones. A matching hint then enters native-key policy admission; a credential matching no hint remains unattributed.",
           "default": [
             {
               "also_header": null,
@@ -4494,6 +4591,18 @@
           "items": {
             "$ref": "#/definitions/ProviderHintConfig"
           }
+        },
+        "native_key_policy": {
+          "description": "Explicit default policy for recognized caller-owned native provider keys. Absent by default, which fails closed if a provider hint matches.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/NativeKeyPolicyConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -4548,6 +4657,85 @@
             "string",
             "null"
           ]
+        }
+      }
+    },
+    "NativeKeyPolicyConfig": {
+      "description": "Default admission policy for caller-owned native provider keys.\n\nNative keys cannot carry an SBproxy policy record because the caller, not the operator, owns their secret. This block supplies the equivalent default policy for every native key recognized by `provider_hints`. Leaving it absent fails closed for recognized native-key traffic.",
+      "type": "object",
+      "required": [
+        "allowed_providers"
+      ],
+      "properties": {
+        "allowed_providers": {
+          "description": "Canonical provider labels admitted to use caller-owned credentials.\n\nMatching is case-insensitive and ignores surrounding whitespace. The list must be non-empty and may not contain duplicates.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_requests_per_minute": {
+          "description": "Max requests per minute for each origin/provider native-key bucket.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_tokens_per_minute": {
+          "description": "Max input and output tokens per minute.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_budget_tokens": {
+          "description": "Max total tokens for the native-key budget window.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_budget_usd": {
+          "description": "Max total cost in USD for the native-key budget window.",
+          "default": null,
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "allowed_models": {
+          "description": "Models native-key traffic may use (empty = all).",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "blocked_models": {
+          "description": "Models native-key traffic may not use.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "require_pii_redaction": {
+          "description": "Named PII redaction rules that must be active before dispatch.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     },
@@ -4753,6 +4941,11 @@
         },
         "bypass_prompt_injection": {
           "description": "Skip the body-aware prompt-injection scan for this key. Default false.",
+          "default": false,
+          "type": "boolean"
+        },
+        "allow_content_capture": {
+          "description": "Consent to the origin's opt-in redacted content capture for console inspection. Default false. A sample is retained only when the AI origin also sets `capture_content: true`, so both the operator and the key owner must opt in.",
           "default": false,
           "type": "boolean"
         },
@@ -5546,6 +5739,447 @@
         }
       }
     },
+    "AttestationConfig": {
+      "description": "`proxy.attestation`: the proxy-wide consumption attestation block.\n\nOff unless [`Self::role`] says otherwise, and inert in every config that does not mention it. When a role is set, the queue, the ledger, and a complete [`AttestationBillableConfig`] all become required, because a role with any of them missing is a proxy that claims to meter and does not.",
+      "type": "object",
+      "properties": {
+        "role": {
+          "description": "Which halves of attestation this proxy performs. See [`AttestationRole`]. Individual origins may narrow or widen this through `origins.<host>.attestation.role`.",
+          "default": "off",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AttestationRole"
+            }
+          ]
+        },
+        "failure_mode": {
+          "description": "What happens when attestation itself cannot run: the queue is full, the ledger will not accept an append, the signing identity is unusable.\n\nDefaults to [`FailureMode::Degraded`], which departs from the `closed` default the rest of this config surface takes, and the departure is the point. Fail-closed is right for a control that enforces a security boundary, because a control that silently admits traffic when it breaks is worse than no control at all. Billing is not a security boundary. A full ledger disk taking the whole API down is a worse outcome than a provable hole in the record, and `degraded` is precisely the posture that leaves the hole detectable: the call proceeds, the guarantee is marked as not made, and the gap is countable so an operator can alert on it and reconcile afterwards. An operator who genuinely cannot serve unbilled traffic sets `closed` and means it.",
+          "default": "degraded",
+          "allOf": [
+            {
+              "$ref": "#/definitions/FailureMode"
+            }
+          ]
+        },
+        "enforcement_mode": {
+          "description": "What happens when attestation *does* reach a verdict and that verdict is \"refuse\": a claim that exceeds an agreement's ceiling, for instance. [`EnforcementMode::Observe`] is the rollout posture, and it is a different question from [`Self::failure_mode`]: a control can reasonably observe while it is being tuned and still need to fail closed when its backend disappears.",
+          "default": "block",
+          "allOf": [
+            {
+              "$ref": "#/definitions/EnforcementMode"
+            }
+          ]
+        },
+        "sign_with": {
+          "description": "Which existing signing identity signs receipts, as the config path that declares it. The only accepted value today is [`ATTESTATION_SIGN_WITH_WEB_BOT_AUTH`], and that block must actually be configured. Required whenever the role writes receipts.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "queue": {
+          "description": "Where unsettled claims wait. Required when the role is not [`AttestationRole::Off`].",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AttestationQueueConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ledger": {
+          "description": "Where settled records are chained. Required when the role is not [`AttestationRole::Off`].",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AttestationLedgerConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "billable": {
+          "description": "What the operator charges for. Required, and required complete, when the role is not [`AttestationRole::Off`].",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AttestationBillableConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "measured": {
+          "description": "Units this proxy counted for itself. See [`AttestationMeasuredConfig`].\n\nListed first because it is the resolver that needs nothing from anybody, and a receipt is easier to argue about when an unarguable line is sitting next to the contested ones.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AttestationMeasuredConfig"
+          }
+        },
+        "route_weights": {
+          "description": "Routes priced in this document. See [`AttestationRouteWeightConfig`].\n\nA sibling list rather than a variant of one `units:` block, and the same goes for [`Self::measured`] and [`Self::origin_headers`]. Each resolver has its own provenance and its own way of being wrong, so each declares itself in its own vocabulary and none of them can be mistaken for another when a receipt is read back. It also means the expression resolver arrives later as a fourth list rather than as a variant every existing entry has to be retrofitted into.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AttestationRouteWeightConfig"
+          }
+        },
+        "origin_headers": {
+          "description": "Counts this proxy reads back from its upstreams. See [`AttestationOriginHeaderConfig`].",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AttestationOriginHeaderConfig"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "AttestationRole": {
+      "description": "What part this proxy plays in attesting to consumption.\n\nThe two halves answer the two halves of a billing dispute and are independently useful, which is why this is four values rather than a boolean. A claim is made before the call and says what it is going to cost; a receipt is written after it and says what it actually consumed. A gateway in front of somebody else's metered API wants [`Self::Claim`] alone. A proxy selling its own upstream wants [`Self::Receipt`] alone. An operator reselling metered capacity wants [`Self::Both`], because they have to answer to a buyer and a supplier at once.",
+      "oneOf": [
+        {
+          "description": "Attest to nothing. The default, and what every config that does not mention the block gets.",
+          "type": "string",
+          "enum": [
+            "off"
+          ]
+        },
+        {
+          "description": "Assert what a call is going to cost, before it is served.",
+          "type": "string",
+          "enum": [
+            "claim"
+          ]
+        },
+        {
+          "description": "Record what a call actually consumed, after it is served.",
+          "type": "string",
+          "enum": [
+            "receipt"
+          ]
+        },
+        {
+          "description": "Both halves. The posture for reselling metered capacity.",
+          "type": "string",
+          "enum": [
+            "both"
+          ]
+        }
+      ]
+    },
+    "EnforcementMode": {
+      "description": "What a control does when it *does* reach a decision and that decision is \"refuse\".\n\nThis is the second of two axes, and keeping them apart is the point. [`FailureMode`] answers \"the control could not run, now what\". `EnforcementMode` answers \"the control ran, it matched, now what\". Those are different events and an operator needs both: a detector can reasonably be in `observe` while it is being tuned, and still need to fail closed when its backend disappears.\n\nThis type replaces the ad-hoc spellings of the same idea that grew per policy: the WAF's `test_mode: bool`, the prompt-injection `Tag` action, and similar. They all meant \"match, but do not block\". `observe` is spelled the same here as in [`FailureMode`] on purpose, so one word means one thing across the config surface.",
+      "oneOf": [
+        {
+          "description": "Refuse the request when the control matches.",
+          "type": "string",
+          "enum": [
+            "block"
+          ]
+        },
+        {
+          "description": "Admit the request but record the match. The rollout posture.",
+          "type": "string",
+          "enum": [
+            "observe"
+          ]
+        }
+      ]
+    },
+    "AttestationQueueConfig": {
+      "description": "`proxy.attestation.queue`: where claims wait until they settle.\n\nA claim is written when the call starts and settled when it finishes, and the gap between those is where a crash loses money. The queue is that gap made durable.",
+      "type": "object",
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "path": {
+          "description": "Filesystem path of the queue. Required: an attestation role with nowhere to hold unsettled claims silently drops them on restart, which is the failure the whole mechanism exists to prevent.",
+          "type": "string"
+        },
+        "max_entries": {
+          "description": "How many unsettled claims to hold before the configured [`AttestationConfig::failure_mode`] applies. Defaults to 100,000, which is roughly a minute of unsettled work at a thousand requests a second.",
+          "default": 100000,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "AttestationLedgerConfig": {
+      "description": "`proxy.attestation.ledger`: where settled records are chained.\n\nThe ledger answers the half of a billing dispute a signature cannot: \"I made calls you never credited\". Each record is hash-chained to the one before it, so a gap is visible rather than merely absent.",
+      "type": "object",
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "path": {
+          "description": "Filesystem path of the append-only ledger file.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AttestationBillableConfig": {
+      "description": "`proxy.attestation.billable`: what the operator charges for.\n\nEvery field is `Option` so that an incomplete block is a config error this crate can describe rather than a serde error that names one missing field at a time. The operator owes an answer for all eight, and [`Self::missing_outcomes`] hands them the whole list in one message. Nothing is defaulted: an unstated billing rule still runs, it just runs as whatever the code happened to do, and nobody discovers what that was until a buyer asks.\n\n`cache_hit` is the case that proves the rule. A vendor selling compute can argue a cache hit cost them nothing; a vendor selling answers can argue the answer is what was bought and where it came from is their business. Both are positions real companies hold, so this surface holds neither.",
+      "type": "object",
+      "properties": {
+        "delivered": {
+          "description": "The response was served to the client in full.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BillableRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_disconnected": {
+          "description": "The client went away before the response finished.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BillableRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin_4xx": {
+          "description": "The origin rejected the request as the caller's fault.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BillableRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin_5xx": {
+          "description": "The origin failed.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BillableRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "policy_blocked": {
+          "description": "A policy refused the call before it reached the origin.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BillableRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rate_limited": {
+          "description": "A rate limit rejected the call.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BillableRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cache_hit": {
+          "description": "The response was served from cache without touching the origin.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BillableRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retry": {
+          "description": "One attempt of a call that was retried.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BillableRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "BillableRule": {
+      "description": "The billing answer for one outcome, in the configuration vocabulary.\n\nA deliberate mirror of `sbproxy_meter::Billable` rather than a re-export. The meter crate depends on no other crate in this workspace, which is what lets an operator metering a plain REST API compile it without the AI stack; deriving [`schemars::JsonSchema`] on its types would end that. So the wire vocabulary lives here, the billing vocabulary lives there, and `sbproxy-core` converts between them. The two are kept in step by `sbproxy_meter::BillableOutcome::ALL`: adding an outcome there stops the conversion compiling until this surface answers for it.",
+      "oneOf": [
+        {
+          "description": "Bill every unit the call produced.",
+          "type": "string",
+          "enum": [
+            "yes"
+          ]
+        },
+        {
+          "description": "Bill nothing. The call is still recorded, because a receipt that omits the free calls cannot be reconciled against a request log.",
+          "type": "string",
+          "enum": [
+            "no"
+          ]
+        },
+        {
+          "description": "Bill the work the origin actually performed, even though the request was cut short.",
+          "type": "string",
+          "enum": [
+            "partial"
+          ]
+        },
+        {
+          "description": "Fold this attempt into the invoice line its claim names, so a flaky origin costs the buyer once rather than once per attempt.",
+          "type": "string",
+          "enum": [
+            "collapse"
+          ]
+        }
+      ]
+    },
+    "AttestationMeasuredConfig": {
+      "description": "`proxy.attestation.measured[]`: one unit the proxy counted itself.\n\nThe only unit source with nothing outside the process in it. The proxy saw the bytes and held the clock, so nobody else contributed to the number and there is no third party whose word has to be taken. That is why it is the resolver to reach for first: a route weight is only as honest as the document it was read from, and an origin header is only as honest as the party being paid for it, whereas this one is arithmetic over things that demonstrably happened.\n\nA partial unit is billed as a whole one. Twelve thousand and forty-three bytes against a kibibyte rule is twelve units, not eleven and a bit, because the operator delivered those bytes and there is no fraction of a kibibyte to hand back. See `sbproxy_meter::MeasuredRule`.",
+      "type": "object",
+      "required": [
+        "name",
+        "quantity"
+      ],
+      "properties": {
+        "name": {
+          "description": "Unit name that appears on the invoice line, for example `egress_kib`. Unique across every resolver: two units sharing a name on one receipt is an invoice line that cannot be read.",
+          "type": "string"
+        },
+        "quantity": {
+          "description": "The observed quantity this entry counts. See [`AttestationMeasuredQuantity`].",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AttestationMeasuredQuantity"
+            }
+          ]
+        },
+        "per": {
+          "description": "How much of the raw quantity makes one unit.\n\nThis is the key that turns bytes into kibibytes: `1024` against [`AttestationMeasuredQuantity::BytesOut`] bills one unit per kibibyte written. A divisor rather than a multiplier because the raw quantity is always the smaller currency and the invoice line is always the larger one. Nobody sells thousandths of a request, but plenty of people sell kibibytes and compute-seconds, and writing `per: 1000` against `duration_ms` says \"a second\" in the units the proxy actually observed rather than asking the operator to express a rate as a fraction.\n\nDefaults to `1`, which bills one unit per observed item and is the only sensible reading of an entry that omits it. Zero is rejected at config compile: a divisor of zero has no answer to fall back on, and the request path is the wrong place to find that out.",
+          "default": 1,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "AttestationMeasuredQuantity": {
+      "description": "Which observed quantity a measured unit counts, in the configuration vocabulary.\n\nA deliberate mirror of `sbproxy_meter::MeasuredQuantity` rather than a re-export, for the same reason [`BillableRule`] mirrors `sbproxy_meter::Billable`. The meter crate depends on no other crate in this workspace, which is what lets an operator metering a plain REST API compile it without the gateway around it; deriving [`schemars::JsonSchema`] on its types would end that. So the config vocabulary lives here, the metering vocabulary lives there, and `sbproxy-core` converts between them. Both spell the variants the same way on the wire, so a config written against one reads the same as a receipt written by the other.",
+      "oneOf": [
+        {
+          "description": "The request itself, which is always one. What a flat per-call charge is built from.",
+          "type": "string",
+          "enum": [
+            "requests"
+          ]
+        },
+        {
+          "description": "Request bytes received from the client.",
+          "type": "string",
+          "enum": [
+            "bytes_in"
+          ]
+        },
+        {
+          "description": "Response bytes written to the client. What was actually written, so a response that was cut short bills what crossed the wire.",
+          "type": "string",
+          "enum": [
+            "bytes_out"
+          ]
+        },
+        {
+          "description": "Wall-clock milliseconds the request was in flight.",
+          "type": "string",
+          "enum": [
+            "duration_ms"
+          ]
+        }
+      ]
+    },
+    "AttestationRouteWeightConfig": {
+      "description": "`proxy.attestation.route_weights[]`: one route the operator priced.\n\nThe simplest thing an operator can say about what a call costs, and the only one that needs nothing from anybody: the weight is written down, so the number is a pure function of the route and the document it was read from. That document is already signed, so naming its revision on the receipt is all it takes for a buyer to check the price themselves. See `sbproxy_meter::RouteWeightTable`.",
+      "type": "object",
+      "required": [
+        "name",
+        "path",
+        "weight"
+      ],
+      "properties": {
+        "name": {
+          "description": "Unit name that appears on the invoice line, for example `search_call`. Repeating a name across entries is how one line gets different prices on different routes; see [`Self::path`].",
+          "type": "string"
+        },
+        "method": {
+          "description": "HTTP method this entry prices, or absent for any method. Matched case-insensitively.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "The path this entry prices: either exact (`/v1/search`) or a prefix ending in `/*` (`/v1/search/*`), which covers everything below that segment and deliberately not the segment itself.\n\nWhen several entries share a [`Self::name`] and all match, the most specific wins: a named method beats an unnamed one, an exact path beats a prefix, and a longer prefix beats a shorter one. One name still bills one line.",
+          "type": "string"
+        },
+        "weight": {
+          "description": "What one matching call costs.\n\nZero is allowed and means the route is metered and free, which is not the same as having no entry for it. No entry means this line does not price the route at all, and the receipt then carries no unit rather than a zero.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "AttestationOriginHeaderConfig": {
+      "description": "`proxy.attestation.origin_headers[]`: one count the upstream reports.\n\nThe only unit source that can be wrong without the proxy being wrong, because the party supplying the number is the party being paid for it. That is not a reason to refuse it: an API selling result rows has to bill result rows, and only the origin knows how many there were. What the proxy does instead is attest rather than vouch. The receipt records the header name and the value exactly as it arrived, so the claim on the invoice is \"the origin sent this\", which is a claim the proxy can actually stand behind.\n\nThere is deliberately no knob for what to do with a value that will not parse. Substituting a number the proxy counted would put the proxy's provenance on the origin's claim, and a receipt that cannot separate \"the origin lied\" from \"the proxy miscounted\" is worthless in the dispute it exists for. A value that does not parse bills zero and goes on the receipt verbatim. See `sbproxy_meter::OriginHeaderRule`.",
+      "type": "object",
+      "required": [
+        "header",
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "description": "Unit name that appears on the invoice line, for example `result_row`. Unique across every resolver: two units sharing a name on one receipt is an invoice line that cannot be read.",
+          "type": "string"
+        },
+        "header": {
+          "description": "Response header the count is read from. Matched case-insensitively, and quoted back on the receipt in the spelling written here.\n\nA header rather than a body path. Reading a JSON body means buffering one, and what that costs a streaming response is its own decision rather than a side effect of a metering key.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
     "ProxyTenantConfig": {
       "description": "WOR-1053: declared tenant. PR1 only carries the `id`; PR2+ adds per-tenant `credentials`, `policies`, `vault`, and `observability` blocks alongside the multi-tenant inheritance fan-out.\n\nA reserved tenant id of `__default__` is the synthetic default every origin resolves to when `origin.tenant_id` is absent. The operator never declares `__default__` explicitly; doing so fails config compile.",
       "type": "object",
@@ -6035,6 +6669,622 @@
         }
       }
     },
+    "PaymentsConfig": {
+      "description": "`proxy.payments`: durable settlement for paid requests.\n\nAbsent means the proxy keeps its existing non-settlement ledger behaviour exactly. Present means a paid request reaches the origin only after a durable intent has committed `Succeeded`.",
+      "type": "object",
+      "required": [
+        "challenge_binding_key",
+        "state_path"
+      ],
+      "properties": {
+        "state_path": {
+          "description": "Absolute path to the SQLite database that owns intents, attempts, proofs, and receipts. Authoritative for this release: a request is authorized because a row in this file says so.",
+          "type": "string"
+        },
+        "challenge_binding_key": {
+          "description": "Secret reference to the key that binds a challenge to its issuing proxy. Never an inline key.",
+          "type": "string"
+        },
+        "authorization_timeout_ms": {
+          "description": "Total budget for the one synchronous provider interaction a paid request is allowed, in milliseconds. Capped at [`MAX_AUTHORIZATION_TIMEOUT_MS`].",
+          "default": 2000,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "max_body_bytes": {
+          "description": "Largest request body the payment path buffers, in bytes. Bounded by [`MAX_PAYMENT_BODY_BYTES`]; a larger body is answered 413 before any challenge or provider work.",
+          "default": 1048576,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "recovery_encryption": {
+          "description": "Encryption for the write-ahead recovery envelopes that make a crashed Stripe dispatch recoverable. Required whenever the Stripe settlement rail is enabled.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RecoveryEncryptionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "worker": {
+          "description": "Recovery-only background worker. It never performs the settlement that authorizes a request.",
+          "default": {
+            "max_reconcile_batch": 32,
+            "reconcile_interval_ms": 1000,
+            "shutdown_timeout_ms": 5000
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/PaymentsWorkerConfig"
+            }
+          ]
+        },
+        "protocols": {
+          "description": "Wire protocols offered on top of the rails.",
+          "default": {
+            "payment_auth": null
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/PaymentProtocolsConfig"
+            }
+          ]
+        },
+        "rails": {
+          "description": "Settlement rails and their provider credentials.",
+          "default": {
+            "lightning_backend": null,
+            "lightning_cln": null,
+            "lightning_lnd": null,
+            "stripe": null,
+            "x402": null
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/PaymentRailsConfig"
+            }
+          ]
+        },
+        "usage_reporters": {
+          "description": "Usage reporters. A reporter accounts for consumption and can never authorize a request or produce a settlement receipt.",
+          "default": {
+            "stripe_meter": null
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/UsageReportersConfig"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RecoveryEncryptionConfig": {
+      "description": "AES-256-GCM material for the Stripe write-ahead recovery envelope.\n\nThe envelope holds the exact bytes of a Stripe create request so a process that crashed between stamping dispatch and recording the response can replay the byte-equivalent POST under the same idempotency key and recover the original response. It never holds the API key or any authorization header.",
+      "type": "object",
+      "required": [
+        "key",
+        "key_id"
+      ],
+      "properties": {
+        "key_id": {
+          "description": "Identifier stored beside each ciphertext so a rotation can tell which key decrypts which envelope. Outstanding envelopes must be drained or expired before their key id is retired.",
+          "type": "string"
+        },
+        "key": {
+          "description": "Secret reference to the 32-byte key. Structural validation checks only that this names a secret; runtime resolution requires exactly 32 decoded bytes.",
+          "type": "string"
+        },
+        "max_age_hours": {
+          "description": "Hard expiry for an envelope, in hours. Bounded by [`RECOVERY_MAX_AGE_HOURS_RANGE`].",
+          "default": 23,
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "PaymentsWorkerConfig": {
+      "description": "Cadence and shutdown budget for the recovery-only worker.",
+      "type": "object",
+      "properties": {
+        "reconcile_interval_ms": {
+          "description": "Delay between reconciliation sweeps, in milliseconds.",
+          "default": 1000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_reconcile_batch": {
+          "description": "Largest number of records claimed in one sweep.",
+          "default": 32,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "shutdown_timeout_ms": {
+          "description": "Time the worker is given to stop claiming and drain in-flight queries at shutdown, in milliseconds.",
+          "default": 5000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "PaymentProtocolsConfig": {
+      "description": "Wire protocols the proxy speaks on top of its settlement rails.",
+      "type": "object",
+      "properties": {
+        "payment_auth": {
+          "description": "Payment HTTP Authentication. Absent means the proxy never emits a `WWW-Authenticate: Payment` challenge.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PaymentAuthProtocolConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "PaymentAuthProtocolConfig": {
+      "description": "Payment HTTP Authentication, pinned to one draft, one method, and one intent.\n\nThe core draft's intent registry is empty, so the method-specific registration supplies the exact request, credential, and receipt semantics. This release implements only the registered `stripe` plus `charge` pair; it does not invent a generic provider schema.",
+      "type": "object",
+      "required": [
+        "realm"
+      ],
+      "properties": {
+        "draft": {
+          "description": "Draft identifier. Must equal [`PAYMENT_AUTH_DRAFT`]. Declared rather than assumed so a configuration written against a different draft fails loudly instead of producing bytes the client cannot parse.",
+          "default": "draft-ryan-httpauth-payment-01",
+          "type": "string"
+        },
+        "realm": {
+          "description": "Protection space echoed in every challenge and credential. It is the first slot of the challenge binding, so changing it invalidates outstanding challenges.",
+          "type": "string"
+        },
+        "method": {
+          "description": "Payment method token. Must equal [`PAYMENT_AUTH_METHOD`].",
+          "default": "stripe",
+          "type": "string"
+        },
+        "intent": {
+          "description": "Intent token. Must equal [`PAYMENT_AUTH_INTENT`].",
+          "default": "charge",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PaymentRailsConfig": {
+      "description": "Settlement rails and their provider credentials.\n\nEvery block is optional, but an advertised rail with no enabled block, or a Lightning advertisement with two enabled backends and no [`Self::lightning_backend`] selector, fails at load rather than at first request.",
+      "type": "object",
+      "properties": {
+        "x402": {
+          "description": "x402 v2 `exact`.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/X402RailConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stripe": {
+          "description": "Stripe PaymentIntents, used both directly and as the settlement half of Payment Auth `stripe` plus `charge`.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StripeRailConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lightning_cln": {
+          "description": "Core Lightning.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LightningClnRailConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lightning_lnd": {
+          "description": "LND.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LightningLndRailConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lightning_backend": {
+          "description": "Which backend an advertised Lightning rail resolves to. Required when both backends are configured; inferred when exactly one is.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LightningBackend"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "X402RailConfig": {
+      "description": "x402 v2 `exact` rail.",
+      "type": "object",
+      "required": [
+        "asset",
+        "asset_decimals",
+        "facilitators",
+        "max_timeout_seconds",
+        "network",
+        "pay_to",
+        "quote_currency"
+      ],
+      "properties": {
+        "scheme": {
+          "description": "Scheme name. Must equal [`X402_SCHEME`].",
+          "default": "exact",
+          "type": "string"
+        },
+        "network": {
+          "description": "CAIP-2 chain identifier, for example `eip155:84532`. A short chain nickname is rejected: an authoritative payment requirement must not depend on a translation table.",
+          "type": "string"
+        },
+        "asset": {
+          "description": "Asset contract address or identifier on `network`.",
+          "type": "string"
+        },
+        "quote_currency": {
+          "description": "ISO-4217 code the quote is priced in. Every rail a single route advertises must share this value; the proxy performs no currency conversion.",
+          "type": "string"
+        },
+        "asset_decimals": {
+          "description": "Decimal places in the asset's atomic unit. Used for the exact checked conversion from quote micros.",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "pay_to": {
+          "description": "Recipient address on `network`.",
+          "type": "string"
+        },
+        "max_timeout_seconds": {
+          "description": "Value copied into the requirement's `maxTimeoutSeconds`. Bounded by [`X402_MAX_TIMEOUT_SECONDS_RANGE`].",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "extra": {
+          "description": "Scheme-specific extra object copied verbatim into the requirement. Its JCS encoding is bounded by [`MAX_X402_EXTRA_JCS_BYTES`] and is byte-stable, so the client can echo it and the proxy can compare it exactly.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": true
+        },
+        "facilitators": {
+          "description": "Ordered facilitator candidates. Fallback is allowed only by issuing a fresh challenge; a signed requirement is bound to the one facilitator it selected.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/X402FacilitatorConfig"
+          }
+        },
+        "verify_timeout_ms": {
+          "description": "Budget for the `verify` call, in milliseconds.",
+          "default": 700,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "settle_timeout_ms": {
+          "description": "Budget for the `settle` call, in milliseconds.",
+          "default": 1200,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "breaker": {
+          "description": "Breaker around the facilitator.",
+          "default": {
+            "failure_threshold": 3,
+            "half_open_max": 1,
+            "open_ms": 5000
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/BreakerConfig"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "X402FacilitatorConfig": {
+      "description": "One facilitator candidate for the x402 rail.\n\nThe URL is the facilitator's complete API root. The adapter preserves every configured path segment, strips only trailing slashes, and appends exactly `/verify` or `/settle`; it never injects a version or protocol segment of its own.",
+      "type": "object",
+      "required": [
+        "facilitator_url"
+      ],
+      "properties": {
+        "facilitator_url": {
+          "description": "Absolute HTTPS API root. No userinfo, query, or fragment, and no endpoint suffix.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "BreakerConfig": {
+      "description": "Bounded circuit breaker around one provider endpoint.",
+      "type": "object",
+      "properties": {
+        "failure_threshold": {
+          "description": "Consecutive transport failures that open the breaker.",
+          "default": 3,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "open_ms": {
+          "description": "How long the breaker stays open, in milliseconds. Bounded by [`BREAKER_OPEN_MS_RANGE`].",
+          "default": 5000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "half_open_max": {
+          "description": "Probes admitted while half open. Exactly 1 in this release: a second concurrent probe against an unhealthy facilitator can dispatch a settlement nobody is waiting to record.",
+          "default": 1,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "StripeRailConfig": {
+      "description": "Stripe settlement rail.",
+      "type": "object",
+      "required": [
+        "api_key",
+        "business_network_id",
+        "currency_decimals",
+        "payment_method_types",
+        "quote_currency"
+      ],
+      "properties": {
+        "api_key": {
+          "description": "Secret reference to the Stripe secret key. Never inline.",
+          "type": "string"
+        },
+        "api_version": {
+          "description": "Stripe API version. Must equal [`STRIPE_API_VERSION`].",
+          "default": "2026-06-24.dahlia",
+          "type": "string"
+        },
+        "account_context": {
+          "description": "Account routing. Only `platform` is accepted in this release, and no `Stripe-Account` header is sent. Connect routing is deliberately not reachable from a challenge or a credential: a client-controlled destination account would let a payer choose who gets paid.",
+          "default": "platform",
+          "type": "string"
+        },
+        "business_network_id": {
+          "description": "Business network identifier copied into the method details of a Payment Auth request.",
+          "type": "string"
+        },
+        "quote_currency": {
+          "description": "ISO-4217 code the quote is priced in.",
+          "type": "string"
+        },
+        "currency_decimals": {
+          "description": "Declared minor-unit decimals for `quote_currency`. Checked against the built-in ISO-4217 table so a mis-declared currency cannot silently charge a hundred times the quoted price.",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "payment_method_types": {
+          "description": "Payment method types offered on the PaymentIntent.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "direct_payment_intent": {
+          "description": "Optional direct PaymentIntent mode.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DirectPaymentIntentConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "DirectPaymentIntentConfig": {
+      "description": "Direct Stripe PaymentIntent mode.\n\nThe challenge creates a manual-capture PaymentIntent and the credential retry captures it. Preparation must never capture funds or deliver the resource, so `automatic` capture is not accepted.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether the direct PaymentIntent mode is offered.",
+          "default": false,
+          "type": "boolean"
+        },
+        "capture_method": {
+          "description": "Capture mode. Only `manual` is accepted.",
+          "default": "manual",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "LightningClnRailConfig": {
+      "description": "Core Lightning rail, reached over its Unix-socket JSON-RPC.",
+      "type": "object",
+      "required": [
+        "quote_currency",
+        "rune",
+        "settlement_decimals",
+        "socket_path"
+      ],
+      "properties": {
+        "socket_path": {
+          "description": "Absolute path to the `lightning-rpc` Unix socket.",
+          "type": "string"
+        },
+        "rune": {
+          "description": "Secret reference to the rune that authorizes the RPC calls.",
+          "type": "string"
+        },
+        "minimum_version": {
+          "description": "Smallest accepted node version as `major.minor`. Cannot be set below [`MIN_CLN_VERSION`], whose `xpay` label and `listinvoices` status this adapter depends on. Startup checks the live version through `getinfo`.",
+          "default": "26.06",
+          "type": "string"
+        },
+        "quote_currency": {
+          "description": "ISO-4217 or asset code the quote is priced in.",
+          "type": "string"
+        },
+        "settlement_decimals": {
+          "description": "Decimal places in the settlement unit. `11` prices BTC in millisatoshis.",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "invoice_expiry_seconds": {
+          "description": "Invoice lifetime, in seconds. Bounded by [`INVOICE_EXPIRY_SECONDS_RANGE`].",
+          "default": 300,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "LightningLndRailConfig": {
+      "description": "LND rail, reached over gRPC.",
+      "type": "object",
+      "required": [
+        "endpoint",
+        "macaroon",
+        "quote_currency",
+        "settlement_decimals",
+        "tls_certificate_path"
+      ],
+      "properties": {
+        "endpoint": {
+          "description": "gRPC endpoint URL. Must be absolute and TLS-bearing.",
+          "type": "string"
+        },
+        "tls_certificate_path": {
+          "description": "Absolute path to the node's TLS certificate.",
+          "type": "string"
+        },
+        "macaroon": {
+          "description": "Secret reference to the hex-encoded macaroon.",
+          "type": "string"
+        },
+        "quote_currency": {
+          "description": "ISO-4217 or asset code the quote is priced in.",
+          "type": "string"
+        },
+        "settlement_decimals": {
+          "description": "Decimal places in the settlement unit.",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "invoice_expiry_seconds": {
+          "description": "Invoice lifetime, in seconds. Bounded by [`INVOICE_EXPIRY_SECONDS_RANGE`].",
+          "default": 300,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "LightningBackend": {
+      "description": "Which settlement backend serves an advertised Lightning rail.",
+      "oneOf": [
+        {
+          "description": "Core Lightning over its Unix-socket JSON-RPC.",
+          "type": "string",
+          "enum": [
+            "cln"
+          ]
+        },
+        {
+          "description": "LND over gRPC.",
+          "type": "string",
+          "enum": [
+            "lnd"
+          ]
+        }
+      ]
+    },
+    "UsageReportersConfig": {
+      "description": "Usage reporters. Accounting only.",
+      "type": "object",
+      "properties": {
+        "stripe_meter": {
+          "description": "Stripe Meter Events. Meter events record consumption; they never prove that a payment settled and can never move an access intent to `Succeeded`.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StripeMeterReporterConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "StripeMeterReporterConfig": {
+      "description": "Stripe Meter Events reporter.",
+      "type": "object",
+      "required": [
+        "customer_field",
+        "event_name"
+      ],
+      "properties": {
+        "event_name": {
+          "description": "Meter event name registered in the Stripe dashboard.",
+          "type": "string"
+        },
+        "customer_field": {
+          "description": "Field on the request context that carries the Stripe customer identifier.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
     "RawOriginConfig": {
       "description": "A single origin config as it appears in YAML. Plugin-specific fields are kept as `serde_json::Value` for deferred parsing.",
       "type": "object",
@@ -6443,6 +7693,17 @@
           "description": "Opt this origin into outbound Web Bot Auth signing (WOR-805). When `true` and `proxy.web_bot_auth` is configured, the proxy signs the request it sends upstream with the proxy's Ed25519 key (RFC 9421, `tag=web-bot-auth`), so an upstream that demands Web Bot Auth accepts SBproxy as a verified agent. Default `false`.",
           "default": false,
           "type": "boolean"
+        },
+        "attestation": {
+          "description": "Per-origin consumption attestation overrides (WOR-2127). Absent leaves the origin on the proxy-wide role with no agreement named. Authoring this block without a `proxy.attestation` block fails config compile: a per-origin role with no queue, ledger, or billing table behind it can never produce a record. See [`OriginAttestationConfig`].",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OriginAttestationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "observability": {
           "description": "Origin-scope observability block. Today the only nested surface is `log.redact.pii`, which composes against the tenant-scope block (or proxy-scope when the origin has no tenant). See [`OriginObservabilityConfig`].",
@@ -8358,6 +9619,33 @@
         "PS512",
         "EdDSA"
       ]
+    },
+    "OriginAttestationConfig": {
+      "description": "`origins.<host>.attestation`: per-origin attestation overrides.\n\nTwo fields, and they are here for different reasons. `role` is an override, because one gateway commonly fronts both a partner API it resells (claims) and its own service (receipts). `agreement_id` has no proxy-wide equivalent at all: it names the commercial agreement the units are billed under, and that is a property of who is on the other end of the connection, never of the proxy.",
+      "type": "object",
+      "properties": {
+        "role": {
+          "description": "Narrows or widens `proxy.attestation.role` for this origin. Absent inherits the proxy-wide role.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AttestationRole"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "agreement_id": {
+          "description": "The commercial agreement this origin's units are billed under. Without it a receipt says how much was consumed but not which contract turns that into money.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "OriginObservabilityConfig": {
       "description": "Origin-scope observability sub-tree. The `log.redact` block, `log.sinks` (origin-scoped fan-out, filtered by the stamped `route`), and `log.custom_fields` (the most-specific access-log fields, which override tenant- and proxy-scope fields of the same name) are all consumed at runtime.",

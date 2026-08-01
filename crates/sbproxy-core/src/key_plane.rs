@@ -1,10 +1,10 @@
-//! WOR-1546: assembly and process-global handle for the dynamic key plane.
+//! WOR-1546: assembly and publication for the dynamic key plane.
 //!
 //! The `key_management:` config block is lowered here into a live `KeyPlane`:
 //! a `KeyCrypto` handle (pepper + master), a `KeyStore` backend, and a
-//! fail-closed `TtlCache` in front of it. The plane is held in a global
-//! `ArcSwapOption` (like the rate-limit registry and the compiled pipeline) so
-//! the auth dispatch and the admin API resolve against one shared instance.
+//! fail-closed `TtlCache` in front of it. Each compiled pipeline owns its exact
+//! plane generation for request processing. A global `ArcSwapOption` follows
+//! the published generation for admin and cluster control-plane consumers.
 //!
 //! Async work (seeding the config records, the Redis invalidation subscriber)
 //! runs on a dedicated, process-lifetime runtime so it is independent of the
@@ -23,8 +23,9 @@ use sbproxy_ai::governance::{
 };
 use sbproxy_ai::governance_redis::{RedisGovernanceConfig, RedisGovernanceStore};
 use sbproxy_config::types::{
-    GovernanceBackendConfig, GovernanceConsistency as ConfigGovernanceConsistency, KeyCacheTier,
-    KeyGovernanceConfig, KeyManagementConfig, KeyStoreBackend, SeedCredentialConfig, SeedKeyConfig,
+    FailureMode, GovernanceBackendConfig, GovernanceConsistency as ConfigGovernanceConsistency,
+    KeyCacheTier, KeyGovernanceConfig, KeyManagementConfig, KeyStoreBackend, SeedCredentialConfig,
+    SeedKeyConfig,
 };
 use sbproxy_keystore::crypto::KeyCrypto;
 use sbproxy_keystore::record::{
@@ -36,7 +37,8 @@ use sbproxy_keystore::{EmbeddedKeyStore, KeyStore, TtlCache, TtlCacheConfig};
 pub struct KeyPlane {
     crypto: KeyCrypto,
     cache: Arc<TtlCache>,
-    failure_mode_allow: bool,
+    resolved_credentials: ResolvedCredentialCache,
+    failure_posture: FailureMode,
     allow_api_override: bool,
     oidc_claim_field: Option<String>,
     governance: KeyGovernanceConfig,
@@ -93,7 +95,19 @@ impl KeyPlane {
         Self {
             crypto,
             cache,
-            failure_mode_allow,
+            resolved_credentials: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            // The legacy boolean's own conversion, kept identical to
+            // `KeyManagementConfig::failure_posture`: `true` admits, but it
+            // admits by falling through with no per-key policy, budget, or
+            // attribution, which is a waived guarantee rather than an open
+            // door. `prepare_key_plane` overrides this with the resolved
+            // posture; the bool parameter stays so callers that only have
+            // the legacy value keep compiling.
+            failure_posture: if failure_mode_allow {
+                FailureMode::Degraded
+            } else {
+                FailureMode::Closed
+            },
             allow_api_override,
             oidc_claim_field,
             governance,
@@ -101,6 +115,13 @@ impl KeyPlane {
             approximate_store,
             inbound: sbproxy_config::types::KeyInboundConfig::default(),
         }
+    }
+
+    /// Pin the posture resolved from `key_management.failure_posture`,
+    /// replacing whatever the legacy `failure_mode_allow` boolean implied.
+    pub(crate) fn with_failure_posture(mut self, posture: FailureMode) -> Self {
+        self.failure_posture = posture;
+        self
     }
 
     /// Attach the inbound header-sweep settings.
@@ -128,10 +149,20 @@ impl KeyPlane {
         &self.cache
     }
 
-    /// When true, a store outage allows the request through (degraded) instead
-    /// of denying. Default false.
-    pub fn failure_mode_allow(&self) -> bool {
-        self.failure_mode_allow
+    /// What this plane does when the key store cannot be reached.
+    ///
+    /// Resolved once at plane construction from
+    /// `key_management.failure_posture`, falling back to the legacy
+    /// `failure_mode_allow` boolean. Every store-outage decision in the
+    /// request path reads this and nothing else.
+    ///
+    /// [`FailureMode::Closed`] (the default) denies with 503.
+    /// [`FailureMode::Degraded`] and [`FailureMode::Open`] both fall
+    /// through to the origin's configured auth, which is not a blanket
+    /// admit; they differ only in whether the lost per-key policy, budget,
+    /// and attribution are recorded as lost.
+    pub fn failure_posture(&self) -> FailureMode {
+        self.failure_posture
     }
 
     /// When true, the admin API may override config-seeded records on reload.
@@ -217,30 +248,40 @@ impl std::fmt::Display for CredentialResolveError {
 /// How long a resolved credential secret stays cached.
 ///
 /// Vault resolution is a network round-trip and must not run per request.
-/// Dropped by [`invalidate_resolved_credential`] on any admin mutation, so a
-/// rotation takes effect on the same signal that drops the record itself.
+/// Dropped by [`KeyPlane::invalidate_resolved_credential`] on any admin
+/// mutation, so a rotation takes effect on the same signal that drops the
+/// record itself.
 const RESOLVED_CREDENTIAL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 type ResolvedCredentialCache =
     parking_lot::Mutex<std::collections::HashMap<String, (std::time::Instant, ResolvedCredential)>>;
 
-fn resolved_credential_cache() -> &'static ResolvedCredentialCache {
-    static CACHE: OnceLock<ResolvedCredentialCache> = OnceLock::new();
-    CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
-}
-
 /// Drop any cached resolved secret for `id`. Called from the admin mutation
 /// path alongside the record-cache invalidation.
 pub fn invalidate_resolved_credential(id: &str) {
-    resolved_credential_cache().lock().remove(id);
+    if let Some(plane) = current_key_plane() {
+        plane.invalidate_resolved_credential(id);
+    }
 }
 
 /// Drop every cached resolved secret.
 pub fn invalidate_all_resolved_credentials() {
-    resolved_credential_cache().lock().clear();
+    if let Some(plane) = current_key_plane() {
+        plane.invalidate_all_resolved_credentials();
+    }
 }
 
 impl KeyPlane {
+    /// Drop one resolved upstream secret from this plane generation.
+    pub(crate) fn invalidate_resolved_credential(&self, id: &str) {
+        self.resolved_credentials.lock().remove(id);
+    }
+
+    /// Drop every resolved upstream secret from this plane generation.
+    pub(crate) fn invalidate_all_resolved_credentials(&self) {
+        self.resolved_credentials.lock().clear();
+    }
+
     /// Resolve a key's bound credential into the header the upstream carries.
     ///
     /// `tenant_id` is the owning tenant of the key that names this credential.
@@ -258,7 +299,7 @@ impl KeyPlane {
         tenant_id: Option<&str>,
     ) -> std::result::Result<ResolvedCredential, CredentialResolveError> {
         if let Some(hit) = {
-            let cache = resolved_credential_cache().lock();
+            let cache = self.resolved_credentials.lock();
             cache.get(id).and_then(|(at, value)| {
                 (at.elapsed() < RESOLVED_CREDENTIAL_TTL).then(|| value.clone())
             })
@@ -315,7 +356,7 @@ impl KeyPlane {
             header: record.header.trim().to_ascii_lowercase(),
             value: format!("{}{}", record.scheme, secret),
         };
-        resolved_credential_cache().lock().insert(
+        self.resolved_credentials.lock().insert(
             id.to_string(),
             (std::time::Instant::now(), resolved.clone()),
         );
@@ -555,11 +596,15 @@ fn build_secrets_manager_spec(
 /// Build the `TtlCache` wrapping `store`, attaching a Redis L2 tier when
 /// configured.
 fn build_cache(cfg: &KeyManagementConfig, store: Arc<dyn KeyStore>) -> Arc<TtlCache> {
+    // No `fail_closed` here any more (WOR-2121). It was `!failure_mode_allow`,
+    // an inverted second spelling of the same operator knob that nothing ever
+    // read: the cache propagates a store error unconditionally and the
+    // admission decision belongs to the request path, which reads
+    // `KeyPlane::failure_posture`.
     let cache_cfg = TtlCacheConfig {
         ttl: std::time::Duration::from_secs(cfg.cache.ttl_secs),
         negative_ttl: std::time::Duration::from_secs(cfg.cache.negative_ttl_secs),
         max_entries: cfg.cache.max_entries,
-        fail_closed: !cfg.failure_mode_allow,
     };
     let mut cache = TtlCache::new(store, cache_cfg);
     match cfg.cache.tier {
@@ -720,6 +765,7 @@ fn lower_seed_key(
     rec.inject_tools = seed.inject_tools.clone();
     rec.inject_mcp = seed.inject_mcp.clone();
     rec.bypass_prompt_injection = seed.bypass_prompt_injection;
+    rec.allow_content_capture = seed.allow_content_capture;
     rec.project = seed.project.clone();
     rec.user = seed.user.clone();
     rec.tags = seed.tags.clone();
@@ -800,36 +846,25 @@ async fn seed_records(
     Ok(())
 }
 
-/// Build, seed, and install the key plane from config. Idempotent across
-/// reloads: re-seeds config records and replaces the installed plane. A no-op
-/// when the block is disabled, in which case any previously installed plane
-/// is removed.
-///
-/// Synchronous: runs async seeding on the dedicated key runtime and returns once
-/// the seed is applied, so seeded keys are usable as soon as the server accepts
-/// traffic.
-pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
-    if !cfg.enabled {
-        uninstall_key_plane();
-        return Ok(());
+/// Build a candidate key plane without changing process-global or store state.
+pub(crate) fn prepare_key_plane(
+    cfg: Option<&KeyManagementConfig>,
+) -> Result<Option<Arc<KeyPlane>>> {
+    // Checked before the `enabled` filter on purpose: a posture this site
+    // cannot honour is an operator mistake whether or not the block is
+    // switched on, and finding out at the moment it is switched on is the
+    // worst time to find out.
+    if let Some(cfg) = cfg {
+        cfg.validate_failure_posture()
+            .map_err(|error| anyhow::anyhow!("config compile: {error}"))?;
     }
+    let Some(cfg) = cfg.filter(|cfg| cfg.enabled) else {
+        return Ok(None);
+    };
     let (governance_store, approximate_store) = build_governance_store(&cfg.governance)?;
     let crypto = build_crypto(cfg)?;
     let store = build_store(cfg)?;
     let cache = build_cache(cfg, store.clone());
-
-    let now = Utc::now();
-    // Seed on a fresh thread driving the dedicated key runtime. A fresh thread
-    // is never already inside a runtime, so `block_on` is safe whether
-    // `init_key_plane` is called at boot (no runtime) or on reload (which may
-    // run on a tokio worker, where a nested `block_on` would otherwise panic).
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| key_runtime().block_on(seed_records(&store, &crypto, cfg, now)))
-            .join()
-            .expect("key-plane seed thread panicked")
-    })
-    .context("seed key_management records")?;
 
     let plane = Arc::new(
         KeyPlane::from_parts_with_governance(
@@ -842,9 +877,49 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
             governance_store,
             approximate_store,
         )
+        .with_failure_posture(cfg.failure_posture())
         .with_inbound(cfg.inbound.clone()),
     );
-    install_key_plane(plane);
+    Ok(Some(plane))
+}
+
+/// Apply declarative seeds after every other candidate preflight succeeds.
+///
+/// Keeping this separate from [`prepare_key_plane`] prevents a later model or
+/// pipeline preflight failure from exposing candidate records through
+/// generation A's shared store. The generic `KeyStore` contract has no
+/// cross-backend batch transaction, so reload treats an error here as a
+/// degraded generation B after all reject-only work has passed; boot still
+/// returns the error.
+pub(crate) fn seed_prepared_key_plane(
+    plane: Option<&Arc<KeyPlane>>,
+    cfg: Option<&KeyManagementConfig>,
+) -> Result<()> {
+    let Some((plane, cfg)) = plane.zip(cfg.filter(|cfg| cfg.enabled)) else {
+        return Ok(());
+    };
+    let store = plane.cache().store().clone();
+    let now = Utc::now();
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| key_runtime().block_on(seed_records(&store, plane.crypto(), cfg, now)))
+            .join()
+            .expect("key-plane seed thread panicked")
+    })
+    .context("seed key_management records")
+}
+
+/// Install a prepared key plane as the process-global admin and cluster view.
+///
+/// Request paths do not read this slot. They use the plane pinned to their
+/// [`crate::pipeline::CompiledPipeline`] generation, so this back-to-back
+/// control-plane swap cannot change an in-flight request.
+pub(crate) fn activate_key_plane(plane: Option<Arc<KeyPlane>>, cfg: Option<&KeyManagementConfig>) {
+    plane_slot().store(plane.clone());
+
+    let Some((plane, cfg)) = plane.zip(cfg.filter(|cfg| cfg.enabled)) else {
+        return;
+    };
 
     // Cross-replica invalidation: subscribe to the Redis channel so a peer's
     // mutation drops the matching local cache entry. Runs forever on the key
@@ -871,6 +946,7 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
     }
 
     if let Some(url) = subscribe_url {
+        let cache = plane.cache().clone();
         key_runtime().spawn(async move {
             loop {
                 if let Err(e) =
@@ -889,6 +965,19 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
         cache_tier = ?cfg.cache.tier,
         "dynamic key plane installed"
     );
+}
+
+/// Build, seed, and immediately install a key plane.
+///
+/// Boot and reload use the crate-internal `prepare_key_plane`,
+/// `seed_prepared_key_plane`, and `activate_key_plane` steps directly so the
+/// plane can be committed with its matching pipeline. This wrapper remains for
+/// callers and tests that intentionally manage only the process-global admin
+/// view.
+pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
+    let plane = prepare_key_plane(Some(cfg))?;
+    seed_prepared_key_plane(plane.as_ref(), Some(cfg))?;
+    activate_key_plane(plane, Some(cfg));
     Ok(())
 }
 
@@ -975,6 +1064,42 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(current_key_plane().is_none());
+    }
+
+    #[test]
+    fn candidate_preparation_does_not_seed_the_live_store_before_commit() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let mut cfg = base_cfg(&path);
+        cfg.seed.keys.push(
+            serde_json::from_value(serde_json::json!({
+                "key_id": "candidate-only",
+                "secret": "candidate-secret"
+            }))
+            .expect("seed fixture"),
+        );
+
+        let plane = prepare_key_plane(Some(&cfg))
+            .expect("prepare candidate")
+            .expect("enabled plane");
+        let store = plane.cache().store().clone();
+        assert!(
+            key_runtime()
+                .block_on(store.get_key("candidate-only"))
+                .expect("read candidate store")
+                .is_none(),
+            "candidate construction must not mutate the store before commit",
+        );
+
+        seed_prepared_key_plane(Some(&plane), Some(&cfg)).expect("seed at commit boundary");
+        assert!(
+            key_runtime()
+                .block_on(store.get_key("candidate-only"))
+                .expect("read committed store")
+                .is_some(),
+            "the explicit commit step applies declarative seeds",
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1094,6 +1219,7 @@ mod tests {
                 inject_tools: vec![],
                 inject_mcp: Some(serde_json::json!({ "ref": "toolhub" })),
                 bypass_prompt_injection: false,
+                allow_content_capture: false,
                 project: None,
                 user: None,
                 tags: vec!["production".into()],
@@ -1160,6 +1286,126 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A config written before `failure_posture` existed must reach the
+    /// plane with exactly the behaviour it always had. That is the whole
+    /// promise of this migration, so it is pinned in both directions.
+    #[test]
+    fn a_legacy_failure_mode_allow_config_resolves_to_the_same_admission() {
+        let _guard = test_plane_guard();
+        // A separate store file per plane: redb takes an exclusive lock, so
+        // two live planes cannot share one path.
+        let closed_path = temp_db();
+        let admitting_path = temp_db();
+
+        let closed_cfg = base_cfg(&closed_path);
+        assert!(!closed_cfg.failure_mode_allow, "the legacy default is deny");
+        let closed = prepare_key_plane(Some(&closed_cfg))
+            .expect("prepare closed plane")
+            .expect("enabled plane");
+        assert_eq!(closed.failure_posture(), FailureMode::Closed);
+        assert!(!closed.failure_posture().admits());
+        drop(closed);
+
+        let mut admitting_cfg = base_cfg(&admitting_path);
+        admitting_cfg.failure_mode_allow = true;
+        let admitting = prepare_key_plane(Some(&admitting_cfg))
+            .expect("prepare admitting plane")
+            .expect("enabled plane");
+        assert!(admitting.failure_posture().admits());
+        // `true` has always meant "fall through with no per-key policy,
+        // budget, or attribution". That is a waived guarantee, and it is
+        // recorded as one rather than as a plain open.
+        assert_eq!(admitting.failure_posture(), FailureMode::Degraded);
+        assert!(admitting.failure_posture().guarantee_waived());
+        drop(admitting);
+
+        std::fs::remove_file(&closed_path).ok();
+        std::fs::remove_file(&admitting_path).ok();
+    }
+
+    /// An explicit posture wins over the legacy boolean, including when the
+    /// two disagree, and `degraded` stays distinguishable from `open`.
+    #[test]
+    fn an_explicit_failure_posture_overrides_the_legacy_boolean() {
+        let _guard = test_plane_guard();
+        let closed_path = temp_db();
+        let open_path = temp_db();
+
+        let mut closed_cfg = base_cfg(&closed_path);
+        closed_cfg.failure_mode_allow = true;
+        closed_cfg.failure_posture = Some(FailureMode::Closed);
+        let plane = prepare_key_plane(Some(&closed_cfg))
+            .expect("prepare plane")
+            .expect("enabled plane");
+        assert_eq!(
+            plane.failure_posture(),
+            FailureMode::Closed,
+            "the explicit key wins even when the legacy boolean says admit"
+        );
+        drop(plane);
+
+        let mut open_cfg = base_cfg(&open_path);
+        open_cfg.failure_mode_allow = false;
+        open_cfg.failure_posture = Some(FailureMode::Open);
+        let plane = prepare_key_plane(Some(&open_cfg))
+            .expect("prepare plane")
+            .expect("enabled plane");
+        assert_eq!(plane.failure_posture(), FailureMode::Open);
+        assert!(plane.failure_posture().admits());
+        assert!(
+            !plane.failure_posture().guarantee_waived(),
+            "a plain open claims nothing, which is what separates it from degraded"
+        );
+        assert_eq!(plane.failure_posture().as_label(), "open");
+        drop(plane);
+
+        std::fs::remove_file(&closed_path).ok();
+        std::fs::remove_file(&open_path).ok();
+    }
+
+    /// `observe` has no meaning for an unreachable store, so it is refused
+    /// before anything is built, and refused even with the block disabled.
+    #[test]
+    fn an_observe_posture_is_refused_before_the_plane_is_built() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let mut cfg = base_cfg(&path);
+        cfg.failure_posture = Some(FailureMode::Observe);
+
+        let error = prepare_key_plane(Some(&cfg))
+            .map(|_| ())
+            .expect_err("observe must not build a plane");
+        assert!(
+            error
+                .to_string()
+                .contains("key_management.failure_posture: `observe` is meaningless"),
+            "the error must name the site: {error}"
+        );
+
+        cfg.enabled = false;
+        let error = prepare_key_plane(Some(&cfg))
+            .map(|_| ())
+            .expect_err("a disabled block still rejects the typo");
+        assert!(
+            error.to_string().contains("key_management.failure_posture"),
+            "unexpected error: {error}"
+        );
+
+        let mut governed = base_cfg(&path);
+        governed.governance.failure_posture = Some(FailureMode::Observe);
+        let error = prepare_key_plane(Some(&governed))
+            .map(|_| ())
+            .expect_err("observe must not build a governance store either");
+        assert!(
+            error
+                .to_string()
+                .contains("key_management.governance.failure_posture"),
+            "the nested site names itself: {error}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn disabled_block_installs_nothing() {
         let _guard = test_plane_guard();
@@ -1215,6 +1461,7 @@ mod tests {
                 inject_tools: vec![],
                 inject_mcp: None,
                 bypass_prompt_injection: false,
+                allow_content_capture: false,
                 project: None,
                 user: None,
                 tags: vec![],
@@ -1461,12 +1708,58 @@ mod resolve_credential_secret_tests {
             "served from cache until invalidated"
         );
 
-        invalidate_resolved_credential("c6");
+        p.invalidate_resolved_credential("c6");
         p.cache().invalidate("c6").await;
         assert_eq!(
             p.resolve_credential_secret("c6", None).await.unwrap().value,
             "Bearer second",
             "invalidation drops the resolved secret, not just the record"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_credential_cache_is_isolated_per_key_plane_generation() {
+        // The same record id can legitimately resolve differently after reload.
+        invalidate_all_resolved_credentials();
+        let plane_a = plane();
+        let plane_b = plane();
+        put(
+            &plane_a,
+            credential(
+                "shared-id",
+                CredentialMaterial::Plaintext {
+                    value: "generation-a".into(),
+                },
+            ),
+        )
+        .await;
+        put(
+            &plane_b,
+            credential(
+                "shared-id",
+                CredentialMaterial::Plaintext {
+                    value: "generation-b".into(),
+                },
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            plane_a
+                .resolve_credential_secret("shared-id", None)
+                .await
+                .unwrap()
+                .value,
+            "Bearer generation-a",
+        );
+        assert_eq!(
+            plane_b
+                .resolve_credential_secret("shared-id", None)
+                .await
+                .unwrap()
+                .value,
+            "Bearer generation-b",
+            "a newer plane must not reuse a resolved secret cached by an older plane",
         );
     }
 }

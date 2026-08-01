@@ -816,6 +816,13 @@ pub struct ProxyServerConfig {
     /// configs are unaffected.
     #[serde(default)]
     pub web_bot_auth: Option<WebBotAuthConfig>,
+    /// Consumption attestation (WOR-2127): whether this proxy asserts
+    /// what a call is going to cost, records what it actually
+    /// consumed, and what it charges for. Absent leaves the whole
+    /// mechanism off, so an existing config is unaffected. See
+    /// [`AttestationConfig`].
+    #[serde(default)]
+    pub attestation: Option<AttestationConfig>,
     /// WOR-1053: declared tenants. Each entry carries an `id`
     /// referenced by `origin.tenant_id`. Future PRs add per-tenant
     /// `credentials`, `policies`, and `vault` blocks; PR1 lands the
@@ -840,6 +847,19 @@ pub struct ProxyServerConfig {
     /// `docs/migration-credentials.md`.
     #[serde(default)]
     pub credentials: Vec<CredentialBlock>,
+    /// Durable payment settlement. When absent, the proxy keeps its
+    /// existing non-settlement crawl-ledger behaviour exactly. When
+    /// present, a paid request reaches the origin only after its
+    /// durable intent has committed `Succeeded`.
+    ///
+    /// The block is always parsed, on every build, so `sbproxy
+    /// validate` reads the same document everywhere. The consumer
+    /// compares [`crate::payments::PaymentsConfig::required_features`]
+    /// against its own compiled feature set and fails startup naming
+    /// the missing feature, so a configured rail that was not compiled
+    /// in never reaches a first request.
+    #[serde(default)]
+    pub payments: Option<crate::payments::PaymentsConfig>,
 }
 
 /// Web Bot Auth signing identity for the proxy. See the
@@ -867,6 +887,466 @@ pub struct WebBotAuthConfig {
     /// the discovery pointer.
     #[serde(default)]
     pub directory_url: Option<String>,
+}
+
+// --- Consumption attestation (WOR-2127) ---
+
+/// The one `sign_with` target this build knows how to resolve.
+///
+/// A config path rather than a key name, because the operator is
+/// pointing at an identity that already exists in their document rather
+/// than declaring a second one. Kept as a validated string so the day a
+/// second signing identity ships, an old config still parses and the
+/// error tells the operator what is on offer.
+pub const ATTESTATION_SIGN_WITH_WEB_BOT_AUTH: &str = "proxy.web_bot_auth";
+
+/// Largest `queue.max_entries` this build accepts.
+///
+/// The queue is an in-process hold for claims that have not settled
+/// yet. Past ten million entries an operator is describing a database,
+/// and sizing one by accident (an extra zero) should fail at config
+/// compile rather than at the memory ceiling.
+pub const MAX_ATTESTATION_QUEUE_ENTRIES: usize = 10_000_000;
+
+const fn default_attestation_queue_max_entries() -> usize {
+    100_000
+}
+
+const fn default_attestation_failure_mode() -> FailureMode {
+    FailureMode::Degraded
+}
+
+const fn default_measured_per() -> u64 {
+    1
+}
+
+/// What part this proxy plays in attesting to consumption.
+///
+/// The two halves answer the two halves of a billing dispute and are
+/// independently useful, which is why this is four values rather than a
+/// boolean. A claim is made before the call and says what it is going
+/// to cost; a receipt is written after it and says what it actually
+/// consumed. A gateway in front of somebody else's metered API wants
+/// [`Self::Claim`] alone. A proxy selling its own upstream wants
+/// [`Self::Receipt`] alone. An operator reselling metered capacity
+/// wants [`Self::Both`], because they have to answer to a buyer and a
+/// supplier at once.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationRole {
+    /// Attest to nothing. The default, and what every config that does
+    /// not mention the block gets.
+    #[default]
+    Off,
+    /// Assert what a call is going to cost, before it is served.
+    Claim,
+    /// Record what a call actually consumed, after it is served.
+    Receipt,
+    /// Both halves. The posture for reselling metered capacity.
+    Both,
+}
+
+impl AttestationRole {
+    /// True when this role asserts a cost before the call is served.
+    pub fn makes_claims(self) -> bool {
+        matches!(self, Self::Claim | Self::Both)
+    }
+
+    /// True when this role records consumption after the call is
+    /// served. The half that needs a signing identity, because a
+    /// receipt nobody can verify is a log line.
+    pub fn writes_receipts(self) -> bool {
+        matches!(self, Self::Receipt | Self::Both)
+    }
+}
+
+/// The billing answer for one outcome, in the configuration
+/// vocabulary.
+///
+/// A deliberate mirror of `sbproxy_meter::Billable` rather than a
+/// re-export. The meter crate depends on no other crate in this
+/// workspace, which is what lets an operator metering a plain REST API
+/// compile it without the AI stack; deriving [`schemars::JsonSchema`]
+/// on its types would end that. So the wire vocabulary lives here, the
+/// billing vocabulary lives there, and `sbproxy-core` converts between
+/// them. The two are kept in step by
+/// `sbproxy_meter::BillableOutcome::ALL`: adding an outcome there stops
+/// the conversion compiling until this surface answers for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BillableRule {
+    /// Bill every unit the call produced.
+    Yes,
+    /// Bill nothing. The call is still recorded, because a receipt that
+    /// omits the free calls cannot be reconciled against a request log.
+    No,
+    /// Bill the work the origin actually performed, even though the
+    /// request was cut short.
+    Partial,
+    /// Fold this attempt into the invoice line its claim names, so a
+    /// flaky origin costs the buyer once rather than once per attempt.
+    Collapse,
+}
+
+/// `proxy.attestation.billable`: what the operator charges for.
+///
+/// Every field is `Option` so that an incomplete block is a config
+/// error this crate can describe rather than a serde error that names
+/// one missing field at a time. The operator owes an answer for all
+/// eight, and [`Self::missing_outcomes`] hands them the whole list in
+/// one message. Nothing is defaulted: an unstated billing rule still
+/// runs, it just runs as whatever the code happened to do, and nobody
+/// discovers what that was until a buyer asks.
+///
+/// `cache_hit` is the case that proves the rule. A vendor selling
+/// compute can argue a cache hit cost them nothing; a vendor selling
+/// answers can argue the answer is what was bought and where it came
+/// from is their business. Both are positions real companies hold, so
+/// this surface holds neither.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AttestationBillableConfig {
+    /// The response was served to the client in full.
+    pub delivered: Option<BillableRule>,
+    /// The client went away before the response finished.
+    pub client_disconnected: Option<BillableRule>,
+    /// The origin rejected the request as the caller's fault.
+    pub origin_4xx: Option<BillableRule>,
+    /// The origin failed.
+    pub origin_5xx: Option<BillableRule>,
+    /// A policy refused the call before it reached the origin.
+    pub policy_blocked: Option<BillableRule>,
+    /// A rate limit rejected the call.
+    pub rate_limited: Option<BillableRule>,
+    /// The response was served from cache without touching the origin.
+    pub cache_hit: Option<BillableRule>,
+    /// One attempt of a call that was retried.
+    pub retry: Option<BillableRule>,
+}
+
+impl AttestationBillableConfig {
+    /// Every outcome the operator has not answered, in the order
+    /// `sbproxy_meter::BillableOutcome::ALL` declares them.
+    ///
+    /// Returned rather than checked so the caller can name the whole
+    /// set in one error. An operator who left three outcomes blank
+    /// should not have to compile three times to find that out.
+    pub fn missing_outcomes(&self) -> Vec<&'static str> {
+        let answered: [(&'static str, bool); 8] = [
+            ("delivered", self.delivered.is_some()),
+            ("client_disconnected", self.client_disconnected.is_some()),
+            ("origin_4xx", self.origin_4xx.is_some()),
+            ("origin_5xx", self.origin_5xx.is_some()),
+            ("policy_blocked", self.policy_blocked.is_some()),
+            ("rate_limited", self.rate_limited.is_some()),
+            ("cache_hit", self.cache_hit.is_some()),
+            ("retry", self.retry.is_some()),
+        ];
+        answered
+            .into_iter()
+            .filter_map(|(name, given)| (!given).then_some(name))
+            .collect()
+    }
+}
+
+/// `proxy.attestation.queue`: where claims wait until they settle.
+///
+/// A claim is written when the call starts and settled when it
+/// finishes, and the gap between those is where a crash loses money.
+/// The queue is that gap made durable.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationQueueConfig {
+    /// Filesystem path of the queue. Required: an attestation role with
+    /// nowhere to hold unsettled claims silently drops them on restart,
+    /// which is the failure the whole mechanism exists to prevent.
+    pub path: String,
+    /// How many unsettled claims to hold before the configured
+    /// [`AttestationConfig::failure_mode`] applies. Defaults to
+    /// 100,000, which is roughly a minute of unsettled work at a
+    /// thousand requests a second.
+    #[serde(default = "default_attestation_queue_max_entries")]
+    pub max_entries: usize,
+}
+
+/// `proxy.attestation.ledger`: where settled records are chained.
+///
+/// The ledger answers the half of a billing dispute a signature cannot:
+/// "I made calls you never credited". Each record is hash-chained to
+/// the one before it, so a gap is visible rather than merely absent.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationLedgerConfig {
+    /// Filesystem path of the append-only ledger file.
+    pub path: String,
+}
+
+/// Which observed quantity a measured unit counts, in the
+/// configuration vocabulary.
+///
+/// A deliberate mirror of `sbproxy_meter::MeasuredQuantity` rather than
+/// a re-export, for the same reason [`BillableRule`] mirrors
+/// `sbproxy_meter::Billable`. The meter crate depends on no other crate
+/// in this workspace, which is what lets an operator metering a plain
+/// REST API compile it without the gateway around it; deriving
+/// [`schemars::JsonSchema`] on its types would end that. So the config
+/// vocabulary lives here, the metering vocabulary lives there, and
+/// `sbproxy-core` converts between them. Both spell the variants the
+/// same way on the wire, so a config written against one reads the same
+/// as a receipt written by the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationMeasuredQuantity {
+    /// The request itself, which is always one. What a flat per-call
+    /// charge is built from.
+    Requests,
+    /// Request bytes received from the client.
+    BytesIn,
+    /// Response bytes written to the client. What was actually written,
+    /// so a response that was cut short bills what crossed the wire.
+    BytesOut,
+    /// Wall-clock milliseconds the request was in flight.
+    DurationMs,
+}
+
+/// `proxy.attestation.measured[]`: one unit the proxy counted itself.
+///
+/// The only unit source with nothing outside the process in it. The
+/// proxy saw the bytes and held the clock, so nobody else contributed
+/// to the number and there is no third party whose word has to be
+/// taken. That is why it is the resolver to reach for first: a route
+/// weight is only as honest as the document it was read from, and an
+/// origin header is only as honest as the party being paid for it,
+/// whereas this one is arithmetic over things that demonstrably
+/// happened.
+///
+/// A partial unit is billed as a whole one. Twelve thousand and
+/// forty-three bytes against a kibibyte rule is twelve units, not
+/// eleven and a bit, because the operator delivered those bytes and
+/// there is no fraction of a kibibyte to hand back. See
+/// `sbproxy_meter::MeasuredRule`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationMeasuredConfig {
+    /// Unit name that appears on the invoice line, for example
+    /// `egress_kib`. Unique across every resolver: two units sharing a
+    /// name on one receipt is an invoice line that cannot be read.
+    pub name: String,
+    /// The observed quantity this entry counts. See
+    /// [`AttestationMeasuredQuantity`].
+    pub quantity: AttestationMeasuredQuantity,
+    /// How much of the raw quantity makes one unit.
+    ///
+    /// This is the key that turns bytes into kibibytes: `1024` against
+    /// [`AttestationMeasuredQuantity::BytesOut`] bills one unit per
+    /// kibibyte written. A divisor rather than a multiplier because the
+    /// raw quantity is always the smaller currency and the invoice line
+    /// is always the larger one. Nobody sells thousandths of a request,
+    /// but plenty of people sell kibibytes and compute-seconds, and
+    /// writing `per: 1000` against `duration_ms` says "a second" in the
+    /// units the proxy actually observed rather than asking the
+    /// operator to express a rate as a fraction.
+    ///
+    /// Defaults to `1`, which bills one unit per observed item and is
+    /// the only sensible reading of an entry that omits it. Zero is
+    /// rejected at config compile: a divisor of zero has no answer to
+    /// fall back on, and the request path is the wrong place to find
+    /// that out.
+    #[serde(default = "default_measured_per")]
+    pub per: u64,
+}
+
+/// `proxy.attestation.route_weights[]`: one route the operator priced.
+///
+/// The simplest thing an operator can say about what a call costs, and
+/// the only one that needs nothing from anybody: the weight is written
+/// down, so the number is a pure function of the route and the document
+/// it was read from. That document is already signed, so naming its
+/// revision on the receipt is all it takes for a buyer to check the
+/// price themselves. See `sbproxy_meter::RouteWeightTable`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationRouteWeightConfig {
+    /// Unit name that appears on the invoice line, for example
+    /// `search_call`. Repeating a name across entries is how one line
+    /// gets different prices on different routes; see [`Self::path`].
+    pub name: String,
+    /// HTTP method this entry prices, or absent for any method.
+    /// Matched case-insensitively.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// The path this entry prices: either exact (`/v1/search`) or a
+    /// prefix ending in `/*` (`/v1/search/*`), which covers everything
+    /// below that segment and deliberately not the segment itself.
+    ///
+    /// When several entries share a [`Self::name`] and all match, the
+    /// most specific wins: a named method beats an unnamed one, an exact
+    /// path beats a prefix, and a longer prefix beats a shorter one. One
+    /// name still bills one line.
+    pub path: String,
+    /// What one matching call costs.
+    ///
+    /// Zero is allowed and means the route is metered and free, which is
+    /// not the same as having no entry for it. No entry means this line
+    /// does not price the route at all, and the receipt then carries no
+    /// unit rather than a zero.
+    pub weight: u64,
+}
+
+/// `proxy.attestation.origin_headers[]`: one count the upstream reports.
+///
+/// The only unit source that can be wrong without the proxy being wrong,
+/// because the party supplying the number is the party being paid for
+/// it. That is not a reason to refuse it: an API selling result rows has
+/// to bill result rows, and only the origin knows how many there were.
+/// What the proxy does instead is attest rather than vouch. The receipt
+/// records the header name and the value exactly as it arrived, so the
+/// claim on the invoice is "the origin sent this", which is a claim the
+/// proxy can actually stand behind.
+///
+/// There is deliberately no knob for what to do with a value that will
+/// not parse. Substituting a number the proxy counted would put the
+/// proxy's provenance on the origin's claim, and a receipt that cannot
+/// separate "the origin lied" from "the proxy miscounted" is worthless
+/// in the dispute it exists for. A value that does not parse bills zero
+/// and goes on the receipt verbatim. See
+/// `sbproxy_meter::OriginHeaderRule`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationOriginHeaderConfig {
+    /// Unit name that appears on the invoice line, for example
+    /// `result_row`. Unique across every resolver: two units sharing a
+    /// name on one receipt is an invoice line that cannot be read.
+    pub name: String,
+    /// Response header the count is read from. Matched
+    /// case-insensitively, and quoted back on the receipt in the
+    /// spelling written here.
+    ///
+    /// A header rather than a body path. Reading a JSON body means
+    /// buffering one, and what that costs a streaming response is its
+    /// own decision rather than a side effect of a metering key.
+    pub header: String,
+}
+
+/// `proxy.attestation`: the proxy-wide consumption attestation block.
+///
+/// Off unless [`Self::role`] says otherwise, and inert in every config
+/// that does not mention it. When a role is set, the queue, the ledger,
+/// and a complete [`AttestationBillableConfig`] all become required,
+/// because a role with any of them missing is a proxy that claims to
+/// meter and does not.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AttestationConfig {
+    /// Which halves of attestation this proxy performs. See
+    /// [`AttestationRole`]. Individual origins may narrow or widen this
+    /// through `origins.<host>.attestation.role`.
+    pub role: AttestationRole,
+    /// What happens when attestation itself cannot run: the queue is
+    /// full, the ledger will not accept an append, the signing identity
+    /// is unusable.
+    ///
+    /// Defaults to [`FailureMode::Degraded`], which departs from the
+    /// `closed` default the rest of this config surface takes, and the
+    /// departure is the point. Fail-closed is right for a control that
+    /// enforces a security boundary, because a control that silently
+    /// admits traffic when it breaks is worse than no control at all.
+    /// Billing is not a security boundary. A full ledger disk taking
+    /// the whole API down is a worse outcome than a provable hole in
+    /// the record, and `degraded` is precisely the posture that leaves
+    /// the hole detectable: the call proceeds, the guarantee is marked
+    /// as not made, and the gap is countable so an operator can alert
+    /// on it and reconcile afterwards. An operator who genuinely cannot
+    /// serve unbilled traffic sets `closed` and means it.
+    #[serde(default = "default_attestation_failure_mode")]
+    pub failure_mode: FailureMode,
+    /// What happens when attestation *does* reach a verdict and that
+    /// verdict is "refuse": a claim that exceeds an agreement's ceiling,
+    /// for instance. [`EnforcementMode::Observe`] is the rollout
+    /// posture, and it is a different question from
+    /// [`Self::failure_mode`]: a control can reasonably observe while it
+    /// is being tuned and still need to fail closed when its backend
+    /// disappears.
+    pub enforcement_mode: EnforcementMode,
+    /// Which existing signing identity signs receipts, as the config
+    /// path that declares it. The only accepted value today is
+    /// [`ATTESTATION_SIGN_WITH_WEB_BOT_AUTH`], and that block must
+    /// actually be configured. Required whenever the role writes
+    /// receipts.
+    pub sign_with: Option<String>,
+    /// Where unsettled claims wait. Required when the role is not
+    /// [`AttestationRole::Off`].
+    pub queue: Option<AttestationQueueConfig>,
+    /// Where settled records are chained. Required when the role is not
+    /// [`AttestationRole::Off`].
+    pub ledger: Option<AttestationLedgerConfig>,
+    /// What the operator charges for. Required, and required complete,
+    /// when the role is not [`AttestationRole::Off`].
+    pub billable: Option<AttestationBillableConfig>,
+    /// Units this proxy counted for itself. See
+    /// [`AttestationMeasuredConfig`].
+    ///
+    /// Listed first because it is the resolver that needs nothing from
+    /// anybody, and a receipt is easier to argue about when an
+    /// unarguable line is sitting next to the contested ones.
+    pub measured: Vec<AttestationMeasuredConfig>,
+    /// Routes priced in this document. See
+    /// [`AttestationRouteWeightConfig`].
+    ///
+    /// A sibling list rather than a variant of one `units:` block, and
+    /// the same goes for [`Self::measured`] and [`Self::origin_headers`].
+    /// Each resolver has its own provenance and its own way of being
+    /// wrong, so each declares itself in its own vocabulary and none of
+    /// them can be mistaken for another when a receipt is read back. It
+    /// also means the expression resolver arrives later as a fourth list
+    /// rather than as a variant every existing entry has to be
+    /// retrofitted into.
+    pub route_weights: Vec<AttestationRouteWeightConfig>,
+    /// Counts this proxy reads back from its upstreams. See
+    /// [`AttestationOriginHeaderConfig`].
+    pub origin_headers: Vec<AttestationOriginHeaderConfig>,
+}
+
+impl Default for AttestationConfig {
+    fn default() -> Self {
+        Self {
+            role: AttestationRole::Off,
+            // Not `FailureMode::default()`. See the field's rustdoc:
+            // billing is not a security boundary, so this one control
+            // defaults away from the surface-wide `closed`.
+            failure_mode: default_attestation_failure_mode(),
+            enforcement_mode: EnforcementMode::Block,
+            sign_with: None,
+            queue: None,
+            ledger: None,
+            billable: None,
+            measured: Vec::new(),
+            route_weights: Vec::new(),
+            origin_headers: Vec::new(),
+        }
+    }
+}
+
+/// `origins.<host>.attestation`: per-origin attestation overrides.
+///
+/// Two fields, and they are here for different reasons. `role` is an
+/// override, because one gateway commonly fronts both a partner API it
+/// resells (claims) and its own service (receipts). `agreement_id` has
+/// no proxy-wide equivalent at all: it names the commercial agreement
+/// the units are billed under, and that is a property of who is on the
+/// other end of the connection, never of the proxy.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct OriginAttestationConfig {
+    /// Narrows or widens `proxy.attestation.role` for this origin.
+    /// Absent inherits the proxy-wide role.
+    pub role: Option<AttestationRole>,
+    /// The commercial agreement this origin's units are billed under.
+    /// Without it a receipt says how much was consumed but not which
+    /// contract turns that into money.
+    pub agreement_id: Option<String>,
 }
 
 impl Default for ProxyServerConfig {
@@ -903,8 +1383,10 @@ impl Default for ProxyServerConfig {
             extensions: HashMap::new(),
             http_client_timeouts: HttpClientTimeoutsConfig::default(),
             web_bot_auth: None,
+            attestation: None,
             tenants: Vec::new(),
             credentials: Vec::new(),
+            payments: None,
         }
     }
 }
@@ -1502,7 +1984,7 @@ pub enum ConfigAuthorityConfigError {
 /// Mirrors the forms the process secret resolver accepts. Deliberately a
 /// shape check only: `sbproxy validate` must not need the environment
 /// variable to be exported or the secret backend to be reachable.
-fn is_secret_reference(value: &str) -> bool {
+pub(crate) fn is_secret_reference(value: &str) -> bool {
     let trimmed = value.trim();
     for prefix in ["env:", "file:"] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
@@ -1655,15 +2137,45 @@ pub struct KeyGovernanceConfig {
     /// Retention for settled, released, and expired reservation outcomes.
     /// Must be at least the lease duration so retries remain idempotent.
     pub terminal_retention_secs: u64,
-    /// Behavior when the governance backend cannot serve a reserve call at
-    /// request time (`GovernanceError::BackendUnavailable`). The default
-    /// denies the request (fail closed): governed limits must not be
-    /// silently bypassed by a backend outage. Setting `allow_unreserved`
-    /// admits the request instead, but every such decision is always
-    /// audited on the `security_audit` channel and counted on
+    /// Superseded by `failure_posture`. Behavior when the governance
+    /// backend cannot serve a reserve call at request time
+    /// (`GovernanceError::BackendUnavailable`). The default denies the
+    /// request (fail closed): governed limits must not be silently
+    /// bypassed by a backend outage. Setting `allow_unreserved` admits the
+    /// request instead, but every such decision is always audited on the
+    /// `security_audit` channel and counted on
     /// `sbproxy_governance_fail_open_total`.
+    ///
+    ///
+    /// Still parsed, and still the value used when `failure_posture` is
+    /// absent, so an existing config keeps behaving exactly as it did.
+    /// Nothing in the runtime reads this field directly any more: the read
+    /// path goes through [`KeyGovernanceConfig::failure_posture`], which
+    /// reports `allow_unreserved` as `degraded` because the call proceeds
+    /// without the reservation this control exists to make.
     #[serde(default)]
     pub failure_mode: GovernanceFailureMode,
+    /// Failure posture for a governance backend outage, in the shared
+    /// [`FailureMode`] vocabulary.
+    ///
+    ///
+    /// Set this in preference to `failure_mode`. When present it wins;
+    /// when absent the legacy `failure_mode` value is converted
+    /// (`closed` stays `closed`, `allow_unreserved` becomes `degraded`).
+    /// It is `Option` on purpose, so "the operator said nothing" stays
+    /// distinguishable from "the operator explicitly asked for the
+    /// default".
+    ///
+    ///
+    /// `closed` denies with 503. `degraded` admits without a reservation
+    /// and records that fact on the `security_audit` channel and on
+    /// `sbproxy_governance_fail_open_total`. `open` also admits but
+    /// records neither, which is why `degraded` is the honest spelling of
+    /// the old `allow_unreserved`. `observe` is meaningless here and is
+    /// rejected at config-compile time: a reserve call that could not
+    /// reach its backend produced no counterfactual verdict to record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_posture: Option<FailureMode>,
     /// Behavior when a governed key carries a `total_micro_usd` limit but
     /// the resolved model has no rate to estimate a pre-request cost
     /// ceiling from. The default (`zero_cost`) admits with no monetary
@@ -1687,6 +2199,7 @@ impl Default for KeyGovernanceConfig {
             lease_ttl_secs: default_governance_lease_ttl_secs(),
             terminal_retention_secs: default_governance_terminal_retention_secs(),
             failure_mode: GovernanceFailureMode::default(),
+            failure_posture: None,
             missing_rate: GovernanceMissingRatePolicy::default(),
             key_introspection: false,
             require_governed_key: false,
@@ -1694,7 +2207,232 @@ impl Default for KeyGovernanceConfig {
     }
 }
 
-/// Behavior when the governance backend cannot serve a reserve call
+/// What a control does when it cannot reach a decision.
+///
+/// A "control" here is anything that gates a request and can itself
+/// fail: a policy whose backend is unreachable, a guardrail whose
+/// provider times out, a detector that never engaged, a store that
+/// cannot be read. The question is always the same, so the knob is too,
+/// and it is spelled `failure_posture` everywhere it appears:
+///
+/// ```yaml
+/// failure_posture: closed     # refuse the request
+/// failure_posture: open       # admit it
+/// failure_posture: degraded   # admit it, but record that the guarantee was not made
+/// failure_posture: observe    # admit it, and record what would have happened
+/// ```
+///
+/// # The four postures
+///
+/// Only [`Closed`](Self::Closed) refuses. The other three all admit the
+/// request and differ in what they leave behind, which is the part that
+/// matters six months later when someone asks whether a control was
+/// actually protecting anything:
+///
+/// - **`open`** admits and claims nothing. Cheapest, and the least
+///   recoverable after the fact.
+/// - **`degraded`** admits while explicitly marking the guarantee as
+///   not made. This is the posture behind the existing
+///   `AllowUnreserved` modes: the request proceeds, but no quota was
+///   reserved and no governance decision was recorded, and that fact is
+///   itself counted so it can be alerted on.
+/// - **`observe`** admits and records the decision the control *would*
+///   have taken. For rolling a control out against live traffic before
+///   letting it refuse anything.
+///
+/// # Relationship to `test_mode` and tag actions
+///
+/// `observe` is deliberately close in spirit to the WAF's `test_mode`
+/// and the prompt-injection `Tag` action, and the overlap is worth
+/// naming so the two do not drift into meaning different things. They
+/// are not the same axis:
+///
+/// - `test_mode` / `Tag` describe what the control does when it
+///   **works** and finds a hit.
+/// - `failure_posture: observe` describes what it does when it **cannot
+///   run at all**.
+///
+/// A control can legitimately be in `test_mode` and still need a
+/// failure posture, because "the detector matched" and "the detector
+/// was unreachable" are different events. Where a site already has
+/// `test_mode`, leave it alone and let `failure_posture` govern only the
+/// cannot-decide path.
+///
+/// # Why this type exists
+///
+/// The same decision was previously spelled six different ways across
+/// the config surface: `fail_open: bool`, `fail_closed: bool`,
+/// `failure_mode_allow: bool`, two separately-declared `failure_mode`
+/// enums, an `on_failure` enum, and an unvalidated `on_error: String`.
+/// Two of those booleans carry **opposite** polarity, so `true` means
+/// "admit" in one struct and "refuse" in another. An operator had to
+/// re-derive the meaning at every site, and a reviewer had to check the
+/// field name before they could read a diff.
+///
+/// New and migrated controls take `failure_posture: FailureMode`. The
+/// name is deliberately not `failure_mode`: two blocks already declare a
+/// field by that exact name carrying a narrower enum, and a test pins
+/// that `failure_mode: open` must fail to parse there. One new word that
+/// works at every site beats one that collides at two.
+///
+/// The legacy fields still parse, because [`schema-v1` compatibility] is
+/// pinned by test, and each site's `failure_posture()` accessor converts
+/// from them when the new key is absent. They carry no `#[deprecated]`
+/// attribute on purpose: `-D warnings` would then turn every remaining
+/// read into a build failure, including the conversion itself. They are
+/// deprecated in prose and by having no other reader left.
+///
+/// # Choosing a default
+///
+/// Default closed for anything that enforces a security boundary: a
+/// control that silently admits traffic when it breaks is worse than no
+/// control, because the config still advertises protection and the
+/// dashboard still reads green.
+///
+/// Default open only where refusing would take the gateway down over a
+/// non-security concern, and say so at the site. A policy-expression
+/// bug should not black-hole every request; an unreachable authorization
+/// backend should.
+///
+/// [`schema-v1` compatibility]: https://github.com/soapbucket/sbproxy
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureMode {
+    /// Refuse the request. The safe default for anything enforcing a
+    /// security boundary: a control that silently admits traffic when
+    /// it breaks is worse than no control, because the config still
+    /// advertises protection and the dashboard still reads green.
+    #[default]
+    Closed,
+    /// Admit the request and claim nothing. Cheapest, and the least
+    /// recoverable after the fact.
+    Open,
+    /// Admit the request while explicitly marking the guarantee as not
+    /// made. The posture behind the legacy `AllowUnreserved` modes: the
+    /// call proceeds, but no quota was reserved and no governance
+    /// decision was recorded, and that fact is counted so it can be
+    /// alerted on.
+    Degraded,
+    /// Admit the request and record the decision the control would have
+    /// taken. For rolling a control out against live traffic before
+    /// letting it refuse anything.
+    Observe,
+}
+
+impl FailureMode {
+    /// True when this posture lets the request proceed.
+    ///
+    /// Three of the four postures admit; they differ in what they leave
+    /// behind, not in whether traffic flows. Callers deciding "do I
+    /// return Deny" want this; callers deciding "what do I record" want
+    /// to match on the variant.
+    pub fn admits(self) -> bool {
+        !matches!(self, Self::Closed)
+    }
+
+    /// True when the control should record what it would have done.
+    pub fn records_counterfactual(self) -> bool {
+        matches!(self, Self::Observe)
+    }
+
+    /// True when the request proceeds without the guarantee this
+    /// control exists to provide. Separately countable from a plain
+    /// `Open` so an operator can alert on lost guarantees specifically.
+    pub fn guarantee_waived(self) -> bool {
+        matches!(self, Self::Degraded)
+    }
+
+    /// Build from a legacy `fail_open`-style boolean, where `true`
+    /// means admit. Use at call sites migrating off such a field so the
+    /// polarity conversion lives in one place rather than being
+    /// re-derived per site.
+    pub fn from_fail_open(fail_open: bool) -> Self {
+        if fail_open {
+            Self::Open
+        } else {
+            Self::Closed
+        }
+    }
+
+    /// Build from a legacy `fail_closed`-style boolean, where `true`
+    /// means refuse. The inverse polarity of [`Self::from_fail_open`],
+    /// and the reason both constructors are named rather than left to a
+    /// bare `if` at each site.
+    pub fn from_fail_closed(fail_closed: bool) -> Self {
+        if fail_closed {
+            Self::Closed
+        } else {
+            Self::Open
+        }
+    }
+
+    /// Stable label for metrics and audit events.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+            Self::Degraded => "degraded",
+            Self::Observe => "observe",
+        }
+    }
+}
+
+/// What a control does when it *does* reach a decision and that
+/// decision is "refuse".
+///
+/// This is the second of two axes, and keeping them apart is the point.
+/// [`FailureMode`] answers "the control could not run, now what".
+/// `EnforcementMode` answers "the control ran, it matched, now what".
+/// Those are different events and an operator needs both: a detector
+/// can reasonably be in `observe` while it is being tuned, and still
+/// need to fail closed when its backend disappears.
+///
+/// This type replaces the ad-hoc spellings of the same idea that grew
+/// per policy: the WAF's `test_mode: bool`, the prompt-injection
+/// `Tag` action, and similar. They all meant "match, but do not
+/// block". `observe` is spelled the same here as in [`FailureMode`] on
+/// purpose, so one word means one thing across the config surface.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementMode {
+    /// Refuse the request when the control matches.
+    #[default]
+    Block,
+    /// Admit the request but record the match. The rollout posture.
+    Observe,
+}
+
+impl EnforcementMode {
+    /// True when a match should refuse the request.
+    pub fn blocks(self) -> bool {
+        matches!(self, Self::Block)
+    }
+
+    /// Build from a legacy `test_mode`-style boolean, where `true`
+    /// means "log but do not block".
+    pub fn from_test_mode(test_mode: bool) -> Self {
+        if test_mode {
+            Self::Observe
+        } else {
+            Self::Block
+        }
+    }
+
+    /// Stable label for metrics and audit events.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Observe => "observe",
+        }
+    }
+}
+
+/// Superseded by [`FailureMode`]. Behavior when the governance backend
+/// cannot serve a reserve call
 /// (`sbproxy_ai::governance::GovernanceStore::reserve`).
 ///
 /// Applies only to a reserve call that fails with
@@ -1702,6 +2440,10 @@ impl Default for KeyGovernanceConfig {
 /// (invalid request shape, a reservation id reused with different input,
 /// a hit against a real governed limit, arithmetic overflow) is unrelated
 /// to backend availability and is not affected by this setting.
+///
+/// Kept because `failure_mode: closed | allow_unreserved` is pinned by
+/// test and by shipped configs. Read it through
+/// [`KeyGovernanceConfig::failure_posture`], never directly.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
 )]
@@ -1753,6 +2495,54 @@ impl KeyGovernanceConfigError {
 }
 
 impl KeyGovernanceConfig {
+    /// This control's posture expressed in the shared [`FailureMode`]
+    /// vocabulary. The one read path for a governance backend outage.
+    ///
+    /// Precedence: an explicit `failure_posture` wins; otherwise the
+    /// legacy `failure_mode` is converted. `closed` maps to
+    /// [`FailureMode::Closed`], and `allow_unreserved` maps to
+    /// [`FailureMode::Degraded`] rather than a plain open, because the
+    /// request proceeds without the reservation this control exists to
+    /// make and that fact is separately recorded.
+    ///
+    /// Reading the posture only here is the point of the whole exercise:
+    /// a config key that nothing reads reproduces the defect this key
+    /// exists to fix, so `failure_mode` has no other consumer left.
+    pub fn failure_posture(&self) -> FailureMode {
+        if let Some(explicit) = self.failure_posture {
+            return explicit;
+        }
+        match self.failure_mode {
+            GovernanceFailureMode::Closed => FailureMode::Closed,
+            GovernanceFailureMode::AllowUnreserved => FailureMode::Degraded,
+        }
+    }
+
+    /// Reject a posture that has no meaning for a governance reserve call.
+    ///
+    /// [`FailureMode::Observe`] records the decision a control *would*
+    /// have taken. A reserve call that never reached its backend produced
+    /// no such decision, so accepting `observe` here would mean silently
+    /// picking some other behaviour on the operator's behalf. Refusing at
+    /// config-compile time is the honest alternative.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operator-facing message, naming the exact config path,
+    /// when the posture cannot be honoured at this site.
+    pub fn validate_failure_posture(&self) -> Result<(), String> {
+        if self.failure_posture == Some(FailureMode::Observe) {
+            return Err(
+                "key_management.governance.failure_posture: `observe` is meaningless for a \
+                 governance backend outage, because a reserve call that never reached its \
+                 backend has no counterfactual verdict to record. Use `closed`, `degraded`, \
+                 or `open`."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Reservation lease duration converted to runtime milliseconds.
     pub fn lease_ttl_millis(&self) -> Result<u64, KeyGovernanceConfigError> {
         self.lease_ttl_secs.checked_mul(1_000).ok_or_else(|| {
@@ -1771,6 +2561,8 @@ impl KeyGovernanceConfig {
 
     /// Validate governance invariants before pipeline construction or reload.
     pub fn validate(&self) -> Result<(), KeyGovernanceConfigError> {
+        self.validate_failure_posture()
+            .map_err(KeyGovernanceConfigError::invalid)?;
         if self.lease_ttl_secs == 0 {
             return Err(KeyGovernanceConfigError::invalid(
                 "lease_ttl_secs must be positive",
@@ -1866,6 +2658,51 @@ pub struct ProviderHintConfig {
     pub also_header: Option<String>,
 }
 
+/// Default admission policy for caller-owned native provider keys.
+///
+/// Native keys cannot carry an SBproxy policy record because the caller, not
+/// the operator, owns their secret. This block supplies the equivalent default
+/// policy for every native key recognized by `provider_hints`. Leaving it
+/// absent fails closed for recognized native-key traffic.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct NativeKeyPolicyConfig {
+    /// Canonical provider labels admitted to use caller-owned credentials.
+    ///
+    /// Matching is case-insensitive and ignores surrounding whitespace. The
+    /// list must be non-empty and may not contain duplicates.
+    pub allowed_providers: Vec<String>,
+    /// Max requests per minute for each origin/provider native-key bucket.
+    #[serde(default)]
+    pub max_requests_per_minute: Option<u64>,
+    /// Max input and output tokens per minute.
+    #[serde(default)]
+    pub max_tokens_per_minute: Option<u64>,
+    /// Max total tokens for the native-key budget window.
+    #[serde(default)]
+    pub max_budget_tokens: Option<u64>,
+    /// Max total cost in USD for the native-key budget window.
+    #[serde(default)]
+    pub max_budget_usd: Option<f64>,
+    /// Models native-key traffic may use (empty = all).
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+    /// Models native-key traffic may not use.
+    #[serde(default)]
+    pub blocked_models: Vec<String>,
+    /// Named PII redaction rules that must be active before dispatch.
+    #[serde(default)]
+    pub require_pii_redaction: Vec<String>,
+}
+
+impl NativeKeyPolicyConfig {
+    /// Whether this policy admits the canonical provider label.
+    pub fn allows(&self, provider: &str) -> bool {
+        self.allowed_providers
+            .iter()
+            .any(|allowed| allowed.trim().eq_ignore_ascii_case(provider.trim()))
+    }
+}
+
 /// `key_management.inbound:` block. Controls which request headers are swept
 /// for a minted key, and whether a route refuses requests that carry none.
 ///
@@ -1874,9 +2711,10 @@ pub struct ProviderHintConfig {
 /// already. So extraction is configured per route here rather than per key.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct KeyInboundConfig {
-    /// Ordered candidate headers. The first value whose shape parses wins.
-    /// An empty list disables the sweep and leaves the legacy `authorization`
-    /// path as the only front door.
+    /// Ordered candidate headers. One well-shaped minted token resolves; two
+    /// distinct tokens are ambiguous and fail closed. An empty list disables
+    /// the sweep and leaves the legacy `authorization` path as the only front
+    /// door.
     #[serde(default = "default_inbound_headers")]
     pub headers: Vec<InboundHeaderConfig>,
     /// Deny with 401 when no minted key resolved. Off by default, so an
@@ -1885,11 +2723,15 @@ pub struct KeyInboundConfig {
     #[serde(default)]
     pub require: bool,
     /// Ordered rules attributing a native (non-minted) inbound credential to
-    /// a provider. First match wins, so more specific value prefixes belong
-    /// before general ones. Attribution never refuses a request: a credential
-    /// matching no rule is admitted unattributed.
+    /// a provider. First matching hint wins, so more specific value prefixes
+    /// belong before general ones. A matching hint then enters native-key
+    /// policy admission; a credential matching no hint remains unattributed.
     #[serde(default = "default_provider_hints")]
     pub provider_hints: Vec<ProviderHintConfig>,
+    /// Explicit default policy for recognized caller-owned native provider
+    /// keys. Absent by default, which fails closed if a provider hint matches.
+    #[serde(default)]
+    pub native_key_policy: Option<NativeKeyPolicyConfig>,
 }
 
 impl Default for KeyInboundConfig {
@@ -1898,6 +2740,7 @@ impl Default for KeyInboundConfig {
             headers: default_inbound_headers(),
             require: false,
             provider_hints: default_provider_hints(),
+            native_key_policy: None,
         }
     }
 }
@@ -1937,11 +2780,16 @@ fn default_provider_hints() -> Vec<ProviderHintConfig> {
     ]
 }
 
-/// Header names that may never be swept: hop-by-hop and framing headers, plus
+/// Header names that may never be swept: standard hop-by-hop and framing
+/// headers, the widely used de-facto `proxy-connection` hop-by-hop header, plus
 /// `cookie`, which has its own redaction and capture rules.
 pub const FORBIDDEN_SWEEP_HEADERS: &[&str] = &[
     "host",
     "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
     "content-length",
     "transfer-encoding",
     "cookie",
@@ -1951,9 +2799,11 @@ pub const FORBIDDEN_SWEEP_HEADERS: &[&str] = &[
 /// carrier.
 ///
 /// In addition to headers that cannot be swept safely, credentials may not
-/// claim realtime handshake metadata, distributed tracing state, or outbound
-/// Web Bot Auth signature fields. Those values have independent protocol
-/// meaning and are written by the proxy.
+/// claim realtime handshake metadata, distributed tracing state, outbound
+/// Web Bot Auth signature fields, or headers promoted into governance, logs,
+/// and capture envelopes. Those values have independent protocol meaning or
+/// leave the raw request-header surface before generic secret redaction can
+/// protect them.
 pub fn credential_header_is_reserved(header: &str) -> bool {
     let lower = header.trim().to_ascii_lowercase();
     FORBIDDEN_SWEEP_HEADERS.contains(&lower.as_str())
@@ -1961,13 +2811,30 @@ pub fn credential_header_is_reserved(header: &str) -> bool {
             lower.as_str(),
             "upgrade"
                 | "openai-beta"
+                | "proxy-authorization"
+                | "proxy-authenticate"
                 | "traceparent"
                 | "tracestate"
                 | "signature-input"
                 | "signature"
                 | "signature-agent"
+                | "x-user-id"
+                | "x-end-user"
+                | "x-sbproxy-tag"
+                | "x-sb-user-id"
+                | "x-sb-session-id"
+                | "x-sb-parent-session-id"
+                | "user-agent"
+                | "referer"
+                | "b3"
+                | "x-b3-traceid"
+                | "x-b3-spanid"
+                | "x-b3-sampled"
+                | "x-b3-parentspanid"
         )
         || lower.starts_with("sec-websocket-")
+        || lower.starts_with("x-a2a-")
+        || lower.starts_with("x-sb-property-")
 }
 
 fn default_inbound_headers() -> Vec<InboundHeaderConfig> {
@@ -2033,6 +2900,54 @@ impl KeyInboundConfig {
                     ));
                 }
             }
+            if credential_header_is_reserved(&hint.header) {
+                return Err(format!(
+                    "key_management.inbound.provider_hints: {:?} may not carry a key",
+                    hint.header
+                ));
+            }
+        }
+        if let Some(policy) = &self.native_key_policy {
+            if policy.allowed_providers.is_empty() {
+                return Err(
+                    "key_management.inbound.native_key_policy.allowed_providers must not be empty"
+                        .to_string(),
+                );
+            }
+            let mut providers = std::collections::HashSet::new();
+            for provider in &policy.allowed_providers {
+                let canonical = provider.trim().to_ascii_lowercase();
+                if canonical.is_empty() {
+                    return Err(
+                        "key_management.inbound.native_key_policy.allowed_providers entries must not be empty"
+                            .to_string(),
+                    );
+                }
+                if !providers.insert(canonical) {
+                    return Err(format!(
+                        "key_management.inbound.native_key_policy.allowed_providers: {provider:?} is listed more than once"
+                    ));
+                }
+            }
+            for (name, value) in [
+                ("max_requests_per_minute", policy.max_requests_per_minute),
+                ("max_tokens_per_minute", policy.max_tokens_per_minute),
+            ] {
+                if value == Some(0) {
+                    return Err(format!(
+                        "key_management.inbound.native_key_policy.{name} must be greater than zero"
+                    ));
+                }
+            }
+            if policy
+                .max_budget_usd
+                .is_some_and(|value| !value.is_finite() || value < 0.0)
+            {
+                return Err(
+                    "key_management.inbound.native_key_policy.max_budget_usd must be finite and non-negative"
+                        .to_string(),
+                );
+            }
         }
         Ok(())
     }
@@ -2044,6 +2959,43 @@ impl KeyInboundConfig {
             .iter()
             .map(|entry| entry.name.trim().to_ascii_lowercase())
             .collect()
+    }
+
+    /// Lowercased union of every primary header that may carry an inbound
+    /// credential.
+    ///
+    /// This includes minted/configured carriers and provider-hint carriers.
+    /// `provider_hints[].also_header` is deliberately excluded: it is only
+    /// match metadata and never contains the credential value.
+    pub fn credential_carrier_names(&self) -> Vec<String> {
+        let mut names = Vec::with_capacity(self.headers.len() + self.provider_hints.len());
+        for name in self
+            .headers
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .chain(self.provider_hints.iter().map(|hint| hint.header.as_str()))
+        {
+            let canonical = name.trim().to_ascii_lowercase();
+            if !canonical.is_empty() && !names.contains(&canonical) {
+                names.push(canonical);
+            }
+        }
+        names
+    }
+
+    /// Whether `header_name` is a primary inbound credential carrier.
+    ///
+    /// Match-only `provider_hints[].also_header` metadata is deliberately
+    /// excluded because it never contains the credential value.
+    pub fn is_credential_carrier(&self, header_name: &str) -> bool {
+        let canonical = header_name.trim();
+        self.headers
+            .iter()
+            .any(|entry| entry.name.trim().eq_ignore_ascii_case(canonical))
+            || self
+                .provider_hints
+                .iter()
+                .any(|hint| hint.header.trim().eq_ignore_ascii_case(canonical))
     }
 }
 
@@ -2075,16 +3027,105 @@ pub struct KeyManagementConfig {
     /// on every reload.
     #[serde(default)]
     pub allow_api_override: bool,
-    /// When the store is unreachable, allow the request through in a degraded
-    /// mode. Default false: fail closed (deny).
+    /// Superseded by `failure_posture`. When the store is unreachable,
+    /// allow the request through in a degraded mode. Default false: fail
+    /// closed (deny).
+    ///
+    ///
+    /// Note the polarity this field is named into: `true` here means
+    /// ALLOW, that is, fail open. Other booleans in this config carry
+    /// the opposite sense, which is the inconsistency [`FailureMode`]
+    /// exists to retire.
+    ///
+    ///
+    /// Still parsed, and still the value used when `failure_posture` is
+    /// absent, so an existing config keeps behaving exactly as it did.
+    /// Nothing in the runtime reads this field directly any more: every
+    /// store-outage decision goes through
+    /// [`KeyManagementConfig::failure_posture`].
     #[serde(default)]
     pub failure_mode_allow: bool,
+    /// Failure posture for a key-store outage, in the shared
+    /// [`FailureMode`] vocabulary.
+    ///
+    ///
+    /// Set this in preference to `failure_mode_allow`. When present it
+    /// wins; when absent the legacy boolean is converted (`false` becomes
+    /// `closed`, `true` becomes `degraded`). It is `Option` on purpose,
+    /// so "the operator said nothing" stays distinguishable from "the
+    /// operator explicitly asked for the default".
+    ///
+    ///
+    /// `closed` refuses with 503. `degraded` and `open` both let the
+    /// request fall through to the origin's own configured auth, which is
+    /// what `failure_mode_allow: true` has always done: it is not a
+    /// blanket admit. `degraded` is the honest label for it, because the
+    /// request proceeds with no per-key policy, no budget, and no
+    /// attribution, and that fact is recorded rather than passed over in
+    /// silence. `observe` is meaningless here and is rejected at
+    /// config-compile time: an unreachable store produced no
+    /// counterfactual verdict to record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_posture: Option<FailureMode>,
     /// Optional OIDC/JWT claim to virtual-key mapping.
     #[serde(default)]
     pub oidc_claim_map: Option<OidcClaimMapConfig>,
     /// Optional declarative seed of keys and credentials.
     #[serde(default)]
     pub seed: KeySeedConfig,
+}
+
+impl KeyManagementConfig {
+    /// What the key plane does when the store cannot be reached, in the
+    /// shared [`FailureMode`] vocabulary. The one read path for a
+    /// key-store outage.
+    ///
+    /// Precedence: an explicit `failure_posture` wins; otherwise the
+    /// legacy `failure_mode_allow` boolean is converted. `false` maps to
+    /// [`FailureMode::Closed`], which is a 503. `true` maps to
+    /// [`FailureMode::Degraded`] rather than [`FailureMode::Open`]: the
+    /// request does proceed, but only by falling through to the origin's
+    /// own configured auth, with no per-key policy, no budget, and no
+    /// attribution. That is a guarantee waived, not a guarantee that was
+    /// never claimed, and it is worth being able to alert on separately.
+    ///
+    /// Both admitting postures behave identically at the four call sites
+    /// that read this. They differ in what they leave behind, which is
+    /// the whole distinction [`FailureMode`] exists to draw.
+    pub fn failure_posture(&self) -> FailureMode {
+        if let Some(explicit) = self.failure_posture {
+            return explicit;
+        }
+        if self.failure_mode_allow {
+            FailureMode::Degraded
+        } else {
+            FailureMode::Closed
+        }
+    }
+
+    /// Reject a posture that has no meaning for a key-store outage, at
+    /// this block or at the nested `governance:` block.
+    ///
+    /// [`FailureMode::Observe`] records the decision a control *would*
+    /// have taken. A store that could not be read produced no such
+    /// decision, so accepting `observe` would mean silently picking some
+    /// other behaviour on the operator's behalf.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operator-facing message, naming the exact config path,
+    /// when the posture cannot be honoured at the site that declares it.
+    pub fn validate_failure_posture(&self) -> Result<(), String> {
+        if self.failure_posture == Some(FailureMode::Observe) {
+            return Err(
+                "key_management.failure_posture: `observe` is meaningless for a key-store \
+                 outage, because a store that could not be read has no counterfactual verdict \
+                 to record. Use `closed`, `degraded`, or `open`."
+                    .to_string(),
+            );
+        }
+        self.governance.validate_failure_posture()
+    }
 }
 
 /// Which store backend backs the key plane.
@@ -2481,6 +3522,12 @@ pub struct SeedKeyConfig {
     /// Skip the body-aware prompt-injection scan for this key. Default false.
     #[serde(default)]
     pub bypass_prompt_injection: bool,
+    /// Consent to the origin's opt-in redacted content capture for
+    /// console inspection. Default false. A sample is retained only
+    /// when the AI origin also sets `capture_content: true`, so both
+    /// the operator and the key owner must opt in.
+    #[serde(default)]
+    pub allow_content_capture: bool,
     /// Project attribution.
     #[serde(default)]
     pub project: Option<String>,
@@ -3705,6 +4752,19 @@ pub struct AdminOperator {
     /// Role governing which admin actions this operator may perform.
     #[serde(default)]
     pub role: AdminRole,
+    /// Billing tenant whose metered consumption this operator may read
+    /// (WOR-2131). Absent means the whole deployment, which is what every
+    /// operator written before this field existed keeps getting.
+    ///
+    /// A receipt names one buyer's traffic, so the meter routes treat a
+    /// cross-tenant read as a disclosure rather than a reporting mistake:
+    /// naming a tenant here narrows `/api/meter/*` to that tenant and
+    /// refuses a request for any other. The scope is read from this
+    /// document on every request rather than carried in the session token,
+    /// so revoking it is a config reload rather than a wait for tokens to
+    /// expire.
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 /// Admin RBAC role (WOR-1716). `read_only` may call read (GET) endpoints
@@ -4178,10 +5238,10 @@ pub const SENSITIVE_HEADER_DENYLIST: &[&str] = &[
 /// Extra header names excluded from `*` and glob capture, on top of
 /// [`SENSITIVE_HEADER_DENYLIST`].
 ///
-/// Holds whatever `key_management.inbound.headers` names, set at load and on
-/// every reload. Without it an operator who sweeps a custom header would have
-/// that header captured by a `capture_headers: ["*"]` glob, and the value it
-/// carries is a live minted key.
+/// Holds every primary carrier named by `key_management.inbound.headers` and
+/// `key_management.inbound.provider_hints`, set at load and on every reload.
+/// Without it a custom carrier could be captured by a
+/// `capture_headers: ["*"]` glob.
 static EXTRA_SENSITIVE_HEADERS: std::sync::OnceLock<
     std::sync::RwLock<std::sync::Arc<Vec<String>>>,
 > = std::sync::OnceLock::new();
@@ -4191,7 +5251,7 @@ fn extra_sensitive_slot() -> &'static std::sync::RwLock<std::sync::Arc<Vec<Strin
 }
 
 /// Replace the operator-configured set of key-bearing headers that globs must
-/// never capture. Pass [`KeyInboundConfig::header_names`].
+/// never capture. Pass [`KeyInboundConfig::credential_carrier_names`].
 pub fn set_extra_sensitive_headers(names: Vec<String>) {
     let lowered: Vec<String> = names
         .into_iter()
@@ -4204,7 +5264,7 @@ pub fn set_extra_sensitive_headers(names: Vec<String>) {
 }
 
 /// Whether `header_name` is sensitive: on the built-in denylist, or named by
-/// the operator's inbound key sweep.
+/// the operator's inbound credential configuration.
 pub fn is_sensitive_header(header_name: &str) -> bool {
     if SENSITIVE_HEADER_DENYLIST.contains(&header_name) {
         return true;
@@ -4266,13 +5326,27 @@ impl CompiledHeaderAllowlist {
     /// exact matches override the denylist except for DPoP proofs,
     /// which are never loggable.
     pub fn matches(&self, header_name: &str) -> bool {
+        self.matches_with_sensitive(header_name, is_sensitive_header)
+    }
+
+    /// Decide whether `header_name` should be captured using the supplied
+    /// sensitive-header predicate.
+    ///
+    /// Request paths that pin a compiled config generation use this form so
+    /// a concurrent reload cannot change which custom credential carriers
+    /// are excluded from wildcard and prefix captures.
+    pub fn matches_with_sensitive(
+        &self,
+        header_name: &str,
+        is_sensitive: impl Fn(&str) -> bool,
+    ) -> bool {
         if header_name == "dpop" {
             return false;
         }
         if self.exact.contains(header_name) {
             return true;
         }
-        let denied = is_sensitive_header(header_name);
+        let denied = is_sensitive(header_name);
         if denied {
             return false;
         }
@@ -5450,6 +6524,14 @@ pub struct RawOriginConfig {
     /// Bot Auth accepts SBproxy as a verified agent. Default `false`.
     #[serde(default)]
     pub outbound_web_bot_auth: bool,
+    /// Per-origin consumption attestation overrides (WOR-2127). Absent
+    /// leaves the origin on the proxy-wide role with no agreement named.
+    /// Authoring this block without a `proxy.attestation` block fails
+    /// config compile: a per-origin role with no queue, ledger, or
+    /// billing table behind it can never produce a record. See
+    /// [`OriginAttestationConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<OriginAttestationConfig>,
     /// Origin-scope observability block. Today the only nested surface
     /// is `log.redact.pii`, which composes against the tenant-scope
     /// block (or proxy-scope when the origin has no tenant). See
@@ -7648,7 +8730,7 @@ proxy:
   extensions:
     classifier:
       endpoint: "http://127.0.0.1:9500"
-    semantic_cache:
+    custom_metadata:
       enabled: true
 origins: {}
 "#;
@@ -7656,8 +8738,8 @@ origins: {}
         let ext = cfg.proxy.extensions;
         assert!(ext.contains_key("classifier"), "classifier ext present");
         assert!(
-            ext.contains_key("semantic_cache"),
-            "semantic_cache ext present"
+            ext.contains_key("custom_metadata"),
+            "custom_metadata ext present"
         );
         let cls = ext.get("classifier").unwrap();
         assert_eq!(
@@ -7679,8 +8761,9 @@ origins: {}
 
     #[test]
     fn origin_extensions_accepts_arbitrary_nested_yaml() {
-        // Per-origin enterprise extensions (e.g. semantic_cache) live in
-        // a sibling opaque map that OSS never inspects.
+        // Per-origin extensions live in a sibling opaque map that nothing
+        // in this workspace inspects. The map keeps arbitrary nested
+        // shapes intact for whoever reads it.
         let yaml = r#"
 origins:
   api.example.com:
@@ -7688,22 +8771,22 @@ origins:
       type: proxy
       url: http://localhost:3000
     extensions:
-      semantic_cache:
+      custom_metadata:
         enabled: true
         ttl_secs: 1200
-        key_template: "{embedding_model}:{lsh_bucket}"
+        label: "{team}:{tier}"
 "#;
         let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
         let origin = &cfg.origins["api.example.com"];
-        let sc = origin
+        let custom = origin
             .extensions
-            .get("semantic_cache")
-            .expect("semantic_cache extension parsed");
-        assert!(sc.get("enabled").unwrap().as_bool().unwrap());
-        assert_eq!(sc.get("ttl_secs").unwrap().as_u64().unwrap(), 1200);
+            .get("custom_metadata")
+            .expect("custom_metadata extension parsed");
+        assert!(custom.get("enabled").unwrap().as_bool().unwrap());
+        assert_eq!(custom.get("ttl_secs").unwrap().as_u64().unwrap(), 1200);
         assert_eq!(
-            sc.get("key_template").unwrap().as_str().unwrap(),
-            "{embedding_model}:{lsh_bucket}"
+            custom.get("label").unwrap().as_str().unwrap(),
+            "{team}:{tier}"
         );
     }
 
@@ -9046,6 +10129,91 @@ mod inbound_key_header_tests {
     use super::*;
 
     #[test]
+    fn native_key_policy_requires_a_nonempty_unique_provider_allowlist() {
+        let mut cfg = KeyInboundConfig {
+            native_key_policy: Some(NativeKeyPolicyConfig {
+                allowed_providers: vec!["openai".to_string(), "anthropic".to_string()],
+                ..NativeKeyPolicyConfig::default()
+            }),
+            ..KeyInboundConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+
+        cfg.native_key_policy = Some(NativeKeyPolicyConfig {
+            allowed_providers: Vec::new(),
+            ..NativeKeyPolicyConfig::default()
+        });
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("allowed_providers must not be empty"));
+
+        cfg.native_key_policy = Some(NativeKeyPolicyConfig {
+            allowed_providers: vec!["OpenAI".to_string(), " openai ".to_string()],
+            ..NativeKeyPolicyConfig::default()
+        });
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("listed more than once"));
+    }
+
+    #[test]
+    fn native_key_policy_is_absent_by_default_so_native_traffic_fails_closed() {
+        assert!(KeyInboundConfig::default().native_key_policy.is_none());
+    }
+
+    #[test]
+    fn native_key_policy_accepts_key_record_governance_fields() {
+        let cfg: KeyInboundConfig = serde_yaml::from_str(
+            r#"
+native_key_policy:
+  allowed_providers: [openai]
+  max_requests_per_minute: 12
+  max_tokens_per_minute: 3456
+  max_budget_tokens: 7890
+  max_budget_usd: 1.25
+  allowed_models: [gpt-5]
+  blocked_models: [gpt-4]
+  require_pii_redaction: [email]
+"#,
+        )
+        .expect("native KeyRecord policy fields should deserialize");
+
+        let policy = cfg.native_key_policy.expect("policy");
+        assert_eq!(policy.max_requests_per_minute, Some(12));
+        assert_eq!(policy.max_tokens_per_minute, Some(3456));
+        assert_eq!(policy.max_budget_tokens, Some(7890));
+        assert_eq!(policy.max_budget_usd, Some(1.25));
+        assert_eq!(policy.allowed_models, ["gpt-5"]);
+        assert_eq!(policy.blocked_models, ["gpt-4"]);
+        assert_eq!(policy.require_pii_redaction, ["email"]);
+    }
+
+    #[test]
+    fn native_key_policy_rejects_zero_limits_and_invalid_cost_budget() {
+        let mut cfg = KeyInboundConfig {
+            native_key_policy: Some(NativeKeyPolicyConfig {
+                allowed_providers: vec!["openai".to_string()],
+                max_requests_per_minute: Some(0),
+                ..NativeKeyPolicyConfig::default()
+            }),
+            ..KeyInboundConfig::default()
+        };
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("must be greater than zero"));
+
+        cfg.native_key_policy = Some(NativeKeyPolicyConfig {
+            allowed_providers: vec!["openai".to_string()],
+            max_budget_usd: Some(f64::NAN),
+            ..NativeKeyPolicyConfig::default()
+        });
+        assert!(cfg.validate().unwrap_err().contains("finite"));
+    }
+
+    #[test]
     fn inbound_header_defaults_cover_the_three_common_shapes() {
         let cfg = KeyInboundConfig::default();
         let names: Vec<&str> = cfg.headers.iter().map(|h| h.name.as_str()).collect();
@@ -9068,6 +10236,7 @@ mod inbound_key_header_tests {
             }],
             require: false,
             provider_hints: Vec::new(),
+            native_key_policy: None,
         };
         assert!(bad.validate().is_err());
     }
@@ -9082,6 +10251,7 @@ mod inbound_key_header_tests {
                 }],
                 require: false,
                 provider_hints: Vec::new(),
+                native_key_policy: None,
             };
             assert!(cfg.validate().is_err(), "{forbidden} must be rejected");
         }
@@ -9106,8 +10276,65 @@ mod inbound_key_header_tests {
                 }],
                 require: false,
                 provider_hints: Vec::new(),
+                native_key_policy: None,
             };
             assert!(cfg.validate().is_err(), "{forbidden} must be rejected");
+        }
+    }
+
+    #[test]
+    fn inbound_validation_rejects_observability_and_capture_owned_headers() {
+        for forbidden in [
+            "X-Sb-User-Id",
+            "x-sb-session-id",
+            "X-SB-PARENT-SESSION-ID",
+            "x-sb-property-credential",
+            "User-Agent",
+            "Referer",
+            "b3",
+            "x-b3-traceid",
+            "x-b3-spanid",
+            "x-b3-sampled",
+            "x-b3-parentspanid",
+            "x-user-id",
+            "x-end-user",
+            "x-sbproxy-tag",
+            "x-a2a-caller-agent-id",
+            "x-a2a-callee-agent-id",
+            "x-a2a-task-id",
+            "x-a2a-parent-request-id",
+            "x-a2a-chain-depth",
+            "x-a2a-chain",
+        ] {
+            for provider_hint in [false, true] {
+                let cfg = KeyInboundConfig {
+                    headers: if provider_hint {
+                        Vec::new()
+                    } else {
+                        vec![InboundHeaderConfig {
+                            name: format!("  {forbidden}  "),
+                            scheme: String::new(),
+                        }]
+                    },
+                    require: false,
+                    provider_hints: if provider_hint {
+                        vec![ProviderHintConfig {
+                            provider: "custom".into(),
+                            header: format!("  {forbidden}  "),
+                            scheme: String::new(),
+                            value_prefix: String::new(),
+                            also_header: None,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    native_key_policy: None,
+                };
+                assert!(
+                    cfg.validate().is_err(),
+                    "{forbidden} must not be a primary credential carrier"
+                );
+            }
         }
     }
 
@@ -9126,6 +10353,7 @@ mod inbound_key_header_tests {
             ],
             require: false,
             provider_hints: Vec::new(),
+            native_key_policy: None,
         };
         assert!(dupe.validate().is_err());
     }
@@ -9136,6 +10364,7 @@ mod inbound_key_header_tests {
             headers: vec![],
             require: false,
             provider_hints: Vec::new(),
+            native_key_policy: None,
         };
         assert!(cfg.validate().is_ok());
         assert!(cfg.header_names().is_empty());
@@ -9150,8 +10379,103 @@ mod inbound_key_header_tests {
             }],
             require: false,
             provider_hints: Vec::new(),
+            native_key_policy: None,
         };
         assert_eq!(cfg.header_names(), ["x-tool-auth"]);
+    }
+
+    #[test]
+    fn credential_carrier_names_include_provider_hint_headers_only() {
+        let cfg = KeyInboundConfig {
+            headers: vec![
+                InboundHeaderConfig {
+                    name: "  X-Tool-Auth  ".into(),
+                    scheme: String::new(),
+                },
+                InboundHeaderConfig {
+                    name: "Authorization".into(),
+                    scheme: "Bearer ".into(),
+                },
+            ],
+            require: false,
+            provider_hints: vec![
+                ProviderHintConfig {
+                    provider: "openai".into(),
+                    header: "X-Native-Provider-Key".into(),
+                    scheme: String::new(),
+                    value_prefix: "native-".into(),
+                    also_header: Some("X-Provider-Version".into()),
+                },
+                ProviderHintConfig {
+                    provider: "openai".into(),
+                    header: "authorization".into(),
+                    scheme: "Bearer ".into(),
+                    value_prefix: "sk-".into(),
+                    also_header: None,
+                },
+            ],
+            native_key_policy: None,
+        };
+
+        assert_eq!(
+            cfg.credential_carrier_names(),
+            ["x-tool-auth", "authorization", "x-native-provider-key"]
+        );
+        assert!(
+            !cfg.credential_carrier_names()
+                .contains(&"x-provider-version".to_string()),
+            "also_header is match metadata, not a credential carrier"
+        );
+    }
+
+    #[test]
+    fn provider_hint_primary_carriers_reuse_reserved_header_rules() {
+        for reserved in [
+            "cookie",
+            "host",
+            "keep-alive",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "traceparent",
+            "proxy-authorization",
+            "sec-websocket-protocol",
+        ] {
+            let cfg = KeyInboundConfig {
+                headers: Vec::new(),
+                require: false,
+                provider_hints: vec![ProviderHintConfig {
+                    provider: "openai".into(),
+                    header: reserved.into(),
+                    scheme: String::new(),
+                    value_prefix: String::new(),
+                    also_header: None,
+                }],
+                native_key_policy: None,
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "{reserved} must not be a provider-hint credential carrier"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_hint_match_metadata_may_use_reserved_headers() {
+        let cfg = KeyInboundConfig {
+            headers: Vec::new(),
+            require: false,
+            provider_hints: vec![ProviderHintConfig {
+                provider: "openai".into(),
+                header: "x-provider-key".into(),
+                scheme: String::new(),
+                value_prefix: String::new(),
+                also_header: Some("traceparent".into()),
+            }],
+            native_key_policy: None,
+        };
+
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

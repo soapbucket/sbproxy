@@ -2,15 +2,17 @@
 
 *Last modified: 2026-07-09*
 
-Every state-mutating admin call emits a typed `AdminAuditEvent`
-envelope on the structured-log stream. Pair this example with the
+Every state-mutating admin call emits an admin-action line and, for a
+config change, a `config_audit` envelope on the structured-log stream.
+Pair this example with the
 [`access-log`](../access-log/) example to see the two streams
 side by side: the access log carries one row per request, the
 audit log carries one envelope per mutation.
 
-See [`docs/audit-log.md`](../../docs/audit-log.md) for the full
-envelope schema (subject / action / target enums), the append-only
-contract, and the structured-log sink notes.
+See [`docs/audit-log.md`](../../docs/audit-log.md) for the field
+reference on each channel (`config_audit`, `security_audit`,
+`key_audit`), the `/api/audit/recent` ring, and the structured-log
+sink notes.
 
 ## Run
 
@@ -28,45 +30,35 @@ config without dropping connections and emits an audit envelope per
 reload.
 
 ```bash
-curl -s -X POST -u admin:demo http://127.0.0.1:9090/admin/reload
+curl -s -X POST -u admin:demo-change-me http://127.0.0.1:9090/admin/reload
 ```
 
 ## What you see on stdout
 
-One access-log row for the admin request, plus one audit envelope
-for the reload mutation:
+The call answers with the new revision:
 
 ```json
-{
-  "event_id": "01H...",
-  "schema_version": 0,
-  "ts": "2026-06-04T01:23:45Z",
-  "tenant_id": "default",
-  "subject": {
-    "kind": "user",
-    "user_id": "admin"
-  },
-  "action": "reload_config",
-  "target": {
-    "target_kind": "config",
-    "config_id": "current"
-  },
-  "before": null,
-  "after": {
-    "config_path": "examples/audit-log/sb.yml",
-    "loaded_at": "2026-06-04T01:23:45Z"
-  },
-  "result": "Success",
-  "request_id": "01H...",
-  "trace_id": "",
-  "span_id": "",
-  "ip": "127.0.0.1"
-}
+{"config_revision":"8f10eba811d1","loaded_at":"2026-08-01T15:02:21.996698+00:00","fully_applied":true,"degraded":[]}
 ```
 
-The `before` / `after` snapshots are redacted per
-`docs/audit-log.md` (secrets stripped); the `reason` field is
-operator-supplied and not redacted.
+Two lines land on stdout. The admin-action line records who called what:
+
+```
+INFO sbproxy::admin::audit: admin action operator=admin role=admin method=POST path=/admin/reload
+```
+
+Then the `config_audit` envelope:
+
+```json
+{"timestamp":"2026-08-01T15:02:15.368528+00:00","source":"api","origins_added":[],"origins_removed":[],"origins_modified":[],"actor":"admin","prior_revision":"8f10eba811d1","next_revision":"8f10eba811d1"}
+```
+
+`source` is `api` because the reload arrived through the admin endpoint;
+the same reload from a file edit records `file_watcher` and carries no
+`actor`. Empty `origins_*` arrays with an unchanged revision mean the
+reload applied but found nothing to change.
+
+Redaction rules for these channels are in `docs/audit-log.md`.
 
 ## What is audited (and what is not)
 
@@ -95,8 +87,8 @@ sink is the breadcrumb path your shipper picks up.
 
 | `curl` | What it audits |
 |---|---|
-| `POST -u admin:demo /admin/reload` | Config reload (the example above) |
-| `POST -u admin:demo /admin/log-level?level=debug` | Log-level change (where supported) |
+| `POST -u admin:demo-change-me /admin/reload` | Config reload (the example above) |
+| `POST -u admin:demo-change-me /admin/log-level?level=debug` | Log-level change (where supported) |
 
 See [`docs/admin-api-reference.md`](../../docs/admin-api-reference.md)
 for the full route list and per-route schema.

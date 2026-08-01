@@ -1,223 +1,162 @@
-# Multi-rail 402 with Accept-Payment negotiation
-*Last modified: 2026-07-09*
+# Three ways to pay for one route
 
-Both rails (x402 + MPP) configured at once. The example demonstrates
-the `Accept-Payment` header negotiation: q-value preference,
-first-match-wins per A3.1, the multi-rail body shape, and the 406
-fallback when no rail matches.
+*Last modified: 2026-08-01*
 
-The stack reuses the mock x402 facilitator from `examples/rail-x402-base-sepolia/`
-and the wiremock Stripe stand-in from `examples/rail-mpp-stripe-test/` so the
-demo runs end-to-end without external dependencies.
+One article route that accepts x402, Payment HTTP Authentication, and
+Stripe directly, all priced at $0.001. The example is about negotiation:
+how a client states a preference, how the proxy picks one challenge, and
+what happens when the preference and the offer do not overlap.
 
-## How it composes
+`Accept-Payment` is a preference list and nothing more. It carries no
+token, no signature, no address, and no amount. It selects which challenge
+comes back and never authorizes a request.
 
-| Service                | Image                              | Role                                                                |
-|------------------------|------------------------------------|---------------------------------------------------------------------|
-| sbproxy                | built from `Dockerfile.cloudbuild` | Reverse proxy on `:8080` enforcing `ai_crawl_control` per `sb.yml`. |
-| mock-x402-facilitator  | `nginx:1.27.3-alpine`              | Reused from example 30; mounts the same nginx config.               |
-| mock-origin            | `nginx:1.27.3-alpine`              | Article server. Returns one canned HTML body on `/article`.         |
-| wiremock               | `wiremock/wiremock:3.10.1`         | Reused from example 31; serves Stripe-shaped JSON.                  |
+## What is in the bundle
 
-All four containers run on a single bridge network (`multirailsb`);
-only `sbproxy` publishes a host port (`8080`).
+| File | Role |
+|---|---|
+| `sb.yml` | x402 and Stripe rails plus the Payment Auth protocol, all in USD |
+| `docker-compose.yml` | `sbproxy`, a mock origin, and the stubs from the sibling examples |
+| `mock-origin/` | nginx serving one canned article |
+| `Makefile` | `up`, `down`, `logs`, `test` |
+| `smoke.json` | Liveness manifest for `scripts/examples-smoke.sh` |
 
-## How to run
+## Run it
 
 ```bash
-cd examples/multi-rail-accept-payment
+cargo build -p sbproxy --release --features payments,payment-mpp,payment-stripe,payment-x402
+sbproxy validate -f examples/multi-rail-accept-payment/sb.yml
+```
+
+```bash
+export SBPROXY_PAYMENT_BINDING_KEY="$(openssl rand -hex 32)"
+export SBPROXY_PAYMENT_RECOVERY_KEY="$(openssl rand -hex 32)"
+export STRIPE_SECRET_KEY=sk_test_...
 docker compose up -d --wait
 ```
 
-Tear down:
+## The grammar
+
+```http
+Accept-Payment: x402;q=1.0, stripe;intent=charge;q=0.5
+```
+
+Each entry is a method token, optionally followed by `;intent=<token>` and
+`;q=<quality>`. Absent `q` means `1.0`. Entries sort by descending
+quality, and the client's own order is preserved within one quality, so
+listing two methods at equal quality is a meaningful statement of
+preference.
+
+Parsing is per entry. A duplicate `intent`, a duplicate `q`, an unknown
+parameter, a quality above 1.0, or a malformed token drops that one entry
+and leaves the rest intact:
+
+```http
+Accept-Payment: stripe;spt=secret, lightning;q=0.25
+```
+
+The first entry is dropped because `spt` is not a preference parameter,
+and the second survives. A malformed header is never a reason to refuse a
+payable request, and proof material in this header is never read as proof
+of anything.
+
+## What each preference gets
+
+```bash
+curl -is -H 'Host: blog.test.sbproxy.dev' -H 'User-Agent: GPTBot/1.0' \
+  -H 'Accept-Payment: x402' \
+  http://127.0.0.1:8080/article
+```
+
+An x402 preference gets the 402 with one `PAYMENT-REQUIRED` field.
+
+```bash
+curl -is -H 'Host: blog.test.sbproxy.dev' -H 'User-Agent: ClaudeBot/1.0' \
+  -H 'Accept-Payment: stripe;intent=charge' \
+  http://127.0.0.1:8080/article
+```
+
+A `stripe` plus `charge` preference gets the 402 with one
+`WWW-Authenticate: Payment` field. Two offered challenges would be two
+separate fields, never one field carrying both.
+
+```bash
+curl -is -H 'Host: blog.test.sbproxy.dev' -H 'User-Agent: GPTBot/1.0' \
+  http://127.0.0.1:8080/article
+```
+
+No preference at all gets the legacy `Crawler-Payment` shape, so crawlers
+that predate any of this keep working unchanged.
+
+```bash
+curl -is -H 'Host: blog.test.sbproxy.dev' -H 'User-Agent: PerplexityBot/1.0' \
+  -H 'Accept-Payment: carrier-pigeon' \
+  http://127.0.0.1:8080/article
+```
+
+A preference with no overlap gets 406 and a list to choose from:
+
+```json
+{
+  "error": "no_acceptable_rail",
+  "supported_rails": ["x402", "mpp"],
+  "target": "blog.test.sbproxy.dev/article"
+}
+```
+
+## One currency per challenge
+
+Every rail this route advertises declares `quote_currency: USD`. That is
+required, not stylistic. The proxy performs no currency conversion, so a
+mixed-currency challenge would offer the payer two different prices for
+one resource. Adding a BTC Lightning rail to this route is refused at
+load:
+
+```text
+advertised rails x402 and lightning are priced in USD and BTC; one
+challenge cannot mix currencies because the proxy performs no
+foreign-exchange conversion
+```
+
+Serving both means two routes, each priced in its own currency, each
+advertising rails that agree.
+
+## mpp and stripe settle on the same rail
+
+`mpp` names Payment HTTP Authentication, which is a credential transport
+rather than a network that moves funds. Its registered `stripe` plus
+`charge` pair settles through `rails.stripe`, the same block the direct
+Stripe mode uses. That is why the config has no `mpp` rail to configure
+and why `protocols.payment_auth` without `rails.stripe` is a load error:
+
+```text
+proxy.payments.protocols.payment_auth uses method `stripe`, which settles
+through proxy.payments.rails.stripe; configure that rail or remove the
+protocol
+```
+
+The two differ in where the credential arrives and what comes back. Payment
+Auth takes an `Authorization: Payment` credential and answers a settled
+request with `Payment-Receipt`. Direct mode hands out a client secret at
+challenge time and takes the retry after the client has confirmed.
+
+## Only one rail is charged
+
+A client presents one credential. The proxy reserves that credential's
+digest against exactly one durable intent before any provider call, so a
+credential replayed against a different intent stops there. Advertising
+three ways to pay does not create three ways to be charged.
+
+## Clean up
 
 ```bash
 docker compose down -v
 ```
 
-## How the negotiation works
+## Related
 
-The proxy resolves the agent's preferred rail order from two signals
-(`docs/402-challenge.md` documents the wire contract):
-
-1. The `Accept-Payment` request header. Comma-separated list of rail
-   tokens, optional q-value parameters (`x402;q=1, mpp;q=0.5`).
-2. The `Accept` request header, when it carries one of
-   `application/sbproxy-multi-rail+json`, `application/x402+json`, or
-   `application/mpp+json`.
-
-The proxy:
-
-1. Parses the agent's preference set.
-2. Filters it through the operator's configured rails (per-policy
-   `rails:` block, optionally narrowed by per-tier `rails:`
-   override).
-3. Sorts the surviving rails by the agent's q-value (descending),
-   breaking ties on the operator's declared rail order.
-4. Emits one rail entry per surviving rail, each carrying its own
-   quote-token JWS (separate nonce per rail per A3.2).
-5. Returns 402 with the multi-rail body or, when no rail survives
-   the filter, returns 406 with a body listing the rails the
-   operator does support.
-
-The "first match wins" `policy` field in the multi-rail body says:
-the agent should pick the first entry it can settle, in the order
-the body lists. The proxy does not ask the agent to nominate a rail;
-it tells the agent which rail entries are available and in what
-preference order.
-
-## What to expect
-
-### 1. q-value preference: x402 first
-
-Agent declares `x402;q=1, mpp;q=0.5`. The proxy lists `x402` before
-`mpp` in the `rails[]` array.
-
-```bash
-curl -i \
-     -H 'Host: blog.test.sbproxy.dev' \
-     -H 'User-Agent: GPTBot/1.0' \
-     -H 'Accept-Payment: x402;q=1, mpp;q=0.5' \
-     http://127.0.0.1:8080/article
-# HTTP/1.1 402 Payment Required
-# Content-Type: application/sbproxy-multi-rail+json
-# {
-#   "rails": [
-#     {"kind":"x402", ...},
-#     {"kind":"mpp",  ...}
-#   ],
-#   "agent_choice_method": "header_negotiation",
-#   "policy": "first_match_wins"
-# }
-```
-
-### 2. q-value preference: mpp first
-
-Agent declares `mpp;q=1, x402;q=0.5`. The proxy lists `mpp` before
-`x402`.
-
-```bash
-curl -i \
-     -H 'Host: blog.test.sbproxy.dev' \
-     -H 'User-Agent: ClaudeBot/1.0' \
-     -H 'Accept-Payment: mpp;q=1, x402;q=0.5' \
-     http://127.0.0.1:8080/article
-# HTTP/1.1 402 Payment Required
-# Content-Type: application/sbproxy-multi-rail+json
-# {
-#   "rails": [
-#     {"kind":"mpp",  ...},
-#     {"kind":"x402", ...}
-#   ],
-#   ...
-# }
-```
-
-### 3. Unknown rail: 406 fallback
-
-Agent declares only `foo`, which is not a valid rail token. The
-proxy returns 406 with a body listing the rails it does support so
-the agent can recover.
-
-```bash
-curl -i \
-     -H 'Host: blog.test.sbproxy.dev' \
-     -H 'User-Agent: PerplexityBot/1.0' \
-     -H 'Accept-Payment: foo;q=1' \
-     http://127.0.0.1:8080/article
-# HTTP/1.1 406 Not Acceptable
-# Content-Type: application/json
-# {
-#   "error": "no_acceptable_rail",
-#   "supported_rails": ["x402","mpp"],
-#   "target": "blog.test.sbproxy.dev/article",
-#   "message": "Agent's Accept-Payment list does not overlap with this route's configured rails."
-# }
-```
-
-### 4. Equal q-values, operator order breaks the tie
-
-When the agent declares the same q-value for both rails, the
-operator's declared order in `sb.yml` (here: x402 first, mpp
-second) breaks the tie.
-
-```bash
-curl -i \
-     -H 'Host: blog.test.sbproxy.dev' \
-     -H 'User-Agent: GPTBot/1.0' \
-     -H 'Accept-Payment: x402, mpp' \
-     http://127.0.0.1:8080/article
-# Both rails have q=1 (default). Operator order says x402 first.
-```
-
-### 5. MIME-type opt-in
-
-Agents that prefer to negotiate via `Accept` (not `Accept-Payment`)
-get the same multi-rail body when their `Accept` includes one of
-the multi-rail MIME types:
-
-```bash
-curl -i \
-     -H 'Host: blog.test.sbproxy.dev' \
-     -H 'User-Agent: GPTBot/1.0' \
-     -H 'Accept: application/sbproxy-multi-rail+json' \
-     http://127.0.0.1:8080/article
-# => 402 with both rails. The catch-all MIME accepts every rail.
-```
-
-`application/x402+json` and `application/mpp+json` work the same way
-but filter the body to the named rail.
-
-### 6. No opt-in: legacy single-rail
-
-Crawlers that send neither `Accept-Payment` nor a multi-rail
-`Accept` MIME type still see a 402, but the body is the Wave 1
-single-rail format with the `Crawler-Payment` header. This keeps
-legacy crawlers working without breaking the new path.
-
-```bash
-curl -i \
-     -H 'Host: blog.test.sbproxy.dev' \
-     -H 'User-Agent: GPTBot/1.0' \
-     http://127.0.0.1:8080/article
-# HTTP/1.1 402 Payment Required
-# Crawler-Payment: realm="ai-crawl" currency="USD" price="0.001000"
-```
-
-## Per-tier rail override
-
-Tiers can narrow the rails on a per-route basis. For example, an
-operator might want all routes to advertise both rails by default
-but force the high-value `/premium/*` route through MPP only:
-
-```yaml
-tiers:
-  - route_pattern: /premium/*
-    price:
-      amount_micros: 50000
-      currency: USD
-    content_shape: html
-    rails: ["mpp"]   # override; ignore policy-level x402 here.
-```
-
-The example does not configure a per-tier override. See the unit
-test `multi_rail_per_tier_filter_overrides_policy_rails` in
-`crates/sbproxy-modules/src/policy/ai_crawl.rs` for the full
-behaviour.
-
-## Cargo features
-
-The example assumes a default-features `sbproxy` build. The
-multi-rail emission path is unconditional in the `sbproxy-modules`
-crate; no operator-set cargo feature is needed.
-
-## Related docs
-
-- `docs/ai-crawl-control.md` - operator-facing crawl-control and
-  billing reference.
-- `docs/402-challenge.md` - wire shape of the 402 / 406 bodies, the
-  negotiation rules, and the quote-token JWS shape.
-- `examples/rail-x402-base-sepolia/` - x402 rail in isolation.
-- `examples/rail-mpp-stripe-test/` - MPP rail in isolation.
-- `examples/quote-token-replay-jwks/` - JWKS endpoint and
-  single-use quote token enforcement.
+- [docs/payment-settlement.md](../../docs/payment-settlement.md) - every `proxy.payments` field, the state table, and the unsupported boundaries.
+- [docs/402-challenge.md](../../docs/402-challenge.md) - the exact challenge, credential, error, and receipt bytes.
+- `examples/rail-x402-base-sepolia/` - x402 v2 `exact` on its own.
+- `examples/rail-mpp-stripe-test/` - Payment HTTP Authentication settling on Stripe.
+- `examples/rail-lightning/` - CLN and LND as alternative backends.

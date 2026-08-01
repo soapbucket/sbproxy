@@ -22,8 +22,8 @@ curl -i -H 'Host: blog.local' \
      -H 'User-Agent: GPTBot/1.0' \
      http://127.0.0.1:8080/article
 # HTTP/1.1 402 Payment Required
-# Crawler-Payment: realm="..."
-# {"price":0.001,"currency":"USD","header":"crawler-payment"}
+# crawler-payment: Crawler-Payment realm="ai-crawl" currency="USD" price="0.001000"
+# {"error":"payment_required","price":"0.001000","amount_micros":1000,"currency":"USD","target":"blog.local/article","header":"crawler-payment"}
 ```
 
 ```bash

@@ -68,32 +68,26 @@ pub struct RealtimeQuotaFailure {
 }
 
 impl RealtimeQuotaFailure {
-    /// Map a pool failure to its client response, or admit the one explicit
-    /// backend-unavailable fail-open mode.
+    /// Map a pool failure to its client response, or `None` when the pool's
+    /// failure posture admits the attempt without a reservation.
+    ///
+    /// This used to be a third, independently written copy of the same
+    /// status mapping the AI dispatch path carries, and the copies had
+    /// already drifted. It now delegates to
+    /// [`sbproxy_ai::quota_pool::pool_error_disposition`], which reads the
+    /// posture through `QuotaPoolConfig::failure_posture` (WOR-2121). The
+    /// realtime path keeps its own type only because Pingora needs the
+    /// exact response stashed on the context before the upstream pipeline
+    /// takes over.
     pub fn from_pool_error(
         config: Option<&sbproxy_ai::QuotaPoolConfig>,
         error: &sbproxy_ai::PoolError,
     ) -> Option<Self> {
-        match error {
-            sbproxy_ai::PoolError::Denied(_) => Some(Self {
-                status: 429,
-                message: "fair-share quota pool exhausted",
-            }),
-            sbproxy_ai::PoolError::BackendUnavailable
-                if config.is_some_and(|config| {
-                    config.failure_mode == sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved
-                }) =>
-            {
-                None
+        match sbproxy_ai::quota_pool::pool_error_disposition(config, error) {
+            sbproxy_ai::quota_pool::PoolErrorDisposition::Admit => None,
+            sbproxy_ai::quota_pool::PoolErrorDisposition::Reject { status, message } => {
+                Some(Self { status, message })
             }
-            sbproxy_ai::PoolError::BackendUnavailable => Some(Self {
-                status: 503,
-                message: "fair-share quota backend unavailable",
-            }),
-            sbproxy_ai::PoolError::InvalidState => Some(Self {
-                status: 503,
-                message: "fair-share quota state unavailable",
-            }),
         }
     }
 }
@@ -134,6 +128,29 @@ pub struct RequestMetrics {
     /// boilerplate-stripping transform. `0` when the
     /// transform did not run or removed nothing.
     pub stripped_bytes: u64,
+}
+
+/// Stable, secret-free classification of the inbound key path.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum InboundKeyMode {
+    /// No governed or recognized native key was admitted.
+    #[default]
+    None,
+    /// An SBproxy-minted key resolved through the governed key plane.
+    Minted,
+    /// A caller-owned native provider key resolved through the default policy.
+    Native,
+}
+
+impl InboundKeyMode {
+    /// Closed vocabulary used by metrics and audit records.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minted => "minted",
+            Self::Native => "native",
+        }
+    }
 }
 
 /// Bounded cache outcome carried to the admin request ring.
@@ -213,6 +230,70 @@ pub(crate) struct LoadBalancerAttemptToken {
     /// Status received from the selected upstream before any proxy response
     /// fallback or modifier can rewrite the downstream status.
     pub(crate) observed_upstream_status: Option<u16>,
+}
+
+/// A payment-shaped response the policy rendered locally.
+///
+/// Replaces the `(header_name, value, body)` tuple this slot used to hold.
+/// That tuple could carry exactly one header, which forced two workarounds:
+/// a `Content-Type` sentinel in the name position to mean "stamp this as the
+/// content type instead", and no way at all to emit the repeated
+/// `WWW-Authenticate` field Payment HTTP Authentication requires, which is
+/// one field per offered challenge rather than one field listing several.
+///
+/// Every field is already final. The request phase writes what is here and
+/// composes nothing, so the policy that decided the outcome is the only thing
+/// that decides how it looks on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentResponse {
+    /// The exact `Content-Type` to stamp.
+    pub content_type: String,
+    /// Additional headers, in order.
+    ///
+    /// A name may repeat. `WWW-Authenticate` does, and the writer appends
+    /// rather than replaces, so two offered challenges produce two fields.
+    pub headers: Vec<(String, String)>,
+    /// The exact body bytes.
+    pub body: String,
+}
+
+impl PaymentResponse {
+    /// A JSON response carrying no extra headers.
+    #[must_use]
+    pub fn json(body: String) -> Self {
+        Self {
+            content_type: "application/json".to_string(),
+            headers: Vec::new(),
+            body,
+        }
+    }
+
+    /// A JSON response carrying one challenge header.
+    #[must_use]
+    pub fn json_with_header(name: &str, value: String, body: String) -> Self {
+        Self {
+            content_type: "application/json".to_string(),
+            headers: vec![(name.to_string(), value)],
+            body,
+        }
+    }
+
+    /// A response whose content type the policy chose.
+    #[must_use]
+    pub fn typed(content_type: String, body: String) -> Self {
+        Self {
+            content_type,
+            headers: Vec::new(),
+            body,
+        }
+    }
+
+    /// Adds one header, keeping any already present under that name.
+    #[must_use]
+    pub fn with_header(mut self, name: &str, value: String) -> Self {
+        self.headers.push((name.to_string(), value));
+        self
+    }
 }
 
 /// Per-request state threaded through all Pingora phases as CTX.
@@ -447,6 +528,30 @@ pub struct RequestContext {
     /// fallback bodies, and cached responses are included.
     pub response_body_bytes: u64,
 
+    // --- Attested metering (WOR-2145) ---
+    /// Values of the response headers `proxy.attestation.origin_headers`
+    /// names, captured in `response_filter` because the upstream response
+    /// header is out of scope by the time the receipt is cut.
+    ///
+    /// Only the configured header names are copied, so a deployment with
+    /// no origin-header rules allocates nothing. Absent and empty are kept
+    /// apart: a name with no entry here is a header the origin never sent,
+    /// which is a different statement from one it sent empty, and the
+    /// receipt's evidence encodes that difference. Filled by
+    /// `crate::meter_runtime::capture_origin_headers` and read once by
+    /// `crate::meter_runtime::record_response`.
+    pub meter_origin_headers: Vec<(String, String)>,
+
+    /// Set when the meter refused this response under
+    /// `failure_mode: closed`, so the body filter drops every chunk
+    /// instead of delivering work the proxy cannot bill for.
+    ///
+    /// Refusing has to suppress the body, not just rewrite the status.
+    /// A 503 with the upstream's body still attached would hand the
+    /// buyer exactly the value the seller just declared itself unable to
+    /// record, which is the one outcome `closed` exists to prevent.
+    pub meter_refused: bool,
+
     // --- Request mirror state ---
     /// Captured-at-`request_filter` parameters for a request whose
     /// mirror should fire from `request_body_filter` (so the body
@@ -627,11 +732,12 @@ pub struct RequestContext {
     pub transform_error_attribution: Option<String>,
 
     // --- AI Crawl Control challenge ---
-    /// Set by an `ai_crawl_control` policy when a request must be
-    /// charged. Tuple is `(header_name, challenge_value, json_body)`.
-    /// The 402 response handler reads this to stamp the configured
-    /// header and write the JSON body.
-    pub crawl_challenge: Option<(String, String, String)>,
+    /// The locally rendered response an `ai_crawl_control` policy
+    /// produced, when a request was charged, refused, or blocked.
+    ///
+    /// The request phase writes this verbatim rather than reassembling
+    /// it, so every payment-shaped response has exactly one author.
+    pub crawl_challenge: Option<PaymentResponse>,
     /// Set by an `ai_crawl_control` policy in Cloudflare Pay Per Crawl
     /// interop mode when a request settled through the ledger. Carries
     /// the `crawler-charged` header value (`<currency> <amount>`, e.g.
@@ -914,6 +1020,10 @@ pub struct RequestContext {
     pub ai_prompt_fingerprint: Option<String>,
     /// Completion / output tokens reported by the provider response.
     pub ai_tokens_out: Option<u64>,
+    /// Tokens served from the upstream provider's prompt cache
+    /// (Anthropic `cache_read_input_tokens`, OpenAI `cached_tokens`).
+    /// `None` when the provider reported no cache activity.
+    pub ai_tokens_cached: Option<u64>,
     /// Rate-limiter bucket for the authenticated virtual key, set only
     /// when the key carries a tokens-per-minute cap (WOR-1833). The
     /// request-completion path uses it to charge the response's token
@@ -1015,6 +1125,13 @@ pub struct RequestContext {
     /// Downstream code reads this instead of re-reading `authorization`, which
     /// an earlier phase may already have consumed.
     pub resolved_inbound_key: Option<Box<sbproxy_keystore::record::KeyRecord>>,
+    /// Secret-free policy synthesized for an admitted caller-owned provider
+    /// credential.
+    ///
+    /// Kept separate from `resolved_inbound_key`: provider-shape attribution
+    /// is not authentication and must never short-circuit the origin's
+    /// configured auth provider.
+    pub native_key_policy_record: Option<Box<sbproxy_keystore::record::KeyRecord>>,
     /// Lowercase name of the header the minted key arrived in.
     ///
     /// Stripped from the upstream request so the proxy's own key never reaches
@@ -1027,6 +1144,19 @@ pub struct RequestContext {
     /// to refuse. Read by metrics, audit, and policy so native-key traffic
     /// stops being invisible.
     pub native_key_provider: Option<String>,
+    /// Secret-free inbound key classification for metrics and audit.
+    pub inbound_key_mode: InboundKeyMode,
+    /// Governed key-policy revision applied to this request, in the
+    /// `r{rev}:{digest}` / `c:{rev}:{digest}` vocabulary the
+    /// `sbproxy.policy_version` span attribute uses. `None` when no
+    /// key policy resolved.
+    pub ai_policy_version: Option<String>,
+    /// Bounded, ordered `policy_type:verdict` pairs recorded as each
+    /// enforcer decides (WOR-2094). Explains why the gateway acted.
+    pub policy_decisions: Vec<String>,
+    /// Machine-readable reason from the policy, guardrail, or auth
+    /// layer that denied this request, when one did (WOR-2094).
+    pub deny_reason: Option<String>,
     /// Accepted ingress governance reservation owned by this request.
     ///
     /// Successful response accounting settles it with actual usage. Paths
@@ -1174,6 +1304,38 @@ pub struct RequestContext {
     /// verbatim instead of falling through to the generic
     /// `send_error` template.
     pub a2a_denial_body: Option<String>,
+    /// WOR-2139: the A2A `contextId` this hop carried, already capped to
+    /// the span-attribute identifier limit.
+    ///
+    /// This is the run correlation key. A2A task ids nest under a
+    /// context id, so it is the identifier that lets a fan-out of agent
+    /// hops reconstruct as one tree rather than a pile of unrelated
+    /// traces. It is read from `params.contextId` in the A2A 1.0
+    /// JSON-RPC body, which means `request_body_filter` is the first
+    /// phase that can see it, and that phase runs *after*
+    /// `upstream_request_filter` has already assembled the upstream
+    /// request. A run id therefore cannot be stamped onto an outbound
+    /// header on this hop; run correlation rides the W3C trace context
+    /// the upstream request filter already injects. The same phase
+    /// boundary is why the A2A injection vocabulary has no `tag` action
+    /// and why the push-notification check had to move to the body
+    /// phase.
+    ///
+    /// Deliberately not a field on `A2AContext`. That struct is built in
+    /// the request filter from headers, one phase earlier, and it
+    /// derives `Serialize` / `Deserialize` with no `serde(default)`, so
+    /// widening it would break deserialization of any already-serialized
+    /// envelope. Keeping the two apart also preserves a trust asymmetry
+    /// worth naming: `A2AContext::task_id` comes from the
+    /// `x-a2a-task-id` header and is honoured only behind the
+    /// trusted-peer gate, while this value comes from the request body
+    /// and is honoured from any caller. Read
+    /// `A2AContext::identity_verified` before treating either as an
+    /// authoritative name for a run.
+    ///
+    /// `None` for non-A2A traffic, for the two `v0` drafts, and for A2A
+    /// 1.0 hops on origins that never buffer the request body.
+    pub a2a_context_id: Option<String>,
 
     // --- WOR-114: per-request feature flags ---
     /// Parsed `x-sb-flags` header + `?_sb.<key>` query params.
@@ -1279,6 +1441,55 @@ impl RequestContext {
         self.fallback_triggered || self.admin_failover_to.is_some()
     }
 
+    /// Canonical, secret-free key identity for accountability surfaces.
+    ///
+    /// One derivation shared by the access log, the admin request ring,
+    /// the inbound-key metric, audit events, and spans, so a single request
+    /// never reports different key ids on different surfaces. Precedence:
+    /// the governed effective policy's key id (set once per AI request),
+    /// then the resolved minted record, then the synthesized native policy
+    /// record, then the authenticated principal's public key id. Every
+    /// source is a public identifier; none carries the raw secret.
+    pub fn accountable_key_id(&self) -> Option<&str> {
+        if let Some(policy) = self.effective_key_policy.as_ref() {
+            if !policy.key_id.is_empty() {
+                return Some(policy.key_id.as_str());
+            }
+        }
+        if let Some(record) = self.resolved_inbound_key.as_deref() {
+            if !record.key_id.is_empty() {
+                return Some(record.key_id.as_str());
+            }
+        }
+        if let Some(record) = self.native_key_policy_record.as_deref() {
+            if !record.key_id.is_empty() {
+                return Some(record.key_id.as_str());
+            }
+        }
+        let principal_id = self.principal.api_key_id();
+        (!principal_id.is_empty()).then_some(principal_id)
+    }
+
+    /// Record one policy decision as a `policy_type:verdict` pair for
+    /// the admin ring's explainability column (WOR-2094).
+    ///
+    /// Bounded so a pathological chain cannot grow a per-request
+    /// allocation: past the cap the final slot is replaced with a
+    /// truncation marker rather than growing further.
+    pub fn record_policy_decision(&mut self, policy_type: &str, verdict: &str) {
+        const MAX_POLICY_DECISIONS: usize = 16;
+        match self.policy_decisions.len().cmp(&MAX_POLICY_DECISIONS) {
+            std::cmp::Ordering::Less => {
+                self.policy_decisions
+                    .push(format!("{policy_type}:{verdict}"));
+            }
+            std::cmp::Ordering::Equal => {
+                self.policy_decisions.push("...:truncated".to_string());
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+
     /// Create a new, empty request context.
     pub fn new() -> Self {
         Self {
@@ -1332,6 +1543,8 @@ impl RequestContext {
             body_bytes_seen: 0,
             request_body_bytes: 0,
             response_body_bytes: 0,
+            meter_origin_headers: Vec::new(),
+            meter_refused: false,
             mirror_pending: None,
             auth_result: None,
             trust_tier: sbproxy_modules::auth::TrustTier::Anonymous,
@@ -1429,6 +1642,7 @@ impl RequestContext {
             ai_prompt_tokens_est: None,
             ai_prompt_fingerprint: None,
             ai_tokens_out: None,
+            ai_tokens_cached: None,
             ai_key_tpm_bucket: None,
             ai_lane_priority: None,
             managed_model_permit: None,
@@ -1449,8 +1663,13 @@ impl RequestContext {
             ai_native_bypass: false,
             effective_key_policy: None,
             resolved_inbound_key: None,
+            native_key_policy_record: None,
             inbound_key_header: None,
             native_key_provider: None,
+            inbound_key_mode: InboundKeyMode::None,
+            ai_policy_version: None,
+            policy_decisions: Vec::new(),
+            deny_reason: None,
             governance_lease: None,
             ai_admission: None,
             ai_realtime_session: None,
@@ -1470,6 +1689,7 @@ impl RequestContext {
             headless_signal: None,
             a2a: None,
             a2a_denial_body: None,
+            a2a_context_id: None,
             flags: crate::sb_flags::RequestFlags::default(),
             policy_response_headers: Vec::new(),
             deny_policy_type: None,
@@ -1509,6 +1729,48 @@ impl Default for RequestContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accountable_key_id_precedence_is_policy_then_record_then_principal() {
+        // WOR-2093: one derivation for every surface. The precedence
+        // mirrors specificity: the governed effective policy knows the
+        // canonical id, records are next, the principal is the fallback.
+        let mut ctx = RequestContext::new();
+        assert!(ctx.accountable_key_id().is_none(), "no key -> no id");
+
+        ctx.principal.attrs.key_id = Some("principal-id".to_string());
+        assert_eq!(ctx.accountable_key_id(), Some("principal-id"));
+
+        let now = chrono::Utc::now();
+        ctx.native_key_policy_record = Some(Box::new(sbproxy_keystore::record::KeyRecord::new(
+            "native:t:api:openai",
+            "hash",
+            now,
+        )));
+        assert_eq!(ctx.accountable_key_id(), Some("native:t:api:openai"));
+
+        ctx.resolved_inbound_key = Some(Box::new(sbproxy_keystore::record::KeyRecord::new(
+            "sbp_minted_id",
+            "hash",
+            now,
+        )));
+        assert_eq!(
+            ctx.accountable_key_id(),
+            Some("sbp_minted_id"),
+            "a minted record beats native attribution"
+        );
+    }
+
+    #[test]
+    fn policy_decisions_are_bounded_with_a_truncation_marker() {
+        let mut ctx = RequestContext::new();
+        for i in 0..40 {
+            ctx.record_policy_decision(&format!("policy_{i}"), "allow");
+        }
+        assert_eq!(ctx.policy_decisions.len(), 17, "16 entries + marker");
+        assert_eq!(ctx.policy_decisions.last().unwrap(), "...:truncated");
+        assert_eq!(ctx.policy_decisions[0], "policy_0:allow");
+    }
 
     #[test]
     fn new_context_has_sensible_defaults() {
@@ -1731,6 +1993,7 @@ mod tests {
             dimension: sbproxy_ai::QuotaPoolDimension::Request,
             consistency: sbproxy_ai::QuotaPoolConsistency::Local,
             failure_mode,
+            failure_posture: None,
         }
     }
 
@@ -1769,6 +2032,46 @@ mod tests {
             allow_unreserved.is_none(),
             "allow_unreserved must bypass only backend unavailability"
         );
+    }
+
+    /// An explicit `failure_posture` wins over the legacy `failure_mode`
+    /// on the realtime path too, and the realtime path agrees with the AI
+    /// dispatch path because both now call one helper.
+    #[test]
+    fn realtime_quota_honours_an_explicit_failure_posture() {
+        use sbproxy_config::types::FailureMode;
+
+        // Legacy says reject, explicit posture says admit.
+        let mut config = quota_pool_config(sbproxy_ai::QuotaPoolFailureMode::Closed);
+        config.failure_posture = Some(FailureMode::Degraded);
+        assert!(
+            RealtimeQuotaFailure::from_pool_error(
+                Some(&config),
+                &sbproxy_ai::PoolError::BackendUnavailable
+            )
+            .is_none(),
+            "the explicit posture wins over the legacy field"
+        );
+
+        // Legacy says admit, explicit posture says reject.
+        let mut config = quota_pool_config(sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved);
+        config.failure_posture = Some(FailureMode::Closed);
+        let failure = RealtimeQuotaFailure::from_pool_error(
+            Some(&config),
+            &sbproxy_ai::PoolError::BackendUnavailable,
+        )
+        .expect("an explicit closed posture must reject");
+        assert_eq!(failure.status, 503);
+
+        // A plain `open` admits exactly like `degraded` here. They differ
+        // only in the fail-open counter, which the admission path owns.
+        let mut config = quota_pool_config(sbproxy_ai::QuotaPoolFailureMode::Closed);
+        config.failure_posture = Some(FailureMode::Open);
+        assert!(RealtimeQuotaFailure::from_pool_error(
+            Some(&config),
+            &sbproxy_ai::PoolError::BackendUnavailable
+        )
+        .is_none());
     }
 
     #[test]

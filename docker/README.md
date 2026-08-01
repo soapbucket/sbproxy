@@ -1,5 +1,7 @@
 # Docker Compose Setup
-*Last modified: 2026-07-20*
+*Last modified: 2026-07-31*
+
+> **This is not the install path.** This directory is a development stack that builds SBproxy from source so you can hack on the proxy with a full observability pipeline around it. To run SBproxy itself, pull the published image instead (`docker pull soapbucket/sbproxy:latest`) and follow the [install guide](../docs/manual.md).
 
 This directory contains a Docker Compose stack for running SBproxy locally with a full observability pipeline. The stack includes:
 

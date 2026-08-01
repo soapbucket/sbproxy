@@ -2,7 +2,17 @@
 //!
 //! This module owns the common safety boundary shared by every external
 //! guardrail: configuration validation, SSRF-safe outbound clients, bounded
-//! response reads, fail-mode handling, and closed-cardinality telemetry.
+//! response reads, failure-posture handling, and closed-cardinality
+//! telemetry.
+//!
+//! Two independent axes govern what a guardrail does, and they are kept
+//! apart on purpose. `mode` carries the enforcement axis: `logging_only`
+//! records a verdict and never refuses. `failure_posture` (legacy
+//! spelling: `fail_open`) carries the failure axis: what happens when the
+//! provider could not be reached at all. Read them through
+//! [`ExternalGuardrailConfig::enforcement`] and
+//! `ExternalGuardrailConfig::failure_posture()` rather than off the raw
+//! fields.
 
 #![allow(missing_docs)]
 
@@ -28,6 +38,15 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::ai_metrics::record_external_guardrail_verdict;
+
+/// The two shared posture vocabularies, re-exported here so a caller of
+/// this module never has to reach into the config crate to name one.
+///
+/// They are different axes and this module is where that shows up most
+/// plainly. [`EnforcementMode`] answers "the provider answered and it
+/// said block, now what"; [`FailureMode`] answers "the provider never
+/// answered at all, now what".
+pub use sbproxy_config::{EnforcementMode, FailureMode};
 
 pub const MAX_GUARDRAIL_RESPONSE_BYTES: usize = 64 * 1024;
 
@@ -106,6 +125,23 @@ impl GuardrailMode {
     pub fn blocks(self) -> bool {
         !matches!(self, Self::LoggingOnly)
     }
+
+    /// This mode's enforcement posture in the shared vocabulary.
+    ///
+    /// `mode` picks *when* a guardrail runs and, in the `logging_only`
+    /// case, also says it must never refuse. That second half is the
+    /// enforcement axis, which is a different question from the failure
+    /// axis carried by `ExternalGuardrailConfig::failure_posture()`:
+    /// `logging_only` is an [`EnforcementMode::Observe`] posture because
+    /// the provider still runs and still records a verdict, it just
+    /// never blocks on one.
+    pub fn enforcement(self) -> EnforcementMode {
+        if self.blocks() {
+            EnforcementMode::Block
+        } else {
+            EnforcementMode::Observe
+        }
+    }
 }
 
 /// Provider contracts supported by the external guardrail configuration.
@@ -162,8 +198,47 @@ pub struct ExternalGuardrailConfig {
     #[serde(default)]
     pub default_on: bool,
     /// Allow traffic when this provider cannot be reached or returns an invalid response.
+    ///
+    /// Legacy spelling of the failure axis, kept because existing
+    /// configurations use it. It still parses and still means exactly
+    /// what it always did: `true` is [`FailureMode::Open`], `false` (and
+    /// an omitted key) is [`FailureMode::Closed`]. Prefer
+    /// `failure_posture`, because a boolean has no way to say
+    /// `degraded`, which is what an admitted-but-unscanned request
+    /// actually is.
+    ///
+    /// Never read this field directly; read
+    /// `ExternalGuardrailConfig::failure_posture()`, which resolves the
+    /// two spellings in one place. Setting both to values that disagree
+    /// is a config-load error.
     #[serde(default)]
-    pub fail_open: bool,
+    pub fail_open: Option<bool>,
+    /// Failure posture: what this guardrail does when its provider
+    /// cannot be reached, answers with a non-success status, is too
+    /// slow, or returns something that is not a verdict.
+    ///
+    /// This is the failure axis only. The enforcement axis lives in
+    /// `mode`: `logging_only` never refuses anything even when the
+    /// provider answers and says block. The two are independent, so a
+    /// guardrail can be rolled out in `mode: logging_only` while still
+    /// declaring `failure_posture: closed` for the day it starts
+    /// enforcing.
+    ///
+    /// - `closed` refuses the request. The default, and the right
+    ///   choice for a guardrail that is actually protecting something.
+    /// - `open` admits the request and claims nothing.
+    /// - `degraded` admits the request while recording that it was
+    ///   never scanned. Prefer this over `open`: the behavior is the
+    ///   same, and it is the truthful description of what happened.
+    /// - `observe` is rejected here. There is no verdict to
+    ///   shadow-record when the provider never answered; the
+    ///   observe-shaped posture for this site is `mode: logging_only`,
+    ///   on the other axis.
+    ///
+    /// When absent, the posture comes from the legacy `fail_open`
+    /// boolean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_posture: Option<FailureMode>,
     /// Per-request provider deadline in milliseconds, from 1 through 30000.
     #[serde(default = "default_timeout_ms")]
     #[schemars(range(min = 1, max = 30_000))]
@@ -242,6 +317,7 @@ impl std::fmt::Debug for ExternalGuardrailConfig {
             .field("mode", &self.mode)
             .field("default_on", &self.default_on)
             .field("fail_open", &self.fail_open)
+            .field("failure_posture", &self.failure_posture)
             .field("timeout_ms", &self.timeout_ms)
             .field("provider", &self.provider)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
@@ -448,11 +524,65 @@ impl CompiledGuardrailProvider {
 }
 
 impl ExternalGuardrailConfig {
+    /// This guardrail's failure posture in the shared vocabulary.
+    ///
+    /// The one place the two spellings are resolved. An explicit
+    /// `failure_posture` wins; otherwise the legacy `fail_open` boolean
+    /// is converted, with an absent key meaning `false`, which is
+    /// [`FailureMode::Closed`]. Request-path code reads this and never
+    /// the raw fields, so the polarity conversion exists once instead of
+    /// at every site that cares.
+    pub fn failure_posture(&self) -> FailureMode {
+        match self.failure_posture {
+            Some(posture) => posture,
+            None => FailureMode::from_fail_open(self.fail_open.unwrap_or(false)),
+        }
+    }
+
+    /// This guardrail's enforcement posture in the shared vocabulary.
+    ///
+    /// Derived from `mode`, and deliberately separate from
+    /// `Self::failure_posture()`. See [`GuardrailMode::enforcement`].
+    pub fn enforcement(&self) -> EnforcementMode {
+        self.mode.enforcement()
+    }
+
+    /// Reject a failure axis that says two things at once, or that says
+    /// something meaningless for this site.
+    fn validate_failure_posture(&self) -> Result<()> {
+        let Some(posture) = self.failure_posture else {
+            return Ok(());
+        };
+        if matches!(posture, FailureMode::Observe) {
+            bail!(
+                "failure_posture: observe is not meaningful on an external guardrail. The \
+                 failure axis applies when the provider could not be reached, so there is no \
+                 verdict to shadow-record. To roll this guardrail out without letting it \
+                 refuse anything, set the enforcement axis instead (mode: logging_only), and \
+                 pick closed, open, or degraded here"
+            );
+        }
+        if let Some(fail_open) = self.fail_open {
+            let legacy = FailureMode::from_fail_open(fail_open);
+            if legacy != posture {
+                let legacy_label = legacy.as_label();
+                let posture_label = posture.as_label();
+                bail!(
+                    "fail_open: {fail_open} and failure_posture: {posture_label} disagree on \
+                     this external guardrail; fail_open: {fail_open} means failure_posture: \
+                     {legacy_label}. Remove fail_open and keep failure_posture"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Validate the wire document and compile its provider contract.
     pub fn validate(&self) -> Result<CompiledGuardrailProvider> {
         if self.name.trim().is_empty() {
             bail!("name must not be empty");
         }
+        self.validate_failure_posture()?;
         if !(1..=30_000).contains(&self.timeout_ms) {
             bail!("timeout_ms must be between 1 and 30000");
         }
@@ -787,18 +917,18 @@ pub enum GuardrailCallError {
     InvalidVerdict,
 }
 
-/// Call an external guardrail. A transport or parse error is mapped through
-/// the configured fail mode exactly once here.
-pub async fn check_external_guardrail(
-    config: &ExternalGuardrailConfig,
-    request: ExternalGuardrailRequest<'_>,
-) -> GuardrailVerdict {
-    let started = std::time::Instant::now();
-    let result = dispatch(config, request).await;
-    let (verdict, outcome) = match result {
-        Ok(verdict) if verdict.allowed => (verdict, "allow"),
-        Ok(verdict) => (verdict, "block"),
-        Err(_) if config.fail_open => (
+/// The verdict and metric outcome for a provider that could not be
+/// reached, was too slow, or did not return a verdict.
+///
+/// Split out so the failure axis is interpreted in exactly one place.
+/// Both admitting postures record `fail_open`, because that is the
+/// bounded outcome vocabulary
+/// `sbproxy_ai_external_guardrail_verdicts_total` already publishes; the
+/// log line carries the posture itself, so `open` and `degraded` stay
+/// distinguishable there.
+fn unavailable_verdict(posture: FailureMode) -> (GuardrailVerdict, &'static str) {
+    match posture {
+        FailureMode::Open => (
             GuardrailVerdict {
                 allowed: true,
                 reason: Some("external guardrail unavailable; fail-open".to_string()),
@@ -806,7 +936,19 @@ pub async fn check_external_guardrail(
             },
             "fail_open",
         ),
-        Err(_) => (
+        FailureMode::Degraded => (
+            GuardrailVerdict {
+                allowed: true,
+                reason: Some("external guardrail unavailable; content was not scanned".to_string()),
+                ..GuardrailVerdict::default()
+            },
+            "fail_open",
+        ),
+        // `observe` cannot reach here from a loaded configuration:
+        // `ExternalGuardrailConfig::validate` rejects it. A hand-built
+        // config that skipped validation gets the safe posture rather
+        // than an invented behavior.
+        FailureMode::Closed | FailureMode::Observe => (
             GuardrailVerdict {
                 allowed: false,
                 reason: Some("external guardrail unavailable; fail-closed".to_string()),
@@ -814,9 +956,25 @@ pub async fn check_external_guardrail(
             },
             "fail_closed",
         ),
+    }
+}
+
+/// Call an external guardrail. A transport or parse error is mapped through
+/// the configured failure posture exactly once here.
+pub async fn check_external_guardrail(
+    config: &ExternalGuardrailConfig,
+    request: ExternalGuardrailRequest<'_>,
+) -> GuardrailVerdict {
+    let started = std::time::Instant::now();
+    let posture = config.failure_posture();
+    let result = dispatch(config, request).await;
+    let (verdict, outcome) = match result {
+        Ok(verdict) if verdict.allowed => (verdict, "allow"),
+        Ok(verdict) => (verdict, "block"),
+        Err(_) => unavailable_verdict(posture),
     };
     record_external_guardrail_verdict(config.provider.as_str(), request.phase.as_str(), outcome);
-    tracing::debug!(guardrail = %config.name, provider = config.provider.as_str(), phase = request.phase.as_str(), latency_ms = started.elapsed().as_millis() as u64, categories = ?verdict.categories, outcome, "external guardrail evaluated");
+    tracing::debug!(guardrail = %config.name, provider = config.provider.as_str(), phase = request.phase.as_str(), latency_ms = started.elapsed().as_millis() as u64, categories = ?verdict.categories, enforcement = config.enforcement().as_label(), posture = posture.as_label(), outcome, "external guardrail evaluated");
     verdict
 }
 
@@ -1037,18 +1195,21 @@ pub async fn run_output_external_guardrails(
     run_external_guardrails(configs, content, model, GuardrailPhase::Output).await
 }
 
-/// Apply input guardrail fail modes when request content is unavailable.
+/// Apply input guardrail failure postures when request content is
+/// unavailable.
 pub fn run_input_external_guardrails_without_content(
     configs: &[ExternalGuardrailConfig],
 ) -> Option<(String, String)> {
     run_external_guardrails_without_content(configs, GuardrailPhase::Input)
 }
 
-/// Apply output guardrail fail modes when the upstream response cannot be
-/// represented as text. The raw bytes are deliberately not converted or sent
-/// to an external service: logging-only and fail-open entries record a
-/// fail-open verdict, while the first enforcing fail-closed entry blocks with
-/// a fixed operator-safe reason.
+/// Apply output guardrail failure postures when the upstream response
+/// cannot be represented as text. The raw bytes are deliberately not
+/// converted or sent to an external service. A guardrail that does not
+/// enforce (`mode: logging_only`) records the skip and admits whatever its
+/// failure posture says, and so does one whose posture admits (`open` or
+/// `degraded`); the first entry that both enforces and fails closed blocks
+/// with a fixed operator-safe reason.
 pub fn run_output_external_guardrails_without_content(
     configs: &[ExternalGuardrailConfig],
 ) -> Option<(String, String)> {
@@ -1073,13 +1234,25 @@ fn run_external_guardrails_without_content(
             continue;
         }
 
-        let blocks = config.mode.blocks() && !config.fail_open;
+        // Two axes, and this is the one line in the request path that
+        // needs both. `enforcement` is what this guardrail does when it
+        // reaches a verdict: `logging_only` never refuses, whatever the
+        // provider says. `posture` is what it does when it cannot reach
+        // one at all, which is the case here because there is no text to
+        // send. Only a guardrail that both enforces and refuses on
+        // failure can block. Spelling them apart is what stops the two
+        // from being read as one knob.
+        let enforcement = config.enforcement();
+        let posture = config.failure_posture();
+        let blocks = enforcement.blocks() && !posture.admits();
         let outcome = if blocks { "fail_closed" } else { "fail_open" };
         record_external_guardrail_verdict(config.provider.as_str(), phase.as_str(), outcome);
         tracing::debug!(
             guardrail = %config.name,
             provider = config.provider.as_str(),
             phase = phase.as_str(),
+            enforcement = enforcement.as_label(),
+            posture = posture.as_label(),
             outcome,
             "external guardrail skipped because content is unavailable"
         );
@@ -1489,6 +1662,161 @@ mod tests {
             "fail_open": fail_open
         }))
         .unwrap()
+    }
+
+    /// The same fixture spelled on the new axis, so the two-axis tests
+    /// can set enforcement and failure independently.
+    fn unavailable_posture_config(mode: &str, posture: &str) -> ExternalGuardrailConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": "posture-policy",
+            "url": "https://8.8.8.8/check",
+            "mode": mode,
+            "default_on": true,
+            "failure_posture": posture
+        }))
+        .unwrap()
+    }
+
+    fn guardrail_document(extra: serde_json::Value) -> ExternalGuardrailConfig {
+        let mut document = serde_json::json!({
+            "name": "custom",
+            "url": "https://8.8.8.8/check",
+            "mode": "pre_call"
+        });
+        document
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(document).unwrap()
+    }
+
+    #[test]
+    fn legacy_fail_open_boolean_still_selects_the_posture() {
+        // An absent key, an explicit false, and an explicit true keep
+        // the exact meanings they had before `failure_posture` existed.
+        let absent = guardrail_document(serde_json::json!({}));
+        assert_eq!(absent.fail_open, None);
+        assert_eq!(absent.failure_posture(), FailureMode::Closed);
+        assert!(absent.validate().is_ok());
+
+        let closed = guardrail_document(serde_json::json!({"fail_open": false}));
+        assert_eq!(closed.failure_posture(), FailureMode::Closed);
+        assert!(closed.validate().is_ok());
+
+        let open = guardrail_document(serde_json::json!({"fail_open": true}));
+        assert_eq!(open.failure_posture(), FailureMode::Open);
+        assert!(open.validate().is_ok());
+    }
+
+    #[test]
+    fn explicit_failure_posture_overrides_the_legacy_boolean() {
+        for (posture, expected) in [
+            ("closed", FailureMode::Closed),
+            ("open", FailureMode::Open),
+            ("degraded", FailureMode::Degraded),
+        ] {
+            let config = guardrail_document(serde_json::json!({"failure_posture": posture}));
+            assert_eq!(config.failure_posture(), expected, "{posture}");
+            config.validate().expect("posture alone is valid");
+        }
+
+        // Precedence: the explicit posture wins over a legacy boolean
+        // that agrees with it, and the legacy field is still readable.
+        let document = serde_json::json!({"fail_open": true, "failure_posture": "open"});
+        let config = guardrail_document(document);
+        assert_eq!(config.fail_open, Some(true));
+        assert_eq!(config.failure_posture(), FailureMode::Open);
+        config
+            .validate()
+            .expect("a redundant but consistent pair stays valid");
+    }
+
+    #[test]
+    fn conflicting_fail_open_and_failure_posture_is_a_config_error() {
+        for (fail_open, posture) in [
+            (true, "closed"),
+            (true, "degraded"),
+            (false, "open"),
+            (false, "degraded"),
+        ] {
+            let document = serde_json::json!({"fail_open": fail_open, "failure_posture": posture});
+            let config = guardrail_document(document);
+            let error = config
+                .validate()
+                .expect_err("disagreeing spellings must fail at config load")
+                .to_string();
+            assert!(error.contains("external guardrail"), "{error}");
+            assert!(error.contains("fail_open"), "{error}");
+            assert!(error.contains("failure_posture"), "{error}");
+        }
+    }
+
+    #[test]
+    fn observe_is_rejected_on_the_failure_axis() {
+        let error = guardrail_document(serde_json::json!({"failure_posture": "observe"}))
+            .validate()
+            .expect_err("observe is meaningless when the provider never answered")
+            .to_string();
+        assert!(error.contains("external guardrail"), "{error}");
+        assert!(error.contains("logging_only"), "{error}");
+    }
+
+    #[test]
+    fn degraded_admits_and_is_labelled_apart_from_a_plain_open() {
+        let (open, open_outcome) = unavailable_verdict(FailureMode::Open);
+        let (degraded, degraded_outcome) = unavailable_verdict(FailureMode::Degraded);
+        let (closed, closed_outcome) = unavailable_verdict(FailureMode::Closed);
+
+        assert!(open.allowed && degraded.allowed && !closed.allowed);
+        assert_eq!(open_outcome, "fail_open");
+        assert_eq!(degraded_outcome, "fail_open");
+        assert_eq!(closed_outcome, "fail_closed");
+        assert_ne!(
+            open.reason, degraded.reason,
+            "degraded must not read as a plain open"
+        );
+        assert_eq!(
+            degraded.reason.as_deref(),
+            Some("external guardrail unavailable; content was not scanned")
+        );
+    }
+
+    #[test]
+    fn enforcement_and_failure_axes_are_independently_settable() {
+        // The point of the split: `mode` says whether a verdict can
+        // refuse, `failure_posture` says whether a missing verdict can.
+        // Only the guardrail that answers yes to both blocks here.
+        let _metric_lock = unavailable_content_metric_lock();
+        for (mode, posture, expected_block) in [
+            ("post_call", "closed", true),
+            ("post_call", "degraded", false),
+            ("logging_only", "closed", false),
+            ("logging_only", "degraded", false),
+        ] {
+            let config = unavailable_posture_config(mode, posture);
+            assert_eq!(config.enforcement().blocks(), mode != "logging_only");
+            assert_eq!(config.failure_posture().admits(), posture != "closed");
+
+            let blocked = run_output_external_guardrails_without_content(&[config]).is_some();
+            assert_eq!(
+                blocked, expected_block,
+                "mode={mode} failure_posture={posture}"
+            );
+        }
+    }
+
+    #[test]
+    fn posture_spelled_configs_match_their_legacy_boolean_equivalents() {
+        let _metric_lock = unavailable_content_metric_lock();
+        for (fail_open, posture) in [(false, "closed"), (true, "open")] {
+            let legacy = unavailable_output_config("post_call", fail_open);
+            let modern = unavailable_posture_config("post_call", posture);
+            assert_eq!(
+                run_output_external_guardrails_without_content(&[legacy]).is_some(),
+                run_output_external_guardrails_without_content(&[modern]).is_some(),
+                "fail_open={fail_open} vs {posture}"
+            );
+        }
     }
 
     fn unavailable_content_metric_lock() -> std::sync::MutexGuard<'static, ()> {

@@ -23,8 +23,20 @@ pub mod admin_compression;
 /// WOR-1553/1554: key + credential lifecycle REST API mounted on the
 /// admin server (`/admin/keys`, `/admin/credentials`).
 pub mod admin_keys;
+/// Attested-metering operator surface (`/api/meter/*`), WOR-2131: units
+/// with their provenance, the mesh coverage a total was assembled from,
+/// a cursor-paged window on the receipt chain, and chain verification.
+/// Every response says whether attestation is off, idle, or reporting
+/// before it says a number, because a page of zeros cannot tell those
+/// three apart.
+pub mod admin_meter;
 /// Model-host status admin API (`/admin/model-host/status`), WOR-1665.
 pub mod admin_model_host;
+/// Settlement status and the reconciliation trigger
+/// (`/admin/payments/*`), WOR-2100. Compiled unconditionally so the routes
+/// answer with a clear reason on a build without the `payments` feature
+/// rather than falling through to a bare 404.
+pub mod admin_payments;
 /// Admin chat playground: list configured AI endpoints and run a chat
 /// completion against any of them through the production AI dispatch
 /// path. Handled in the async admin connection handler.
@@ -42,6 +54,19 @@ pub mod admin_ui;
 pub mod agent_class;
 /// Boot wiring for the alert evaluation loop (dispatcher + engine + drain).
 pub mod alerting;
+/// Lowering `proxy.attestation` into the metering vocabulary the
+/// request path runs on: the resolved role, the two posture axes, the
+/// queue and ledger locations, and the operator's complete position on
+/// what they charge for.
+pub mod attestation;
+
+/// WOR-2100: runtime assembly for authoritative payment settlement.
+///
+/// Opens the durable settlement store, registers the rail adapters this
+/// build compiled, and owns the recovery worker's lifecycle. Feature-gated
+/// by `payments`, so a build without settlement carries none of it.
+#[cfg(feature = "payments")]
+pub mod billing_runtime;
 /// Empty-shell registry for built-in policy
 /// enforcer wrappers.
 ///
@@ -88,6 +113,7 @@ pub mod config_source;
 /// upstream authority, verify it, merge it over the base document, and
 /// apply it through the shared reload transaction.
 pub mod config_subscriber;
+pub mod content_capture;
 pub mod context;
 pub mod dispatch;
 /// Host capability diagnostics behind `sbproxy doctor`.
@@ -110,10 +136,25 @@ pub mod key_plane;
 pub mod key_policy;
 /// WOR-1562: mesh distributed-cache tier for the key plane.
 pub mod mesh_cache;
+/// WOR-2130: mesh-wide meter reporting. One receipt chain per node, and a
+/// scatter-gather that labels a total assembled from an incomplete set as
+/// exactly that. Deliberately not built on `cluster_metrics`; see the
+/// module docs for why receipts cannot use a live-view-retaining aggregator.
+pub mod meter_cluster;
+/// WOR-2145: the seam where a served request becomes a signed, chained
+/// receipt. Holds the chain, the sequencing lock that keeps a receipt's
+/// sequence equal to the entry carrying it, and the two phases the work is
+/// split across: a cheap preflight in `response_filter`, which is the only
+/// place a receipt failure can still refuse anything, and the receipt
+/// itself in `logging`, where the final status and byte counts are known.
+pub mod meter_runtime;
 /// WOR-1563: distributed per-key spend + rate counters via mesh CRDTs.
 pub mod model_discovery;
 /// Authenticated private model-plane dispatch primitives.
 pub mod model_plane;
+/// Signs payment requirements into the existing quote JWS.
+#[cfg(feature = "payments")]
+pub mod payment_signer;
 /// Managed-model runtime integration exposed for lifecycle adapters and
 /// black-box reload tests.
 #[doc(hidden)]
@@ -144,6 +185,10 @@ pub mod policy_dispatch;
 /// Re-exported here for admin/runtime compatibility; the implementation
 /// lives beside its policy config in `sbproxy-modules`.
 pub use sbproxy_modules::policy::rate_limit_budget;
+/// WOR-2098: route-scoped RAG runtimes built once per compiled pipeline,
+/// keyed by origin and optional forward rule. Feature-gated by `rag`.
+#[cfg(feature = "rag")]
+pub mod rag_runtime;
 pub(crate) mod rate_limit_cluster;
 pub mod reload;
 pub mod router;
@@ -153,6 +198,10 @@ pub mod router;
 /// into a typed `sb_flags::RequestFlags` struct that the request
 /// pipeline reads to alter behavior on the current request only.
 pub mod sb_flags;
+/// WOR-2099: per-action semantic caches built once per compiled pipeline,
+/// keyed by origin and optional forward rule. The `backend` field selects
+/// memory, Redis, or mesh at runtime; no Cargo feature gates the choice.
+pub mod semantic_cache_runtime;
 pub mod server;
 /// Synthetic-transaction probe driver. Background task that
 /// fires an in-process request through the compiled handler chain

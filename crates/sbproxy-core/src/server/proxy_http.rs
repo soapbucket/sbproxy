@@ -627,6 +627,43 @@ fn realtime_provider_credential(
     Some(RealtimeCredential { header, value })
 }
 
+fn realtime_native_provider_credential(
+    provider: &sbproxy_ai::ProviderConfig,
+    headers: &http::HeaderMap,
+    hints: &[sbproxy_config::types::ProviderHintConfig],
+    native_provider: &str,
+) -> Option<RealtimeCredential> {
+    if !provider.accepts_native_credential_for(native_provider) {
+        return None;
+    }
+    let api_key =
+        crate::inbound_key::resolve_native_provider_credential(headers, hints, native_provider)?;
+    let mut resolved_provider = provider.clone();
+    resolved_provider.api_key = Some(api_key.to_string());
+    realtime_provider_credential(&resolved_provider)
+}
+
+fn realtime_native_provider_credential_for_pipeline(
+    provider: &sbproxy_ai::ProviderConfig,
+    headers: &http::HeaderMap,
+    pipeline: &CompiledPipeline,
+    native_provider: &str,
+) -> Option<RealtimeCredential> {
+    let inbound = pipeline.inbound_key_config()?;
+    realtime_native_provider_credential(provider, headers, &inbound.provider_hints, native_provider)
+}
+
+fn realtime_inbound_carrier_names(ctx: &RequestContext) -> Vec<String> {
+    let mut headers = Vec::new();
+    if let Some(header) = ctx.inbound_key_header.as_ref() {
+        headers.push(header.clone());
+    }
+    if let Some(inbound) = ctx.pipeline.inbound_key_config() {
+        headers.extend(inbound.credential_carrier_names());
+    }
+    headers
+}
+
 fn choose_realtime_credential(
     bound: Option<RealtimeCredential>,
     provider: Option<RealtimeCredential>,
@@ -1294,15 +1331,11 @@ impl ProxyHttp for SbProxy {
         Self::CTX: Send + Sync,
     {
         let is_realtime = ctx.ai_realtime_dispatch.is_some();
-        let mut realtime_inbound_key_headers = Vec::new();
-        if is_realtime {
-            if let Some(header) = ctx.inbound_key_header.as_ref() {
-                realtime_inbound_key_headers.push(header.clone());
-            }
-            if let Some(plane) = crate::key_plane::current_key_plane() {
-                realtime_inbound_key_headers.extend(plane.inbound().header_names());
-            }
-        }
+        let realtime_inbound_key_headers = if is_realtime {
+            realtime_inbound_carrier_names(ctx)
+        } else {
+            Vec::new()
+        };
 
         // Collect header modifications into owned Vecs, then drop the pipeline
         // guard before calling Pingora's insert_header (requires 'static borrows).
@@ -1426,7 +1459,18 @@ impl ProxyHttp for SbProxy {
                         .providers
                         .iter()
                         .find(|provider| provider.name.as_str() == dispatch.provider_name)
-                        .and_then(realtime_provider_credential);
+                        .and_then(|provider| {
+                            if ctx.inbound_key_mode != crate::context::InboundKeyMode::Native {
+                                return realtime_provider_credential(provider);
+                            }
+                            let native_provider = ctx.native_key_provider.as_deref()?;
+                            realtime_native_provider_credential_for_pipeline(
+                                provider,
+                                &session.req_header().headers,
+                                &pipeline,
+                                native_provider,
+                            )
+                        });
                 }
 
                 // WOR-819: REST -> gRPC transcoding. When the resolved
@@ -1915,7 +1959,7 @@ impl ProxyHttp for SbProxy {
 
         let mut realtime_bound_auth: Option<RealtimeCredential> = None;
         if let Some(credential_id) = bound_credential_id {
-            let Some(plane) = crate::key_plane::current_key_plane() else {
+            let Some(plane) = ctx.pipeline.key_plane().cloned() else {
                 warn!(
                     credential_id = %credential_id,
                     "a key binds a credential but no key plane is installed"
@@ -1966,7 +2010,9 @@ impl ProxyHttp for SbProxy {
                     ));
                 }
             }
-        } else if let Some(cred_cfg) = outbound_cred.as_ref().filter(|_| !is_realtime) {
+        } else if let Some(cred_cfg) = outbound_cred.as_ref().filter(|_| {
+            !is_realtime && ctx.inbound_key_mode != crate::context::InboundKeyMode::Native
+        }) {
             let inbound_bearer: Option<String> = session
                 .req_header()
                 .headers
@@ -2064,7 +2110,7 @@ impl ProxyHttp for SbProxy {
 
         // Apply Lua script request modifiers
         for script in &lua_scripts {
-            match lua_request_modifier(script, session.req_header(), &ctx.hostname) {
+            match lua_request_modifier(script, session.req_header(), ctx) {
                 Ok(headers_to_set) => {
                     for (key, value) in headers_to_set {
                         let _ = upstream_request.insert_header(key, &value);
@@ -2401,6 +2447,15 @@ impl ProxyHttp for SbProxy {
         // Set unconditionally because a single request only enters
         // this hook once per upstream response.
         ctx.upstream_first_byte_at = Some(std::time::Instant::now());
+
+        // WOR-2145: snapshot the response headers the attestation config
+        // meters, before this hook starts rewriting headers of its own.
+        // The evidence on a receipt has to be what the origin actually
+        // sent: a value read after the proxy edited it would be the
+        // proxy quoting itself and calling it the upstream's claim.
+        // A no-op unless this origin writes receipts and declares
+        // origin-header rules.
+        crate::meter_runtime::capture_origin_headers(ctx, upstream_response);
 
         // --- WOR-808: RSL `Link: rel="license"` discovery header ---
         //
@@ -3493,6 +3548,43 @@ impl ProxyHttp for SbProxy {
             }
         }
 
+        // --- WOR-2145: refuse rather than serve work we cannot bill ---
+        //
+        // This is the last point at which the meter can refuse anything.
+        // The receipt itself is cut in `logging`, which runs after the
+        // response has been written and cannot recall a single byte, so
+        // `failure_mode: closed` has to make its decision here, on the
+        // strength of whether the chain is writable at all.
+        //
+        // Rewriting the status is not enough on its own. The body is
+        // suppressed in `response_body_filter` through `meter_refused`,
+        // because a 503 delivered with the upstream's body attached
+        // hands the buyer exactly the value the seller has just declared
+        // itself unable to record.
+        //
+        // Only `closed` reaches this branch. `degraded`, `open`, and
+        // `observe` all admit, and each leaves its own kind of trace
+        // when the receipt is cut.
+        if crate::meter_runtime::preflight_refuses(ctx) {
+            ctx.meter_refused = true;
+            ctx.response_status = Some(503);
+            upstream_response
+                .set_status(http::StatusCode::SERVICE_UNAVAILABLE)
+                .ok();
+            // A suppressed body is an empty body, and it has to say so.
+            // Leaving the upstream's framing in place would advertise
+            // bytes that are never sent and hang the client waiting for
+            // them.
+            upstream_response.remove_header("content-encoding");
+            upstream_response.remove_header("transfer-encoding");
+            let _ = upstream_response.insert_header("content-length", "0");
+            tracing::warn!(
+                tenant_id = %ctx.tenant_id,
+                host = %ctx.hostname,
+                "attestation: refusing under failure_mode closed; the receipt chain is not writable"
+            );
+        }
+
         // Phase-timing capture: snapshot the moment response_filter
         // returns. Paired with `ctx.upstream_first_byte_at` (set at
         // the top of this hook), this is the response-filter phase
@@ -3889,6 +3981,46 @@ impl ProxyHttp for SbProxy {
                 let mut graphql_content_digest_body = None;
                 let mut graphql_content_digest_body_taken = false;
                 let content_digest_uses_graphql_original = ctx.graphql_validation_pending;
+                // WOR-2118: parse the agent-to-agent envelope once,
+                // before the policy loop, so the `a2a` arm and the
+                // prompt-injection arm read one structure rather than
+                // each re-parsing the body. `ctx.a2a` is the envelope
+                // the A2A enforcer resolved, which is not the same as
+                // the one header detection stamped: it also carries the
+                // operator's `route_glob` match and the verified `act`
+                // chain overlay.
+                //
+                // The identifiers are cloned rather than borrowed
+                // because the loop below mutates `ctx`, and they are
+                // cloned only when the body actually parsed as A2A so a
+                // plain validated POST pays nothing for this.
+                let a2a_ctx = ctx.a2a.clone();
+                let a2a_v1 = a2a_ctx
+                    .as_ref()
+                    .filter(|c| c.spec == sbproxy_modules::A2ASpec::V1_0)
+                    .and_then(|_| sbproxy_modules::a2a_v1::parse_request(&collected));
+                let a2a_idents = a2a_v1.as_ref().map(|_| {
+                    (
+                        ctx.hostname.to_string(),
+                        ctx.request_id.to_string(),
+                        ctx.tenant_id.to_string(),
+                    )
+                });
+                // WOR-2139: capture the run correlation id off the same
+                // parse. `params.contextId` groups every hop of one
+                // multi-agent run, and this is the first phase where it
+                // exists: the request filter builds the A2A envelope
+                // from headers, which do not carry it. Stamped on the
+                // context so the terminal surfaces (access log, and any
+                // span opened later in the request) all read one bounded
+                // value. Nothing is added to the upstream request here,
+                // because `upstream_request_filter` already ran.
+                if let Some(context_id) = a2a_v1
+                    .as_ref()
+                    .and_then(crate::server::a2a_body_phase::run_context_id)
+                {
+                    ctx.a2a_context_id = Some(context_id);
+                }
                 if let Some(origin_idx) = ctx.origin_idx {
                     if let Some(policies) = pipeline.policies.get(origin_idx) {
                         for policy in policies {
@@ -4027,7 +4159,80 @@ impl ProxyHttp for SbProxy {
                                         | OpenApiValidationResult::OutOfScope => {}
                                     }
                                 }
+                                Policy::A2A(p) => {
+                                    // WOR-2118: the A2A 1.0
+                                    // push-notification SSRF check. It
+                                    // runs here rather than in the
+                                    // request filter because the
+                                    // enforcer's request snapshot always
+                                    // carries an empty body, so the
+                                    // check was gated on a condition
+                                    // that could never hold and never
+                                    // fired once. The buffered body is
+                                    // the first place the registration
+                                    // is actually visible.
+                                    let (Some(a2a), Some(parsed), Some((route, _, _))) =
+                                        (a2a_ctx.as_ref(), a2a_v1.as_ref(), a2a_idents.as_ref())
+                                    else {
+                                        continue;
+                                    };
+                                    if let Some(rejection) =
+                                        crate::server::a2a_body_phase::check_push_notification(
+                                            p,
+                                            route,
+                                            a2a.spec.as_label(),
+                                            a2a.identity_verified,
+                                            parsed,
+                                        )
+                                    {
+                                        ctx.a2a_denial_body = Some(rejection.body.clone());
+                                        ctx.deny_policy_type = Some(rejection.deny_policy_type);
+                                        failed = Some((
+                                            rejection.status,
+                                            rejection.body,
+                                            rejection.content_type,
+                                        ));
+                                        break;
+                                    }
+                                }
                                 Policy::PromptInjectionV2(p) => {
+                                    // WOR-2118: an agent-to-agent hop
+                                    // goes through the structured seam,
+                                    // which scores each message part on
+                                    // its own and picks the action from
+                                    // the hop's delegation depth. The
+                                    // generic path below fuses the whole
+                                    // JSON-RPC envelope into one string,
+                                    // which is what that seam exists to
+                                    // stop doing.
+                                    if let (
+                                        Some(a2a),
+                                        Some(parsed),
+                                        Some((route, request_id, tenant_id)),
+                                    ) = (a2a_ctx.as_ref(), a2a_v1.as_ref(), a2a_idents.as_ref())
+                                    {
+                                        let audit = sbproxy_modules::BodyAwareAuditContext {
+                                            hostname: route.as_str(),
+                                            request_id: Some(request_id.as_str()),
+                                            tenant_id: Some(tenant_id.as_str()),
+                                            virtual_key_id: None,
+                                            policy_version: None,
+                                        };
+                                        if let Some(rejection) =
+                                            crate::server::a2a_body_phase::scan_message_parts(
+                                                p, route, a2a, parsed, &collected, audit,
+                                            )
+                                        {
+                                            ctx.deny_policy_type = Some(rejection.deny_policy_type);
+                                            failed = Some((
+                                                rejection.status,
+                                                rejection.body,
+                                                rejection.content_type,
+                                            ));
+                                            break;
+                                        }
+                                        continue;
+                                    }
                                     // WOR-801: body-aware scan. The URI +
                                     // headers were scanned synchronously by
                                     // the request_filter enforcer; here we
@@ -4308,6 +4513,18 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // WOR-2145: the meter refused this response in `response_filter`
+        // under `failure_mode: closed`. Drop every chunk so the buyer
+        // receives none of the work the proxy cannot record.
+        //
+        // Ahead of the byte accounting below on purpose. `bytes_out` is
+        // the evidence behind a measured unit, so it has to be what
+        // actually crossed the wire and not what the upstream offered.
+        if ctx.meter_refused {
+            *body = None;
+            return Ok(None);
+        }
+
         // Track outbound body bytes for the access log. Counts what
         // the client receives, including transformed / fallback /
         // cached bodies, since those are what downstream egress
@@ -5401,6 +5618,18 @@ impl ProxyHttp for SbProxy {
                 ctx.tenant_id.as_str(),
                 ctx.principal.api_key_id(),
                 &ctx.rollup_properties,
+                // WOR-2140: the realtime surface bills like any other, so
+                // it carries the same agent identity. `billable_id` still
+                // refuses an unverified name, so this cannot become a way
+                // to spend against an agent's budget over a websocket.
+                sbproxy_ai::budget::AgentIdentity {
+                    id: ctx
+                        .a2a
+                        .as_ref()
+                        .map(|a2a| sbproxy_ai::tracing_spans::cap_agent_id(&a2a.caller_agent_id))
+                        .filter(|id| !id.is_empty()),
+                    verified: ctx.a2a.as_ref().is_some_and(|a2a| a2a.identity_verified),
+                },
                 &span,
             );
             info!(
@@ -5437,6 +5666,34 @@ impl ProxyHttp for SbProxy {
         // store (no-op unless the origin uses outcome-aware routing).
         record_routing_feedback(ctx);
 
+        // WOR-2145: cut the attested consumption receipt.
+        //
+        // Here rather than in `response_filter` because this is the
+        // first point at which the facts a receipt states are all
+        // final: the status after every override, the bytes that
+        // actually crossed the wire, and whether the client stayed to
+        // receive them. Metering off the response header would bill
+        // intent rather than delivery.
+        //
+        // A downstream error source is the client going away. That is a
+        // different commercial event from the origin failing, and the
+        // outcome table prices the two separately, so the distinction
+        // is carried rather than flattened into "something went wrong".
+        //
+        // No-op unless this origin's resolved role writes receipts.
+        {
+            let client_disconnected =
+                e.is_some_and(|error| *error.esource() == pingora_error::ErrorSource::Downstream);
+            let path = session.req_header().uri.path().to_string();
+            crate::meter_runtime::record_response(
+                ctx,
+                &method,
+                &path,
+                status_u16,
+                client_disconnected,
+            );
+        }
+
         // --- Wave 3 / G1.6 wire: per-agent labels on the hot path ---
         //
         // Read the agent dimensions out of the request context that
@@ -5465,6 +5722,15 @@ impl ProxyHttp for SbProxy {
             ctx.request_body_bytes,
             ctx.response_body_bytes,
             agent_labels,
+        );
+        // WOR-2093: one canonical id for the metric, the ring row below,
+        // the access log, and spans.
+        let accountable_key_id = ctx.accountable_key_id().map(str::to_string);
+        sbproxy_observe::metrics::record_inbound_key_request(
+            ctx.native_key_provider.as_deref(),
+            ctx.inbound_key_mode.as_str(),
+            ctx.tenant_id.as_str(),
+            accountable_key_id.as_deref(),
         );
 
         // WOR-1718: mirror the completed request into the admin request-log
@@ -5508,6 +5774,21 @@ impl ProxyHttp for SbProxy {
                 cost_usd_micros: ctx.ai_cost_usd_micros,
                 guardrail_category: ctx.ai_guardrail_category.clone(),
                 guardrail_action: ctx.ai_guardrail_action.clone(),
+                // WOR-2093: key accountability columns, from the same
+                // canonical derivation as the metric emitted above.
+                api_key_id: accountable_key_id,
+                key_mode: ctx.inbound_key_mode.as_str().to_string(),
+                key_provider: ctx.native_key_provider.clone(),
+                tenant_id: ctx.tenant_id.to_string(),
+                user_id: ctx.user_id.clone(),
+                // WOR-2094: explainability columns; every row names the
+                // config and policy generations that governed it and why
+                // the gateway acted.
+                error_class: super::access_log::classify_error_class(status_u16),
+                config_revision: ctx.pipeline.config_revision.clone(),
+                policy_version: ctx.ai_policy_version.clone(),
+                policy_decisions: ctx.policy_decisions.clone(),
+                deny_reason: ctx.deny_reason.clone(),
             });
         }
 
@@ -5625,6 +5906,12 @@ impl ProxyHttp for SbProxy {
                         team: ctx.attribution_tags.team.clone().unwrap_or_default(),
                         api_key_id: ctx.principal.api_key_id().to_string(),
                         project: ctx.attribution_tags.project.clone().unwrap_or_default(),
+                        // WOR-2140: same source as the usage path and the
+                        // `agent_id` metric label. `attribution_tags` only
+                        // carries an agent the proxy verified, so an
+                        // unverified caller rolls up unattributed rather
+                        // than under a name it chose for itself.
+                        agent_id: ctx.attribution_tags.agent_id.clone().unwrap_or_default(),
                         properties: ctx.rollup_properties.clone(),
                     },
                     kind: sbproxy_observe::usage_rollup::RollupKind::Outcome(
@@ -5980,6 +6267,127 @@ mod tests {
         let provider_auth = realtime_provider_credential(&provider);
         assert!(provider_auth.is_none(), "blank API keys are unavailable");
         assert!(choose_realtime_credential(None, provider_auth).is_err());
+    }
+
+    #[test]
+    fn realtime_native_credential_requires_exact_destination_binding() {
+        let unbound: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "primary",
+            "provider_type": "openai",
+            "api_key": "operator-key-must-not-be-billed"
+        }))
+        .unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer sk-caller-owned-canary"),
+        );
+        let inbound = sbproxy_config::types::KeyInboundConfig::default();
+
+        assert!(
+            realtime_native_provider_credential(
+                &unbound,
+                &headers,
+                &inbound.provider_hints,
+                "openai",
+            )
+            .is_none(),
+            "wire format alone must not authorize caller-secret forwarding"
+        );
+
+        let bound: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "primary",
+            "provider_type": "openai",
+            "api_key": "operator-key-must-not-be-billed",
+            "accept_native_credentials_for": "openai"
+        }))
+        .unwrap();
+        let credential = realtime_native_provider_credential(
+            &bound,
+            &headers,
+            &inbound.provider_hints,
+            "openai",
+        )
+        .expect("matching caller credential");
+        assert_eq!(credential.header, "Authorization");
+        assert_eq!(credential.value, "Bearer sk-caller-owned-canary");
+        assert!(!credential.value.contains("operator-key-must-not-be-billed"));
+        assert!(realtime_native_provider_credential(
+            &bound,
+            &headers,
+            &inbound.provider_hints,
+            "anthropic",
+        )
+        .is_none());
+    }
+
+    fn realtime_pipeline_with_provider_hint(
+        header: &str,
+        value_prefix: &str,
+    ) -> std::sync::Arc<CompiledPipeline> {
+        let mut config = sbproxy_config::CompiledConfig::default();
+        let mut key_management = sbproxy_config::KeyManagementConfig::default();
+        key_management.inbound.headers.clear();
+        key_management.inbound.provider_hints = vec![sbproxy_config::ProviderHintConfig {
+            provider: "openai".to_string(),
+            header: header.to_string(),
+            scheme: String::new(),
+            value_prefix: value_prefix.to_string(),
+            also_header: None,
+        }];
+        config.server.key_management = Some(key_management);
+        std::sync::Arc::new(
+            CompiledPipeline::from_config_for_validation(config)
+                .expect("compile realtime pipeline"),
+        )
+    }
+
+    #[test]
+    fn realtime_carriers_and_provider_hints_stay_pinned_across_reload() {
+        let old_pipeline =
+            realtime_pipeline_with_provider_hint("x-native-carrier-a", "old-caller-");
+        let new_pipeline =
+            realtime_pipeline_with_provider_hint("x-native-carrier-b", "new-caller-");
+        let old_ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&old_pipeline),
+            ..RequestContext::default()
+        };
+
+        let carriers = realtime_inbound_carrier_names(&old_ctx);
+        assert!(carriers.iter().any(|name| name == "x-native-carrier-a"));
+        assert!(!carriers.iter().any(|name| name == "x-native-carrier-b"));
+
+        let provider: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "primary",
+            "provider_type": "openai",
+            "api_key": "operator-key-must-not-be-billed",
+            "accept_native_credentials_for": "openai"
+        }))
+        .unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-native-carrier-a",
+            http::HeaderValue::from_static("old-caller-credential"),
+        );
+
+        let credential = realtime_native_provider_credential_for_pipeline(
+            &provider,
+            &headers,
+            &old_pipeline,
+            "openai",
+        )
+        .expect("old pipeline resolves its own provider hint");
+        assert_eq!(credential.value, "Bearer old-caller-credential");
+        assert!(
+            realtime_native_provider_credential_for_pipeline(
+                &provider,
+                &headers,
+                &new_pipeline,
+                "openai",
+            )
+            .is_none(),
+            "new pipeline hints must not change an old request"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-01*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -30,6 +30,10 @@ SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI m
 - [getting-started-sovereign-multicloud.md](getting-started-sovereign-multicloud.md) - use Kubernetes, sidecars, and secret backends.
 - [use-case-own-openrouter.md](use-case-own-openrouter.md) - run a provider gateway on your own credentials.
 - [use-case-coding-assistant.md](use-case-coding-assistant.md) - point a coding assistant at a local model.
+- [use-case-connect-codex.md](use-case-connect-codex.md) - connect Codex CLI to a governed gateway.
+- [use-case-connect-cursor.md](use-case-connect-cursor.md) - connect Cursor to a governed gateway.
+- [use-case-connect-cline.md](use-case-connect-cline.md) - connect Cline to a governed gateway.
+- [use-case-connect-copilot.md](use-case-connect-copilot.md) - connect GitHub Copilot BYOK to a governed gateway.
 - [use-case-production-ops.md](use-case-production-ops.md) - move from a laptop deployment to operational ownership.
 
 ## Route AI, APIs, and tools
@@ -56,6 +60,7 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [ai-predictive-budget.md](ai-predictive-budget.md) - predictive budgets with soft-landing: warn, then downgrade, then block as a scope approaches its cap.
 - [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md) - classify upstream failures (timeout, rate-limit, context-window, content-policy) and set per-error retry counts.
 - [ai-context-compression.md](ai-context-compression.md) - selectable compression profiles, explicit input budgets, Redis summary state, value accounting, evaluation, metrics, and logs.
+- [rag.md](rag.md) - SBproxy in front of a RAG pipeline: gateway-side retrieval from five vector stores, plus marked-context governance, guardrails, and metering.
 - [local-inference.md](local-inference.md) - run embeddings (semantic cache) and prompt-injection classify on local ONNX models via the sidecar or in-process.
 - [ai-lb-benchmark.md](ai-lb-benchmark.md) - P50/P95/P99/P99.9 latency comparison across AI router strategies under skewed load.
 - [providers.md](providers.md) - the catalog of supported LLM providers.
@@ -64,22 +69,23 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [mcp.md](mcp.md) - the MCP gateway: wire shape, capabilities, and `experimental.agentSkillsUrl` advertising.
 - [mcp-archestra-guardrails.md](mcp-archestra-guardrails.md) - Archestra-derived MCP guardrails: egress, session risk, quarantine, stdio, run-as-user, and compaction.
 - [tool-versioning.md](tool-versioning.md) - the rollout plane (publish several versions of one tool, resolve per consumer, adapt, sunset) plus the compatibility oracle: a contract digest and a semver grade per tool, with a version-bump linter that fails an under-bump.
-- [a2a-gateway.md](a2a-gateway.md) - the `a2a` action: typed AgentCard, capability discovery, and modality negotiation helpers.
+- [a2a-gateway.md](a2a-gateway.md) - the `a2a` action and policy: envelope trust, per-hop chain limits, push-notification target validation, typed AgentCard, and modality negotiation helpers.
 - [agent-skills.md](agent-skills.md) - Agent Skills v0.2.0 well-known projection: schema, integrity, archive safety, no-script-execution contract.
 - [cloudflare-code-mode.md](cloudflare-code-mode.md) - typed TypeScript module emission for Cloudflare Code Mode agents over the MCP federation registry.
 - [ai-crawl-control.md](ai-crawl-control.md) - the `ai_crawl_control` policy: Pay Per Crawl token challenge and ledger trait.
+- [payment-settlement.md](payment-settlement.md) - `proxy.payments`: charge for a request and prove it was paid before the origin is called.
 - [content-for-agents.md](content-for-agents.md) - operator guide to agent-aware content delivery: shape negotiation, body transforms, well-known license posture.
 - [rsl.md](rsl.md) - RSL 1.0 licensing cookbook: expressing license stance via YAML and the resulting `/licenses.xml` projection.
 - [web-bot-auth.md](web-bot-auth.md) - the `bot_auth` provider: verifying RFC 9421-signed AI crawlers against a published key directory.
 - [outbound-dpop.md](outbound-dpop.md) - RFC 9449 sender-constrained OAuth credentials and per-request proof minting for upstream calls.
 - [auth-oidc.md](auth-oidc.md) - the `oidc` auth provider: OpenID Connect Relying-Party login flow (authorization-code + PKCE, sealed session cookie, optional userinfo trust-header projection, RP-initiated logout).
-- [prompt-injection-v2.md](prompt-injection-v2.md) - the v2 guardrail: swappable detector returning score + label, with score-to-action mapping.
+- [prompt-injection-v2.md](prompt-injection-v2.md) - the v2 guardrail: swappable detector returning score + label, with score-to-action mapping and a delegation-depth-aware action at the agent boundary.
 
 ## Connect clients
 
 Point a framework you already run at the gateway: chat completions through the OpenAI-compatible endpoint, tools through the MCP gateway. Every snippet on these pages was validated against a running proxy.
 
-- [langchain.md](langchain.md) - LangChain (python): ChatOpenAI with a gateway base_url, MCP tools via langchain-mcp-adapters.
+- [langchain.md](langchain.md) - LangChain (python): any provider through ChatOpenAI at the gateway, native ChatAnthropic on `/v1/messages`, MCP tools via langchain-mcp-adapters.
 - [vercel-ai-sdk.md](vercel-ai-sdk.md) - Vercel AI SDK (typescript): the openai-compatible provider, MCP tools via the AI SDK's MCP client.
 - [pydantic-ai.md](pydantic-ai.md) - Pydantic AI (python): OpenAIChatModel through the gateway, MCP toolsets on an Agent.
 - [mastra.md](mastra.md) - Mastra (typescript): agents on a gateway-backed model, tools from the MCP client.
@@ -100,7 +106,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [threat-model.md](threat-model.md) - OSS trust boundaries and per-wave review checklist.
 - [events.md](events.md) - the event bus, callback hooks, and emitted event types.
 - [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0 document from the live config.
-- [policy.md](policy.md) - the policy engine and the `semantic_constraint` policy.
+- [policy.md](policy.md) - the policy engine, the `semantic_constraint` policy, and the `request_validator`, `concurrent_limit`, `rate_limit_budget`, `http_framing`, and `a2a` policy reference.
 - [object-authz.md](object-authz.md) - `object_authz` policy: BOLA + BFLA enforcement with tenant-isolation and enumeration detection.
 - [headless-detection.md](headless-detection.md) - header-only headless / stealth-browser indicator heuristics surfaced under `request.agent.headless_*`.
 - [content-digest.md](content-digest.md) - `content_digest` policy: RFC 9530 request-body verification for integrity-critical inboxes.
@@ -115,7 +121,8 @@ Point a framework you already run at the gateway: chat completions through the O
 
 ## Reference
 
-- [402-challenge.md](402-challenge.md) - wire-format contract for the `402 Payment Required` body.
+- [payment-settlement.md](payment-settlement.md) - `proxy.payments`: rails, durable intents, the state table that gates origin access, timeouts, reconciliation, and the exact unsupported boundaries.
+- [402-challenge.md](402-challenge.md) - the exact bytes of every payment challenge, credential, problem document, and receipt.
 - [l402.md](l402.md) - L402 (Lightning HTTP 402) macaroon bearer credential surface: issuer, verifier, attenuation, payment-hash binding.
 - [admin-api-reference.md](admin-api-reference.md) - per-route schema for the embedded admin server (`/api/*`, `/admin/*`, and the unauthenticated probe routes).
 - [config-stability.md](config-stability.md) - field stability guarantees and versioning.
@@ -142,4 +149,4 @@ Point a framework you already run at the gateway: chat completions through the O
 ## Machine-readable documentation
 
 - [llms.txt](llms.txt) - flat capability catalog (one line per shipped feature), per the [llmstxt.org](https://llmstxt.org/) convention. The small index AI tools fetch first.
-- [llms-full.txt](llms-full.txt) - the entire docs corpus (this directory + the top-level `README.md`, `MIGRATION.md`, `CHANGELOG.md`) flattened into one file so AI tools that want the full set get it in one HTTP request. Generated; do not hand-edit. Regenerate with `scripts/regen-llms-full.sh` after any docs change. Mirrored live at <https://sbproxy.dev/llms-full.txt>.
+- [llms-full.txt](llms-full.txt) - the entire docs corpus (this directory + the top-level `README.md`, `MIGRATION.md`, `CHANGELOG.md`) flattened into one file so AI tools that want the full set get it in one HTTP request. Generated; do not hand-edit and do not commit it on a branch. CI regenerates it on `main` after a docs change merges. Mirrored live at <https://sbproxy.dev/llms-full.txt>.

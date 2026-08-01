@@ -1,211 +1,128 @@
-# Lightning Network billing rail (BOLT-12)
-*Last modified: 2026-07-09*
+# Lightning settlement on your own node
 
-Lightning rail in the `Accept-Payment` negotiation contract alongside
-x402 + MPP. The example shows how an operator declares `lightning` in
-the per-tier `rails:` override and what the OSS multi-rail challenge
-body looks like for an agent that opts into Lightning settlement.
+*Last modified: 2026-08-01*
 
-OSS advertises Lightning in the multi-rail challenge body; settlement
-requires the enterprise `lightning-cln`, `lightning-lnd`, or
-`lightning-phoenixd` cargo features. This example exercises the
-negotiation path only.
+An article route priced at 2100 satoshis, settling over a Lightning node
+you run. Core Lightning and LND are alternative backends for one
+advertised `lightning` rail, and this example is mostly about making that
+choice explicit rather than accidental.
 
-## Why this is a doc-only example
+There is no hermetic Lightning stub in this repository, so the runnable
+part of this example is config validation. Serving it needs a reachable
+node.
 
-Examples 30 and 31 ship Docker stacks because their settlement paths
-have hermetic stand-ins (a mock x402 facilitator and a wiremock
-Stripe). Lightning has no equivalent OSS stand-in: the BillingRail
-trait impl that talks to a Lightning node lives in the enterprise
-build, gated behind one of:
+## What is in the bundle
 
-- `lightning-cln`     - Core Lightning node backend.
-- `lightning-lnd`     - LND node backend.
-- `lightning-phoenixd` - Phoenix self-custodial backend.
+| File | Role |
+|---|---|
+| `sb.yml` | Both backends configured, with `lightning_backend` selecting one |
+| `smoke.json` | Liveness manifest for `scripts/examples-smoke.sh` |
 
-Each enterprise feature registers a `BillingRail` named `lightning`
-into the trait registry. The OSS proxy consumes the registry and
-emits a Lightning entry in the multi-rail body whenever a registered
-rail matches the operator's offered set; with no rail registered, the
-OSS proxy still negotiates against the `lightning` token on the wire
-and falls back to the next entry the operator declared (here `x402`).
-
-The contract this example pins is the negotiation shape: how the
-operator declares Lightning in YAML, how the policy filters the
-rails through the agent's `Accept-Payment` header, and what the
-challenge body looks like.
-
-## How the YAML composes
-
-The interesting blocks in `sb.yml` are the per-tier `rails:` override
-and the top-level `rails:` block:
-
-```yaml
-tiers:
-  - route_pattern: /article*
-    price:
-      amount_micros: 1000
-      currency: USD
-    content_shape: html
-    paywall_position: top_of_page
-    rails:
-      - lightning
-      - x402
-
-rails:
-  x402:
-    chain: base
-    facilitator: https://facilitator-base.x402.org
-    asset: USDC
-    pay_to: "0x0000000000000000000000000000000000000000"
-    version: "2"
-  mpp:
-    version: "1"
-```
-
-Two things to notice:
-
-1. The per-tier `rails:` override lists `lightning` first, then
-   `x402`. The order is the operator's preference: q-value ties on
-   the agent side fall through to this declared order.
-
-2. The top-level `rails:` block configures x402 + MPP because those
-   are the rails the OSS build can settle today. Lightning does not
-   appear at the top level: the `Rail::Lightning` enum variant on the
-   OSS side is what makes the per-tier `rails: [lightning]` filter
-   parse cleanly, and the registered enterprise BillingRail is what
-   makes a Lightning entry appear in the emitted body.
-
-## What the negotiation looks like
-
-Per A3.1 the proxy resolves the agent's preferred rail order from
-two signals:
-
-1. The `Accept-Payment` request header (q-value list).
-2. The `Accept` request header, when it carries one of
-   `application/sbproxy-multi-rail+json`, `application/x402+json`, or
-   `application/mpp+json`.
-
-The proxy then:
-
-1. Parses the agent's preference set (`lightning`, `x402`, ...).
-2. Filters it through the operator's offered rails (per-tier
-   override on `/article*` allows `lightning` and `x402`).
-3. Sorts the survivors by the agent's q-value, breaking ties on the
-   operator's declared rail order.
-4. Emits one rail entry per surviving rail, each carrying its own
-   per-rail quote-token JWS (separate nonce per rail per A3.2).
-5. Returns 402 with the multi-rail body, or 406 if no rail survives.
-
-### 1. AI crawler, Accept-Payment: lightning, x402
-
-Agent prefers Lightning, falls back to x402.
+## Validate it
 
 ```bash
-curl -i \
-     -H 'Host: blog.test.sbproxy.dev' \
-     -H 'User-Agent: GPTBot/1.0' \
-     -H 'Accept-Payment: lightning, x402' \
-     http://127.0.0.1:8080/article
-# HTTP/1.1 402 Payment Required
-# Content-Type: application/sbproxy-multi-rail+json
-# {
-#   "rails": [
-#     {
-#       "kind": "lightning",
-#       "amount_micros": 1000,
-#       "currency": "USD",
-#       "expires_at": "2026-05-07T...",
-#       "quote_token": "eyJhbGc..."
-#     },
-#     {
-#       "kind": "x402",
-#       "version": "2",
-#       "chain": "base",
-#       "facilitator": "https://facilitator-base.x402.org",
-#       "asset": "USDC",
-#       "amount_micros": 1000,
-#       "currency": "USD",
-#       "pay_to": "0x0000...",
-#       "expires_at": "2026-05-07T...",
-#       "quote_token": "eyJhbGc..."
-#     }
-#   ],
-#   "agent_choice_method": "header_negotiation",
-#   "policy": "first_match_wins"
-# }
+cargo build -p sbproxy --release --features payments,payment-lightning-cln
+sbproxy validate -f examples/rail-lightning/sb.yml
 ```
 
-The `lightning` entry only surfaces when the proxy is built with one
-of the enterprise `lightning-*` features and the corresponding
-BillingRail is registered. The OSS-default build serves the same
-negotiation but emits only the `x402` entry from the per-tier
-override.
+Validation resolves no rune, opens no socket, and dials no node.
 
-### 2. AI crawler, Accept-Payment: lightning (no fallback)
+## One rail, two backends
 
-Agent only accepts Lightning. With the enterprise build, the body
-carries one `lightning` entry. With the OSS-default build, the
-proxy responds 406 because the agent's preference set has no overlap
-with the OSS-emittable rails:
+`lightning` is what a route advertises. `lightning_cln` and
+`lightning_lnd` are what settle it. Exactly one adapter registers per
+settlement rail, so an advertised `lightning` rail has to resolve to one
+of them.
 
-```bash
-curl -i \
-     -H 'Host: blog.test.sbproxy.dev' \
-     -H 'User-Agent: GPTBot/1.0' \
-     -H 'Accept-Payment: lightning' \
-     http://127.0.0.1:8080/article
-# HTTP/1.1 406 Not Acceptable
-# {"error":"no_acceptable_rail","supported_rails":["lightning","x402"], ...}
+With one backend block configured, the selector is inferred. With both
+configured, drop `lightning_backend` and a route that advertises
+`lightning` is refused at load:
+
+```text
+proxy.payments.rails configures both lightning_cln and lightning_lnd; set
+proxy.payments.rails.lightning_backend to `cln` or `lnd` so an advertised
+lightning rail resolves to exactly one adapter
 ```
 
-The `supported_rails` list on the 406 reflects the operator's
-declared offered set (the per-tier `rails:` override), not the
-runtime-emittable subset. The agent retries with one of the listed
-rails on its `Accept-Payment` header.
+Naming a backend whose block is absent is refused the same way. Having
+both blocks and advertising neither is allowed, because that is what a
+migration looks like halfway through.
 
-### 3. AI crawler, no opt-in
+## Choosing between them
 
-A crawler UA without an `Accept-Payment` header (and without the
-multi-rail Accept MIME) gets the Wave 1 single-rail format with the
-`Crawler-Payment` header. Legacy crawlers keep working unchanged.
+| | Core Lightning | LND |
+|---|---|---|
+| Transport | Unix domain socket, JSON-RPC | gRPC over TLS |
+| Credential | A rune | A hex-encoded macaroon |
+| Minimum version | v26.06 | Pinned to `v0.20.1-beta` protobufs |
+| Extra file needed | None | The node's TLS certificate |
 
-## How to swap an enterprise build in
+Neither backend is preferred. Pick the node you already operate.
 
-Operators on the enterprise tier select one of:
+## Core Lightning needs v26.06 or newer
 
-| Feature              | Backend                                  | Use when                                         |
-|----------------------|------------------------------------------|--------------------------------------------------|
-| `lightning-cln`      | Core Lightning node (lightningd / cln)   | Operator runs CLN and wants direct gRPC control. |
-| `lightning-lnd`      | LND node                                 | Operator runs LND or uses an LND-API hosted node. |
-| `lightning-phoenixd` | Phoenix self-custodial daemon            | Operator wants a self-custodial single-binary path. |
+The adapter reads the documented `xpay` label and the `listinvoices`
+status that v26.06 defines. Setting the floor lower is refused at load:
 
-Each feature registers the same `BillingRail` name (`lightning`) so
-the OSS proxy's negotiation path does not change between backends;
-only the settlement code does. The OSS YAML schema in `sb.yml` is
-unchanged across backends, which is the reason the negotiation
-contract is OSS and the settlement is enterprise.
+```text
+proxy.payments.rails.lightning_cln.minimum_version is "24.11", below the
+26.06 this adapter requires for the documented `xpay` label and
+`listinvoices` status
+```
 
-## Cargo features (OSS)
+Startup then checks the live node through `getinfo` and refuses to
+register the adapter if the running version is older. A version check that
+only ran at first payment would fail a paid request instead of a boot.
 
-The example assumes a default-features `sbproxy` build. The
-multi-rail emission path is unconditional in the `sbproxy-modules`
-crate; the per-tier `rails: [lightning]` filter parses cleanly
-without any operator-set OSS feature because the `Rail::Lightning`
-enum variant ships in the OSS schema.
+## LND needs all three of endpoint, certificate, and macaroon
 
-The `lightning-cln`, `lightning-lnd`, and `lightning-phoenixd`
-features are part of the enterprise build only.
+A connection missing any one of them cannot be established, so all three
+are required at load rather than discovered at first payment. The endpoint
+must be absolute and TLS-bearing, the certificate path must be absolute,
+and the macaroon must be a secret reference. The macaroon is attached as
+call metadata and redacted everywhere else.
 
-## Related docs
+## Currency, and why the route is priced in BTC
 
-- `docs/402-challenge.md` - wire shape of the 402 body, plus the
-  quote-token JWS shape and JWKS publication.
-- `examples/rail-x402-base-sepolia/` - x402 rail with a hermetic
-  mock facilitator.
-- `examples/rail-mpp-stripe-test/` - MPP rail with Stripe test
-  mode + wiremock fallback.
-- `examples/multi-rail-accept-payment/` - both x402 + MPP wired
-  together with q-value negotiation.
-- `examples/quote-token-replay-jwks/` - JWKS endpoint and
-  single-use quote-token enforcement.
+Both rails declare `quote_currency: BTC`, so the route is priced in BTC.
+The proxy performs no currency conversion, and one challenge cannot mix
+currencies, because that would offer the payer two different prices for
+one resource. Add a USD rail to this route and it is refused by name:
+
+```text
+advertised rails lightning and x402 are priced in BTC and USD; one
+challenge cannot mix currencies because the proxy performs no
+foreign-exchange conversion
+```
+
+Serving both means separately priced routes, each advertising rails that
+agree on currency.
+
+`settlement_decimals: 11` prices BTC in millisatoshis. The tier's
+`amount_micros: 21` is 21 micro-BTC, which is 2100 satoshis. That
+conversion is exact integer arithmetic; a price that does not convert
+without a remainder is a config error rather than a rounding.
+
+## What settlement actually requires
+
+A transport success is not a payment. The rail queries the exact labeled
+invoice and requires the node's own paid status before anything reaches
+the origin. An RPC call that returned 200 while the invoice is still
+unpaid settles nothing.
+
+Recovery uses the same durable label. Every invoice the proxy creates
+carries a unique label persisted before the write, so a process that
+crashed mid-create can find the invoice it made instead of making a second
+one.
+
+## Clean up
+
+Nothing to tear down. This example starts no containers.
+
+## Related
+
+- [docs/payment-settlement.md](../../docs/payment-settlement.md) - every `proxy.payments` field, the state table, and the unsupported boundaries.
+- [docs/402-challenge.md](../../docs/402-challenge.md) - the exact challenge and credential bytes.
+- [docs/l402.md](../../docs/l402.md) - the separate L402 macaroon credential surface.
+- `examples/rail-x402-base-sepolia/` - x402 v2 `exact`.
+- `examples/rail-mpp-stripe-test/` - Payment HTTP Authentication settling on Stripe.

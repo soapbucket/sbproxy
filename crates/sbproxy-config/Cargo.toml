@@ -50,3 +50,14 @@ rcgen = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Killing a hung `git` has to reach the whole process group, not just the
+# direct child: git shells out, and reaping only the child orphans its
+# grandchildren with the scratch files still open.
+#
+# rustix rather than libc because this crate is `#![forbid(unsafe_code)]`,
+# which an `#[allow]` cannot override. rustix wraps the same syscall
+# safely, is already in the lockfile, and is Apache-2.0 WITH
+# LLVM-exception OR Apache-2.0 OR MIT, so NOTICE is unaffected.
+rustix = { version = "0.38", features = ["process"] }

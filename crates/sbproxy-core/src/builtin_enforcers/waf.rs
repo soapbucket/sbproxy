@@ -4,9 +4,17 @@
 //! Lifts the body of the `Policy::Waf(p)` arm. Runs the configured
 //! WAF engine against the request URI + headers. On
 //! [`sbproxy_modules::WafResult::Blocked`] returns the policy's
-//! denial message; on [`sbproxy_modules::WafResult::Error`]
-//! routes by the policy's `fail_open` flag (allow with a warning
-//! on `true`, deny on `false`).
+//! denial message; on [`sbproxy_modules::WafResult::Error`] routes by
+//! the policy's effective failure posture
+//! (`WafPolicy::failure_posture`), which resolves the `failure_posture`
+//! key when set and the legacy `fail_open` boolean otherwise.
+//!
+//! The error arm fires when a custom rule could not be evaluated: an
+//! invalid regex, an unknown operator, a rule with no matchable field,
+//! or a Lua / JavaScript engine that failed. Every other rule in the
+//! policy still ran first, and a block from any of them outranks the
+//! posture. Built-in patterns, the managed CRS bundle, and feed rules
+//! compile their regexes at load, so they cannot reach this arm.
 //!
 //! When persistent (time-boxed) blocking is enabled on the policy, the
 //! enforcer also:
@@ -99,6 +107,10 @@ impl PolicyEnforcer for WafEnforcer {
         // inside the `async move` closures below (which cannot borrow
         // `ctx`). Each match arm moves its own clone.
         let tenant = ctx.tenant_id.to_string();
+        let key_provider = ctx.native_key_provider.clone();
+        let key_mode = ctx.inbound_key_mode.as_str().to_string();
+        // WOR-2093: captured up front for the same `async move` reason.
+        let api_key_id = ctx.accountable_key_id().map(str::to_string);
         let block_state = policy.block_store().map(|store| {
             let kind = store.key_kind();
             let key = resolve_block_key(kind, store.cel_key(), req, ctx);
@@ -162,6 +174,9 @@ impl PolicyEnforcer for WafEnforcer {
                                         None,
                                         None,
                                     )
+                                    .with_tenant_id(tenant.clone())
+                                    .with_key_context(key_provider.clone(), key_mode.clone())
+                                    .with_api_key_id(api_key_id.clone())
                                     .emit();
                                 }
                                 sbproxy_modules::policy::waf::StrikeOutcome::Counted => {
@@ -182,12 +197,35 @@ impl PolicyEnforcer for WafEnforcer {
                 })
             }
             WafResult::Error(err) => {
-                if policy.fail_open {
-                    tracing::warn!(error = %err, "WAF engine error, fail_open=true, allowing request");
+                // Read the posture through the accessor, never off
+                // `fail_open` directly: the legacy boolean is one of two
+                // inputs and the polarity conversion belongs in one
+                // place.
+                let posture = policy.failure_posture();
+                if posture.admits() {
+                    tracing::warn!(
+                        error = %err,
+                        failure_posture = posture.as_label(),
+                        // `degraded` is the posture that says out loud
+                        // "this request went through uninspected". A
+                        // plain `open` admits and claims nothing, so the
+                        // field is how an operator alerts on the
+                        // difference without a new metric series.
+                        guarantee_waived = posture.guarantee_waived(),
+                        "WAF could not reach a verdict; request admitted by failure_posture"
+                    );
                     Box::pin(async move { Ok(PolicyDecision::Allow) })
                 } else {
-                    tracing::warn!(error = %err, "WAF engine error, fail_open=false, blocking request");
+                    tracing::warn!(
+                        error = %err,
+                        failure_posture = posture.as_label(),
+                        "WAF could not reach a verdict; request refused by failure_posture"
+                    );
                     ctx.deny_policy_type = Some("waf");
+                    // 403 and a vague message on purpose. The caller
+                    // learns it was refused, not that a rule in this
+                    // deployment is broken, which would be a map of
+                    // where to push next.
                     Box::pin(async move {
                         Ok(PolicyDecision::Deny {
                             status: 403,

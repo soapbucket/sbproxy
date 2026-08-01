@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-08-01*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -191,6 +191,13 @@ Served unauthenticated because the keys themselves are public. The
 document aggregates keys across every `ai_crawl_control` policy so a
 multi-tenant deployment publishes one document for all of its
 issuers.
+
+There are two unrelated reasons the `keys` array holds more than one
+entry, so read it by `kid` rather than by position. Several issuers is
+the multi-tenant case above. Two entries for one issuer is a rotation
+window: the key that origin signs under now, plus the
+`quote_token.previous_key_id` it keeps verifying until the last quote
+signed under the old key has passed its TTL.
 
 ---
 
@@ -492,6 +499,16 @@ Response body: an array of `RequestLogEntry`:
 | `tokens_in`, `tokens_out` | int | Parsed prompt and completion tokens. |
 | `cost_usd_micros` | int | Estimated AI cost in millionths of a US dollar. |
 | `guardrail_category`, `guardrail_action` | string | Bounded guardrail outcome when a guardrail intervened. |
+| `api_key_id` | string | Canonical public id of the key that governed the request, when one resolved. Matches the access log column, the `sbproxy_inbound_key_requests_total{api_key_id}` label, and the `sbproxy.key_id` span attribute. Never the secret. |
+| `key_mode` | string | Inbound credential mode: `none`, `minted`, or `native`. |
+| `key_provider` | string | Recognized native provider label, present on `native` rows. |
+| `tenant_id` | string | Origin-scoped tenant label (`__default__` when the origin declares none). |
+| `user_id` | string | Resolved end-user identifier when user capture resolved one, already capped and redacted. |
+| `error_class` | string | Coarse failure class (`auth_denied`, `rate_limited`, `upstream_5xx`, ...). Absent on success. |
+| `config_revision` | string | Config revision of the pipeline generation that served the request. |
+| `policy_version` | string | Governed key-policy revision that applied, when a key policy resolved. Same vocabulary as the `sbproxy.policy_version` span attribute. |
+| `policy_decisions` | array | Bounded, ordered `policy_type:verdict` pairs recorded as enforcers decided. Explains what applied, not just what denied. |
+| `deny_reason` | string | Machine-readable reason from the policy, guardrail, or auth layer that denied the request, when one did. |
 
 This is an in-memory ring buffer; entries are lost when the process
 exits. For durable request logs, enable the structured access log
@@ -500,11 +517,39 @@ exits. For durable request logs, enable the structured access log
 Supported query parameters: `status` (exact match), `method`
 (case-insensitive), `path` (substring), `guardrail_action`,
 `guardrail_category`, `cache_status`, `retried`, `property_key`,
-`property_value`, `offset`, and `limit` (defaults to and is clamped at
+`property_value`, `api_key_id` (exact canonical key id), `key_mode`
+(`none`, `minted`, or `native`), `session_id` (exact ULID), `offset`,
+and `limit` (defaults to and is clamped at
 `max_log_entries`). `cache_status` accepts the four values listed above.
 `retried` accepts only `true` or `false`. Property matching is exact after
 URL decoding; `property_value` requires `property_key`. No parameters returns
 the newest entries.
+
+To answer "what did this key do", filter by `api_key_id`; every row a
+governed request produced carries the same canonical id across this
+ring, the access log, the inbound-key metric, and exported spans.
+
+### `GET /api/requests/{request_id}/content`
+
+Fetch one request's redacted content sample: the prompt messages and
+response text retained when the AI origin sets `capture_content: true`
+AND the governed key's policy sets `allow_content_capture`. Both flags
+default to off and both must be on; unkeyed and native-key traffic is
+never sampled.
+
+Admin role required (a read-only operator receives `403`). Every read
+is audited before the content is returned: an `inspect_request_content`
+event naming the operator lands on the `sbproxy::admin::audit` tracing
+target and the `/api/audit/events` sample. `404` means no sample exists
+for that request id, either because a gate was off or because the
+bounded store (200 samples, at most 50 per tenant, cleared on restart)
+has already evicted it.
+
+Samples are redacted before storage: the secret redactor, the origin's
+PII redactor when configured, and an 8 KiB payload cap all apply, and
+configured credential carriers never reach capture surfaces. The
+durable content path is OTLP `trace_content:`; this endpoint is a
+runtime inspection sample.
 
 The admin UI derives its Sessions list and detail pages from this ring. Those
 pages are a recent operational view, not durable trace storage, a timing
@@ -728,12 +773,50 @@ add, remove, or re-role one by editing `admin.username` /
 `POST /admin/login` authenticates against, so it cannot report an
 account that does not work.
 
+### `GET /api/operators`
+
+The operator accounts declared under `admin.operators`, each with its
+role. Read-only, like `/api/admin/users`; accounts are config, not API
+state. Passwords are never included.
+
+```json
+[{"username": "viewer", "role": "read_only"}]
+```
+
 ### `GET /api/audit/recent`
 
 Recent rate-limit budget audit rows (suspend, throttle, resume
 transitions), newest first. `?limit=` bounds the count (default 50).
 Returns `[]` (not an error) when no `rate_limits:` block is
 configured, so there is nothing to have audited.
+
+### `GET /api/audit/events`
+
+Unified audit sample across five channels, newest first: `security`
+(auth denials and policy violations), `key` (key and credential
+lifecycle mutations), `config` (config writes and reloads), `admin`
+(sign-ins and every mutating admin action), and `policy` (non-allow
+policy verdicts).
+
+| Field | Type | Description |
+|---|---|---|
+| `timestamp` | string | RFC 3339 timestamp of the event. |
+| `channel` | string | One of `security`, `key`, `config`, `admin`, `policy`. |
+| `kind` | string | Channel-specific kind: the security event type, the lifecycle operation, the config source, the admin action, or the denying policy type. |
+| `actor` | string | Operator who performed the change, on change channels. |
+| `tenant_id` | string | Tenant scope, when known. |
+| `api_key_id` | string | Canonical public key id the event is attributed to, when one resolved. Never the secret. |
+| `request_id` | string | Request correlation id for request-scoped events. |
+| `detail` | string | Bounded machine-readable detail: the deny reason, the revision pair, or the status diff. |
+
+Query parameters: `limit` (default 100, capped at 1000), `channel`,
+`kind`, and `key_id` (all exact matches).
+
+This is a bounded in-memory sample for runtime inspection: the ring
+holds the most recent 1,000 events and clears on restart. The durable
+audit trail is whatever your log pipeline or OTel collector ships the
+`security_audit`, `key_audit`, `config_audit`, and
+`sbproxy::admin::audit` tracing targets to.
 
 ### `GET /api/rate_limits/budget`
 
@@ -1497,6 +1580,20 @@ when the digest is not in the verified cache; `409` with a stable
 `reason` when removal is blocked (e.g. the artifact backs a ready
 replica); a manager-open or filesystem failure is `502`.
 
+### `GET /admin/model-host/jobs`, `GET /admin/model-host/jobs/{id}`
+
+Durable async job records for load, evict, stop, drain, and reset:
+queued, in-flight, and retained terminal jobs. `POST /admin/model-host/load`
+(and its evict/stop/drain/reset siblings) return `202` with a
+`{job_id, poll_url}` when a job store is configured; poll the job by id
+for state and progress. `404` for an unknown id.
+
+### `GET /admin/model-host/jobs/{id}/stream`
+
+Server-sent-events tail of one durable job: `id:` lines for
+`Last-Event-ID` replay, closing when the job reaches a terminal state.
+Use it instead of polling to follow a long load to completion.
+
 ---
 
 ## Cache admin
@@ -1677,7 +1774,19 @@ hand.
 
 Fleet-aggregated metrics (mesh tier). See [observability.md](observability.md)
 for the aggregation model; `404` when the mesh metrics tier is not
-configured.
+configured. The published set is a small, additive allowlist: request
+and connection totals, attributed AI tokens and cost, model-host
+cold-load and placement signals, the inbound-key request counter
+(governed vs native traffic split), and the mesh convergence and health
+families (anti-entropy rounds and keys, replication writes and
+read-repairs, peer-state transitions, node-isolated, handoff keys).
+
+### `GET /admin/cluster/vram`
+
+Cluster-wide GPU VRAM aggregation per node: total and free bytes per
+device, summed across the fleet. Sourced from each node's latest
+model-host status snapshot; a node that has reported none is omitted.
+`405` for a method other than GET.
 
 ### `GET /admin/cluster/artifacts`
 
@@ -1775,6 +1884,24 @@ continue.
 
 ---
 
+## Config authority
+
+Mounted on the admin listener when the node runs as a config authority.
+The authority validates a configuration exactly as boot does, signs it,
+stores it under a monotonic revision, and serves it to subscribers.
+See [configuration.md](configuration.md) for the authority/subscriber
+model.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/admin/config-authority/publish?mode=overlay\|replace` | Publish the request body as a signed bundle. Returns the new revision, content digest, and ETag. |
+| POST | `/admin/config-authority/rollback` | Republish a previous revision under a new revision number. |
+| GET | `/admin/config-authority/status` | Current revision, digest, ETag, signing key id, and each subscriber's last-seen revision. |
+| GET, POST | `/admin/config-authority/subscribers` | List subscribers, or register one with `{"subscriber_id": ...}`. |
+| POST | `/admin/config-authority/subscribers/revoke` | Revoke by `credential_id`, or all credentials for a `subscriber_id`. |
+
+---
+
 ## Admin UI (`GET /admin/ui`, `GET /`)
 
 The admin server serves a full operator dashboard under `/admin/ui/`:
@@ -1816,23 +1943,31 @@ contracts live with the feature.
 
 ## Chat playground
 
-Two routes back the dashboard's interactive chat surface. Both sit
-behind the admin auth and RBAC gate; the chat route is a mutation, so
-it requires the `admin` role.
+Three routes back the dashboard's interactive chat surface. All sit
+behind the admin auth and RBAC gate; the two POST routes are mutations,
+so they require the `admin` role.
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/admin/api/playground/endpoints` | List every AI origin the live pipeline serves, with each provider's declared models and default model. Read-only, sourced from the compiled pipeline, so a config reload updates it without a restart. |
-| POST | `/admin/api/playground/chat` | Run a chat completion against a chosen endpoint through the same AI client the data plane uses. Returns the upstream response plus token usage, cost, and latency. |
+| POST | `/admin/api/playground/chat` | Run a chat completion against a chosen endpoint by calling the AI client directly. Returns the upstream response plus token usage, cost, and latency. Bypasses the data-plane pipeline (see below). |
+| POST | `/admin/api/playground/dispatch` | Run a chat completion as a chosen virtual key by minting a single-use `sbpgtkt_` ticket and making a real loopback call to the data-plane listener, so the full request pipeline applies: the key's policy, governance, routing, guardrails, and transforms. |
 
-The playground is live: a chat call goes out to the real upstream
-through the same AI client the data plane uses, and the response
-carries actual token usage, cost, and latency. It calls the AI client
-directly, though, so it does not traverse the data-plane pipeline:
+The two POST routes differ in what they exercise. `/chat` calls the AI
+client directly and does not traverse the data-plane pipeline:
 per-origin policies, guardrails, transforms, and the
-`x-sbproxy-debug-*` header stamping do not apply. Pass `"debug": true`
-in the request body to get a `debug` block with a server-logged
-request id and the config revision for correlation instead.
+`x-sbproxy-debug-*` header stamping do not apply. Use it to check that
+an upstream and model answer at all.
+
+`/dispatch` is the governed path: it impersonates a virtual key through
+a single-use ticket and loops back through the data-plane listener, so
+the key's full policy and every pipeline stage apply exactly as they
+would for real traffic. It returns `409` when key management is off,
+`404` for an unknown key or origin, `403` when the key is not active,
+and `501` when the origin requires TLS (`force_ssl`), which the
+loopback call cannot satisfy. Pass `"debug": true` in either POST body
+to get a `debug` block with a server-logged request id and the config
+revision for correlation.
 
 Unauthenticated requests see `401 Unauthorized`; other verbs return
 `405 Method Not Allowed`.

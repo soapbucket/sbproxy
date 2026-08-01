@@ -972,7 +972,8 @@ enum ModelEngineArg {
     #[value(name = "sglang")]
     SGLang,
     LlamaCpp,
-    Embedded,
+    #[value(name = "mistralrs")]
+    MistralRs,
 }
 
 impl From<ModelEngineArg> for sbproxy_model_host::EngineChoice {
@@ -982,7 +983,7 @@ impl From<ModelEngineArg> for sbproxy_model_host::EngineChoice {
             ModelEngineArg::Vllm => Self::Vllm,
             ModelEngineArg::SGLang => Self::SGLang,
             ModelEngineArg::LlamaCpp => Self::LlamaCpp,
-            ModelEngineArg::Embedded => Self::Embedded,
+            ModelEngineArg::MistralRs => Self::MistralRs,
         }
     }
 }
@@ -1318,6 +1319,17 @@ fn main() {
     // Anchor the uptime clock at real process start, so `/health` reports
     // true uptime rather than time-since-first-health-hit.
     sbproxy_observe::mark_process_start();
+
+    // Point the attested meter's self-observation at the `sbproxy_meter_*`
+    // families before any config is compiled. The meter reports through a
+    // seam rather than owning a metrics dependency (it must stay compilable
+    // by an operator who wants the hash chain and nothing else), so nothing
+    // is recorded until somebody installs the receiving end. Doing it here
+    // means the first metered request of a deployment is counted, which is
+    // usually the one somebody is watching. The return value is discarded
+    // because a second install is refused rather than accepted, and this is
+    // the only caller.
+    let _ = sbproxy_observe::meter_metrics::install();
 
     let cli = Cli::parse();
 
@@ -2935,13 +2947,17 @@ fn parse_run_engine(value: &str) -> anyhow::Result<sbproxy_model_host::EngineCho
         "vllm" => Ok(sbproxy_model_host::EngineChoice::Vllm),
         "sglang" => Ok(sbproxy_model_host::EngineChoice::SGLang),
         "llama_cpp" => Ok(sbproxy_model_host::EngineChoice::LlamaCpp),
+        "mistralrs" => Ok(sbproxy_model_host::EngineChoice::MistralRs),
         "embedded" => {
             anyhow::bail!(
-                "embedded is not a managed process engine; use auto, vllm, sglang, or llama_cpp"
+                "embedded is not a managed process engine; use auto, vllm, sglang, llama_cpp, \
+                 or mistralrs"
             )
         }
         other => {
-            anyhow::bail!("unknown engine '{other}'; use auto, vllm, sglang, or llama_cpp")
+            anyhow::bail!(
+                "unknown engine '{other}'; use auto, vllm, sglang, llama_cpp, or mistralrs"
+            )
         }
     }
 }
@@ -3043,9 +3059,13 @@ fn prepare_run(args: &RunArgs) -> anyhow::Result<PreparedRun> {
                 "acceleration": acceleration,
             })
         }
-        sbproxy_model_host::EngineKind::Embedded => {
-            anyhow::bail!("catalog resolved the unsupported embedded managed engine")
-        }
+        sbproxy_model_host::EngineKind::MistralRs => serde_json::json!({
+            // Binary engine like llama.cpp: PATH-first with the pinned
+            // upstream prebuilt release as the fallback (WOR-1861).
+            "launch": "binary",
+            "version": sbproxy_model_host::mistralrs_release::DEFAULT_MISTRALRS_RELEASE_TAG,
+            "acceleration": acceleration,
+        }),
     };
     let action = serde_json::json!({
         "type": "ai_proxy",
@@ -4551,7 +4571,7 @@ fn engine_kind_name(engine: sbproxy_model_host::EngineKind) -> &'static str {
         sbproxy_model_host::EngineKind::Vllm => "vllm",
         sbproxy_model_host::EngineKind::SGLang => "sglang",
         sbproxy_model_host::EngineKind::LlamaCpp => "llama_cpp",
-        sbproxy_model_host::EngineKind::Embedded => "embedded",
+        sbproxy_model_host::EngineKind::MistralRs => "mistralrs",
     }
 }
 
@@ -4596,6 +4616,9 @@ fn managed_engine_choice(
         sbproxy_config::ManagedEngineChoice::Vllm => sbproxy_model_host::EngineChoice::Vllm,
         sbproxy_config::ManagedEngineChoice::SGLang => sbproxy_model_host::EngineChoice::SGLang,
         sbproxy_config::ManagedEngineChoice::LlamaCpp => sbproxy_model_host::EngineChoice::LlamaCpp,
+        sbproxy_config::ManagedEngineChoice::MistralRs => {
+            sbproxy_model_host::EngineChoice::MistralRs
+        }
     }
 }
 
@@ -5494,6 +5517,9 @@ fn configured_artifact_protection(
                 sbproxy_config::ManagedEngineChoice::LlamaCpp => {
                     sbproxy_model_host::EngineChoice::LlamaCpp
                 }
+                sbproxy_config::ManagedEngineChoice::MistralRs => {
+                    sbproxy_model_host::EngineChoice::MistralRs
+                }
             };
             let artifact = catalog.resolve_artifact(
                 &sbproxy_model_host::ResolveArtifactRequest {
@@ -5959,7 +5985,7 @@ fn engine_choice_name(engine: sbproxy_model_host::EngineChoice) -> &'static str 
         sbproxy_model_host::EngineChoice::Vllm => "vllm",
         sbproxy_model_host::EngineChoice::SGLang => "sglang",
         sbproxy_model_host::EngineChoice::LlamaCpp => "llama_cpp",
-        sbproxy_model_host::EngineChoice::Embedded => "embedded",
+        sbproxy_model_host::EngineChoice::MistralRs => "mistralrs",
     }
 }
 
@@ -6072,6 +6098,7 @@ fn handle_models_show(
 
 const SBPROXY_RELEASE_REPO: &str = "soapbucket/sbproxy";
 const LLAMA_RELEASE_REPO: &str = "ggml-org/llama.cpp";
+const MISTRALRS_RELEASE_REPO: &str = "EricLBuehler/mistral.rs";
 
 #[derive(serde::Serialize)]
 struct SelfFreshness {
@@ -6807,6 +6834,18 @@ fn check_engines_freshness() -> Vec<EngineFreshness> {
             pinned_release: None,
             latest_release: None,
             update_available: false,
+        },
+        {
+            let pinned = sbproxy_model_host::mistralrs_release::DEFAULT_MISTRALRS_RELEASE_TAG;
+            let latest = github_latest_release(MISTRALRS_RELEASE_REPO);
+            let update = latest.as_deref().map(|l| l != pinned).unwrap_or(false);
+            EngineFreshness {
+                engine: "mistralrs",
+                installed: engine_version("mistralrs"),
+                pinned_release: Some(pinned.to_string()),
+                latest_release: latest,
+                update_available: update,
+            }
         },
     ]
 }

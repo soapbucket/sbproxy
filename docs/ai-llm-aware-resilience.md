@@ -1,6 +1,6 @@
 # LLM-aware resilience
 
-*Last modified: 2026-07-29*
+*Last modified: 2026-08-01*
 
 Status-code retries treat every `5xx` the same and ignore the LLM-specific
 failure modes a provider signals in the response: a context-window
@@ -149,7 +149,62 @@ it recovers, alongside the PeakEWMA latency model. Failover itself routes to
 a different provider, so a retry never re-runs a side-effecting request
 against the same upstream.
 
-## Try it
+## Calling it
 
-The runnable example is in
-[`examples/ai-llm-aware-resilience/`](../examples/ai-llm-aware-resilience/).
+The runnable configuration is
+[`examples/ai-llm-aware-resilience/`](../examples/ai-llm-aware-resilience/). It
+puts the `retry_policy` above on a `fallback_chain` across two deployments,
+`openai-primary` at `priority: 1` and `openai-secondary` at `priority: 2`.
+Start it:
+
+```bash
+export OPENAI_API_KEY=sk-...
+make run CONFIG=examples/ai-llm-aware-resilience/sb.yml
+```
+
+Send an ordinary chat request. The retry policy is server-side, so the client
+sends nothing extra:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.local' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Say hi in one word."}]}'
+```
+
+With a working key that returns the provider's own chat completion, so the
+body comes from the model rather than from SBproxy. The part this page is
+about is not visible in a successful response: it is what happens when the
+provider fails.
+
+The classifier half is reachable without any provider key. Send a body that is
+not JSON:
+
+```bash
+curl -sS -i http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.local' \
+  -H 'Content-Type: application/json' \
+  -d 'not json'
+```
+
+That returns `400` with:
+
+```json
+{"error": "invalid JSON body"}
+```
+
+Note the shape. This is the flat parse-failure body the gateway emits before a
+request is understood well enough to have a provider, a model, or an error
+class. It is deliberately not the structured `{"error": {"message", "type",
+"code", "request_id"}}` envelope that a guardrail block or a classified
+provider failure returns, because at this point nothing has been classified.
+Neither deployment was touched and no retry was counted.
+
+To watch the retry policy itself, point a provider at an upstream you control
+and have it answer `429`. Each rejected attempt logs at `WARN` with the
+message `AI proxy: provider returned error, trying next` and the fields
+`provider`, `status`, and `attempt`, where `attempt` is a zero-based index.
+With `rate_limit: 3` you see that line for attempts `0`, `1`, and `2` against
+`openai-primary` before the chain advances to `openai-secondary`. A `400` that
+classifies as `bad_request` logs the line once and advances immediately,
+because its policy entry is `0`.

@@ -22,7 +22,13 @@ use sbproxy_platform::storage::{
 use smallvec::SmallVec;
 
 use crate::snapshot::{CompiledConfig, CompiledOrigin};
-use crate::types::{ConfigFile, L2CacheConfig, L2CacheParams, MessengerSettings, RawOriginConfig};
+use crate::types::{
+    AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig,
+    AttestationMeasuredConfig, AttestationOriginHeaderConfig, AttestationQueueConfig,
+    AttestationRole, AttestationRouteWeightConfig, ConfigFile, EnforcementMode, FailureMode,
+    L2CacheConfig, L2CacheParams, MessengerSettings, OriginAttestationConfig, RawOriginConfig,
+    WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, MAX_ATTESTATION_QUEUE_ENTRIES,
+};
 
 const MAX_REDIS_TLS_FILE_BYTES: u64 = 1_048_576;
 
@@ -1337,6 +1343,26 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         );
     }
 
+    if let Some(key_management) = config_file.proxy.key_management.as_ref() {
+        key_management
+            .inbound
+            .validate()
+            .map_err(|error| anyhow::anyhow!("config compile: {error}"))?;
+
+        let correlation = &config_file.proxy.correlation_id;
+        if correlation.enabled
+            && key_management
+                .inbound
+                .is_credential_carrier(&correlation.header)
+        {
+            anyhow::bail!(
+                "config compile: proxy.correlation_id.header {:?} may not also be a primary \
+                 credential carrier because correlation IDs are logged, forwarded, and echoed",
+                correlation.header
+            );
+        }
+    }
+
     if let Some(local_path) = config_file
         .proxy
         .compression_state
@@ -1420,6 +1446,18 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
             validate_publishing_node_admin_credentials(config_file.proxy.admin.as_ref())?;
             validate_publish_signing_key(publish)?;
         }
+    }
+
+    // Payment settlement. Every rule here is structural or cross-field,
+    // so it holds on a machine that has none of the credentials: no
+    // secret is resolved, no SQLite file is opened, no provider object
+    // is created, and no worker starts. A configured rail whose Cargo
+    // feature is missing is caught later, at runtime assembly, where
+    // the compiled feature set is actually known.
+    if let Some(payments) = config_file.proxy.payments.as_ref() {
+        payments
+            .validate()
+            .context("config compile: proxy.payments")?;
     }
 
     if let Some(cluster) = crate::cluster::resolve_effective_cluster(&config_file.proxy)
@@ -1529,6 +1567,30 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
             anyhow::bail!(
                 "proxy.web_bot_auth.ed25519_seed_hex must be 64 hex characters (a 32-byte Ed25519 seed)"
             );
+        }
+    }
+
+    // WOR-2127: consumption attestation. Validated here rather than in
+    // the pipeline because `sbproxy validate` has to reject a broken
+    // block without touching the filesystem, and because a proxy that
+    // announces a metering role it cannot honour should not start.
+    if let Some(attestation) = &config_file.proxy.attestation {
+        validate_attestation(attestation, config_file.proxy.web_bot_auth.as_ref())?;
+        for origin in &origins {
+            if let Some(origin_attestation) = &origin.attestation {
+                validate_origin_attestation(&origin.hostname, attestation, origin_attestation)?;
+            }
+        }
+    } else {
+        for origin in &origins {
+            if origin.attestation.is_some() {
+                anyhow::bail!(
+                    "origin `{}` declares an `attestation:` block but `proxy.attestation` is \
+                     absent. A per-origin role has no queue, no ledger, and no billing table \
+                     behind it, so it could never produce a record.",
+                    origin.hostname,
+                );
+            }
         }
     }
 
@@ -1688,6 +1750,407 @@ pub fn ensure_node_local_refs_resolved(resolved_text: &str) -> Result<()> {
          identify this node, so the literal placeholder text cannot be used as a value: export \
          the environment variable(s) on this host, or move the value into a node-local overlay"
     )
+}
+
+/// Validate `proxy.attestation` before anything is built from it.
+///
+/// Runs on every compile, including the one behind `sbproxy validate`,
+/// which is why it lives here and not in the pipeline: the pipeline is
+/// allowed to touch the filesystem and this is not, and an operator
+/// checking a candidate config deserves the same answer the server
+/// would give them.
+///
+/// The rule the whole block turns on is that a declared role has to be
+/// honourable. A role with no queue drops unsettled claims on restart,
+/// a role with no ledger cannot prove a gap, a role with an incomplete
+/// billing table charges by accident, and a receipt with no signing
+/// identity is a log line. Each of those fails here rather than at the
+/// moment somebody disputes an invoice.
+fn validate_attestation(
+    attestation: &AttestationConfig,
+    web_bot_auth: Option<&WebBotAuthConfig>,
+) -> Result<()> {
+    let role: AttestationRole = attestation.role;
+    let failure_mode: FailureMode = attestation.failure_mode;
+    let enforcement_mode: EnforcementMode = attestation.enforcement_mode;
+    let engaged = role.makes_claims() || role.writes_receipts();
+
+    if engaged && !failure_mode.admits() {
+        tracing::warn!(
+            failure_mode = failure_mode.as_label(),
+            "proxy.attestation.failure_mode refuses traffic when metering itself breaks. \
+             That is the right call for an operator who cannot serve unbilled traffic, and \
+             the wrong one for everybody else: a full ledger disk then takes the API down."
+        );
+    }
+    if engaged && !enforcement_mode.blocks() {
+        tracing::info!(
+            enforcement_mode = enforcement_mode.as_label(),
+            "proxy.attestation records attestation verdicts without acting on them"
+        );
+    }
+
+    match attestation.sign_with.as_deref() {
+        None if role.writes_receipts() => anyhow::bail!(
+            "proxy.attestation.role writes receipts, so proxy.attestation.sign_with is \
+             required: an unsigned receipt is a log line, not evidence. Set it to \
+             `{ATTESTATION_SIGN_WITH_WEB_BOT_AUTH}`."
+        ),
+        None => {}
+        Some(identity)
+            if identity == ATTESTATION_SIGN_WITH_WEB_BOT_AUTH && web_bot_auth.is_none() =>
+        {
+            anyhow::bail!(
+                "proxy.attestation.sign_with names `{ATTESTATION_SIGN_WITH_WEB_BOT_AUTH}`, \
+                 but that block is not configured, so there is no key to sign with"
+            )
+        }
+        Some(identity) if identity == ATTESTATION_SIGN_WITH_WEB_BOT_AUTH => {}
+        Some(other) => anyhow::bail!(
+            "proxy.attestation.sign_with `{other}` is not a signing identity this build can \
+             resolve; the only accepted value is `{ATTESTATION_SIGN_WITH_WEB_BOT_AUTH}`"
+        ),
+    }
+
+    match &attestation.queue {
+        Some(queue) => validate_attestation_queue(queue)?,
+        None if engaged => anyhow::bail!(
+            "proxy.attestation declares a role, so proxy.attestation.queue is required: a \
+             claim is written when a call starts and settled when it finishes, and with \
+             nowhere to hold the gap a restart loses every claim in flight"
+        ),
+        None => {}
+    }
+
+    match &attestation.ledger {
+        Some(ledger) => validate_attestation_ledger(ledger)?,
+        None if engaged => anyhow::bail!(
+            "proxy.attestation declares a role, so proxy.attestation.ledger is required: a \
+             signature on each record says nothing about records that were never written, \
+             and the chain is what makes a gap visible"
+        ),
+        None => {}
+    }
+
+    match &attestation.billable {
+        Some(billable) => validate_attestation_billable(billable)?,
+        None if engaged => anyhow::bail!(
+            "proxy.attestation declares a role, so proxy.attestation.billable is required, \
+             with an answer for all eight outcomes. There is no default, on purpose: an \
+             unstated billing rule still runs, it just runs as whatever the code happened \
+             to do."
+        ),
+        None => {}
+    }
+
+    validate_attestation_unit_resolvers(
+        &attestation.measured,
+        &attestation.route_weights,
+        &attestation.origin_headers,
+    )?;
+
+    if engaged
+        && attestation.measured.is_empty()
+        && attestation.route_weights.is_empty()
+        && attestation.origin_headers.is_empty()
+    {
+        // Not an error. A deployment can legitimately want the record
+        // without the arithmetic: an event per call, an outcome, and a
+        // chain that proves none went missing. It is worth saying out
+        // loud all the same, because an operator who meant to price
+        // something and mistyped the key gets a proxy that meters
+        // diligently and bills nothing, and the receipts look fine.
+        tracing::warn!(
+            "proxy.attestation declares a role but no unit resolvers, so every receipt will \
+             record an outcome with an empty units list. Declare proxy.attestation.measured, \
+             proxy.attestation.route_weights, or proxy.attestation.origin_headers to price \
+             the calls."
+        );
+    }
+
+    Ok(())
+}
+
+/// Reject unit resolver declarations that could not produce a readable
+/// invoice.
+///
+/// The cross-cutting check is the one worth having here: a unit name has
+/// to identify one invoice line, across all three lists rather than
+/// within each one. Route weights may repeat a name on purpose, because
+/// several routes priced differently are still one line, and the most
+/// specific match wins. Everything else that repeats a name produces two
+/// entries on one receipt that a buyer cannot tell apart, and worse,
+/// whose provenance differs, which defeats the reason the units are
+/// broken out by source in the first place.
+fn validate_attestation_unit_resolvers(
+    measured: &[AttestationMeasuredConfig],
+    route_weights: &[AttestationRouteWeightConfig],
+    origin_headers: &[AttestationOriginHeaderConfig],
+) -> Result<()> {
+    let mut measured_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for (index, entry) in measured.iter().enumerate() {
+        validate_attestation_measured(index, entry)?;
+        let name: &str = entry.name.trim();
+        if !measured_names.insert(name) {
+            anyhow::bail!(
+                "proxy.attestation.measured: `{name}` is declared twice. One unit name is one \
+                 invoice line, and two quantities filling the same line would produce a receipt \
+                 nobody can read."
+            );
+        }
+    }
+
+    let mut route_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut seen_routes: std::collections::HashSet<(String, Option<String>, String)> =
+        std::collections::HashSet::new();
+
+    for entry in route_weights {
+        validate_attestation_route_weight(entry)?;
+        let name: &str = entry.name.trim();
+        let method: Option<String> = entry
+            .method
+            .as_deref()
+            .map(|method| method.trim().to_ascii_uppercase());
+        let path: &str = entry.path.trim();
+        if !seen_routes.insert((name.to_string(), method, path.to_string())) {
+            anyhow::bail!(
+                "proxy.attestation.route_weights: `{name}` prices `{path}` twice. Two weights \
+                 for one route on one invoice line have no defensible order, so pick the one \
+                 you meant."
+            );
+        }
+        if measured_names.contains(name) {
+            return Err(unit_name_claimed_twice(
+                name,
+                "a measured unit",
+                "a route weight",
+            ));
+        }
+        route_names.insert(name);
+    }
+
+    let mut header_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for entry in origin_headers {
+        validate_attestation_origin_header(entry)?;
+        let name: &str = entry.name.trim();
+        if !header_names.insert(name) {
+            anyhow::bail!(
+                "proxy.attestation.origin_headers: `{name}` is declared twice. One unit name is \
+                 one invoice line, and two headers filling the same line would produce a \
+                 receipt nobody can read."
+            );
+        }
+        if measured_names.contains(name) {
+            return Err(unit_name_claimed_twice(
+                name,
+                "a measured unit",
+                "an origin header",
+            ));
+        }
+        if route_names.contains(name) {
+            return Err(unit_name_claimed_twice(
+                name,
+                "a route weight",
+                "an origin header",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// The error for one unit name claimed by two different resolvers.
+///
+/// Written once rather than three times so the three pairings cannot
+/// drift apart in wording; the reason is identical in every one of them.
+fn unit_name_claimed_twice(name: &str, first: &str, second: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "proxy.attestation: `{name}` is declared as both {first} and {second}. One name has to \
+         mean one thing on a receipt: a buyer reading two `{name}` lines with different \
+         provenance cannot tell which number came from where, which is the whole reason units \
+         carry a source."
+    )
+}
+
+/// Reject a measured entry that names nothing or divides by nothing.
+fn validate_attestation_measured(index: usize, entry: &AttestationMeasuredConfig) -> Result<()> {
+    let name: &str = entry.name.trim();
+    if name.is_empty() {
+        anyhow::bail!(
+            "proxy.attestation.measured[{index}].name is empty; every entry needs a non-empty \
+             `name`, because it is the invoice line the count is billed on"
+        );
+    }
+
+    if entry.per == 0 {
+        anyhow::bail!(
+            "proxy.attestation.measured[{index}].per is 0. `per` is a divisor: it says how much \
+             of the raw quantity makes one unit, so a divisor of zero cannot produce a unit \
+             count for `{name}`. Use 1 to bill one unit per observed item, or 1024 to bill \
+             kibibytes."
+        );
+    }
+
+    Ok(())
+}
+
+/// Reject a route weight that names nothing or matches nothing.
+fn validate_attestation_route_weight(entry: &AttestationRouteWeightConfig) -> Result<()> {
+    let name: &str = entry.name.trim();
+    if name.is_empty() {
+        anyhow::bail!(
+            "proxy.attestation.route_weights: every entry needs a non-empty `name`; it is the \
+             invoice line the weight is billed on"
+        );
+    }
+
+    let path: &str = entry.path.trim();
+    if !path.starts_with('/') {
+        anyhow::bail!(
+            "proxy.attestation.route_weights: `{name}` has path {path:?}, which does not start \
+             with `/` and so can never match a request path"
+        );
+    }
+    // A `*` anywhere but the documented suffix is the shape of somebody
+    // expecting glob matching. It would silently match nothing, which is
+    // a route that quietly stops being priced.
+    let stars = path.matches('*').count();
+    if stars > 1 || (stars == 1 && !path.ends_with("/*")) {
+        anyhow::bail!(
+            "proxy.attestation.route_weights: `{name}` has path {path:?}. The only wildcard is \
+             a trailing `/*`, which matches everything below that segment; anywhere else a `*` \
+             is matched literally and the route would silently go unpriced."
+        );
+    }
+
+    if let Some(method) = entry.method.as_deref() {
+        let method: &str = method.trim();
+        if method.is_empty() {
+            anyhow::bail!(
+                "proxy.attestation.route_weights: `{name}` has an empty `method`. Omit the key \
+                 to price every method."
+            );
+        }
+        if !method.bytes().all(|byte| byte.is_ascii_graphic()) {
+            anyhow::bail!(
+                "proxy.attestation.route_weights: `{name}` has method {method:?}, which is not \
+                 an HTTP method token"
+            );
+        }
+    }
+
+    // `weight` is deliberately unchecked. Zero is a real answer (metered
+    // and free) and there is no upper bound worth inventing for a number
+    // the operator is charging themselves against.
+    Ok(())
+}
+
+/// Reject an origin-header rule that names nothing or names a header
+/// that cannot exist.
+fn validate_attestation_origin_header(entry: &AttestationOriginHeaderConfig) -> Result<()> {
+    let name: &str = entry.name.trim();
+    if name.is_empty() {
+        anyhow::bail!(
+            "proxy.attestation.origin_headers: every entry needs a non-empty `name`; it is the \
+             invoice line the origin's count is billed on"
+        );
+    }
+
+    let header: &str = entry.header.trim();
+    if header.is_empty()
+        || http::header::HeaderName::from_bytes(header.to_ascii_lowercase().as_bytes()).is_err()
+    {
+        anyhow::bail!(
+            "proxy.attestation.origin_headers: `{name}` reads {header:?}, which is not a valid \
+             HTTP header name, so no response could ever carry it"
+        );
+    }
+    Ok(())
+}
+
+/// Reject a claim queue that could not hold a claim.
+fn validate_attestation_queue(queue: &AttestationQueueConfig) -> Result<()> {
+    if queue.path.trim().is_empty() {
+        anyhow::bail!("proxy.attestation.queue.path must be non-empty");
+    }
+    let max_entries: usize = queue.max_entries;
+    if max_entries == 0 {
+        anyhow::bail!(
+            "proxy.attestation.queue.max_entries must be at least 1; a queue of zero drops \
+             every claim at the moment it is made, which is silently not metering"
+        );
+    }
+    if max_entries > MAX_ATTESTATION_QUEUE_ENTRIES {
+        anyhow::bail!(
+            "proxy.attestation.queue.max_entries {max_entries} exceeds the cap of \
+             {MAX_ATTESTATION_QUEUE_ENTRIES}; past that an operator is describing a \
+             database rather than a hold buffer, and an extra zero should not be the way \
+             they find out"
+        );
+    }
+    Ok(())
+}
+
+/// Reject a ledger path that names nothing.
+fn validate_attestation_ledger(ledger: &AttestationLedgerConfig) -> Result<()> {
+    if ledger.path.trim().is_empty() {
+        anyhow::bail!("proxy.attestation.ledger.path must be non-empty");
+    }
+    Ok(())
+}
+
+/// Refuse a billing table that leaves any outcome unanswered, naming
+/// every one that is missing rather than the first.
+///
+/// Serde would reject a missing required field on its own, one field per
+/// compile. That is the wrong shape for this block: an operator who left
+/// three outcomes blank should see all three, because the point of the
+/// exercise is to make them decide, not to make them guess.
+fn validate_attestation_billable(billable: &AttestationBillableConfig) -> Result<()> {
+    let missing: Vec<&'static str> = billable.missing_outcomes();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "proxy.attestation.billable has no answer for {}. Every outcome needs one, \
+             because a billing rule left implicit is a billing rule nobody agreed to. Each \
+             takes one of yes, no, partial, collapse.",
+            missing.join(", "),
+        );
+    }
+    Ok(())
+}
+
+/// Validate one origin's attestation override against the proxy block
+/// it inherits from.
+///
+/// The check worth having is the widening one. `proxy.attestation` only
+/// has to declare a signing identity when the proxy-wide role writes
+/// receipts, so an origin that widens `claim` to `both` can reach a
+/// receipt with nothing to sign it. That hole is invisible in either
+/// block on its own, which is why this runs where both are in scope.
+fn validate_origin_attestation(
+    hostname: &str,
+    proxy: &AttestationConfig,
+    attestation: &OriginAttestationConfig,
+) -> Result<()> {
+    let role: Option<AttestationRole> = attestation.role;
+    let agreement_id: Option<&str> = attestation.agreement_id.as_deref();
+    let resolved: AttestationRole = role.unwrap_or(proxy.role);
+
+    if resolved.writes_receipts() && proxy.sign_with.is_none() {
+        anyhow::bail!(
+            "origin `{hostname}`: attestation.role writes receipts, but \
+             proxy.attestation.sign_with is unset, so nothing could sign them. An unsigned \
+             receipt is a log line, not evidence."
+        );
+    }
+    if resolved.writes_receipts() && agreement_id.is_none() {
+        tracing::warn!(
+            hostname = %hostname,
+            "origin writes receipts but names no attestation.agreement_id, so its receipts \
+             will record how much was consumed without naming the contract that prices it"
+        );
+    }
+    Ok(())
 }
 
 /// Compile a single origin from its raw config.
@@ -1956,6 +2419,21 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         }
     }
 
+    // WOR-2127: shape-check the per-origin attestation override. An
+    // empty `agreement_id` is worse than an absent one: it parses, it
+    // reaches a receipt, and it names no contract, so the buyer holds a
+    // signed document that cannot be priced.
+    if let Some(attestation) = &config.attestation {
+        if let Some(agreement_id) = &attestation.agreement_id {
+            if agreement_id.trim().is_empty() {
+                anyhow::bail!(
+                    "origin {hostname}: attestation.agreement_id must be non-empty when set; \
+                     omit the key to name no agreement"
+                );
+            }
+        }
+    }
+
     // WOR-1053: resolve the origin's declared tenant against the
     // `proxy.tenants[]` list. Absent declarations fall back to the
     // synthetic `__default__` tenant so existing single-tenant
@@ -2038,6 +2516,11 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         outbound_credential: config.outbound_credential,
         // WOR-805: opt-in for outbound Web Bot Auth signing.
         outbound_web_bot_auth: config.outbound_web_bot_auth,
+        // WOR-2127: per-origin attestation role override + agreement id.
+        // Shape-checked above; the cross-block requirement (there has to
+        // be a `proxy.attestation` for this to mean anything) is checked
+        // in `compile_config`, which can see both.
+        attestation: config.attestation,
         // WOR-1043 PR3: origin-scope observability overrides.
         observability: config.observability,
     })
@@ -2068,6 +2551,71 @@ fn transform_type_is(value: &serde_json::Value, wanted: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn compile_rejects_invalid_inbound_key_config_even_when_disabled() {
+        for carrier_yaml in [
+            "headers:\n        - name: x-sb-property-credential",
+            "headers: []\n      provider_hints:\n        - provider: custom\n          header: x-sb-user-id",
+        ] {
+            let yaml = format!(
+                "proxy:\n  key_management:\n    enabled: false\n    inbound:\n      {carrier_yaml}\n"
+            );
+            let error = compile_config(&yaml)
+                .err()
+                .expect("compile must run inbound credential validation");
+            assert!(
+                format!("{error:#}").contains("may not carry a key"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_rejects_primary_carriers_that_collide_with_correlation_ids() {
+        for (correlation_yaml, inbound_yaml) in [
+            (
+                "",
+                "headers:\n        - name: X-Request-Id\n          scheme: ''\n      provider_hints: []",
+            ),
+            (
+                "  correlation_id:\n    header: X-Custom-Correlation\n",
+                "headers: []\n      provider_hints:\n        - provider: custom\n          header: x-custom-correlation",
+            ),
+        ] {
+            let yaml = format!(
+                "proxy:\n{correlation_yaml}  key_management:\n    enabled: false\n    inbound:\n      {inbound_yaml}\n"
+            );
+            let error = compile_config(&yaml)
+                .err()
+                .expect("correlation IDs must not carry credentials");
+            let message = format!("{error:#}");
+            assert!(message.contains("correlation_id"), "{message}");
+            assert!(message.contains("credential"), "{message}");
+        }
+    }
+
+    #[test]
+    fn compile_allows_reserved_match_metadata_and_disabled_correlation() {
+        let yaml = r#"
+proxy:
+  correlation_id:
+    enabled: false
+    header: X-Custom-Correlation
+  key_management:
+    enabled: false
+    inbound:
+      headers:
+        - name: X-Custom-Correlation
+          scheme: ""
+      provider_hints:
+        - provider: custom
+          header: X-Opaque-Credential
+          also_header: X-Sb-User-Id
+"#;
+        compile_config(yaml)
+            .expect("disabled correlation and non-carrier metadata must remain valid");
+    }
 
     #[test]
     fn top_level_feature_flags_compile_into_the_runtime_snapshot() {
@@ -4119,9 +4667,10 @@ origins:
 
     #[test]
     fn compile_config_propagates_origin_extensions() {
-        // Opaque per-origin extensions must round-trip from the raw
-        // YAML into the compiled snapshot so extensions (e.g. the
-        // semantic-cache hook) can read their own keys.
+        // Opaque per-origin extensions must round-trip from the raw YAML
+        // into the compiled snapshot so an extension can read its own
+        // keys. The map stays generic: nothing in this workspace
+        // interprets it.
         let yaml = r#"
 origins:
   "api.example.com":
@@ -4129,18 +4678,18 @@ origins:
       type: proxy
       url: http://127.0.0.1:18888
     extensions:
-      semantic_cache:
+      custom_metadata:
         enabled: true
         ttl_secs: 600
 "#;
         let compiled = compile_config(yaml).expect("compile");
         let origin = compiled.resolve_origin("api.example.com").expect("origin");
-        let sc = origin
+        let custom = origin
             .extensions
-            .get("semantic_cache")
-            .expect("semantic_cache extension present after compile");
-        assert!(sc.get("enabled").unwrap().as_bool().unwrap());
-        assert_eq!(sc.get("ttl_secs").unwrap().as_u64().unwrap(), 600);
+            .get("custom_metadata")
+            .expect("custom_metadata extension present after compile");
+        assert!(custom.get("enabled").unwrap().as_bool().unwrap());
+        assert_eq!(custom.get("ttl_secs").unwrap().as_u64().unwrap(), 600);
     }
 
     #[test]
@@ -4689,6 +5238,614 @@ origins:
             Ok(_) => panic!("empty key_id must fail config load"),
             Err(e) => assert!(e.to_string().contains("key_id"), "got: {e}"),
         }
+    }
+
+    // --- WOR-2127: consumption attestation ---
+
+    /// The signing identity every attestation fixture below points at.
+    const ATTESTATION_SIGNER: &str = r#"
+  web_bot_auth:
+    key_id: sbproxy-2026
+    ed25519_seed_hex: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef""#;
+
+    /// A complete billing table, indented to sit under `attestation:`.
+    const ATTESTATION_BILLABLE: &str = r#"
+    billable:
+      delivered: yes
+      client_disconnected: partial
+      origin_4xx: no
+      origin_5xx: no
+      policy_blocked: no
+      rate_limited: no
+      cache_hit: yes
+      retry: collapse"#;
+
+    /// One static origin, so a fixture only has to say what it is
+    /// testing.
+    const ATTESTATION_ORIGIN: &str = r#"
+origins:
+  api.partner.example:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#;
+
+    /// A config whose `attestation:` body is the caller's, with the
+    /// signer, queue, ledger, and billing table already in place.
+    fn attestation_yaml(body: &str) -> String {
+        format!(
+            "proxy:{ATTESTATION_SIGNER}\n  attestation:{body}\n    sign_with: proxy.web_bot_auth\
+             \n    queue:\n      path: /tmp/sbproxy-attestation/claims.q\n      max_entries: 100000\
+             \n    ledger:\n      path: /tmp/sbproxy-attestation/receipts.ndjson\
+             {ATTESTATION_BILLABLE}\n{ATTESTATION_ORIGIN}"
+        )
+    }
+
+    #[test]
+    fn attestation_valid_config_compiles() {
+        let compiled = compile_config(&attestation_yaml("\n    role: both")).expect("compile");
+        let attestation = compiled
+            .server
+            .attestation
+            .expect("the attestation block survives compilation");
+
+        assert_eq!(attestation.role, AttestationRole::Both);
+        // The whole reason this key departs from the surface-wide
+        // `closed`: billing is not a security boundary, so an unwritable
+        // ledger must not take the API down.
+        assert_eq!(attestation.failure_mode, FailureMode::Degraded);
+        assert_eq!(attestation.enforcement_mode, EnforcementMode::Block);
+        assert_eq!(
+            attestation.sign_with.as_deref(),
+            Some(ATTESTATION_SIGN_WITH_WEB_BOT_AUTH)
+        );
+        let queue = attestation.queue.expect("queue present");
+        assert_eq!(queue.max_entries, 100_000);
+        assert!(attestation.ledger.is_some());
+        assert!(attestation
+            .billable
+            .expect("billable present")
+            .missing_outcomes()
+            .is_empty());
+    }
+
+    #[test]
+    fn attestation_absent_block_still_compiles() {
+        let yaml = r#"
+origins:
+  api.partner.example:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#;
+        let compiled = compile_config(yaml).expect("a config with no attestation block compiles");
+        assert!(compiled.server.attestation.is_none());
+        assert!(compiled
+            .resolve_origin("api.partner.example")
+            .expect("origin compiled")
+            .attestation
+            .is_none());
+    }
+
+    #[test]
+    fn attestation_every_failure_mode_parses() {
+        for (spelling, expected) in [
+            ("closed", FailureMode::Closed),
+            ("open", FailureMode::Open),
+            ("degraded", FailureMode::Degraded),
+            ("observe", FailureMode::Observe),
+        ] {
+            let yaml =
+                attestation_yaml(&format!("\n    role: claim\n    failure_mode: {spelling}"));
+            let compiled =
+                compile_config(&yaml).unwrap_or_else(|e| panic!("{spelling} must compile: {e}"));
+            assert_eq!(
+                compiled
+                    .server
+                    .attestation
+                    .expect("attestation present")
+                    .failure_mode,
+                expected,
+                "failure_mode: {spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn attestation_incomplete_billable_names_every_missing_outcome() {
+        let yaml = format!(
+            "proxy:{ATTESTATION_SIGNER}\n  attestation:\n    role: claim\
+             \n    sign_with: proxy.web_bot_auth\
+             \n    queue:\n      path: /tmp/sbproxy-attestation/claims.q\
+             \n    ledger:\n      path: /tmp/sbproxy-attestation/receipts.ndjson\
+             \n    billable:\n      delivered: yes\n      client_disconnected: partial\
+             \n      origin_4xx: no\n      origin_5xx: no\n      policy_blocked: no\
+             \n      rate_limited: no\n{ATTESTATION_ORIGIN}"
+        );
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("an incomplete billing table is not a table");
+        let rendered = error.to_string();
+
+        // Both, in one message. An operator who left two outcomes blank
+        // should not have to compile twice to find that out.
+        assert!(rendered.contains("cache_hit"), "{rendered}");
+        assert!(rendered.contains("retry"), "{rendered}");
+    }
+
+    #[test]
+    fn attestation_role_without_a_billing_table_fails_config_load() {
+        let yaml = format!(
+            "proxy:{ATTESTATION_SIGNER}\n  attestation:\n    role: claim\
+             \n    sign_with: proxy.web_bot_auth\
+             \n    queue:\n      path: /tmp/sbproxy-attestation/claims.q\
+             \n    ledger:\n      path: /tmp/sbproxy-attestation/receipts.ndjson\
+             \n{ATTESTATION_ORIGIN}"
+        );
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("a role with no billing table must fail");
+        assert!(
+            error.to_string().contains("billable"),
+            "the error names the key the operator has to author: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_role_without_a_queue_fails_config_load() {
+        let yaml = format!(
+            "proxy:{ATTESTATION_SIGNER}\n  attestation:\n    role: claim\
+             \n    sign_with: proxy.web_bot_auth\
+             \n    ledger:\n      path: /tmp/sbproxy-attestation/receipts.ndjson\
+             {ATTESTATION_BILLABLE}\n{ATTESTATION_ORIGIN}"
+        );
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("a role with nowhere to hold claims fails");
+        assert!(error.to_string().contains("queue"), "got: {error}");
+    }
+
+    #[test]
+    fn attestation_zero_queue_capacity_fails_config_load() {
+        let yaml =
+            attestation_yaml("\n    role: claim").replace("max_entries: 100000", "max_entries: 0");
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("a queue of zero is not a queue");
+        assert!(error.to_string().contains("max_entries"), "got: {error}");
+    }
+
+    #[test]
+    fn attestation_unknown_signing_identity_fails_config_load() {
+        let yaml = attestation_yaml("\n    role: receipt")
+            .replace("sign_with: proxy.web_bot_auth", "sign_with: proxy.mtls");
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("an unresolvable signer must fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("sign_with"), "{rendered}");
+        assert!(
+            rendered.contains(ATTESTATION_SIGN_WITH_WEB_BOT_AUTH),
+            "the error tells the operator what is on offer: {rendered}"
+        );
+    }
+
+    #[test]
+    fn attestation_receipt_role_without_a_signer_fails_config_load() {
+        let yaml = attestation_yaml("\n    role: receipt")
+            .replace("\n    sign_with: proxy.web_bot_auth", "");
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("an unsigned receipt is not evidence");
+        assert!(error.to_string().contains("sign_with"), "got: {error}");
+    }
+
+    #[test]
+    fn attestation_origin_override_survives_compilation() {
+        let override_block =
+            "      body: \"ok\"\n    attestation:\n      role: claim\n      agreement_id: acme-2026\n";
+        let yaml =
+            attestation_yaml("\n    role: both").replace("      body: \"ok\"\n", override_block);
+
+        let compiled = compile_config(&yaml).expect("a per-origin override compiles");
+        let origin = compiled
+            .resolve_origin("api.partner.example")
+            .expect("origin compiled");
+        let attestation = origin
+            .attestation
+            .as_ref()
+            .expect("the override survives compilation");
+
+        assert_eq!(attestation.role, Some(AttestationRole::Claim));
+        assert_eq!(attestation.agreement_id.as_deref(), Some("acme-2026"));
+    }
+
+    #[test]
+    fn attestation_origin_block_without_a_proxy_block_fails_config_load() {
+        let yaml = r#"
+origins:
+  api.partner.example:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    attestation:
+      role: claim
+      agreement_id: acme-2026
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("a per-origin role with nothing behind it must fail");
+        assert!(
+            error.to_string().contains("proxy.attestation"),
+            "the error points at the block the operator is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_origin_widening_past_the_signer_fails_config_load() {
+        // `proxy.attestation` only has to name a signer when the
+        // proxy-wide role writes receipts. An origin that widens `claim`
+        // to `both` reaches a receipt with nothing to sign it, and that
+        // hole is invisible in either block on its own.
+        let yaml = attestation_yaml("\n    role: claim")
+            .replace("\n    sign_with: proxy.web_bot_auth", "")
+            .replace(
+                "      body: \"ok\"\n",
+                "      body: \"ok\"\n    attestation:\n      role: both\n",
+            );
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("widening past the signer must fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("sign_with"), "{rendered}");
+        assert!(rendered.contains("api.partner.example"), "{rendered}");
+    }
+
+    #[test]
+    fn attestation_empty_agreement_id_fails_config_load() {
+        let yaml = attestation_yaml("\n    role: both").replace(
+            "      body: \"ok\"\n",
+            "      body: \"ok\"\n    attestation:\n      agreement_id: \"\"\n",
+        );
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("an empty agreement names no contract");
+        assert!(error.to_string().contains("agreement_id"), "got: {error}");
+    }
+
+    // --- WOR-2128: unit resolvers ---
+
+    #[test]
+    fn attestation_resolvers_survive_compilation_in_the_operators_spelling() {
+        let compiled = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    route_weights:\
+             \n      - name: search_call\
+             \n        method: POST\
+             \n        path: /v1/search\
+             \n        weight: 5\
+             \n      - name: search_call\
+             \n        path: /v1/search/*\
+             \n        weight: 1\
+             \n    origin_headers:\
+             \n      - name: result_row\
+             \n        header: X-Rows-Returned",
+        ))
+        .expect("a complete block with resolvers compiles");
+
+        let attestation = compiled
+            .server
+            .attestation
+            .expect("the attestation block survives compilation");
+
+        assert_eq!(attestation.route_weights.len(), 2);
+        assert_eq!(attestation.route_weights[0].name, "search_call");
+        assert_eq!(attestation.route_weights[0].method.as_deref(), Some("POST"));
+        assert_eq!(attestation.route_weights[0].path, "/v1/search");
+        assert_eq!(attestation.route_weights[0].weight, 5);
+        assert_eq!(
+            attestation.route_weights[1].method, None,
+            "an omitted method prices every method"
+        );
+        assert_eq!(attestation.origin_headers.len(), 1);
+        assert_eq!(
+            attestation.origin_headers[0].header, "X-Rows-Returned",
+            "the receipt quotes this back, so the operator's casing is kept"
+        );
+    }
+
+    #[test]
+    fn attestation_one_unit_name_may_not_come_from_two_provenances() {
+        // The check the units-carry-a-source design depends on. Two
+        // `search_call` lines on one receipt, one priced by config and
+        // one asserted by the origin, cannot be told apart by whoever
+        // reads it, which is exactly what the source field is for.
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    route_weights:\
+             \n      - name: search_call\
+             \n        path: /v1/search\
+             \n        weight: 5\
+             \n    origin_headers:\
+             \n      - name: search_call\
+             \n        header: X-Rows-Returned",
+        ))
+        .err()
+        .expect("a name shared across resolvers is not compilable");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("search_call"), "{rendered}");
+        assert!(rendered.contains("provenance"), "{rendered}");
+    }
+
+    #[test]
+    fn attestation_route_priced_twice_on_one_line_fails_config_load() {
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    route_weights:\
+             \n      - name: search_call\
+             \n        method: post\
+             \n        path: /v1/search\
+             \n        weight: 5\
+             \n      - name: search_call\
+             \n        method: POST\
+             \n        path: /v1/search\
+             \n        weight: 9",
+        ))
+        .err()
+        .expect("two weights for one route have no defensible order");
+
+        assert!(
+            error.to_string().contains("twice"),
+            "the method is matched case-insensitively, so these are one route: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_wildcard_outside_the_documented_suffix_fails_config_load() {
+        for path in ["/v1/*/search", "/v1/search*", "/*/x", "/v1/*/*"] {
+            let error = compile_config(&attestation_yaml(&format!(
+                "\n    role: receipt\
+                 \n    route_weights:\
+                 \n      - name: search_call\
+                 \n        path: \"{path}\"\
+                 \n        weight: 5"
+            )))
+            .err()
+            .unwrap_or_else(|| panic!("{path:?} looks like a glob and is not one"));
+
+            assert!(
+                error.to_string().contains("wildcard"),
+                "{path:?}: a `*` that matches literally leaves a route silently unpriced: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn attestation_relative_route_path_fails_config_load() {
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    route_weights:\
+             \n      - name: search_call\
+             \n        path: v1/search\
+             \n        weight: 5",
+        ))
+        .err()
+        .expect("a path that can never match a request path is a typo, not a rule");
+
+        assert!(
+            error.to_string().contains("does not start with"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_unreachable_origin_header_fails_config_load() {
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    origin_headers:\
+             \n      - name: result_row\
+             \n        header: \"X Rows Returned\"",
+        ))
+        .err()
+        .expect("a header name with spaces cannot arrive on a response");
+
+        assert!(
+            error.to_string().contains("valid HTTP header name"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_zero_weight_is_a_metered_free_route() {
+        let compiled = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    route_weights:\
+             \n      - name: health_call\
+             \n        path: /healthz\
+             \n        weight: 0",
+        ))
+        .expect("metered and free is a position an operator is allowed to hold");
+
+        assert_eq!(
+            compiled
+                .server
+                .attestation
+                .expect("attestation present")
+                .route_weights[0]
+                .weight,
+            0
+        );
+    }
+
+    #[test]
+    fn attestation_role_without_resolvers_still_compiles() {
+        // Recording every call and pricing none of it is a legitimate
+        // posture: the chain still proves no call went missing. The
+        // compiler warns and does not refuse.
+        let compiled = compile_config(&attestation_yaml("\n    role: receipt"))
+            .expect("a role without unit resolvers is not an error");
+        let attestation = compiled.server.attestation.expect("attestation present");
+        assert!(attestation.measured.is_empty());
+        assert!(attestation.route_weights.is_empty());
+        assert!(attestation.origin_headers.is_empty());
+    }
+
+    // --- WOR-2145: the measured unit resolver ---
+
+    #[test]
+    fn attestation_measured_units_survive_compilation_with_per_defaulted() {
+        let compiled = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    measured:\
+             \n      - name: api_call\
+             \n        quantity: requests\
+             \n      - name: egress_kib\
+             \n        quantity: bytes_out\
+             \n        per: 1024",
+        ))
+        .expect("a complete block with measured units compiles");
+
+        let attestation = compiled
+            .server
+            .attestation
+            .expect("the attestation block survives compilation");
+
+        assert_eq!(attestation.measured.len(), 2);
+        assert_eq!(attestation.measured[0].name, "api_call");
+        assert_eq!(
+            attestation.measured[0].quantity,
+            crate::types::AttestationMeasuredQuantity::Requests
+        );
+        assert_eq!(
+            attestation.measured[0].per, 1,
+            "an omitted `per` bills one unit per observed item"
+        );
+        assert_eq!(
+            attestation.measured[1].per, 1024,
+            "1024 against bytes_out is what turns bytes into kibibytes"
+        );
+    }
+
+    #[test]
+    fn attestation_every_measured_quantity_spelling_parses() {
+        use crate::types::AttestationMeasuredQuantity as Quantity;
+
+        let compiled = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    measured:\
+             \n      - name: api_call\
+             \n        quantity: requests\
+             \n      - name: ingress_kib\
+             \n        quantity: bytes_in\
+             \n        per: 1024\
+             \n      - name: egress_kib\
+             \n        quantity: bytes_out\
+             \n        per: 1024\
+             \n      - name: compute_second\
+             \n        quantity: duration_ms\
+             \n        per: 1000",
+        ))
+        .expect("every quantity the meter counts is spellable in config");
+
+        let quantities: Vec<Quantity> = compiled
+            .server
+            .attestation
+            .expect("attestation present")
+            .measured
+            .iter()
+            .map(|entry| entry.quantity)
+            .collect();
+
+        assert_eq!(
+            quantities,
+            vec![
+                Quantity::Requests,
+                Quantity::BytesIn,
+                Quantity::BytesOut,
+                Quantity::DurationMs,
+            ],
+            "the config spelling and the metering spelling are the same snake_case"
+        );
+    }
+
+    #[test]
+    fn attestation_measured_divisor_of_zero_fails_config_load() {
+        // `per` reaches the request path as a divisor. Catching zero
+        // here is the difference between a config error and a panic
+        // while a response is being written.
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    measured:\
+             \n      - name: egress_kib\
+             \n        quantity: bytes_out\
+             \n        per: 0",
+        ))
+        .err()
+        .expect("a divisor of zero cannot produce a unit count");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("proxy.attestation.measured[0].per"),
+            "the error names the key the operator has to fix: {rendered}"
+        );
+        assert!(rendered.contains("divisor"), "{rendered}");
+    }
+
+    #[test]
+    fn attestation_measured_without_a_name_fails_config_load() {
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    measured:\
+             \n      - name: \"\"\
+             \n        quantity: requests",
+        ))
+        .err()
+        .expect("a unit with no name has no invoice line to be billed on");
+
+        assert!(
+            error
+                .to_string()
+                .contains("proxy.attestation.measured[0].name"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_measured_name_may_not_be_claimed_by_another_resolver() {
+        // Same rule as the route-weight/origin-header collision, and
+        // for the same reason: two `api_call` lines with different
+        // provenance is a receipt nobody can read.
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    measured:\
+             \n      - name: api_call\
+             \n        quantity: requests\
+             \n    route_weights:\
+             \n      - name: api_call\
+             \n        path: /v1/search\
+             \n        weight: 5",
+        ))
+        .err()
+        .expect("a name shared across resolvers is not compilable");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("api_call"), "{rendered}");
+        assert!(rendered.contains("provenance"), "{rendered}");
     }
 
     // --- WOR-193: agent_skills schema validation ---

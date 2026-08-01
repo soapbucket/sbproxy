@@ -894,9 +894,14 @@ mod tests {
             tags: Vec::new(),
             metadata: std::collections::BTreeMap::new(),
             request_id: None,
+            session_id: None,
             tag: None,
             priority: None,
             engine_version: None,
+            agent_id: None,
+            a2a_context_id: None,
+            a2a_identity_verified: None,
+            workflow_id: None,
         }
     }
 

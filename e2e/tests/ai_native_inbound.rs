@@ -169,6 +169,44 @@ origins:
     )
 }
 
+fn anthropic_native_pii_config(upstream_base: &str, store_path: &std::path::Path) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: "{}"
+    crypto:
+      pepper: e2e-native-pii-pepper
+      master_key: e2e-native-pii-master
+    inbound:
+      native_key_policy:
+        allowed_providers: [anthropic]
+        require_pii_redaction: [email]
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      pii:
+        enabled: true
+      providers:
+        - name: anthropic
+          provider_type: anthropic
+          accept_native_credentials_for: anthropic
+          api_key: "operator-key-must-not-be-used"
+          base_url: "{upstream_base}"
+          allow_private_base_url: true
+          models: [claude-3-5-sonnet]
+      routing:
+        strategy: round_robin
+"#,
+        store_path.display()
+    )
+}
+
 #[test]
 fn anthropic_messages_inbound_translates_request_and_response() {
     let upstream = MockUpstream::start(json!({
@@ -535,6 +573,52 @@ fn anthropic_native_failure_falls_back_to_openai_and_rewraps_response() {
     assert!(body.get("choices").is_none(), "{body}");
     assert_eq!(anthropic.captured()[0].path, "/v1/messages");
     assert_eq!(openai.captured()[0].path, "/v1/chat/completions");
+}
+
+#[test]
+fn anthropic_native_bypass_never_forwards_pre_redaction_content() {
+    let upstream = MockUpstream::start(json!({
+        "id": "msg_redacted",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "safe"}],
+        "model": "claude-3-5-sonnet",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 8, "output_tokens": 1}
+    }))
+    .expect("start Anthropic mock");
+    let store_dir = tempfile::tempdir().expect("store directory");
+    let yaml =
+        anthropic_native_pii_config(&upstream.base_url(), &store_dir.path().join("keys.redb"));
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "max_tokens": 128,
+        "messages": [{
+            "role": "user",
+            "content": "contact alice@example.com"
+        }]
+    });
+
+    let response = harness
+        .post_json(
+            "/v1/messages",
+            "ai.localhost",
+            &body,
+            &[("x-api-key", "sk-ant-api03-caller-owned")],
+        )
+        .expect("post native Anthropic request");
+    assert_eq!(response.status, 200);
+
+    let captured = upstream.captured();
+    assert_eq!(captured.len(), 1);
+    let forwarded: serde_json::Value =
+        serde_json::from_slice(&captured[0].body).expect("forwarded JSON");
+    let forwarded_text = forwarded["messages"][0]["content"]
+        .as_str()
+        .expect("forwarded text");
+    assert!(forwarded_text.contains("[REDACTED:EMAIL]"), "{forwarded}");
+    assert!(!forwarded_text.contains("alice@example.com"), "{forwarded}");
 }
 
 #[test]

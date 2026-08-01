@@ -200,6 +200,7 @@ struct KeyMutation {
     /// Federated-MCP injection ref. JSON `null` clears it.
     inject_mcp: Patch<serde_json::Value>,
     bypass_prompt_injection: Patch<bool>,
+    allow_content_capture: Patch<bool>,
     project: Patch<String>,
     user: Patch<String>,
     tags: Patch<Vec<String>>,
@@ -286,6 +287,10 @@ fn validate_key_mutation(m: &KeyMutation) -> Result<(), String> {
             "bypass_prompt_injection",
             matches!(&m.bypass_prompt_injection, Patch::Null),
         ),
+        (
+            "allow_content_capture",
+            matches!(&m.allow_content_capture, Patch::Null),
+        ),
     ] {
         if is_null {
             return Err(format!(
@@ -341,6 +346,9 @@ fn apply_key_mutation(rec: &mut KeyRecord, m: &KeyMutation) {
     apply_nullable(&mut rec.inject_mcp, &m.inject_mcp);
     if let Patch::Value(value) = &m.bypass_prompt_injection {
         rec.bypass_prompt_injection = *value;
+    }
+    if let Patch::Value(value) = &m.allow_content_capture {
+        rec.allow_content_capture = *value;
     }
     apply_nullable(&mut rec.project, &m.project);
     apply_nullable(&mut rec.user, &m.user);
@@ -1269,6 +1277,7 @@ fn set_key_status(id: &str, status: RecordStatus, body: Option<&str>) -> Resp {
     if rec.status == RecordStatus::Revoked {
         return terminal_key(id, rec.policy_revision);
     }
+    let prior_status = rec.status;
     rec.status = status;
     rec.updated_at = Utc::now();
     let rec = match store_key_if_revision(&plane, rec, expected_revision) {
@@ -1276,7 +1285,13 @@ fn set_key_status(id: &str, status: RecordStatus, body: Option<&str>) -> Resp {
         Err(response) => return response,
     };
     invalidate(&plane, id);
-    audit_mutation(status_verb(status), "key", id);
+    audit_mutation_scoped(
+        status_verb(status),
+        "key",
+        id,
+        rec.tenant_id.as_deref(),
+        Some((prior_status, status)),
+    );
     ok(json!({ "key": KeyView::from(&rec) }))
 }
 
@@ -1549,13 +1564,20 @@ fn set_credential_status(id: &str, status: RecordStatus) -> Resp {
         Ok(None) => return not_found("credential not found"),
         Err(e) => return internal_error(&e),
     };
+    let prior_status = rec.status;
     rec.status = status;
     rec.updated_at = Utc::now();
     if let Err(e) = store_credential(&plane, rec.clone()) {
         return internal_error(&e);
     }
     invalidate(&plane, id);
-    audit_mutation(status_verb(status), "credential", id);
+    audit_mutation_scoped(
+        status_verb(status),
+        "credential",
+        id,
+        rec.tenant_id.as_deref(),
+        Some((prior_status, status)),
+    );
     ok(json!({ "credential": CredentialView::from(&rec) }))
 }
 
@@ -1618,6 +1640,7 @@ struct KeyView {
     #[serde(skip_serializing_if = "Option::is_none")]
     inject_mcp: Option<serde_json::Value>,
     bypass_prompt_injection: bool,
+    allow_content_capture: bool,
     project: Option<String>,
     user: Option<String>,
     tags: Vec<String>,
@@ -1655,6 +1678,7 @@ impl From<&KeyRecord> for KeyView {
             inject_tools: r.inject_tools.clone(),
             inject_mcp: r.inject_mcp.clone(),
             bypass_prompt_injection: r.bypass_prompt_injection,
+            allow_content_capture: r.allow_content_capture,
             project: r.project.clone(),
             user: r.user.clone(),
             tags: r.tags.clone(),
@@ -1788,7 +1812,7 @@ fn invalidate(plane: &KeyPlane, id: &str) {
     // A credential's resolved secret is cached separately from its record, so
     // a rotation has to drop both on the same signal or the old secret keeps
     // going upstream until the TTL lapses.
-    crate::key_plane::invalidate_resolved_credential(id);
+    plane.invalidate_resolved_credential(id);
 }
 
 fn status_verb(status: RecordStatus) -> &'static str {
@@ -1801,8 +1825,46 @@ fn status_verb(status: RecordStatus) -> &'static str {
 
 /// Emit an audit record for a key/credential mutation. Wired to the audit sink
 /// in WOR-1557; here it stamps the structured event onto the tracing pipeline.
+///
+/// WOR-2094: names the acting operator (from the admin dispatch
+/// thread-local) so the trail answers who changed what, not just that
+/// something changed.
 fn audit_mutation(op: &str, kind: &str, id: &str) {
-    sbproxy_observe::KeyAuditEntry::new(op, kind, id).emit();
+    audit_mutation_scoped(op, kind, id, None, None);
+}
+
+/// [`audit_mutation`] with tenant scope and a secret-free status diff
+/// for mutations where both are cheaply at hand (WOR-2094).
+fn audit_mutation_scoped(
+    op: &str,
+    kind: &str,
+    id: &str,
+    tenant_id: Option<&str>,
+    status_diff: Option<(RecordStatus, RecordStatus)>,
+) {
+    let mut entry = sbproxy_observe::KeyAuditEntry::new(op, kind, id);
+    if let Some(actor) = crate::admin::current_admin_actor() {
+        entry = entry.with_actor(actor);
+    }
+    if let Some(tenant_id) = tenant_id {
+        entry = entry.with_tenant_id(tenant_id);
+    }
+    if let Some((before, after)) = status_diff {
+        entry = entry.with_diff(
+            Some(json!({ "status": status_label(before) })),
+            Some(json!({ "status": status_label(after) })),
+        );
+    }
+    entry.emit();
+}
+
+/// Closed status vocabulary for the audit diff; never a secret.
+fn status_label(status: RecordStatus) -> &'static str {
+    match status {
+        RecordStatus::Active => "active",
+        RecordStatus::Blocked => "blocked",
+        RecordStatus::Revoked => "revoked",
+    }
 }
 
 fn parse_body<T: for<'de> Deserialize<'de> + Default>(body: Option<&str>) -> Result<T, Resp> {
@@ -2092,6 +2154,24 @@ mod tests {
             let body = format!(r#"{{"id":"c","secret":"s","header":"{bad}"}}"#);
             let resp = dispatch("POST", "/admin/credentials", Some(&body)).unwrap();
             assert_eq!(resp.0, 400, "{bad} must be rejected: {}", resp.2);
+        }
+    }
+
+    #[test]
+    fn hop_by_hop_credential_headers_are_rejected_at_admin_creation() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        for (index, header) in ["keep-alive", "proxy-connection", "te", "trailer"]
+            .into_iter()
+            .enumerate()
+        {
+            let body = format!(r#"{{"id":"hop-{index}","secret":"s","header":"{header}"}}"#);
+            let resp = dispatch("POST", "/admin/credentials", Some(&body)).unwrap();
+            assert_eq!(
+                resp.0, 400,
+                "{header} must be rejected before storage: {}",
+                resp.2
+            );
         }
     }
 

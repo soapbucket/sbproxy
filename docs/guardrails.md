@@ -1,5 +1,7 @@
 # External AI guardrails
 
+*Last modified: 2026-08-01*
+
 External guardrails let an AI route ask a moderation or policy service before SBproxy sends a request upstream, after it receives a non-streaming response, or in logging-only mode. The adapter receives the selected model and the inspected phase. SBproxy records bounded labels for provider, phase, and outcome. It does not put prompt text, headers, or credentials into those labels.
 
 Built-in guardrails stay in `guardrails.input` and `guardrails.output`. They cover the local checks documented in [the AI gateway guide](ai-gateway.md). External adapters live in `guardrails.external`, so a route can use both. Prompt Security and Model Armor are not named adapters. Use the generic webhook contract when a service has a compatible endpoint.
@@ -24,6 +26,69 @@ guardrails:
 `name` is an operator-defined identifier used in logs and client error codes. Metrics use bounded provider, phase, and outcome labels instead. `provider: generic` selects the small JSON contract below. A loopback URL needs `allow_private_url: true`; public URLs are resolved and pinned before use, while private targets are rejected by default. `mode: pre_call` evaluates the request before provider dispatch. `default_on: true` automatically enables the configured phases on this route. `fail_open: false` makes a timeout, a non-success response, malformed JSON, or a response larger than 64 KiB block the request. `timeout_ms` accepts 1 through 30000 and defaults to 2000.
 
 Modes decide which content is sent to the adapter. `pre_call` checks input. `post_call` checks a buffered, non-streaming model response. `during_call` checks both. `logging_only` checks both input and output but never blocks.
+
+### Calling it
+
+Start the example, which brings up the gateway, the model fixture, and the webhook together:
+
+```bash
+cd examples/ai-external-guardrails
+docker compose up --build
+```
+
+Send a prompt the webhook allows:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.local' \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"model":"fixture-model","messages":[{"role":"user","content":"allowed prompt"}]}'
+```
+
+The webhook returns `allowed: true`, so the request reaches the model and the model answers:
+
+```json
+{
+  "id": "chatcmpl-fixture",
+  "object": "chat.completion",
+  "created": 0,
+  "model": "fixture-model",
+  "choices": [
+    {
+      "index": 0,
+      "message": {"role": "assistant", "content": "fixture response"},
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+}
+```
+
+Now send one it blocks. The fixture blocks any prompt containing `blocked`:
+
+```bash
+curl -sS -i http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.local' \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"model":"fixture-model","messages":[{"role":"user","content":"blocked prompt"}]}'
+```
+
+That returns `400` and the model is never called:
+
+```json
+{
+  "error": {
+    "code": "local-policy",
+    "message": "external guardrail blocked content",
+    "request_id": "<differs on every request>",
+    "type": "guardrail_violation"
+  }
+}
+```
+
+Three things in that body are worth reading closely. `code` is the adapter's `name` from the configuration, which is how you tell two adapters apart in a client error. `message` is the fixed safe string, not text the webhook supplied, so a provider cannot use a block to write arbitrary content into your client's error path. `request_id` is the value to correlate against the access log, and it is the only field here that changes between runs.
+
+Watch the fixture log while both run. It prints `method`, `path`, `model`, `phase`, and `verdict`, and nothing else. No prompt, no request body, no header, no credential.
 
 ## Streaming and multipart content
 

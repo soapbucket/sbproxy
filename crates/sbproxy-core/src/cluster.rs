@@ -1585,12 +1585,15 @@ fn start_cluster_metrics(handle: &ClusterHandle) {
 /// The generation is a monotonic tick rather than a timestamp, because cluster
 /// state fences on generation and a clock that moves backwards would make a
 /// republish look stale.
+///
+/// The counter itself lives in `key_capability` as one process-wide atomic, so
+/// this loop and an immediate preflight publication share it. Two publishers
+/// with two private counters could otherwise write different payloads at the
+/// same generation, which cluster state rejects as a conflict.
 async fn run_capability_announcer() {
     let period = crate::key_capability::CAPABILITY_TTL / 2;
-    let mut generation: u64 = 0;
     loop {
-        generation = generation.saturating_add(1);
-        crate::key_capability::announce_local_capabilities(generation).await;
+        crate::key_capability::announce_local_capabilities().await;
         tokio::time::sleep(period).await;
     }
 }
@@ -1600,14 +1603,14 @@ async fn run_capability_announcer() {
 ///
 /// This is deliberately not part of `start_cluster_metrics`. That function
 /// runs from `reconcile_process_cluster`, which `server::lifecycle` calls
-/// *before* `key_plane::init_key_plane` installs the approximate store, on
+/// *before* lifecycle activates the prepared approximate store, on
 /// both the boot path (`server::lifecycle::run`) and the config-reload path
 /// (`server::lifecycle::reload_from_config_yaml`). A governance check made
 /// inside `start_cluster_metrics` would always observe `current_key_plane()`
 /// as not-yet-updated for this cycle and never spawn. Instead,
 /// `server::lifecycle` calls this function itself, immediately after
-/// `init_key_plane` returns on both paths, once both the process cluster
-/// handle and the key plane are guaranteed installed.
+/// key-plane activation on both paths, once both the process cluster handle and
+/// the key plane are guaranteed installed.
 ///
 /// Idempotent: guarded by its own atomic, separate from
 /// `start_cluster_metrics`'s `STARTED` gate, so it does not consume that
@@ -1674,6 +1677,86 @@ pub(crate) fn start_rate_limit_dissemination() {
         handle.clone(),
         tier,
         crate::rate_limit_cluster::DEFAULT_RATE_LIMIT_CADENCE_SECS,
+    ));
+}
+
+/// Start publication of this node's receipt-chain segment on a clustered
+/// node.
+///
+/// Without this the mesh-wide meter has a reader and no writer. Every peer's
+/// gather finds no record under this node's id and reports it as
+/// [`sbproxy_meter::coverage::CoverageGap::NeverReported`], so a clustered
+/// deployment's coverage view says the whole fleet has never reported and
+/// the cluster total is permanently partial.
+///
+/// Publishing is the only thing the loop does. Gathering is a request rather
+/// than a background job, so the coverage block on an answer describes the
+/// moment somebody asked rather than the last time a timer fired. See
+/// [`crate::meter_cluster::run_loop`], which states the same split from the
+/// other side.
+///
+/// # Cadence
+///
+/// Fifteen seconds, matching [`crate::governance_cluster::run_loop`] rather
+/// than the faster cadence [`crate::cluster::start_rate_limit_dissemination`]
+/// uses. A rate limit is a promise about a 60 second window and needs several
+/// exchanges inside one to keep the overshoot bound tight. A chain head is a
+/// durable fact on a disk, so a peer reading one fifteen seconds late is
+/// reading a true number that is fifteen seconds old, and the gather labels
+/// records past their age bound stale rather than quietly summing them.
+///
+/// # Why there is no attestation predicate
+///
+/// The segment closure reads the current pipeline on every tick rather than
+/// capturing one, so a reload that replaces the meter cannot leave this loop
+/// republishing a segment from a runtime that no longer exists. A process
+/// with attestation switched off therefore returns `None` every tick and
+/// publishes nothing, which is the whole guard. A boot-time attestation check
+/// here would do worse than duplicate that: it would latch a node that later
+/// reloads attestation on into permanent silence, because the starter only
+/// gets one successful attempt.
+///
+/// # State
+///
+/// This shares the one process-wide [`crate::meter_cluster::ClusterMeterView`]
+/// with the admin gather rather than building its own. Publishing touches none
+/// of the memory that type holds, so a second view would work today, and that
+/// is exactly what makes it worth avoiding: the type documents itself as one
+/// per process because its last-known-heads table never evicts, and a second
+/// instance would sit there being harmless until somebody taught the publish
+/// path to remember a head, at which point the two would disagree about which
+/// nodes had ever reported.
+///
+/// Idempotent behind its own atomic, like its two siblings, so calling it
+/// again from a later reload is a no-op rather than a second publisher.
+pub(crate) fn start_meter_dissemination() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(handle) = current_cluster_handle() else {
+        return;
+    };
+    if handle.mesh_node().is_none() {
+        return;
+    }
+    if STARTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    cluster_runtime().spawn(crate::meter_cluster::run_loop(
+        handle.clone(),
+        crate::admin_meter::cluster_view().clone(),
+        || {
+            crate::reload::current_pipeline_full()
+                .attestation
+                .as_ref()
+                .and_then(|attestation| attestation.chain.as_ref())
+                .and_then(|chain| chain.segment())
+        },
+        15,
     ));
 }
 

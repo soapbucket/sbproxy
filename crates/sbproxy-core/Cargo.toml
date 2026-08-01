@@ -34,10 +34,6 @@ gpu-nvidia = ["sbproxy-model-host/gpu-nvidia"]
 gpu-apple = ["sbproxy-model-host/gpu-apple"]
 # Hugging Face weight download for the model host. Same gating.
 model-weights = ["sbproxy-model-host/weights"]
-# WOR-1658: the in-process embedded engine, forwarded to the model host.
-# Off by default (mistral.rs is a large dep tree); `sbproxy doctor`
-# reports whether this build compiled it in.
-embedded = ["sbproxy-model-host/embedded"]
 # Pulls the resolver in `sbproxy-modules::policy::agent_class` and the
 # reverse-DNS verifier in `sbproxy-security::agent_verify` into the
 # request pipeline. Off by default for library consumers; the
@@ -73,6 +69,51 @@ inprocess-embed = ["dep:sbproxy-classifiers"]
 # guardrail. Shares the ONNX runtime already pulled in by
 # `inprocess-embed`, so enabling it adds no new dependency.
 inprocess-classify = ["dep:sbproxy-classifiers"]
+# WOR-2098: route-scoped RAG retrieval. `rag` pulls in the runtime crate
+# and the per-pipeline registry in `rag_runtime`; the `rag-*` features
+# select individual embedding and vector-store adapters, and `rag-full`
+# turns on every documented provider (the `sbproxy` binary's default).
+# Off by default so library consumers keep RAG out of their graph.
+rag = ["dep:sbproxy-rag"]
+rag-embedding-openai = ["rag", "sbproxy-rag/embedding-openai"]
+rag-embedding-compatible = ["rag", "sbproxy-rag/embedding-compatible"]
+rag-embedding-cohere = ["rag", "sbproxy-rag/embedding-cohere"]
+rag-embedding-bedrock = ["rag", "sbproxy-rag/embedding-bedrock"]
+rag-embedding-vertex = ["rag", "sbproxy-rag/embedding-vertex"]
+rag-vector-chroma = ["rag", "sbproxy-rag/vector-chroma"]
+rag-vector-pinecone = ["rag", "sbproxy-rag/vector-pinecone"]
+rag-vector-qdrant = ["rag", "sbproxy-rag/vector-qdrant"]
+rag-vector-redis = ["rag", "sbproxy-rag/vector-redis"]
+rag-vector-weaviate = ["rag", "sbproxy-rag/vector-weaviate"]
+# WOR-2100: authoritative payment settlement. `payments` pulls in the
+# billing crate's durable store, dispatch gate, authoritative service, and
+# recovery-only worker, and compiles `billing_runtime`. Each rail feature
+# adds exactly one adapter and implies `payments`.
+#
+# No payment feature joins any default set. A build that does not ask for
+# settlement carries no SQLite settlement store, no provider adapters, and
+# no recovery worker, and `proxy.payments` in a configuration document
+# still parses so `sbproxy validate` reads the same file on every build.
+# The runtime assembly is where a configured-but-not-compiled rail becomes
+# a startup failure naming the missing feature.
+payments = ["dep:sbproxy-billing", "sbproxy-billing/runtime", "sbproxy-modules/payments"]
+payment-mpp = ["payments", "sbproxy-billing/mpp", "sbproxy-modules/payment-mpp"]
+payment-stripe = ["payments", "sbproxy-billing/stripe"]
+payment-x402 = ["payments", "sbproxy-billing/x402"]
+payment-lightning-cln = ["payments", "sbproxy-billing/lightning-cln"]
+payment-lightning-lnd = ["payments", "sbproxy-billing/lightning-lnd"]
+rag-full = [
+  "rag-embedding-openai",
+  "rag-embedding-compatible",
+  "rag-embedding-cohere",
+  "rag-embedding-bedrock",
+  "rag-embedding-vertex",
+  "rag-vector-chroma",
+  "rag-vector-pinecone",
+  "rag-vector-qdrant",
+  "rag-vector-redis",
+  "rag-vector-weaviate",
+]
 
 [dependencies]
 sbproxy-plugin.workspace = true
@@ -92,6 +133,23 @@ sbproxy-middleware.workspace = true
 sbproxy-observe.workspace = true
 sbproxy-extension.workspace = true
 sbproxy-ai.workspace = true
+# WOR-2127: the metering vocabulary the `proxy.attestation` block lowers
+# into. The conversion lives here rather than in sbproxy-meter, which
+# depends on no workspace crate so an operator metering a plain REST API
+# can compile it without the gateway; deriving JsonSchema on its types
+# would end that. Acyclic: the edge only runs this way.
+sbproxy-meter.workspace = true
+# WOR-2098: route-scoped RAG runtime construction, pulled in only by the
+# `rag` feature. The workspace entry ships `default-features = false`, so
+# provider adapters activate solely through the `rag-*` forwards above.
+sbproxy-rag = { workspace = true, optional = true }
+# WOR-2100: authoritative payment settlement, pulled in only by the
+# `payments` feature. The workspace entry ships `default-features = false`,
+# so the durable store, the service, the recovery worker, and every rail
+# adapter activate solely through the forwards above. The billing crate
+# depends on none of the crates in this graph, which is what keeps the
+# dependency acyclic while core owns the runtime assembly.
+sbproxy-billing = { workspace = true, optional = true }
 # WOR-1680: own the local model-host runtime (spawn/supervise engines
 # for serve: providers) as a process-global built at dispatch time.
 sbproxy-model-host.workspace = true

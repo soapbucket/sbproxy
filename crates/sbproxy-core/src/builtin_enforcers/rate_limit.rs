@@ -159,6 +159,7 @@ pub(crate) fn rate_limit_key_from_cel(
         &mut cel_ctx,
         ctx.resolved_inbound_key
             .as_deref()
+            .or(ctx.native_key_policy_record.as_deref())
             .map(|record| record.key_id.as_str()),
     );
     let features = FeatureFlagsView {

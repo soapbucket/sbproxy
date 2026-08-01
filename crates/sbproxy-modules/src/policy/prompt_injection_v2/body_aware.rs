@@ -420,7 +420,6 @@ impl PromptInjectionV2Policy {
 #[cfg(test)]
 mod tests {
     use super::super::heuristic::HeuristicDetector;
-    use super::super::PromptInjectionAction;
     use super::*;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -494,8 +493,16 @@ mod tests {
             .with_threshold(0.5)
     }
 
+    // Same detector and threshold as `heuristic_policy`, built the way
+    // an operator's config builds it so `action: block` is proved to
+    // survive deserialization rather than being poked in after it.
     fn block_policy() -> PromptInjectionV2Policy {
-        heuristic_policy().with_action(PromptInjectionAction::Block)
+        PromptInjectionV2Policy::from_config(serde_json::json!({
+            "detector": "heuristic-v1",
+            "threshold": 0.5,
+            "action": "block",
+        }))
+        .expect("the test policy config must compile")
     }
 
     #[test]

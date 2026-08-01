@@ -1,5 +1,5 @@
 # agent_budget policy
-*Last modified: 2026-05-31*
+*Last modified: 2026-08-01*
 
 ![70 rapid requests from a Cursor user agent: 200s until the per-agent budget trips and the rest return 429](assets/agent-budget.gif)
 
@@ -47,9 +47,94 @@ The policy reports its verdict to the dispatcher; the dispatcher maps the verdic
 | Verdict | `on_exceed` | HTTP outcome |
 |---|---|---|
 | Within budget | n/a | pass through |
-| Cap fired, deny | `deny` | 429 with `Retry-After` |
+| Cap fired, deny | `deny` | 429, JSON body naming the cap that fired |
 | Cap fired, log | `log` | pass through, metric increments |
 | Cap fired, downgrade | `downgrade` | dispatcher picks the cheaper AI provider for this request |
+
+## Calling it
+
+The runnable configuration is
+[`examples/agent-budget/`](../examples/agent-budget/): the block above with
+`requests_per_minute: 60`, `burst: 10`, `on_exceed: deny`, and
+`on_anonymous: skip`, in front of a plain proxy origin. Start it:
+
+```bash
+make run CONFIG=examples/agent-budget/sb.yml
+```
+
+The budget keys on the resolved `agent_id`, so what identifies the caller is
+the `User-Agent`, not the address it comes from. Send requests fast enough to
+outrun the refill:
+
+```bash
+for i in $(seq 1 70); do
+  curl -s -o /dev/null -w '%{http_code} ' \
+    -H 'Host: ai.local' \
+    -H 'User-Agent: Cursor/0.42.0' \
+    http://127.0.0.1:8080/anything
+done
+```
+
+The bucket starts full at 60 and refills at one token per second, so the first
+60 pass straight through and after that the loop is throttled to roughly the
+refill rate. A run that takes about twenty seconds prints something close to:
+
+```
+200 200 200 ... 200 429 429
+```
+
+The exact request that first returns `429` depends on how fast the loop runs,
+because tokens keep arriving while it does. That is the point of a token
+bucket rather than a fixed window: there is no cliff at a request count, only
+a sustained rate.
+
+Ask for the failing response in full to see what a denial says:
+
+```bash
+curl -sS -i \
+  -H 'Host: ai.local' \
+  -H 'User-Agent: Cursor/0.42.0' \
+  http://127.0.0.1:8080/anything
+```
+
+```http
+HTTP/1.1 429 Too Many Requests
+content-type: application/json
+content-length: 54
+
+{"error":"agent budget exceeded: requests per minute"}
+```
+
+The body names which of the three caps fired, so `requests_per_minute`,
+`tokens_per_hour`, and `burst` are distinguishable from the client side
+without reading the proxy log. The other two read
+`agent budget exceeded: tokens per hour` and `agent budget exceeded: burst`.
+There is no `Retry-After` header on this response; the refill rate is
+`requests_per_minute / 60` per second and is not advertised per request.
+
+Change only the `User-Agent` and the budget starts over, because that resolves
+to a different `agent_id` and therefore a different bucket. Send the two
+back to back, straight after the drain above, so the drained bucket has not had
+a second to refill:
+
+```bash
+curl -s -o /dev/null -w 'cursor=%{http_code} ' \
+  -H 'Host: ai.local' -H 'User-Agent: Cursor/0.42.0' \
+  http://127.0.0.1:8080/anything
+curl -s -o /dev/null -w 'claudebot=%{http_code}\n' \
+  -H 'Host: ai.local' -H 'User-Agent: ClaudeBot/1.0' \
+  http://127.0.0.1:8080/anything
+# cursor=429 claudebot=200
+```
+
+Wait a second between those two and the first one returns `200` again, because
+the bucket has refilled one token. The buckets are per agent, not per client
+address: both requests came from the same machine.
+
+A request with no recognised agent resolves no `agent_id` at all, and
+`on_anonymous: skip` means the policy does not enforce against it. Set
+`on_anonymous: shared` to collapse that traffic into one fallback bucket
+instead.
 
 ## Observability
 

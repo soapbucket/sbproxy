@@ -206,3 +206,20 @@ groups:
         annotations:
           summary: "Compression value for {{ $labels.model }} has no price"
           description: "Successful compression is avoiding more than 10 estimated input tokens per second for this model, but no avoided-cost value is being recorded. Configure an input price or accept token-only value reporting for this model."
+
+      - alert: SBProxyOcspStapleStale
+        # WOR-2086: the staple refresh cadence is 12h, so an age past
+        # 26h means at least two consecutive refresh cycles failed (or
+        # the refresh task itself died; the gauge is published by a
+        # once-a-minute tick in the same task, so a fully dead task
+        # freezes the series and the absent/stale distinction still
+        # surfaces in the dashboard). Between the refresh stopping and
+        # the staple expiring, handshakes keep succeeding, which is why
+        # nothing else fires first.
+        expr: sbproxy_ocsp_staple_age_seconds > 93600
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OCSP staple for {{ $labels.host }} is stale"
+          description: "The cached OCSP staple for {{ $labels.host }} is {{ $value | humanizeDuration }} old against a 12h refresh cadence. The refresh loop is failing or dead; clients keep accepting the old staple only until it expires."

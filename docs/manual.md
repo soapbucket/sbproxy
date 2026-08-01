@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-07-30*
+*Last modified: 2026-08-01*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -105,7 +105,23 @@ docker run --rm \
   soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
 ```
 
-On Windows, quote the host path in the volume flag (PowerShell: `-v C:\Users\you\proxy:/etc/sbproxy:ro`).
+Features that persist state on disk (the [dynamic key management](key-management.md) keystore, usage rollups) default their paths to `/var/lib/sbproxy`. Mount a volume there so that state survives container replacement:
+
+```bash
+docker run --rm \
+  -p 8080:8080 \
+  -v /path/to/config:/etc/sbproxy:ro \
+  -v sbproxy-state:/var/lib/sbproxy \
+  soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
+```
+
+Images up to v1.9.0 ship without the `/var/lib/sbproxy` directory, and the container runs as a nonroot user that cannot create it, so on those versions the mount is required for these features to start at all.
+
+Three PowerShell notes for Windows:
+
+- Quote the host path in the volume flag (`-v C:\Users\you\proxy:/etc/sbproxy:ro`).
+- `curl` is an alias for `Invoke-WebRequest` and rejects flags like `-H`; call `curl.exe` explicitly when testing the proxy (real curl ships with Windows 10 and later).
+- `export` does not exist in PowerShell. Set variables with `$env:NAME = "value"`, or pass them into the container with `-e NAME` or `--env-file`. Save any env file as UTF-8 without a byte order mark: Docker silently ignores every line of the UTF-16 files Windows PowerShell 5 produces by default with `>` redirection.
 
 ### From source
 

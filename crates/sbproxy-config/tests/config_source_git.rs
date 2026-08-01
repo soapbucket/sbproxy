@@ -305,6 +305,67 @@ fn write_hanging_git(dir: &Path) -> PathBuf {
     path
 }
 
+/// A hanging fetch must not leave its grandchildren running.
+///
+/// The fake `git` is a shell script, so the process the loader spawns is
+/// `sh` and the thing that actually sleeps is a child of that shell.
+/// Killing only the direct child reaps the shell and orphans the sleep,
+/// which then survives with the loader's scratch files still open. In
+/// production that is a process leaked on every reload against a hung
+/// remote, and a scratch directory that cannot be cleaned while it is
+/// held.
+///
+/// Asserted by pid rather than by a `pgrep` sweep so a concurrent test
+/// running its own fixture cannot make this pass or fail by accident.
+#[cfg(unix)]
+#[test]
+fn a_hanging_fetch_leaves_no_orphaned_grandchild() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake_git = write_hanging_git(dir.path());
+    let ctx = FetchContext::with_git_binary_at(&fake_git);
+    let mut source = git_source("file:///irrelevant", Some("main"));
+    if let ConfigSource::Git { timeout_secs, .. } = &mut source {
+        *timeout_secs = 1;
+    }
+
+    let before = sleeping_pids_under(dir.path());
+    let _ = load_source_blocking(&source, "", &ctx).expect_err("a hanging fetch must fail");
+
+    // The kill is asynchronous; give the group a moment to die before
+    // concluding it did not. Far below the fixture's own 20s sleep, so a
+    // surviving orphan is still unambiguous.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let after = sleeping_pids_under(dir.path());
+    let leaked: Vec<_> = after.difference(&before).collect();
+    assert!(
+        leaked.is_empty(),
+        "the timeout leaked {} orphaned process(es): {leaked:?}",
+        leaked.len(),
+    );
+}
+
+/// Pids of `sleep` processes spawned by the fake git in `scratch`.
+///
+/// Matches on the fixture's own directory so this cannot observe another
+/// test's fixture. Returns an empty set when `ps` is unavailable rather
+/// than failing, since the assertion above is about what is left over.
+#[cfg(unix)]
+fn sleeping_pids_under(scratch: &Path) -> std::collections::BTreeSet<u32> {
+    let marker = scratch.to_string_lossy().to_string();
+    let out = Command::new("ps")
+        .args(["-eo", "pid=,ppid=,command="])
+        .output();
+    let Ok(out) = out else {
+        return Default::default();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| line.contains("sleep 20") || line.contains(&marker))
+        .filter_map(|line| line.split_whitespace().next()?.parse::<u32>().ok())
+        .collect()
+}
+
 #[cfg(unix)]
 #[test]
 fn a_fetch_that_hangs_is_killed_at_the_timeout() {

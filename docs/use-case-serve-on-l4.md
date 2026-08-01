@@ -105,7 +105,7 @@ guide uses the explicit form to pin the weights file.
 
 To serve GLM instead, point the model line at a GLM GGUF repo and file the same way. Gemma is not in the built-in catalog and its repos are gated, so give it a model manifest entry instead: one reviewable file that names the source repo, a pinned revision, per-file sha256 digests, a pull policy, and, for a gated repo, your Hugging Face token as an `hf_token` secret reference rather than a literal in config. Point `serve.catalog_file` at the manifest and name its entry in `serve.models`. A curated manifest with digests doubles as a supply-chain allowlist. See [`examples/model-manifest`](../examples/model-manifest) and the manifest section of [model-host.md](model-host.md).
 
-One paragraph on why this config surface is shaped the way it is. Letting configuration start subprocesses inside a gateway that holds provider keys is a real attack surface, so it is constrained. `engine` is an allowlisted enum (`auto`, `vllm`, `sglang`, `llama_cpp`, or `embedded`), never a command string. The runtime owns typed argument templates and provisions each engine through its supported path: an operator binary, a verified release or source build, a pinned uv environment, or a digest-pinned container. Downloaded weights verify against manifest sha256 digests before an engine reads them. The full posture, including what is enforced today and what hardening remains, is in [security-model-host.md](security-model-host.md).
+One paragraph on why this config surface is shaped the way it is. Letting configuration start subprocesses inside a gateway that holds provider keys is a real attack surface, so it is constrained. `engine` is an allowlisted enum (`auto`, `vllm`, `sglang`, `llama_cpp`, `embedded`, or `mistralrs`), never a command string. The runtime owns typed argument templates and provisions each engine through its supported path: an operator binary, a verified release or source build, a pinned uv environment, or a digest-pinned container. Downloaded weights verify against manifest sha256 digests before an engine reads them. The full posture, including what is enforced today and what hardening remains, is in [security-model-host.md](security-model-host.md).
 
 ## Run it (stand-in)
 
@@ -143,7 +143,7 @@ $ sbproxy plan -f sb.yml
 Plan: 1 added, 0 changed, 0 removed. max-blast-radius: reload
 ```
 
-Exit code 2 means valid with changes present; a config that fails validation exits 3 with the findings printed. The serve-specific rejections are enforced at gateway start, before the listener takes traffic. An engine outside the allowlist (`unknown variant 'shell', expected one of 'auto', 'vllm', 'sglang', 'llama_cpp', 'embedded'`) or a `base_url` on a served provider is a fatal boot error with a message naming the fix. `validate` and `plan` going green is the part of this page that is true on every machine, GPU or none.
+Exit code 2 means valid with changes present; a config that fails validation exits 3 with the findings printed. The serve-specific rejections are enforced at gateway start, before the listener takes traffic. An engine outside the allowlist (`unknown variant 'shell', expected one of 'auto', 'vllm', 'sglang', 'llama_cpp', 'embedded', 'mistralrs'`) or a `base_url` on a served provider is a fatal boot error with a message naming the fix. `validate` and `plan` going green is the part of this page that is true on every machine, GPU or none.
 
 If `llama-server` is available on this box, go further and start the gateway:
 

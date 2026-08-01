@@ -1,12 +1,12 @@
 # LangChain with SBproxy
 
-*Last modified: 2026-07-12*
+*Last modified: 2026-07-31*
 
 A LangChain application normally talks to providers directly: `langchain-openai` calls `api.openai.com`, and each tool server is a separate connection with its own credentials. Point both sides at an SBproxy you run and every model call and every tool call crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. On the LangChain side the change is a base URL on the model and one server entry for tools.
 
 ## Chat completions through the gateway
 
-SBproxy serves an OpenAI-compatible endpoint at `/v1/chat/completions`, so `ChatOpenAI` from the `langchain-openai` package works unchanged. Set `base_url` to the gateway and pass your virtual key as the `api_key`:
+SBproxy serves an OpenAI-compatible endpoint at `/v1/chat/completions`, so `ChatOpenAI` from the `langchain-openai` package works unchanged: set `base_url` to the gateway and pass your virtual key as the `api_key`. Save this as `chat.py`:
 
 ```python
 from langchain_openai import ChatOpenAI
@@ -23,7 +23,7 @@ print(reply.content)
 
 Install the package with `pip install langchain-openai`. Streaming, `bind_tools`, structured output, and every other `ChatOpenAI` feature ride the same wire format, so nothing else in your chains changes.
 
-The gateway needs an origin with an `ai_proxy` action and a credential for the virtual key. Save this as `sb.yml`, export `OPENAI_API_KEY`, and start the gateway with `sbproxy sb.yml` (`sbproxy validate sb.yml` checks the file without booting, and fails loud if the variable is unset):
+The gateway needs an origin with an `ai_proxy` action and a credential for the virtual key. Save this as `sb.yml`:
 
 ```yaml
 proxy:
@@ -54,9 +54,93 @@ origins:
           allow: [gpt-4o-mini]
 ```
 
-Origin keys match the `Host` header and hostname matching strips the port, so `"127.0.0.1"` matches a client whose base URL is `http://127.0.0.1:8080`. When the gateway runs on another machine, key the origin with the hostname your application uses. The real provider key comes from the environment through `${OPENAI_API_KEY}` interpolation; never put a raw provider key in the file.
+Origin keys match the `Host` header and hostname matching strips the port, so `"127.0.0.1"` matches a client whose base URL is `http://127.0.0.1:8080`. When the gateway runs on another machine, key the origin with the hostname your application uses.
+
+Two different keys appear across the two files, and you fill in both yourself:
+
+- **The virtual key** (`sk-your-virtual-key`) is a value you invent. It must be identical in two places: `api_key` in `chat.py` and `key:` under `credentials:` in `sb.yml`. Replace the placeholder with your own value in both; [Generating secret values](secrets.md#generating-secret-values) shows how to generate a strong one.
+- **The provider key** (`${OPENAI_API_KEY}`) is the real key from your provider's console. It lives only in the environment variable; the gateway reads it through `${OPENAI_API_KEY}` interpolation at startup. Never put a raw provider key in either file.
 
 Be precise about what the virtual key is doing here. When a request arrives with `Authorization: Bearer sk-your-virtual-key`, the gateway matches it to the `langchain-app` credential, enforces the `models.allow` list (a request for a model outside the list is rejected with 403 before any upstream call), stamps the request with the credential's `project` and `tags` for attribution in metrics and the ledger, and swaps in the real `${OPENAI_API_KEY}` before calling the provider. Your application never holds the provider key. The `attrs.budget` block is attribution metadata that surfaces as attribution labels on the `sbproxy_ai_*_attributed_total` metrics; enforced spend ceilings live in an action-level `budget:` block. The virtual key is not inbound authentication by itself either: a request presenting an unknown key, or no key at all, still passes through on the provider's configured key, so add an `authentication` block to the origin whenever the gateway is reachable beyond localhost. [ai-gateway.md](ai-gateway.md) covers all of this in depth.
+
+## Run it
+
+Use two terminals. In the first, set the provider key, check the config, and start the gateway:
+
+```bash
+export OPENAI_API_KEY=sk-proj-...
+sbproxy validate sb.yml
+sbproxy serve -f sb.yml
+```
+
+`validate` compiles the file without booting and fails loud when `${OPENAI_API_KEY}` is unset. `serve` stays in the foreground; startup is done when the log prints `starting sbproxy on 0.0.0.0:8080`.
+
+In the second terminal, run the script:
+
+```bash
+python chat.py
+```
+
+The model's one-sentence answer prints to the terminal. To check the gateway without Python in the loop, send the same request with curl:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk-your-virtual-key' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Say hello."}]}'
+```
+
+Either way, the request shows up in the gateway's access log, counts against the `langchain-app` credential, and appears in the `sbproxy_ai_*` metrics.
+
+**On Windows**, two of these commands differ in PowerShell:
+
+- `curl` is an alias for `Invoke-WebRequest` there, and it rejects flags like `-H`. Call `curl.exe` explicitly (real curl ships with Windows 10 and later).
+- `export` is a Unix shell builtin. Set the provider key with `$env:OPENAI_API_KEY = "sk-proj-..."` instead. When the gateway runs in Docker, pass the variable into the container with `-e OPENAI_API_KEY` or `--env-file secrets.env` on the `docker run` command line. If you write an env file, save it as UTF-8 without a byte order mark: Docker silently ignores every line of the UTF-16 files that Windows PowerShell 5's `>` redirection produces by default.
+
+## Anthropic and every other provider
+
+`ChatOpenAI` is not tied to OpenAI models. It is a client for the OpenAI wire format, and the gateway speaks that format for every provider it fronts; the translation to each provider's native API happens inside the gateway. The same class drives Claude, Gemini, Mistral, or a local model: declare the provider in the config and request its model by name.
+
+```yaml
+origins:
+  "127.0.0.1":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          models:
+            - claude-haiku-4-5
+```
+
+```python
+llm = ChatOpenAI(
+    model="claude-haiku-4-5",
+    base_url="http://127.0.0.1:8080/v1",
+    api_key="sk-your-virtual-key",
+)
+```
+
+The gateway routes on the request's `model` field, calls Anthropic's native API upstream, and answers in the OpenAI shape `ChatOpenAI` expects. Add each new model to the credential's `models.allow` list too, or the gateway rejects the request with a 403 before any upstream call.
+
+The gateway also serves Anthropic's native Messages API at `/v1/messages`, so `langchain-anthropic` works without switching classes. Point `ChatAnthropic` at the gateway host with no path suffix; the Anthropic SDK appends `/v1/messages` itself:
+
+```python
+from langchain_anthropic import ChatAnthropic
+
+llm = ChatAnthropic(
+    model="claude-haiku-4-5",
+    base_url="http://127.0.0.1:8080",
+    api_key="sk-your-virtual-key",
+)
+```
+
+Two caveats on the native path. Releases through v1.9.0 answered `/v1/messages` in the OpenAI response shape, which Anthropic clients cannot parse; use a newer release for this path, or stay on `ChatOpenAI`, which works on every version. And the Anthropic SDK presents its key in the `x-api-key` header, which the static `credentials:` block does not read (it reads `Authorization: Bearer`), so on this path the virtual key is ignored unless you enable [dynamic key management](key-management.md), whose default header sweep includes `x-api-key`.
 
 ## MCP tools through the gateway
 

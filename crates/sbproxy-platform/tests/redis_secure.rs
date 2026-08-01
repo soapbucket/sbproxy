@@ -25,6 +25,7 @@ fn authenticated_dsn(port: u16, password: &str, database: u8) -> String {
 }
 
 fn store_for(dsn: &str, tls: RedisTlsConfig) -> RedisKVStore {
+    support::install_default_crypto_provider();
     let connection = ValidatedRedisConnection::new(dsn, tls)
         .unwrap_or_else(|_| panic!("secure Redis test connection configuration was rejected"));
     let mut config = RedisConfig::new(connection);
@@ -36,6 +37,7 @@ fn store_for(dsn: &str, tls: RedisTlsConfig) -> RedisKVStore {
 }
 
 fn pooled_store_for(dsn: &str, tls: RedisTlsConfig, pool_size: usize) -> RedisKVStore {
+    support::install_default_crypto_provider();
     let connection = ValidatedRedisConnection::new(dsn, tls)
         .unwrap_or_else(|_| panic!("secure Redis test connection configuration was rejected"));
     let mut config = RedisConfig::new(connection);

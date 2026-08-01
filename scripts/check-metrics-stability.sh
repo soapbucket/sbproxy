@@ -11,7 +11,10 @@ ACTUAL="$(mktemp -t sbproxy-metrics-stability.XXXXXX)"
 trap 'rm -f "$ACTUAL"' EXIT
 
 cd "$ROOT_DIR"
-cargo run -q -p sbproxy-observe --bin generate-metrics-stability > "$ACTUAL"
+# shellcheck source=scripts/lib/workspace-bin.sh
+. "$ROOT_DIR/scripts/lib/workspace-bin.sh"
+run_workspace_bin generate-metrics-stability \
+  -p sbproxy-observe --bin generate-metrics-stability > "$ACTUAL"
 
 if [ ! -f "$EXPECTED" ]; then
   echo "metrics stability catalogue is missing: $EXPECTED" >&2

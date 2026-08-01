@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-07-23*
+*Last modified: 2026-08-01*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -288,8 +288,8 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 | `sbproxy_judge_latency_seconds_bucket` | 240 | Labels: `provider`, `cached`; histogram buckets 100ms..30s. Per-judge call latency. |
 | `sbproxy_judge_cost_usd` | 10 | Labels: `provider`. Counter; per-provider judge spend in USD. |
 | `sbproxy_judge_budget_exhausted_total` | 40 | Labels: `tenant`. Counts judge calls refused because the per-tenant judge budget was exhausted. |
-| `sbproxy_ai_tokens_attributed_total` | 8 000 | Labels: `origin`, `provider`, `model`, `direction` (input\|output), `project`, `feature`, `team`, `agent_type`, `environment`. `origin` is the config hostname the request arrived on, so it is bounded by the config. The unified attribution token counter for AI traffic; same shape as the non-AI `sbproxy_tokens_attributed_total` but tagged with provider / model. |
-| `sbproxy_ai_cost_dollars_attributed_total` | 8 000 | Labels: same shape as `sbproxy_ai_tokens_attributed_total` but valued in USD. Pair with the tokens counter to derive the per-attribution unit cost. |
+| `sbproxy_ai_tokens_attributed_total` | 8 000 | Labels: `origin`, `provider`, `model`, `direction` (input\|output), `project`, `feature`, `team`, `agent_type`, `environment`, `agent_id`. `origin` is the config hostname the request arrived on, so it is bounded by the config. `agent_id` is appended last because the label list is positional. Note it is bounded differently from the other `agent_*` labels: those pass through the runtime cardinality limiter, and this one does not, because it is set in `sbproxy-ai`, which does not depend on `sbproxy-observe`. What bounds it is the rule that only a verified agent identity is ever written. An unverified caller names itself, so honouring the name would let one caller mint an agent per request and push every real agent into `__other__` permanently. Unverified spend records under the empty label here and keeps its claimed identity in the usage ledger instead, beside the flag saying it was not verified. The unified attribution token counter for AI traffic; same shape as the non-AI `sbproxy_tokens_attributed_total` but tagged with provider / model. |
+| `sbproxy_ai_cost_dollars_attributed_total` | 8 000 | Labels: same shape as `sbproxy_ai_tokens_attributed_total` but valued in USD, and without `direction`. Pair with the tokens counter to derive the per-attribution unit cost. `sum by (agent_id)` over this counter is the Prometheus answer to "which agent spent this"; the durable rollups below answer the same question across restarts. |
 | `sbproxy_ai_wasted_tokens_total` | 8 000 | Labels: `kind` (cancelled\|retried\|cached\|guardrail_blocked\|other) plus the standard attribution labels. Counts tokens spent that did NOT survive to a useful response. Drives the FOCUS waste-signal export. |
 | `sbproxy_ai_wasted_cost_dollars_total` | 8 000 | Same shape as `sbproxy_ai_wasted_tokens_total` but valued in USD. |
 | `sbproxy_ai_cascade_tier_outcomes_total` | 200 | Labels: `tier` (the cascade-rule tier name, sanitised), `outcome` (advanced\|blocked\|served). Counts each cascade-rule tier outcome the AI router observed. |
@@ -302,9 +302,17 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 | `sbproxy_ai_shadow_timeout_total` | 1 | Counter; shadow evaluations dropped because the per-eval timeout fired. |
 | `sbproxy_ai_token_estimate_error_ratio_bucket` | 200 | Labels: `model`; histogram buckets `(estimate - actual) / actual` between -1 and +1. Drives the pre-flight estimator's accuracy alert. |
 
-Hard rule: `request_id`, `session_id`, and `user_id` are never label values on Prometheus metrics; they live as span attributes (under traces) and log fields (under logs). `agent_id` IS a label, but only in its sanitized form: values are bounded to the agent-class registry plus the reserved sentinels, and anything outside that set demotes rather than minting a new series. Raw high-cardinality identifiers (a per-request UA string, an unregistered agent name) never become label values.
+Hard rule: run-scoped identifiers are never label values on Prometheus metrics. That covers run ids, task ids, context ids, session ids, conversation ids, trace and span ids, and request or correlation ids. Each takes one distinct value per run and never repeats, so as a label it mints one time series per run, and those series outlive the run by the whole retention window. They belong on spans (under traces), on log lines (under logs), and in durable per-request records, where reconstructing a single run is exactly the point.
+
+That rule used to be prose here and nowhere else, and prose does not fail a build. It is now executable: `run_scoped_label_gaps` in `crates/sbproxy-observe/src/metric_registry.rs` scans the whole metric table, and `no_metric_carries_a_run_scoped_identifier_label` in `crates/sbproxy-observe/tests/metric_drift.rs` asserts it. Look there before adding a label. The matcher has two halves. First, an exact (case-insensitive) list of run-scoped label names, listing every spelling that has shown up in this codebase or the specs it implements: `run_id`, `runid`, `ctx_id`, and the bare `run`. Second, one anchored structural rule: a label ending `_id`, `_uuid`, or `_guid` is forbidden when the underscore segment immediately before that suffix is a run-scoped stem. The anchoring is what makes it safe to generalize. It catches `a2a_task_id` and `parent_request_id`, and it leaves `api_key_id`, `agent_id`, `node_id`, `policy_id`, and `tenant_id` alone, because the segment before their suffix is `key`, `agent`, `node`, `policy`, or `tenant`. Fix a failure by dropping the label, not by giving it a cardinality budget: a label the budget table has never heard of falls through to the workspace default of 1000, so the run id would be admitted for 1000 write-once series and then read `__other__` forever, which looks like data and is not.
+
+A bounded-but-large dimension is a different argument and is not covered by that guard. `user` is the clearest case: it is bounded by user count, not by traffic, and `sbproxy_tokens_attributed_total` carries it as a label today. Dimensions in that class are governed at runtime by the cardinality budget in `crates/sbproxy-observe/src/cardinality.rs` rather than forbidden outright. `agent_id` is the same class with a tighter bound: it IS a label, but only in its sanitized form, with values bounded to the agent-class registry plus the reserved sentinels, and anything outside that set demotes rather than minting a new series. Raw high-cardinality identifiers (a per-request UA string, an unregistered agent name) never become label values.
+
+That distinction is what makes per-agent cost attribution expressible at all. An agent is a unit of spend, so `agent_id` sits on the attributed token and cost counters, budgeted at 200 distinct values. The identifier of one *run* of that agent is not, and the difference is the whole rule: the agent is a fixture of the system and its label count grows with how many agents you deploy, while a run id grows with traffic. Both facts about a request are kept, in the two places that can afford them: the bounded one on the metric, the per-run one on the span and in the durable per-request record. The guard reads the label name to tell them apart, and it lets `agent_id` through because the segment before its `_id` suffix is `agent` rather than a run-scoped stem.
 
 When a budget is exhausted the offending label demotes to `__other__` and `sbproxy_label_cardinality_overflow_total` increments. The metric update still happens; a demoted bucket is preferable to a missing one because gaps look like real traffic dips.
+
+Forbidding the label does not mean losing the identifier. A run id reaches the AI span as `session.id` and the access log as `a2a_context_id`, which is where reconstructing one run is exactly the point. The one place it cannot reach is an outbound request header on the hop that learned it: the A2A `contextId` lives in the JSON-RPC request body, the body is parsed at the body phase, and the body phase runs after the upstream request header has already been assembled and sent. Run correlation between hops rides the W3C trace context instead. "[The phase constraint: a run id cannot ride an outbound header](#the-phase-constraint-a-run-id-cannot-ride-an-outbound-header)" under Traces has the detail.
 
 ### Fleet totals across a cluster
 
@@ -314,7 +322,9 @@ For deployments running the mesh key tier without a Prometheus, one node can rep
 
 ### Durable usage rollups and windowed spend
 
-Prometheus counters are process-lifetime, so on their own the admin Spend page zeroes at every restart. The proxy therefore also folds every AI request into durable spend rollups: hour buckets keyed by provider, model, tenant, team, credential id, and project, each aggregating request counts, tokens by direction, cost in micro-USD, and a closed outcome split (`ok` / `blocked` / `error`). Buckets live in an embedded database file; hourly buckets compact into daily buckets past the hourly retention, and daily buckets prune past the daily retention. Rows carry no prompt content and no raw key material (credential id only), so the file is safe to back up and ship, and the write path is a bounded queue drained off the data plane (a full queue drops the event and increments `sbproxy_telemetry_dropped_total{kind="usage_rollup"}` rather than blocking traffic).
+Prometheus counters are process-lifetime, so on their own the admin Spend page zeroes at every restart. The proxy therefore also folds every AI request into durable spend rollups: hour buckets keyed by origin, provider, model, tenant, team, credential id, project, and agent id, each aggregating request counts, tokens by direction, cost in micro-USD, and a closed outcome split (`ok` / `blocked` / `error`). Buckets live in an embedded database file; hourly buckets compact into daily buckets past the hourly retention, and daily buckets prune past the daily retention. Rows carry no prompt content and no raw key material (credential id only), so the file is safe to back up and ship, and the write path is a bounded queue drained off the data plane (a full queue drops the event and increments `sbproxy_telemetry_dropped_total{kind="usage_rollup"}` rather than blocking traffic).
+
+The agent id is the agent-as-unit dimension: it makes "which agent spent this" a durable question rather than one that only holds until the next restart. It carries the same sanitized, bounded value as the `agent_id` metric label described under the cardinality budget above, so the rollup answer and the Prometheus answer agree, and a request with no agent identity lands in the empty segment alongside the rows written before the dimension existed.
 
 ```yaml
 proxy:
@@ -335,9 +345,30 @@ GET /api/usage/spend?window=24h&group_by=model
 GET /api/usage/spend?from=1760000000&to=1760086400&group_by=team
 ```
 
-`window` is one of `1h | 24h | 7d | 30d`; `from` / `to` are Unix seconds and override the window; `group_by` is one of `provider | model | tenant | team | api_key | project | origin | total`. Rollup rows written by builds that predate the `origin` dimension group under the empty segment. The response carries `bucket_secs` (3600 while the window is inside the hourly retention, 86400 past it), time-ordered `buckets` (`ts_secs`, `group`, `requests`, `tokens_in`, `tokens_out`, `cost_usd_micros`, `ok`, `blocked`, `error`), and window `totals` in the same shape. Calling `/api/usage/spend` with no parameters keeps returning the legacy process-lifetime totals. The admin Spend page renders this history with a range selector, so yesterday's spend still renders after a restart.
+`window` is one of `1h | 24h | 7d | 30d`; `from` / `to` are Unix seconds and override the window; `group_by` is one of `provider | model | tenant | team | api_key | project | origin | agent | total`. Rollup rows written by builds that predate the `origin` or `agent` dimension group under the empty segment, so a history that spans an upgrade shows the older traffic as one unattributed series rather than dropping it. The response carries `bucket_secs` (3600 while the window is inside the hourly retention, 86400 past it), time-ordered `buckets` (`ts_secs`, `group`, `requests`, `tokens_in`, `tokens_out`, `cost_usd_micros`, `ok`, `blocked`, `error`), and window `totals` in the same shape. Calling `/api/usage/spend` with no parameters keeps returning the legacy process-lifetime totals. The admin Spend page renders this history with a range selector, so yesterday's spend still renders after a restart.
 
 The bucket schema doubles as the ingestion contract for external spend pipelines: the same events feed the rollups and the usage sinks, so a durable analytics store can consume the identical dimensions.
+
+### Meter metrics, and why they are not the billing record
+
+When `proxy.attestation` is on, the proxy meters consumption and writes a signed, hash-chained receipt for every settled call. Six families report on that machinery.
+
+| Metric | Labels | What it tells you |
+|---|---|---|
+| `sbproxy_meter_units_total` | `tenant_id`, `unit`, `source` | Units counted, with provenance on the dashboard. `source` is `measured`, `route_weight`, or `origin_header`. |
+| `sbproxy_meter_receipts_total` | `tenant_id`, `outcome`, `billable` | What your billable table is actually doing. Attempts that bill nothing are counted too, so a free call and an unseen call do not look the same. |
+| `sbproxy_meter_chain_gap_total` | `tenant_id`, `failure_mode` | The meter owed a record and could not write it. Nonzero means unbilled consumption. Alert on this one. |
+| `sbproxy_meter_divergence_total` | `tenant_id` | The unit counter and the chain disagree past the export window. |
+| `sbproxy_meter_chain_seq` | none | Chain head. Flat under traffic means a stalled meter, which no counter shows on its own. |
+| `sbproxy_meter_append_duration_seconds` | none | Append latency, including lock wait. This is where backpressure on the metering path becomes visible. |
+
+**These metrics are not the billing record.** The signed chain is. Metrics are lossy by design in three ways that all look like healthy data on a dashboard: OTLP export drops a batch when the collector is unreachable and carries on, cumulative counters reset to zero when the process restarts, and aggregation windows destroy the individual receipts that went into a sum. A total read off a panel can be short by a deploy's worth of traffic with nothing anywhere saying so. Reconcile invoices against the chain. Use these to find out whether the meter is healthy, which is the one question the chain cannot answer about itself.
+
+Both surfaces carry all six: the OTLP push path exports them as `sbproxy.meter.*` instruments when `telemetry.export_metrics` is on, and `/metrics` scrapes them under the names above. The two are not equally reliable under load. `/metrics` degrades at peak volume, and billing visibility that vanishes exactly when volume is highest is worse than no dashboard, because its absence reads as quiet rather than as a gap. Enable the OTLP push path for anything you intend to act on.
+
+`route` is not a label on any of them, on purpose. `tenant x route x unit x source x outcome` is a cardinality bomb and route is by far the largest factor in it. Route lives on the receipt instead, and the receipt is reachable: `sbproxy_meter_append_duration_seconds_bucket` carries a trace exemplar, the trace carries `claim_id`, and `claim_id` names the exact signed receipt. A spike on the panel is three clicks from the document that explains it.
+
+Divergence is an alert, never enforcement. If the counter and the chain disagree, either receipts were dropped or something is recording units outside the chain. Both are worth knowing and neither is worth failing traffic over, so divergence never trips the configured `failure_mode` and never refuses a request. The shipped rules are `SBPROXY-METER-CHAIN-GAP` (page), `SBPROXY-METER-DIVERGENCE` (ticket), and `SBPROXY-METER-STALLED` (ticket) in `deploy/alerts/alerting-rules.yml`.
 
 ## Logs
 
@@ -377,6 +408,17 @@ AI request lines additionally carry the spend and governance columns log-only co
 | `guardrail_action` | string enum | What the guardrail did. `block` is the only live action today; `redact`, `rewrite`, and `hold` are reserved. |
 
 The same three columns ride the `RequestEvent` envelope and the admin request ring, and `/api/requests` accepts `guardrail_action=` and `guardrail_category=` as exact-match query filters alongside the existing `status`, `method`, and `path` params.
+
+Agent-to-agent lines additionally carry the run correlation columns, so a multi-agent run can be reassembled from logs alone:
+
+| Field | Type | Notes |
+|---|---|---|
+| `a2a_context_id` | string | The A2A `contextId` this hop carried, capped at 128 bytes. The run-scoped grouping key: task ids nest under it, so joining lines on it reassembles one run. Absent for traffic that carried no A2A envelope, and for A2A hops on an origin that never buffers the request body. |
+| `a2a_identity_verified` | boolean | Whether the hop's identity fields came from a source the proxy trusts. Absent for non-A2A traffic. |
+
+`session_id` remains the caller-scoped key and keeps its own column. A consumer that wants "the key that groups related traffic" should read `a2a_context_id` first and fall back to `session_id`, which is the same precedence the `session.id` span attribute uses.
+
+Read `a2a_identity_verified` before aggregating on `a2a_context_id`. An unverified caller picks its own context id, so it can merge its usage into another caller's run or shard one run across unbounded distinct ids. A per-run total computed without that filter is a number the caller chose. The `sbproxy_a2a_hops_total` metric splits hops the same way with its `allow:verified` and `allow:unverified` decision labels.
 
 Event types pinned for Wave 1: `request_started`, `request_completed`, `request_error`, `policy_evaluated`, `policy_blocked`, `action_challenge_issued`, `action_redeemed`, `ledger_call`, `audit_emit`, `notify_dispatch`, `boot`, `config_reload`, `health_status_change`.
 
@@ -664,7 +706,7 @@ Span names follow `sbproxy.<pillar>.<verb>`:
 
 Span attributes include the OTel semantic conventions (`http.request.method`, `http.response.status_code`, `server.address`) plus the SBproxy-specific set (`sbproxy.request_id`, `sbproxy.tenant_id`, `sbproxy.route`, `sbproxy.agent_id`, `sbproxy.agent_class`, `sbproxy.rail`, `sbproxy.shape`, `sbproxy.ledger.idempotency_key`).
 
-High-cardinality attributes (`request_id`, `agent_id`) are span attributes only, never Prometheus labels.
+Per-request attributes such as `request_id` are span attributes only, never Prometheus labels; the Hard rule under the cardinality budget above is the long form. `agent_id` is the exception that proves the shape of that rule: it rides the span in full fidelity and it is also a Prometheus label, because the label carries only the sanitized, budgeted form.
 
 ### AI gateway spans (gen_ai / OpenInference)
 
@@ -681,6 +723,7 @@ The AI request span (`ai.request`) follows the OpenTelemetry GenAI semantic conv
 | Content (opt-in) | role-aware `gen_ai.*.message` span events | `input.value`, `output.value`, `llm.input_messages.*`, `llm.output_messages.*` |
 | Failure | `otel.status_code = ERROR` plus `error.type` (`guardrail_blocked`, `rate_limited`, `content_filter`, `budget_exceeded`, `upstream_5xx`, `timeout`; generic dispatch failures use `provider_error`) | n/a |
 | Tenant | `sbproxy.tenant_id` | n/a |
+| Run identity | `sbproxy.run.id_source`, `sbproxy.a2a.task_id`, `sbproxy.a2a.caller_agent_id`, `sbproxy.a2a.identity_verified` | `session.id`, `graph.node.id`, `graph.node.parent_id` |
 
 Token counting happens at the proxy (not trusted from the upstream's self-report), cost is derived from the catalog stamped in `sbproxy.ai.pricing_version`, and the exact span value is `sbproxy.ai.cost_usd_micros` in micro-USD (`1e-6` USD). The GenAI attribute set is pinned by a conformance test to OpenTelemetry GenAI semconv `1.36.0`, with OpenInference pinned to a source revision in `crates/sbproxy-ai/src/tracing_spans.rs`, so emitted spans cannot silently drift off-spec.
 
@@ -697,6 +740,43 @@ emits one `gen_ai.tool.message` span event per call with the tool-call id
 and name (both bounded; at most 16 events per completion). Call arguments
 join the event only under the same `trace_content` gate and redaction as
 the message content.
+
+### Run identity across a multi-agent run
+
+One user request handled by several agents produces one trace per hop. Without a shared key those hops are unrelated traces, and the spend, the latency, and the blast radius of the whole run are invisible. SBproxy emits the OpenInference run attributes so a backend can put them back together.
+
+| Attribute | What it holds |
+|---|---|
+| `session.id` | The key that groups related traces. The A2A `contextId` when the hop carried one, otherwise the capture-session identifier. |
+| `sbproxy.run.id_source` | Which of the two filled `session.id`: `a2a_context_id` or `capture_session`. |
+| `graph.node.id` | This hop's own identifier. |
+| `graph.node.parent_id` | The calling hop's identifier. Unset means this hop is the root of the call graph, which is what OpenInference specifies. |
+| `sbproxy.a2a.task_id` | The caller-assigned A2A task id, when one was asserted. |
+| `sbproxy.a2a.caller_agent_id` | Which agent made the call. The claimed identity, so read it with `sbproxy.a2a.identity_verified`. The metric label of the same name is stricter and carries only verified identities. |
+| `sbproxy.a2a.identity_verified` | Whether the hop's identity fields came from a source the proxy trusts. Absent on traffic that carried no agent-to-agent envelope. |
+
+The two node fields come from different namespaces, which is worth knowing before you build a graph query on them. `graph.node.id` is the proxy's own request id for this hop. `graph.node.parent_id` is whatever the calling agent asserted in `x-a2a-parent-request-id`, honoured only when the immediate peer is in `proxy.trusted_proxies`, and it is an id in the agents' namespace rather than the proxy's. Do not close the edge by having callers echo back the request id the proxy gave them. `request_id` is adopted from the inbound correlation header when one is present, so a caller that returns it arrives with a parent equal to this hop's own node id, and the proxy drops that edge rather than emit a node that is its own caller. Until a node id the caller cannot supply lands, treat `graph.node.parent_id` as the caller's claim about its own topology and read `sbproxy.a2a.identity_verified` alongside it.
+
+The two grouping keys are ordered rather than merged. An A2A `contextId` names a whole run, because A2A task ids nest under it, so it wins when present. The capture session names one caller's traffic, and it fills the slot otherwise, which keeps `session.id` populated on ordinary traffic instead of empty on everything that is not an agent hop. `sbproxy.run.id_source` tells you which meaning you are looking at.
+
+The capture session keeps its own separate `sbproxy.session_id` attribute and is never overwritten by a run id. A capture session is a validated ULID with a cardinality budget, and it also feeds the semantic-cache key and the cache-bypass decision, so writing a caller-chosen value into it would silently repartition the cache. The two attributes coexist and answer different questions.
+
+**Read the trust flag before you trust the id.** An unverified caller picks its own `contextId`. It can therefore merge its spend into somebody else's run, or shard one run across unbounded distinct ids to make a per-run budget meaningless. `sbproxy.a2a.identity_verified` is the same trust decision the `sbproxy_a2a_hops_total` metric partitions on with its `allow:verified` and `allow:unverified` decision labels, and it rides beside the id everywhere the id appears, including the access log. A run total computed without filtering on it is a number the caller chose.
+
+Caller-supplied identifiers are truncated to 128 bytes before they reach a span attribute, and the truncation happens once where the id is first read so every downstream surface reports the same bounded string. Run ids, context ids, and task ids are span attributes and log columns only. They must never become Prometheus labels; the bounded `route`, `spec`, `decision`, and `reason` labels are the entire metric surface for the agent-to-agent path.
+
+#### The phase constraint: a run id cannot ride an outbound header
+
+The A2A `contextId` exists in the JSON-RPC request body and nowhere else. The request headers do not carry it, which means the proxy cannot see it until it has buffered the body, and the body is buffered in `request_body_filter`. That phase runs **after** `upstream_request_filter` has already assembled and sent the upstream request header.
+
+The consequence is worth stating plainly rather than leaving for someone to discover: **the proxy cannot stamp a run id onto an outbound header on the hop it learned it.** Run correlation between hops therefore rides the W3C trace context, which the upstream request filter already injects on every proxied request, not a bespoke run header.
+
+This is a recurring boundary rather than a one-off. It is the same phase gap that made the agent-boundary `tag` action impossible (there is no header left to stamp), and that left the A2A push-notification check gated on a request body the request-filter surface can never see, so it never ran once. When a control needs the request body, it lives at the body phase and it gives up header mutation on that hop.
+
+Two follow-on effects to expect when reading traces:
+
+- On the AI gateway surface the handler completes inside `request_filter`, earlier than the body phase, so `session.id` there resolves to the capture session and `sbproxy.run.id_source` reports `capture_session`. The A2A run id for that request reaches the access log rather than the span.
+- The run id is only captured on origins that already buffer the request body. Configuring an `a2a` policy does that for A2A 1.0; an origin with no body-consuming policy does not buffer, and nothing is buffered merely to read an identifier.
 
 ### MCP execute_tool spans
 
@@ -878,7 +958,8 @@ Then send one chat request. A healthy LLM-native backend shows a trace shaped li
 trace: 9ff0a9a1c66e4c41ad3f2a8515d9d025
 span: ai.request
 attributes:
-  gen_ai.operation.name = chat_completions
+  gen_ai.operation.name = chat
+  sbproxy.ai.surface = chat_completions
   gen_ai.system = openai
   gen_ai.request.model = gpt-4o-mini
   gen_ai.response.model = gpt-4o-mini-2024-07-18
@@ -900,6 +981,8 @@ events:
   gen_ai.user.message
   gen_ai.assistant.message
 ```
+
+`gen_ai.operation.name` carries the OTel GenAI operation vocabulary, derived from the classified surface: `chat` (chat completions, Anthropic Messages, OpenAI Responses, realtime), `embeddings`, `image_generation` (generations, edits, variations), and `audio` (transcription, translation, speech). Control-plane surfaces such as `models` or `files` are not generation operations and pass their surface label through unchanged. The finer-grained endpoint identity always rides on `sbproxy.ai.surface`.
 
 On a blocked or failed generation, `otel.status_code = ERROR` and `error.type` is one of `guardrail_blocked`, `rate_limited`, `content_filter`, `budget_exceeded`, `upstream_5xx`, or `timeout`; generic dispatch failures use `provider_error`. Phoenix, Langfuse, Datadog, Honeycomb, Jaeger, and Tempo all preserve those attributes. The difference is presentation: Phoenix and Langfuse render a generation view, while the generic trace backends expose the same fields as searchable attributes.
 

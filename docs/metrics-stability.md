@@ -63,6 +63,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_a2a_chain_depth` | Histogram | `stable` | `beta` | `route`, `spec` | Distribution of A2A chain depth observed at the proxy. |
 | `sbproxy_a2a_denied_total` | Counter | `stable` | `beta` | `route`, `reason` | A2A hops denied by the a2a policy, labelled by route and reason. |
 | `sbproxy_a2a_hops_total` | Counter | `stable` | `beta` | `route`, `spec`, `decision` | A2A hops observed by the proxy, labelled by route, spec, and policy decision. |
+| `sbproxy_a2a_methods_total` | Counter | `stable` | `beta` | `route`, `method` | A2A 1.0 JSON-RPC methods observed by the proxy, labelled by route and method. |
 | `sbproxy_acme_renewal_duration_seconds` | Histogram | `stable` | `beta` | `result` | ACME renewal full-flow duration, by outcome. |
 | `sbproxy_acme_renewals_total` | Counter | `stable` | `beta` | `result` | ACME certificate renewal attempts, by outcome. |
 | `sbproxy_active_connections` | Gauge | `stable` | `stable` | none | Current active connections. |
@@ -90,7 +91,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_ai_compression_value_cost_saved_micros_total` | Counter | `stable` | `beta` | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Gross known-price target-model input cost avoided by successful AI context compression, in micro-USD. |
 | `sbproxy_ai_compression_value_tokens_saved_total` | Counter | `stable` | `beta` | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Estimated target-model input tokens avoided by successful AI context compression. |
 | `sbproxy_ai_context_poisoning_findings_total` | Counter | `stable` | `beta` | `rule_id`, `action` | Context-poisoning guardrail findings. |
-| `sbproxy_ai_cost_dollars_attributed_total` | Counter | `stable` | `beta` | `origin`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id` | AI cost in USD, partitioned by attribution tag. |
+| `sbproxy_ai_cost_dollars_attributed_total` | Counter | `stable` | `beta` | `origin`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | AI cost in USD, partitioned by attribution tag. |
 | `sbproxy_ai_cost_saved_micros_total` | Counter | `stable` | `beta` | `tenant`, `origin`, `model` | Micro-USD avoided by a semantic-cache hit. |
 | `sbproxy_ai_cost_usd_micros_total` | Counter | `stable` | `beta` | `provider`, `model`, `tenant_id` | Derived AI request cost in micro-USD. |
 | `sbproxy_ai_failovers_total` | Counter | `stable` | `beta` | `from_provider`, `to_provider`, `reason` | Provider failover events. |
@@ -110,6 +111,9 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_ai_price_source_total` | Counter | `stable` | `alpha` | `source` | Cost estimates by the price-table layer that produced the price. |
 | `sbproxy_ai_provider_attempts_total` | Counter | `stable` | `beta` | `provider`, `outcome` | AI provider attempts during failover/selection, by provider and outcome. |
 | `sbproxy_ai_provider_errors_total` | Counter | `stable` | `stable` | `provider`, `error_kind` | Per-provider AI error events. |
+| `sbproxy_ai_rag_context_bytes` | Histogram | `stable` | `beta` | none | Bytes of rendered RAG context injected into the request body. |
+| `sbproxy_ai_rag_latency_seconds` | Histogram | `stable` | `beta` | `stage`, `provider` | RAG retrieval latency in seconds, by stage (embedding, search, total) and provider. |
+| `sbproxy_ai_rag_requests_total` | Counter | `stable` | `beta` | `embedding`, `vector_store`, `outcome` | AI requests that ran RAG retrieval, by embedding provider, vector store, and closed outcome (retrieved, no_match, stale, continued, error). |
 | `sbproxy_ai_ratelimit_rejected_total` | Counter | `stable` | `beta` | `axis`, `key_hash`, `tenant`, `model` | AI gateway rate-limit rejections, partitioned by axis. |
 | `sbproxy_ai_reasoning_policy_attempts_total` | Counter | `stable` | `beta` | `provider`, `outcome` | AI provider attempts by concise-reasoning policy outcome. |
 | `sbproxy_ai_realtime_audio_seconds_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `provider`, `direction` | Cumulative audio seconds forwarded over Realtime sessions. |
@@ -130,7 +134,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_ai_surface_request_duration_seconds` | Histogram | `stable` | `stable` | `surface`, `method` | AI request latency partitioned by classified surface. |
 | `sbproxy_ai_surface_requests_total` | Counter | `stable` | `stable` | `surface`, `method` | AI gateway requests partitioned by classified surface. |
 | `sbproxy_ai_token_estimate_error_ratio` | Histogram | `stable` | `beta` | `model` | Relative error of pre-request token estimate vs upstream usage.prompt_tokens. |
-| `sbproxy_ai_tokens_attributed_total` | Counter | `stable` | `beta` | `origin`, `provider`, `model`, `surface`, `direction`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id` | AI tokens consumed, partitioned by attribution tag. |
+| `sbproxy_ai_tokens_attributed_total` | Counter | `stable` | `beta` | `origin`, `provider`, `model`, `surface`, `direction`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | AI tokens consumed, partitioned by attribution tag. |
 | `sbproxy_ai_tokens_saved_total` | Counter | `stable` | `beta` | `tenant`, `origin`, `model`, `kind` | Tokens avoided by a semantic-cache hit. |
 | `sbproxy_ai_ttft_seconds` | Histogram | `stable` | `stable` | `provider`, `model` | AI streaming time to first token. |
 | `sbproxy_ai_usage_parse_miss_total` | Counter | `stable` | `beta` | `provider`, `surface` | 2xx AI responses on a token surface that carried no parseable usage block (budget debited from an estimate). |
@@ -167,10 +171,11 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_errors_total` | Counter | `stable` | `beta` | `hostname`, `error_type` | Total errors. |
 | `sbproxy_governance_fail_open_total` | Counter | `stable` | `beta` | `key_id` | Governed admissions that bypassed reservation because the governance backend was unavailable and failure_mode is allow_unreserved. |
 | `sbproxy_grpc_status_total` | Counter | `stable` | `beta` | `code` | Observed gRPC status codes, by canonical name. |
-| `sbproxy_hooks_channel_dropped_total` | Counter | `stable` | `beta` | `reason` | Bounded channel sends dropped on the hot path, labelled by drop reason. |
+| `sbproxy_hooks_channel_dropped_total` | Counter | `config_only` (nothing emits this yet) | `beta` | `reason` | Bounded channel sends dropped on the hot path, labelled by drop reason. |
 | `sbproxy_http_framing_blocks_total` | Counter | `stable` | `beta` | `reason`, `tenant` | Requests rejected by the http_framing policy (request smuggling defense). |
 | `sbproxy_idempotency_cache_duration_seconds` | Histogram | `stable` | `beta` | `backend` | Idempotency cache lookup duration, by backend. |
 | `sbproxy_idempotency_cache_results_total` | Counter | `stable` | `beta` | `backend`, `result` | Idempotency cache outcomes, by backend and result. |
+| `sbproxy_inbound_key_requests_total` | Counter | `stable` | `beta` | `provider`, `key_mode`, `tenant_id`, `api_key_id` | Requests partitioned by caller credential mode and recognized provider. |
 | `sbproxy_inference_duration_seconds` | Histogram | `stable` | `beta` | `kind`, `backend`, `model` | Local inference latency in seconds. |
 | `sbproxy_inference_requests_total` | Counter | `stable` | `beta` | `kind`, `backend`, `model`, `result` | Local inference call counts. |
 | `sbproxy_judge_budget_exhausted_total` | Counter | `stable` | `beta` | `tenant` | Judge calls denied because the per-tenant budget was empty. |
@@ -193,6 +198,12 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_mcp_tool_dispatch_total` | Counter | `stable` | `beta` | `tool`, `result` | MCP tool dispatch attempts, by tool name and outcome. |
 | `sbproxy_mcp_tool_version_calls_total` | Counter | `stable` | `beta` | `tool`, `version`, `via`, `deprecated` | Rollout-plane tool calls, by tool, served version, resolution rung, and deprecation. |
 | `sbproxy_mcp_upstream_io_failures_total` | Counter | `stable` | `beta` | `kind` | MCP upstream IO failures absorbed by deadlines and byte caps, by kind. |
+| `sbproxy_meter_append_duration_seconds` | Histogram | `stable` | `beta` | none | Time to append one entry to the meter's signed chain, including lock wait. |
+| `sbproxy_meter_chain_gap_total` | Counter | `stable` | `beta` | `tenant_id`, `failure_mode` | Records the meter owed and could not write, by tenant and the posture in force. |
+| `sbproxy_meter_chain_seq` | Gauge | `stable` | `beta` | none | Head sequence number of the meter's signed chain. |
+| `sbproxy_meter_divergence_total` | Counter | `stable` | `beta` | `tenant_id` | Windows in which counted units and chained units disagreed, by tenant. |
+| `sbproxy_meter_receipts_total` | Counter | `stable` | `beta` | `tenant_id`, `outcome`, `billable` | Metered attempts, by tenant, outcome, and the operator's billing answer for it. |
+| `sbproxy_meter_units_total` | Counter | `stable` | `beta` | `tenant_id`, `unit`, `source` | Units the meter counted, by tenant, operator-chosen unit name, and provenance. |
 | `sbproxy_metrics_render_failures_total` | Counter | `stable` | `beta` | `reason` | Failures to encode the Prometheus scrape body. |
 | `sbproxy_mirror_state_drift_total` | Counter | `stable` | `beta` | none | Times the mirror_pending slot was unexpectedly empty when the pipeline tried to fire a shadow request. |
 | `sbproxy_model_host_active_requests` | Gauge | `stable` | `beta` | `deployment` | Requests holding an active managed-model permit. |
@@ -223,7 +234,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_mtls_handshake_total` | Counter | `stable` | `beta` | `result` | mTLS client-certificate verification outcomes. |
 | `sbproxy_object_authz_violations_total` | Counter | `stable` | `beta` | `origin`, `kind` | Object/function-level authorization violations, by kind (bola, bfla, enumeration). |
 | `sbproxy_ocsp_fetch_total` | Counter | `stable` | `beta` | `result` | OCSP fetch attempts, by outcome. |
-| `sbproxy_ocsp_staple_age_seconds` | Gauge | `stable` | `beta` | `host` | Age of the cached OCSP staple for the host, in seconds. |
+| `sbproxy_ocsp_staple_age_seconds` | Gauge | `stable` | `beta` | `host` | Age of the cached OCSP staple for the host, in seconds. Published once a minute by the refresh task; absent until the first successful fetch, so never-stapled is distinguishable from stale. |
 | `sbproxy_operator_leader_is_leader` | Gauge | `stable` | `beta` | none | 1 when this operator replica currently holds the leader lease. |
 | `sbproxy_operator_leader_transitions_total` | Counter | `stable` | `beta` | `result` | Leader-election lifecycle events on this replica. |
 | `sbproxy_operator_reconcile_duration_seconds` | Histogram | `stable` | `beta` | `kind` | Operator reconcile duration, by CRD kind. |
@@ -232,6 +243,12 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_origin_request_duration_seconds` | Histogram | `stable` | `beta` | `origin`, `method`, `status` | Request latency per origin. |
 | `sbproxy_origin_requests_total` | Counter | `stable` | `beta` | `origin`, `method`, `status` | Total HTTP requests per origin. |
 | `sbproxy_outbound_request_duration_seconds` | Histogram | `stable` | `beta` | `host`, `method`, `status` | Wall-clock latency of one outbound upstream request. |
+| `sbproxy_payment_provider_calls_total` | Counter | `stable` | `beta` | `rail`, `operation`, `provider_class` | Payment provider calls that left the process, by rail, operation, and provider class. |
+| `sbproxy_payment_rail_enabled` | Gauge | `stable` | `beta` | `rail` | 1 for each settlement rail this build compiled and this configuration registered, 0 otherwise. |
+| `sbproxy_payment_recovery_total` | Counter | `stable` | `beta` | `operation`, `outcome` | Durable rows the settlement recovery worker moved, by recovery operation and committed outcome. |
+| `sbproxy_payment_settlement_total` | Counter | `stable` | `beta` | `rail`, `operation`, `outcome` | Durable payment settlement transitions, by rail, operation, and committed outcome. |
+| `sbproxy_payment_worker_drain_clean` | Gauge | `stable` | `beta` | none | 1 when the settlement worker drained inside its shutdown deadline, 0 when it was abandoned mid tick. |
+| `sbproxy_payment_worker_ticks_total` | Counter | `stable` | `beta` | none | Completed settlement recovery worker ticks. |
 | `sbproxy_phase_duration_seconds` | Histogram | `stable` | `stable` | `phase`, `origin` | Intra-request phase duration, partitioned by phase + origin. |
 | `sbproxy_plugin_init_duration_seconds` | Histogram | `stable` | `beta` | `kind`, `plugin`, `result` | Plugin factory init duration, by kind, plugin name, and outcome. |
 | `sbproxy_plugin_init_total` | Counter | `stable` | `beta` | `kind`, `plugin`, `result` | Plugin factory init attempts, by kind, plugin name, and outcome. |

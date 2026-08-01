@@ -1,6 +1,6 @@
 use sbproxy_core::hooks::{
     IntentCategory, IntentDetectionHook, PipelineLifecycleHook, PromptClassifierHook,
-    QualityScoringHook, SemanticLookupHook, StreamCacheRecorderHook, StreamSafetyHook,
+    QualityScoringHook, StreamSafetyHook,
 };
 
 #[test]
@@ -9,9 +9,7 @@ fn traits_are_object_safe() {
     assert_object_safe::<dyn PromptClassifierHook>();
     assert_object_safe::<dyn IntentDetectionHook>();
     assert_object_safe::<dyn QualityScoringHook>();
-    assert_object_safe::<dyn SemanticLookupHook>();
     assert_object_safe::<dyn StreamSafetyHook>();
-    assert_object_safe::<dyn StreamCacheRecorderHook>();
     assert_object_safe::<dyn PipelineLifecycleHook>();
 }
 

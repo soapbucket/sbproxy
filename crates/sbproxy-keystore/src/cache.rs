@@ -11,10 +11,21 @@
 //! cached for a shorter window so a flood of unknown keys cannot stampede the
 //! store. A store error is never cached.
 //!
-//! Fail-closed: when the store cannot be reached, [`TtlCache::resolve_key`]
-//! returns `Err`. The caller maps that to a denial when [`TtlCacheConfig::fail_closed`]
-//! is set (the default); only an operator who explicitly opted into
-//! `failure_mode_allow` treats an unreachable store as allow.
+//! Store errors are never swallowed: when the store cannot be reached,
+//! [`TtlCache::resolve_key`] and [`TtlCache::resolve_credential`] return
+//! `Err`. What that means for the request is not this cache's decision.
+//! The caller owns it, reading `proxy.key_management.failure_posture`
+//! through `KeyManagementConfig::failure_posture()`, and denies (503) or
+//! falls through to the origin's configured auth accordingly.
+//!
+//! This module used to carry its own `fail_closed: bool` alongside that
+//! posture, populated as `!failure_mode_allow`. It was one operator knob
+//! spelled twice with opposite polarity, and only the other spelling was
+//! ever consulted: nothing outside a test read it, and neither resolve
+//! path branched on it. It is gone rather than migrated (WOR-2121). This
+//! crate deliberately does not depend on `sbproxy-config`, so importing
+//! the shared `FailureMode` here would drag the whole config schema into
+//! a lean crate to hold a value it does not act on.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,9 +51,6 @@ pub struct TtlCacheConfig {
     /// Soft cap on entries per map; over it, expired entries are purged and then
     /// the least-recently-used entry is evicted.
     pub max_entries: usize,
-    /// When the store is unreachable, deny (the default). Set false only via an
-    /// explicit `failure_mode_allow`.
-    pub fail_closed: bool,
 }
 
 impl Default for TtlCacheConfig {
@@ -51,7 +59,6 @@ impl Default for TtlCacheConfig {
             ttl: Duration::from_secs(60),
             negative_ttl: Duration::from_secs(5),
             max_entries: 10_000,
-            fail_closed: true,
         }
     }
 }
@@ -82,7 +89,7 @@ struct Entry<V> {
     stamp: u64,
 }
 
-/// A fail-closed TTL cache wrapping a [`KeyStore`].
+/// A TTL cache wrapping a [`KeyStore`] that never swallows a store error.
 pub struct TtlCache {
     store: Arc<dyn KeyStore>,
     tier: Option<Arc<dyn CacheTier>>,
@@ -117,18 +124,14 @@ impl TtlCache {
         &self.store
     }
 
-    /// Whether the cache is configured to fail closed (deny) on store errors.
-    pub fn fail_closed(&self) -> bool {
-        self.cfg.fail_closed
-    }
-
     fn next_stamp(&self) -> u64 {
         self.stamp.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Resolve a key record by its public `key_id`, going L1 -> L2 -> store.
     /// `Ok(None)` means the key is genuinely absent; `Err` means the store
-    /// could not be reached (the caller fails closed).
+    /// could not be reached. The caller decides what an unreachable store
+    /// means for the request, from its configured failure posture.
     pub async fn resolve_key(&self, key_id: &str) -> Result<Option<KeyRecord>> {
         let now = Instant::now();
         // L1.
@@ -460,13 +463,24 @@ mod tests {
         assert_eq!(store.loads(), 2);
     }
 
+    /// A store error always surfaces to the caller, on both resolve paths.
+    ///
+    /// This is the cache's whole contract around an unreachable store, and
+    /// it holds no matter what the operator's failure posture is: the
+    /// cache never decides admission, it only refuses to invent an answer.
+    /// A silent `Ok(None)` here would be indistinguishable from "that key
+    /// does not exist", which is a 401 rather than a 503 and would make an
+    /// outage look like a bad credential.
     #[tokio::test]
-    async fn fail_closed_propagates_store_error() {
+    async fn store_error_propagates_to_the_caller_that_owns_the_decision() {
         let cache = TtlCache::new(Arc::new(BrokenStore), TtlCacheConfig::default());
-        assert!(cache.fail_closed());
         assert!(
             cache.resolve_key("k1").await.is_err(),
-            "store error surfaces so the caller can deny"
+            "store error surfaces so the caller can apply its failure posture"
+        );
+        assert!(
+            cache.resolve_credential("c1").await.is_err(),
+            "the credential path surfaces the same error for the same reason"
         );
     }
 

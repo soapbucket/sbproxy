@@ -3,7 +3,7 @@ use std::sync::{
     Arc,
 };
 
-use sbproxy_httpkit::{default_outbound, token_bearing_outbound};
+use sbproxy_httpkit::{default_outbound, token_bearing_outbound, OutboundClientBuilder};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -13,6 +13,14 @@ async fn response_server(
     status: impl Into<String>,
     location: Option<String>,
 ) -> (String, Arc<AtomicBool>) {
+    let (url, _address, was_hit) = response_server_with_addr(status, location).await;
+    (url, was_hit)
+}
+
+async fn response_server_with_addr(
+    status: impl Into<String>,
+    location: Option<String>,
+) -> (String, std::net::SocketAddr, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let was_hit = Arc::new(AtomicBool::new(false));
@@ -44,7 +52,7 @@ async fn response_server(
         stream.write_all(response.as_bytes()).await.unwrap();
     });
 
-    (format!("http://{address}"), was_hit)
+    (format!("http://{address}"), address, was_hit)
 }
 
 #[tokio::test]
@@ -91,4 +99,32 @@ async fn default_outbound_follows_at_most_two_redirects() {
     assert!(second_was_hit.load(Ordering::SeqCst));
     assert!(third_was_hit.load(Ordering::SeqCst));
     assert!(!fourth_was_hit.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn pinned_client_dials_the_pinned_address_without_following_redirects() {
+    // A client that ignored the pin would try to resolve the synthetic host and fail;
+    // a client that followed the redirect would leak the pinned request to the second server.
+    let (second_url, second_was_hit) = response_server("204 No Content", None).await;
+    let (_first_url, first_address, first_was_hit) =
+        response_server_with_addr("302 Found", Some(second_url)).await;
+
+    let client = OutboundClientBuilder::new()
+        .no_redirects()
+        .resolve_to_addrs("rag-fixture.invalid", &[first_address])
+        .build()
+        .unwrap();
+
+    let response = client
+        .get(format!(
+            "http://rag-fixture.invalid:{}/health",
+            first_address.port()
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    assert!(first_was_hit.load(Ordering::SeqCst));
+    assert!(!second_was_hit.load(Ordering::SeqCst));
 }

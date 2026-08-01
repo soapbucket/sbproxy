@@ -26,7 +26,16 @@ use crate::metrics::{CRYPTO_KIND_TRANSPORT, MESH_CRYPTO_DECRYPT_FAILED};
 use crate::state::distributed_cache::DistributedCache;
 use crate::state::replicated::ReplicaShard;
 
-use super::frame::{read_frame, write_frame, CacheOp, CacheResult, Request, Response};
+use super::frame::{
+    read_frame, write_frame, CacheOp, CacheResult, CacheSnapshot, Request, Response,
+    MAX_ROUTED_SNAPSHOT_BYTES,
+};
+
+/// Fixed reply text for a snapshot request that violates its bounds.
+///
+/// The string is a constant so a rejection can never echo the requested
+/// prefix, a stored key, or a stored value back to the peer or into a log.
+const SNAPSHOT_REJECTED: &str = "invalid cache snapshot request";
 
 // --- Handle ---
 
@@ -340,6 +349,24 @@ async fn handle_connection<S>(
                 )),
                 None => CacheResult::Error("replicated substrate not enabled".to_string()),
             },
+            // Bounded routed-prefix snapshot. Dispatch stays local like every
+            // other arm: the client already resolved the consistent-hash
+            // owner, so recursing into a routed method here would amplify the
+            // read. The bounded helper is the only entry point, so the reply
+            // can never exceed the fixed entry and byte caps.
+            CacheOp::SnapshotPrefix { prefix, maximum } => {
+                match cache.snapshot_prefix_local_bounded(
+                    &prefix,
+                    maximum as usize,
+                    MAX_ROUTED_SNAPSHOT_BYTES,
+                ) {
+                    Ok(snapshot) => CacheResult::Snapshot(CacheSnapshot {
+                        entries: snapshot.entries,
+                        truncated: snapshot.truncated,
+                    }),
+                    Err(_) => CacheResult::Error(SNAPSHOT_REJECTED.to_string()),
+                }
+            }
         };
 
         // --- Write the response ---
@@ -620,6 +647,153 @@ mod tests {
         assert_eq!(cache.get_local("b"), None);
 
         drop(stream);
+        server.shutdown();
+    }
+
+    /// Send one request over a fresh raw connection and return the reply.
+    async fn round_trip(port: u16, op: CacheOp) -> CacheResult {
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let (mut r, mut w) = stream.split();
+        let req = Request { request_id: 1, op };
+        let bytes = crate::transport::wire::encode(&req).expect("ser");
+        write_frame(&mut w, &bytes).await.expect("write");
+        let resp_bytes = read_frame(&mut r).await.expect("read");
+        let resp: Response = crate::transport::wire::decode(&resp_bytes).expect("deser");
+        assert_eq!(resp.request_id, 1);
+        resp.result
+    }
+
+    #[tokio::test]
+    async fn server_handles_snapshot_prefix_in_lexicographic_order() {
+        let cache: Arc<DistributedCache<Bytes>> =
+            Arc::new(DistributedCache::new("server-node", 16));
+        cache.put_local("member:c", Bytes::from_static(b"three"));
+        cache.put_local("member:a", Bytes::from_static(b"one"));
+        cache.put_local("member:b", Bytes::from_static(b"two"));
+        cache.put_local("other:a", Bytes::from_static(b"skip"));
+        let server = TransportServer::start(0, cache.clone())
+            .await
+            .expect("start");
+        let port = server.local_port();
+
+        let result = round_trip(
+            port,
+            CacheOp::SnapshotPrefix {
+                prefix: "member:".to_string(),
+                maximum: 16,
+            },
+        )
+        .await;
+        match result {
+            CacheResult::Snapshot(snapshot) => {
+                assert_eq!(
+                    snapshot
+                        .entries
+                        .iter()
+                        .map(|(key, _)| key.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["member:a", "member:b", "member:c"]
+                );
+                assert!(!snapshot.truncated);
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn server_snapshot_prefix_omits_expired_entries() {
+        let cache: Arc<DistributedCache<Bytes>> =
+            Arc::new(DistributedCache::new("server-node", 16));
+        cache.put_local("member:live", Bytes::from_static(b"live"));
+        cache.put_local_with_ttl("member:gone", Bytes::from_static(b"gone"), 1);
+        let server = TransportServer::start(0, cache.clone())
+            .await
+            .expect("start");
+        let port = server.local_port();
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        let result = round_trip(
+            port,
+            CacheOp::SnapshotPrefix {
+                prefix: "member:".to_string(),
+                maximum: 16,
+            },
+        )
+        .await;
+        match result {
+            CacheResult::Snapshot(snapshot) => {
+                assert_eq!(
+                    snapshot.entries,
+                    vec![("member:live".to_string(), Bytes::from_static(b"live"))]
+                );
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn server_snapshot_prefix_sets_truncated() {
+        let cache: Arc<DistributedCache<Bytes>> =
+            Arc::new(DistributedCache::new("server-node", 16));
+        for index in 0..5u32 {
+            cache.put_local(&format!("member:{index}"), Bytes::from_static(b"v"));
+        }
+        let server = TransportServer::start(0, cache.clone())
+            .await
+            .expect("start");
+        let port = server.local_port();
+
+        let result = round_trip(
+            port,
+            CacheOp::SnapshotPrefix {
+                prefix: "member:".to_string(),
+                maximum: 2,
+            },
+        )
+        .await;
+        match result {
+            CacheResult::Snapshot(snapshot) => {
+                assert_eq!(snapshot.entries.len(), 2);
+                assert!(snapshot.truncated, "a bounded page must report truncation");
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn server_snapshot_prefix_rejects_invalid_limit_without_echoing_prefix() {
+        let cache: Arc<DistributedCache<Bytes>> =
+            Arc::new(DistributedCache::new("server-node", 16));
+        cache.put_local("member:secret-suffix", Bytes::from_static(b"secret-value"));
+        let server = TransportServer::start(0, cache.clone())
+            .await
+            .expect("start");
+        let port = server.local_port();
+
+        for (prefix, maximum) in [
+            ("member:secret-suffix".to_string(), 0u32),
+            ("member:secret-suffix".to_string(), 4_097),
+            (String::new(), 16),
+        ] {
+            let result = round_trip(port, CacheOp::SnapshotPrefix { prefix, maximum }).await;
+            match result {
+                CacheResult::Error(message) => {
+                    assert_eq!(message, SNAPSHOT_REJECTED);
+                    assert!(!message.contains("secret-suffix"), "{message}");
+                    assert!(!message.contains("secret-value"), "{message}");
+                }
+                other => panic!("expected Error, got {other:?}"),
+            }
+        }
+
         server.shutdown();
     }
 

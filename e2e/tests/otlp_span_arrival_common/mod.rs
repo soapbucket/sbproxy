@@ -202,7 +202,11 @@ pub async fn assert_complete_ai_span_exports(
 }
 
 fn emit_complete_ai_request_span() {
-    let span = sbproxy_ai::tracing_spans::ai_request_span("chat_completions", "POST");
+    let span = sbproxy_ai::tracing_spans::ai_request_span(
+        "chat_completions",
+        sbproxy_ai::tracing_spans::OP_CHAT,
+        "POST",
+    );
     let _entered = span.clone().entered();
     span.record("sbproxy.tenant_id", "tenant-wor1217");
     span.record("gen_ai.system", "openai");

@@ -633,6 +633,10 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
 
     let mut new_pipeline = CompiledPipeline::from_config(compiled)?;
     preflight_default_safety_centroids(&new_pipeline)?;
+    // A settlement runtime that will not start fails the reload before the
+    // pipeline is swapped, so the previous generation keeps serving with its
+    // store and its worker untouched.
+    attach_payments_runtime(&mut new_pipeline)?;
 
     // WOR-196: pick up `listings/*.yaml` from the same Repo (the
     // directory the served `sb.yml` lives in) and stash the loaded
@@ -748,6 +752,19 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
     {
         let compiled = &new_pipeline.config;
 
+        // Config seeds target the external system of record, whose generic
+        // backend contract has no cross-record transaction. Apply them only
+        // after every reject-only preflight has succeeded. A backend failure
+        // degrades this generation but still publishes plane B with pipeline B,
+        // never pipeline B against plane A.
+        if let Err(e) = crate::key_plane::seed_prepared_key_plane(
+            new_pipeline.key_plane(),
+            compiled.server.key_management.as_ref(),
+        ) {
+            tracing::error!(error = %e, "failed to seed dynamic key plane on reload");
+            outcome.degrade(DegradedSubsystem::KeyPlane);
+        }
+
         // WOR-594: refresh the operator-configured Lua sandbox limits on
         // reload so SIGHUP / hot-reload pick up changes to
         // `proxy.scripting.lua.sandbox:` without restarting the process.
@@ -790,17 +807,13 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
         // `agent_detect.*` takes effect.
         install_detection_singletons(compiled);
 
-        // WOR-1546: reconcile the dynamic key plane so a reload that changed
-        // `key_management:` re-seeds config records and swaps the live plane.
-        // Config-seeded records are re-asserted unless `allow_api_override`.
-        if let Some(km) = compiled.server.key_management.as_ref() {
-            if let Err(e) = crate::key_plane::init_key_plane(km) {
-                tracing::error!(error = %e, "failed to reconcile dynamic key plane on reload");
-                outcome.degrade(DegradedSubsystem::KeyPlane);
-            }
-        } else {
-            crate::key_plane::uninstall_key_plane();
-        }
+        // Publish the candidate key plane as the admin and cluster view. The
+        // request path uses the same Arc pinned inside `new_pipeline`, so a
+        // request that started on generation A cannot cross into B here.
+        crate::key_plane::activate_key_plane(
+            new_pipeline.key_plane().cloned(),
+            compiled.server.key_management.as_ref(),
+        );
     }
 
     // WOR-1835: same reasoning as the boot path above - retry starting
@@ -809,6 +822,7 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
     // until both clustering and approximate governance are configured.
     crate::cluster::start_governance_dissemination();
     crate::cluster::start_rate_limit_dissemination();
+    crate::cluster::start_meter_dissemination();
 
     reload::load_pipeline(new_pipeline);
 
@@ -948,6 +962,56 @@ pub fn install_sighup_handler(config_path: String) {
             }
         }
     });
+}
+
+/// Build and publish the settlement runtime for a freshly compiled pipeline.
+///
+/// A no-op when `proxy.payments` is absent, which is the default and leaves
+/// the existing non-settlement ledger behaviour exactly as it was.
+///
+/// Failure is fatal to the pipeline rather than degrading. Every other
+/// subsystem in this file that fails at boot can serve without itself:
+/// alerting stops evaluating, listings serve empty. Settlement cannot,
+/// because the thing it would degrade to is answering a payer's credential
+/// without a durable record of what was charged.
+///
+/// # Errors
+///
+/// Returns the startup failure, which names the configuration surface the
+/// operator wrote.
+#[cfg(feature = "payments")]
+fn attach_payments_runtime(pipeline: &mut CompiledPipeline) -> anyhow::Result<()> {
+    let Some(payments) = pipeline.config.server.payments.clone() else {
+        return Ok(());
+    };
+    let clustered = pipeline.config.server.cluster.is_some();
+    let runtime = crate::billing_runtime::install(&payments, clustered)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    tracing::info!(
+        rails = ?runtime.rails(),
+        schema_version = runtime.status().schema_version,
+        "payment settlement runtime published",
+    );
+    pipeline.payments = Some(runtime);
+    Ok(())
+}
+
+/// Settlement is not compiled into this build.
+///
+/// A configured `proxy.payments` block still fails, and names the feature,
+/// rather than being parsed and quietly ignored. The configuration crate
+/// carries no `cfg` of its own precisely so this check lives here.
+#[cfg(not(feature = "payments"))]
+fn attach_payments_runtime(pipeline: &mut CompiledPipeline) -> anyhow::Result<()> {
+    if pipeline.config.server.payments.is_some() {
+        anyhow::bail!(
+            "proxy.payments is configured but this binary was built without the `payments` \
+             cargo feature, so it has no settlement store, no authoritative service, and no \
+             recovery worker. Rebuild with `--features payments` plus the flag for each rail \
+             the routes advertise, or remove the block"
+        );
+    }
+    Ok(())
 }
 
 /// SIGHUP handler is a no-op on non-Unix targets.
@@ -1326,33 +1390,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         crate::rate_limit_budget::install_registry(rl);
     }
 
-    // --- WOR-1546: assemble and install the dynamic key plane ---
-    //
-    // Lowered from `proxy.key_management:`. Builds the store, policy cache, and
-    // at-rest crypto, seeds config records, and (for the redis backend/tier)
-    // starts the cross-replica invalidation subscriber. Inert when the block is
-    // absent or `enabled: false`.
-    // Install the one process-owned cluster before the key plane so the mesh
-    // cache tier consumes this handle instead of opening duplicate listeners.
+    // Install the one process-owned cluster before pipeline construction so a
+    // candidate mesh-backed key plane consumes this handle instead of opening
+    // duplicate listeners.
     crate::cluster::reconcile_process_cluster(&server_config)?;
-
-    if let Some(km) = server_config.key_management.as_ref() {
-        if let Err(e) = crate::key_plane::init_key_plane(km) {
-            tracing::error!(error = %e, "failed to install dynamic key plane");
-        }
-    } else {
-        crate::key_plane::uninstall_key_plane();
-    }
-
-    // WOR-1835: start cross-node governance-counter dissemination now that
-    // both the process cluster handle (reconciled above) and the key plane
-    // (installed just above, when configured) are in place. This cannot run
-    // any earlier: `reconcile_process_cluster` starts cluster metrics before
-    // the key plane exists, so a check made there would never see the
-    // approximate governance store. See `cluster::start_governance_dissemination`
-    // for the idempotency contract.
-    crate::cluster::start_governance_dissemination();
-    crate::cluster::start_rate_limit_dissemination();
 
     // --- WOR-1186: register the session-ledger sink when enabled ---
     //
@@ -1413,6 +1454,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // Compile config into a pipeline with action/auth/policy module instances.
     let mut pipeline = CompiledPipeline::from_config(compiled)?;
     preflight_default_safety_centroids(&pipeline)?;
+    attach_payments_runtime(&mut pipeline)?;
 
     // WOR-196: pick up `listings/*.yaml` from the same Repo (the
     // directory the served `sb.yml` lives in) and stash the loaded
@@ -1498,6 +1540,23 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         .max()
         .unwrap_or(DEFAULT_MODEL_PLANE_BODY_LIMIT);
     let _model_plane_shutdown = start_process_model_plane(model_plane_body_limit)?;
+
+    // The pipeline constructor prepared this exact generation's key plane
+    // without touching global or store state. Boot has completed every other
+    // fallible preflight, so apply declarative seeds and then expose the plane
+    // to admin/cluster consumers immediately before publishing the matching
+    // request pipeline.
+    crate::key_plane::seed_prepared_key_plane(
+        pipeline.key_plane(),
+        pipeline.config.server.key_management.as_ref(),
+    )?;
+    crate::key_plane::activate_key_plane(
+        pipeline.key_plane().cloned(),
+        pipeline.config.server.key_management.as_ref(),
+    );
+    crate::cluster::start_governance_dissemination();
+    crate::cluster::start_rate_limit_dissemination();
+    crate::cluster::start_meter_dissemination();
 
     // Store in hot-reload slot.
     reload::load_pipeline(pipeline);
@@ -1901,6 +1960,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                             username: o.username.clone(),
                             password_hash: o.password_hash.clone(),
                             role: o.role,
+                            // WOR-2131: the meter's tenant scope for this
+                            // login. Carried through so the admin surface
+                            // reads it from config rather than from a token.
+                            tenant: o.tenant.clone(),
                         })
                         .collect()
                 })
@@ -2765,20 +2828,17 @@ fn install_op_redact_state(compiled: &sbproxy_config::CompiledConfig) {
         origin_pii,
     });
 
-    // Teach both redaction paths which headers the inbound key sweep reads.
-    // A configured sweep header carries a live minted key, and a custom name
-    // matches none of the built-in `-key` / `-secret` / `-token` rules, so
-    // without this it would reach the access log and a `capture_headers: ["*"]`
-    // glob in plaintext. Driven from config so adding a header cannot silently
-    // open that hole.
-    let swept = compiled
+    // Teach every redaction path which primary headers can carry inbound
+    // credentials. This union covers minted/configured carriers and native
+    // provider-hint carriers; match-only `also_header` values are excluded.
+    let credential_carriers = compiled
         .server
         .key_management
         .as_ref()
-        .map(|km| km.inbound.header_names())
+        .map(|km| km.inbound.credential_carrier_names())
         .unwrap_or_default();
-    sbproxy_observe::logging::set_swept_header_names(swept.clone());
-    sbproxy_config::types::set_extra_sensitive_headers(swept);
+    sbproxy_observe::logging::set_swept_header_names(credential_carriers.clone());
+    sbproxy_config::types::set_extra_sensitive_headers(credential_carriers);
 }
 
 /// Compose a child scope's `(enabled, rules)` from the parent's
@@ -3633,6 +3693,7 @@ origins:
             agents_json: None,
             outbound_credential: None,
             outbound_web_bot_auth: false,
+            attestation: None,
             observability: Some(OriginObservabilityConfig {
                 log: OriginObservabilityLogConfig {
                     sinks: Vec::new(),
@@ -3811,6 +3872,21 @@ origins:
 /// non-ephemeral backend in this repository, so nothing can break, and
 /// the whole point is that the exposure must not be able to appear
 /// silently.
+///
+/// # Why the distributed semantic cache warns rather than aborts
+///
+/// WOR-2099 gave the semantic cache Redis and mesh backends, so for the
+/// first time a semantic cache can outlive the process on purpose. That
+/// moves it into the same category as the response cache above: an
+/// operator who writes `backend: redis` chose a shared store knowingly,
+/// and aborting their boot on upgrade would break a documented feature
+/// rather than tell them something new. The values are prompts and model
+/// output, so the exposure still gets said out loud, once per backend.
+///
+/// This is deliberately not silent. The check that used to cover the
+/// semantic cache read it through a hook that WOR-2099 deleted, and
+/// leaving it at that would have turned a boot guard into a no-op in the
+/// same change that introduced the backends it was written to catch.
 fn enforce_cache_at_rest_posture(
     pipeline: &crate::pipeline::CompiledPipeline,
 ) -> anyhow::Result<()> {
@@ -3844,42 +3920,63 @@ fn enforce_cache_at_rest_posture(
             );
         }
     }
+
+    warn_on_distributed_semantic_backends(pipeline);
     Ok(())
 }
 
+/// Say once per distributed backend that the semantic cache is putting
+/// prompts and model output somewhere this process does not own.
+///
+/// Grouped by backend rather than by slot: an operator with forty origins
+/// on one Redis has one fact to learn, not forty. Memory never warns,
+/// because it dies with the process.
+fn warn_on_distributed_semantic_backends(pipeline: &crate::pipeline::CompiledPipeline) {
+    use sbproxy_ai::semantic_cache::SemanticCacheBackend;
+
+    let mut redis = 0_usize;
+    let mut mesh = 0_usize;
+    for registration in pipeline.semantic_caches.registrations() {
+        if registration.cache.is_none() {
+            continue;
+        }
+        match registration.backend {
+            Some(SemanticCacheBackend::Redis) => redis += 1,
+            Some(SemanticCacheBackend::Mesh) => mesh += 1,
+            Some(SemanticCacheBackend::Memory) | None => {}
+        }
+    }
+    for (backend, durability, routes) in
+        [("redis", "persistent", redis), ("mesh", "replicated", mesh)]
+    {
+        if routes > 0 {
+            tracing::warn!(
+                backend,
+                durability,
+                routes,
+                "the semantic cache is storing prompts and model output unencrypted on a \
+                 backend that outlives this process; treat it as sensitive operator data and \
+                 secure the backend transport and storage"
+            );
+        }
+    }
+}
 #[cfg(test)]
 mod at_rest_posture_tests {
     use super::*;
-    use crate::hooks::{
-        CachedResponse, LookupOutcome, LookupRequest, PurgeScope, SemanticLookupHook, StoreRequest,
-    };
     use sbproxy_cache::{AtRestPosture, CacheDurability};
     use std::sync::Arc;
 
-    /// A semantic cache that reports whatever posture the test asks for.
-    struct PostureCache(AtRestPosture);
-
-    #[async_trait::async_trait]
-    impl SemanticLookupHook for PostureCache {
-        async fn lookup(&self, _req: &LookupRequest) -> LookupOutcome {
-            LookupOutcome::default()
-        }
-        async fn store(&self, _req: StoreRequest, _resp: CachedResponse) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn purge(&self, _scope: PurgeScope) -> anyhow::Result<u64> {
-            Ok(0)
-        }
-        fn at_rest_posture(&self) -> AtRestPosture {
-            self.0
-        }
-    }
-
-    fn pipeline_with(posture: Option<AtRestPosture>) -> crate::pipeline::CompiledPipeline {
+    /// A pluggable cache surface reporting whatever posture the test asks
+    /// for. WOR-2099 deleted the semantic lookup hook, so nothing in tree
+    /// registers a surface today; this keeps the fatal branch covered so a
+    /// future surface with a durable backend still cannot land quietly.
+    fn pipeline_with_surface(
+        name: &'static str,
+        posture: AtRestPosture,
+    ) -> crate::pipeline::CompiledPipeline {
         let mut hooks = crate::hooks::Hooks::default();
-        if let Some(posture) = posture {
-            hooks.semantic_lookup = Some(Arc::new(PostureCache(posture)));
-        }
+        hooks.test_cache_surfaces.push((name, posture));
         crate::pipeline::CompiledPipeline {
             hooks,
             ..Default::default()
@@ -3887,74 +3984,54 @@ mod at_rest_posture_tests {
     }
 
     #[test]
-    fn a_pipeline_with_no_cache_hooks_passes() {
-        assert!(enforce_cache_at_rest_posture(&pipeline_with(None)).is_ok());
+    fn a_pipeline_with_no_cache_surfaces_passes() {
+        assert!(
+            enforce_cache_at_rest_posture(&crate::pipeline::CompiledPipeline::default()).is_ok()
+        );
     }
 
     #[test]
     fn the_default_memory_only_posture_passes() {
-        // Every in-tree implementation inherits this, so the check must
-        // be a no-op for an OSS build.
-        assert!(
-            enforce_cache_at_rest_posture(&pipeline_with(Some(AtRestPosture::memory_only())))
-                .is_ok()
-        );
+        // Every in-tree implementation inherits this, so the check must be
+        // a no-op for an OSS build.
+        let pipeline = pipeline_with_surface("test surface", AtRestPosture::memory_only());
+        assert!(enforce_cache_at_rest_posture(&pipeline).is_ok());
     }
 
     #[test]
-    fn a_persistent_unencrypted_semantic_cache_aborts_boot() {
-        // The whole point of the guard: a backend swap that starts
-        // writing prompts to disk must not go unnoticed.
-        let err = enforce_cache_at_rest_posture(&pipeline_with(Some(AtRestPosture::new(
-            CacheDurability::Persistent,
-            false,
-        ))))
-        .expect_err("an unencrypted persistent cache must fail loud");
+    fn a_persistent_unencrypted_surface_aborts_boot() {
+        // The whole point of the guard: a backend swap that starts writing
+        // prompts to disk must not go unnoticed.
+        let pipeline = pipeline_with_surface(
+            "test surface",
+            AtRestPosture::new(CacheDurability::Persistent, false),
+        );
+        let err = enforce_cache_at_rest_posture(&pipeline)
+            .expect_err("an unencrypted persistent cache must fail loud");
         let message = err.to_string();
-        assert!(message.contains("semantic response cache"), "{message}");
+        assert!(message.contains("test surface"), "{message}");
         assert!(message.contains("persistent"), "{message}");
     }
 
     #[test]
-    fn a_replicated_unencrypted_semantic_cache_aborts_boot() {
-        let err = enforce_cache_at_rest_posture(&pipeline_with(Some(AtRestPosture::new(
-            CacheDurability::Replicated,
-            false,
-        ))))
-        .expect_err("an unencrypted replicated cache must fail loud");
+    fn a_replicated_unencrypted_surface_aborts_boot() {
+        let pipeline = pipeline_with_surface(
+            "test surface",
+            AtRestPosture::new(CacheDurability::Replicated, false),
+        );
+        let err = enforce_cache_at_rest_posture(&pipeline)
+            .expect_err("an unencrypted replicated cache must fail loud");
         assert!(err.to_string().contains("replicated"), "{err}");
     }
 
     #[test]
-    fn a_persistent_encrypted_semantic_cache_passes() {
-        // Encryption is the fix the error message asks for, so applying
-        // it has to actually clear the check.
-        assert!(
-            enforce_cache_at_rest_posture(&pipeline_with(Some(AtRestPosture::new(
-                CacheDurability::Persistent,
-                true,
-            ))))
-            .is_ok()
+    fn a_persistent_encrypted_surface_passes() {
+        // Encryption is the fix the error message asks for, so applying it
+        // has to actually clear the check.
+        let pipeline = pipeline_with_surface(
+            "test surface",
+            AtRestPosture::new(CacheDurability::Persistent, true),
         );
-    }
-
-    #[test]
-    fn an_unencrypted_persistent_response_cache_warns_but_does_not_abort() {
-        // Deliberately asymmetric with the hook surfaces above: running
-        // the response cache unencrypted on a file backend is a shipped
-        // configuration, and breaking it on upgrade would tell the
-        // operator nothing they did not already choose.
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        let pipeline = crate::pipeline::CompiledPipeline {
-            cache_store: Some(Arc::new(
-                sbproxy_cache::FileCacheStore::new(sbproxy_cache::FileCacheConfig {
-                    directory: dir.path().to_string_lossy().into_owned(),
-                    max_size_mb: 0,
-                })
-                .expect("file store"),
-            )),
-            ..Default::default()
-        };
         assert!(enforce_cache_at_rest_posture(&pipeline).is_ok());
     }
 
@@ -3965,5 +4042,15 @@ mod at_rest_posture_tests {
             ..Default::default()
         };
         assert!(enforce_cache_at_rest_posture(&pipeline).is_ok());
+    }
+
+    #[test]
+    fn an_empty_semantic_registry_warns_about_nothing() {
+        // A default pipeline has no semantic registrations, so the
+        // distributed warning path must be a no-op rather than panicking on
+        // an empty registry.
+        let pipeline = crate::pipeline::CompiledPipeline::default();
+        warn_on_distributed_semantic_backends(&pipeline);
+        assert_eq!(pipeline.semantic_caches.registrations().count(), 0);
     }
 }

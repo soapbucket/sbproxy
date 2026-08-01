@@ -1,16 +1,15 @@
-# Stack for the 30-rail-x402-base-sepolia example.
+# Stack for the rail-x402-base-sepolia example.
 #
 # Three containers on one bridge network:
 #
 #   sbproxy                  - the gateway, mounts ./sb.yml read-only on :8080
-#   mock-x402-facilitator    - tiny stub that always-200s on the
-#                              x402 facilitator endpoints; honours
-#                              `?reorg=depth=N` for chain-reorg sims.
+#   mock-x402-facilitator    - stub answering /verify and /settle with the
+#                              pinned x402 v2 shapes, published on :8081
 #   mock-origin              - nginx serving a single article HTML
 #
-# The mock facilitator lets the demo run in CI without testnet keys;
-# see sb-testnet.yml + the README for swapping in the real Base
-# Sepolia facilitator.
+# The stub is a wire-shape reference, not a settlement backend: it serves
+# plain HTTP and the rail requires an HTTPS API root. See sb-testnet.yml
+# and the README for pointing the rail at a real facilitator.
 #
 # Bring up:    docker compose up -d --wait
 # Validate:    docker compose config
@@ -46,21 +45,20 @@ services:
     networks:
       - x402sb
 
-  # --- Mock x402 facilitator ---
+  # --- x402 facilitator stub ---
   #
-  # Implements just the surface the demo needs:
-  #   GET  /supported              -> 200 (list of supported chains)
-  #   POST /verify                 -> 200 (always passes signature check)
-  #   POST /settle                 -> 200 (synthesises a `txhash`)
+  # The only two endpoints an x402 rail ever calls, plus a health probe:
+  #   POST /verify                 -> 200 {"isValid":true}
+  #   POST /settle                 -> 200 {"success":true,"transaction":...}
   #   GET  /__health               -> 200 (compose health probe)
   #
-  # The `?reorg=depth=N` query parameter on `/settle` causes the mock
-  # to reply with `{"reorg_depth": N}` so the README walkthrough can
-  # demonstrate how the proxy handles a transient reorg without a
-  # live testnet.
+  # It performs no signature verification and moves no value. Published on
+  # :8081 so the wire shapes can be read with curl.
   mock-x402-facilitator:
     image: nginx:1.27.3-alpine
     container_name: sbproxy_30_x402_facilitator
+    ports:
+      - "8081:80"
     volumes:
       - ./mock-x402-facilitator/default.conf:/etc/nginx/conf.d/default.conf:ro
     healthcheck:

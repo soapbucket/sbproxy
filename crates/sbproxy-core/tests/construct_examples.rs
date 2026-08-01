@@ -198,14 +198,40 @@ fn every_oss_example_constructs_its_pipeline() {
                 continue;
             }
         };
-        if let Err(e) =
-            sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled)
-        {
-            failures.push(format!(
-                "{}: pipeline construction: {:#}",
-                file.display(),
-                e
-            ));
+        // examples/ai-rag-local configures gateway-side retrieval, which
+        // only exists behind the `rag` feature family. A default-feature
+        // build of this crate compiles none of it, so the sweep expects
+        // the documented missing-feature rejection there instead of a
+        // successful construction. Every other outcome (any other error,
+        // or an unexpected success without the feature) is a failure.
+        let is_rag_example = file
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "ai-rag-local");
+        let expect_missing_rag_feature = is_rag_example && !cfg!(feature = "rag");
+        match sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled) {
+            Ok(_) => {
+                if expect_missing_rag_feature {
+                    failures.push(format!(
+                        "{}: constructed without the `rag` feature; expected the \
+                         \"rebuild with feature 'rag'\" rejection",
+                        file.display()
+                    ));
+                }
+            }
+            Err(e) => {
+                let rendered = format!("{:#}", e);
+                if expect_missing_rag_feature && rendered.contains("rebuild with feature 'rag'") {
+                    // Expected: the config is valid, this build just
+                    // ships no RAG runtime.
+                } else {
+                    failures.push(format!(
+                        "{}: pipeline construction: {}",
+                        file.display(),
+                        rendered
+                    ));
+                }
+            }
         }
     }
     if !failures.is_empty() {
@@ -217,4 +243,21 @@ fn every_oss_example_constructs_its_pipeline() {
             summary
         );
     }
+}
+
+/// With the RAG adapters compiled in (`--features rag-full`, which the
+/// released binary ships by default), the ai-rag-local example must
+/// construct its pipeline end to end, not just compile its config.
+#[cfg(feature = "rag-full")]
+#[test]
+fn ai_rag_local_constructs_with_rag_features() {
+    export_example_env_dummies();
+    let root = workspace_root();
+    let file = root.join("examples").join("ai-rag-local").join("sb.yml");
+    let yaml =
+        std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {}", file.display(), e));
+    let compiled = sbproxy_config::compile_config(&yaml)
+        .unwrap_or_else(|e| panic!("{}: compile_config: {:#}", file.display(), e));
+    sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+        .unwrap_or_else(|e| panic!("{}: pipeline construction: {:#}", file.display(), e));
 }

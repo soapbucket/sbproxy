@@ -1,5 +1,5 @@
 # Audit log
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-01*
 
 SBproxy's audit surface is a set of narrow, structured channels rather than one audit framework. This page documents what actually ships: the admin-action audit rows served at `/api/audit/recent`, the `config_audit` / `security_audit` / `key_audit` tracing channels, the `AdminAuditEmitter` plugin seam, and the emission metric. There is no `sbproxy_audit` crate, no envelope middleware, and no append-only storage trait in the OSS tree; durable persistence and hash-chained verification live in the commercial distribution.
 
@@ -42,6 +42,70 @@ queryable via `/api/audit/recent`, and every row is mirrored to the structured
 `security_audit` tracing target. Explicitly authoring `audit.sink` emits a
 config-only warning.
 
+## Calling it
+
+The runnable configuration is
+[`examples/audit-log/`](../examples/audit-log/). It boots a proxied origin so
+there is something to reload, enables the admin server on `:9090` behind basic
+auth, and turns the access log on so both streams are visible together. Start
+it:
+
+```bash
+make run CONFIG=examples/audit-log/sb.yml
+```
+
+`POST /admin/reload` is the canonical state-mutating admin call. The password
+is the one in that config, `demo-change-me`:
+
+```bash
+curl -sS -X POST -u admin:demo-change-me http://127.0.0.1:9090/admin/reload
+```
+
+The call itself answers with the new revision:
+
+```json
+{"config_revision":"8f10eba811d1","loaded_at":"2026-08-01T15:02:21.996698+00:00","fully_applied":true,"degraded":[]}
+```
+
+Two lines land on the proxy's stdout. First the admin-action line, on the
+`sbproxy::admin::audit` target, which records who called what:
+
+```
+INFO sbproxy::admin::audit: admin action operator=admin role=admin method=POST path=/admin/reload
+```
+
+Then the `config_audit` envelope, which is JSON because it is meant for a
+sink rather than a human:
+
+```json
+{"timestamp":"2026-08-01T15:02:15.368528+00:00","source":"api","origins_added":[],"origins_removed":[],"origins_modified":[],"actor":"admin","prior_revision":"8f10eba811d1","next_revision":"8f10eba811d1"}
+```
+
+`source` is `api` because the change arrived through the admin endpoint; the
+same reload triggered by editing the file on disk records `file_watcher` and
+carries no `actor`. The three `origins_*` arrays are empty and
+`prior_revision` equals `next_revision` because nothing in the file actually
+changed between the two reads. That is the useful shape to recognise: a reload
+that was applied but was a no-op looks exactly like this, and a reload that
+changed something names the hostnames and moves the revision.
+
+The admin-action audit ring is a separate surface, and on a fresh proxy it is
+empty:
+
+```bash
+curl -sS -u admin:demo-change-me 'http://127.0.0.1:9090/api/audit/recent?limit=50'
+```
+
+```json
+[]
+```
+
+That empty array is correct rather than a misconfiguration. As described
+above, the rows in this ring come from the workspace rate-limit budget's
+auto-suspend and resume transitions, which are its only emitters today. A
+config reload does not produce one. If you are looking for a record of the
+reload, it is the `config_audit` line, not this endpoint.
+
 ## Tracing audit channels
 
 Three structured channels in `crates/sbproxy-observe/src/audit.rs` emit JSON records on dedicated `tracing` targets, so operators can route each one to its own sink (a SIEM, ClickHouse, a file) independently of the main application log.
@@ -58,6 +122,12 @@ One `ConfigAuditEntry` per applied configuration update, emitted at INFO on the 
 | `origins_removed` | Hostnames removed. |
 | `origins_modified` | Hostnames whose configuration changed. |
 | `tenant_id` | Tenant scope, omitted for proxy-wide changes. |
+| `actor` | Operator that made the change, when it arrived through an authenticated admin surface. Omitted for file-watcher and mesh-broadcast changes. |
+| `prior_revision` | Config revision before the change, when known. |
+| `next_revision` | Config revision after the change, when known. Equal to `prior_revision` when the reload found nothing to change. |
+
+Every field after `origins_modified` is omitted rather than nulled when it
+does not apply.
 
 ### `security_audit`: security-relevant rejections
 

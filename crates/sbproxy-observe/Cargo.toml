@@ -18,6 +18,11 @@ sbproxy-util.workspace = true
 # SSRF guard for alert webhook URLs (WOR-604). No cycle: sbproxy-security
 # does not depend on sbproxy-observe.
 sbproxy-security.workspace = true
+# The meter's self-observation seam (WOR-2129). The direction is the only
+# one that works: sbproxy-meter depends on no workspace crate at all and
+# must keep not depending on one, so the crate that owns Prometheus and the
+# OTLP pipeline reaches down to it rather than the other way round.
+sbproxy-meter.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 prometheus.workspace = true

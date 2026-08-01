@@ -43,8 +43,6 @@ pub mod deployment;
 pub mod deployment_store;
 pub mod desired;
 pub mod device_residency;
-#[cfg(feature = "embedded")]
-pub mod embedded;
 pub mod engine_driver;
 pub mod fit;
 pub mod foreign_cache;
@@ -57,6 +55,8 @@ pub mod llama_release;
 pub mod lockfile;
 pub mod lora;
 pub mod manifest;
+pub mod mistralrs_driver;
+pub mod mistralrs_release;
 pub mod node_snapshot;
 pub mod placement;
 pub mod probe_cpu;
@@ -182,6 +182,11 @@ pub use lora::{AdapterRoute, LoraCache};
 pub use manifest::{
     resolve_cache_dir, resolve_cache_dir_default, validate_serve_against_manifest, SourceScheme,
     SERVICE_CACHE_DIR,
+};
+pub use mistralrs_driver::{MistralRsBinarySource, MistralRsDriver, SystemMistralRsBinarySource};
+pub use mistralrs_release::{
+    asset_url as mistralrs_asset_url, release_asset as mistralrs_release_asset,
+    DEFAULT_MISTRALRS_RELEASE_TAG,
 };
 pub use placement::{
     plan_placement, PlacementAssignment, PlacementError, PlacementNode, PlacementPlan,

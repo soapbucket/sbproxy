@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-07-30*
+*Last modified: 2026-08-01*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -8,7 +8,7 @@ Three providers behind one wire format ([config](../examples/ai-gateway-quicksta
 
 SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 72 native providers behind one OpenAI-compatible API, including native Anthropic, Gemini, and Bedrock translators. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
 
-This guide owns the end-to-end picture: provider setup, wire compatibility, routing, streaming, budgets, caching, prompt controls, and per-request attribution. Seven features get a summary here and a full page of their own: the [guardrail mesh](ai-guardrail-mesh.md), [outcome-aware routing](ai-outcome-aware-routing.md), the [AI policy plane](ai-policy-cel.md), [predictive budgets with soft-landing](ai-predictive-budget.md), the [verifiable usage ledger](ai-usage-ledger.md), [LLM-aware resilience](ai-llm-aware-resilience.md), and [AI context compression](ai-context-compression.md). For those seven, the linked page is canonical; it carries the semantics, tuning advice, and reference tables.
+This guide owns the end-to-end picture: provider setup, wire compatibility, routing, streaming, budgets, caching, prompt controls, and per-request attribution. Coming from an agent framework? [langchain.md](langchain.md) is the shortest path: it points LangChain's model client and MCP tools at the gateway and runs a first request end to end. Seven features get a summary here and a full page of their own: the [guardrail mesh](ai-guardrail-mesh.md), [outcome-aware routing](ai-outcome-aware-routing.md), the [AI policy plane](ai-policy-cel.md), [predictive budgets with soft-landing](ai-predictive-budget.md), the [verifiable usage ledger](ai-usage-ledger.md), [LLM-aware resilience](ai-llm-aware-resilience.md), and [AI context compression](ai-context-compression.md). For those seven, the linked page is canonical; it carries the semantics, tuning advice, and reference tables.
 
 ## Provider setup
 
@@ -598,6 +598,8 @@ Input guardrails inspect the parsed prompt ahead of egress ([config](../examples
 
 The built-in pipeline supports ten guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, `context_poisoning`, `agent_alignment`, and `classifier`. Built-in guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. For HTTP policy services, use [external guardrail adapters](guardrails.md). For CEL-based request gating see the CEL section below, and [configuration.md](configuration.md#guardrails-guardrails) for the per-type field schema.
 
+An external guardrail entry carries two independent settings that are easy to confuse. `mode` picks when the adapter runs and, in the `logging_only` case, says it must never refuse; that is the enforcement axis. `failure_posture` says what happens when the adapter cannot be reached, is too slow, or returns something that is not a verdict; that is the failure axis. They compose: a guardrail can sit in `mode: logging_only` during rollout while already declaring `failure_posture: closed` for the day it starts enforcing. Accepted values are `closed` (refuse, the default), `open` (admit), and `degraded` (admit, and record that the content was never scanned; prefer this over `open`). `observe` is rejected on this axis, because a provider that never answered leaves no verdict to shadow-record; `mode: logging_only` is the observe-shaped setting, on the other axis. The older boolean spelling `fail_open: true|false` still parses and still means `open` and `closed`; setting both to values that disagree is a config-load error naming both keys. Field reference and the per-provider contracts are in [guardrails.md](guardrails.md).
+
 Input guardrails apply to whichever body field the surface carries user text in:
 
 | Surface | Field guarded |
@@ -609,6 +611,10 @@ Input guardrails apply to whichever body field the surface carries user text in:
 | `moderations` | `body["input"]` |
 
 A single built-in guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. Multipart-bodied surfaces (image edits, image variations, audio transcription) bypass the built-in input check today because their bodies are forwarded byte-transparently; built-in output scanning for those surfaces is reserved for a follow-up. External adapters apply their documented [unavailable-content policy](guardrails.md#streaming-and-multipart-content) to multipart bodies.
+
+### Gateway-side retrieval (RAG)
+
+An `ai_proxy` route can carry a `rag:` block that makes the gateway perform retrieval itself: it embeds the request's query, runs a tenant-scoped search against a configured vector store, and injects the retrieved chunks as marked system context before dispatch. The stage order is fixed: input guardrails run over the original request, then retrieval, then context injection, then the input guardrails run again over the augmented request, and only then do the AI policy plane, budgets, caching, and routing proceed. Retrieved text therefore gets the same screening as user text, and a prompt the original pass rejects never causes embedding egress. Field reference, failure policy, limits, build features, and metrics are in [rag.md](rag.md); the runnable fixture walkthrough is [`examples/ai-rag-local/`](../examples/ai-rag-local/).
 
 ### Safety guardrail modes
 
@@ -967,9 +973,13 @@ action:
 
 The action table, the full `ai.*` namespace, and the fail-open semantics are in [ai-policy-cel.md](ai-policy-cel.md).
 
+`on_error` is the one failure setting in the AI gateway that does not use the shared `closed` / `open` / `degraded` / `observe` posture words, and that is deliberate. A posture answers a single question, does the request proceed. `on_error` is a whole fallback decision drawn from the same action set the expression itself emits, so it can route, redact, tag, and audit in one go: `on_error: redact route_to:gpt-4o-mini audit:high` is a real configuration that no posture word can express. Two of the seven tokens do line up, and it is worth knowing which: `block` is the shared `closed`, and `allow` is the shared `open`. Every token is parsed and validated when the policy is compiled at config load, so a bad `on_error` is a startup failure rather than a request-time surprise.
+
+The default is `allow`, and it is the one place in the gateway where defaulting open is correct. `on_error` fires when the operator's own expression could not be evaluated: a typo in a field path, a type error, a token outside the closed set. That is a bug in a rule, not evidence that the request is dangerous, and the guardrails, budgets, and rate limits that do enforce security boundaries have already run and are unaffected. Defaulting closed would let one malformed expression black-hole every request on the route. Set `on_error: block` for the strict reading, or `on_error: allow audit:high` to keep the failure visible without refusing traffic.
+
 ## Budgets
 
-Set token or dollar caps that apply across a workspace, a single virtual key, an end user, a model, an origin, or a metadata tag. The `budget` block sits under `action` and is parsed by `BudgetConfig` in `crates/sbproxy-ai/src/budget.rs`.
+Set token or dollar caps that apply across a workspace, a single virtual key, an end user, a model, an origin, a metadata tag, or a single agent. The `budget` block sits under `action` and is parsed by `BudgetConfig` in `crates/sbproxy-ai/src/budget.rs`.
 
 By default the counters are per-instance (an in-process tracker), so a cluster of N replicas enforces roughly N times a given cap. When the key store runs on Redis (a `key_management` Redis backend, which is the clustered deployment shape), the same Redis also accumulates the spend and enforcement reads the shared total, so the fleet enforces one budget. Nothing extra is configured: cluster-shared budgets turn on whenever a Redis key store is present. If Redis is briefly unreachable the shared read fails open to the local tracker, so the per-instance count stays the floor.
 
@@ -1014,7 +1024,7 @@ action:
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
-| `scope` | enum | required | One of `workspace`, `api_key`, `user`, `model`, `origin`, `tag`. |
+| `scope` | enum | required | One of `workspace`, `api_key`, `user`, `model`, `origin`, `tag`, `agent`. |
 | `max_tokens` | u64 | unset | Total prompt + completion tokens allowed for the scope. |
 | `max_cost_usd` | f64 | unset | Total cost ceiling in USD across all requests in the scope. |
 | `period` | string | unset | One of `daily`, `weekly`, `monthly`, `total`. Window over which usage accumulates. |
@@ -1029,7 +1039,8 @@ action:
   the cheapest configured model it can price; it blocks only when no target is
   available.
 - Setting only `max_tokens` and leaving `max_cost_usd` unset (or vice versa) is supported. A limit with neither field is a no-op.
-- Multiple limits on the same scope with different `period` values (for example daily and monthly) accrue in separate window buckets. Each limit is checked against its own key; the tightest binding that is exceeded fires first in declaration order. There is no separate org/team/project hierarchy tracker: `BudgetScope` is the single enum (`workspace`, `api_key`, `user`, `model`, `origin`, `tag`) used by `BudgetLimit`.
+- Multiple limits on the same scope with different `period` values (for example daily and monthly) accrue in separate window buckets. Each limit is checked against its own key; the tightest binding that is exceeded fires first in declaration order. There is no separate org/team/project hierarchy tracker: `BudgetScope` is the single enum (`workspace`, `api_key`, `user`, `model`, `origin`, `tag`, `agent`) used by `BudgetLimit`.
+- An `agent`-scoped limit keys on the agent-to-agent caller identity, so per-agent spend is enforced rather than only reported. It names an agent only when the proxy verified that identity: asserted by a peer listed in `proxy.trusted_proxies`, or lifted from the RFC 8693 `act` chain of a signed token. An unverified caller names itself, so honouring the name would let it spend to the cap and then rename itself for a fresh allowance, or burn through the budget of an agent whose name it borrowed. Unverified and unidentified spend therefore pools into one shared bucket that is still capped, which is the same `__unattributed__` fallback a request missing `x-user-id` gets. That fails closed: one noisy unverified caller can exhaust the shared bucket, and no unverified caller can reach a named agent's budget. Reporting keeps the finer grain, since the usage ledger records the claimed id and the trust flag either way. This is a different mechanism from the `agent_budget` policy, which rate-limits requests per fingerprinted agent class; this caps spend per asserted agent identity.
 - Realtime WebSocket requests run the same hard-limit preflight before the
   upgrade. `block` returns 402 without an upstream WebSocket handshake, `log`
   permits the upgrade, and `downgrade` replaces every inbound `model` query
@@ -1089,6 +1100,13 @@ Refresh the vendored file out of band with `scripts/refresh-model-prices.sh /etc
 ## Virtual API keys (`credentials:`)
 
 Issue per-team or per-app keys that the gateway validates locally. Each key can pin a provider, restrict models, set its own request rate, carry its own budget ceiling, and tag requests for downstream attribution. The shipped shape is a `credentials:` list of `type: ai_provider` entries next to the origin's `action:` block; the same block also lives at `tenants[].credentials` and `proxy.credentials` scope, with origin shadowing tenant shadowing proxy for entries that share a `name`. The legacy `virtual_keys:` key is rejected at config compile with a pointer to [migration-credentials.md](migration-credentials.md).
+
+With key management enabled, exact configured values are resolved from every
+carrier in `key_management.inbound.headers`, including its configured scheme;
+the defaults cover `Authorization: Bearer`, `x-api-key`, and `x-sb-api`.
+Canonical and stored legacy keys take precedence, and provider-native policy is
+the final fallback. Without key management, configured values retain the
+legacy `Authorization: Bearer` lookup.
 
 Set `action.require_governed_key: true` to reject requests that do not resolve
 to a governed public key identity on that origin. Dynamic mutation, the full
@@ -1413,11 +1431,36 @@ A request with `stream: true` enters the SSE relay only when the upstream return
 
 ### Method coverage
 
-The gateway accepts any standard HTTP method for any supported surface. GET, POST, PUT, DELETE, PATCH, HEAD, and OPTIONS all dispatch through the same provider-selection and observability surface. Non-POST methods do not engage the standard JSON POST inference pipeline, so they do not perform JSON body parsing or stored-key token and cost settlement. Method-aware dispatch is what makes `DELETE /v1/assistants/{id}`, `POST /v1/threads/{id}/runs/{id}/cancel`, and the other non-POST verbs work end-to-end. Strict settlement for these methods is deferred to WOR-1845.
+The gateway accepts any standard HTTP method for any supported surface. GET,
+POST, PUT, DELETE, PATCH, HEAD, and OPTIONS share credential resolution,
+provider policy, rate admission, and observability. PUT and PATCH JSON bodies
+also apply governed model routing, model allow/block policy, request PII
+redaction, and token/cost budget preflight before idempotency lookup or
+dispatch. Locally served discovery endpoints filter their results by provider
+and model policy. Other bodyless methods cannot interpret a model or redact a
+body, so a credential that requires either fails closed on those requests.
+
+Non-POST responses do not yet settle stored-key token and cost counters.
+Method-aware dispatch is what makes `DELETE /v1/assistants/{id}`,
+`POST /v1/threads/{id}/runs/{id}/cancel`, and the other non-POST verbs work
+end-to-end when their credential policy is satisfiable. Strict settlement for
+these methods is deferred to WOR-1845.
 
 ### Multipart bodies
 
-Image edits, image variations, audio transcription, and audio translation send multipart request bodies. The proxy detects multipart by inspecting the inbound `Content-Type` header; when it starts with `multipart/`, the body is forwarded via `AiClient::forward_bytes` with the original Content-Type preserved. A governed key's `route_to_model` rewrites only the bounded multipart `model` part before forwarding; every other part remains byte-for-byte. Provider format translation (Anthropic, etc.) does not run for multipart, since these surfaces are OpenAI-only. Multipart responses do not currently settle stored-key token-per-minute or lifetime token and cost counters; that work is deferred to WOR-1845.
+Image edits, image variations, audio transcription, and audio translation send
+multipart request bodies. The proxy detects multipart from the inbound
+`Content-Type`; when it starts with `multipart/`, the body is forwarded with
+that Content-Type preserved. A governed key's model policy is checked against
+the bounded `model` part, and `route_to_model` or a budget downgrade rewrites
+only that part. A required model with no interpretable model part fails closed.
+Because the gateway cannot safely apply JSON PII redaction to arbitrary
+multipart bytes, a credential with `require_pii_redaction` is rejected before
+idempotency, cache, or provider dispatch.
+
+Provider format translation does not run for multipart. Multipart responses do
+not currently settle stored-key token-per-minute or lifetime token and cost
+counters; that work is deferred to WOR-1845.
 
 ### Per-surface configuration
 
@@ -1708,7 +1751,13 @@ locally, and there are no per-surface emulation config blocks.
 
 ### `realtime`
 
-Realtime WebSocket proxying ships and is documented in the [Realtime](#realtime-1) section below: the gateway gates the upgrade on provider capability, applies `per_surface_rate_limits.realtime`, and forwards frames byte-transparently. There is no `realtime:` config key on the action; writing one is silently ignored. Realtime instead uses the action's shared provider, rate-limit, budget, and governed-key settings.
+Realtime WebSocket proxying ships and is documented in the
+[Realtime](#realtime-1) section below. The gateway resolves credential policy,
+checks provider and model eligibility, applies per-key and per-surface RPM plus
+budget preflight, and then forwards frames byte-transparently. A credential
+that requires PII redaction is rejected because opaque WebSocket frames cannot
+meet that requirement. There is no `realtime:` config key on the action;
+writing one is silently ignored.
 
 The action-level `budget` block and governed-key identity also participate in
 pre-upgrade admission. Provider and bound key-plane credentials are selected
@@ -1719,7 +1768,11 @@ The `realtime.rs` module itself is design-stage shape code with no serving-path 
 
 ## Per-request attribution
 
-The gateway records provider, model, token counts, and estimated cost for every AI request and exposes them through Prometheus metrics (see below). Direct response headers for these fields are not emitted today.
+The gateway records provider and model when they are resolved, and token counts
+or estimated cost when the surface and provider response make them
+interpretable. It does not invent token/cost values for opaque multipart,
+method-aware, or Realtime traffic. Available values are exposed through
+Prometheus metrics (see below); direct response headers are not emitted today.
 
 ### Authoritative identity: tenant and credential
 
@@ -1729,7 +1782,7 @@ two authoritative identity dimensions in addition to provider/model:
 - `tenant_id`: the tenant the request resolved to (`__default__` in single-tenant deployments), taken from the matched origin.
 - `api_key_id`: a stable id for the credential (API key) that authenticated the request and injected its policy. This is the join key that ties spend back to the agent routing traffic through the gateway.
 
-Both are sourced from the resolved principal, never from a request header, so a caller cannot misattribute its own spend. The business attribution tags (`project`, `feature`, `team`, ...) remain caller-overridable through `SB-Attr-*` headers over the credential defaults; the trust dimensions above do not.
+Both are sourced from the resolved principal, never from a request header, so a caller cannot misattribute its own spend. The business attribution tags (`project`, `feature`, `team`, ...) remain caller-overridable through `SB-Attr-*` headers over the credential defaults; the trust dimensions above do not, and neither does `agent_id` (see the next section).
 
 `api_key_id` resolution:
 
@@ -1759,6 +1812,108 @@ operator-supplied project, user, tags, and metadata. Request spans and metrics
 use a smaller fixed field set, and security audit events exclude free-form
 metadata.
 
+### Cost per agent
+
+`api_key_id` answers "which credential spent this". It stops answering the
+question you actually have the moment one service runs several agents behind one
+key, which is the normal shape: a planner, a researcher, and a summariser all
+holding the same credential, and a bill that says only that the credential spent
+$4,000.
+
+So spend is also attributed to the agent that spent it, to the run it happened
+inside, and to the workflow that run belongs to.
+
+| Dimension | Where it comes from | Metric label | Usage ledger | Request span | Access log |
+|---|---|---|---|---|---|
+| agent | the resolved agent-to-agent identity (`x-a2a-caller-agent-id`, or an RFC 8693 `act` chain) | `agent_id` | `agent_id` | `sbproxy.a2a.caller_agent_id` | `attribution.agent_id` |
+| run | the A2A `contextId` | none, deliberately | `a2a_context_id` | `session.id` | `a2a_context_id` |
+| workflow | the `SB-Attr-Trace-Id` header | none, deliberately | join through `request_id` | none | `attribution.trace_id` |
+| trust | whether the proxy verified the identity | none | `a2a_identity_verified` | `sbproxy.a2a.identity_verified` | `a2a_identity_verified` |
+
+Only the agent becomes a metric label. An agent id names a member of your agent
+roster, so its distinct values are bounded by how many agents you run. A run id
+or a workflow id takes a fresh value every time, so as a label each one would
+mint a Prometheus time series per run and the series count would grow with your
+traffic instead of with your system. Those two live on the span, the access log,
+and the usage ledger, which is where an unbounded correlation key belongs, and
+the build fails if anyone tries to make either a label.
+
+One caveat on the run column. The A2A `contextId` travels in the JSON-RPC request
+body, and the AI gateway answers the request before the body phase that parses
+it, so on this surface the run id is currently absent and `session.id` falls back
+to the capture session. `sbproxy.run.id_source` on the span says which of the two
+filled it, so a query never has to guess. The agent id has no such gap: it
+arrives in a header and is resolved before dispatch.
+
+With that in place, per-agent burn is one query and no join:
+
+```promql
+# USD per minute, by agent, over the last 5 minutes
+sum by (agent_id) (rate(sbproxy_ai_cost_dollars_attributed_total[5m])) * 60
+
+# The same, split by model, to see which agent is on the expensive one
+sum by (agent_id, model) (rate(sbproxy_ai_cost_dollars_attributed_total[5m])) * 60
+```
+
+#### The agent cannot name itself
+
+There is no `SB-Attr-Agent-Id` header. Sending one is a `400`, the same as any
+other unrecognised `SB-Attr-*` key. (`SB-Attr-Agent` is a different tag and still
+works: it carries `agent_type`, the `runtime` versus `development` bucket.)
+
+The reason is that a caller who can name its own agent can charge its spend to a
+different agent, or invent a fresh agent per request until the label's
+cardinality budget demotes every real agent to `__other__` and the whole view
+goes dark. So `agent_id` is filled from the agent-to-agent identity the proxy
+resolved, and it reaches a metric label only when that identity was verified:
+supplied by a peer in `proxy.trusted_proxies`, or lifted from the RFC 8693 `act`
+chain of a signed token. Spend the gateway could not tie to a verified agent
+still counts, under an empty `agent_id`, which reads as "not attributed" rather
+than as somebody else's bill.
+
+The usage ledger is stricter about this than the metrics are, because it is the
+record you would take to a chargeback argument. It keeps the agent id and the
+run id even when they were not verified, and writes `a2a_identity_verified:
+false` beside them. Dropping the ids would lose real spend; recording them
+without the flag would launder a number the caller chose into a number you
+signed. Filter on that flag before you total anything per agent or per run. It is
+the same trust decision the access log writes as `a2a_identity_verified` and the
+`sbproxy_a2a_hops_total` metric splits with its `allow:verified` and
+`allow:unverified` labels.
+
+Every identifier is capped at 128 bytes, once, at the point the request context
+first records it. The span, the ledger entry, and the metric label then all read
+the same capped string, so a long agent id cannot end up looking like two
+different agents on two different surfaces.
+
+#### Nobody else does this, and here is why that matters
+
+Per-agent cost has no industry convention to follow. That is not a gap we are
+filling ahead of a standard; there is no standard in progress.
+
+OpenTelemetry's GenAI semantic conventions, which this gateway otherwise tracks
+closely (currently pinned at v1.36.0), define no cost attribute and no cost
+metric at all. Tokens are covered. Money is not. So there is no
+`gen_ai.usage.cost` in the spec to be compliant with, and certainly no
+convention for attributing it to an agent.
+
+Observability vendors do not model it either. Langfuse is the clearest case
+because its limit is structural rather than a missing feature: cost lives on
+`generation` and `embedding` observations, and an agent is not one of those, so
+there is no place in the data model for "what this agent cost". You can put an
+agent id in metadata, which is what our Langfuse sink does, but that is a tag on
+a span, not a cost dimension you can roll up.
+
+The part worth insisting on is where the numbers come from. Our token counts and
+USD figures are parsed out of the provider's own response, in
+`crates/sbproxy-ai/src/usage_parser.rs`, at the point the response passes through
+the proxy. They are the provider's numbers, priced against a pinned catalogue
+whose revision is stamped on the span so a re-price can reproduce the original
+math. A tool that only observes the agent protocol never sees the provider
+response. It has to take the agent's word for what it spent, which means an agent
+with a bug, or an agent that never reports at all, is invisible in its own cost
+report. Sitting on the wire is what makes the attribution worth attributing.
+
 ### Request-path prompt accounting
 
 For chat-completions requests the gateway computes, on the request path before any upstream call, an estimated prompt-token count and a salted, non-reversible prompt fingerprint (`pf_<hex>`). Both ride on the request-event envelope (`prompt_tokens_est`, `prompt_fingerprint`). The fingerprint lets identical prompts be correlated for cache/value analysis without persisting prompt text; the salt is per-process so fingerprints are not reversible or cross-deployment correlatable. When a request is blocked or fails before producing upstream usage, the estimated prompt tokens are still attributed (see the outcome metric below), so request-path value is never lost.
@@ -1771,6 +1926,25 @@ off by default; every captured value runs through the secret redactor, the
 origin's configured PII redactor when present, and an 8 KiB payload cap with a
 `...[truncated]` marker. Streaming responses are assembled from forwarded
 chunks before the completion is recorded.
+
+### Console content samples
+
+`capture_content: true` on an AI origin retains a redacted sample of the
+prompt and response in a bounded in-memory store so an operator can inspect
+one request's content from the admin console without a trace backend. The
+gate is two-sided and fails closed: a sample is retained only when the origin
+sets this flag AND the governed key's policy sets `allow_content_capture`.
+Unkeyed and native-key traffic is never sampled, because only a minted key's
+policy can carry the consent bit.
+
+The same redaction stack as `trace_content` always applies (the secret
+redactor, the origin's PII redactor when configured, the 8 KiB cap), and
+configured credential carriers never reach capture surfaces. The store holds
+the most recent 200 samples, at most 50 per tenant, and clears on restart.
+Samples are fetched with `GET /api/requests/{request_id}/content` (admin role
+only; every read is audited with the operator's name). For durable content
+capture, use `trace_content` with your collector; this store is a runtime
+inspection sample, not a log.
 
 ## Verifiable usage ledger
 
@@ -1801,8 +1975,8 @@ The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpo
 | `sbproxy_ai_cost_usd_micros_total` | Counter | `provider`, `model`, `tenant_id` | Derived request cost in micro-USD (`1e-6` USD); mirrored to OTLP as `sbproxy.ai.cost_usd_micros` when `telemetry.export_metrics` is enabled |
 | `sbproxy_ai_request_duration_seconds` | Histogram | `provider`, `model` | End-to-end AI request latency. Now recorded on the live path for every accepted upstream response |
 | `sbproxy_ai_inter_token_latency_seconds` | Histogram | `provider`, `model` | Average inter-token latency (TPOT) per streaming response, derived from the generation window. Completes the TTFT / TPOT / throughput serving triple |
-| `sbproxy_ai_tokens_attributed_total` | Counter | `origin`, `provider`, `model`, `surface`, `direction`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id` | Per-attribution token spend. `sum by (tenant_id, model)` for multi-tenant multi-model token volume |
-| `sbproxy_ai_cost_dollars_attributed_total` | Counter | same as above minus `direction` | Per-attribution USD spend. `sum by (api_key_id)` for per-credential chargeback |
+| `sbproxy_ai_tokens_attributed_total` | Counter | `origin`, `provider`, `model`, `surface`, `direction`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | Per-attribution token spend. `sum by (tenant_id, model)` for multi-tenant multi-model token volume; `sum by (agent_id)` for per-agent volume |
+| `sbproxy_ai_cost_dollars_attributed_total` | Counter | same as above minus `direction` | Per-attribution USD spend. `sum by (api_key_id)` for per-credential chargeback, `sum by (agent_id)` for per-agent chargeback. `agent_id` is empty unless a verified agent identity resolved; see [Cost per agent](#cost-per-agent) |
 | `sbproxy_ai_request_duration_attributed_seconds` | Histogram | `provider`, `model`, `surface`, `tenant_id`, `api_key_id` | Model latency sliceable per tenant / credential / model. `histogram_quantile(0.95, sum by (le, tenant_id, model) (rate(..._bucket[5m])))` |
 | `sbproxy_ai_requests_attributed_total` | Counter | `origin`, `provider`, `model`, `surface`, `tenant_id`, `api_key_id`, `outcome` | One row per request with a closed `outcome` label (`ok`, `guardrail_block`, `content_filter`, `budget_exceeded`, `rate_limited`, `timeout`, `upstream_5xx`, `auth_denied`, `client_error`, `other`). `sum by (tenant_id, outcome)` answers value-vs-waste |
 | `sbproxy_ai_failovers_total` | Counter | `from_provider`, `to_provider`, `reason` | Provider failover events |
@@ -1927,19 +2101,31 @@ What runs before the upgrade:
 - Governed-key identity is resolved before dispatch. Its immutable public key
   id scopes any per-key budget; the plaintext key is never used as a budget
   key or stored on the realtime request context.
+- Provider allow/block policy and explicit native-credential destination
+  binding constrain the selected Realtime provider. `provider_type` alone
+  never authorizes caller-secret forwarding. Model allow/block policy is applied to the
+  query model; a required model that is absent fails closed. A
+  `route_to_model` override becomes the authoritative upstream query value.
+- Per-key RPM is charged once before upgrade. A credential requiring PII
+  redaction fails closed because frame-transparent proxying cannot inspect and
+  rewrite the session safely.
 - Hard budget admission uses the action budget merged with the governed key's
   budget. `block` returns the existing 402 `budget_exceeded` JSON response,
   `log` warns and continues, and `downgrade` makes the target model
   authoritative in the upstream query.
-- One trusted upstream credential is selected: a credential bound to the
-  governed key wins, otherwise the selected provider's nonblank `api_key` is
-  used. If neither exists, the request fails closed with 503 and no upstream
-  WebSocket handshake.
+- One trusted upstream credential is selected. A credential bound to a
+  governed key wins. For admitted native traffic, the caller credential is
+  used only when the selected provider sets a matching
+  `accept_native_credentials_for`; otherwise selection fails before upgrade.
+  All other traffic uses the selected provider's nonblank `api_key`. If no
+  authoritative credential exists, the request fails closed with 503 and no
+  upstream WebSocket handshake.
 
 Credential headers are finalized after ordinary header modifiers and Lua
 scripts. The proxy removes caller-controlled `Authorization`,
 `Proxy-Authorization`, `DPoP`, `x-api-key`, `api-key`, `x-goog-api-key`,
-`x-sb-api`, every resolved/configured inbound key header, the origin
+`x-sb-api`, every primary carrier from `inbound.headers` and
+`inbound.provider_hints`, the origin
 `outbound_credential` presentation header, and the selected credential's own
 header, then inserts exactly one trusted credential. This means a Lua script
 cannot replace the provider credential. Credential carriers cannot claim

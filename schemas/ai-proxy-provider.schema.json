@@ -34,6 +34,14 @@
         "null"
       ]
     },
+    "accept_native_credentials_for": {
+      "description": "Canonical native-provider label whose caller-owned credential this exact provider destination may receive.\n\nThis is an explicit destination trust decision. It defaults to disabled and must match `provider_type` (or `name` when no type is configured). For example, `openai` permits an OpenAI-shaped native key to replace `api_key` only for this provider entry and its effective `base_url`.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "base_url": {
       "description": "Override the upstream base URL (defaults to the provider's well-known URL).",
       "default": null,
@@ -459,10 +467,10 @@
           ]
         },
         {
-          "description": "Force the in-process embedded engine (WOR-1658). `Auto` never resolves to this; the embedded engine is an explicit opt-in because it changes the deployment model (no subprocess) and is only present when the `embedded` feature is compiled.",
+          "description": "Force mistral.rs (WOR-1861). `Auto` never resolves to this: mistral.rs is an explicit opt-in that stays behind vLLM (safetensors) and llama.cpp (GGUF) until it has certification mileage, and the planner must not prefer it for large MoE prefill workloads.",
           "type": "string",
           "enum": [
-            "embedded"
+            "mistralrs"
           ]
         }
       ]

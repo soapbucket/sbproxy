@@ -1,8 +1,10 @@
 # Getting started
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-07-31*
 
 This walkthrough runs one local upstream through three gateway configurations. It needs SBproxy, `curl`, and `jq`. It makes no network request to an AI provider and needs no API key.
+
+On Windows, run the commands in Git Bash, or replace `curl` with `curl.exe` in PowerShell: the bare name is an alias for `Invoke-WebRequest` there and rejects flags like `-H`.
 
 SBproxy currently binds its data listener to all host interfaces. Run this
 walkthrough on a trusted development machine or behind a host firewall. The
@@ -169,4 +171,4 @@ Press `Ctrl-C` in the gateway terminal, then press `Ctrl-C` in the upstream term
 
 ## Continue
 
-Read [core concepts](core-concepts.md) for the shared request pipeline, then use [configuration.md](configuration.md) to change the example. [MCP](mcp.md) and [AI gateway](ai-gateway.md) explain the two actions in depth. To run actual local model weights, use [Run your first managed model](quickstart-serve.md).
+Read [core concepts](core-concepts.md) for the shared request pipeline, then use [configuration.md](configuration.md) to change the example. [MCP](mcp.md) and [AI gateway](ai-gateway.md) explain the two actions in depth. To connect a LangChain application, model calls and tools both, follow [langchain.md](langchain.md). To run actual local model weights, use [Run your first managed model](quickstart-serve.md).

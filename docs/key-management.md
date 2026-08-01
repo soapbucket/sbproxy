@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-07-26*
+*Last modified: 2026-07-31*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -43,12 +43,21 @@ proxy:
       pepper: env:SBPROXY_KEY_PEPPER       # HMAC key for inbound hashing
       master_key: env:SBPROXY_KEY_MASTER   # envelope key for upstream creds
     inbound:
-      headers:                             # swept in order; first match wins
+      headers:                             # one minted token resolves; conflicts deny
         - {name: authorization, scheme: "Bearer "}
         - {name: x-api-key,     scheme: ""}
         - {name: x-sb-api,      scheme: ""}
       require: false                       # 401 when no minted key resolved
-    failure_mode_allow: false        # fail closed when the store is down
+      native_key_policy:
+        allowed_providers: [openai, anthropic]
+        max_requests_per_minute: 600
+        max_tokens_per_minute: 200000
+        max_budget_tokens: 10000000
+        max_budget_usd: 250.00
+        allowed_models: [gpt-5, claude-sonnet-4]
+        blocked_models: []
+        require_pii_redaction: [email]
+    failure_posture: closed          # closed | degraded | open
     allow_api_override: false        # config records win on reload
     oidc_claim_map:
       claim_field: virtual_key       # JWT/OIDC claim that names the record
@@ -59,6 +68,13 @@ proxy:
 
 When `enabled` is false (the default) the block is inert and inbound auth keeps
 using the compiled `credentials:` blocks.
+
+In Docker, mount a volume at `/var/lib/sbproxy` so the keystore survives
+container replacement (`-v sbproxy-state:/var/lib/sbproxy`). Images up to
+v1.9.0 ship without that directory and the nonroot runtime user cannot create
+it, so on those versions the mount is required: without it the key plane
+fails to install at boot with `create keystore directory '/var/lib/sbproxy'`.
+A bind mount to a host directory works too.
 
 ## Which header carries the key
 
@@ -72,14 +88,19 @@ holds the key you would have to have resolved the key already. The default
 covers the three common shapes and you can add your own.
 
 A minted token looks like `sbp_<16 hex>_<64 hex>`, a fixed 85 characters over a
-fixed alphabet. That means a swept header is accepted or rejected on length and
-prefix alone, with no store lookup, so sweeping a header your origin already
-proxies cannot misfire. A caller presenting their own `sk-proj-...` or
-`sk-ant-...` provider key passes straight through to the upstream that owns it.
+fixed alphabet. SBproxy recognizes that shape before store access, then looks
+up the public key id and verifies the secret. Shape recognition alone never
+authenticates a request. A caller presenting their own `sk-proj-...` or
+`sk-ant-...` provider key enters the native-key policy described below and,
+when allowed, passes through to the upstream that owns it.
 
-The header a key arrives in is always removed before the request goes upstream.
-Your key is not an upstream credential, and forwarding it would hand a governed
-secret to every origin the proxy talks to.
+The configured carrier list is also the lookup surface for legacy stored
+`sk-<id>-<secret>` keys and exact `credentials: {type: ai_provider}` values on
+AI routes. Resolution order is canonical `sbp_...`, stored legacy key, a
+verified OIDC/JWT claim mapped to a stored record, exact configured credential,
+then provider-native policy. The winning governed carrier is removed before
+dispatch, so that presented value does not accompany the operator's provider
+credential upstream.
 
 ### Two ways to use it
 
@@ -94,8 +115,9 @@ upstream <- x-api-key: <the real provider key>  (from the bound credential)
 ```
 
 **Sidecar.** The tool keeps sending its own credential, and the minted key
-rides alongside in `x-sb-api`. SBproxy governs the request without ever holding
-the upstream secret.
+rides alongside in `x-sb-api`. SBproxy governs the request without storing or
+managing the caller-owned upstream secret; it still receives and forwards that
+secret on the proxied request.
 
 ```
 client  ->  authorization: Bearer <the tool's own key>
@@ -109,15 +131,104 @@ credential, if any, is written to its own header.
 ### Attributing native provider keys
 
 A request that carries no minted key but does carry a recognizable provider
-credential is attributed to that provider. The rules live under
+credential is attributed to and governed as that provider. The rules live under
 `inbound.provider_hints`, ship with defaults for the common shapes (`sk-ant-`
 is Anthropic, `sk-or-` is OpenRouter, a bare `sk-` bearer is OpenAI,
 `x-goog-api-key` is Gemini, `api-key` is Azure), and are ordered: the first
 match wins, so specific prefixes belong before loose ones.
 
-Attribution is observational. It never refuses a request, and a credential
-matching no rule is admitted unattributed. It exists so native-key traffic
-shows up in metrics, audit, and policy instead of being invisible.
+Primary credential carriers are security-sensitive protocol fields, so SBproxy
+validates them even when `key_management.enabled` is currently `false`.
+Carriers cannot reuse hop-by-hop, framing, WebSocket, tracing, signature,
+correlation, budget identity, A2A envelope, access-log identity, or
+capture-envelope headers. This includes `x-user-id`, `x-end-user`,
+`x-sbproxy-tag`, `x-sb-user-id`, the session headers, and the `x-a2a-*` and
+`x-sb-property-*` namespaces.
+`provider_hints[].also_header` is match metadata rather than a credential
+carrier, so it may still name protocol metadata such as a provider version
+header.
+
+Recognized native credentials require an explicit
+`inbound.native_key_policy.allowed_providers` allowlist. If the policy is
+absent or the recognized provider is not listed, SBproxy returns 403 before
+dispatch. A credential matching no hint remains unattributed and follows the
+origin's ordinary auth behavior.
+
+The same block is lowered to a secret-free KeyRecord-shaped default. Every
+traffic type gets provider admission, audit attribution, a stable
+tenant/origin/provider identity, and automatic
+`max_requests_per_minute` enforcement. AI routes additionally apply provider
+and model policy, token/cost budget preflight, and PII requirements wherever
+the request shape can be interpreted. JSON POST and PUT/PATCH bodies can be
+inspected and redacted. Multipart and Realtime cannot safely satisfy required
+PII redaction and fail closed when a credential requires it; bodyless or
+otherwise uninterpretable methods fail closed when model policy requires a
+model. Multipart and non-POST responses do not yet settle token/cost counters,
+so those fields are admission signals rather than strict usage ceilings on
+those surfaces.
+
+Limits are bucketed by tenant, origin, and recognized provider. The native
+policy identity is built from those labels and contains no credential bytes.
+
+On a generic proxy route, an allowed caller-owned credential passes upstream
+unchanged, even when that origin also configures `outbound_credential`: native
+mode represents an explicit caller-owned identity, so the origin credential
+must not replace it. SBproxy receives and forwards the caller-owned secret, but
+does not store, manage, or substitute it. An AI provider must opt in as an
+exact credential destination. Set `accept_native_credentials_for` to the
+canonical hint label, and make it match the provider's wire type:
+
+```yaml
+action:
+  type: ai_proxy
+  providers:
+    - name: openai-primary
+      provider_type: openai
+      accept_native_credentials_for: openai
+      base_url: https://api.openai.com/v1
+      api_key: ${OPENAI_API_KEY} # used when the caller is not in native mode
+```
+
+The opt-in belongs to this provider entry and its effective `base_url`.
+`provider_type` selects the wire format; it does not grant a destination access
+to caller credentials. Without the opt-in, a custom endpoint that speaks the
+OpenAI protocol receives only its operator credential. If the native
+credential cannot be re-resolved or no opted-in provider exists, the request
+fails before an upstream call. Minted `sbp_...` keys take precedence and never
+enter native-key policy resolution.
+
+Confidence cascade and race routing are unavailable for native credentials.
+Cascade returns 503 and race returns 403 before request-body processing, cache
+or idempotency lookup, managed-model preparation, streaming dispatch, or the
+first upstream attempt. Sequential fallback can use another provider only when
+that provider entry has its own matching `accept_native_credentials_for`
+binding.
+For the same reason, configured shadow copies are suppressed for native
+traffic: the primary response proceeds normally, while neither the caller
+credential nor an operator credential is sent to the shadow target.
+
+The companion metric
+`sbproxy_inbound_key_requests_total{provider,key_mode,tenant_id,api_key_id}`
+uses the closed `key_mode` values `none`, `minted`, and `native`. An unresolved
+provider or key id is the empty label value. Native `api_key_id` is the stable,
+secret-free tenant/origin/provider policy-bucket id. Access logs, request
+events, and security audit records carry the same `key_provider` and
+`key_mode` fields. No raw provider key is stored in those records or metric
+labels.
+
+One canonical key id spans every per-request surface: the admin request
+ring (`GET /api/requests?api_key_id=`), the access log, the metric label,
+usage events, and the `sbproxy.key_id` span attribute all report the same
+id for the same request, so "what did this key do" has one answer
+everywhere. Key and credential lifecycle changes are audited with the
+acting operator and a status diff, queryable at `GET /api/audit/events`;
+see [admin-api-reference.md](admin-api-reference.md).
+
+A key policy may set `allow_content_capture: true` to consent to the
+origin's opt-in console content sampling. Consent alone captures nothing:
+the AI origin must also set `capture_content: true`, and every retained
+sample is redacted before storage. See the console content samples
+section of [ai-gateway.md](ai-gateway.md).
 
 ### Requiring a key
 
@@ -144,8 +255,9 @@ policies:
 
 The header carries the presented secret, so bucketing on it means the bucket
 changes when you rotate the key and the caller gets a fresh budget. The key id
-does not change. `request.key_id` is an empty string when no minted key
-resolved, so the expression still evaluates on unauthenticated traffic.
+does not change. `request.key_id` is the secret-free native policy-bucket id for
+admitted native traffic and an empty string when no key policy resolved, so the
+expression still evaluates on unauthenticated traffic.
 
 `concurrent_limit` with `key_by: api_key` already does this for you: it uses the
 resolved key id when there is one and falls back to the header otherwise.
@@ -345,9 +457,69 @@ Set `pepper` and `master_key` to a stable secret in production. Both accept
 leave them unset, sbproxy generates an ephemeral value and warns: stored hashes
 and encrypted credentials will not survive a restart.
 
-By default the plane fails closed. If the store cannot be reached, a request
-carrying a virtual key is denied. Set `failure_mode_allow: true` only if you have
-weighed an outage of the store against an outage of your gateway.
+Generate each value as 32 bytes of cryptographic randomness, hex-encoded
+(`openssl rand -hex 32`), and never reuse one value for both roles. See
+[Generating secret values](secrets.md#generating-secret-values) for the full
+guidance, including the PowerShell equivalent for Windows machines without
+`openssl`.
+
+### What happens when the store is down
+
+`failure_posture` decides it. The default is `closed`: if the store cannot be
+reached, a request carrying a virtual key is denied with `503`.
+
+```yaml
+proxy:
+  key_management:
+    enabled: true
+    failure_posture: closed        # closed | degraded | open
+```
+
+| Posture | The request | What is left behind |
+|---|---|---|
+| `closed` (default) | Denied with `503` | The denial itself, at `WARN` |
+| `degraded` | Falls through to the origin's own configured auth | `WARN` with `failure_posture=degraded` and `guarantee_waived=true` |
+| `open` | Falls through to the origin's own configured auth | `WARN` with `failure_posture=open` and `guarantee_waived=false` |
+
+Both admitting postures do the same thing to the request. Neither is a blanket
+admit: the request falls through to whatever auth the origin already has, so an
+origin with a `credentials:` block still authenticates it. What they change is
+the record. A key-store outage means the request runs with no per-key policy,
+no budget, and no attribution, and `degraded` is the posture that says so out
+loud, in a field you can alert on. `open` admits the same request and claims
+nothing about what was lost.
+
+Pick `degraded` over `open` unless you have a specific reason to suppress the
+signal. Pick either only if you have weighed an outage of the store against an
+outage of your gateway.
+
+`observe` is rejected at config-compile time here. It means "record the verdict
+the control would have reached", and a store that could not be read reached no
+verdict. Setting it fails startup with a message naming the key rather than
+quietly picking one of the other three for you.
+
+Try it against a store that is not there:
+
+```bash
+$ sbproxy run --config sb.yml            # store path points at a dead volume
+$ curl -si -H "Authorization: Bearer sk-abc123-secret" http://localhost:8080/v1/models \
+    | head -1
+HTTP/1.1 503 Service Unavailable         # failure_posture: closed
+```
+
+Flip the posture to `degraded`, restart, and the same call falls through to the
+origin's configured auth instead, leaving this in the log:
+
+```
+WARN key store unavailable; falling through to configured auth with no per-key
+     policy, budget, or attribution failure_posture="degraded" guarantee_waived=true
+```
+
+The older boolean `failure_mode_allow` still parses and still means what it
+always meant. It is used only when `failure_posture` is absent: `false` resolves
+to `closed`, and `true` resolves to `degraded`. Nothing in the runtime reads the
+boolean directly any more, so an existing config keeps its exact behavior and a
+new one gets a knob that can say which kind of "allow" it means.
 
 ## Key identity and policy revisions
 
@@ -680,7 +852,7 @@ proxy:
       #   url: rediss://governance.internal:6379/2
       lease_ttl_secs: 120
       terminal_retention_secs: 300
-      failure_mode: closed        # closed | allow_unreserved
+      failure_posture: closed     # closed | degraded | open
       missing_rate: zero_cost     # zero_cost | require_rate
 ```
 
@@ -707,14 +879,35 @@ proxy:
   `key_management.store` and `cache.tier: redis`; configure a strict
   governance URL separately even if you already point those at Redis.
 
-`failure_mode` (default `closed`) decides what happens when a governance
-backend outage stops a reserve call from completing. `closed` denies the
-request with `503` rather than let a governed limit go silently unenforced.
-`allow_unreserved` is the audited escape hatch: it admits the request without
-a reservation instead, and every time it fires the decision is logged,
-recorded on the `security_audit` channel, and counted on
-`sbproxy_governance_fail_open_total{key_id}`, so leaving it off the default
-posture is a deliberate choice you can see in the numbers, not a silent one.
+`failure_posture` (default `closed`) decides what happens when a governance
+backend outage stops a reserve call from completing. It takes the same three
+values the key store's posture takes, and they mean the same things here:
+
+| Posture | The request | What is left behind |
+|---|---|---|
+| `closed` (default) | Denied with `503` | The denial, at `WARN` |
+| `degraded` | Admitted with no reservation | `WARN`, a `security_audit` event, and `sbproxy_governance_fail_open_total{key_id}` |
+| `open` | Admitted with no reservation | `WARN` only |
+
+`degraded` is the audited escape hatch: it admits the request without a
+reservation, and every time it fires the decision is logged, recorded on the
+`security_audit` channel, and counted, so running off the default posture is a
+choice you can see in the numbers rather than a silent one. `open` admits the
+same request and records neither the audit event nor the counter. That is the
+only difference between them, and it is the reason to prefer `degraded`.
+
+`observe` is rejected at config-compile time here too: a reserve call that never
+reached its backend produced no verdict to record.
+
+The older `failure_mode: closed | allow_unreserved` still parses and is used
+only when `failure_posture` is absent. `closed` resolves to `closed` and
+`allow_unreserved` resolves to `degraded`, which is what `allow_unreserved`
+always did: the audit event and the fail-open counter have fired on that path
+since it shipped. An existing config keeps its exact behavior.
+
+A settle call that cannot reach the backend after a reservation already
+succeeded is unaffected by either key. It stays best-effort, and the
+reservation's own drop-time repair reconciles it later.
 
 `missing_rate` (default `zero_cost`) governs a key that carries a
 `total_micro_usd` limit when the resolved model has no configured rate.
@@ -789,8 +982,9 @@ token whose mapped claim names a revoked, blocked, or expired record is denied
 with 403 on the next request, and a claim naming a record that does not exist
 is denied with 401. A token that carries no mapped claim at all is simply
 unmapped; it authenticates on its own terms with no per-key policy. When the
-store is unreachable this path fails closed unless `failure_mode_allow` is set,
-matching the bearer path.
+store is unreachable this path reads the same `failure_posture` every other
+inbound-key path reads, so it fails closed by default and falls through under
+`degraded` or `open`, matching the bearer path.
 
 ## Migrating from static credentials
 

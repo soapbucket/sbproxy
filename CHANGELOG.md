@@ -12,6 +12,16 @@ the next version cut.
 
 ### Added
 
+- **mistral.rs is a subprocess engine kind.** `engine: mistralrs` drives the
+  upstream v0.9 `mistralrs` CLI as a supervised subprocess over its
+  OpenAI-compatible surface, acquired exactly like llama.cpp: PATH-first,
+  then the pinned upstream prebuilt release (Metal on Apple Silicon; CPU
+  and per-compute-capability CUDA builds on Linux x86-64), sha256-verified
+  against checked-in digests. The lane serves safetensors weights with
+  native tool calls, appears in `sbproxy doctor` and `models list`, and is
+  an explicit opt-in: `auto` never resolves to it and placement ranks it
+  behind the certified lanes. See
+  [`docs/model-host.md`](docs/model-host.md).
 - **A managed worker refuses to boot into a configuration it cannot
   serve.** `sbproxy doctor --strict <config>` runs six named startup checks
   (NVIDIA driver, visible accelerators, per-entry engine compatibility,
@@ -74,8 +84,50 @@ the next version cut.
   send boundary, with explicit closed or `allow_unreserved` backend failure
   behavior.
 
+### Removed
+
+- **The in-process embedded engine (`engine: embedded`, WOR-1658).**
+  Never on by default (it required a build with `--features embedded`) and
+  never certified: no dedicated tests, no CI lane, and no capability-ledger
+  entry. llama.cpp already covers the CPU/Metal, zero-external-binary case
+  it existed for, and the new `mistralrs` subprocess engine (see above)
+  covers safetensors mistral.rs serving without the large in-process
+  dependency tree. A config that still sets `engine: embedded` now fails
+  to parse.
+
 ### Fixed
 
+- **The `a2a` policy no longer decides on inputs the caller controls.**
+  Chain depth, chain membership, and caller and callee identity were read
+  from `X-A2A-*` request headers with no verification and no ingress
+  stripping, so a caller could send `X-A2A-Chain-Depth: 1` with no chain
+  and clear `max_chain_depth` and cycle detection together, or rename
+  itself off `caller_denylist`. The envelope now comes from the RFC 8693
+  `act` claim chain on the verified principal, which a caller cannot
+  flatten, and the `X-A2A-*` headers are honoured only from a peer in
+  `proxy.trusted_proxies` and stripped from everyone else. Operators
+  relying on the header transport must now list the peer that stamps it;
+  `examples/a2a-protocol/` shows the shape. The policy's `route_glob` is
+  also consulted for the first time: it was parsed, validated, and never
+  read, so the one detection signal a caller could not opt out of did
+  nothing. See [A2A gateway](docs/a2a-gateway.md).
+
+- **`sbproxy_a2a_hops_total` distinguishes verified allows from
+  unverified ones.** The `decision` label emitted a bare `allow` whether
+  the policy had checked a verified delegation chain or waved through an
+  envelope it could not trust, so a fully bypassed policy produced the
+  same green dashboard as a working one. Allows are now
+  `allow:verified` or `allow:unverified`, and a request the policy never
+  engaged on records `skip:undetected` rather than nothing at all.
+  Denials are unchanged. This relabels a `beta`-compatibility metric; no
+  dashboard or alert in this repository reads it.
+
+- **Ollama streaming keeps its stream and its usage accounting.** The
+  buffered-relay fallback for streaming requests keyed on `text/event-stream`
+  alone, so Ollama's NDJSON (`application/x-ndjson`) success responses were
+  buffered whole and their token counts never reached budget recording: a
+  workspace past its cap kept getting 200s. NDJSON responses now stay on the
+  streaming relay, where the Ollama usage parser reads them line by line.
 - **A bulk credential purge now reaches every node.** `invalidate_all` cleared
   only the local shard, so peers kept serving stale resolved credentials until
   TTL. It now fans out to every peer. The same change fixes the opposite problem

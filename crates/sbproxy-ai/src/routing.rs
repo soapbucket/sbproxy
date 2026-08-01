@@ -1317,6 +1317,7 @@ mod tests {
             provider_type: None,
             deployment: None,
             api_key: None,
+            accept_native_credentials_for: None,
             base_url: None,
             models: Vec::new(),
             default_model: None,

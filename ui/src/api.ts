@@ -1831,6 +1831,18 @@ export interface RequestLog {
   guardrail_category?: string;
   guardrail_action?: string;
   origin?: string;
+  // WOR-2093 key accountability columns.
+  api_key_id?: string;
+  key_mode?: "none" | "minted" | "native" | string;
+  key_provider?: string;
+  tenant_id?: string;
+  user_id?: string;
+  // WOR-2094 explainability columns.
+  error_class?: string;
+  config_revision?: string;
+  policy_version?: string;
+  policy_decisions?: string[];
+  deny_reason?: string;
   [k: string]: unknown;
 }
 
@@ -1846,6 +1858,9 @@ export interface RequestFilters {
   retried?: boolean;
   propertyKey?: string;
   propertyValue?: string;
+  // WOR-2093: server-side key accountability filters.
+  apiKeyId?: string;
+  keyMode?: "none" | "minted" | "native";
 }
 
 export type AlertRuleState = "inactive" | "ok" | "firing";
@@ -1914,6 +1929,42 @@ export interface PromptEntry {
   active?: string;
   versions?: (string | { version?: string; created_at?: string })[];
   [k: string]: unknown;
+}
+
+// WOR-2094: one normalized audit event from the bounded runtime sample.
+export interface AuditEvent {
+  timestamp: string;
+  channel: "security" | "key" | "config" | "admin" | "policy" | string;
+  kind: string;
+  actor?: string;
+  tenant_id?: string;
+  api_key_id?: string;
+  request_id?: string;
+  detail?: string;
+}
+
+export interface AuditEventFilters {
+  limit?: number;
+  channel?: string;
+  kind?: string;
+  keyId?: string;
+}
+
+// WOR-2096: one redacted content sample for one request.
+export interface CapturedMessage {
+  role: string;
+  content: string;
+}
+
+export interface ContentSample {
+  request_id: string;
+  api_key_id?: string;
+  tenant_id: string;
+  origin: string;
+  model?: string;
+  captured_at: string;
+  input_messages: CapturedMessage[];
+  output_text?: string;
 }
 
 /* ---- Endpoint helpers ---- */
@@ -2025,6 +2076,9 @@ export interface AdminUsersResponse {
 export interface OperatorSummary {
   username: string;
   role: "admin" | "read_only";
+  /** Billing tenant this login is narrowed to on the meter routes.
+   *  Absent means the whole deployment. */
+  tenant?: string;
 }
 
 // Windowed spend from the durable usage rollups (WOR-1875).
@@ -2060,6 +2114,148 @@ export interface SpendWindowResponse {
   property_keys: string[];
 }
 
+/* ---- Attested metering (WOR-2131) ---- */
+
+/**
+ * Whether the meter is switched off, switched on and empty, or reporting.
+ *
+ * The distinction the whole meter view exists to make. A page of zeros
+ * cannot tell "attestation is off" from "attestation is on and has
+ * recorded nothing", and those have different next steps.
+ */
+export type MeterState = "off" | "idle" | "reporting";
+
+/** One unit total, with its provenance kept beside the count. */
+export interface MeterUnitRow {
+  /** The key the row is grouped under, per the request's `group_by`. */
+  group: string;
+  tenant: string;
+  unit: string;
+  /** `measured`, `route_weight`, or `origin_header`. */
+  source: string;
+  count: number;
+}
+
+/** One node whose units are inside the cluster and outside the total. */
+export interface MeterUncoveredNode {
+  node_id: string;
+  /** `never_reported`, `stale`, `not_live`, `unreachable`, `unreadable`. */
+  gap: string;
+  /** The last chain head this node was ever seen at, or null if never. */
+  last_known_seq: number | null;
+  last_seen_at: string | null;
+}
+
+/** Which nodes a cluster total covers, and which it does not. */
+export interface MeterCoverage {
+  complete: boolean;
+  expected: number;
+  answered: string[];
+  uncovered: MeterUncoveredNode[];
+  gathered_at: string;
+}
+
+/** One row of the per-node chain-head table. */
+export interface MeterNodeRow {
+  node_id: string;
+  covered: boolean;
+  local: boolean;
+  head_seq?: number;
+  head_hash?: string;
+  claims?: number;
+  observed_at?: string;
+  gap?: string;
+  last_known_seq?: number | null;
+  last_seen_at?: string | null;
+}
+
+/** Records the meter owed and could not write, per tenant and posture. */
+export interface MeterGapRow {
+  tenant: string;
+  /** `closed`, `open`, `degraded`, or `observe`. */
+  failure_mode: string;
+  count: number;
+}
+
+/** This node's own chain, as read from disk. */
+export interface MeterChain {
+  node_id: string;
+  present: boolean;
+  entries: number;
+  head_hash: string;
+  damaged_at_seq: number | null;
+  damage_reason: string | null;
+}
+
+/** The attestation posture this generation runs under. */
+export interface MeterAttestation {
+  configured: boolean;
+  role?: string;
+  failure_mode?: string;
+  signing_key_id?: string | null;
+  ledger_path?: string;
+}
+
+export interface MeterSummary {
+  schema_version: number;
+  state: MeterState;
+  reason: string | null;
+  group_by: string;
+  tenant: string | null;
+  gathered_at: string;
+  attestation: MeterAttestation;
+  chain: MeterChain | null;
+  /** Null when no mesh is configured: one chain, nothing to fan out over. */
+  coverage: MeterCoverage | null;
+  nodes: MeterNodeRow[];
+  totals: MeterUnitRow[];
+  claims: number;
+  gaps: {
+    total: number;
+    by_tenant: MeterGapRow[];
+    divergence_total: number;
+  };
+}
+
+/** One receipt: the chain link, then the document the link attests to. */
+export interface MeterReceipt {
+  seq: number;
+  recorded_at: string;
+  prev_hash: string;
+  entry_hash: string;
+  /** Hex Ed25519 over the entry digest, when the chain is signed. */
+  signature?: string;
+  claims: Record<string, unknown>;
+}
+
+export interface MeterReceiptPage {
+  schema_version: number;
+  state: MeterState;
+  reason: string | null;
+  node_id: string;
+  tenant: string | null;
+  since_seq: number;
+  limit: number;
+  receipts: MeterReceipt[];
+  next_since_seq: number | null;
+  damaged_at_seq?: number | null;
+  damage_reason?: string | null;
+}
+
+/** The verdict of one chain verification run. */
+export interface MeterVerifyResult {
+  schema_version: number;
+  state: MeterState;
+  /** `ok`, `broken`, `not_started`, or `unreadable`. */
+  outcome: string;
+  node_id: string;
+  entries?: number;
+  /** The first sequence number that failed, when the outcome is `broken`. */
+  broken_seq?: number | null;
+  reason?: string | null;
+  verified_at: string;
+}
+
 function requestsPath(filters: RequestFilters = {}): string {
   const params = new URLSearchParams();
   if (filters.method) params.set("method", filters.method);
@@ -2083,6 +2279,11 @@ function requestsPath(filters: RequestFilters = {}): string {
       params.set("property_value", filters.propertyValue);
     }
   }
+  // WOR-2093: these three filter server-side now; the views still apply
+  // the same predicates client-side so live-tail rows stay consistent.
+  if (filters.sessionId) params.set("session_id", filters.sessionId);
+  if (filters.apiKeyId) params.set("api_key_id", filters.apiKeyId);
+  if (filters.keyMode) params.set("key_mode", filters.keyMode);
   const query = params.toString();
   return query ? `/api/requests?${query}` : "/api/requests";
 }
@@ -2235,6 +2436,25 @@ export const api = {
   // session cookie same-origin; the server enforces auth on connect.
   requestsStreamUrl: () => "/api/requests/stream",
 
+  // WOR-2094: unified audit sample (security/key/config/admin/policy).
+  auditEvents: (filters: AuditEventFilters = {}) => {
+    const params = new URLSearchParams();
+    if (filters.limit) params.set("limit", String(filters.limit));
+    if (filters.channel) params.set("channel", filters.channel);
+    if (filters.kind) params.set("kind", filters.kind);
+    if (filters.keyId) params.set("key_id", filters.keyId);
+    const query = params.toString();
+    return getJson<AuditEvent[]>(
+      query ? `/api/audit/events?${query}` : "/api/audit/events",
+    );
+  },
+  // WOR-2096: one request's redacted content sample (admin role only;
+  // the server audits every read).
+  requestContent: (requestId: string) =>
+    getJson<ContentSample>(
+      `/api/requests/${encodeURIComponent(requestId)}/content`,
+    ),
+
   // File-authoritative alert runtime state and targeted channel probes.
   alerts: () => getJson<AlertSnapshot>("/api/alerts"),
   testAlertChannel: async (channelIndex: number): Promise<void> => {
@@ -2249,6 +2469,24 @@ export const api = {
   // Configured RBAC operators only (excludes the top-level admin
   // credential). password_hash is never returned.
   operators: () => getJson<OperatorSummary[]>("/api/operators"),
+
+  // Attested metering (WOR-2131). All three are tenant-scoped server-side
+  // from the authenticated operator; passing `tenant` narrows further and
+  // is refused with 403 when it names somebody the operator may not read.
+  meterSummary: (groupBy = "tenant", tenant?: string) => {
+    const params = new URLSearchParams({ group_by: groupBy });
+    if (tenant) params.set("tenant", tenant);
+    return getJson<MeterSummary>(`/api/meter/summary?${params.toString()}`);
+  },
+  meterReceipts: (sinceSeq = 0, tenant?: string, limit?: number) => {
+    const params = new URLSearchParams({ since_seq: String(sinceSeq) });
+    if (tenant) params.set("tenant", tenant);
+    if (limit) params.set("limit", String(limit));
+    return getJson<MeterReceiptPage>(`/api/meter/receipts?${params.toString()}`);
+  },
+  // A POST because it walks the whole chain file. The connection handler's
+  // RBAC gate therefore restricts it to the admin role.
+  meterVerify: () => sendJson<MeterVerifyResult>("POST", "/api/meter/verify"),
 
   // Windowed spend history from the durable rollups (WOR-1875).
   spendWindow: (window: string, groupBy: string) =>

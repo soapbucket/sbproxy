@@ -15,9 +15,9 @@ use smallvec::SmallVec;
 use crate::types::{
     AccessLogConfig, AgentClassesConfig, AgentSkillEntry, AgentsJsonConfig, CompressionConfig,
     CorsConfig, ErrorPageEntry, HstsConfig, IdempotencyConfig, MessageSignaturesConfig,
-    MirrorConfig, OlpConfig, ProblemDetailsConfig, ProxyServerConfig, ProxyStatusConfig,
-    RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig, SessionConfig,
-    WebBotAuthPublishConfig,
+    MirrorConfig, OlpConfig, OriginAttestationConfig, ProblemDetailsConfig, ProxyServerConfig,
+    ProxyStatusConfig, RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig,
+    SessionConfig, WebBotAuthPublishConfig,
 };
 
 /// Fully compiled, immutable origin ready for request processing.
@@ -196,6 +196,12 @@ pub struct CompiledOrigin {
     /// When `true` and `proxy.web_bot_auth` is set, the proxy signs the
     /// upstream request with its Ed25519 key (RFC 9421, `tag=web-bot-auth`).
     pub outbound_web_bot_auth: bool,
+    /// Per-origin consumption attestation overrides (WOR-2127). `None`
+    /// leaves the origin on `proxy.attestation`'s role with no
+    /// agreement named. The resolved posture the request path actually
+    /// runs under is computed once per pipeline generation, not per
+    /// request; see `sbproxy_core::attestation`.
+    pub attestation: Option<OriginAttestationConfig>,
     /// WOR-1043 PR3: origin-scope observability overrides. Today the
     /// only nested surface is `log.redact.pii`, composed against the
     /// tenant-scope (or proxy-scope) PII pass at config-load. `None`

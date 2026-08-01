@@ -4,6 +4,56 @@
 # Enforced by scripts/check-pub-item-ratchet.sh. This number must never
 # go up. Lower it whenever a cleanup lands; the script tells you to.
 #
-# Measured on WOR-2065, 2026-07-30, after the sbproxy-security and
-# sbproxy-cache sweep.
-208
+# Measured on WOR-1941, 2026-07-30, after inbound key validation and
+# key-plane generation pinning gained their production consumers.
+#
+# Raised to 216 on WOR-2098, 2026-07-31: the RAG provider adapters ship
+# wire-contract integration tests, and their injection seams (scripted
+# DNS resolver, address policy, fixture-pinned client builder, escape
+# helper, render probe) must be `pub` for `tests/` to reach them. All
+# are `#[doc(hidden)]` and most also have in-crate production callers.
+#
+# Raised to 218 on WOR-2099, 2026-07-31: the distributed semantic cache
+# added `SemanticNamespace::origin_prefix` and
+# `SEMANTIC_ANONYMOUS_CREDENTIAL`, both in sbproxy-ai and both consumed
+# from sbproxy-core's test modules (the Redis purge-scope tests and the
+# credential-identity tests). Cross-crate test use requires `pub`, so
+# neither can be narrowed, and both have in-file production callers.
+#
+# Raised to 319 on WOR-2100, 2026-07-31: the whole delta is the new
+# `sbproxy-billing` crate, and it is the one case this ratchet's fourth
+# option was written for. The crate is the durable settlement domain,
+# and its production caller does not exist yet: the `ai_crawl` policy
+# still emits the legacy per-rail challenge and redeems against the old
+# ledger, so nothing in the request path yet names a payment
+# requirement, a rail adapter, or a settlement receipt. Its 224 tests
+# are its only consumers today.
+#
+# These are not narrowable. The crate's public surface is what
+# `sbproxy-core` will call across a crate boundary, and the contract
+# tests that pin the wire formats (x402 v2, Payment Auth draft-01,
+# Stripe PaymentIntents, CLN, LND) live in `tests/` precisely so they
+# exercise the same surface a caller gets rather than a private one.
+#
+# This number comes back down when the origin gate lands and the
+# request path starts calling the service, the registry, and the
+# requirement types. Do not raise it again for this crate.
+#
+# Raised to 321 on WOR-2139, 2026-08-01, for two items that cannot be
+# narrowed without defeating what they are for.
+#
+# `run_scoped_label_gaps` (sbproxy-observe/src/metric_registry.rs) is
+# the static guard that forbids a run, task, context, or trace id from
+# becoming a Prometheus label. Its consumer is
+# `tests/metric_drift.rs`, a separate integration-test crate, so `pub`
+# is the only way to reach it. `tenant_label_gaps` sits beside it for
+# exactly the same reason and has since it was written. The guard has
+# to run against the same public table a caller sees; asserting against
+# a private copy would prove nothing.
+#
+# `MAX_RUN_ID_BYTES` (sbproxy-ai/src/tracing_spans.rs) is the cap
+# applied to a caller-supplied run identifier before it reaches a span
+# attribute. It crosses into sbproxy-core, where the body phase caps at
+# capture so the span and the access log agree on one value. A cap that
+# two crates must agree on is a contract, not an implementation detail.
+321

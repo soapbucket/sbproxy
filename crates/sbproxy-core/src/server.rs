@@ -179,35 +179,18 @@ pub async fn shutdown_cache_revalidate_tasks() {
     CACHE_REVALIDATE_TASKS.wait().await;
 }
 
-/// Pending semantic-cache write produced by a cache-miss path.
+/// Pending semantic-cache write produced by a lookup that missed
+/// (WOR-2099).
 ///
-/// Tuple components: (hook, prompt key, cacheable upstream statuses,
-/// max response size in bytes, model id, origin). When populated, the AI relay
-/// dispatches `hook.store` after the upstream response is forwarded,
-/// subject to the status and size gates.
-type PendingSemcacheMiss = (
-    std::sync::Arc<dyn crate::hooks::SemanticLookupHook>,
-    String,
-    Vec<u16>,
-    Option<usize>,
-    Option<String>,
-    String,
-);
-
-/// Pending OSS embedding-cache write produced by a semantic miss
-/// (WOR-796). Tuple components: (cache handle, prompt key, the prompt's
-/// embedding vector). When populated, the AI relay stores the upstream
-/// response under this key + vector after a successful (200) response.
-/// Mutually exclusive with [`PendingSemcacheMiss`]: the OSS cache only
-/// runs when the enterprise `SemanticLookupHook` is absent.
+/// Tuple components: the compiled cache for the routed action, and the
+/// private write token that lookup produced. The token carries the derived
+/// namespace, prompt digest, normalized embedding, and generated keys, so
+/// the eventual write cannot drift from the lookup that admitted it. When
+/// populated, the buffered AI relay awaits `cache.store` once the provider
+/// response has passed the status gate and the output guardrails.
 type PendingEmbedMiss = (
     std::sync::Arc<sbproxy_ai::EmbeddingCache>,
-    String,
-    Vec<f32>,
-    // WOR-1142: per-caller cache scope (hashed tenant + credential) so
-    // the write-on-miss store records the same scope the lookup filtered
-    // on.
-    String,
+    sbproxy_ai::SemanticWriteToken,
 );
 
 /// The main proxy implementation.
@@ -754,9 +737,45 @@ fn build_request_template_context(
     tmpl
 }
 
+/// Render `ctx.principal` as the JSON shape every script engine shares.
+///
+/// One call site for the whole request path, so the Lua `ctx.principal`
+/// table, the JS `ctx.principal` object, and the CEL `principal.*`
+/// namespace can never drift apart: all three are fed from the same
+/// [`sbproxy_plugin::Principal`] on the live context.
+fn principal_context_json(principal: &sbproxy_plugin::Principal) -> serde_json::Value {
+    sbproxy_extension::js::build_principal_json(
+        Some(principal.tenant_id.as_str()),
+        (!principal.sub.is_empty()).then_some(principal.sub.as_str()),
+        Some(principal.source.as_str()),
+        principal.virtual_key.as_ref().map(|vk| vk.name.as_str()),
+        principal
+            .virtual_key
+            .as_ref()
+            .map(|vk| vk.allowed_providers.as_slice())
+            .unwrap_or(&[]),
+        principal.attrs.project.as_deref(),
+        principal.attrs.user.as_deref(),
+        principal.attrs.team.as_deref(),
+        &principal.attrs.tags,
+        &principal.attrs.metadata,
+        &principal.attrs.roles,
+        principal.attrs.claims.as_ref(),
+    )
+}
+
+/// Build the shared `ctx` table handed to every Lua / JS script surface
+/// (request modifiers, response modifiers, and the Lua/JS body
+/// transforms, which all route through here).
+///
+/// Carries `request.aipref`, `request.tls`, and `principal`, mirroring
+/// the CEL namespaces so a policy written for CEL ports across engines.
+/// Absent signals render as empty strings / `false` rather than being
+/// omitted, so a script can branch on `ctx.request.tls.ja4` or
+/// `ctx.principal.attrs.team` without probing for presence first.
 fn script_modifier_context(ctx: &RequestContext) -> serde_json::Value {
     let aipref = ctx.aipref.unwrap_or_default();
-    serde_json::json!({
+    let mut root = serde_json::json!({
         "request": {
             "aipref": {
                 "train": aipref.train,
@@ -765,7 +784,26 @@ fn script_modifier_context(ctx: &RequestContext) -> serde_json::Value {
                 "ai-input": aipref.ai_input,
             }
         }
-    })
+    });
+    // WOR-2083: the TLS fingerprint rides on the request sub-table so
+    // scripts read `ctx.request.tls.ja4` exactly like the CEL surface.
+    if let Some(request) = root.get_mut("request") {
+        let fp = ctx.tls_fingerprint.as_ref();
+        sbproxy_extension::lua::bindings::enrich_request_table_with_tls_fingerprint(
+            request,
+            fp.and_then(|f| f.ja3.as_deref()),
+            fp.and_then(|f| f.ja4.as_deref()),
+            fp.and_then(|f| f.ja4h.as_deref()),
+            fp.is_some_and(|f| f.trustworthy),
+        );
+    }
+    if let Some(map) = root.as_object_mut() {
+        map.insert(
+            "principal".to_string(),
+            principal_context_json(&ctx.principal),
+        );
+    }
+    root
 }
 
 fn insert_json_header(
@@ -3158,6 +3196,12 @@ fn emit_auth_audit(
         Some(session.req_header().method.as_str().to_string()),
     )
     .with_tenant_id(ctx.tenant_id.to_string())
+    .with_key_context(
+        ctx.native_key_provider.clone(),
+        ctx.inbound_key_mode.as_str(),
+    )
+    // WOR-2093: a denial names the key it denied, when one resolved.
+    .with_api_key_id(ctx.accountable_key_id())
     .emit();
 }
 
@@ -3253,6 +3297,26 @@ fn emit_policy_verdict(
         // workspace id as the OSS-scope tenant proxy.
         sbproxy_observe::metrics::record_policy_audit_event_dropped(&ctx.workspace_id);
     }
+    // WOR-2094: non-allow verdicts land on the console's audit sample.
+    // Allow verdicts stay off the ring (they would flood it at request
+    // volume); the per-request policy_decisions column carries them.
+    if !matches!(verdict, sbproxy_observe::events::VerdictTag::Allow) {
+        sbproxy_observe::audit_ring::push_audit_event(
+            sbproxy_observe::audit_ring::AuditRingEvent::new(
+                "policy",
+                policy_id,
+                None,
+                Some(ctx.tenant_id.clone()),
+                None,
+                Some(ctx.request_id.clone()),
+                Some(format!(
+                    "{} verdict on {} surface ({elapsed_ms}ms)",
+                    verdict.as_label(),
+                    surface.as_label(),
+                )),
+            ),
+        );
+    }
 }
 
 /// Build a frozen `http::Request<bytes::Bytes>` snapshot of the
@@ -3262,6 +3326,20 @@ fn emit_policy_verdict(
 /// this helper materialises one from the Pingora session so the
 /// existing built-in arms can keep their `Session` view while
 /// plugin enforcers see the standard `http` types.
+///
+/// # The body is always empty
+///
+/// The snapshot carries the request line and headers only. Its body is
+/// unconditionally `bytes::Bytes::new()`, because the request filter
+/// runs before any body byte has been read.
+///
+/// This is load bearing for anyone writing an enforcer. A check gated
+/// on `req.body()` does not run, ever, and it fails silently: the
+/// enforcer returns `Allow`, its metrics stay flat, and unit tests that
+/// call the underlying check directly keep passing. The A2A 1.0
+/// push-notification SSRF check shipped that way and never fired once
+/// in production. If a policy needs the body, it belongs at the body
+/// phase; see `crate::server::a2a_body_phase` for the pattern.
 fn build_plugin_request_snapshot(session: &Session) -> Option<http::Request<bytes::Bytes>> {
     let req = session.req_header();
     let method = req.method.as_str();
@@ -3508,6 +3586,9 @@ async fn check_policies(
                     "policy enforce() returned error; treating as deny"
                 );
                 emit_policy_verdict(verdict_ctx, policy_id, surface, VerdictTag::Deny, started);
+                // WOR-2094: the ring row explains the denial too.
+                ctx.record_policy_decision(policy_id, VerdictTag::Deny.as_label());
+                ctx.deny_reason = Some(format!("{policy_id}: enforce error"));
                 return Some((500, "policy error".to_string(), "plugin"));
             }
         };
@@ -3517,7 +3598,11 @@ async fn check_policies(
             &mut confirm_state,
         );
         emit_policy_verdict(verdict_ctx, policy_id, surface, translated.verdict, started);
+        // WOR-2094: mirror every verdict onto the request context so the
+        // admin ring row can explain what applied, not just what denied.
+        ctx.record_policy_decision(policy_id, translated.verdict.as_label());
         if let Some(deny) = translated.deny {
+            ctx.deny_reason = Some(format!("{policy_id}: {}", deny.1));
             return Some(deny);
         }
     }
@@ -3563,16 +3648,17 @@ fn shared_lua_engine() -> anyhow::Result<std::sync::Arc<sbproxy_extension::lua::
 
 /// Execute a Lua request modifier script.
 ///
-/// The script must define `modify_request(req, ctx)` which receives the request
-/// data as a table with `method`, `path`, and `headers` fields, and an empty
-/// context table. It must return a table with `set_headers` (and optionally
-/// `remove_headers`) to apply to the upstream request.
+/// The script must define `modify_request(req, ctx)` which receives the
+/// request data as a table with `method`, `path`, `headers`, and `tls`
+/// fields, and a context table carrying `request.aipref`, `request.tls`,
+/// and `principal` (WOR-2083). It must return a table with `set_headers`
+/// (and optionally `remove_headers`) to apply to the upstream request.
 ///
 /// Returns a list of (header_name, header_value) pairs to set.
 fn lua_request_modifier(
     script: &str,
     req_header: &RequestHeader,
-    hostname: &str,
+    ctx: &RequestContext,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let engine = shared_lua_engine()?;
 
@@ -3584,13 +3670,24 @@ fn lua_request_modifier(
         }
     }
 
-    let req_table = serde_json::json!({
+    let mut req_table = serde_json::json!({
         "method": req_header.method.as_str(),
         "path": req_header.uri.path(),
         "headers": headers_map,
-        "host": hostname,
+        "host": ctx.hostname.as_str(),
     });
-    let ctx_table = serde_json::json!({});
+    // WOR-2083: `req.tls.ja4` etc., matching the CEL `tls.*` namespace.
+    {
+        let fp = ctx.tls_fingerprint.as_ref();
+        sbproxy_extension::lua::bindings::enrich_request_table_with_tls_fingerprint(
+            &mut req_table,
+            fp.and_then(|f| f.ja3.as_deref()),
+            fp.and_then(|f| f.ja4.as_deref()),
+            fp.and_then(|f| f.ja4h.as_deref()),
+            fp.is_some_and(|f| f.trustworthy),
+        );
+    }
+    let ctx_table = script_modifier_context(ctx);
 
     // Try the Rust format first (modify_request returning {set_headers: {...}}).
     // If not found, try the Go format (match_request with req:set_header()).
@@ -3821,6 +3918,12 @@ use action_dispatch::*;
 // Dispatch-side glue for the MCP tool rollout plane (versioned
 // catalogue views, per-consumer routing, adapters, sunset).
 pub(crate) mod mcp_rollout;
+
+// WOR-2118: agent-to-agent checks that need the request body. They
+// live at the body phase because `build_plugin_request_snapshot` above
+// always hands enforcers an empty body, so the request-filter surface
+// cannot run them.
+pub(crate) mod a2a_body_phase;
 
 // The ProxyHttp trait impl lives in the `proxy_http` submodule
 //. A trait impl needs no re-import to take effect.

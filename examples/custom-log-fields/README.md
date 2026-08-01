@@ -43,3 +43,4 @@ Fields can be declared at three scopes and compose per request as **proxy then t
 - `engine` is one of `cel`, `lua`, `js`. WASM is not supported for log fields (it is a compiled module, not inline source).
 - Field names must be unique within a scope. A field whose script errors (or whose variable does not resolve) is omitted from the line rather than failing the request.
 - Custom values pass through the same redaction as every other field.
+- The request-header context omits every header configured as a primary credential carrier under `key_management.inbound` before interpolation or a script runs. `${request.header.NAME}` resolves to an empty string for a carrier, and `request.headers["name"]` is absent in CEL, Lua, and JavaScript. A `provider_hints[].also_header` is matching metadata rather than a carrier and remains available unless that name is also configured as a carrier.

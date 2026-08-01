@@ -128,18 +128,23 @@ pub fn build_launch_spec(
                 args.push(t.to_string());
             }
         }
-        EngineKind::Embedded => {
-            // WOR-1658: in-process engine. No subprocess is spawned; the
-            // launcher reads these args to load the model into the
-            // gateway. The first arg is the model repo, then the loopback
-            // port the in-process server binds (so the runtime routes to
-            // it like any other engine), then the context window.
+        EngineKind::MistralRs => {
+            // WOR-1861: `mistralrs serve -m <repo> --host 127.0.0.1
+            //   --port <p> --no-ui --max-seq-len <ctx>`. The unified v0.9
+            // CLI serves an OpenAI-compatible surface on the loopback
+            // port; `--no-ui` keeps it an API server. mistral.rs takes no
+            // KV dtype flag, so a configured `kv_quant` is deliberately
+            // not emitted (see `effective_kv_cache`, which books no
+            // saving for this engine).
+            args.push("serve".to_string());
+            args.push("-m".to_string());
             args.push(model.hf_repo.clone());
             args.push("--host".to_string());
             args.push("127.0.0.1".to_string());
             args.push("--port".to_string());
             args.push(port.to_string());
-            args.push("--ctx-size".to_string());
+            args.push("--no-ui".to_string());
+            args.push("--max-seq-len".to_string());
             args.push(plan.seq_len.to_string());
         }
     }
@@ -181,8 +186,10 @@ pub fn wrap_uvx(spec: &LaunchSpec, uv_path: &str, package_version: Option<&str>)
                 ],
             )
         }
-        // vLLM is the default uvx package; llama.cpp and embedded never
-        // reach this wrapper (they are not Python-package engines).
+        // vLLM is the default uvx package; llama.cpp and
+        // mistral.rs never reach this wrapper (they are not
+        // Python-package engines: config validation rejects `uvx` for
+        // them and the acquisition planner never yields a uvx plan).
         _ => {
             let from = match package_version {
                 Some(v) => format!("vllm=={v}"),
@@ -239,6 +246,18 @@ pub fn vllm_use_local_snapshot(args: &mut [String], snapshot: &std::path::Path) 
 /// the generated argv is unchanged. A no-op when `--model-path` is absent.
 pub fn sglang_use_local_snapshot(args: &mut [String], snapshot: &std::path::Path) {
     if let Some(index) = args.iter().position(|argument| argument == "--model-path") {
+        if let Some(model) = args.get_mut(index + 1) {
+            *model = snapshot.display().to_string();
+        }
+    }
+}
+
+/// Retarget a mistral.rs `serve -m <source>` argv to one verified local
+/// snapshot directory (WOR-1861), mirroring [`vllm_use_local_snapshot`].
+/// The rest of the generated argv is unchanged. A no-op when `-m` is
+/// absent.
+pub fn mistralrs_use_local_model(args: &mut [String], snapshot: &std::path::Path) {
+    if let Some(index) = args.iter().position(|argument| argument == "-m") {
         if let Some(model) = args.get_mut(index + 1) {
             *model = snapshot.display().to_string();
         }
@@ -440,10 +459,6 @@ pub struct ProcessEngineLauncher {
     runner: EngineProcessRunner,
     /// Opaque running process handle so `kill` can reach it.
     process: std::sync::Arc<tokio::sync::Mutex<Option<std::sync::Arc<dyn EngineProcess>>>>,
-    /// In-process embedded engine (WOR-1658), when the launched engine is
-    /// `EngineKind::Embedded`. Present only under the `embedded` feature.
-    #[cfg(feature = "embedded")]
-    embedded: std::sync::Arc<tokio::sync::Mutex<Option<crate::embedded::EmbeddedServer>>>,
 }
 
 impl Default for ProcessEngineLauncher {
@@ -453,8 +468,6 @@ impl Default for ProcessEngineLauncher {
             health_path: "/health".to_string(),
             runner: EngineProcessRunner::default(),
             process: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-            #[cfg(feature = "embedded")]
-            embedded: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
@@ -478,29 +491,6 @@ impl ProcessEngineLauncher {
             }
         }
         None
-    }
-
-    /// Launch the in-process embedded engine (WOR-1658). With the
-    /// `embedded` feature, loads the model with mistral.rs and serves an
-    /// OpenAI endpoint on `port` (so the runtime routes to it like any
-    /// other engine); the model id is the first argv element from
-    /// `build_launch_spec`'s embedded arm. Without the feature it returns
-    /// a state-accurate error (the plan-time
-    /// [`EngineDoctor`](crate::config::EngineDoctor) also flags it).
-    #[cfg(feature = "embedded")]
-    async fn launch_embedded(&self, spec: &LaunchSpec, port: u16) -> Result<u16, String> {
-        let repo = spec
-            .args
-            .first()
-            .ok_or_else(|| "embedded launch spec has no model repo".to_string())?;
-        let server = crate::embedded::EmbeddedServer::start(repo, port).await?;
-        *self.embedded.lock().await = Some(server);
-        Ok(port)
-    }
-
-    #[cfg(not(feature = "embedded"))]
-    async fn launch_embedded(&self, _spec: &LaunchSpec, _port: u16) -> Result<u16, String> {
-        Err("engine: embedded needs a build with --features embedded (WOR-1658)".to_string())
     }
 }
 
@@ -603,12 +593,6 @@ impl EngineLauncher for ProcessEngineLauncher {
     async fn launch(&self, spec: &LaunchSpec) -> Result<u16, String> {
         let port = Self::port_from_spec(spec)
             .ok_or_else(|| "launch spec has no --port to probe".to_string())?;
-        // WOR-1658: an in-process engine is not a subprocess. Dispatch to
-        // the embedded path, which starts a server inside the gateway on
-        // `port` (behind the `embedded` feature) rather than spawning.
-        if spec.engine.is_in_process() {
-            return self.launch_embedded(spec, port).await;
-        }
         let command = EngineCommand {
             executable: spec.program.clone().into(),
             arguments: spec.args.clone(),
@@ -628,13 +612,6 @@ impl EngineLauncher for ProcessEngineLauncher {
     }
 
     async fn kill(&self) {
-        // WOR-1658: an in-process embedded engine has no child process;
-        // stop its server task and drop the model to free memory.
-        #[cfg(feature = "embedded")]
-        if let Some(server) = self.embedded.lock().await.take() {
-            server.shutdown().await;
-            return;
-        }
         if let Some(process) = self.process.lock().await.take() {
             if let Err(error) = process.shutdown(Duration::from_secs(10)).await {
                 tracing::warn!(reason = %error.reason(), "managed engine shutdown failed");
@@ -849,44 +826,6 @@ mod tests {
         // Idempotent: a second call does not add a duplicate.
         llama_set_hf_file(&mut args, "y.gguf");
         assert_eq!(args.iter().filter(|a| *a == "--hf-file").count(), 1);
-    }
-
-    #[test]
-    fn embedded_spec_carries_engine_repo_and_port() {
-        // WOR-1658: the embedded spec is tagged as in-process and carries
-        // the repo + loopback port the in-process server binds.
-        let spec = build_launch_spec(
-            EngineKind::Embedded,
-            &model(),
-            &plan("Q4_K_M"),
-            8010,
-            KvCacheQuant::Auto,
-            &[],
-        );
-        assert_eq!(spec.engine, EngineKind::Embedded);
-        assert!(spec.engine.is_in_process());
-        assert_eq!(spec.args[0], "Qwen/Qwen3-14B");
-        let pi = spec.args.iter().position(|a| a == "--port").unwrap();
-        assert_eq!(spec.args[pi + 1], "8010");
-    }
-
-    #[tokio::test]
-    async fn embedded_launch_reports_state_not_a_spawn_error() {
-        // The launcher dispatches an in-process engine to the embedded
-        // path; without the backend it returns a state-accurate error
-        // (naming embedded / WOR-1658), never a generic spawn failure.
-        let spec = build_launch_spec(
-            EngineKind::Embedded,
-            &model(),
-            &plan("Q4_K_M"),
-            8011,
-            KvCacheQuant::Auto,
-            &[],
-        );
-        let launcher = ProcessEngineLauncher::with_timeout(Duration::from_secs(1));
-        let err = launcher.launch(&spec).await.unwrap_err();
-        assert!(err.contains("embedded"), "unexpected error: {err}");
-        assert!(!err.contains("spawn"), "should not be a spawn error: {err}");
     }
 
     #[test]

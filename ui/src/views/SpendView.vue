@@ -33,7 +33,6 @@ const costFamily = computed(() =>
   findFamily(
     families.value,
     "sbproxy_ai_cost_dollars_attributed_total",
-    "sbproxy_ai_cost_dollars_total",
   ),
 );
 // Tokens by direction (input|output, plus cache/reasoning variants).
@@ -41,14 +40,12 @@ const tokensFamily = computed(() =>
   findFamily(
     families.value,
     "sbproxy_ai_tokens_attributed_total",
-    "sbproxy_ai_tokens_total",
   ),
 );
 const aiRequestsFamily = computed(() =>
   findFamily(
     families.value,
     "sbproxy_ai_requests_attributed_total",
-    "sbproxy_ai_requests_total",
   ),
 );
 

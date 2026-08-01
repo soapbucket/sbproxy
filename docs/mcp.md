@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-08-01*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -82,6 +82,96 @@ origins:
 Adapted from `examples/mcp-federation/sb.yml`. The wire-format
 struct is `McpActionConfig` in
 `crates/sbproxy-modules/src/action/mcp.rs`.
+
+## Calling it
+
+Eight examples exercise different parts of this page. The one that matches the
+config above, and the one used here, is
+[`examples/mcp-federation/`](../examples/mcp-federation/), because federation
+is what the `mcp` action is for and because it is self-contained: it ships its
+own upstream. For sessions, RBAC and quotas, progressive discovery, OAuth
+discovery, or tool versioning, use the example named for that feature.
+
+It runs as two processes. The first is a mock REST API that stands in for a
+real service; the second is the gateway that federates it:
+
+```bash
+sbproxy serve -f examples/mcp-federation/upstream.yml &
+sbproxy serve -f examples/mcp-federation/sb.yml
+```
+
+Every call below is an HTTP POST of a JSON-RPC envelope to the same URL. The
+`Accept` header must offer both `application/json` and `text/event-stream`,
+because the Streamable HTTP transport chooses between them per response:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080 \
+  -H 'Host: mcp.example.com' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2025-06-18' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-demo","version":"1.0.0"}}}'
+```
+
+```json
+{"jsonrpc":"2.0","result":{"capabilities":{"tools":{"listChanged":true}},"protocolVersion":"2025-06-18","serverInfo":{"name":"my-mcp","version":"1.0.0"}},"id":1}
+```
+
+`serverInfo` echoes the configured `server_info`, and the gateway answers this
+locally without contacting any upstream, so `initialize` succeeds even with
+every federated server down.
+
+`tools/list` is where federation shows:
+
+```json
+{"jsonrpc":"2.0","id":2,"result":{"tools":[{"description":"Search repositories by query.","inputSchema":{"properties":{"q":{"type":"string"}},"required":["q"],"type":"object"},"name":"gh.search_repos"}]}}
+```
+
+One tool, not two. The config federates two servers: `gh`, an OpenAPI-backed
+server pointed at the mock, and `db`, pointed at `postgres.example.com`, a
+reserved placeholder that does not resolve. The catalogue degrades per server
+rather than failing as a whole, so `db` is dropped with a log line and `gh`
+still answers. A federated catalogue that silently shrinks is the failure mode
+to watch for here: check `tools/list` against the servers you configured, not
+against what your client happens to need.
+
+Note that `gh.search_repos` came from an OpenAPI document. Its `inputSchema`
+was derived from the spec's parameters, with no MCP server written for it.
+
+Calling it dispatches a real HTTP request to the mock:
+
+```bash
+-d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"gh.search_repos","arguments":{"q":"sbproxy"}}}'
+```
+
+```json
+{"jsonrpc":"2.0","result":{"content":[{"text":"[{\"full_name\":\"soapbucket/sbproxy\",\"name\":\"sbproxy\",\"stars\":4200},{\"full_name\":\"soapbucket/docs\",\"name\":\"docs\",\"stars\":12}]","type":"text"}],"isError":false},"id":3}
+```
+
+The upstream's JSON is returned as a *string* inside a `text` content block,
+which is what MCP specifies. A client parses that string; it is not a nested
+JSON object.
+
+The two failure shapes are distinct and worth telling apart. A tool the
+`tool_allowlist` guardrail blocks never leaves the proxy:
+
+```json
+{"jsonrpc":"2.0","error":{"code":-32602,"message":"tool 'gh.delete_repo' is blocked by tool_allowlist guardrail"},"id":4}
+```
+
+`-32602` is JSON-RPC "invalid params": the gateway is saying the requested tool
+is not one it will accept. A tool that is simply not in the registry reports
+differently:
+
+```json
+{"jsonrpc":"2.0","error":{"code":-32603,"message":"tool call failed: unknown tool: db.query"},"id":5}
+```
+
+`-32603` is "internal error", and `unknown tool` here is a consequence of `db`
+never answering `tools/list`, not of `db.query` being forbidden. Both are
+`200 OK` at the HTTP layer, as JSON-RPC requires; the error lives in the
+envelope. A client that checks HTTP status alone sees every one of these as a
+success.
 
 ## `mcp` action fields
 
@@ -214,6 +304,82 @@ principal and tenant, latency, cost) into the same sink stream as
 model spend, so tool spend is queryable next to it. Code-mode calls
 (from the emitted `codemode.ts` runtime) are attributed to the
 code-execution sandbox in the session ledger.
+
+## Trace-context propagation
+
+Every `tools/call` and `resources/read` the gateway forwards carries
+the trace context of the request that caused it, so a tool call in an
+upstream's logs can be joined back to the agent run that made it.
+
+The context travels in the JSON-RPC body, inside the `params._meta`
+block that
+[SEP-414](https://modelcontextprotocol.io/seps/414-request-meta)
+defines, under the key names `traceparent` and `tracestate`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 1,
+  "params": {
+    "name": "gh.search_repos",
+    "arguments": {"q": "sbproxy"},
+    "_meta": {
+      "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+    }
+  }
+}
+```
+
+Those key names are bare. MCP otherwise requires a DNS-style prefix on
+`_meta` keys, and SEP-414 carves out an explicit exception for trace
+context: a namespaced spelling such as
+`io.modelcontextprotocol.traceparent` would break trace and log
+correlation for every tool that already knows what `traceparent`
+means. An upstream reading `_meta` for trace context should read these
+names exactly, with no prefix.
+
+The body carries it rather than an HTTP header because one of the
+three transports has no headers at all. A `transport: stdio` upstream
+is a local child process that receives a line of JSON on stdin and
+nothing else, which is the same reason run-as-user credentials are
+refused on that transport. Putting the context in the body means an
+upstream sees the identical field whether it is reached over
+Streamable HTTP, over SSE, or over stdio.
+
+A `type: openapi` upstream is the one exception, and only because it
+is not MCP on the wire. Those calls dispatch as plain REST requests
+with no JSON-RPC body to hold a `_meta` block, so they carry the same
+context in a standard `traceparent` HTTP header instead. Redirects
+that the egress policy authorizes carry it too.
+
+### Turning it on
+
+There is no MCP-side knob. The context comes from the proxy's own
+tracing, so it appears once `proxy.observability.telemetry.enabled` is
+`true`:
+
+```yaml
+proxy:
+  observability:
+    telemetry:
+      enabled: true
+      endpoint: "http://otel-collector:4317"
+```
+
+With telemetry off there is no trace to propagate, and the gateway
+sends no `_meta` block rather than an empty or placeholder one, so an
+upstream can tell an untraced call from a malformed one. See
+[observability.md](observability.md) for the rest of that block.
+
+### What does not carry it
+
+Catalogue refreshes do not. The `tools/list`, `resources/list`, and
+`initialize` calls the federation makes on its own refresh schedule
+are gateway housekeeping, not work done for a caller. Attributing a
+background refresh to whichever request happened to be in flight when
+the timer fired would be worse than leaving it uncorrelated: the
+result would be wrong rather than absent.
 
 ## Submodules
 

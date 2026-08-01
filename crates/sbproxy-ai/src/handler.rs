@@ -136,15 +136,28 @@ pub struct AiHandlerConfig {
     /// `pii` configured and a trace backend inside your trust boundary.
     #[serde(default)]
     pub trace_content: bool,
-    /// Opaque semantic-cache configuration block. The OSS proxy
-    /// stores this verbatim and surfaces it through the stream cache
-    /// recorder hook so the enterprise implementation can read its
-    /// `streaming` sub-block (`enabled`, `replay_pacing`, ...) without
-    /// the OSS pipeline having to validate or interpret any of those
-    /// fields. Shape contract lives in the enterprise crate; OSS only
-    /// passes the value through.
+    /// WOR-2096: retain a redacted sample of this origin's prompt and
+    /// response text in a bounded in-memory store so an operator can
+    /// inspect one request's content from the admin console. Off by
+    /// default, and gated twice: capture happens only when this flag is
+    /// on AND the governed key's policy sets `allow_content_capture`.
+    /// The same redaction stack as `trace_content` applies (secret
+    /// redactor, then the origin's `pii` redactor, then the payload
+    /// cap). Nothing is durable: the store clears on restart, and the
+    /// production-grade content path remains OTLP `trace_content`.
     #[serde(default)]
-    pub semantic_cache: Option<serde_json::Value>,
+    pub capture_content: bool,
+    /// Typed semantic-cache configuration for this action.
+    ///
+    /// Parsed and bounds-checked at config load rather than carried as an
+    /// opaque value: WOR-2099 gave this block a backend selector, and a
+    /// misspelled or out-of-range field has to fail the load instead of
+    /// silently disabling the cache on first request. The compiled
+    /// runtime is built from this by
+    /// `sbproxy_core::semantic_cache_runtime`, which owns backend
+    /// selection per origin and forward rule.
+    #[serde(default)]
+    pub semantic_cache: Option<crate::semantic_cache::EmbeddingCacheConfig>,
     /// WOR-800: per-origin versioned prompt store. Named prompts, each
     /// with one or more numbered versions and optional reusable
     /// `partials:` fragments, referenced from a request body as
@@ -193,6 +206,9 @@ pub struct AiHandlerConfig {
     /// exist. Process-local only unless a future atomic backend lands.
     #[serde(default)]
     pub quota_pool: Option<crate::quota_pool::QuotaPoolConfig>,
+    /// Optional route-scoped retrieval augmentation.
+    #[serde(default)]
+    pub rag: Option<crate::rag_config::RagRouteConfig>,
     /// Lazy-compiled guardrail pipeline, owned by this reload-managed
     /// handler config. Keeping the cache here makes its lifetime follow
     /// the published config: a reload cannot reuse a pipeline by recycled
@@ -212,15 +228,6 @@ pub struct AiHandlerConfig {
     /// the same way (skip redaction).
     #[serde(skip)]
     pub(crate) pii_redactor: OnceLock<Option<sbproxy_security::pii::PiiRedactor>>,
-    /// Lazy-built OSS embedding semantic cache (WOR-796), parsed from
-    /// the `semantic_cache` block on first use. `None` inside the
-    /// OnceLock means the cache is disabled or misconfigured; the
-    /// request path treats both as "no semantic layer". Held in an
-    /// `Arc` so the instance (and its entries) persist across requests
-    /// for the lifetime of this per-origin config.
-    #[serde(skip)]
-    pub(crate) embedding_cache:
-        OnceLock<Option<std::sync::Arc<crate::semantic_cache::EmbeddingCache>>>,
     /// Lazily-built provider router (WOR-798), held in an `Arc` so its
     /// per-provider latency / token / connection state persists across
     /// requests for the lifetime of this per-origin config (rebuilt only
@@ -312,35 +319,6 @@ impl AiHandlerConfig {
                         None
                     }
                 }
-            })
-            .as_ref()
-    }
-
-    /// Return the OSS embedding semantic cache for this handler,
-    /// building it on first call (WOR-796). `None` when the
-    /// `semantic_cache` block is absent, disabled, missing the
-    /// `embedding` provider sub-block, or fails to parse. The cache is
-    /// opt-in, so the common path returns `None` with no cost beyond
-    /// the one-time parse.
-    pub fn embedding_cache(
-        &self,
-    ) -> Option<&std::sync::Arc<crate::semantic_cache::EmbeddingCache>> {
-        self.embedding_cache
-            .get_or_init(|| {
-                let value = self.semantic_cache.as_ref()?;
-                let cfg: crate::semantic_cache::EmbeddingCacheConfig =
-                    match serde_json::from_value(value.clone()) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "AI handler: semantic_cache block did not parse as an embedding \
-                                 cache config; semantic caching disabled"
-                            );
-                            return None;
-                        }
-                    };
-                crate::semantic_cache::EmbeddingCache::from_config(&cfg).map(std::sync::Arc::new)
             })
             .as_ref()
     }
@@ -847,6 +825,10 @@ impl AiHandlerConfig {
     /// Build from a generic JSON value.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
         let mut config: Self = serde_json::from_value(value)?;
+        if let Some(rag) = config.rag.as_ref() {
+            rag.validate()
+                .map_err(|error| anyhow::anyhow!("ai rag: {error}"))?;
+        }
         config
             .reasoning
             .validate()
@@ -882,10 +864,27 @@ impl AiHandlerConfig {
         // WOR-603: validate each provider's base_url at config load so an
         // SSRF target (file://, link-local metadata, loopback, ...) fails
         // fast here rather than being dispatched at request time.
+        let mut provider_names = std::collections::HashSet::new();
+        for provider in &config.providers {
+            if !provider_names.insert(provider.name.as_str()) {
+                anyhow::bail!(
+                    "ai provider name {:?} is configured more than once",
+                    provider.name
+                );
+            }
+        }
         for provider in &config.providers {
             provider.validate_managed_model().map_err(|error| {
                 anyhow::anyhow!("ai provider {:?} managed model: {error}", provider.name)
             })?;
+            provider
+                .validate_native_credential_binding()
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "ai provider {:?} native credential binding: {error}",
+                        provider.name
+                    )
+                })?;
             provider
                 .validate_base_url()
                 .map_err(|e| anyhow::anyhow!("ai provider {:?} base_url: {e}", provider.name))?;
@@ -1177,6 +1176,55 @@ impl AiSurface {
         }
     }
 
+    /// The OpenTelemetry GenAI `gen_ai.operation.name` for this surface
+    /// (WOR-2085).
+    ///
+    /// [`Self::label`] is the metrics/tracing *surface* identifier and
+    /// stays exactly as it is; this mapping exists because the OTel
+    /// convention names the operation differently: a chat completion is
+    /// `chat`, not `chat_completions`, and every image or audio shape
+    /// collapses onto one operation name. Before this mapping the
+    /// request span stamped the surface label into
+    /// `gen_ai.operation.name`, which happened to be right for
+    /// embeddings and `images/generations` and wrong for everything
+    /// else, chat included.
+    ///
+    /// Control-plane surfaces (models, files, batches, fine-tuning,
+    /// assistants, threads, moderations, reranking, unknown) are
+    /// deliberately left on their surface label: they are not GenAI
+    /// generation operations, the convention has no name for them, and
+    /// relabelling them `chat` would be the exact misreporting this
+    /// mapping removes.
+    pub fn operation_name(&self) -> &'static str {
+        match self {
+            // Chat-shaped generation, whatever the inbound dialect:
+            // OpenAI chat completions, Anthropic Messages, OpenAI
+            // Responses, and the realtime session all produce chat
+            // turns.
+            AiSurface::ChatCompletions
+            | AiSurface::Messages
+            | AiSurface::Responses
+            | AiSurface::Realtime => crate::tracing_spans::OP_CHAT,
+            AiSurface::Embeddings => crate::tracing_spans::OP_EMBEDDINGS,
+            AiSurface::ImageGeneration | AiSurface::ImageEdits | AiSurface::ImageVariations => {
+                crate::tracing_spans::OP_IMAGE_GENERATION
+            }
+            AiSurface::AudioTranscription | AiSurface::AudioSpeech => {
+                crate::tracing_spans::OP_AUDIO
+            }
+            // Not generation operations; see the doc comment.
+            AiSurface::Models
+            | AiSurface::Assistants
+            | AiSurface::Threads
+            | AiSurface::Batches
+            | AiSurface::FineTuning
+            | AiSurface::Files
+            | AiSurface::Moderations
+            | AiSurface::Reranking
+            | AiSurface::Unknown => self.label(),
+        }
+    }
+
     /// Whether v1 shadow evaluation may replay this request surface.
     ///
     /// Only chat evaluation surfaces are safe to copy. Mutating and non-chat
@@ -1371,11 +1419,11 @@ mod tests {
             shadow: None,
             pii: None,
             trace_content: false,
+            capture_content: false,
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
-            embedding_cache: OnceLock::new(),
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
@@ -1383,6 +1431,7 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             quota_pool: None,
+            rag: None,
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
@@ -1412,11 +1461,11 @@ mod tests {
             shadow: None,
             pii: None,
             trace_content: false,
+            capture_content: false,
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
-            embedding_cache: OnceLock::new(),
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
@@ -1424,6 +1473,7 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             quota_pool: None,
+            rag: None,
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
@@ -1453,11 +1503,11 @@ mod tests {
             shadow: None,
             pii: None,
             trace_content: false,
+            capture_content: false,
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
-            embedding_cache: OnceLock::new(),
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
@@ -1465,6 +1515,7 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             quota_pool: None,
+            rag: None,
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
@@ -1495,11 +1546,11 @@ mod tests {
             shadow: None,
             pii: None,
             trace_content: false,
+            capture_content: false,
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
-            embedding_cache: OnceLock::new(),
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
@@ -1507,6 +1558,7 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             quota_pool: None,
+            rag: None,
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
@@ -2087,6 +2139,44 @@ mod tests {
             err.contains("openai"),
             "error suggests the canonical name: {err}"
         );
+    }
+
+    #[test]
+    fn from_config_rejects_duplicate_provider_destination_names() {
+        let err = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "primary", "base_url": "https://one.example/v1"},
+                {"name": "primary", "base_url": "https://two.example/v1"}
+            ]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("configured more than once"), "{err}");
+    }
+
+    #[test]
+    fn from_config_validates_native_credential_destination_binding() {
+        let err = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "primary",
+                "provider_type": "openai",
+                "base_url": "https://8.8.8.8/v1",
+                "accept_native_credentials_for": "anthropic"
+            }]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("native credential binding"), "{err}");
+
+        assert!(AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "primary",
+                "provider_type": "openai",
+                "base_url": "https://8.8.8.8/v1",
+                "accept_native_credentials_for": "openai"
+            }]
+        }))
+        .is_ok());
     }
 
     #[test]
