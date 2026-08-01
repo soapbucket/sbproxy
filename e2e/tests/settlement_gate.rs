@@ -248,10 +248,42 @@ struct Stack {
     _dir: tempfile::TempDir,
 }
 
+/// Writes one test-only secret into the per-test temp dir, owner
+/// read/write only, and returns its absolute path.
+///
+/// The proxy resolves `file:` references itself at boot, with no
+/// `proxy.secrets` backend needed. A provider URI such as
+/// `secret://env/NAME` would require one and fail boot without it,
+/// which is exactly how the first version of this harness died.
+fn write_secret_file(
+    dir: &std::path::Path,
+    name: &str,
+    value: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join(name);
+    std::fs::write(&path, value)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(path)
+}
+
+/// A fresh, clearly test-only binding key per run: 32 bytes from the OS
+/// entropy pool, hex encoded. Generated, never vendored, never reused.
+fn fresh_test_key() -> anyhow::Result<String> {
+    let mut bytes = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 fn start_stack() -> anyhow::Result<Stack> {
     let dir = tempfile::tempdir()?;
     let socket_path = dir.path().join("lightning-rpc");
     let state_path = dir.path().join("settlement.sqlite3");
+    // The stub node never checks the rune, so its value only has to
+    // exist; the binding key derives real signing material and gets a
+    // fresh random value each run.
+    let binding_key_path = write_secret_file(dir.path(), "binding.key", &fresh_test_key()?)?;
+    let rune_path = write_secret_file(dir.path(), "cln.rune", "sbproxy-e2e-test-only-rune")?;
     let node = ClnStub::start(&socket_path)?;
     let origin = CountingOrigin::start()?;
 
@@ -261,11 +293,11 @@ proxy:
   http_bind_port: 0
   payments:
     state_path: {state_path}
-    challenge_binding_key: secret://env/SBPROXY_E2E_BINDING_KEY
+    challenge_binding_key: file:{binding_key}
     rails:
       lightning_cln:
         socket_path: {socket_path}
-        rune: secret://env/SBPROXY_E2E_CLN_RUNE
+        rune: file:{rune}
         quote_currency: BTC
         settlement_decimals: 11
 origins:
@@ -282,20 +314,13 @@ origins:
           - GPTBot
 "#,
         state_path = state_path.display(),
+        binding_key = binding_key_path.display(),
         socket_path = socket_path.display(),
+        rune = rune_path.display(),
         origin_port = origin.port,
     );
 
-    let harness = ProxyHarness::start_payments_with_yaml_and_env(
-        &yaml,
-        &[
-            (
-                "SBPROXY_E2E_BINDING_KEY",
-                "e2e-settlement-binding-key-material".to_string(),
-            ),
-            ("SBPROXY_E2E_CLN_RUNE", "e2e-test-rune".to_string()),
-        ],
-    )?;
+    let harness = ProxyHarness::start_payments_with_yaml_and_env(&yaml, &[])?;
     Ok(Stack {
         harness,
         node,

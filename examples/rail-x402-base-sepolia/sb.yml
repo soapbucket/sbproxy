@@ -39,9 +39,13 @@ proxy:
     state_path: /var/lib/sbproxy/payments.sqlite3
 
     # Names the key that binds a challenge to the proxy that issued it.
-    # Must be a reference (`secret://env/NAME`, `env:NAME`, `file:/path`);
-    # an inline key is rejected at load.
-    challenge_binding_key: secret://env/SBPROXY_PAYMENT_BINDING_KEY
+    # Must be a reference; an inline key is rejected at load. `env:NAME`
+    # reads the environment at startup and `file:/path` reads a file,
+    # neither needing any other configuration. A provider URI such as
+    # `secret://<backend>/<name>` also works, but only with a matching
+    # backend declared under proxy.secrets.backends; without one the
+    # proxy refuses to boot.
+    challenge_binding_key: env:SBPROXY_PAYMENT_BINDING_KEY
 
     # Total budget for the one synchronous provider interaction a paid
     # request is allowed. 2000 ms is both the default and the hard ceiling.

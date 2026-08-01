@@ -28,7 +28,10 @@ proxy:
 
   payments:
     state_path: /var/lib/sbproxy/payments.sqlite3
-    challenge_binding_key: secret://env/SBPROXY_PAYMENT_BINDING_KEY
+    # `env:NAME` reads the exported variable at startup with no other
+    # configuration; a `secret://<backend>/<name>` URI would need a
+    # backend under proxy.secrets.backends before the proxy boots.
+    challenge_binding_key: env:SBPROXY_PAYMENT_BINDING_KEY
     authorization_timeout_ms: 2000
     max_body_bytes: 1048576
 
