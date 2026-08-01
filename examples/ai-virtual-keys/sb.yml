@@ -119,7 +119,6 @@ origins:
         policies:
           - type: rate_limit
             rpm: 30
-            tpm: 60000
 
       - name: team-data
         type: ai_provider
@@ -139,4 +138,3 @@ origins:
         policies:
           - type: rate_limit
             rpm: 120
-            tpm: 400000

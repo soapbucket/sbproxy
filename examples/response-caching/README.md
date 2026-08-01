@@ -1,10 +1,10 @@
 # Response caching
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-01*
 
 ![Response caching](../../docs/assets/response-caching.gif)
 
-Demonstrates the per-origin `response_cache` block. Successful responses are stored in the in-memory cache for 60 seconds, keyed on the request method, host, path, and query string. The second request for the same URL is served from cache without contacting `test.sbproxy.dev`. With `cache_control: true`, SBproxy honours upstream `Cache-Control` directives such as `no-store` or `max-age` overrides when they are stricter than the configured TTL. The cache is easiest to see in the round-trip time: the first request pays the full trip to the echo upstream, the cached one answers from memory.
+Demonstrates the per-origin `response_cache` block. Successful responses are stored in the in-memory cache for 60 seconds, keyed on the request method, host, path, and query string. The second request for the same URL is served from cache without contacting `test.sbproxy.dev`. The configured `ttl_secs` is the only expiry input: upstream `Cache-Control` directives do not shorten or extend it. The cache is easiest to see in the round-trip time: the first request pays the full trip to the echo upstream, the cached one answers from memory.
 
 ## Run
 
@@ -51,7 +51,6 @@ A request with a different query string is treated as a separate cache key and h
 
 - `response_cache` action sibling - per-origin cache configuration
 - `ttl_secs` - hard upper bound on cache entry age
-- `cache_control: true` - upstream `Cache-Control` headers can shorten the TTL
 - `x-sbproxy-cache` response header - `HIT`, `STALE`, or `HIT-RESERVE` marks a cached serve; the header is absent on a miss, and no `Age` header is set
 
 ## See also
