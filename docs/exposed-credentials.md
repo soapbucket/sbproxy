@@ -1,5 +1,5 @@
 # Exposed credentials check
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-01*
 
 ![a basic-auth request using a known-leaked password stamped with the exposed-credential-check header on its way upstream](assets/exposed-credentials.gif)
 
@@ -55,6 +55,64 @@ $ printf 'password' | openssl dgst -sha1 -hex | tr a-z A-Z
 ```
 
 Trim surrounding whitespace; comments (`#`) and blank lines are skipped.
+
+## Calling it
+
+The runnable configuration is
+[`examples/exposed-credentials/`](../examples/exposed-credentials/): the block
+above with `action: tag`, three plaintext passwords, and the SHA-1 of
+`hunter2`, in front of an echo upstream. Start it:
+
+```bash
+make run CONFIG=examples/exposed-credentials/sb.yml
+```
+
+Because the upstream echoes the request back, the tag the proxy stamped is
+visible in its response:
+
+```bash
+curl -sS -u alice:password -H 'Host: api.local' \
+  http://127.0.0.1:8080/get | jq '.headers["exposed-credential-check"]'
+# "leaked-password"
+```
+
+The plaintext entry and the hash-only entry behave identically, which is the
+point of allowing both:
+
+```bash
+curl -sS -u alice:hunter2 -H 'Host: api.local' \
+  http://127.0.0.1:8080/get | jq '.headers["exposed-credential-check"]'
+# "leaked-password"
+```
+
+`hunter2` never appears in the config. Only its SHA-1 does, and the match still
+lands. A password on no list stamps nothing at all rather than stamping a
+negative verdict:
+
+```bash
+curl -sS -u 'alice:8sQ%2nT9.zR1@p#X' -H 'Host: api.local' \
+  http://127.0.0.1:8080/get | jq '.headers["exposed-credential-check"] // "not present"'
+# "not present"
+```
+
+That absence is the contract worth building on. An upstream should treat
+"header present" as the signal and must not expect a header saying the
+credential is clean.
+
+Under `action: tag` every one of these is a `200`; the request is forwarded
+either way and the upstream decides. Switch to `action: block` and the same
+leaked credential is refused at the edge instead:
+
+```http
+HTTP/1.1 403 Forbidden
+content-type: application/json
+
+{"error":"credential flagged as exposed"}
+```
+
+The body is a single `error` field. There is no `reason`, and no indication of
+which list entry matched, deliberately: telling a caller why their password was
+rejected would confirm a specific password is on a public breach list.
 
 ## What the upstream sees
 

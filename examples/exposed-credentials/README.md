@@ -34,7 +34,7 @@ curl -s -u alice:'8sQ%2nT9.zR1@p#X' -H 'Host: api.local' http://127.0.0.1:8080/g
 
 # To switch to hard-block, set action: block and the same request becomes:
 # HTTP/1.1 403 Forbidden
-# {"error":"forbidden","reason":"exposed credential"}
+# {"error":"credential flagged as exposed"}
 ```
 
 ## What this exercises

@@ -1,6 +1,6 @@
 # OpenAPI schema validation
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-01*
 
 The `openapi_validation` policy loads an OpenAPI 3.0 document at startup and validates each incoming request body against the matching operation's `requestBody` schema. Requests whose path + method are not described in the spec, or whose `Content-Type` has no schema, are passed through untouched, with one exception: when the matched operation declares `requestBody.required: true`, a request whose `Content-Type` matches no schema is rejected rather than passed through.
 
@@ -72,9 +72,82 @@ origins:
                           age:  {type: integer, minimum: 0, maximum: 150}
 ```
 
-A clean `POST /users/42` with `{"name":"alice","age":30}` is forwarded; `{"age":30}` is rejected with `422` and a JSON body naming `/name`.
+## Calling it
 
-A working example config lives at `examples/openapi-validation/sb.yml`.
+The runnable configuration is
+[`examples/openapi-validation/`](../examples/openapi-validation/), which is the
+spec above with `status: 400`. Start it:
+
+```bash
+make run CONFIG=examples/openapi-validation/sb.yml
+```
+
+The upstream has no `/users` route, so a forwarded request comes back as its
+`404`. That is the signal the policy allowed it through:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' -H 'Host: api.local' \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"alice","age":30}' \
+  http://127.0.0.1:8080/users/42
+# 404, forwarded
+```
+
+Drop the required field and the edge answers instead:
+
+```bash
+curl -sS -H 'Host: api.local' -H 'Content-Type: application/json' \
+  -d '{"age":30}' http://127.0.0.1:8080/users/42
+```
+
+```json
+{"detail":"POST /users/{id} body failed schema validation at ","error":"openapi validation failed"}
+```
+
+`detail` names the matched operation as a template rather than the concrete
+path, and ends with the JSON pointer to the failing *instance* location. For a
+missing required property that pointer is the document root, so the string ends
+with `at ` and nothing after it. It does not name `/name`: the object is what
+failed the `required` check, not the absent property. `additionalProperties`
+violations report the root the same way.
+
+A failure inside a property does carry a pointer:
+
+```bash
+curl -sS -H 'Host: api.local' -H 'Content-Type: application/json' \
+  -d '{"name":"alice","age":"thirty"}' http://127.0.0.1:8080/users/42
+# {"detail":"POST /users/{id} body failed schema validation at /age","error":"openapi validation failed"}
+
+curl -sS -H 'Host: api.local' -H 'Content-Type: application/json' \
+  -d '{"name":"alice","age":999}' http://127.0.0.1:8080/users/42
+# {"detail":"POST /users/{id} body failed schema validation at /age","error":"openapi validation failed"}
+```
+
+A type error and a range error are indistinguishable from the outside: both
+report `/age` and neither says what was wrong or echoes what was sent. That is
+deliberate, so a probing client cannot use the error text to confirm guesses.
+
+A path the spec does not describe is forwarded without inspection:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' -H 'Host: api.local' \
+  -H 'Content-Type: application/json' \
+  -d '{"whatever":1}' http://127.0.0.1:8080/not-in-spec
+# 404, forwarded unvalidated
+```
+
+### This policy needs a request that goes upstream
+
+Validation runs in `request_body_filter`, which only executes for a request the
+proxy forwards. Pair `openapi_validation` with a `static` action and the policy
+compiles, appears in the verdict stream, and validates nothing: the static
+response is produced before the body is ever read, so every body is accepted.
+The same applies to the other body-reading policies, `content_digest` and
+`request_validator`.
+
+The example uses a `proxy` action for that reason. If you are testing this
+policy against a stub origin and every malformed body returns success, check
+the action type first.
 
 ## Limitations
 

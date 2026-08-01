@@ -26,11 +26,13 @@ proxy:
 
 origins:
   "api.local":
+    # A proxy action, not `static`. Body-validating policies run in
+    # `request_body_filter`, which only executes for a request that is
+    # forwarded upstream; a `static` action answers earlier and the
+    # validation never runs.
     action:
-      type: static
-      status_code: 200
-      content_type: application/json
-      body: '{"ok":true}'
+      type: proxy
+      url: https://test.sbproxy.dev
 
     policies:
       - type: openapi_validation
