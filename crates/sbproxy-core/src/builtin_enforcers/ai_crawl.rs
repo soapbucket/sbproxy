@@ -31,7 +31,7 @@ use sbproxy_modules::AiCrawlDecision;
 use sbproxy_modules::RateLimitInfo;
 use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
 
-use crate::context::RequestContext;
+use crate::context::{PaymentResponse, RequestContext};
 
 /// Newtype wrapper that adapts [`AiCrawlControlPolicy`] to the
 /// [`PolicyEnforcer`] trait surface.
@@ -120,7 +120,11 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                 // `crawler-price` header through the same challenge slot
                 // the single-rail path uses; the 402 response handler
                 // stamps the literal header name `crawler-price`.
-                ctx.crawl_challenge = Some(("crawler-price".to_string(), price_header, body));
+                ctx.crawl_challenge = Some(PaymentResponse::json_with_header(
+                    "crawler-price",
+                    price_header,
+                    body,
+                ));
                 ctx.deny_policy_type = Some("ai_crawl_payment");
                 Box::pin(async move {
                     Ok(PolicyDecision::Deny {
@@ -130,7 +134,11 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                 })
             }
             AiCrawlDecision::Charge { body, challenge } => {
-                ctx.crawl_challenge = Some((policy.header_name().to_string(), challenge, body));
+                ctx.crawl_challenge = Some(PaymentResponse::json_with_header(
+                    policy.header_name(),
+                    challenge,
+                    body,
+                ));
                 ctx.deny_policy_type = Some("ai_crawl_payment");
                 Box::pin(async move {
                     Ok(PolicyDecision::Deny {
@@ -140,8 +148,7 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                 })
             }
             AiCrawlDecision::MultiRail { body, content_type } => {
-                ctx.crawl_challenge =
-                    Some(("Content-Type".to_string(), content_type.to_string(), body));
+                ctx.crawl_challenge = Some(PaymentResponse::typed(content_type.to_string(), body));
                 ctx.deny_policy_type = Some("ai_crawl_multi_rail");
                 Box::pin(async move {
                     Ok(PolicyDecision::Deny {
@@ -151,11 +158,7 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                 })
             }
             AiCrawlDecision::NoAcceptableRail { body } => {
-                ctx.crawl_challenge = Some((
-                    "Content-Type".to_string(),
-                    "application/json".to_string(),
-                    body,
-                ));
+                ctx.crawl_challenge = Some(PaymentResponse::json(body));
                 ctx.deny_policy_type = Some("ai_crawl_no_acceptable_rail");
                 Box::pin(async move {
                     Ok(PolicyDecision::Deny {
@@ -169,11 +172,7 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                 // Signal the operator declared as disallowed (`=no`).
                 // Block with 403 and carry the JSON explanation through
                 // the same challenge slot the other deny shapes use.
-                ctx.crawl_challenge = Some((
-                    "Content-Type".to_string(),
-                    "application/json".to_string(),
-                    body,
-                ));
+                ctx.crawl_challenge = Some(PaymentResponse::json(body));
                 ctx.deny_policy_type = Some("ai_crawl_signal_blocked");
                 Box::pin(async move {
                     Ok(PolicyDecision::Deny {
@@ -198,7 +197,7 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                 body,
                 retry_after_seconds,
             } => {
-                ctx.crawl_challenge = Some((policy.header_name().to_string(), String::new(), body));
+                ctx.crawl_challenge = Some(PaymentResponse::json(body));
                 ctx.rate_limit_info = Some(RateLimitInfo {
                     allowed: false,
                     limit: 0,
