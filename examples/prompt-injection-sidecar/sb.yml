@@ -42,7 +42,11 @@ origins:
         action: tag
         detector: sidecar
         threshold: 0.5
-        enable_body_aware: true
+        # No `enable_body_aware` here: tag stamps headers onto the
+        # upstream request, which is already assembled by the time the
+        # body is read, so tag + body-aware is refused at config
+        # compile on a proxy origin. Tag mode scores the URI + headers;
+        # body scanning pairs with block or log (see block.local).
         detector_config:
           # gRPC endpoint of the sidecar.
           endpoint: http://127.0.0.1:9440

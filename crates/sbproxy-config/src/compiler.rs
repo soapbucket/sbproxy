@@ -2363,6 +2363,82 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         ];
     }
 
+    // --- WOR-2136: refuse the dead tag + body-aware combination ---
+    //
+    // `action: tag` stamps the score / label headers onto the upstream
+    // request, and the upstream request is already assembled by the
+    // time the request body is read. On anything but an `ai_proxy`
+    // origin a body-aware hit therefore has nowhere to write: the
+    // combination reads as enforcing and enforces nothing. `ai_proxy`
+    // is exempt because that path reads the body before dispatch and
+    // can tag. Rejecting at compile keeps the dead combination out of
+    // running configs.
+    let origin_action_type = config
+        .action
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    for policy in &config.policies {
+        if !policy_type_is(policy, "prompt_injection_v2") {
+            continue;
+        }
+        if !policy
+            .get("enable_body_aware")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let action_key = policy.get("action").and_then(|v| v.as_str());
+        if action_key.unwrap_or("tag") == "tag" && origin_action_type != "ai_proxy" {
+            let default_note = if action_key.is_none() {
+                " (the default)"
+            } else {
+                ""
+            };
+            anyhow::bail!(
+                "origin {hostname}: prompt_injection_v2 sets `enable_body_aware: true` \
+                 with `action: tag`{default_note} on a `{origin_action_type}` origin. \
+                 A body hit cannot stamp the tag headers because the upstream request \
+                 is already assembled by the time the body is read, so this combination \
+                 enforces nothing. Use `action: block` or `action: log` for body-aware \
+                 scanning here; tagging on a body hit works only on `ai_proxy` origins, \
+                 which read the body before dispatch."
+            );
+        }
+    }
+
+    // --- WOR-2136: warn about body-reading policies on `static` ---
+    //
+    // A `static` action answers at the request phase and never
+    // forwards, so `request_body_filter` never runs and a policy that
+    // inspects the request body inspects nothing there. Warn rather
+    // than reject: the origin still serves, and the combination has
+    // shipped before as a copy-paste artifact (fixed in #861).
+    if origin_action_type == "static" {
+        for policy in &config.policies {
+            let policy_type = policy.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let reads_body = matches!(
+                policy_type,
+                "openapi_validation" | "content_digest" | "request_validator"
+            ) || (policy_type == "prompt_injection_v2"
+                && policy
+                    .get("enable_body_aware")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false));
+            if reads_body {
+                tracing::warn!(
+                    hostname = %hostname,
+                    policy = %policy_type,
+                    "policy reads the request body, but a `static` action never \
+                     forwards a request, so request_body_filter never runs and the \
+                     policy validates nothing on this origin"
+                );
+            }
+        }
+    }
+
     // --- Wave 4 / G4.5: validate and intern the Content-Signal value ---
     //
     // The closed enum is `{ai-train, search, ai-input}` per A4.1's
@@ -2615,6 +2691,177 @@ proxy:
 "#;
         compile_config(yaml)
             .expect("disabled correlation and non-carrier metadata must remain valid");
+    }
+
+    // --- WOR-2136: the dead tag + body-aware combination ---
+
+    #[test]
+    fn compile_rejects_tag_with_body_aware_on_a_plain_proxy_origin() {
+        let yaml = r#"
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: prompt_injection_v2
+        detector: heuristic-v1
+        action: tag
+        enable_body_aware: true
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("tag + body-aware on a proxy origin must not compile");
+        let message = format!("{error:#}");
+        assert!(message.contains("enable_body_aware"), "{message}");
+        assert!(
+            message.contains("already assembled by the time the body is read"),
+            "{message}"
+        );
+        assert!(
+            message.contains("`action: block` or `action: log`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn compile_rejects_the_default_tag_with_body_aware_too() {
+        // `tag` is the default action, so omitting the key is the same
+        // dead combination; the message names the default explicitly.
+        let yaml = r#"
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: prompt_injection_v2
+        detector: heuristic-v1
+        enable_body_aware: true
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("the default action is tag, so this must not compile either");
+        assert!(format!("{error:#}").contains("(the default)"), "{error:#}");
+    }
+
+    #[test]
+    fn compile_allows_the_live_prompt_injection_combinations() {
+        // tag without body-aware: the URI + header scan can stamp.
+        // block with body-aware: a body hit rejects, which works.
+        for policy_yaml in [
+            "action: tag",
+            "action: block\n        enable_body_aware: true",
+            "action: log\n        enable_body_aware: true",
+        ] {
+            let yaml = format!(
+                r#"
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: prompt_injection_v2
+        detector: heuristic-v1
+        {policy_yaml}
+"#
+            );
+            compile_config(&yaml)
+                .unwrap_or_else(|error| panic!("`{policy_yaml}` must stay compilable: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn compile_allows_tag_with_body_aware_on_an_ai_proxy_origin() {
+        // The ai_proxy path reads the body before dispatch and can tag,
+        // so the combination is live there and must keep compiling.
+        let yaml = r#"
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+    policies:
+      - type: prompt_injection_v2
+        detector: heuristic-v1
+        action: tag
+        enable_body_aware: true
+"#;
+        compile_config(yaml).expect("tag + body-aware is live on ai_proxy origins");
+    }
+
+    #[test]
+    fn a_body_reading_policy_on_a_static_origin_warns_at_compile() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Counts compile-time warnings that name the request_body_filter
+        // gap, so the assertion cannot pass on an unrelated warning.
+        struct WarnCounter(Arc<AtomicUsize>);
+
+        impl tracing::Subscriber for WarnCounter {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                metadata.target().starts_with("sbproxy_config")
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct SeenGapMessage(bool);
+                impl tracing::field::Visit for SeenGapMessage {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message"
+                            && format!("{value:?}").contains("request_body_filter never runs")
+                        {
+                            self.0 = true;
+                        }
+                    }
+                }
+                if *event.metadata().level() == tracing::Level::WARN {
+                    let mut visitor = SeenGapMessage(false);
+                    event.record(&mut visitor);
+                    if visitor.0 {
+                        self.0.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let yaml = r#"
+origins:
+  "static.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: request_validator
+        schema:
+          type: object
+"#;
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let compiled =
+            tracing::subscriber::with_default(WarnCounter(Arc::clone(&warnings)), || {
+                compile_config(yaml)
+            });
+        compiled.expect("a body-reading policy on a static origin compiles; it only warns");
+        assert_eq!(
+            warnings.load(Ordering::Relaxed),
+            1,
+            "the static + body-reading combination must warn exactly once"
+        );
     }
 
     #[test]

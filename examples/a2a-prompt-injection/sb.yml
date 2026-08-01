@@ -34,7 +34,9 @@
 #      `block` only. Tagging writes a score header onto the upstream
 #      request, and by the time the body has been buffered that
 #      request was already built, so there is nothing left to write
-#      to. A top-level `action: tag` resolves to `log` here.
+#      to. For the same reason a top-level `action: tag` combined
+#      with `enable_body_aware: true` is refused at config compile on
+#      a proxy origin, so this example sets `action: log` outright.
 #
 # Run:
 #   make run CONFIG=examples/a2a-prompt-injection/sb.yml
@@ -119,9 +121,11 @@ origins:
       - type: prompt_injection_v2
         detector: heuristic-v1
         threshold: 0.5
-        # Baseline action. At the agent boundary this projects onto
-        # `log`, since `tag` cannot run at the body phase.
-        action: tag
+        # Baseline action. `log` is the honest spelling here: no
+        # action at the body phase can stamp tag headers, and `tag`
+        # together with `enable_body_aware: true` is refused at
+        # config compile on a proxy origin.
+        action: log
         # Score each message part on its own rather than fusing the
         # whole JSON-RPC envelope into one string. Costs one
         # classification per part instead of one per hop; buys

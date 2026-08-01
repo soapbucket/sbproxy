@@ -1,6 +1,6 @@
 # Prompt injection at the agent boundary
 
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-01*
 
 Prompt-injection scanning on the hop between two agents rather than on the hop between a person and a model. The message carrying the injection was written by another agent, and no human read it on the way through.
 
@@ -18,7 +18,7 @@ The flag defaults to false, and that default is deliberate. This scan is inline 
 
 Delegation depth is 0 at the chain root and 1 on the first delegated call. It is `chain_depth` minus one, and the two are worth keeping straight because they disagree by one everywhere. Set the key to `null` to turn the escalation off on a route that cannot absorb the rejections.
 
-**No `tag`.** The agent-boundary vocabulary is `log` or `block`. Tagging means writing a score header onto the upstream request, and by the time the body has been buffered that request has already been assembled and its header slot drained. The variant does not exist here rather than existing and doing nothing. A top-level `action: tag` resolves to `log` at this boundary, and that projection is the reason it is spelled out in `sb.yml` instead of left implicit.
+**No `tag`.** The agent-boundary vocabulary is `log` or `block`. Tagging means writing a score header onto the upstream request, and by the time the body has been buffered that request has already been assembled and its header slot drained. The variant does not exist here rather than existing and doing nothing. For the same reason, `action: tag` combined with `enable_body_aware: true` is refused at config compile on a proxy origin, so `sb.yml` sets `action: log` explicitly instead of relying on the projection.
 
 ## The envelope has to come from somewhere you trust
 
