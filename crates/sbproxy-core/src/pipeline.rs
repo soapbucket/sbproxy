@@ -2176,7 +2176,15 @@ fn compile_origin_policy_chain(
 ) -> anyhow::Result<Vec<Policy>> {
     let mut chain: Vec<Policy> = policy_configs
         .iter()
-        .map(compile_policy)
+        .map(|cfg| {
+            // WOR-2162: name the origin on a policy compile failure so
+            // an operator can find the offending block (the policy
+            // module's own error names the policy type and, for CEL,
+            // quotes the bad expression).
+            use anyhow::Context as _;
+            compile_policy(cfg)
+                .with_context(|| format!("origin `{origin_id}`: invalid policy config"))
+        })
         .collect::<anyhow::Result<_>>()?;
     if l2_store.is_some() {
         for p in chain.iter_mut() {
@@ -3789,6 +3797,67 @@ origins: {}
         let tls = TlsFingerprintConfig::from_extensions(&cfg.server.extensions);
         // Default => disabled (safe).
         assert!(!tls.enabled);
+    }
+
+    // --- WOR-2162: expression policies reject invalid CEL at compile ---
+
+    #[test]
+    fn expression_policy_with_invalid_cel_rejects_the_config() {
+        // The old behavior accepted this config and then ADMITTED every
+        // request when the per-request CEL compile failed. Pipeline
+        // construction (the shared path under boot and reload) must
+        // refuse it with a diagnostic naming the origin, the policy,
+        // and the bad expression.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "cel.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: expression
+        expression: 'this is not valid CEL !!!'
+"#;
+        let cfg = sbproxy_config::compile_config(yaml).expect("yaml parses");
+        let err = CompiledPipeline::from_config(cfg)
+            .expect_err("invalid CEL must reject the candidate config");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cel.local"),
+            "diagnostic must name the origin: {msg}"
+        );
+        assert!(
+            msg.contains("expression"),
+            "diagnostic must name the policy type: {msg}"
+        );
+        assert!(
+            msg.contains("this is not valid CEL !!!"),
+            "diagnostic must quote the bad expression: {msg}"
+        );
+    }
+
+    #[test]
+    fn expression_policy_with_valid_cel_still_compiles() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "cel.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: expression
+        expression: 'request.method == "GET"'
+"#;
+        let cfg = sbproxy_config::compile_config(yaml).expect("yaml parses");
+        CompiledPipeline::from_config(cfg).expect("valid CEL must keep compiling");
     }
 
     // --- response cache store selection ---
