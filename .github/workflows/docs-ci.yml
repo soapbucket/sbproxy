@@ -44,6 +44,8 @@ on:
 # default from the repo settings.
 permissions:
   contents: read
+  # The llms-full guard below asks the API for the PR's file list.
+  pull-requests: read
 
 # Cancel superseded runs on the same ref so force-pushes do not
 # double-spend runner minutes.
@@ -121,8 +123,38 @@ jobs:
       - name: spec citation hygiene
         run: bash scripts/check-spec-citations.sh
 
-      # WOR-1826: docs/llms-full.txt is generated from docs/*.md; fail
-      # the PR when a doc change ships without regenerating it, so the
-      # corpus AI tools fetch never drifts from the docs users read.
-      - name: llms-full.txt is current
-        run: ./scripts/regen-llms-full.sh --check
+      # WOR-1826 asked every branch to regenerate docs/llms-full.txt so
+      # the corpus never drifted from the docs. That worked, and it also
+      # meant two concurrent doc PRs always conflicted on a 2 MB
+      # generated file. WOR-2119 moved the regeneration to
+      # llms-full-refresh.yml, which owns the file on main; a branch
+      # that hand-carries it is back to conflicting with every other
+      # branch, so reject it here and say what to run instead.
+      - name: llms-full.txt is left to CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Ask the API which files the PR touches rather than diffing
+          # locally: checkout is shallow here, so the merge base a
+          # `base...HEAD` diff needs is usually not in the clone.
+          if ! gh pr view "${{ github.event.pull_request.number }}" \
+                 --json files --jq '.files[].path' \
+               | grep -qx 'docs/llms-full.txt'; then
+            echo "docs/llms-full.txt untouched by this branch"
+            exit 0
+          fi
+          # Workflow commands are read from stdout, so the annotation
+          # has to go there rather than stderr to reach the PR.
+          cat <<'MSG'
+          ::error::this branch commits docs/llms-full.txt, which CI now owns.
+
+          Drop it from the branch:
+
+            git checkout origin/main -- docs/llms-full.txt
+            git commit -m 'chore: drop generated llms-full.txt from the branch'
+
+          The llms-full-refresh workflow regenerates it on main after
+          this PR merges. Edit the source docs/*.md; never the corpus.
+          MSG
+          exit 1
