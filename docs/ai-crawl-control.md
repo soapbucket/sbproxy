@@ -30,9 +30,9 @@ bytes of every challenge, credential, error, and receipt.
 crawler GET /article
         User-Agent: GPTBot/1.0
 proxy   <- 402 Payment Required
-        Crawler-Payment: realm="ai-crawl" currency="USD" price="0.001"
+        Crawler-Payment: Crawler-Payment realm="ai-crawl" currency="USD" price="0.001000"
         Content-Type: application/json
-        body: {"error":"payment_required","price":"0.001","currency":"USD","target":"blog.example.com/article","header":"crawler-payment"}
+        body: {"error":"payment_required","price":"0.001000","amount_micros":1000,"currency":"USD","target":"blog.example.com/article","header":"crawler-payment"}
 
 crawler GET /article (after paying out-of-band)
         User-Agent: GPTBot/1.0
@@ -79,6 +79,89 @@ policies:
 | `ledger` | block | unset | HTTP ledger client config. See "HTTP ledger" below. Mutually exclusive with `valid_tokens`. |
 
 Only `GET` and `HEAD` requests are subject to charging today. `POST`, `PUT`, `PATCH`, and `DELETE` pass through without charge.
+
+## Calling it
+
+The runnable configuration is
+[`examples/ai-crawl-control/`](../examples/ai-crawl-control/), which is the
+block above in front of a proxy origin, seeded with three single-use tokens
+(`token-aaa-001`, `token-aaa-002`, `token-aaa-003`). Start it:
+
+```bash
+make run CONFIG=examples/ai-crawl-control/sb.yml
+```
+
+Arrive as a known crawler with no token:
+
+```bash
+curl -sS -i -H 'Host: blog.local' \
+  -H 'User-Agent: GPTBot/1.0' \
+  http://127.0.0.1:8080/article
+```
+
+```http
+HTTP/1.1 402 Payment Required
+content-type: application/json
+crawler-payment: Crawler-Payment realm="ai-crawl" currency="USD" price="0.001000"
+content-length: 142
+
+{"error":"payment_required","price":"0.001000","amount_micros":1000,"currency":"USD","target":"blog.local/article","header":"crawler-payment"}
+```
+
+Two details in there are easy to get wrong. `price` is a **string**, not a
+JSON number, and it is rendered at six decimal places, so `0.001` in the
+config reads back as `"0.001000"`. `amount_micros` carries the same figure as
+an integer count of millionths, which is the field to compute against, since
+it avoids parsing a decimal string into a float. `target` is the host and path
+being charged for, so a crawler can tell which resource the quote covers.
+
+The response header name is whatever `header:` is set to, here
+`crawler-payment`. Its value repeats the canonical `Crawler-Payment` scheme
+name followed by the realm, currency, and price.
+
+Now pay. Retry with a seeded token in that same header:
+
+```bash
+curl -sS -i -H 'Host: blog.local' \
+  -H 'User-Agent: GPTBot/1.0' \
+  -H 'crawler-payment: token-aaa-001' \
+  http://127.0.0.1:8080/article
+```
+
+The paywall opens and the upstream's real response comes back:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+link: </licenses.xml>; rel="license"
+Transfer-Encoding: chunked
+```
+
+Send that exact request a second time and it is refused, because the ledger is
+single-use and the token left the set when it was redeemed:
+
+```http
+HTTP/1.1 402 Payment Required
+crawler-payment: Crawler-Payment realm="ai-crawl" currency="USD" price="0.001000"
+
+{"error":"payment_required","price":"0.001000","amount_micros":1000,"currency":"USD","target":"blog.local/article","header":"crawler-payment"}
+```
+
+That replay refusal is the property worth checking in your own run. A token
+that keeps working is a ledger that is not spending, and with the in-memory
+ledger it also means a proxy restart has reseeded `valid_tokens` from the
+config.
+
+Finally, the same URL with no crawler User-Agent is not charged at all:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H 'Host: blog.local' http://127.0.0.1:8080/article
+# 200
+```
+
+The challenge fires on the User-Agent substring match, so ordinary browser
+and client traffic reaches the origin untouched.
 
 ## Tiered pricing
 

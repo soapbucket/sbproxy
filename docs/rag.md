@@ -161,9 +161,9 @@ and the model is never called:
 ```json
 {
   "error": {
-    "type": "rag_retrieval_failed",
     "code": "rag_retrieval_failed",
-    "message": "retrieval context was unavailable"
+    "message": "retrieval context was unavailable",
+    "type": "rag_retrieval_failed"
   }
 }
 ```
@@ -349,9 +349,9 @@ error:
 ```json
 {
   "error": {
-    "type": "rag_retrieval_failed",
     "code": "rag_retrieval_failed",
-    "message": "retrieval context was unavailable"
+    "message": "retrieval context was unavailable",
+    "type": "rag_retrieval_failed"
   }
 }
 ```

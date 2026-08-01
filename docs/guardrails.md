@@ -78,10 +78,10 @@ That returns `400` and the model is never called:
 ```json
 {
   "error": {
-    "message": "external guardrail blocked content",
-    "type": "guardrail_violation",
     "code": "local-policy",
-    "request_id": "<differs on every request>"
+    "message": "external guardrail blocked content",
+    "request_id": "<differs on every request>",
+    "type": "guardrail_violation"
   }
 }
 ```
