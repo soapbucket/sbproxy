@@ -50,8 +50,6 @@ pub struct BuildFeatures {
     pub gpu_nvidia: bool,
     /// Apple Silicon (Metal) unified-memory discovery.
     pub gpu_apple: bool,
-    /// The in-process embedded engine (no subprocess).
-    pub embedded: bool,
     /// sbproxy-managed Hugging Face weight download with sha256
     /// verification. Engines can still self-download when this is off.
     pub model_weights: bool,
@@ -69,7 +67,6 @@ impl BuildFeatures {
         Self {
             gpu_nvidia: cfg!(feature = "gpu-nvidia"),
             gpu_apple: cfg!(feature = "gpu-apple"),
-            embedded: cfg!(feature = "embedded"),
             model_weights: cfg!(feature = "model-weights"),
             tls_fingerprint: cfg!(feature = "tls-fingerprint"),
             inprocess_embed: cfg!(feature = "inprocess-embed"),
@@ -172,11 +169,9 @@ pub struct AcquisitionOption {
 /// acquisition options viable on this host.
 #[derive(Debug, Clone, Serialize)]
 pub struct EngineBinary {
-    /// The `engine:` value a `serve:` block uses (`vllm`, `llama_cpp`,
-    /// `embedded`).
+    /// The `engine:` value a `serve:` block uses (`vllm`, `llama_cpp`).
     pub engine: &'static str,
-    /// The program the launcher execs (`vllm`, `llama-server`; a
-    /// sentinel for the in-process embedded engine).
+    /// The program the launcher execs (`vllm`, `llama-server`).
     pub program: &'static str,
     /// Resolved path, or `None` when the program is not on `PATH`.
     pub path: Option<PathBuf>,
@@ -520,12 +515,10 @@ impl DoctorReport {
             brew: package_managers.brew.is_some(),
             uv: python.uv.is_some(),
             pip: python.pip,
-            embedded_feature: features.embedded,
         };
         let engines = vec![
             engine_report("llama_cpp", "llama-server", &env),
             engine_report("vllm", "vllm", &env),
-            engine_report("embedded", "embedded", &env),
             engine_report("mistralrs", "mistralrs", &env),
         ];
 
@@ -990,7 +983,6 @@ impl DoctorReport {
             sbproxy_model_host::EngineKind::Vllm => "vllm",
             sbproxy_model_host::EngineKind::SGLang => "sglang",
             sbproxy_model_host::EngineKind::LlamaCpp => "llama_cpp",
-            sbproxy_model_host::EngineKind::Embedded => "embedded",
             sbproxy_model_host::EngineKind::MistralRs => "mistralrs",
         };
         self.engines.iter().find(|e| e.engine == engine)
@@ -1033,10 +1025,6 @@ impl DoctorReport {
         out.push_str(&format!(
             "  model-weights   (managed weight download)     {}\n",
             yn(self.features.model_weights)
-        ));
-        out.push_str(&format!(
-            "  embedded        (in-process engine)           {}\n",
-            yn(self.features.embedded)
         ));
 
         out.push_str("\ngpus / memory budget\n");
@@ -1221,17 +1209,12 @@ struct EngineEnvView {
     brew: bool,
     uv: bool,
     pip: bool,
-    embedded_feature: bool,
 }
 
 /// Build one engine's report: `PATH` resolution, version, and the
 /// acquisition options viable on this host, best-first.
 fn engine_report(engine: &'static str, program: &'static str, env: &EngineEnvView) -> EngineBinary {
-    let path = if program == "embedded" {
-        None
-    } else {
-        find_on_path(program)
-    };
+    let path = find_on_path(program);
     let version = path.as_ref().and_then(|_| match program {
         "llama-server" => run_version("llama-server", &["--version"]),
         "vllm" => run_version("vllm", &["--version"]),
@@ -1242,15 +1225,6 @@ fn engine_report(engine: &'static str, program: &'static str, env: &EngineEnvVie
         "llama_cpp" => llama_acquisition(env, path.is_some()),
         "vllm" => vllm_acquisition(env, path.is_some()),
         "mistralrs" => mistralrs_acquisition(env, path.is_some()),
-        "embedded" => vec![AcquisitionOption {
-            method: "built-in",
-            available: env.embedded_feature,
-            detail: if env.embedded_feature {
-                "in-process engine compiled in (engine: embedded)".to_string()
-            } else {
-                "rebuild with --features embedded for the in-process engine".to_string()
-            },
-        }],
         _ => Vec::new(),
     };
     EngineBinary {
@@ -1462,11 +1436,9 @@ fn serving_verdict(
         }
     }
 
-    // "Installed" = a binary on PATH, or the embedded engine compiled
-    // in. That is what can serve *right now*, before acquisition wiring.
-    let any_installed = engines
-        .iter()
-        .any(|e| e.path.is_some() || (e.engine == "embedded" && e.runnable()));
+    // "Installed" = a binary on PATH. That is what can serve *right
+    // now*, before acquisition wiring.
+    let any_installed = engines.iter().any(|e| e.path.is_some());
     let any_acquirable = engines.iter().any(|e| e.runnable());
 
     if !any_installed {
@@ -2328,7 +2300,7 @@ mod tests {
     #[test]
     fn every_engine_reports_acquisition_options() {
         let report = DoctorReport::collect();
-        assert_eq!(report.engines.len(), 4);
+        assert_eq!(report.engines.len(), 3);
         for e in &report.engines {
             assert!(
                 !e.acquisition.is_empty(),
@@ -2350,7 +2322,6 @@ mod tests {
             brew: false,
             uv: false,
             pip: false,
-            embedded_feature: false,
         };
         let llama = engine_report("llama_cpp", "llama-server", &env);
         assert!(
@@ -2371,7 +2342,6 @@ mod tests {
             brew: true,
             uv: true,
             pip: true,
-            embedded_feature: false,
         };
         let vllm = engine_report("vllm", "vllm", &mac_full);
         assert!(
@@ -2390,12 +2360,10 @@ mod tests {
             brew: false,
             uv: false,
             pip: false,
-            embedded_feature: false,
         };
         let engines = vec![
             engine_report("llama_cpp", "llama-server", &env),
             engine_report("vllm", "vllm", &env),
-            engine_report("embedded", "embedded", &env),
         ];
         let verdict = serving_verdict(
             &[],
@@ -2505,7 +2473,6 @@ mod tests {
             brew: false,
             uv: false,
             pip: false,
-            embedded_feature: false,
         };
         let llama = engine_report("llama_cpp", "llama-server", &env);
         let prebuilt = llama

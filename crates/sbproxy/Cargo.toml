@@ -83,9 +83,6 @@ gpu-nvidia = ["sbproxy-core/gpu-nvidia"]
 # answers instead.
 gpu-apple = ["sbproxy-core/gpu-apple"]
 model-weights = ["sbproxy-core/model-weights", "sbproxy-model-host/weights"]
-# WOR-1658: in-process embedded engine (mistral.rs). Off by default; a
-# single-binary / zero-external-engine deploy opts in.
-embedded = ["sbproxy-core/embedded"]
 # WOR-2098: route-scoped RAG retrieval, forwarded to sbproxy-core. The
 # released binary ships `rag-full` (every documented embedding and
 # vector-store adapter); a narrow build can select single adapters, e.g.

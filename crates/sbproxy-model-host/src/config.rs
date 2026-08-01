@@ -48,13 +48,6 @@ pub enum EngineKind {
     SGLang,
     /// llama.cpp `llama-server`, the low-VRAM / GGUF / edge path.
     LlamaCpp,
-    /// In-process engine (WOR-1658): no subprocess, no external binary.
-    /// The model runs inside the gateway behind the `embedded` cargo
-    /// feature (candle backend), serving over a loopback HTTP port like
-    /// the others so the runtime routes to it unchanged. A build without
-    /// the `embedded` feature accepts the config but fails the launch
-    /// with a clear "rebuild with --features embedded" error.
-    Embedded,
     /// mistral.rs (WOR-1861), driven as a supervised subprocess over its
     /// OpenAI-compatible HTTP surface via the upstream prebuilt `mistralrs`
     /// binary (pinned tag + sha256, PATH-first), exactly like llama.cpp.
@@ -68,10 +61,7 @@ pub enum EngineKind {
 }
 
 impl EngineKind {
-    /// The binary name looked up on `PATH` for this engine. For
-    /// [`EngineKind::Embedded`] this is a sentinel, not a real
-    /// executable: the embedded engine runs in-process and never spawns
-    /// a subprocess, so the name is never resolved on `PATH`.
+    /// The binary name looked up on `PATH` for this engine.
     pub fn binary_name(self) -> &'static str {
         match self {
             EngineKind::Vllm => "vllm",
@@ -80,32 +70,23 @@ impl EngineKind {
             // `PATH`. The managed driver owns the real invocation.
             EngineKind::SGLang => "sglang",
             EngineKind::LlamaCpp => "llama-server",
-            EngineKind::Embedded => "embedded",
             // The v0.9 unified CLI: upstream's installer and release
             // tarballs both ship a single `mistralrs` binary.
             EngineKind::MistralRs => "mistralrs",
         }
     }
 
-    /// Whether this engine runs in-process (no subprocess spawn). Only
-    /// [`EngineKind::Embedded`] does; the launcher dispatches on it.
-    pub fn is_in_process(self) -> bool {
-        matches!(self, EngineKind::Embedded)
-    }
-
     /// The model id this engine's OpenAI surface accepts in request
     /// bodies for a managed deployment (WOR-1861). vLLM and SGLang are
     /// launched with `--served-model-name <deployment>`, so the
-    /// deployment id is the served name; llama.cpp and the embedded
-    /// engine ignore the field. mistral.rs has no served-name flag: it
-    /// registers the model under the id it loaded (the snapshot path)
-    /// and accepts `default` as the alias for the loaded model, so the
-    /// deployment id would be rejected with a 404-shaped error.
+    /// deployment id is the served name; llama.cpp ignores the field.
+    /// mistral.rs has no served-name flag: it registers the model under
+    /// the id it loaded (the snapshot path) and accepts `default` as the
+    /// alias for the loaded model, so the deployment id would be
+    /// rejected with a 404-shaped error.
     pub fn request_model_id(self, deployment: &str) -> &str {
         match self {
-            EngineKind::Vllm | EngineKind::SGLang | EngineKind::LlamaCpp | EngineKind::Embedded => {
-                deployment
-            }
+            EngineKind::Vllm | EngineKind::SGLang | EngineKind::LlamaCpp => deployment,
             EngineKind::MistralRs => "default",
         }
     }
@@ -133,11 +114,6 @@ pub enum EngineChoice {
     SGLang,
     /// Force llama.cpp.
     LlamaCpp,
-    /// Force the in-process embedded engine (WOR-1658). `Auto` never
-    /// resolves to this; the embedded engine is an explicit opt-in
-    /// because it changes the deployment model (no subprocess) and is
-    /// only present when the `embedded` feature is compiled.
-    Embedded,
     /// Force mistral.rs (WOR-1861). `Auto` never resolves to this:
     /// mistral.rs is an explicit opt-in that stays behind vLLM
     /// (safetensors) and llama.cpp (GGUF) until it has certification
@@ -163,7 +139,6 @@ impl EngineChoice {
             EngineChoice::Vllm => EngineKind::Vllm,
             EngineChoice::SGLang => EngineKind::SGLang,
             EngineChoice::LlamaCpp => EngineKind::LlamaCpp,
-            EngineChoice::Embedded => EngineKind::Embedded,
             EngineChoice::MistralRs => EngineKind::MistralRs,
             EngineChoice::Auto if is_gguf => EngineKind::LlamaCpp,
             EngineChoice::Auto => EngineKind::Vllm,
@@ -177,7 +152,6 @@ impl EngineChoice {
             EngineChoice::Vllm => "engine: vllm (forced)",
             EngineChoice::SGLang => "engine: sglang (forced, opt-in)",
             EngineChoice::LlamaCpp => "engine: llama_cpp (forced)",
-            EngineChoice::Embedded => "engine: embedded (forced, in-process)",
             EngineChoice::MistralRs => "engine: mistralrs (forced, opt-in)",
             EngineChoice::Auto if is_gguf => "auto -> llama_cpp (GGUF weights)",
             EngineChoice::Auto => "auto -> vllm (safetensors)",
@@ -463,9 +437,6 @@ pub fn effective_kv_cache(kv: KvCacheQuant, engine: EngineKind) -> EffectiveKvCa
         effective: KvCacheQuant::F16,
     };
 
-    if engine == EngineKind::Embedded {
-        return DEFAULT;
-    }
     match (kv, engine) {
         (KvCacheQuant::Auto, _) => DEFAULT,
         (KvCacheQuant::F16, _) => F16,
@@ -502,12 +473,8 @@ pub fn effective_kv_cache(kv: KvCacheQuant, engine: EngineKind) -> EffectiveKvCa
 
         // mistral.rs is launched without a KV dtype flag, so requested
         // low-precision modes fall back to the engine default and the
-        // planner books no saving (same posture as the embedded engine).
+        // planner books no saving.
         (_, EngineKind::MistralRs) => DEFAULT,
-
-        // Handled above; kept explicit so a new engine kind fails to
-        // compile here rather than silently defaulting.
-        (_, EngineKind::Embedded) => DEFAULT,
     }
 }
 
@@ -1115,17 +1082,6 @@ impl EngineDoctor {
                     }),
                 )
             }
-            EngineKind::Embedded => {
-                // The in-process engine needs no binary; it needs the
-                // `embedded` feature compiled into this build (WOR-1658).
-                let compiled = cfg!(feature = "embedded");
-                (
-                    compiled,
-                    (!compiled).then(|| {
-                        "engine: embedded needs a build with --features embedded".to_string()
-                    }),
-                )
-            }
             EngineKind::MistralRs => (
                 // PATH is the boot-time signal; the doctor's engine row
                 // ORs in prebuilt-release acquirability, mirroring
@@ -1197,7 +1153,6 @@ models:
         assert_eq!(EngineKind::Vllm.binary_name(), "vllm");
         assert_eq!(EngineKind::SGLang.binary_name(), "sglang");
         assert_eq!(EngineKind::LlamaCpp.binary_name(), "llama-server");
-        assert_eq!(EngineKind::Embedded.binary_name(), "embedded");
         assert_eq!(EngineKind::MistralRs.binary_name(), "mistralrs");
         // The outbound request model id: vLLM/SGLang serve under the
         // deployment id (--served-model-name); mistral.rs only accepts
@@ -1233,8 +1188,6 @@ models:
             EngineKind::SGLang
         );
         assert_eq!(EngineChoice::Auto.resolve(false, true), EngineKind::Vllm);
-        // SGLang is a subprocess engine, not in-process.
-        assert!(!EngineKind::SGLang.is_in_process());
     }
 
     #[test]
@@ -1256,44 +1209,6 @@ models:
         let s = &static_cfg.models[0];
         assert!(!s.dynamic_lora());
         assert_eq!(s.lora_capacity(), 2);
-    }
-
-    #[test]
-    fn embedded_engine_resolves_and_is_in_process() {
-        // WOR-1658: `engine: embedded` parses, is a forced choice (Auto
-        // never picks it), and marks the in-process launch path.
-        let cfg: ModelHostConfig =
-            serde_yaml::from_str("models:\n  - model: qwen3-0.6b\n    engine: embedded\n")
-                .expect("embedded parses");
-        assert_eq!(cfg.models[0].engine, EngineChoice::Embedded);
-        assert_eq!(
-            EngineChoice::Embedded.resolve(false, true),
-            EngineKind::Embedded
-        );
-        assert!(EngineKind::Embedded.is_in_process());
-        assert!(!EngineKind::Vllm.is_in_process());
-        assert!(!EngineKind::LlamaCpp.is_in_process());
-    }
-
-    #[test]
-    fn embedded_doctor_gated_on_feature() {
-        // The plan-time doctor reports an embedded model as runnable only
-        // when the `embedded` feature is compiled; otherwise it blocks
-        // with a clear rebuild hint (WOR-1658).
-        let cfg: ModelHostConfig =
-            serde_yaml::from_str("models:\n  - model: qwen3-0.6b\n    engine: embedded\n").unwrap();
-        let env = EngineEnv::default();
-        let doc = EngineDoctor::for_entry(&cfg.models[0], false, &env);
-        if cfg!(feature = "embedded") {
-            assert!(doc.runnable);
-        } else {
-            assert!(!doc.runnable);
-            assert!(doc
-                .blocker
-                .as_deref()
-                .unwrap()
-                .contains("--features embedded"));
-        }
     }
 
     #[test]
@@ -1408,7 +1323,6 @@ models:
             (EngineKind::Vllm, "vllm"),
             (EngineKind::SGLang, "sglang"),
             (EngineKind::LlamaCpp, "llama-server"),
-            (EngineKind::Embedded, "embedded"),
             (EngineKind::MistralRs, "mistralrs"),
         ] {
             assert_eq!(kind.binary_name(), expect);
@@ -1638,11 +1552,10 @@ mod kv_cache_contract {
     use super::*;
 
     /// Every engine kind, so adding one forces a decision here.
-    const ENGINES: [EngineKind; 5] = [
+    const ENGINES: [EngineKind; 4] = [
         EngineKind::Vllm,
         EngineKind::SGLang,
         EngineKind::LlamaCpp,
-        EngineKind::Embedded,
         EngineKind::MistralRs,
     ];
 
@@ -1748,17 +1661,6 @@ mod kv_cache_contract {
         assert_eq!(effective.flag_value, Some("q4_0"));
         assert_eq!(effective.bytes_per_element, Some(0.5));
         assert!(!effective.is_substituted(KvCacheQuant::Int4));
-    }
-
-    #[test]
-    fn the_embedded_engine_books_no_saving_because_it_takes_no_flag() {
-        // It ignores kv_quant entirely, so booking fp8's 1.0 would be a
-        // 2x under-estimate against the f16 it really runs.
-        for mode in MODES {
-            let effective = effective_kv_cache(mode, EngineKind::Embedded);
-            assert_eq!(effective.flag_value, None, "{mode:?}");
-            assert_eq!(effective.bytes_per_element, None, "{mode:?}");
-        }
     }
 
     #[test]

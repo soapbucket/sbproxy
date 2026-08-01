@@ -179,7 +179,6 @@ const fn engine_choice(engine: EngineKind) -> EngineChoice {
         EngineKind::Vllm => EngineChoice::Vllm,
         EngineKind::SGLang => EngineChoice::SGLang,
         EngineKind::LlamaCpp => EngineChoice::LlamaCpp,
-        EngineKind::Embedded => EngineChoice::Embedded,
         EngineKind::MistralRs => EngineChoice::MistralRs,
     }
 }

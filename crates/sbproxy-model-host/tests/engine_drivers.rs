@@ -62,7 +62,6 @@ impl EngineDriver for FixtureDriver {
                 EngineKind::Vllm => vec![ArtifactFormat::Safetensors],
                 EngineKind::SGLang => vec![ArtifactFormat::Safetensors],
                 EngineKind::MistralRs => vec![ArtifactFormat::Safetensors],
-                EngineKind::Embedded => Vec::new(),
             },
             accelerators: vec![sbproxy_model_host::AcceleratorKind::Cpu],
             supports_container: self.kind == EngineKind::Vllm,

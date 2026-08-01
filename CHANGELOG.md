@@ -84,6 +84,17 @@ the next version cut.
   send boundary, with explicit closed or `allow_unreserved` backend failure
   behavior.
 
+### Removed
+
+- **The in-process embedded engine (`engine: embedded`, WOR-1658).**
+  Never on by default (it required a build with `--features embedded`) and
+  never certified: no dedicated tests, no CI lane, and no capability-ledger
+  entry. llama.cpp already covers the CPU/Metal, zero-external-binary case
+  it existed for, and the new `mistralrs` subprocess engine (see above)
+  covers safetensors mistral.rs serving without the large in-process
+  dependency tree. A config that still sets `engine: embedded` now fails
+  to parse.
+
 ### Fixed
 
 - **The `a2a` policy no longer decides on inputs the caller controls.**
