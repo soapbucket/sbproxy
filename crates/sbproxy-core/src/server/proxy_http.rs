@@ -3958,9 +3958,37 @@ impl ProxyHttp for SbProxy {
         // `validator_failed`, and emit `None` so the upstream is not
         // contacted.
         if ctx.validate_request_body {
+            // Mirror of THREAT_SCAN_HARD_CAP above: the validator
+            // accumulator is the other buffer-then-release dance in
+            // this filter and gets the same bound, so a client that
+            // streams an oversize or unterminated body cannot grow
+            // proxy memory with it (WOR-2137). Overflow takes the same
+            // exit as the threat-scan cap: reject with 413 before the
+            // chunk is buffered, never run the validators, never
+            // contact the upstream.
+            const VALIDATE_BODY_HARD_CAP: usize = 8 * 1024 * 1024;
+
             let buf = ctx
                 .request_body_buf
                 .get_or_insert_with(bytes::BytesMut::new);
+            let incoming_len = body.as_ref().map_or(0, Bytes::len);
+            if buf.len().saturating_add(incoming_len) > VALIDATE_BODY_HARD_CAP {
+                debug!(
+                    received = buf.len().saturating_add(incoming_len),
+                    cap = VALIDATE_BODY_HARD_CAP,
+                    "request body validation blocked request: body exceeds buffering cap"
+                );
+                ctx.validator_failed = Some((
+                    413,
+                    error_json_body("request entity too large"),
+                    "application/json".to_string(),
+                ));
+                *body = None;
+                return Err(pingora_error::Error::explain(
+                    pingora_error::ErrorType::HTTPStatus(413),
+                    "request body validation exceeded buffering cap",
+                ));
+            }
             if let Some(chunk) = body.take() {
                 buf.extend_from_slice(&chunk);
             }
@@ -4248,6 +4276,17 @@ impl ProxyHttp for SbProxy {
                                             ));
                                             break;
                                         }
+                                        continue;
+                                    }
+                                    // WOR-2137: the generic body scan is
+                                    // opt-in. The enforcer only requests
+                                    // buffering when `enable_body_aware`
+                                    // is set, but the buffer may exist
+                                    // because another policy asked for
+                                    // it, and a body buffered for a
+                                    // validator must not feed a scan the
+                                    // operator switched off.
+                                    if !p.body_aware_enabled() {
                                         continue;
                                     }
                                     // WOR-801: body-aware scan. The URI +

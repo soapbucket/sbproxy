@@ -11,12 +11,12 @@
 # engine. Omit `detector` only when you want verified local artifact
 # auto-selection; see docs/prompt-injection-v2.md.
 #
-# Scope: the OSS scaffold scans the request URI + non-auth headers at
+# Scope: the policy scans the request URI + non-auth headers at
 # request-filter time so the tag-action path can stamp trust headers
 # before the upstream request is built (the same channel `dlp` and
 # `exposed_credentials` use). Body-aware detection (the prompt
-# typically lives in the JSON body) lands with the ONNX classifier
-# follow-up.
+# typically lives in the JSON body) is opt-in via
+# `enable_body_aware: true`; the block.local origin below turns it on.
 #
 # Run:
 #   make run CONFIG=examples/prompt-injection-v2/sb.yml
@@ -73,6 +73,13 @@ origins:
         action: block
         detector: heuristic-v1
         threshold: 0.5
+        # Also scan the buffered request body, so a prompt smuggled in
+        # the JSON payload is caught, not just one in the URI or a
+        # header. Body scanning is opt-in and the buffer is capped at
+        # 8 MiB; a larger body is rejected with 413 before the scan.
+        # Pairs with block (or log): a body-borne hit arrives after the
+        # upstream request is assembled, so it cannot stamp tag headers.
+        enable_body_aware: true
         block_body: '{"error":"prompt injection detected"}'
         block_content_type: application/json
 
