@@ -1134,6 +1134,21 @@ pub struct CompiledPipeline {
     /// runtime and never falls back to the origin's.
     #[cfg(feature = "rag")]
     pub rag_runtimes: crate::rag_runtime::RagRuntimeRegistry,
+    /// The published settlement runtime for this config generation, when
+    /// `proxy.payments` is configured (WOR-2100).
+    ///
+    /// Attached after construction rather than built inside it, because
+    /// publishing is async and proving the store answers has to happen while
+    /// the previous generation is still serving. `None` means settlement is
+    /// not configured, which is the default and leaves the existing
+    /// non-settlement ledger behaviour exactly as it was.
+    ///
+    /// Pinned to the pipeline for the same reason the key plane is: a
+    /// request pins a pipeline at ingress, so a reload cannot move a paid
+    /// request onto a different settlement store than the one that issued
+    /// its challenge.
+    #[cfg(feature = "payments")]
+    pub payments: Option<Arc<crate::billing_runtime::PaymentsRuntime>>,
     /// Compiled auth for each origin (None if no auth configured).
     pub auths: Vec<Option<Auth>>,
     /// Compiled policies for each origin (may be empty).
@@ -1309,6 +1324,10 @@ impl Default for CompiledPipeline {
             compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry::default(),
             #[cfg(feature = "rag")]
             rag_runtimes: crate::rag_runtime::RagRuntimeRegistry::default(),
+            // Attached by the lifecycle after an async health check, never
+            // by construction. A default pipeline has no settlement.
+            #[cfg(feature = "payments")]
+            payments: None,
             auths: Vec::new(),
             policies: Vec::new(),
             enforcers: Vec::new(),
@@ -1877,6 +1896,11 @@ impl CompiledPipeline {
             compression_runtimes,
             #[cfg(feature = "rag")]
             rag_runtimes,
+            // Attached by the lifecycle after an async health check, never
+            // by construction: publishing starts a worker, and a candidate
+            // that is then discarded must not leave one claiming leases.
+            #[cfg(feature = "payments")]
+            payments: None,
             auths,
             policies,
             enforcers,

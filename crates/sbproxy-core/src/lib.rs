@@ -25,6 +25,11 @@ pub mod admin_compression;
 pub mod admin_keys;
 /// Model-host status admin API (`/admin/model-host/status`), WOR-1665.
 pub mod admin_model_host;
+/// Settlement status and the reconciliation trigger
+/// (`/admin/payments/*`), WOR-2100. Compiled unconditionally so the routes
+/// answer with a clear reason on a build without the `payments` feature
+/// rather than falling through to a bare 404.
+pub mod admin_payments;
 /// Admin chat playground: list configured AI endpoints and run a chat
 /// completion against any of them through the production AI dispatch
 /// path. Handled in the async admin connection handler.

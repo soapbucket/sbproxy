@@ -179,6 +179,191 @@ pub enum PaymentsRuntimeError {
         /// The cargo feature that compiles that rail's adapter.
         feature: &'static str,
     },
+
+    /// A secret reference in the document could not be resolved.
+    ///
+    /// Carries the field, never the reference and never the value. A
+    /// startup error that echoed the reference would put the vault path in
+    /// a log; one that echoed the value would put the credential there.
+    #[error("proxy.payments.{field} names a secret that could not be resolved; settlement will not start with a credential it cannot read")]
+    SecretUnresolved {
+        /// Dotted path of the field whose secret failed, relative to
+        /// `proxy.payments`.
+        field: &'static str,
+    },
+}
+
+/// The key id settlement quote tokens are signed under.
+///
+/// Distinct from any `ai_crawl_control.quote_token.key_id` an operator
+/// configures, so the two keyspaces cannot be confused by a verifier holding
+/// both.
+const QUOTE_KEY_ID: &str = "sbproxy-payments";
+
+/// The `iss` claim used when no Payment Auth realm is configured.
+const DEFAULT_QUOTE_ISSUER: &str = "sbproxy-payments";
+
+/// Salt for the quote signing key derivation.
+///
+/// Fixed and source-visible. HKDF's salt is not required to be secret; the
+/// input keying material is, and that is the operator's configured
+/// `challenge_binding_key`.
+const QUOTE_SEED_SALT: &[u8] = b"sbproxy-payments-v1";
+
+/// How long a settlement quote token stays valid by default.
+///
+/// The requirement carries its own expiry and the signer stamps `exp` from
+/// it, so this only bounds the signer's own default for a caller that does
+/// not supply one. Settlement always supplies one.
+const QUOTE_DEFAULT_TTL: Duration = Duration::from_secs(600);
+
+/// Build, health check, and publish a settlement runtime.
+///
+/// The whole two-phase construction in one call, for the boot and reload
+/// paths that want a running runtime rather than a candidate. Secrets are
+/// resolved here, once, and handed to the assembly as bytes; nothing below
+/// this function reads a secret backend.
+///
+/// The old runtime, if any, is the caller's to drain. This function either
+/// returns a fully proven runtime or fails without leaving one behind, which
+/// is what lets a reload keep serving on the previous generation.
+///
+/// # Errors
+///
+/// Returns [`PaymentsRuntimeError::SecretUnresolved`] when a configured
+/// secret cannot be read, and whatever
+/// [`PaymentsRuntimeCandidate::build`], [`PaymentsRuntimeCandidate::check_health`],
+/// and [`PaymentsRuntimeCandidate::publish`] return.
+pub async fn build_payments_runtime(
+    config: &PaymentsConfig,
+    clustered: bool,
+) -> Result<PaymentsRuntime, PaymentsRuntimeError> {
+    // One configured secret, two derived keys. `challenge_binding_key` is
+    // the operator's single settlement secret; the Payment Auth challenge id
+    // is a MAC under it and quote tokens are signed under a key derived from
+    // it here. The purpose enum is what keeps those two keyspaces apart, so
+    // a weakness found in one primitive cannot be carried into the other.
+    let binding_key = resolve_secret(&config.challenge_binding_key, "challenge_binding_key")?;
+    let seed_bytes = Zeroizing::new(sbproxy_security::hkdf_derive_purpose(
+        binding_key.as_bytes(),
+        QUOTE_SEED_SALT,
+        sbproxy_security::HkdfPurpose::Signing,
+        32,
+    ));
+    let mut seed = [0_u8; 32];
+    seed.copy_from_slice(&seed_bytes);
+
+    let quote_signer = sbproxy_modules::policy::quote_token::QuoteTokenSigner::from_seed_bytes(
+        &seed,
+        QUOTE_KEY_ID,
+        quote_issuer(config),
+        QUOTE_DEFAULT_TTL,
+    );
+    let verifying = quote_signer.verifying_key();
+    let nonce_store = Arc::new(sbproxy_modules::policy::quote_token::InMemoryNonceStore::new())
+        as Arc<dyn sbproxy_modules::policy::quote_token::NonceStore>;
+    let verifier = sbproxy_modules::policy::quote_token::QuoteTokenVerifier::single_key(
+        QUOTE_KEY_ID,
+        verifying,
+        nonce_store,
+    );
+
+    let inputs = PaymentsRuntimeInputs {
+        signer: Arc::new(crate::payment_signer::QuoteRequirementSigner::new(
+            quote_signer,
+            verifier,
+        )),
+        recovery_key: match &config.recovery_encryption {
+            Some(recovery) => Some(Zeroizing::new(
+                resolve_secret(&recovery.key, "recovery_encryption.key")?
+                    .as_bytes()
+                    .to_vec(),
+            )),
+            None => None,
+        },
+        stripe_api_key: match &config.rails.stripe {
+            Some(stripe) => Some(resolve_secret(&stripe.api_key, "rails.stripe.api_key")?),
+            None => None,
+        },
+        cln_rune: match &config.rails.lightning_cln {
+            Some(cln) => Some(resolve_secret(&cln.rune, "rails.lightning_cln.rune")?),
+            None => None,
+        },
+        clock: None,
+        clustered,
+    };
+
+    let candidate = PaymentsRuntimeCandidate::build(config, &inputs)?;
+    candidate.check_health().await?;
+    candidate.publish()
+}
+
+/// A dedicated, process-lifetime runtime for the settlement worker.
+///
+/// Independent of the Pingora service runtimes, mirroring `alerting`,
+/// `key_plane`, and `cluster`. The recovery worker has to outlive whatever
+/// task started it: a worker spawned onto a temporary runtime would stop the
+/// moment that runtime dropped, and the first thing an operator would notice
+/// is that ambiguous payments stopped reconciling, silently, with the proxy
+/// still serving.
+fn payments_worker_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("sbproxy-payments")
+            .enable_all()
+            .build()
+            .expect("build payments runtime")
+    })
+}
+
+/// Build and publish a settlement runtime from the synchronous boot path.
+///
+/// Blocks the caller until the store is open, migrated, proven readable, and
+/// the recovery worker is running, then hands back the published runtime.
+/// Blocking is the point: a proxy that cannot open its settlement ledger must
+/// not reach the point of accepting a paid request, and boot is where an
+/// operator can still see why.
+///
+/// # Errors
+///
+/// Returns whatever [`build_payments_runtime`] returns.
+pub fn install(
+    config: &PaymentsConfig,
+    clustered: bool,
+) -> Result<Arc<PaymentsRuntime>, PaymentsRuntimeError> {
+    payments_worker_runtime()
+        .block_on(build_payments_runtime(config, clustered))
+        .map(Arc::new)
+}
+
+/// The `iss` claim settlement quotes carry.
+///
+/// The Payment Auth realm when one is configured, because that is the
+/// protection space the operator already published to payers, and a fixed
+/// fallback otherwise. It is only ever read back by this proxy's own
+/// verifier, so it needs to be stable rather than resolvable.
+fn quote_issuer(config: &PaymentsConfig) -> &str {
+    config
+        .protocols
+        .payment_auth
+        .as_ref()
+        .map_or(DEFAULT_QUOTE_ISSUER, |protocol| protocol.realm.as_str())
+}
+
+/// Resolve one secret reference into a zeroizing buffer.
+///
+/// The underlying error is dropped on purpose. It names the reference, and a
+/// reference is a vault path; the field name is enough for an operator to
+/// find the line they wrote.
+fn resolve_secret(
+    reference: &str,
+    field: &'static str,
+) -> Result<Zeroizing<String>, PaymentsRuntimeError> {
+    crate::config_source::resolve_secret_reference(reference, field)
+        .map(Zeroizing::new)
+        .map_err(|_| PaymentsRuntimeError::SecretUnresolved { field })
 }
 
 /// The cargo features this binary carries for payments.
@@ -532,9 +717,51 @@ impl PaymentsRuntime {
         &self,
         limit: u32,
     ) -> Result<Vec<ReconciliationReport>, PaymentsRuntimeError> {
-        let now_ms = self.service.clock().now_ms();
-        let claimed = self
-            .service
+        reconcile_with(Arc::clone(&self.service), limit).await
+    }
+
+    /// Run a reconciliation sweep from a synchronous caller.
+    ///
+    /// The admin dispatch is synchronous and may itself be running inside a
+    /// tokio runtime, so this spawns onto the settlement runtime and waits on
+    /// a plain channel rather than calling `block_on`, which panics when
+    /// entered from within another runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Self::reconcile_now`] returns, and
+    /// [`PaymentsRuntimeError::Billing`] if the sweep task disappeared
+    /// without answering.
+    pub fn reconcile_now_blocking(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ReconciliationReport>, PaymentsRuntimeError> {
+        let service = Arc::clone(&self.service);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        payments_worker_runtime().spawn(async move {
+            let _ = sender.send(reconcile_with(service, limit).await);
+        });
+        receiver
+            .recv()
+            .unwrap_or(Err(PaymentsRuntimeError::Billing {
+                surface: "worker",
+                source: BillingError::StoreUnavailable,
+            }))
+    }
+}
+
+/// The reconciliation sweep, over a service handle rather than a runtime.
+///
+/// Separated so both the async and the synchronous entry points run exactly
+/// the same code: an operator triggering a sweep from the admin surface must
+/// not get different behaviour from the one the worker performs.
+async fn reconcile_with(
+    service: Arc<BillingService>,
+    limit: u32,
+) -> Result<Vec<ReconciliationReport>, PaymentsRuntimeError> {
+    {
+        let now_ms = service.clock().now_ms();
+        let claimed = service
             .store()
             .claim_reconciliation(now_ms, WorkerConfig::default().lease_ttl_ms, limit)
             .await
@@ -550,8 +777,7 @@ impl PaymentsRuntime {
             record_payment_provider_call(rail.as_str(), "query", provider_class(rail));
 
             let span = telemetry::settlement_span("reconcile");
-            let outcome = self
-                .service
+            let outcome = service
                 .reconcile_attempt(attempt)
                 .instrument(span)
                 .await
@@ -570,7 +796,9 @@ impl PaymentsRuntime {
         }
         Ok(reports)
     }
+}
 
+impl PaymentsRuntime {
     /// Stop claiming new work and wait for the current tick to drain.
     ///
     /// The returned status reports `clean_shutdown` truthfully. `false`
@@ -764,7 +992,7 @@ fn configured_rails(config: &PaymentsConfig) -> Vec<SettlementRail> {
 // A build with `payments` and no rail feature reads neither argument. That
 // is a real configuration: the store, the service, and the recovery worker
 // all work, and every configured rail then fails the coverage check by name.
-#[allow(unused_variables)]
+#[allow(unused_variables, unused_mut)]
 fn compiled_registry(
     config: &PaymentsConfig,
     inputs: &PaymentsRuntimeInputs,
