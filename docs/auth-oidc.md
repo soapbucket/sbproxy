@@ -1,6 +1,6 @@
 # OIDC Relying-Party login
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-01*
 
 The `oidc` auth provider turns SBproxy into an OpenID Connect
 Relying Party. Unlike the `jwt` provider, which only validates a
@@ -50,7 +50,7 @@ the curl invocations to walk through.
 1. The browser requests a protected origin without a session cookie.
 2. SBproxy mints a transaction cookie (sealed PKCE verifier + state
    + nonce, TTL `tx_ttl_secs`) and 302's the browser to
-   `authorization_endpoint?response_type=code&client_id=...&code_challenge=...&state=...&nonce=...&scope=...&redirect_uri=https://app.example.com/oidc/callback`.
+   `authorization_endpoint?response_type=code&client_id=...&redirect_uri=https%3A%2F%2Fapp.example.com%2Foidc%2Fcallback&scope=...&state=...&nonce=...&code_challenge=...&code_challenge_method=S256`.
 3. The IdP authenticates the user and 302's back to
    `https://app.example.com/oidc/callback?code=...&state=...`.
 4. The `/oidc/callback` handler (a synthetic endpoint mounted by
@@ -67,6 +67,103 @@ the curl invocations to walk through.
 All cookies use the `__Host-` prefix per RFC 6265bis (forces
 `Secure` + `Path=/` + no `Domain`), so the cookie-tossing attack
 against the session secret is closed.
+
+## Calling it
+
+The runnable configuration is [`examples/oidc/`](../examples/oidc/). Its IdP
+endpoints point at `idp.example.com`, which does not exist, so the login
+cannot complete. Everything SBproxy itself does before and after the IdP is
+still reachable, and that is the half worth checking. Start it:
+
+```bash
+make run CONFIG=examples/oidc/sb.yml
+```
+
+Request a protected path with no session cookie:
+
+```bash
+curl -sS -i -H 'Host: app.example.com' http://127.0.0.1:8080/dashboard
+```
+
+```http
+HTTP/1.1 302 Found
+Location: https://idp.example.com/authorize?response_type=code&client_id=sbproxy-app-example-com&redirect_uri=https%3A%2F%2Fapp.example.com%2Foidc%2Fcallback&scope=openid%20email%20profile&state=ye50VIeL_wUmrTKZjLjLPXQkx8mZRav89uRrUbW6J48&nonce=SLuBu1Wo9kW2Q1hiLsGNNmeVX7ZYjvj5YDJIv4cuyTI&code_challenge=XfOcq25BKC28bKxO9RzKist0YkW4tPvA0ysn7SZ-1hI&code_challenge_method=S256
+Set-Cookie: __Host-sbproxy_oidc_tx=uXKf80cZ7IJpktd3cFHBD_plDohWO5iCvoIWG_uNgLD...; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=300
+```
+
+`state`, `nonce`, and `code_challenge` are freshly generated per login and
+differ on every request. `code_challenge_method=S256` confirms PKCE is on;
+there is no configuration knob that turns it off. `redirect_uri` is the
+`/oidc/callback` path the provider mounts, percent-encoded, and it is the
+value that has to be registered with the IdP.
+
+The `Set-Cookie` is the transaction cookie, not the session. It seals the PKCE
+verifier, the `state`, and the `nonce` so the callback can verify the response
+without server-side state. `Max-Age=300` is `tx_ttl_secs`, so a login left
+open for longer than five minutes has to restart. The `__Host-` prefix forces
+`Secure` and `Path=/` with no `Domain`, which is what closes cookie-tossing
+against the session secret.
+
+The response also carries a small JSON body with an empty `error` field. A
+browser follows the `Location` and never renders it; it is visible only
+because `curl` prints the body.
+
+Now call the callback the way a forged request would, without the transaction
+cookie:
+
+```bash
+curl -sS -i -H 'Host: app.example.com' \
+  'http://127.0.0.1:8080/oidc/callback?code=abc&state=xyz'
+```
+
+```json
+{"error":"invalid_request","error_description":"oidc tx cookie missing; restart the login"}
+```
+
+That is `400`, and it is the state-fixation guard doing its job: a `code` and
+`state` alone are not enough, because the `state` has to match the one sealed
+in the cookie this browser was given.
+
+Logout is worth exercising in both directions, because the interesting case is
+the one that is refused. The example allowlists
+`https://app.example.com/goodbye` and sets `post_logout_redirect_default` to
+`https://app.example.com/`. An allowlisted target is honoured verbatim:
+
+```bash
+curl -sS -i -H 'Host: app.example.com' \
+  'http://127.0.0.1:8080/oidc/logout?post_logout_redirect_uri=https://app.example.com/goodbye'
+```
+
+```http
+HTTP/1.1 302 Found
+location: https://idp.example.com/oauth/logout?id_token_hint=&post_logout_redirect_uri=https%3A%2F%2Fapp.example.com%2Fgoodbye
+set-cookie: __Host-sbproxy_session=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0
+```
+
+A target that is not on the allowlist is **replaced, not rejected**:
+
+```bash
+curl -sS -i -H 'Host: app.example.com' \
+  'http://127.0.0.1:8080/oidc/logout?post_logout_redirect_uri=https://evil.example.com/'
+```
+
+```http
+HTTP/1.1 302 Found
+location: https://idp.example.com/oauth/logout?id_token_hint=&post_logout_redirect_uri=https%3A%2F%2Fapp.example.com%2F
+```
+
+The attacker-supplied host is gone and `post_logout_redirect_default` took its
+place. Expect a `302`, not a `400`, when testing this: the gate is a
+substitution rather than an error, so a test that asserts on a failure status
+will pass for the wrong reason. Matching is an exact string comparison, so
+`https://app.example.com/goodbye` and
+`https://app.example.com/goodbye/` are different entries.
+
+In both cases `set-cookie` clears the session with `Max-Age=0` before the
+redirect, so the cookie is dropped whether or not the IdP honours the
+end-session call. `id_token_hint` is sent empty because the session cookie
+does not carry the original ID token; an OP that requires the hint rejects the
+redirect, which is why most deployments do not depend on it.
 
 ## Configuration reference
 

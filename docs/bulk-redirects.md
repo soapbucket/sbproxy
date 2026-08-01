@@ -1,5 +1,5 @@
 # Bulk redirects
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-01*
 
 ![/old/about answered with a 301 from a CSV row and a shop path answered 308 from an inline row](assets/bulk-redirects.gif)
 
@@ -71,6 +71,77 @@ bulk_list:
   values when omitted; per-row overrides win when set.
 - Unmapped paths fall through to the action's `url:`. When `url:`
   is empty, the proxy returns `404`.
+
+## Calling it
+
+The runnable configuration is
+[`examples/bulk-redirects/`](../examples/bulk-redirects/). It declares two
+origins: `marketing.local` reads `redirects.csv` from disk with
+`status_code: 301` and `preserve_query: true`, and `shop.local` carries an
+inline list with per-row overrides and a `url:` fallback. Start it from the
+repo root, because the file-backed list resolves its path against the working
+directory:
+
+```bash
+make run CONFIG=examples/bulk-redirects/sb.yml
+```
+
+`%{redirect_url}` is the useful curl format here: it prints the resolved
+`Location` without following it.
+
+```bash
+curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
+  -H 'Host: marketing.local' http://127.0.0.1:8080/old/about
+```
+
+Running each interesting path through that gives:
+
+```
+marketing.local /old/about                  301 http://127.0.0.1:8080/about
+marketing.local /old/team                   301 http://127.0.0.1:8080/about/team
+marketing.local /press/2022/october-launch  301 http://127.0.0.1:8080/press/archive/2022-10
+marketing.local /blog/announcement-2023     308 https://blog.example.com/announcements/2023
+shop.local      /category/legacy            308 http://127.0.0.1:8080/category/2024
+shop.local      /promo/black-friday-2024    302 http://127.0.0.1:8080/promo/cyber-monday-2024
+shop.local      /docs/v1                    302 https://docs.example.com/v2
+shop.local      /nothing-here               302 https://shop.example.com/
+```
+
+Read the status column against the config to see the override rules working.
+On `marketing.local` the CSV rows that name `301` and the press rows that name
+nothing both answer `301`, because the action's `status_code` is the fallback.
+The `/blog/announcement-2023` row carries `308` of its own and wins. On
+`shop.local` the action's `status_code` is `302`, so `/category/legacy` answers
+`308` only because its row overrides it.
+
+The last line is the fallback rather than a match: `/nothing-here` is in no
+row, so it lands on the action's `url:`. An origin with no `url:` returns
+`404` for an unmapped path instead, which is the difference between a redirect
+list and a catch-all.
+
+Destinations are used as written. A row pointing at `/about` produces a
+relative `Location`, which is why curl resolves it against the request origin
+and prints `http://127.0.0.1:8080/about`; a row pointing at a full URL sends
+the browser off-host.
+
+Query strings follow `preserve_query`, and the two origins differ:
+
+```bash
+curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
+  -H 'Host: marketing.local' 'http://127.0.0.1:8080/old/about?utm=spring&id=7'
+# 301 http://127.0.0.1:8080/about?utm=spring&id=7
+
+curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
+  -H 'Host: shop.local' 'http://127.0.0.1:8080/category/legacy?x=1'
+# 308 http://127.0.0.1:8080/category/2024
+```
+
+`marketing.local` sets `preserve_query: true` on the action, so the whole
+query survives. `shop.local` does not set it at all, so it defaults to off and
+every row drops the query. That default is worth knowing before a migration:
+losing `utm=` parameters across a bulk redirect is silent, and the row-level
+`preserve_query: false` on `/docs/v1` is redundant on this origin precisely
+because the action-level default is already off.
 
 ## Per-origin isolation
 
