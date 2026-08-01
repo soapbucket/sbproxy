@@ -245,10 +245,8 @@ pub(crate) fn scan_message_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sbproxy_modules::policy::prompt_injection_v2::HeuristicDetector;
     use sbproxy_modules::policy::A2APolicyConfig;
-    use sbproxy_modules::{A2ASpec, PromptInjectionA2AConfig, PromptInjectionAction};
-    use std::sync::Arc;
+    use sbproxy_modules::A2ASpec;
 
     fn audit() -> BodyAwareAuditContext<'static> {
         BodyAwareAuditContext {
@@ -266,10 +264,21 @@ mod tests {
         ctx
     }
 
+    // Every fixture below goes through `from_config`, the same
+    // deserialization an operator's YAML takes. The `a2a` block is new
+    // enough that a wrong serde attribute on it is a live risk, and a
+    // fixture that pokes the fields in directly would step over exactly
+    // the code most likely to be wrong.
+    fn policy_from(config: serde_json::Value) -> PromptInjectionV2Policy {
+        PromptInjectionV2Policy::from_config(config).expect("the test policy config must compile")
+    }
+
     fn heuristic_policy() -> PromptInjectionV2Policy {
-        PromptInjectionV2Policy::with_detector(Arc::new(HeuristicDetector::new()))
-            .with_threshold(0.5)
-            .with_body_aware(true)
+        policy_from(serde_json::json!({
+            "detector": "heuristic-v1",
+            "threshold": 0.5,
+            "enable_body_aware": true,
+        }))
     }
 
     fn send_message(parts: &[&str]) -> Vec<u8> {
@@ -464,10 +473,16 @@ mod tests {
         // The documented escape hatch for a high-volume east-west route.
         let body = send_message(&[INJECTION]);
         let parsed = sbproxy_modules::a2a_v1::parse_request(&body).expect("parses");
-        let policy = heuristic_policy().with_a2a(PromptInjectionA2AConfig {
-            root_action: None,
-            block_above_delegation_depth: None,
-        });
+        // An explicit `null` rather than an absent key: serde applies
+        // the field default only when the key is missing, so this is
+        // also the assertion that the escape hatch survives the config
+        // round trip.
+        let policy = policy_from(serde_json::json!({
+            "detector": "heuristic-v1",
+            "threshold": 0.5,
+            "enable_body_aware": true,
+            "a2a": { "block_above_delegation_depth": null },
+        }));
 
         assert!(scan_message_parts(
             &policy,
@@ -487,7 +502,12 @@ mod tests {
         // log by the new depth rule.
         let body = send_message(&[INJECTION]);
         let parsed = sbproxy_modules::a2a_v1::parse_request(&body).expect("parses");
-        let policy = heuristic_policy().with_action(PromptInjectionAction::Block);
+        let policy = policy_from(serde_json::json!({
+            "detector": "heuristic-v1",
+            "threshold": 0.5,
+            "enable_body_aware": true,
+            "action": "block",
+        }));
 
         assert!(scan_message_parts(
             &policy,
@@ -508,7 +528,11 @@ mod tests {
         // agent boundary is governed at all.
         let body = send_message(&[INJECTION]);
         let parsed = sbproxy_modules::a2a_v1::parse_request(&body).expect("parses");
-        let policy = heuristic_policy().with_body_aware(false);
+        let policy = policy_from(serde_json::json!({
+            "detector": "heuristic-v1",
+            "threshold": 0.5,
+            "enable_body_aware": false,
+        }));
 
         assert!(scan_message_parts(
             &policy,

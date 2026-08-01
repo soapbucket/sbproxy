@@ -375,12 +375,6 @@ impl PromptInjectionV2Policy {
         }
     }
 
-    /// Override the configured action. Used by tests.
-    pub fn with_action(mut self, action: PromptInjectionAction) -> Self {
-        self.action = action;
-        self
-    }
-
     /// Override the score threshold. Used by tests.
     pub fn with_threshold(mut self, threshold: f64) -> Self {
         self.threshold = threshold;
@@ -432,23 +426,9 @@ impl PromptInjectionV2Policy {
         self.enable_body_aware
     }
 
-    /// Override the body-aware flag. Used by tests and by the AI
-    /// handler integration shim that wants to force-enable the path
-    /// during integration tests.
-    pub fn with_body_aware(mut self, enable: bool) -> Self {
-        self.enable_body_aware = enable;
-        self
-    }
-
     /// Borrow the agent-to-agent tuning block.
     pub fn a2a(&self) -> &PromptInjectionA2AConfig {
         &self.a2a
-    }
-
-    /// Override the agent-to-agent tuning block. Used by tests.
-    pub fn with_a2a(mut self, a2a: PromptInjectionA2AConfig) -> Self {
-        self.a2a = a2a;
-        self
     }
 
     /// Action for an agent-to-agent hit at delegation depth 0.
