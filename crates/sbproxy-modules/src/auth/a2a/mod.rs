@@ -7,7 +7,7 @@
 //! The two `v0` draft parsers live behind feature flags, and nothing
 //! in the workspace enables them, so for those specs the default build
 //! compiles detection only and treats matched requests as plain POSTs.
-//! The ratified [`v1`] parser is **not** gated: gating it would leave
+//! The ratified `v1` parser is **not** gated: gating it would leave
 //! the current standard in the same position the drafts are in, which
 //! is a parser nobody compiles and therefore no governance at all.
 
