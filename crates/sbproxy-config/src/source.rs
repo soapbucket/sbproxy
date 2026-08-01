@@ -66,6 +66,44 @@ use crate::types::ConfigSource;
 /// upper bound on disk and network use.
 pub const MAX_RECURSION_DEPTH: usize = 8;
 
+/// SIGKILL an entire process group by the group leader's pid.
+///
+/// `git` spawns helpers (credential helpers, `git-remote-*` transports,
+/// ssh), so the process that hangs is often not the one this code holds
+/// a handle to. `Child::kill` signals only the direct child, which reaps
+/// git and reparents its helpers to init, still running and still
+/// holding this call's scratch descriptors. Signalling the group reaches
+/// all of them.
+///
+/// The group is created by `process_group(0)` at spawn, so `pid` is also
+/// the group id. The guard against signalling our own group is the
+/// important part: without `process_group(0)` (a spawn this code did not
+/// make, or a future non-unix path) the child would share the parent's
+/// group and `kill(-pgid)` would take down the proxy itself.
+///
+/// Failures are ignored deliberately. The only ones reachable here are a
+/// group that already exited and a permissions error that a retry cannot
+/// fix, and the caller is already returning a timeout.
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    // This crate is `#![forbid(unsafe_code)]`, so the raw `kill(-pgid)`
+    // the model-host supervisor uses is not available here. rustix wraps
+    // the same syscall safely.
+    let Ok(raw) = i32::try_from(pid) else {
+        return;
+    };
+    let Some(pgid) = rustix::process::Pid::from_raw(raw) else {
+        return;
+    };
+    // Never signal our own group: without the `process_group(0)` above
+    // the child would share the proxy's group and this would take the
+    // proxy down with it.
+    if rustix::process::getpgrp() == pgid {
+        return;
+    }
+    let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::Kill);
+}
+
 /// Interval between `try_wait` probes while a `git` child runs.
 ///
 /// Short enough that the enforced timeout is accurate to a fraction of a
@@ -318,6 +356,9 @@ impl GitBinaryCloner {
     /// Run one `git` invocation with a hard timeout, returning its
     /// captured stderr.
     ///
+    /// See [`kill_process_group`] for why the timeout signals a group
+    /// rather than the child alone.
+    ///
     /// Output is redirected to a file rather than a pipe on purpose: a
     /// piped child that fills the pipe buffer blocks forever, and this
     /// function's whole job is to be the thing that cannot hang.
@@ -354,6 +395,24 @@ impl GitBinaryCloner {
         command.stdout(Stdio::from(stdout_file));
         command.stderr(Stdio::from(stderr_file));
 
+        // Put the child in its own process group so the timeout below can
+        // signal the whole tree.
+        //
+        // `git` shells out constantly (credential helpers, `git-remote-*`
+        // transports, an ssh it spawned). Killing only the direct child
+        // reaps git and leaves whatever it spawned running, still holding
+        // this scratch directory's descriptors open. That is a process
+        // leaked on every reload against a hung remote, and a scratch
+        // directory that cannot be cleaned while it is held.
+        //
+        // Same approach the model-host supervisor uses for engine
+        // subprocesses; see `signal_isolated_process_group` there.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+
         let mut child = command.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 ConfigSourceError::MissingGitBinary(format!(
@@ -375,8 +434,16 @@ impl GitBinaryCloner {
                 Err(e) => return Err(ConfigSourceError::Clone(format!("wait for git: {e}"))),
             }
             if Instant::now() >= deadline {
-                // Kill, then reap, so the child cannot outlive this
-                // process as a zombie holding a network connection open.
+                // Kill the whole group, then reap, so neither the child
+                // nor anything it spawned outlives this call holding a
+                // network connection or a scratch descriptor open.
+                //
+                // The group signal comes first: killing the direct child
+                // alone would reparent its children to init while they
+                // keep running, and there would be no handle left to find
+                // them by.
+                #[cfg(unix)]
+                kill_process_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(ConfigSourceError::Timeout(format!(
