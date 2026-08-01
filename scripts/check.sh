@@ -198,6 +198,15 @@ make tapes-check
 step "documentation configs match canonical examples"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/sync-doc-configs.py" --check
 
+# Not a CI lane, because there isn't one. examples/README.md is generated
+# by gen-examples-catalog.py, which has supported --check since it was
+# written, and nothing has ever called it: not CI, not this gate, not the
+# Makefile. It had silently drifted by two rows on main. A generated file
+# with a drift checker nobody invokes is the same failure as having no
+# checker at all.
+step "examples catalog is current"
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/gen-examples-catalog.py" --check
+
 # CI: ci.yml test lane. No network, no cargo.
 step "install.sh verifies its download"
 sh "$ROOT/scripts/tests/install_verify.sh"

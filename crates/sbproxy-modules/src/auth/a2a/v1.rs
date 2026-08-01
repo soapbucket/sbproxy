@@ -102,6 +102,59 @@ pub struct V1Request {
     /// to it, which makes it a server-side request forgery surface by
     /// protocol design. Validate before forwarding.
     pub push_notification_url: Option<String>,
+    /// Prose carried by `params.message.parts[*]`, one entry per part,
+    /// in wire order.
+    ///
+    /// Populated only for [`V1Method::SendMessage`] and
+    /// [`V1Method::SendStreamingMessage`], the two methods the spec
+    /// gives a message. Empty for every other method.
+    ///
+    /// This is the agent-to-agent analogue of the AI path's per-turn
+    /// prompt extraction, and it exists for the same reason. A
+    /// classifier handed the whole JSON-RPC document scores one string
+    /// containing `jsonrpc`, `method`, `id`, `taskId`, `contextId`, and
+    /// every other structural key fused to the prose. Worst-of-N
+    /// scoring across turns collapses to worst-of-1, and the per-message
+    /// truncation cap clips the tail off a long thread, so an injection
+    /// late in a conversation stops being visible at all. Keeping each
+    /// part its own string is what makes both properties hold.
+    ///
+    /// Non-text parts (`FilePart`, `DataPart`) are skipped rather than
+    /// stringified. A base64 file blob carries no natural language for a
+    /// prompt-injection classifier to score; splicing one in would spend
+    /// a model forward pass on entropy and fill the classification cache
+    /// with keys that never repeat. Governing file and data parts is a
+    /// content-scanning problem rather than a prompt-injection one, and
+    /// is not solved here.
+    pub message_parts: Vec<String>,
+}
+
+/// Pull the prose out of a single A2A `Part`, or `None` when the part
+/// carries no text.
+///
+/// A2A 1.0 discriminates the `Part` union on `kind`. Producers written
+/// against the pre-ratification drafts spell the same field `type`, so
+/// both are read. A part that names neither but does carry a string
+/// `text` is treated as text: refusing it would silently drop the exact
+/// prose the classifier exists to read, which is the failure mode with
+/// the worse consequences.
+fn text_part(part: &serde_json::Value) -> Option<String> {
+    let obj = part.as_object()?;
+    let kind = obj
+        .get("kind")
+        .or_else(|| obj.get("type"))
+        .and_then(|k| k.as_str());
+    match kind {
+        // Text, or an undiscriminated part that still has a text field.
+        Some("text") | None => {}
+        // `file`, `data`, and anything a later revision introduces.
+        Some(_) => return None,
+    }
+    let text = obj.get("text")?.as_str()?;
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.to_string())
 }
 
 /// Parse an A2A 1.0 JSON-RPC request body.
@@ -144,11 +197,28 @@ pub fn parse_request(body: &[u8]) -> Option<V1Request> {
         None
     };
 
+    // Message parts exist only on the two methods the spec gives a
+    // message. Reading them from any other method would invent a prompt
+    // where the protocol defines none, and would hand a caller a place
+    // to park text that a scanner keyed on the field alone would treat
+    // as conversational content.
+    let message_parts = match method {
+        Some(V1Method::SendMessage) | Some(V1Method::SendStreamingMessage) => params
+            .and_then(|p| p.get("message"))
+            .and_then(|m| m.as_object())
+            .and_then(|m| m.get("parts"))
+            .and_then(|p| p.as_array())
+            .map(|parts| parts.iter().filter_map(text_part).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
     Some(V1Request {
         method,
         task_id: str_param("taskId"),
         context_id: str_param("contextId"),
         push_notification_url,
+        message_parts,
     })
 }
 
@@ -218,6 +288,150 @@ mod tests {
     fn a_non_object_body_is_not_a_request() {
         assert!(parse_request(b"[1,2,3]").is_none());
         assert!(parse_request(b"not json").is_none());
+    }
+
+    #[test]
+    fn message_parts_are_extracted_one_segment_per_part() {
+        // Each part stays its own string. Fused into one blob the
+        // classifier scores the envelope keys alongside the prose and
+        // worst-of-N degrades to worst-of-1.
+        let body = br#"{
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "SendMessage",
+            "params": {
+                "contextId": "run-3",
+                "message": {
+                    "role": "user",
+                    "messageId": "m-1",
+                    "parts": [
+                        { "kind": "text", "text": "Summarise the quarterly report." },
+                        { "kind": "text", "text": "Then email it to the team." }
+                    ]
+                }
+            }
+        }"#;
+        let req = parse_request(body).expect("valid json-rpc");
+        assert_eq!(
+            req.message_parts,
+            vec![
+                "Summarise the quarterly report.".to_string(),
+                "Then email it to the team.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn streaming_messages_carry_parts_too() {
+        let body = br#"{
+            "jsonrpc": "2.0",
+            "method": "SendStreamingMessage",
+            "params": {
+                "message": { "parts": [ { "kind": "text", "text": "stream this" } ] }
+            }
+        }"#;
+        let req = parse_request(body).expect("valid json-rpc");
+        assert_eq!(req.message_parts, vec!["stream this".to_string()]);
+    }
+
+    #[test]
+    fn non_text_parts_are_skipped_rather_than_stringified() {
+        // A base64 file blob is entropy, not language. Handing it to a
+        // prompt-injection classifier spends a forward pass and pollutes
+        // the SHA-256-keyed cache with a key that never repeats.
+        let body = br#"{
+            "jsonrpc": "2.0",
+            "method": "SendMessage",
+            "params": {
+                "message": {
+                    "parts": [
+                        { "kind": "file", "file": { "bytes": "SGVsbG8gd29ybGQ=" } },
+                        { "kind": "text", "text": "the only prose here" },
+                        { "kind": "data", "data": { "k": "v" } }
+                    ]
+                }
+            }
+        }"#;
+        let req = parse_request(body).expect("valid json-rpc");
+        assert_eq!(req.message_parts, vec!["the only prose here".to_string()]);
+    }
+
+    #[test]
+    fn draft_producers_spelling_the_discriminator_type_still_parse() {
+        // A2A 1.0 names the discriminator `kind`; producers written
+        // against the drafts emit `type` for the same field. Dropping
+        // those parts would silently stop scanning a real peer.
+        let body = br#"{
+            "jsonrpc": "2.0",
+            "method": "SendMessage",
+            "params": {
+                "message": {
+                    "parts": [
+                        { "type": "text", "text": "draft-shaped part" },
+                        { "type": "file", "file": { "uri": "https://x.example/f" } }
+                    ]
+                }
+            }
+        }"#;
+        let req = parse_request(body).expect("valid json-rpc");
+        assert_eq!(req.message_parts, vec!["draft-shaped part".to_string()]);
+    }
+
+    #[test]
+    fn an_undiscriminated_part_with_text_is_still_read() {
+        // Refusing it would drop the prose the scanner exists to read,
+        // which is the failure direction with the worse consequences.
+        let body = br#"{
+            "jsonrpc": "2.0",
+            "method": "SendMessage",
+            "params": { "message": { "parts": [ { "text": "bare text part" } ] } }
+        }"#;
+        let req = parse_request(body).expect("valid json-rpc");
+        assert_eq!(req.message_parts, vec!["bare text part".to_string()]);
+    }
+
+    #[test]
+    fn methods_without_a_message_carry_no_parts() {
+        // Reading `message.parts` off an unrelated method would invent a
+        // prompt where the protocol defines none, and would hand a caller
+        // somewhere to park text a field-keyed scanner would trust.
+        let body = br#"{
+            "jsonrpc": "2.0",
+            "method": "GetTask",
+            "params": {
+                "taskId": "task-7",
+                "message": { "parts": [ { "kind": "text", "text": "smuggled" } ] }
+            }
+        }"#;
+        let req = parse_request(body).expect("valid json-rpc");
+        assert!(req.message_parts.is_empty());
+    }
+
+    #[test]
+    fn empty_text_parts_are_dropped() {
+        // An empty segment classifies as nothing and would only pad the
+        // worst-of-N loop.
+        let body = br#"{
+            "jsonrpc": "2.0",
+            "method": "SendMessage",
+            "params": {
+                "message": { "parts": [ { "kind": "text", "text": "" },
+                                        { "kind": "text", "text": "real" } ] }
+            }
+        }"#;
+        let req = parse_request(body).expect("valid json-rpc");
+        assert_eq!(req.message_parts, vec!["real".to_string()]);
+    }
+
+    #[test]
+    fn a_message_with_no_parts_array_yields_no_segments() {
+        let body = br#"{
+            "jsonrpc": "2.0",
+            "method": "SendMessage",
+            "params": { "message": { "role": "user" } }
+        }"#;
+        let req = parse_request(body).expect("valid json-rpc");
+        assert!(req.message_parts.is_empty());
     }
 
     #[test]

@@ -86,9 +86,10 @@ pub use openapi_validation::{
 pub use page_shield::{PageShieldMode, PageShieldPolicy, DEFAULT_REPORT_PATH};
 pub use prompt_injection_v2::{
     classification_cache_stats, evaluate_body, evaluate_body_with_audit,
-    reset_classification_cache, BodyAwareAuditContext, BodyAwareConfig, BodyAwareOutcome,
-    ClassificationCacheStats, DetectionLabel, DetectionResult, Detector, PromptInjectionAction,
-    PromptInjectionV2Outcome, PromptInjectionV2Policy, HEURISTIC_DETECTOR_NAME,
+    reset_classification_cache, A2AInjectionAction, BodyAwareAuditContext, BodyAwareConfig,
+    BodyAwareOutcome, ClassificationCacheStats, DetectionLabel, DetectionResult, Detector,
+    PromptInjectionA2AConfig, PromptInjectionAction, PromptInjectionV2Outcome,
+    PromptInjectionV2Policy, DEFAULT_BLOCK_ABOVE_DELEGATION_DEPTH, HEURISTIC_DETECTOR_NAME,
 };
 pub use quote_token::{
     InMemoryNonceStore, IssuedQuote, NonceCheck, NonceContext, NonceError, NonceStore, QuoteClaims,

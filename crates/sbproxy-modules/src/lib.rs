@@ -31,10 +31,10 @@ pub use auth::{ApiKeyAuth, Auth};
 pub use compile::*;
 pub use policy::{
     classification_cache_stats, evaluate_body, evaluate_body_with_audit, parse_aipref,
-    reset_classification_cache, AgentBudgetDecision, AgentBudgetExceedReason, AgentBudgetGuard,
-    AgentBudgetOnAnonymous, AgentBudgetOnExceed, AgentBudgetPolicy, AiCrawlControlPolicy,
-    AiCrawlDecision, AiCrawlLedger, AiprefParseError, AiprefSignal, AssertionPolicy,
-    BodyAwareAuditContext, BodyAwareConfig, BodyAwareOutcome, BotDetection,
+    reset_classification_cache, A2AInjectionAction, AgentBudgetDecision, AgentBudgetExceedReason,
+    AgentBudgetGuard, AgentBudgetOnAnonymous, AgentBudgetOnExceed, AgentBudgetPolicy,
+    AiCrawlControlPolicy, AiCrawlDecision, AiCrawlLedger, AiprefParseError, AiprefSignal,
+    AssertionPolicy, BodyAwareAuditContext, BodyAwareConfig, BodyAwareOutcome, BotDetection,
     ClassificationCacheStats, ContentDigestOnMissing, ContentDigestPolicy,
     ContentDigestVerifyOutcome, ContentShape, ContentSignal, ContentSignalParseError,
     DdosCheckResult, DdosPolicy, DetectionLabel, DetectionResult, Detector, DlpAction,
@@ -42,10 +42,11 @@ pub use policy::{
     ExposedCredsResult, ExpressionPolicy, ExpressionViews, InMemoryLedger, LedgerError, Money,
     ObjectAuthzPolicy, ObjectAuthzPrincipal, ObjectAuthzViolation, ObjectAuthzViolationKind,
     OpenApiValidationMode, OpenApiValidationPolicy, OpenApiValidationResult, OwnerSource,
-    PageShieldMode, PageShieldPolicy, PaywallPosition, Policy, PricingModel, PromptInjectionAction,
-    PromptInjectionV2Outcome, PromptInjectionV2Policy, RateLimitInfo, RateLimitPolicy,
-    RedeemResult, SecHeadersPolicy, SecurityHeader, SriCheckResult, SriPolicy, SriViolation,
-    SriViolationReason, ThreatProtection, Tier, WafResult, HEURISTIC_DETECTOR_NAME,
+    PageShieldMode, PageShieldPolicy, PaywallPosition, Policy, PricingModel,
+    PromptInjectionA2AConfig, PromptInjectionAction, PromptInjectionV2Outcome,
+    PromptInjectionV2Policy, RateLimitInfo, RateLimitPolicy, RedeemResult, SecHeadersPolicy,
+    SecurityHeader, SriCheckResult, SriPolicy, SriViolation, SriViolationReason, ThreatProtection,
+    Tier, WafResult, DEFAULT_BLOCK_ABOVE_DELEGATION_DEPTH, HEURISTIC_DETECTOR_NAME,
 };
 #[cfg(feature = "http-ledger")]
 pub use policy::{HttpLedger, HttpLedgerConfig};

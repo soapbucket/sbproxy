@@ -120,6 +120,22 @@ pub struct A2AContext {
 }
 
 impl A2AContext {
+    /// Hops behind this one: 0 for the chain root, 1 for the first
+    /// delegated call, and so on.
+    ///
+    /// This is [`chain_depth`] minus one, saturating. The two numbers
+    /// are easy to conflate and they disagree by one everywhere, so
+    /// policies that reason about "how far from the human" should reach
+    /// for this rather than doing the subtraction at each call site.
+    /// `chain_depth` starts at 1 because it counts hops including the
+    /// current one; delegation depth starts at 0 because it counts
+    /// delegations, and a chain root was delegated to by nobody.
+    ///
+    /// [`chain_depth`]: Self::chain_depth
+    pub fn delegation_depth(&self) -> u32 {
+        self.chain_depth.saturating_sub(1)
+    }
+
     /// Build an empty (zero-default) context for the given spec.
     /// Useful when detection succeeded but parsing produced no fields,
     /// so the policy module can still apply route-level limits.
@@ -510,6 +526,33 @@ mod tests {
         assert_eq!(ctx.chain_depth, 1);
         assert!(ctx.chain.is_empty());
         assert_eq!(ctx.raw_envelope_version, "google-v0");
+    }
+
+    #[test]
+    fn a_chain_root_has_delegation_depth_zero() {
+        // The off-by-one that policies keying on "how far from the
+        // human" have to get right: chain_depth counts this hop, so a
+        // root reads 1 there and 0 here.
+        let ctx = A2AContext::empty(A2ASpec::V1_0);
+        assert_eq!(ctx.chain_depth, 1);
+        assert_eq!(ctx.delegation_depth(), 0);
+    }
+
+    #[test]
+    fn delegation_depth_tracks_chain_depth_minus_one() {
+        let mut ctx = A2AContext::empty(A2ASpec::V1_0);
+        ctx.chain_depth = 4;
+        assert_eq!(ctx.delegation_depth(), 3);
+    }
+
+    #[test]
+    fn delegation_depth_saturates_rather_than_wrapping() {
+        // A zero chain_depth is out of contract, but underflowing it to
+        // u32::MAX would turn a malformed envelope into the deepest
+        // possible chain and block everything.
+        let mut ctx = A2AContext::empty(A2ASpec::V1_0);
+        ctx.chain_depth = 0;
+        assert_eq!(ctx.delegation_depth(), 0);
     }
 
     /// Every `x-a2a-*` field an untrusted caller can set. Used by the

@@ -66,6 +66,100 @@ impl PromptInjectionAction {
     }
 }
 
+/// What the policy does when the detector flags an agent-to-agent
+/// message body.
+///
+/// Deliberately narrower than [`PromptInjectionAction`]: there is no
+/// `Tag`. Tagging means stamping the score and label onto the upstream
+/// request, and the request-body phase is downstream of the point where
+/// that request was built. `upstream_request_filter` drains
+/// `RequestContext::trust_headers` before the first body byte is read,
+/// so a hit found in the body has nowhere to write. Offering `tag` here
+/// would be offering a setting that logs and nothing else, and an
+/// operator reading their config would believe a control was running
+/// that was not. The variant is absent so the mistake is unavailable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum A2AInjectionAction {
+    /// Emit the structured audit record and forward the hop. Default
+    /// at delegation depth 0.
+    #[default]
+    Log,
+    /// Reject the hop with `403 Forbidden`. The message body never
+    /// reaches the callee agent.
+    Block,
+}
+
+impl A2AInjectionAction {
+    /// Stable string used in metrics, audit records, and logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Log => "log",
+            Self::Block => "block",
+        }
+    }
+
+    /// True when the action rejects the hop.
+    pub fn is_block(&self) -> bool {
+        matches!(self, Self::Block)
+    }
+}
+
+/// Default for [`PromptInjectionA2AConfig::block_above_delegation_depth`].
+///
+/// Zero, so any hop that was delegated at all blocks on a hit while the
+/// chain root falls through to the baseline action.
+pub const DEFAULT_BLOCK_ABOVE_DELEGATION_DEPTH: u32 = 0;
+
+/// Agent-to-agent tuning for the `prompt_injection_v2` policy.
+///
+/// Reached as the `a2a` block under a `prompt_injection_v2` policy. The
+/// whole block is optional; omitting it takes the defaults below, which
+/// are the reject-at-depth posture rather than a disabled one.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PromptInjectionA2AConfig {
+    /// Action for a hit on a hop at delegation depth 0, meaning the
+    /// chain root: a caller nobody delegated to, with a human plausibly
+    /// still watching.
+    ///
+    /// Omitted means "follow the policy's top-level `action`", with
+    /// `tag` resolving to `log` because tagging cannot be honoured at
+    /// the body phase. See [`A2AInjectionAction`] for why that variant
+    /// does not exist here.
+    #[serde(default)]
+    pub root_action: Option<A2AInjectionAction>,
+    /// Delegation depth above which a hit blocks regardless of
+    /// `root_action`.
+    ///
+    /// Delegation depth counts hops behind the current one, so the chain
+    /// root is 0 and the first delegated call is 1. It is
+    /// `A2AContext::chain_depth` minus one; the off-by-one is worth
+    /// stating because the two numbers are a natural thing to conflate.
+    ///
+    /// Defaults to [`DEFAULT_BLOCK_ABOVE_DELEGATION_DEPTH`]. The
+    /// reasoning is that supervision thins with distance: by the third
+    /// hop of a fan-out nobody is reading the message that carried the
+    /// injection, and the blast radius of a false negative is larger
+    /// than the cost of a false positive. Set to `null` to disable the
+    /// escalation entirely, which is the documented escape hatch for a
+    /// high-volume east-west route that cannot absorb the rejections.
+    #[serde(default = "default_block_above_delegation_depth")]
+    pub block_above_delegation_depth: Option<u32>,
+}
+
+fn default_block_above_delegation_depth() -> Option<u32> {
+    Some(DEFAULT_BLOCK_ABOVE_DELEGATION_DEPTH)
+}
+
+impl Default for PromptInjectionA2AConfig {
+    fn default() -> Self {
+        Self {
+            root_action: None,
+            block_above_delegation_depth: Some(DEFAULT_BLOCK_ABOVE_DELEGATION_DEPTH),
+        }
+    }
+}
+
 /// Outcome of running the policy against a single prompt.
 #[derive(Clone, Debug)]
 pub enum PromptInjectionV2Outcome {
@@ -142,6 +236,11 @@ struct RawConfig {
     /// measured false-positive rates against their traffic.
     #[serde(default)]
     enable_body_aware: bool,
+    /// Agent-to-agent tuning. Optional; see
+    /// [`PromptInjectionA2AConfig`] for the defaults an omitted block
+    /// takes, which are not "disabled".
+    #[serde(default)]
+    a2a: PromptInjectionA2AConfig,
 }
 
 fn default_threshold() -> f64 {
@@ -175,6 +274,7 @@ pub struct PromptInjectionV2Policy {
     block_body: String,
     block_content_type: String,
     enable_body_aware: bool,
+    a2a: PromptInjectionA2AConfig,
 }
 
 impl std::fmt::Debug for PromptInjectionV2Policy {
@@ -252,6 +352,7 @@ impl PromptInjectionV2Policy {
             block_body: raw.block_body,
             block_content_type: raw.block_content_type,
             enable_body_aware: raw.enable_body_aware,
+            a2a: raw.a2a,
         })
     }
 
@@ -270,6 +371,7 @@ impl PromptInjectionV2Policy {
             block_body: DEFAULT_BLOCK_BODY.to_string(),
             block_content_type: "text/plain".to_string(),
             enable_body_aware: false,
+            a2a: PromptInjectionA2AConfig::default(),
         }
     }
 
@@ -336,6 +438,62 @@ impl PromptInjectionV2Policy {
     pub fn with_body_aware(mut self, enable: bool) -> Self {
         self.enable_body_aware = enable;
         self
+    }
+
+    /// Borrow the agent-to-agent tuning block.
+    pub fn a2a(&self) -> &PromptInjectionA2AConfig {
+        &self.a2a
+    }
+
+    /// Override the agent-to-agent tuning block. Used by tests.
+    pub fn with_a2a(mut self, a2a: PromptInjectionA2AConfig) -> Self {
+        self.a2a = a2a;
+        self
+    }
+
+    /// Action for an agent-to-agent hit at delegation depth 0.
+    ///
+    /// Resolves `a2a.root_action` when the operator set it, and
+    /// otherwise projects the policy's top-level [`action`] onto the two
+    /// behaviours that exist at the request-body phase.
+    ///
+    /// `tag` projects onto `log`, and that is a downgrade rather than a
+    /// translation. Tagging writes the score and label onto the upstream
+    /// request; by the time the body has been buffered, the upstream
+    /// request header has been built and its trust-header slot drained,
+    /// so there is nothing left to write to. The projection is stated
+    /// here, in the config docs, and in `docs/prompt-injection-v2.md`
+    /// rather than left for an operator to discover from an absence of
+    /// headers.
+    ///
+    /// [`action`]: Self::action
+    pub fn a2a_root_action(&self) -> A2AInjectionAction {
+        match self.a2a.root_action {
+            Some(explicit) => explicit,
+            None => match self.action {
+                PromptInjectionAction::Block => A2AInjectionAction::Block,
+                PromptInjectionAction::Tag | PromptInjectionAction::Log => A2AInjectionAction::Log,
+            },
+        }
+    }
+
+    /// Action for an agent-to-agent hit at `delegation_depth`.
+    ///
+    /// `delegation_depth` counts hops behind the current one, so the
+    /// chain root is 0. Derive it with
+    /// `A2AContext::delegation_depth` rather than passing
+    /// `chain_depth`, which is one larger.
+    ///
+    /// Above `a2a.block_above_delegation_depth` the answer is always
+    /// [`A2AInjectionAction::Block`], on the reasoning that supervision
+    /// thins with distance from the human who started the chain.
+    pub fn a2a_action_for_depth(&self, delegation_depth: u32) -> A2AInjectionAction {
+        if let Some(limit) = self.a2a.block_above_delegation_depth {
+            if delegation_depth > limit {
+                return A2AInjectionAction::Block;
+            }
+        }
+        self.a2a_root_action()
     }
 
     /// Run the detector on `prompt` and decide what to do.
@@ -685,5 +843,102 @@ mod tests {
     fn registered_detectors_includes_heuristic() {
         let names = registered_detector_names();
         assert!(names.contains(&HEURISTIC_DETECTOR_NAME));
+    }
+
+    // --- agent-to-agent action resolution (WOR-2118) ---
+
+    fn a2a_policy(json: serde_json::Value) -> PromptInjectionV2Policy {
+        PromptInjectionV2Policy::from_config(json).expect("config compiles")
+    }
+
+    #[test]
+    fn an_omitted_a2a_block_still_rejects_delegated_hops() {
+        // AC3's reject-by-default. Omitting the block must not read as
+        // "disabled"; a hop that was delegated at all blocks on a hit.
+        let p = a2a_policy(serde_json::json!({ "detector": "heuristic-v1" }));
+        assert_eq!(p.a2a_action_for_depth(0), A2AInjectionAction::Log);
+        assert_eq!(p.a2a_action_for_depth(1), A2AInjectionAction::Block);
+        assert_eq!(p.a2a_action_for_depth(7), A2AInjectionAction::Block);
+    }
+
+    #[test]
+    fn tag_projects_onto_log_because_tagging_cannot_run_at_the_body_phase() {
+        // `tag` writes the score onto the upstream request, and the
+        // upstream request header is already built and its trust-header
+        // slot already drained by the time the body is buffered. The
+        // projection is deliberate and documented; what must not happen
+        // is `tag` silently resolving to something that claims to
+        // enforce.
+        let p = a2a_policy(serde_json::json!({
+            "detector": "heuristic-v1",
+            "action": "tag",
+        }));
+        assert_eq!(p.action(), PromptInjectionAction::Tag);
+        assert_eq!(p.a2a_root_action(), A2AInjectionAction::Log);
+    }
+
+    #[test]
+    fn a_top_level_block_carries_into_the_chain_root() {
+        // Behaviour preservation for operators who already wrote
+        // `action: block`: the new depth rule must not downgrade depth 0.
+        let p = a2a_policy(serde_json::json!({
+            "detector": "heuristic-v1",
+            "action": "block",
+        }));
+        assert_eq!(p.a2a_action_for_depth(0), A2AInjectionAction::Block);
+    }
+
+    #[test]
+    fn an_explicit_root_action_overrides_the_projection() {
+        let p = a2a_policy(serde_json::json!({
+            "detector": "heuristic-v1",
+            "action": "log",
+            "a2a": { "root_action": "block" },
+        }));
+        assert_eq!(p.a2a_action_for_depth(0), A2AInjectionAction::Block);
+    }
+
+    #[test]
+    fn a_null_escalation_limit_is_the_high_volume_escape_hatch() {
+        // `null` has to mean "no escalation" rather than falling back to
+        // the default, or an operator cannot turn the rule off. serde
+        // applies `default` only for an absent key, so an explicit null
+        // lands on None.
+        let p = a2a_policy(serde_json::json!({
+            "detector": "heuristic-v1",
+            "a2a": { "block_above_delegation_depth": null },
+        }));
+        assert_eq!(p.a2a().block_above_delegation_depth, None);
+        assert_eq!(p.a2a_action_for_depth(31), A2AInjectionAction::Log);
+    }
+
+    #[test]
+    fn a_raised_escalation_limit_moves_the_boundary() {
+        let p = a2a_policy(serde_json::json!({
+            "detector": "heuristic-v1",
+            "a2a": { "block_above_delegation_depth": 2 },
+        }));
+        assert_eq!(p.a2a_action_for_depth(2), A2AInjectionAction::Log);
+        assert_eq!(p.a2a_action_for_depth(3), A2AInjectionAction::Block);
+    }
+
+    #[test]
+    fn the_a2a_action_vocabulary_has_no_tag_variant() {
+        // The guard against reintroducing the dead option: `tag` must
+        // not deserialize into the agent-boundary vocabulary at all.
+        let err = serde_json::from_value::<A2AInjectionAction>(serde_json::json!("tag"))
+            .expect_err("tag must not be a valid agent-boundary action");
+        assert!(err.to_string().contains("tag"));
+    }
+
+    #[test]
+    fn a2a_defaults_match_the_documented_posture() {
+        let cfg = PromptInjectionA2AConfig::default();
+        assert_eq!(cfg.root_action, None);
+        assert_eq!(
+            cfg.block_above_delegation_depth,
+            Some(DEFAULT_BLOCK_ABOVE_DELEGATION_DEPTH)
+        );
+        assert_eq!(DEFAULT_BLOCK_ABOVE_DELEGATION_DEPTH, 0);
     }
 }

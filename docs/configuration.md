@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-30*
+*Last modified: 2026-07-31*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -2790,8 +2790,13 @@ policies:
 | `label_header` | string | `x-prompt-injection-label` | Header carrying `clean` / `suspicious` / `injection` on `action: tag`. |
 | `block_body` | string | `prompt injection detected` | Response body returned on `action: block`. |
 | `block_content_type` | string | `text/plain` | Content-Type for the block body. |
+| `enable_body_aware` | boolean | `false` | Scan parsed message bodies as independent segments (worst-of-N, per-segment caching) rather than as one string. Applies to `ai_proxy` prompts and to A2A message parts. |
+| `a2a.root_action` | string | inherit | `log` or `block`, applied to an agent-to-agent hit at delegation depth 0. Omitted follows `action`, with `tag` resolving to `log`. |
+| `a2a.block_above_delegation_depth` | integer or null | `0` | Delegation depth above which an agent-to-agent hit blocks regardless of `a2a.root_action`. Depth 0 is the chain root, so the default blocks any delegated hop. `null` disables the escalation. |
 
 The generic policy scans the request URI + non-auth headers (`Authorization`, `Cookie`, `Set-Cookie` are excluded so tokens carried by design don't self-flag) at request-filter time. Tag mode stamps the score / label headers via the existing trust-headers channel before `upstream_request_filter` builds the upstream request; block mode rejects with `403` immediately. Set `enable_body_aware: true` on an AI origin after measuring false positives to scan parsed prompt bodies as well. See [prompt-injection-v2.md](prompt-injection-v2.md) for auto-selection failure boundaries, the eval harness, and custom detector registration.
+
+The `a2a.*` keys apply only when an `a2a` policy is configured on the same origin and the request is detected as A2A 1.0. There is no `tag` in the agent-boundary vocabulary: the scan runs at the request-body phase, after the upstream request header has been built, so there is no header left to stamp. See [prompt-injection-v2.md](prompt-injection-v2.md#the-agent-boundary).
 
 ### waf
 

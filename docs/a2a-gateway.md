@@ -81,6 +81,87 @@ that wants to avoid the policy simply sends neither, and an undetected
 request is allowed. **Set `route_glob` on any route you actually intend
 to govern.** It is the only signal a caller cannot opt out of.
 
+## What the policy reads from the request body
+
+The checks above run on headers and the verified principal. Two further
+controls need the JSON-RPC body, and on A2A 1.0 routes the proxy buffers
+the request so they can run.
+
+### Push-notification targets
+
+A2A 1.0 lets a caller register a webhook with
+`CreateTaskPushNotificationConfig` and have the upstream agent POST task
+status and artifacts to it. The URL is caller-supplied and the dial is
+made by an authenticated backend, which is the confused-deputy shape.
+Because the payload carries artifacts, a target inside private space
+exfiltrates rather than merely probes.
+
+Registrations are validated before the body reaches the agent. The
+default posture refuses private address space and non-HTTP schemes.
+Internal callbacks are a legitimate deployment, so name the host:
+
+```yaml
+policies:
+  - type: a2a
+    route_glob: "/agents/**"
+    push_target_allowlist:
+      - "callbacks.internal.example"
+```
+
+The denial body names the class of block and never echoes a resolved
+address, so a refusal cannot be used to map your network:
+
+```json
+{"error":"a2a_push_target_blocked","reason":"blocked: private address space"}
+```
+
+Two limits are worth stating plainly. This is registration-time
+validation, and the party that later dials the URL is the upstream
+agent, not the proxy. So it cannot close the DNS-rebinding window
+between registration and delivery; that needs the agent to pin the
+address it validated, which is a contract with the upstream rather than
+something a gateway can impose. And it applies to A2A 1.0 only, because
+the v0 drafts have no push-notification surface.
+
+Watch `sbproxy_a2a_methods_total{method="CreateTaskPushNotificationConfig"}`
+for registration volume and
+`sbproxy_a2a_denied_total{reason="push_target_blocked"}` for refusals.
+
+### Message content
+
+An A2A message body is a place an injection travels between agents with
+nobody reading it. Compose `prompt_injection_v2` on the same origin and
+the classifier scans `params.message.parts[*].text` on `SendMessage` and
+`SendStreamingMessage`, with the action chosen by how far down the
+delegation chain the hop sits.
+
+The full configuration, including why the agent boundary has its own
+action vocabulary and why the default rejects on delegated hops, is in
+[prompt-injection-v2.md](prompt-injection-v2.md#the-agent-boundary).
+
+### Cost
+
+Buffering holds the request until the body has arrived, on a hop that a
+fan-out step multiplies. It is enabled only for detected A2A 1.0 routes,
+and only when an `a2a` policy is configured on the origin. The v0 drafts
+and non-A2A traffic are unaffected.
+
+## What is not scanned: the response direction
+
+Everything above governs the request. Nothing governs what comes back.
+
+Artifacts returned by the callee, and the `TaskArtifactUpdateEvent`
+stream on `SendStreamingMessage`, are proxied without inspection. There
+is no response-direction parser and no response-direction
+prompt-injection scan. An agent that returns an injection in its output,
+whether because it was compromised or because it faithfully relayed
+poisoned content it retrieved, reaches the calling agent unexamined.
+
+That matters more than it first sounds, because the calling agent is
+usually the one with the tools. Treat callee output as untrusted input
+at the caller, and do not read the request-side controls as covering the
+round trip.
+
 ## Wire shape
 
 The A2A protocol is JSON-RPC over HTTP. Clients call `POST /<agent>/tasks/sendSubscribe` (or the streaming variant) with a JSON-RPC envelope; the agent responds with a `Task` document. The gateway sits in front of one or more agent endpoints; the discovery and negotiation surfaces below are what the design adds on top of the bare proxy.
