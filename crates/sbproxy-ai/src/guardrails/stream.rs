@@ -547,7 +547,7 @@ mod tests {
         for chunk in [
             r#"{"summ"#,
             r#"ary":"a sandwich"#,
-            r#"","tags":["food"#,
+            r#"","tags":["food""#,
             r#"]}"#,
         ] {
             assert!(
