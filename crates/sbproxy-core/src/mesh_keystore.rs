@@ -169,12 +169,6 @@ impl MeshKeystoreReadiness {
     pub fn ready(&self) -> bool {
         !self.quarantined_at_boot || self.substrate.complete_anti_entropy_rounds() > 0
     }
-
-    /// Whether the long-absence quarantine fired when this node's shard
-    /// opened.
-    pub fn quarantined_at_boot(&self) -> bool {
-        self.quarantined_at_boot
-    }
 }
 
 fn readiness_slot() -> &'static ArcSwapOption<MeshKeystoreReadiness> {
