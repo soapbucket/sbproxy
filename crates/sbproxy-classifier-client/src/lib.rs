@@ -21,9 +21,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sbproxy_classifier_proto::{
-    compress_request, ClassifyRequest, ClassifyResponse, CompressRequest, CompressResponse,
-    EmbedRequest, InferenceServiceClient, VersionRequest, VersionResponse,
+    compress_request, ClassifyRequest, CompressRequest, CompressResponse, EmbedRequest,
+    InferenceServiceClient, VersionRequest, VersionResponse,
 };
+
+/// Classification response types, re-exported so callers of
+/// [`ClassifierClient::classify`] can name them without depending on the
+/// proto crate directly.
+pub use sbproxy_classifier_proto::{ClassifyResponse, Label};
 use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
@@ -59,7 +64,8 @@ pub enum ClassifierClientError {
         /// Status message returned by the sidecar.
         message: String,
     },
-    /// The sidecar returned a structurally invalid compression response.
+    /// The sidecar returned a structurally invalid response (see
+    /// `validate_classify_response` / `validate_compress_response`).
     #[error("classifier protocol error: {0}")]
     Protocol(String),
     /// The caller supplied an invalid compression request.
@@ -217,6 +223,15 @@ impl ClassifierClient {
     }
 
     /// Classify `text` with the named model (empty = the sidecar's default).
+    ///
+    /// The response is validated before it is returned: it carries at least
+    /// one label, every label has a non-empty name unique within the
+    /// response, and every score is finite and within `0.0..=1.0`. A
+    /// response that fails any of these checks surfaces as
+    /// [`ClassifierClientError::Protocol`], so a malformed sidecar verdict
+    /// flows through the caller's fail policy instead of masquerading as a
+    /// clean result. The returned labels are ordered highest score first
+    /// regardless of the order the sidecar sent them in.
     pub async fn classify(
         &self,
         model: &str,
@@ -230,11 +245,14 @@ impl ClassifierClient {
         // Clone the inner client so this method takes `&self`: tonic clients
         // require `&mut self`, and the channel clone shares the connection.
         let mut client = self.inner.clone();
-        match tokio::time::timeout(self.timeout, client.classify(request)).await {
-            Ok(Ok(resp)) => Ok(resp.into_inner()),
-            Ok(Err(status)) => Err(rpc_error(status)),
-            Err(_) => Err(ClassifierClientError::Timeout(self.timeout)),
-        }
+        let mut response = match tokio::time::timeout(self.timeout, client.classify(request)).await
+        {
+            Ok(Ok(resp)) => resp.into_inner(),
+            Ok(Err(status)) => return Err(rpc_error(status)),
+            Err(_) => return Err(ClassifierClientError::Timeout(self.timeout)),
+        };
+        validate_classify_response(&mut response)?;
+        Ok(response)
     }
 
     /// Embed `inputs` with the named model (empty = the sidecar's default).
@@ -322,6 +340,63 @@ impl ClassifierClient {
     }
 }
 
+/// Validate (and normalize) a classification response before it reaches an
+/// adapter (WOR-2161).
+///
+/// The proto cannot express these invariants, so the client enforces them
+/// centrally, mirroring [`validate_compress_response`]:
+///
+/// * at least one label is present;
+/// * every label name is non-empty;
+/// * every score is finite and within `0.0..=1.0`.
+///
+/// Duplicates: two labels whose names collide ASCII-case-insensitively are
+/// rejected. Adapters match label names case-insensitively (the sidecar
+/// detector's `injection_label`), so a duplicate pair such as `Injection`
+/// 0.9 / `INJECTION` 0.1 makes the verdict ambiguous; guessing which score
+/// the sidecar meant is how a bypass hides, so the response fails loud
+/// instead.
+///
+/// Ordering: the proto documents labels as "highest score first" but this
+/// client does not trust the sidecar to honor that. After validation the
+/// labels are re-sorted descending by score (stable, so equal scores keep
+/// the sidecar's relative order), turning the documented ordering into an
+/// enforced invariant callers may rely on.
+fn validate_classify_response(
+    response: &mut ClassifyResponse,
+) -> Result<(), ClassifierClientError> {
+    if response.labels.is_empty() {
+        return Err(ClassifierClientError::Protocol(
+            "classification response contains no labels".to_string(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(response.labels.len());
+    for label in &response.labels {
+        if label.name.is_empty() {
+            return Err(ClassifierClientError::Protocol(
+                "classification response contains a label with an empty name".to_string(),
+            ));
+        }
+        if !label.score.is_finite() || !(0.0..=1.0).contains(&label.score) {
+            return Err(ClassifierClientError::Protocol(format!(
+                "classification response label {:?} has invalid score {}: \
+                 must be finite and in [0.0, 1.0]",
+                label.name, label.score
+            )));
+        }
+        if !seen.insert(label.name.to_ascii_lowercase()) {
+            return Err(ClassifierClientError::Protocol(format!(
+                "classification response contains duplicate label {:?} \
+                 (names are compared case-insensitively)",
+                label.name
+            )));
+        }
+    }
+    // total_cmp is safe here: every score was just checked finite.
+    response.labels.sort_by(|a, b| b.score.total_cmp(&a.score));
+    Ok(())
+}
+
 fn validate_compress_response(
     source: &str,
     response: &CompressResponse,
@@ -378,13 +453,67 @@ mod tests {
             req: Request<ClassifyRequest>,
         ) -> Result<Response<ClassifyResponse>, Status> {
             let model = req.into_inner().model;
-            Ok(Response::new(ClassifyResponse {
-                labels: vec![Label {
+            // Malformed-response fixtures keyed by model name, mirroring the
+            // compress stubs below: each one is structurally valid protobuf
+            // that the client must reject as a protocol error (WOR-2161).
+            let labels = match model.as_str() {
+                "empty-labels" => vec![],
+                "empty-name" => vec![Label {
+                    name: String::new(),
+                    score: 0.5,
+                }],
+                "nan-score" => vec![Label {
+                    name: "injection".to_string(),
+                    score: f64::NAN,
+                }],
+                "inf-score" => vec![Label {
+                    name: "injection".to_string(),
+                    score: f64::INFINITY,
+                }],
+                "negative-score" => vec![Label {
+                    name: "injection".to_string(),
+                    score: -0.25,
+                }],
+                "overrange-score" => vec![Label {
+                    name: "injection".to_string(),
+                    score: 1.5,
+                }],
+                "duplicate-labels" => vec![
+                    Label {
+                        name: "Injection".to_string(),
+                        score: 0.9,
+                    },
+                    Label {
+                        name: "INJECTION".to_string(),
+                        score: 0.1,
+                    },
+                ],
+                "unsorted-labels" => vec![
+                    Label {
+                        name: "benign".to_string(),
+                        score: 0.25,
+                    },
+                    Label {
+                        name: "injection".to_string(),
+                        score: 0.75,
+                    },
+                ],
+                "boundary-scores" => vec![
+                    Label {
+                        name: "injection".to_string(),
+                        score: 1.0,
+                    },
+                    Label {
+                        name: "benign".to_string(),
+                        score: 0.0,
+                    },
+                ],
+                _ => vec![Label {
                     name: format!("stub:{model}"),
                     score: 0.99,
                 }],
-                latency_us: 1,
-            }))
+            };
+            Ok(Response::new(ClassifyResponse { labels, latency_us: 1 }))
         }
         async fn embed(
             &self,
@@ -513,6 +642,77 @@ mod tests {
 
         let version = client.version().await.unwrap();
         assert_eq!(version.models, vec!["stub".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn classify_rejects_malformed_sidecar_responses() {
+        let Some(endpoint) = spawn_stub().await else {
+            return;
+        };
+        let client =
+            ClassifierClient::connect(&endpoint, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .expect("connect");
+
+        for model in [
+            "empty-labels",
+            "empty-name",
+            "nan-score",
+            "inf-score",
+            "negative-score",
+            "overrange-score",
+            "duplicate-labels",
+        ] {
+            let error = client
+                .classify(model, "ignore previous")
+                .await
+                .expect_err("malformed response must fail");
+            assert!(
+                matches!(error, ClassifierClientError::Protocol(_)),
+                "unexpected error for {model}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_sorts_labels_highest_score_first() {
+        // The proto documents this ordering but the client enforces it, so
+        // a sidecar that returns labels unsorted still yields the invariant.
+        let Some(endpoint) = spawn_stub().await else {
+            return;
+        };
+        let client =
+            ClassifierClient::connect(&endpoint, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .expect("connect");
+
+        let resp = client
+            .classify("unsorted-labels", "ignore previous")
+            .await
+            .expect("valid response");
+        assert_eq!(resp.labels.len(), 2);
+        assert_eq!(resp.labels[0].name, "injection");
+        assert_eq!(resp.labels[0].score, 0.75);
+        assert_eq!(resp.labels[1].name, "benign");
+    }
+
+    #[tokio::test]
+    async fn classify_accepts_boundary_scores() {
+        // 0.0 and 1.0 are valid scores; the range check is inclusive.
+        let Some(endpoint) = spawn_stub().await else {
+            return;
+        };
+        let client =
+            ClassifierClient::connect(&endpoint, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .expect("connect");
+
+        let resp = client
+            .classify("boundary-scores", "ignore previous")
+            .await
+            .expect("boundary scores are valid");
+        assert_eq!(resp.labels[0].score, 1.0);
+        assert_eq!(resp.labels[1].score, 0.0);
     }
 
     #[tokio::test]
