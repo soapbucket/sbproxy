@@ -339,7 +339,11 @@ mod tests {
         }));
         assert!(g.check("[1,2,3]").is_none());
         let short = g.check("[1]").expect("minItems must block");
-        assert!(short.reason.contains("minItems"), "reason: {}", short.reason);
+        assert!(
+            short.reason.contains("minItems"),
+            "reason: {}",
+            short.reason
+        );
         let wrong = g.check(r#"[1,"x",3]"#).expect("item type must block");
         assert!(
             wrong.reason.contains("/1") && wrong.reason.contains("keyword: type"),
