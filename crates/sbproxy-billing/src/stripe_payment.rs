@@ -1121,6 +1121,14 @@ pub struct StripeSettlerConfig {
     pub total_deadline_ms: u64,
     /// How long a sealed recovery envelope stays replayable, in milliseconds.
     pub recovery_ttl_ms: i64,
+    /// Whether direct PaymentIntent mode is offered, from
+    /// `proxy.payments.rails.stripe.direct_payment_intent.enabled`.
+    ///
+    /// Carried here so the operator's switch reaches the one place that can
+    /// honor it. Without it the adapter would offer direct mode whatever
+    /// the configuration said, which is the failure the config-reader
+    /// coverage check exists to catch.
+    pub direct_payment_intent_enabled: bool,
 }
 
 impl Default for StripeSettlerConfig {
@@ -1129,6 +1137,10 @@ impl Default for StripeSettlerConfig {
             call_timeout_ms: 800,
             total_deadline_ms: MAX_TOTAL_DEADLINE_MS,
             recovery_ttl_ms: MAX_RECOVERY_AGE_MS,
+            // Off unless an operator asks for it, matching the config
+            // default. Direct mode charges a card the proxy never sees a
+            // credential for, so it should never arrive by omission.
+            direct_payment_intent_enabled: false,
         }
     }
 }
@@ -1146,6 +1158,7 @@ pub struct StripePaymentIntentSettler<T: StripeTransport> {
     call_timeout: Duration,
     total_deadline: Duration,
     recovery_ttl_ms: i64,
+    direct_payment_intent_enabled: bool,
 }
 
 impl<T: StripeTransport> StripePaymentIntentSettler<T> {
@@ -1183,6 +1196,7 @@ impl<T: StripeTransport> StripePaymentIntentSettler<T> {
             call_timeout: Duration::from_millis(config.call_timeout_ms),
             total_deadline: Duration::from_millis(config.total_deadline_ms),
             recovery_ttl_ms: config.recovery_ttl_ms,
+            direct_payment_intent_enabled: config.direct_payment_intent_enabled,
         })
     }
 
@@ -1294,6 +1308,12 @@ impl<T: StripeTransport> StripePaymentIntentSettler<T> {
         capture_method: &str,
         account_context: &str,
     ) -> Result<ChallengeMaterial, BillingError> {
+        if !self.direct_payment_intent_enabled {
+            // Refuse rather than silently falling back to the Payment Auth
+            // path: an operator who turned this off should not discover it
+            // still ran by reading a Stripe dashboard.
+            return Err(BillingError::UnsupportedOperation);
+        }
         let draft = &request.draft;
         let (body, metadata) = build_direct_create_form(
             &request.intent_id,
