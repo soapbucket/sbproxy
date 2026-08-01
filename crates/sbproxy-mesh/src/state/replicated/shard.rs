@@ -30,8 +30,8 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 use bytes::Bytes;
 use redb::{Database, ReadableTable, TableDefinition};
@@ -60,6 +60,25 @@ const MAX_KEY_BYTES: usize = 512;
 /// Shared millisecond clock. Injected so GC grace and quarantine tests can
 /// drive time deterministically.
 pub type MeshClock = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// Application-supplied merge override consulted whenever a candidate
+/// register meets a stored one for a key under the fence's prefix
+/// (WOR-2064).
+///
+/// Called as `fence(current, candidate)`. `Some(false)` retains the
+/// stored register no matter what the candidate's logical version says;
+/// `Some(true)` installs the candidate the same way; `None` defers to the
+/// normal causal merge. A fence must be a pure function of the two
+/// registers so that replicas and read reconciliation reach the same
+/// verdict in any order: for any pair where the fence fires, it must fire
+/// with the opposite verdict when the arguments are swapped.
+///
+/// The motivating consumer is the mesh keystore's revocation fence: a key
+/// record whose status is terminal must never merge back to a usable one,
+/// even against a higher logical version, because the substrate's plain
+/// version ordering would otherwise resurrect it.
+pub type MergeFenceFn =
+    std::sync::Arc<dyn Fn(&VersionedLwwRegister, &VersionedLwwRegister) -> Option<bool> + Send + Sync>;
 
 /// Capacity and value-size bounds enforced by the shard.
 #[derive(Debug, Clone, Copy)]
@@ -133,6 +152,14 @@ pub struct ReplicaShard {
     /// Records discarded by the long-absence quarantine on open. Zero when
     /// the shard was opened within the grace window.
     quarantine_discarded: AtomicU64,
+    /// Whether the long-absence quarantine fired on open, independent of
+    /// how many records it discarded. A quarantined shard starts from
+    /// nothing and consumers that serve authority from it (the mesh
+    /// keystore) hold traffic until anti-entropy has repopulated it.
+    quarantined: AtomicBool,
+    /// Registered [`MergeFenceFn`]s, matched by key prefix in insertion
+    /// order; the first matching prefix decides.
+    merge_fences: RwLock<Vec<(String, MergeFenceFn)>>,
 }
 
 impl ReplicaShard {
@@ -185,6 +212,8 @@ impl ReplicaShard {
             limits,
             grace_ms,
             quarantine_discarded: AtomicU64::new(0),
+            quarantined: AtomicBool::new(false),
+            merge_fences: RwLock::new(Vec::new()),
         };
 
         if absent_past_grace {
@@ -192,6 +221,7 @@ impl ReplicaShard {
             shard
                 .quarantine_discarded
                 .store(discarded, Ordering::Relaxed);
+            shard.quarantined.store(true, Ordering::Relaxed);
             tracing::warn!(
                 discarded,
                 "replica shard offline longer than tombstone GC grace; discarding stored \
@@ -214,7 +244,42 @@ impl ReplicaShard {
             limits,
             grace_ms,
             quarantine_discarded: AtomicU64::new(0),
+            quarantined: AtomicBool::new(false),
+            merge_fences: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Register (or replace) a [`MergeFenceFn`] for keys under `prefix`.
+    ///
+    /// Consulted on every apply for a key that already stores a record,
+    /// and by the coordinator's read reconciliation, before the causal
+    /// merge runs. Registration is idempotent per prefix so a reloaded
+    /// consumer replaces its fence instead of stacking a new one.
+    pub fn install_merge_fence(&self, prefix: impl Into<String>, fence: MergeFenceFn) {
+        let prefix = prefix.into();
+        let mut fences = self.merge_fences.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = fences.iter_mut().find(|(existing, _)| *existing == prefix) {
+            slot.1 = fence;
+        } else {
+            fences.push((prefix, fence));
+        }
+    }
+
+    /// The registered fence verdict for `key`, if any fence matches and
+    /// fires. `None` means the causal merge decides.
+    pub(crate) fn fence_verdict(
+        &self,
+        key: &str,
+        current: &VersionedLwwRegister,
+        candidate: &VersionedLwwRegister,
+    ) -> Option<bool> {
+        let fences = self.merge_fences.read().unwrap_or_else(|e| e.into_inner());
+        for (prefix, fence) in fences.iter() {
+            if key.starts_with(prefix.as_str()) {
+                return fence(current, candidate);
+            }
+        }
+        None
     }
 
     fn load_persisted(&self, now: u64) -> Result<(), ShardError> {
@@ -384,6 +449,28 @@ impl ReplicaShard {
             }
             None => None,
         };
+
+        // Apply-time merge fence (WOR-2064): a registered fence may
+        // override the causal merge for keys under its prefix. It runs
+        // on every replica's apply, which covers coordinator writes,
+        // anti-entropy pulls and pushes, and read repair alike.
+        if let Some(existing) = current.as_ref() {
+            match self.fence_verdict(key, &existing.register, candidate) {
+                Some(false) => return Ok(VersionedLwwMergeOutcome::Unchanged),
+                Some(true) => {
+                    let record = StoredRecord {
+                        register: candidate.clone(),
+                        expires_at_ms: record_expiry(candidate, ttl_secs, now),
+                    };
+                    if records.get(key) != Some(&record) {
+                        self.persist_record(key, &record)?;
+                        records.insert(key.to_string(), record);
+                    }
+                    return Ok(VersionedLwwMergeOutcome::Replaced);
+                }
+                None => {}
+            }
+        }
 
         // Expired-tombstone fence: a tombstone past the GC grace period may
         // still fence out an existing stale record, but it must never
@@ -578,6 +665,14 @@ impl ReplicaShard {
         self.quarantine_discarded.load(Ordering::Relaxed)
     }
 
+    /// Whether the long-absence quarantine fired when this shard opened,
+    /// even if it held no records to discard. Consumers that treat the
+    /// shard as an authority (the mesh keystore) stay unready until the
+    /// first complete anti-entropy round has repopulated it.
+    pub fn quarantined(&self) -> bool {
+        self.quarantined.load(Ordering::Relaxed)
+    }
+
     /// The shard's millisecond clock.
     pub fn clock(&self) -> MeshClock {
         self.clock.clone()
@@ -729,7 +824,93 @@ mod tests {
         .unwrap();
         assert_eq!(reopened.fetch("k"), None);
         assert_eq!(reopened.quarantine_discarded(), 1);
+        assert!(reopened.quarantined());
         assert!(reopened.is_empty());
+    }
+
+    fn absorbing_fence() -> MergeFenceFn {
+        // "terminal" is an absorbing value: once stored it repels every
+        // non-terminal candidate, and a terminal candidate displaces a
+        // non-terminal record regardless of version. Mirrors the shape of
+        // the keystore's revocation fence.
+        Arc::new(|current, candidate| {
+            let cur = current.value() == Some("terminal");
+            let cand = candidate.value() == Some("terminal");
+            match (cur, cand) {
+                (true, false) => Some(false),
+                (false, true) => Some(true),
+                _ => None,
+            }
+        })
+    }
+
+    #[test]
+    fn merge_fence_retains_current_against_a_higher_version_candidate() {
+        let clock_cell = Arc::new(TestClockCell::new(1_000));
+        let shard = ReplicaShard::in_memory(ShardLimits::default(), 0, fixed_clock(clock_cell));
+        shard.install_merge_fence("fenced:", absorbing_fence());
+
+        shard
+            .apply("fenced:k", &live("terminal", "node-a", 1_000, 2), 0)
+            .unwrap();
+        let outcome = shard
+            .apply("fenced:k", &live("fresh", "node-z", 2_000, 9), 0)
+            .unwrap();
+        assert_eq!(outcome, VersionedLwwMergeOutcome::Unchanged);
+        assert_eq!(
+            shard.fetch("fenced:k").unwrap().value(),
+            Some("terminal"),
+            "a higher logical version must not merge past the fence"
+        );
+    }
+
+    #[test]
+    fn merge_fence_installs_a_lower_version_candidate_when_it_says_so() {
+        let clock_cell = Arc::new(TestClockCell::new(1_000));
+        let shard = ReplicaShard::in_memory(ShardLimits::default(), 0, fixed_clock(clock_cell));
+        shard.install_merge_fence("fenced:", absorbing_fence());
+
+        shard
+            .apply("fenced:k", &live("fresh", "node-a", 1_000, 9), 0)
+            .unwrap();
+        let outcome = shard
+            .apply("fenced:k", &live("terminal", "node-b", 2_000, 2), 0)
+            .unwrap();
+        assert_eq!(outcome, VersionedLwwMergeOutcome::Replaced);
+        let stored = shard.fetch("fenced:k").unwrap();
+        assert_eq!(stored.value(), Some("terminal"));
+        assert_eq!(stored.logical_version(), 2);
+    }
+
+    #[test]
+    fn merge_fence_is_prefix_scoped_and_replaceable() {
+        let clock_cell = Arc::new(TestClockCell::new(1_000));
+        let shard = ReplicaShard::in_memory(ShardLimits::default(), 0, fixed_clock(clock_cell));
+        shard.install_merge_fence("fenced:", absorbing_fence());
+
+        // A key outside the prefix follows the plain causal merge.
+        shard
+            .apply("plain:k", &live("terminal", "node-a", 1_000, 2), 0)
+            .unwrap();
+        shard
+            .apply("plain:k", &live("fresh", "node-z", 2_000, 9), 0)
+            .unwrap();
+        assert_eq!(shard.fetch("plain:k").unwrap().value(), Some("fresh"));
+
+        // Reinstalling under the same prefix replaces the fence rather
+        // than stacking a second one.
+        shard.install_merge_fence("fenced:", Arc::new(|_, _| None));
+        shard
+            .apply("fenced:k", &live("terminal", "node-a", 1_000, 2), 0)
+            .unwrap();
+        shard
+            .apply("fenced:k", &live("fresh", "node-z", 2_000, 9), 0)
+            .unwrap();
+        assert_eq!(
+            shard.fetch("fenced:k").unwrap().value(),
+            Some("fresh"),
+            "the replaced fence must not keep enforcing the old verdict"
+        );
     }
 
     #[test]

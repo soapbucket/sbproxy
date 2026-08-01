@@ -708,6 +708,55 @@ async fn fleet_admin_list_delete_and_purge_are_complete_and_bounded() {
     assert!(bounded.truncated);
 }
 
+// --- WOR-2064: anti-entropy completeness signal ---
+
+#[tokio::test]
+async fn complete_anti_entropy_rounds_counts_only_fully_synced_rounds() {
+    let clock_cell = Arc::new(AtomicU64::new(1_000_000));
+    let members = ["node-a", "node-b"];
+    let a = TestNode::start("node-a", &members, shared_clock(&clock_cell), 0).await;
+    let b = TestNode::start("node-b", &members, shared_clock(&clock_cell), 0).await;
+    let addrs = addr_map(&[&a, &b]);
+    let store_a = store_for(
+        &a,
+        &addrs,
+        settings(2, Consistency::All, Consistency::Quorum, 0),
+    );
+
+    assert_eq!(store_a.complete_anti_entropy_rounds(), 0);
+    store_a.maintenance_round().await;
+    assert_eq!(
+        store_a.complete_anti_entropy_rounds(),
+        1,
+        "a round that reached every peer counts"
+    );
+
+    // A pinned-consistency clone shares the counter, so a consumer that
+    // pins quorum semantics still observes the node's maintenance loop.
+    let pinned = store_a.with_consistency(Consistency::Quorum, Consistency::Quorum);
+    assert_eq!(pinned.complete_anti_entropy_rounds(), 1);
+
+    // With the peer unreachable, the round must not count as complete.
+    let dead_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let mut cut = addrs.clone();
+    cut.insert("node-b".to_string(), format!("127.0.0.1:{dead_port}"));
+    let store_cut = store_for(
+        &a,
+        &cut,
+        settings(2, Consistency::All, Consistency::Quorum, 0),
+    );
+    store_cut.maintenance_round().await;
+    assert_eq!(
+        store_cut.complete_anti_entropy_rounds(),
+        0,
+        "an unreachable peer disqualifies the round"
+    );
+    drop(b);
+}
+
 // --- Read repair ---
 
 #[tokio::test]

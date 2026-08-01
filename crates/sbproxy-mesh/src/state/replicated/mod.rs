@@ -31,6 +31,7 @@ pub mod admin;
 pub mod maintenance;
 pub mod shard;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,7 +43,7 @@ use crate::state::distributed_cache::DistributedCache;
 use crate::state::register::{VersionedLwwMergeOutcome, VersionedLwwRegister};
 use crate::transport::TransportClientPool;
 
-pub use shard::{MeshClock, ReplicaShard, ShardError, ShardLimits};
+pub use shard::{MergeFenceFn, MeshClock, ReplicaShard, ShardError, ShardLimits};
 
 /// Per-operation transport timeout for replica fan-out calls. The client
 /// pool has no deadline of its own, so the coordinator bounds every remote
@@ -192,6 +193,11 @@ pub struct ReplicatedStore {
     pub(crate) settings: ReplicationSettings,
     pub(crate) clock: MeshClock,
     local_node_id: String,
+    /// Completed anti-entropy rounds in which every peer synced fully.
+    /// Shared across [`Self::with_consistency`] clones so a pinned
+    /// coordinator observes the maintenance loop that runs on the
+    /// original store.
+    pub(crate) complete_sync_rounds: Arc<AtomicU64>,
 }
 
 impl ReplicatedStore {
@@ -215,7 +221,47 @@ impl ReplicatedStore {
             settings,
             clock,
             local_node_id,
+            complete_sync_rounds: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// A coordinator over the same shard, ring, transport, clock, and
+    /// isolation view with pinned consistency levels (WOR-2064).
+    ///
+    /// Everything except the read and write consistency is shared with
+    /// `self`, including the anti-entropy completeness counter, so a
+    /// consumer that must not inherit the operator's consistency choice
+    /// (the mesh keystore pins quorum writes and quorum reads) still
+    /// rides the one maintenance loop the node runs. Do not spawn a
+    /// second maintenance loop on the returned store.
+    pub fn with_consistency(
+        &self,
+        write_consistency: Consistency,
+        read_consistency: Consistency,
+    ) -> Self {
+        Self {
+            shard: self.shard.clone(),
+            cache: self.cache.clone(),
+            pool: self.pool.clone(),
+            peer_addr: self.peer_addr.clone(),
+            is_isolated: self.is_isolated.clone(),
+            settings: ReplicationSettings {
+                write_consistency,
+                read_consistency,
+                ..self.settings.clone()
+            },
+            clock: self.clock.clone(),
+            local_node_id: self.local_node_id.clone(),
+            complete_sync_rounds: self.complete_sync_rounds.clone(),
+        }
+    }
+
+    /// How many maintenance rounds have completed a full anti-entropy
+    /// pass, meaning every current peer's digest walk finished and every
+    /// needed record transferred. A node recovering from the long-absence
+    /// quarantine is caught up once this moves past zero after boot.
+    pub fn complete_anti_entropy_rounds(&self) -> u64 {
+        self.complete_sync_rounds.load(Ordering::Relaxed)
     }
 
     /// The local durable shard (transport dispatch applies records here).
@@ -343,14 +389,21 @@ impl ReplicatedStore {
         }
 
         // Reconcile: causally merge every response into a winner, keeping
-        // the winning record's expiry so repair preserves lifetimes.
+        // the winning record's expiry so repair preserves lifetimes. A
+        // registered merge fence overrides the causal order here exactly
+        // as it does on apply, so a reader can never surface a record the
+        // replicas' own merges would refuse to store (WOR-2064).
         let mut winner: Option<VersionedLwwRegister> = None;
         for (_, record) in responses.iter() {
             match (winner.as_mut(), record) {
                 (None, Some(r)) => winner = Some(r.register.clone()),
-                (Some(w), Some(r)) => {
-                    w.merge_causal(&r.register);
-                }
+                (Some(w), Some(r)) => match self.shard.fence_verdict(key, w, &r.register) {
+                    Some(true) => *w = r.register.clone(),
+                    Some(false) => {}
+                    None => {
+                        w.merge_causal(&r.register);
+                    }
+                },
                 _ => {}
             }
         }

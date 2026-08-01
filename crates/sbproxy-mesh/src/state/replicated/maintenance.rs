@@ -74,10 +74,19 @@ impl ReplicatedStore {
             tracing::warn!(%error, "replicated maintenance: heartbeat persist failed");
         }
         self.handoff_round(&mut report).await;
-        self.anti_entropy_round(&mut report).await;
+        let all_peers_synced = self.anti_entropy_round(&mut report).await;
         self.gc_round(&mut report).await;
         MESH_ANTI_ENTROPY_ROUNDS.inc();
         MESH_REPLICA_SHARD_ENTRIES.set(self.shard.len() as i64);
+        if all_peers_synced {
+            // WOR-2064: consumers waiting out the long-absence quarantine
+            // (the mesh keystore's readiness gate) count only rounds in
+            // which every peer synced fully; a round that skipped an
+            // unreachable peer or truncated a digest walk proves nothing
+            // about being caught up.
+            self.complete_sync_rounds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         report
     }
 
@@ -145,21 +154,29 @@ impl ReplicatedStore {
     }
 
     /// Phase 2: reconcile with each peer through bounded digest exchange.
-    async fn anti_entropy_round(&self, report: &mut MaintenanceReport) {
+    /// Returns whether every peer synced fully this round.
+    async fn anti_entropy_round(&self, report: &mut MaintenanceReport) -> bool {
         let peers: Vec<String> = self
             .cache
             .member_nodes()
             .into_iter()
             .filter(|n| n != self.local_node_id())
             .collect();
+        let mut all_synced = true;
         for peer in peers {
-            self.sync_with_peer(&peer, report).await;
+            if !self.sync_with_peer(&peer, report).await {
+                all_synced = false;
+            }
         }
+        all_synced
     }
 
-    async fn sync_with_peer(&self, peer: &str, report: &mut MaintenanceReport) {
+    /// Returns `true` only when the peer's digest walk completed and
+    /// every transfer this round needed succeeded in both directions.
+    async fn sync_with_peer(&self, peer: &str, report: &mut MaintenanceReport) -> bool {
+        let mut synced = true;
         let Some(client) = self.client_for(peer) else {
-            return;
+            return false;
         };
 
         // --- Pull phase: walk the peer's digest ---
@@ -174,7 +191,7 @@ impl ReplicatedStore {
             .await
             {
                 Ok(Ok(page)) => page,
-                _ => return,
+                _ => return false,
             };
             peer_digest.extend(page.entries);
             match page.next_page_token {
@@ -187,6 +204,7 @@ impl ReplicatedStore {
         }
         if !complete {
             report.truncated = true;
+            synced = false;
         }
 
         let grace_ms = self.settings.tombstone_gc_grace_secs.saturating_mul(1_000);
@@ -215,20 +233,26 @@ impl ReplicatedStore {
             }
             // Fetch the full record and causally merge it in. StaleRejected
             // is fine here: it means the local side advanced concurrently.
-            if let Ok(Some(record)) = self.fetch_record_from(peer, &entry.key).await {
-                let ttl = record.remaining_ttl_secs((self.clock)());
-                if self.shard.apply(&entry.key, &record.register, ttl).is_ok() {
-                    report.pulled += 1;
-                    MESH_ANTI_ENTROPY_KEYS
-                        .with_label_values(&[ANTI_ENTROPY_DIRECTION_PULL])
-                        .inc();
+            match self.fetch_record_from(peer, &entry.key).await {
+                Ok(Some(record)) => {
+                    let ttl = record.remaining_ttl_secs((self.clock)());
+                    if self.shard.apply(&entry.key, &record.register, ttl).is_ok() {
+                        report.pulled += 1;
+                        MESH_ANTI_ENTROPY_KEYS
+                            .with_label_values(&[ANTI_ENTROPY_DIRECTION_PULL])
+                            .inc();
+                    } else {
+                        synced = false;
+                    }
                 }
+                Ok(None) => {}
+                Err(_) => synced = false,
             }
         }
 
         // --- Push phase: only sound against a complete peer digest ---
         if !complete {
-            return;
+            return false;
         }
         let peer_versions: std::collections::HashMap<&str, &KeyDigest> = peer_digest
             .iter()
@@ -245,7 +269,10 @@ impl ReplicatedStore {
             for (key, record) in page {
                 scanned += 1;
                 if scanned > MAX_KEYS_PER_ROUND {
-                    return;
+                    // Budget exhausted mid-scan: the push phase for this
+                    // peer is incomplete, so the round cannot count as a
+                    // full sync.
+                    return false;
                 }
                 if !self.replica_set(&key).iter().any(|n| n == peer) {
                     continue;
@@ -280,9 +307,12 @@ impl ReplicatedStore {
                     MESH_ANTI_ENTROPY_KEYS
                         .with_label_values(&[ANTI_ENTROPY_DIRECTION_PUSH])
                         .inc();
+                } else {
+                    synced = false;
                 }
             }
         }
+        synced
     }
 
     /// Phase 3: acknowledgement-aware tombstone collection.
