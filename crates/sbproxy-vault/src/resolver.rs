@@ -180,11 +180,6 @@ mod tests {
     use super::*;
     use crate::local::LocalVault;
 
-    /// Serializes the tests that mutate the process-global environment so
-    /// `std::env::set_var`/`remove_var` never race a concurrent reader in
-    /// this test binary.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn resolver_no_backend() -> SecretResolver {
         SecretResolver::new()
     }
@@ -208,26 +203,23 @@ mod tests {
 
     #[test]
     fn resolve_env_var_pattern() {
-        // SAFETY (for both unsafe blocks below): ENV_LOCK serializes the
-        // env-mutating tests in this binary, so `set_var`/`remove_var` never
-        // race a concurrent environment access.
-        let _env = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("TEST_RESOLVER_ENV", "from_environment") };
+        let _env = crate::test_env::EnvVarGuard::set(&[(
+            "TEST_RESOLVER_ENV",
+            Some("from_environment"),
+        )]);
         let resolver = resolver_no_backend();
         assert_eq!(
             resolver.resolve("${TEST_RESOLVER_ENV}").unwrap(),
             "from_environment"
         );
-        unsafe { std::env::remove_var("TEST_RESOLVER_ENV") };
     }
 
     #[test]
     fn resolve_legacy_vault_env_reference() {
-        // SAFETY (for both unsafe blocks below): ENV_LOCK serializes the
-        // env-mutating tests in this binary, so `set_var`/`remove_var` never
-        // race a concurrent environment access.
-        let _env = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("TEST_LEGACY_VAULT_ENV", "from_legacy_env") };
+        let _env = crate::test_env::EnvVarGuard::set(&[(
+            "TEST_LEGACY_VAULT_ENV",
+            Some("from_legacy_env"),
+        )]);
         let resolver = resolver_no_backend();
         assert_eq!(
             resolver
@@ -235,7 +227,6 @@ mod tests {
                 .unwrap(),
             "from_legacy_env"
         );
-        unsafe { std::env::remove_var("TEST_LEGACY_VAULT_ENV") };
     }
 
     #[test]

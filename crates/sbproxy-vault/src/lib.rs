@@ -18,6 +18,8 @@ pub mod resolver;
 pub mod rotation;
 pub mod scope;
 pub mod secret_string;
+#[cfg(test)]
+mod test_env;
 pub mod vault_ref;
 
 pub use aws::{AwsAuth, AwsSecretsManagerBackend, AwsSecretsManagerConfig, DEFAULT_AWS_CACHE_TTL};
