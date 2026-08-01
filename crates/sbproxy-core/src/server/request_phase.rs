@@ -3091,7 +3091,20 @@ pub(super) async fn request_filter(
         tenant_id: policy_workspace_id.clone(),
         workspace_id: policy_workspace_id,
     };
-    match check_policies(&pipeline.enforcers[origin_idx], session, ctx, &verdict_ctx).await {
+    let policy_verdict =
+        check_policies(&pipeline.enforcers[origin_idx], session, ctx, &verdict_ctx).await;
+    // WOR-2143: the settlement origin gate. When `proxy.payments` is
+    // active and the chain's verdict is an `ai_crawl_control` 402, the
+    // gate answers from durable settlement state instead: it turns the
+    // deny into an allow exactly when a payment durably settled, and
+    // rewrites the stored challenge otherwise. This is the call-site
+    // seam on purpose: the enforcer trait's returned future cannot
+    // borrow the RequestContext, and settlement has to await the store
+    // and then mutate it.
+    #[cfg(feature = "payments")]
+    let policy_verdict =
+        crate::settlement_gate::apply(session.req_header(), ctx, policy_verdict).await;
+    match policy_verdict {
         None => {
             sbproxy_observe::metrics::record_policy(&policy_origin, "all", "allow");
             // `ctx.rate_limit_info` was populated in-place by the
@@ -3333,6 +3346,37 @@ pub(super) async fn request_filter(
                         let _ = header.insert_header("Retry-After", info.reset_secs.to_string());
                     }
                 }
+                session
+                    .write_response_header(Box::new(header), false)
+                    .await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::copy_from_slice(body.as_bytes())), true)
+                    .await?;
+            } else if policy_type == "ai_crawl_settlement" {
+                // WOR-2143: a settlement-gate response that is not a 402
+                // (the 406 rail negotiation failure, the 400 duplicate
+                // credential, the 503 infrastructure refusal). The gate
+                // rendered every byte, including any Retry-After or
+                // problem+json content type; write it verbatim.
+                let rendered = ctx
+                    .crawl_challenge
+                    .take()
+                    .unwrap_or_else(|| crate::context::PaymentResponse::json(error_json_body(&msg)));
+                let body = rendered.body;
+                let header_count = 2 + rendered.headers.len();
+                let mut header = pingora_http::ResponseHeader::build(status, Some(header_count))
+                    .map_err(|e| {
+                        Error::because(
+                            ErrorType::InternalError,
+                            "failed to build response header",
+                            e,
+                        )
+                    })?;
+                let _ = header.insert_header("content-type", &rendered.content_type);
+                for (name, value) in &rendered.headers {
+                    let _ = header.append_header(name.clone(), value);
+                }
+                let _ = header.insert_header("content-length", body.len().to_string());
                 session
                     .write_response_header(Box::new(header), false)
                     .await?;
