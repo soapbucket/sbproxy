@@ -10902,6 +10902,35 @@ mod external_guardrail_context_tests {
         }
     }
 
+    /// Whether `buffer` holds a complete HTTP/1.1 response: a terminated
+    /// header block plus at least `content-length` body bytes.
+    ///
+    /// Used to tell a reset that arrived after the whole response from one
+    /// that truncated it. A response with no `content-length` is treated as
+    /// complete once its headers terminate, which is what the close-delimited
+    /// bodies in these fixtures look like.
+    fn http_response_is_complete(buffer: &[u8]) -> bool {
+        let Some(header_end) = buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)
+        else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&buffer[..header_end]);
+        let declared = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        });
+        match declared {
+            Some(length) => buffer.len() - header_end >= length,
+            None => true,
+        }
+    }
+
     async fn live_downstream_body(mut client: DownstreamClient) -> Vec<u8> {
         let task = client.task.as_mut().expect("downstream client task");
         match tokio::time::timeout(Duration::from_secs(2), task).await {
@@ -10956,23 +10985,34 @@ mod external_guardrail_context_tests {
                 .await
                 .expect("write request headers");
             stream.write_all(&body).await.expect("write request body");
+            // Half-close after the request. An early policy refusal never
+            // reads the body, and a close with unread data in the socket
+            // buffer is what turns the server's FIN into an RST; the RST
+            // can arrive between the response headers and the response
+            // body, truncating the read below.
+            let _ = stream.shutdown().await;
             let mut response = Vec::new();
             let mut chunk = [0_u8; 4096];
             loop {
                 match stream.read(&mut chunk).await {
                     Ok(0) => break,
                     Ok(read) => response.extend_from_slice(&chunk[..read]),
-                    // An early policy refusal deliberately leaves the request
-                    // body unread. The raw socket fixture may observe the
-                    // resulting close as ECONNRESET after receiving the full
-                    // response; retain those response bytes as EOF.
+                    // A reset counts as EOF only once the response is whole.
+                    // Accepting it on any non-empty buffer is what made this
+                    // fixture flaky: a reset after the headers but before the
+                    // body returned a header-only response, and assertions on
+                    // the body then failed with an empty one.
                     Err(error)
                         if error.kind() == std::io::ErrorKind::ConnectionReset
-                            && !response.is_empty() =>
+                            && http_response_is_complete(&response) =>
                     {
                         break;
                     }
-                    Err(error) => panic!("read downstream response: {error:?}"),
+                    Err(error) => panic!(
+                        "read downstream response: {error:?} after {} bytes: {}",
+                        response.len(),
+                        String::from_utf8_lossy(&response)
+                    ),
                 }
             }
             response

@@ -1680,13 +1680,18 @@ pub const METRICS: &[MetricCapability] = &[
     MetricCapability {
         name: "sbproxy_hooks_channel_dropped_total",
         kind: MetricKind::Counter,
-        writer: Writer::Recorder("record_channel_drop"),
-        support: SupportLevel::Stable,
+        writer: Writer::Nothing,
+        // Downgraded from Stable with the writer: the registry's own rule
+        // is that nothing unwritten may claim stability, and a counter no
+        // code can increment is not a signal an operator should build on.
+        support: SupportLevel::ConfigOnly,
         compat: CompatTier::Beta,
         registry: Registry::Proxy,
         labels: &["reason"],
         description: "Bounded channel sends dropped on the hot path, labelled by drop reason.",
-        dead_reason: None,
+        dead_reason: Some(
+            "the only bounded hook channel this counted was the stream cache recorder, and              WOR-2099 deleted that hook: semantic caching is now compiled per action into              the semantic-cache registry and reached directly, so there is no channel left              to drop from. The recorder (record_channel_drop) is deliberately kept because              it is lane-generic and the family name is composed at runtime, so the next              bounded hook channel wires this by passing its own lane. Until then the              counter is honestly dead rather than a flat zero claiming to be live. Delete              both if no such channel appears",
+        ),
     },
     MetricCapability {
         name: "sbproxy_http_framing_blocks_total",
