@@ -513,7 +513,10 @@ mod tests {
                     score: 0.99,
                 }],
             };
-            Ok(Response::new(ClassifyResponse { labels, latency_us: 1 }))
+            Ok(Response::new(ClassifyResponse {
+                labels,
+                latency_us: 1,
+            }))
         }
         async fn embed(
             &self,
