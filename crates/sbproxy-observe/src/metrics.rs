@@ -1694,6 +1694,32 @@ pub fn record_a2a_hop(route: &str, spec: &str, decision: &str) {
         .inc();
 }
 
+/// Record one A2A 1.0 JSON-RPC method invocation.
+///
+/// Separate from `sbproxy_a2a_hops_total` rather than another label on
+/// it: method only exists for the ratified 1.0 spec, so folding it in
+/// would leave an empty dimension on every v0 hop and multiply the
+/// existing series by a value most of them cannot carry.
+///
+/// `method` must come from the closed method enum, never from the raw
+/// wire string. The enum has eleven variants; the wire field is
+/// caller-controlled and unbounded, and would blow up cardinality.
+pub fn record_a2a_method(route: &str, method: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_a2a_methods_total",
+            "A2A 1.0 JSON-RPC methods observed by the proxy, labelled by route and method.",
+            &["route", "method"],
+        )
+        .expect("a2a methods counter registers")
+    });
+    let route = sanitize_label("route", route);
+    counter.with_label_values(&[route.as_ref(), method]).inc();
+}
+
 /// Record an A2A chain depth observation. Surfaces
 /// the depth distribution per route + spec so dashboards can spot
 /// runaway recursion before the depth-cap policy denies.
@@ -2629,6 +2655,167 @@ pub fn record_policy_decision_latency(surface: &str, duration_secs: f64) {
         .expect("policy decision latency histogram registers")
     });
     hist.with_label_values(&[surface]).observe(duration_secs);
+}
+
+// --- WOR-2100: payment settlement observability ---
+//
+// Four label names, and every one of them is closed by construction rather
+// than by sanitization. `rail` is the settlement rail's stable spelling and
+// has four values. `operation` names the settlement or recovery step from a
+// fixed list. `outcome` is the durable transition the store committed, one
+// of `succeeded`, `terminal`, `retry_wait`, or `needs_reconciliation`.
+// `provider_class` names the kind of provider rather than the provider
+// itself: `facilitator`, `card_processor`, `lightning_node`, or `meter`.
+//
+// None of these recorders takes a payer identifier, a tenant, a quote id, a
+// challenge id, an intent id, a provider reference, a PaymentIntent id, an
+// invoice, a credential, a client secret, a macaroon, a rune, or provider
+// error text. Those values are not sanitized down to a bounded set here;
+// they are not parameters at all, which is the only form of that promise a
+// reader can check by looking at the signature.
+//
+// That is also why nothing below calls `sanitize_label`. A closed enum
+// cannot overflow a cardinality budget, and routing it through the limiter
+// would consume budget slots that an unbounded label actually needs.
+
+/// Increment `sbproxy_payment_settlement_total{rail, operation, outcome}`.
+///
+/// One observation per durable settlement transition. `outcome` is the
+/// state the store committed, never the adapter's return value, so a
+/// provider that answered "paid" while the durable record moved to
+/// `needs_reconciliation` is counted as `needs_reconciliation`. That is the
+/// point: the metric has to agree with the thing that decides access.
+pub fn record_payment_settlement(rail: &str, operation: &str, outcome: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_payment_settlement_total",
+            "Durable payment settlement transitions, by rail, operation, and committed outcome",
+            &["rail", "operation", "outcome"],
+        )
+        .expect("payment settlement counter registers")
+    });
+    counter.with_label_values(&[rail, operation, outcome]).inc();
+}
+
+/// Increment
+/// `sbproxy_payment_provider_calls_total{rail, operation, provider_class}`.
+///
+/// One observation per call that actually left the process. It exists so an
+/// operator can see that reconciliation is doing provider reads and not
+/// provider writes: `operation` is `query` for every reconciliation, and a
+/// `settle` on this family from a background sweep would be a bug with a
+/// visible signature.
+pub fn record_payment_provider_call(rail: &str, operation: &str, provider_class: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_payment_provider_calls_total",
+            "Payment provider calls that left the process, by rail, operation, and provider class",
+            &["rail", "operation", "provider_class"],
+        )
+        .expect("payment provider call counter registers")
+    });
+    counter
+        .with_label_values(&[rail, operation, provider_class])
+        .inc();
+}
+
+/// Add to `sbproxy_payment_recovery_total{operation, outcome}`.
+///
+/// The recovery worker reports its work as durable-row counts rather than
+/// as events, so this takes a delta. `count` may be zero: incrementing by
+/// zero creates the series, which makes an idle recovery queue draw a flat
+/// line instead of disappearing from the scrape.
+///
+/// There is no `rail` label here on purpose. A sweep claims rows across
+/// every rail in one batch and reports one total, so splitting it by rail
+/// would mean inventing an attribution the worker never computed.
+pub fn record_payment_recovery(operation: &str, outcome: &str, count: u64) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_payment_recovery_total",
+            "Durable rows the settlement recovery worker moved, by recovery operation and committed outcome",
+            &["operation", "outcome"],
+        )
+        .expect("payment recovery counter registers")
+    });
+    counter
+        .with_label_values(&[operation, outcome])
+        .inc_by(count);
+}
+
+/// Add to `sbproxy_payment_worker_ticks_total`.
+///
+/// A tick is one completed pass over every recovery queue. The worker
+/// counts its own ticks, so the observer hands over a delta rather than
+/// calling once per tick and hoping it never misses one.
+///
+/// A flat tick rate beside a growing `sbproxy_payment_recovery_total` is a
+/// backlog. A tick rate that stops entirely is a worker that died, which is
+/// otherwise invisible from outside because the request path keeps serving
+/// and only the recovery of stuck payments quietly stops.
+pub fn record_payment_worker_ticks(completed: u64) {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_payment_worker_ticks_total",
+            "Completed settlement recovery worker ticks"
+        )
+        .expect("payment worker tick counter registers")
+    });
+    counter.inc_by(completed);
+}
+
+/// Set `sbproxy_payment_worker_drain_clean` to 1 or 0.
+///
+/// Reports the truth about shutdown rather than the intent. `0` means the
+/// configured shutdown deadline elapsed and the loop was abandoned partway
+/// through a tick. Nothing is corrupted by that, because every transition
+/// the worker performs is its own committed transaction, but the operator
+/// should be able to tell the difference between a drain and a stop.
+pub fn record_payment_worker_drain(clean: bool) {
+    use prometheus::{register_int_gauge, IntGauge};
+    use std::sync::OnceLock;
+    static G: OnceLock<IntGauge> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge!(
+            "sbproxy_payment_worker_drain_clean",
+            "1 when the settlement worker drained inside its shutdown deadline, 0 when it was abandoned mid tick"
+        )
+        .expect("payment worker drain gauge registers")
+    });
+    gauge.set(i64::from(clean));
+}
+
+/// Set `sbproxy_payment_rail_enabled{rail}` to 1 or 0.
+///
+/// Stamped once per rail at runtime assembly, after the compiled feature
+/// check and after the adapter registered. It answers the question an
+/// operator asks first when a payer reports a rail they cannot use: is this
+/// build even carrying that adapter, and did this configuration turn it on.
+pub fn record_payment_rail_enabled(rail: &str, enabled: bool) {
+    use prometheus::{register_int_gauge_vec, IntGaugeVec};
+    use std::sync::OnceLock;
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "sbproxy_payment_rail_enabled",
+            "1 for each settlement rail this build compiled and this configuration registered, 0 otherwise",
+            &["rail"],
+        )
+        .expect("payment rail gauge registers")
+    });
+    gauge.with_label_values(&[rail]).set(i64::from(enabled));
 }
 
 // --- WOR-75: four exemplar-emitting histograms ---

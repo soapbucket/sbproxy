@@ -57,7 +57,7 @@ proxy:
         allowed_models: [gpt-5, claude-sonnet-4]
         blocked_models: []
         require_pii_redaction: [email]
-    failure_mode_allow: false        # fail closed when the store is down
+    failure_posture: closed          # closed | degraded | open
     allow_api_override: false        # config records win on reload
     oidc_claim_map:
       claim_field: virtual_key       # JWT/OIDC claim that names the record
@@ -463,9 +463,63 @@ Generate each value as 32 bytes of cryptographic randomness, hex-encoded
 guidance, including the PowerShell equivalent for Windows machines without
 `openssl`.
 
-By default the plane fails closed. If the store cannot be reached, a request
-carrying a virtual key is denied. Set `failure_mode_allow: true` only if you have
-weighed an outage of the store against an outage of your gateway.
+### What happens when the store is down
+
+`failure_posture` decides it. The default is `closed`: if the store cannot be
+reached, a request carrying a virtual key is denied with `503`.
+
+```yaml
+proxy:
+  key_management:
+    enabled: true
+    failure_posture: closed        # closed | degraded | open
+```
+
+| Posture | The request | What is left behind |
+|---|---|---|
+| `closed` (default) | Denied with `503` | The denial itself, at `WARN` |
+| `degraded` | Falls through to the origin's own configured auth | `WARN` with `failure_posture=degraded` and `guarantee_waived=true` |
+| `open` | Falls through to the origin's own configured auth | `WARN` with `failure_posture=open` and `guarantee_waived=false` |
+
+Both admitting postures do the same thing to the request. Neither is a blanket
+admit: the request falls through to whatever auth the origin already has, so an
+origin with a `credentials:` block still authenticates it. What they change is
+the record. A key-store outage means the request runs with no per-key policy,
+no budget, and no attribution, and `degraded` is the posture that says so out
+loud, in a field you can alert on. `open` admits the same request and claims
+nothing about what was lost.
+
+Pick `degraded` over `open` unless you have a specific reason to suppress the
+signal. Pick either only if you have weighed an outage of the store against an
+outage of your gateway.
+
+`observe` is rejected at config-compile time here. It means "record the verdict
+the control would have reached", and a store that could not be read reached no
+verdict. Setting it fails startup with a message naming the key rather than
+quietly picking one of the other three for you.
+
+Try it against a store that is not there:
+
+```bash
+$ sbproxy run --config sb.yml            # store path points at a dead volume
+$ curl -si -H "Authorization: Bearer sk-abc123-secret" http://localhost:8080/v1/models \
+    | head -1
+HTTP/1.1 503 Service Unavailable         # failure_posture: closed
+```
+
+Flip the posture to `degraded`, restart, and the same call falls through to the
+origin's configured auth instead, leaving this in the log:
+
+```
+WARN key store unavailable; falling through to configured auth with no per-key
+     policy, budget, or attribution failure_posture="degraded" guarantee_waived=true
+```
+
+The older boolean `failure_mode_allow` still parses and still means what it
+always meant. It is used only when `failure_posture` is absent: `false` resolves
+to `closed`, and `true` resolves to `degraded`. Nothing in the runtime reads the
+boolean directly any more, so an existing config keeps its exact behavior and a
+new one gets a knob that can say which kind of "allow" it means.
 
 ## Key identity and policy revisions
 
@@ -798,7 +852,7 @@ proxy:
       #   url: rediss://governance.internal:6379/2
       lease_ttl_secs: 120
       terminal_retention_secs: 300
-      failure_mode: closed        # closed | allow_unreserved
+      failure_posture: closed     # closed | degraded | open
       missing_rate: zero_cost     # zero_cost | require_rate
 ```
 
@@ -825,14 +879,35 @@ proxy:
   `key_management.store` and `cache.tier: redis`; configure a strict
   governance URL separately even if you already point those at Redis.
 
-`failure_mode` (default `closed`) decides what happens when a governance
-backend outage stops a reserve call from completing. `closed` denies the
-request with `503` rather than let a governed limit go silently unenforced.
-`allow_unreserved` is the audited escape hatch: it admits the request without
-a reservation instead, and every time it fires the decision is logged,
-recorded on the `security_audit` channel, and counted on
-`sbproxy_governance_fail_open_total{key_id}`, so leaving it off the default
-posture is a deliberate choice you can see in the numbers, not a silent one.
+`failure_posture` (default `closed`) decides what happens when a governance
+backend outage stops a reserve call from completing. It takes the same three
+values the key store's posture takes, and they mean the same things here:
+
+| Posture | The request | What is left behind |
+|---|---|---|
+| `closed` (default) | Denied with `503` | The denial, at `WARN` |
+| `degraded` | Admitted with no reservation | `WARN`, a `security_audit` event, and `sbproxy_governance_fail_open_total{key_id}` |
+| `open` | Admitted with no reservation | `WARN` only |
+
+`degraded` is the audited escape hatch: it admits the request without a
+reservation, and every time it fires the decision is logged, recorded on the
+`security_audit` channel, and counted, so running off the default posture is a
+choice you can see in the numbers rather than a silent one. `open` admits the
+same request and records neither the audit event nor the counter. That is the
+only difference between them, and it is the reason to prefer `degraded`.
+
+`observe` is rejected at config-compile time here too: a reserve call that never
+reached its backend produced no verdict to record.
+
+The older `failure_mode: closed | allow_unreserved` still parses and is used
+only when `failure_posture` is absent. `closed` resolves to `closed` and
+`allow_unreserved` resolves to `degraded`, which is what `allow_unreserved`
+always did: the audit event and the fail-open counter have fired on that path
+since it shipped. An existing config keeps its exact behavior.
+
+A settle call that cannot reach the backend after a reservation already
+succeeded is unaffected by either key. It stays best-effort, and the
+reservation's own drop-time repair reconciles it later.
 
 `missing_rate` (default `zero_cost`) governs a key that carries a
 `total_micro_usd` limit when the resolved model has no configured rate.
@@ -907,8 +982,9 @@ token whose mapped claim names a revoked, blocked, or expired record is denied
 with 403 on the next request, and a claim naming a record that does not exist
 is denied with 401. A token that carries no mapped claim at all is simply
 unmapped; it authenticates on its own terms with no per-key policy. When the
-store is unreachable this path fails closed unless `failure_mode_allow` is set,
-matching the bearer path.
+store is unreachable this path reads the same `failure_posture` every other
+inbound-key path reads, so it fails closed by default and falls through under
+`degraded` or `open`, matching the bearer path.
 
 ## Migrating from static credentials
 

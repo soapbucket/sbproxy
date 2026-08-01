@@ -132,7 +132,13 @@ impl TestClock {
 }
 
 fn rag_config(on_failure: serde_json::Value) -> RagRouteConfig {
-    serde_json::from_value(json!({
+    rag_config_with(json!({ "on_failure": on_failure }))
+}
+
+/// The same fixture route with `extra` merged over it, so a test can
+/// spell the failure axis either way.
+fn rag_config_with(extra: serde_json::Value) -> RagRouteConfig {
+    let mut document = json!({
         "embedding": {
             "provider": "compatible",
             "base_url": "http://127.0.0.1:8090/v1",
@@ -146,10 +152,11 @@ fn rag_config(on_failure: serde_json::Value) -> RagRouteConfig {
             "collection": "support_docs",
             "allow_private_url": true
         },
-        "filters": {"static_equals": {"lang": "en"}},
-        "on_failure": on_failure
-    }))
-    .unwrap()
+        "filters": {"static_equals": {"lang": "en"}}
+    });
+    let fields = document.as_object_mut().expect("fixture is an object");
+    fields.extend(extra.as_object().expect("overlay is an object").clone());
+    serde_json::from_value(document).unwrap()
 }
 
 fn use_stale(max_age_secs: u64, max_entries: usize) -> serde_json::Value {
@@ -203,6 +210,20 @@ fn fixture_with(
     produced: usize,
     chunks: Vec<RetrievedChunk>,
 ) -> Fixture {
+    fixture_from_config(rag_config(on_failure), declared, produced, chunks)
+}
+
+fn posture_fixture(posture: &str) -> Fixture {
+    let config = rag_config_with(json!({ "failure_posture": posture }));
+    fixture_from_config(config, Some(3), 3, default_chunks())
+}
+
+fn fixture_from_config(
+    config: RagRouteConfig,
+    declared: Option<usize>,
+    produced: usize,
+    chunks: Vec<RetrievedChunk>,
+) -> Fixture {
     let events: Events = Arc::new(Mutex::new(Vec::new()));
     let clock = TestClock::new();
     let embedder = Arc::new(MockEmbedder {
@@ -212,7 +233,7 @@ fn fixture_with(
     });
     let vector = Arc::new(MockVectorStore::new(Arc::clone(&events), chunks));
     let runtime = RagRuntime::from_parts(
-        &rag_config(on_failure),
+        &config,
         embedder,
         Arc::clone(&vector) as Arc<dyn VectorStore>,
         clock.clock(),
@@ -482,4 +503,95 @@ async fn stale_miss_returns_the_original_provider_error() {
     let body = chat_body("refund policy");
     let error = runtime.retrieve(request(&body)).await.unwrap_err();
     assert_eq!(error, vector_failure());
+}
+
+#[tokio::test]
+async fn failure_posture_reaches_the_same_runtime_decision_as_on_failure() {
+    let body = chat_body("refund policy");
+
+    // `closed` refuses, exactly as `on_failure: {mode: fail_closed}`
+    // does. Both spellings run the same arm of the runtime.
+    let closed = posture_fixture("closed");
+    closed.vector.fail();
+    assert_eq!(
+        closed.runtime.retrieve(request(&body)).await.unwrap_err(),
+        vector_failure()
+    );
+
+    // `degraded` forwards the original request, exactly as
+    // `on_failure: {mode: continue_without_context}` does.
+    let degraded = posture_fixture("degraded");
+    degraded.vector.fail();
+    let result = degraded.runtime.retrieve(request(&body)).await.unwrap();
+    assert_eq!(result.outcome, RetrievalOutcome::Continued);
+    assert!(result.rendered_context.is_none());
+    assert!(result.chunks.is_empty());
+}
+
+#[tokio::test]
+async fn a_posture_spelled_route_never_gets_a_stale_cache() {
+    // The carve-out, checked at runtime rather than only in config:
+    // `use_stale` is the only way to a stale cache, so a route that
+    // declares `degraded` continues without context on every failure
+    // instead of quietly replaying an earlier answer.
+    let Fixture {
+        runtime, vector, ..
+    } = posture_fixture("degraded");
+    let body = chat_body("refund policy");
+    let primed = runtime.retrieve(request(&body)).await.unwrap();
+    assert_eq!(primed.outcome, RetrievalOutcome::Retrieved);
+
+    vector.fail();
+    let after = runtime.retrieve(request(&body)).await.unwrap();
+    assert_eq!(after.outcome, RetrievalOutcome::Continued);
+    assert!(after.rendered_context.is_none());
+}
+
+#[tokio::test]
+async fn use_stale_still_serves_stale_context_through_the_resolved_policy() {
+    // The legacy spelling keeps every behavior it had, including the
+    // cache the shared posture vocabulary cannot describe.
+    let Fixture {
+        runtime,
+        vector,
+        clock,
+        ..
+    } = fixture(use_stale(300, 8));
+    let body = chat_body("refund policy");
+    let first = runtime.retrieve(request(&body)).await.unwrap();
+
+    clock.advance(Duration::from_secs(10));
+    vector.fail();
+    let stale = runtime.retrieve(request(&body)).await.unwrap();
+    assert_eq!(stale.outcome, RetrievalOutcome::Stale);
+    assert_eq!(stale.rendered_context, first.rendered_context);
+}
+
+#[test]
+fn contradictory_and_meaningless_failure_axes_are_rejected_at_config_load() {
+    let conflict = rag_config_with(json!({
+        "failure_posture": "closed",
+        "on_failure": {"mode": "use_stale"}
+    }));
+    let error = conflict
+        .validate()
+        .expect_err("a route that disagrees with itself must not load")
+        .to_string();
+    assert!(error.contains("failure_posture"), "{error}");
+    assert!(error.contains("on_failure"), "{error}");
+
+    for posture in ["open", "observe"] {
+        let error = rag_config_with(json!({ "failure_posture": posture }))
+            .validate()
+            .expect_err("a posture a rag route cannot mean must not load")
+            .to_string();
+        assert!(error.contains("failure_posture"), "{error}");
+    }
+
+    // Everything a route could already say still loads unchanged.
+    for mode in ["fail_closed", "continue_without_context", "use_stale"] {
+        rag_config(json!({ "mode": mode }))
+            .validate()
+            .unwrap_or_else(|error| panic!("{mode} must still load: {error}"));
+    }
 }

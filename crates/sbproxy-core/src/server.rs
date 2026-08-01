@@ -3326,6 +3326,20 @@ fn emit_policy_verdict(
 /// this helper materialises one from the Pingora session so the
 /// existing built-in arms can keep their `Session` view while
 /// plugin enforcers see the standard `http` types.
+///
+/// # The body is always empty
+///
+/// The snapshot carries the request line and headers only. Its body is
+/// unconditionally `bytes::Bytes::new()`, because the request filter
+/// runs before any body byte has been read.
+///
+/// This is load bearing for anyone writing an enforcer. A check gated
+/// on `req.body()` does not run, ever, and it fails silently: the
+/// enforcer returns `Allow`, its metrics stay flat, and unit tests that
+/// call the underlying check directly keep passing. The A2A 1.0
+/// push-notification SSRF check shipped that way and never fired once
+/// in production. If a policy needs the body, it belongs at the body
+/// phase; see `crate::server::a2a_body_phase` for the pattern.
 fn build_plugin_request_snapshot(session: &Session) -> Option<http::Request<bytes::Bytes>> {
     let req = session.req_header();
     let method = req.method.as_str();
@@ -3904,6 +3918,12 @@ use action_dispatch::*;
 // Dispatch-side glue for the MCP tool rollout plane (versioned
 // catalogue views, per-consumer routing, adapters, sunset).
 pub(crate) mod mcp_rollout;
+
+// WOR-2118: agent-to-agent checks that need the request body. They
+// live at the body phase because `build_plugin_request_snapshot` above
+// always hands enforcers an empty body, so the request-filter surface
+// cannot run them.
+pub(crate) mod a2a_body_phase;
 
 // The ProxyHttp trait impl lives in the `proxy_http` submodule
 //. A trait impl needs no re-import to take effect.

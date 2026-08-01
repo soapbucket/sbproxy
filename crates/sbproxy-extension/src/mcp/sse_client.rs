@@ -14,6 +14,14 @@
 //! 2. **Handshake**: GET `sse_url` to receive an `endpoint` event,
 //!    then POST the request to that endpoint and wait for the response
 //!    event on the SSE stream.
+//!
+//! # Trace context
+//!
+//! As with the Streamable HTTP transport, no `traceparent` header is
+//! injected here. SEP-414 trace context arrives inside the request's
+//! `params._meta`, put there by the federation when it built the
+//! request, so it reaches the upstream over this transport and over
+//! stdio in exactly the same form.
 
 use super::streamable::{read_body_capped, read_sse_response_capped};
 use super::types::{JsonRpcRequest, JsonRpcResponse};

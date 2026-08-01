@@ -63,6 +63,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_a2a_chain_depth` | Histogram | `stable` | `beta` | `route`, `spec` | Distribution of A2A chain depth observed at the proxy. |
 | `sbproxy_a2a_denied_total` | Counter | `stable` | `beta` | `route`, `reason` | A2A hops denied by the a2a policy, labelled by route and reason. |
 | `sbproxy_a2a_hops_total` | Counter | `stable` | `beta` | `route`, `spec`, `decision` | A2A hops observed by the proxy, labelled by route, spec, and policy decision. |
+| `sbproxy_a2a_methods_total` | Counter | `stable` | `beta` | `route`, `method` | A2A 1.0 JSON-RPC methods observed by the proxy, labelled by route and method. |
 | `sbproxy_acme_renewal_duration_seconds` | Histogram | `stable` | `beta` | `result` | ACME renewal full-flow duration, by outcome. |
 | `sbproxy_acme_renewals_total` | Counter | `stable` | `beta` | `result` | ACME certificate renewal attempts, by outcome. |
 | `sbproxy_active_connections` | Gauge | `stable` | `stable` | none | Current active connections. |
@@ -197,6 +198,12 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_mcp_tool_dispatch_total` | Counter | `stable` | `beta` | `tool`, `result` | MCP tool dispatch attempts, by tool name and outcome. |
 | `sbproxy_mcp_tool_version_calls_total` | Counter | `stable` | `beta` | `tool`, `version`, `via`, `deprecated` | Rollout-plane tool calls, by tool, served version, resolution rung, and deprecation. |
 | `sbproxy_mcp_upstream_io_failures_total` | Counter | `stable` | `beta` | `kind` | MCP upstream IO failures absorbed by deadlines and byte caps, by kind. |
+| `sbproxy_meter_append_duration_seconds` | Histogram | `stable` | `beta` | none | Time to append one entry to the meter's signed chain, including lock wait. |
+| `sbproxy_meter_chain_gap_total` | Counter | `stable` | `beta` | `tenant_id`, `failure_mode` | Records the meter owed and could not write, by tenant and the posture in force. |
+| `sbproxy_meter_chain_seq` | Gauge | `stable` | `beta` | none | Head sequence number of the meter's signed chain. |
+| `sbproxy_meter_divergence_total` | Counter | `stable` | `beta` | `tenant_id` | Windows in which counted units and chained units disagreed, by tenant. |
+| `sbproxy_meter_receipts_total` | Counter | `stable` | `beta` | `tenant_id`, `outcome`, `billable` | Metered attempts, by tenant, outcome, and the operator's billing answer for it. |
+| `sbproxy_meter_units_total` | Counter | `stable` | `beta` | `tenant_id`, `unit`, `source` | Units the meter counted, by tenant, operator-chosen unit name, and provenance. |
 | `sbproxy_metrics_render_failures_total` | Counter | `stable` | `beta` | `reason` | Failures to encode the Prometheus scrape body. |
 | `sbproxy_mirror_state_drift_total` | Counter | `stable` | `beta` | none | Times the mirror_pending slot was unexpectedly empty when the pipeline tried to fire a shadow request. |
 | `sbproxy_model_host_active_requests` | Gauge | `stable` | `beta` | `deployment` | Requests holding an active managed-model permit. |
@@ -236,6 +243,12 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_origin_request_duration_seconds` | Histogram | `stable` | `beta` | `origin`, `method`, `status` | Request latency per origin. |
 | `sbproxy_origin_requests_total` | Counter | `stable` | `beta` | `origin`, `method`, `status` | Total HTTP requests per origin. |
 | `sbproxy_outbound_request_duration_seconds` | Histogram | `stable` | `beta` | `host`, `method`, `status` | Wall-clock latency of one outbound upstream request. |
+| `sbproxy_payment_provider_calls_total` | Counter | `stable` | `beta` | `rail`, `operation`, `provider_class` | Payment provider calls that left the process, by rail, operation, and provider class. |
+| `sbproxy_payment_rail_enabled` | Gauge | `stable` | `beta` | `rail` | 1 for each settlement rail this build compiled and this configuration registered, 0 otherwise. |
+| `sbproxy_payment_recovery_total` | Counter | `stable` | `beta` | `operation`, `outcome` | Durable rows the settlement recovery worker moved, by recovery operation and committed outcome. |
+| `sbproxy_payment_settlement_total` | Counter | `stable` | `beta` | `rail`, `operation`, `outcome` | Durable payment settlement transitions, by rail, operation, and committed outcome. |
+| `sbproxy_payment_worker_drain_clean` | Gauge | `stable` | `beta` | none | 1 when the settlement worker drained inside its shutdown deadline, 0 when it was abandoned mid tick. |
+| `sbproxy_payment_worker_ticks_total` | Counter | `stable` | `beta` | none | Completed settlement recovery worker ticks. |
 | `sbproxy_phase_duration_seconds` | Histogram | `stable` | `stable` | `phase`, `origin` | Intra-request phase duration, partitioned by phase + origin. |
 | `sbproxy_plugin_init_duration_seconds` | Histogram | `stable` | `beta` | `kind`, `plugin`, `result` | Plugin factory init duration, by kind, plugin name, and outcome. |
 | `sbproxy_plugin_init_total` | Counter | `stable` | `beta` | `kind`, `plugin`, `result` | Plugin factory init attempts, by kind, plugin name, and outcome. |

@@ -68,32 +68,26 @@ pub struct RealtimeQuotaFailure {
 }
 
 impl RealtimeQuotaFailure {
-    /// Map a pool failure to its client response, or admit the one explicit
-    /// backend-unavailable fail-open mode.
+    /// Map a pool failure to its client response, or `None` when the pool's
+    /// failure posture admits the attempt without a reservation.
+    ///
+    /// This used to be a third, independently written copy of the same
+    /// status mapping the AI dispatch path carries, and the copies had
+    /// already drifted. It now delegates to
+    /// [`sbproxy_ai::quota_pool::pool_error_disposition`], which reads the
+    /// posture through `QuotaPoolConfig::failure_posture` (WOR-2121). The
+    /// realtime path keeps its own type only because Pingora needs the
+    /// exact response stashed on the context before the upstream pipeline
+    /// takes over.
     pub fn from_pool_error(
         config: Option<&sbproxy_ai::QuotaPoolConfig>,
         error: &sbproxy_ai::PoolError,
     ) -> Option<Self> {
-        match error {
-            sbproxy_ai::PoolError::Denied(_) => Some(Self {
-                status: 429,
-                message: "fair-share quota pool exhausted",
-            }),
-            sbproxy_ai::PoolError::BackendUnavailable
-                if config.is_some_and(|config| {
-                    config.failure_mode == sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved
-                }) =>
-            {
-                None
+        match sbproxy_ai::quota_pool::pool_error_disposition(config, error) {
+            sbproxy_ai::quota_pool::PoolErrorDisposition::Admit => None,
+            sbproxy_ai::quota_pool::PoolErrorDisposition::Reject { status, message } => {
+                Some(Self { status, message })
             }
-            sbproxy_ai::PoolError::BackendUnavailable => Some(Self {
-                status: 503,
-                message: "fair-share quota backend unavailable",
-            }),
-            sbproxy_ai::PoolError::InvalidState => Some(Self {
-                status: 503,
-                message: "fair-share quota state unavailable",
-            }),
         }
     }
 }
@@ -236,6 +230,70 @@ pub(crate) struct LoadBalancerAttemptToken {
     /// Status received from the selected upstream before any proxy response
     /// fallback or modifier can rewrite the downstream status.
     pub(crate) observed_upstream_status: Option<u16>,
+}
+
+/// A payment-shaped response the policy rendered locally.
+///
+/// Replaces the `(header_name, value, body)` tuple this slot used to hold.
+/// That tuple could carry exactly one header, which forced two workarounds:
+/// a `Content-Type` sentinel in the name position to mean "stamp this as the
+/// content type instead", and no way at all to emit the repeated
+/// `WWW-Authenticate` field Payment HTTP Authentication requires, which is
+/// one field per offered challenge rather than one field listing several.
+///
+/// Every field is already final. The request phase writes what is here and
+/// composes nothing, so the policy that decided the outcome is the only thing
+/// that decides how it looks on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentResponse {
+    /// The exact `Content-Type` to stamp.
+    pub content_type: String,
+    /// Additional headers, in order.
+    ///
+    /// A name may repeat. `WWW-Authenticate` does, and the writer appends
+    /// rather than replaces, so two offered challenges produce two fields.
+    pub headers: Vec<(String, String)>,
+    /// The exact body bytes.
+    pub body: String,
+}
+
+impl PaymentResponse {
+    /// A JSON response carrying no extra headers.
+    #[must_use]
+    pub fn json(body: String) -> Self {
+        Self {
+            content_type: "application/json".to_string(),
+            headers: Vec::new(),
+            body,
+        }
+    }
+
+    /// A JSON response carrying one challenge header.
+    #[must_use]
+    pub fn json_with_header(name: &str, value: String, body: String) -> Self {
+        Self {
+            content_type: "application/json".to_string(),
+            headers: vec![(name.to_string(), value)],
+            body,
+        }
+    }
+
+    /// A response whose content type the policy chose.
+    #[must_use]
+    pub fn typed(content_type: String, body: String) -> Self {
+        Self {
+            content_type,
+            headers: Vec::new(),
+            body,
+        }
+    }
+
+    /// Adds one header, keeping any already present under that name.
+    #[must_use]
+    pub fn with_header(mut self, name: &str, value: String) -> Self {
+        self.headers.push((name.to_string(), value));
+        self
+    }
 }
 
 /// Per-request state threaded through all Pingora phases as CTX.
@@ -650,11 +708,12 @@ pub struct RequestContext {
     pub transform_error_attribution: Option<String>,
 
     // --- AI Crawl Control challenge ---
-    /// Set by an `ai_crawl_control` policy when a request must be
-    /// charged. Tuple is `(header_name, challenge_value, json_body)`.
-    /// The 402 response handler reads this to stamp the configured
-    /// header and write the JSON body.
-    pub crawl_challenge: Option<(String, String, String)>,
+    /// The locally rendered response an `ai_crawl_control` policy
+    /// produced, when a request was charged, refused, or blocked.
+    ///
+    /// The request phase writes this verbatim rather than reassembling
+    /// it, so every payment-shaped response has exactly one author.
+    pub crawl_challenge: Option<PaymentResponse>,
     /// Set by an `ai_crawl_control` policy in Cloudflare Pay Per Crawl
     /// interop mode when a request settled through the ledger. Carries
     /// the `crawler-charged` header value (`<currency> <amount>`, e.g.
@@ -1221,6 +1280,38 @@ pub struct RequestContext {
     /// verbatim instead of falling through to the generic
     /// `send_error` template.
     pub a2a_denial_body: Option<String>,
+    /// WOR-2139: the A2A `contextId` this hop carried, already capped to
+    /// the span-attribute identifier limit.
+    ///
+    /// This is the run correlation key. A2A task ids nest under a
+    /// context id, so it is the identifier that lets a fan-out of agent
+    /// hops reconstruct as one tree rather than a pile of unrelated
+    /// traces. It is read from `params.contextId` in the A2A 1.0
+    /// JSON-RPC body, which means `request_body_filter` is the first
+    /// phase that can see it, and that phase runs *after*
+    /// `upstream_request_filter` has already assembled the upstream
+    /// request. A run id therefore cannot be stamped onto an outbound
+    /// header on this hop; run correlation rides the W3C trace context
+    /// the upstream request filter already injects. The same phase
+    /// boundary is why the A2A injection vocabulary has no `tag` action
+    /// and why the push-notification check had to move to the body
+    /// phase.
+    ///
+    /// Deliberately not a field on `A2AContext`. That struct is built in
+    /// the request filter from headers, one phase earlier, and it
+    /// derives `Serialize` / `Deserialize` with no `serde(default)`, so
+    /// widening it would break deserialization of any already-serialized
+    /// envelope. Keeping the two apart also preserves a trust asymmetry
+    /// worth naming: `A2AContext::task_id` comes from the
+    /// `x-a2a-task-id` header and is honoured only behind the
+    /// trusted-peer gate, while this value comes from the request body
+    /// and is honoured from any caller. Read
+    /// `A2AContext::identity_verified` before treating either as an
+    /// authoritative name for a run.
+    ///
+    /// `None` for non-A2A traffic, for the two `v0` drafts, and for A2A
+    /// 1.0 hops on origins that never buffer the request body.
+    pub a2a_context_id: Option<String>,
 
     // --- WOR-114: per-request feature flags ---
     /// Parsed `x-sb-flags` header + `?_sb.<key>` query params.
@@ -1572,6 +1663,7 @@ impl RequestContext {
             headless_signal: None,
             a2a: None,
             a2a_denial_body: None,
+            a2a_context_id: None,
             flags: crate::sb_flags::RequestFlags::default(),
             policy_response_headers: Vec::new(),
             deny_policy_type: None,
@@ -1875,6 +1967,7 @@ mod tests {
             dimension: sbproxy_ai::QuotaPoolDimension::Request,
             consistency: sbproxy_ai::QuotaPoolConsistency::Local,
             failure_mode,
+            failure_posture: None,
         }
     }
 
@@ -1913,6 +2006,46 @@ mod tests {
             allow_unreserved.is_none(),
             "allow_unreserved must bypass only backend unavailability"
         );
+    }
+
+    /// An explicit `failure_posture` wins over the legacy `failure_mode`
+    /// on the realtime path too, and the realtime path agrees with the AI
+    /// dispatch path because both now call one helper.
+    #[test]
+    fn realtime_quota_honours_an_explicit_failure_posture() {
+        use sbproxy_config::types::FailureMode;
+
+        // Legacy says reject, explicit posture says admit.
+        let mut config = quota_pool_config(sbproxy_ai::QuotaPoolFailureMode::Closed);
+        config.failure_posture = Some(FailureMode::Degraded);
+        assert!(
+            RealtimeQuotaFailure::from_pool_error(
+                Some(&config),
+                &sbproxy_ai::PoolError::BackendUnavailable
+            )
+            .is_none(),
+            "the explicit posture wins over the legacy field"
+        );
+
+        // Legacy says admit, explicit posture says reject.
+        let mut config = quota_pool_config(sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved);
+        config.failure_posture = Some(FailureMode::Closed);
+        let failure = RealtimeQuotaFailure::from_pool_error(
+            Some(&config),
+            &sbproxy_ai::PoolError::BackendUnavailable,
+        )
+        .expect("an explicit closed posture must reject");
+        assert_eq!(failure.status, 503);
+
+        // A plain `open` admits exactly like `degraded` here. They differ
+        // only in the fail-open counter, which the admission path owns.
+        let mut config = quota_pool_config(sbproxy_ai::QuotaPoolFailureMode::Closed);
+        config.failure_posture = Some(FailureMode::Open);
+        assert!(RealtimeQuotaFailure::from_pool_error(
+            Some(&config),
+            &sbproxy_ai::PoolError::BackendUnavailable
+        )
+        .is_none());
     }
 
     #[test]

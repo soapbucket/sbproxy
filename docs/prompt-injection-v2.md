@@ -1,5 +1,5 @@
 # prompt_injection_v2
-*Last modified: 2026-07-27*
+*Last modified: 2026-07-31*
 
 Successor to the v1 `prompt_injection` heuristic guardrail. The v2
 policy splits *detection* from *enforcement*: a swappable detector
@@ -426,6 +426,117 @@ Real-world patterns the scaffold catches today:
   like `X-Prompt`, `X-User-Message`, or `X-Subject`.
 - Any path that includes user-supplied free text (e.g. RPC-style URLs
   that encode the prompt in the path segment).
+
+## The agent boundary
+
+Everything above assumes a person is on one end. The east-west case, one
+agent calling another, differs in three ways that change how the policy
+is configured.
+
+Compose the policy with `a2a` on the same origin:
+
+```yaml
+policies:
+  - type: a2a
+    route_glob: "/agents/**"
+
+  - type: prompt_injection_v2
+    detector: heuristic-v1
+    threshold: 0.5
+    action: tag
+    enable_body_aware: true
+    a2a:
+      root_action: log
+      block_above_delegation_depth: 0
+```
+
+A worked example with runnable requests is
+[examples/a2a-prompt-injection](https://github.com/soapbucket/sbproxy/tree/main/examples/a2a-prompt-injection).
+
+### Segmentation, and why `enable_body_aware` matters more here
+
+An A2A 1.0 `SendMessage` body is a JSON-RPC envelope. The message lives
+under `params.message.parts`; around it sit `jsonrpc`, `method`, `id`,
+`params.taskId`, `params.contextId`, and any file or data parts.
+
+With `enable_body_aware: false`, the default, the whole document is
+classified as one string. That is one forward pass per hop, which is the
+cheap option and the reason it is the default: this scan is inline on an
+east-west hop, and a fan-out step multiplies request count. It also
+gives up the two properties the detector is built around. Worst-of-N
+scoring across turns collapses to worst-of-1, and the per-message length
+cap fills up on the head of the envelope, so an injection late in a long
+thread never reaches the classifier at all.
+
+With `enable_body_aware: true` each text part is scored on its own,
+worst-of-N across parts, with per-part results cached by content hash so
+a replayed thread costs almost nothing after the first pass. Non-text
+parts (`FilePart`, `DataPart`) are skipped rather than fed in: a base64
+blob carries no language to score, and classifying it would spend a
+model pass on entropy and fill the cache with a key that never repeats.
+Governing file and data parts is content scanning, which this policy
+does not do.
+
+Turn it on once you have measured the classifier against your own
+traffic. Leaving it off is the documented escape hatch for a
+high-volume route, and it does not disable the agent-boundary scan; it
+only makes it coarser.
+
+### Delegation depth decides the action
+
+`block_above_delegation_depth` rejects a hit outright once the hop was
+delegated, regardless of the baseline action. The reasoning is that
+supervision thins with distance: at the chain root a person may still be
+watching, and three hops into a fan-out nobody is reading the message
+that carried the injection.
+
+Delegation depth is 0 at the chain root and 1 on the first delegated
+call. It is `chain_depth` minus one. The two numbers disagree by one
+everywhere and are easy to conflate, so it is worth checking which one a
+config value is expressed in.
+
+Set the key to `null` to switch the escalation off:
+
+```yaml
+    a2a:
+      block_above_delegation_depth: null
+```
+
+The depth rule is only as good as the depth. If the envelope arrives on
+`X-A2A-*` headers from an untrusted peer, the caller picks its own
+number and lands on the chain-root action every time. See
+[a2a-gateway.md](a2a-gateway.md) for the two ways to get an envelope
+worth enforcing against.
+
+### There is no `tag` at this boundary
+
+The agent-boundary vocabulary is `log` or `block`. `tag` is absent, not
+unimplemented.
+
+Tagging means writing the score and label onto the upstream request. The
+agent-boundary scan runs at the request-body phase, and by then the
+upstream request header has been assembled and its trust-header slot
+drained, so a hit found in the body has nowhere to write. Offering `tag`
+would be offering a setting that reads as enforcing and only logs.
+
+A top-level `action: tag` therefore resolves to `log` here, and
+`action: block` resolves to `block`. Set `a2a.root_action` explicitly
+when you want the two boundaries to differ.
+
+### Failure posture
+
+The body-aware evaluator is fail-open: any detector error logs and
+returns clean. Pointing it at the agent boundary imports that posture,
+so a classifier that is down or wedged means agent-to-agent messages
+pass unscanned rather than being refused. That is not configurable
+today. The push-notification check described in
+[a2a-gateway.md](a2a-gateway.md) is not affected; it is a deterministic
+URL validation with no external dependency.
+
+### Request direction only
+
+This scans requests. Artifacts and `TaskArtifactUpdateEvent` streams
+coming back from the callee are not parsed and not scanned.
 
 ## Heuristic limitations
 

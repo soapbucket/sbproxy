@@ -3935,6 +3935,46 @@ impl ProxyHttp for SbProxy {
                 let mut graphql_content_digest_body = None;
                 let mut graphql_content_digest_body_taken = false;
                 let content_digest_uses_graphql_original = ctx.graphql_validation_pending;
+                // WOR-2118: parse the agent-to-agent envelope once,
+                // before the policy loop, so the `a2a` arm and the
+                // prompt-injection arm read one structure rather than
+                // each re-parsing the body. `ctx.a2a` is the envelope
+                // the A2A enforcer resolved, which is not the same as
+                // the one header detection stamped: it also carries the
+                // operator's `route_glob` match and the verified `act`
+                // chain overlay.
+                //
+                // The identifiers are cloned rather than borrowed
+                // because the loop below mutates `ctx`, and they are
+                // cloned only when the body actually parsed as A2A so a
+                // plain validated POST pays nothing for this.
+                let a2a_ctx = ctx.a2a.clone();
+                let a2a_v1 = a2a_ctx
+                    .as_ref()
+                    .filter(|c| c.spec == sbproxy_modules::A2ASpec::V1_0)
+                    .and_then(|_| sbproxy_modules::a2a_v1::parse_request(&collected));
+                let a2a_idents = a2a_v1.as_ref().map(|_| {
+                    (
+                        ctx.hostname.to_string(),
+                        ctx.request_id.to_string(),
+                        ctx.tenant_id.to_string(),
+                    )
+                });
+                // WOR-2139: capture the run correlation id off the same
+                // parse. `params.contextId` groups every hop of one
+                // multi-agent run, and this is the first phase where it
+                // exists: the request filter builds the A2A envelope
+                // from headers, which do not carry it. Stamped on the
+                // context so the terminal surfaces (access log, and any
+                // span opened later in the request) all read one bounded
+                // value. Nothing is added to the upstream request here,
+                // because `upstream_request_filter` already ran.
+                if let Some(context_id) = a2a_v1
+                    .as_ref()
+                    .and_then(crate::server::a2a_body_phase::run_context_id)
+                {
+                    ctx.a2a_context_id = Some(context_id);
+                }
                 if let Some(origin_idx) = ctx.origin_idx {
                     if let Some(policies) = pipeline.policies.get(origin_idx) {
                         for policy in policies {
@@ -4073,7 +4113,80 @@ impl ProxyHttp for SbProxy {
                                         | OpenApiValidationResult::OutOfScope => {}
                                     }
                                 }
+                                Policy::A2A(p) => {
+                                    // WOR-2118: the A2A 1.0
+                                    // push-notification SSRF check. It
+                                    // runs here rather than in the
+                                    // request filter because the
+                                    // enforcer's request snapshot always
+                                    // carries an empty body, so the
+                                    // check was gated on a condition
+                                    // that could never hold and never
+                                    // fired once. The buffered body is
+                                    // the first place the registration
+                                    // is actually visible.
+                                    let (Some(a2a), Some(parsed), Some((route, _, _))) =
+                                        (a2a_ctx.as_ref(), a2a_v1.as_ref(), a2a_idents.as_ref())
+                                    else {
+                                        continue;
+                                    };
+                                    if let Some(rejection) =
+                                        crate::server::a2a_body_phase::check_push_notification(
+                                            p,
+                                            route,
+                                            a2a.spec.as_label(),
+                                            a2a.identity_verified,
+                                            parsed,
+                                        )
+                                    {
+                                        ctx.a2a_denial_body = Some(rejection.body.clone());
+                                        ctx.deny_policy_type = Some(rejection.deny_policy_type);
+                                        failed = Some((
+                                            rejection.status,
+                                            rejection.body,
+                                            rejection.content_type,
+                                        ));
+                                        break;
+                                    }
+                                }
                                 Policy::PromptInjectionV2(p) => {
+                                    // WOR-2118: an agent-to-agent hop
+                                    // goes through the structured seam,
+                                    // which scores each message part on
+                                    // its own and picks the action from
+                                    // the hop's delegation depth. The
+                                    // generic path below fuses the whole
+                                    // JSON-RPC envelope into one string,
+                                    // which is what that seam exists to
+                                    // stop doing.
+                                    if let (
+                                        Some(a2a),
+                                        Some(parsed),
+                                        Some((route, request_id, tenant_id)),
+                                    ) = (a2a_ctx.as_ref(), a2a_v1.as_ref(), a2a_idents.as_ref())
+                                    {
+                                        let audit = sbproxy_modules::BodyAwareAuditContext {
+                                            hostname: route.as_str(),
+                                            request_id: Some(request_id.as_str()),
+                                            tenant_id: Some(tenant_id.as_str()),
+                                            virtual_key_id: None,
+                                            policy_version: None,
+                                        };
+                                        if let Some(rejection) =
+                                            crate::server::a2a_body_phase::scan_message_parts(
+                                                p, route, a2a, parsed, &collected, audit,
+                                            )
+                                        {
+                                            ctx.deny_policy_type = Some(rejection.deny_policy_type);
+                                            failed = Some((
+                                                rejection.status,
+                                                rejection.body,
+                                                rejection.content_type,
+                                            ));
+                                            break;
+                                        }
+                                        continue;
+                                    }
                                     // WOR-801: body-aware scan. The URI +
                                     // headers were scanned synchronously by
                                     // the request_filter enforcer; here we

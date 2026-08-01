@@ -1093,64 +1093,42 @@ fn governance_micro_usd_ceiling(
 
 /// Whether a `GovernanceError::BackendUnavailable` reserve failure
 /// (WOR-1835, task 8) should admit the request without a reservation,
-/// given the configured [`sbproxy_config::types::GovernanceFailureMode`].
+/// under the resolved governance failure posture.
 ///
 /// Applies only to that one error variant; every other reserve error
 /// (a real governed limit, a malformed request, a reused reservation id,
 /// arithmetic overflow) is unrelated to backend availability and keeps
 /// failing open unconditionally, unaffected by this setting.
+///
+/// Take the posture from
+/// [`sbproxy_config::types::KeyGovernanceConfig::failure_posture`], never
+/// from the legacy `failure_mode` field: the accessor is what resolves
+/// the new `failure_posture` key against it (WOR-2121).
 fn governance_admits_on_backend_unavailable(
-    failure_mode: sbproxy_config::types::GovernanceFailureMode,
+    failure_posture: sbproxy_config::types::FailureMode,
 ) -> bool {
-    matches!(
-        failure_mode,
-        sbproxy_config::types::GovernanceFailureMode::AllowUnreserved
-    )
+    failure_posture.admits()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QuotaPoolErrorDisposition {
-    AllowUnreserved,
-    Reject { status: u16, message: &'static str },
-}
-
-fn quota_pool_error_disposition(
-    config: &sbproxy_ai::QuotaPoolConfig,
-    error: &sbproxy_ai::PoolError,
-) -> QuotaPoolErrorDisposition {
-    match error {
-        sbproxy_ai::PoolError::Denied(_) => QuotaPoolErrorDisposition::Reject {
-            status: 429,
-            message: "fair-share quota pool exhausted",
-        },
-        sbproxy_ai::PoolError::BackendUnavailable
-            if config.failure_mode == sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved =>
-        {
-            QuotaPoolErrorDisposition::AllowUnreserved
-        }
-        sbproxy_ai::PoolError::BackendUnavailable => QuotaPoolErrorDisposition::Reject {
-            status: 503,
-            message: "fair-share quota backend unavailable",
-        },
-        sbproxy_ai::PoolError::InvalidState => QuotaPoolErrorDisposition::Reject {
-            status: 503,
-            message: "fair-share quota state unavailable",
-        },
-    }
-}
+/// The one quota-pool failure mapping, shared with the realtime path in
+/// [`crate::context::RealtimeQuotaFailure`].
+///
+/// This dispatch path and the realtime path each carried their own copy
+/// of the mapping, written independently, and they had already drifted:
+/// a denial with no resolvable pool config produced a 429 on one and a
+/// 503 on the other. The shared helper resolves the posture through
+/// `QuotaPoolConfig::failure_posture`, so a `failure_posture` set on a
+/// pool now governs every path that pool can fail on (WOR-2121).
+type QuotaPoolErrorDisposition = sbproxy_ai::quota_pool::PoolErrorDisposition;
 
 fn quota_pool_error_from_attempt(
     config: Option<&sbproxy_ai::QuotaPoolConfig>,
     error: &anyhow::Error,
 ) -> Option<QuotaPoolErrorDisposition> {
     let pool_error = error.downcast_ref::<sbproxy_ai::PoolError>()?;
-    Some(match config {
-        Some(config) => quota_pool_error_disposition(config, pool_error),
-        None => QuotaPoolErrorDisposition::Reject {
-            status: 503,
-            message: "fair-share quota state unavailable",
-        },
-    })
+    Some(sbproxy_ai::quota_pool::pool_error_disposition(
+        config, pool_error,
+    ))
 }
 
 async fn send_quota_pool_attempt_error(
@@ -1163,7 +1141,7 @@ async fn send_quota_pool_attempt_error(
             send_error(session, status, message).await?;
             Ok(true)
         }
-        Some(QuotaPoolErrorDisposition::AllowUnreserved) | None => Ok(false),
+        Some(QuotaPoolErrorDisposition::Admit) | None => Ok(false),
     }
 }
 
@@ -1226,22 +1204,20 @@ async fn admit_quota_pool_attempt(
 ) -> Result<(), QuotaPoolErrorDisposition> {
     match admission.consume(reservation_id).await {
         Ok(()) => Ok(()),
-        Err(error) => match config {
-            Some(config) => match quota_pool_error_disposition(config, &error) {
-                // `QuotaPoolAdmission` normally consumes this branch and
-                // records the metric itself. Keep the defensive fallback so
-                // a future admission implementation cannot accidentally turn
-                // an explicit allow-unreserved policy into a hard failure.
-                QuotaPoolErrorDisposition::AllowUnreserved => {
+        Err(error) => match sbproxy_ai::quota_pool::pool_error_disposition(config, &error) {
+            // `QuotaPoolAdmission` normally consumes this branch and
+            // records the metric itself. Keep the defensive fallback so
+            // a future admission implementation cannot accidentally turn
+            // an explicit admitting posture into a hard failure. Only a
+            // waived guarantee is counted; a plain `open` claims nothing,
+            // exactly as on the reserve path.
+            QuotaPoolErrorDisposition::Admit => {
+                if let Some(config) = config.filter(|c| c.failure_posture().guarantee_waived()) {
                     sbproxy_ai::ai_metrics::record_quota_pool_fail_open(&config.name);
-                    Ok(())
                 }
-                reject => Err(reject),
-            },
-            None => Err(QuotaPoolErrorDisposition::Reject {
-                status: 503,
-                message: "fair-share quota state unavailable",
-            }),
+                Ok(())
+            }
+            reject => Err(reject),
         },
     }
 }
@@ -1253,21 +1229,15 @@ async fn reserve_quota_pool_attempt(
 ) -> std::result::Result<sbproxy_ai::quota_pool::QuotaPoolAttemptGuard, QuotaPoolErrorDisposition> {
     match admission.reserve_attempt(reservation_id).await {
         Ok(attempt) => Ok(attempt),
-        Err(error) => match config {
-            Some(config) => match quota_pool_error_disposition(config, &error) {
-                QuotaPoolErrorDisposition::AllowUnreserved => {
-                    debug_assert!(
-                        false,
-                        "reserve_attempt must convert allow-unreserved to a no-op guard"
-                    );
-                    Err(QuotaPoolErrorDisposition::AllowUnreserved)
-                }
-                reject => Err(reject),
-            },
-            None => Err(QuotaPoolErrorDisposition::Reject {
-                status: 503,
-                message: "fair-share quota state unavailable",
-            }),
+        Err(error) => match sbproxy_ai::quota_pool::pool_error_disposition(config, &error) {
+            QuotaPoolErrorDisposition::Admit => {
+                debug_assert!(
+                    false,
+                    "reserve_attempt must convert an admitting posture to a no-op guard"
+                );
+                Err(QuotaPoolErrorDisposition::Admit)
+            }
+            reject => Err(reject),
         },
     }
 }
@@ -1284,10 +1254,10 @@ async fn reserve_quota_pool_attempt_or_respond(
             send_error(session, status, message).await?;
             Ok(None)
         }
-        Err(QuotaPoolErrorDisposition::AllowUnreserved) => {
+        Err(QuotaPoolErrorDisposition::Admit) => {
             debug_assert!(
                 false,
-                "reserve_attempt must convert allow-unreserved to a no-op guard"
+                "reserve_attempt must convert an admitting posture to a no-op guard"
             );
             send_error(session, 503, "fair-share quota state unavailable").await?;
             Ok(None)
@@ -1358,11 +1328,18 @@ mod quota_pool_dispatch_tests {
         config
     }
 
+    fn disposition(
+        config: &sbproxy_ai::QuotaPoolConfig,
+        error: &sbproxy_ai::PoolError,
+    ) -> QuotaPoolErrorDisposition {
+        sbproxy_ai::quota_pool::pool_error_disposition(Some(config), error)
+    }
+
     #[test]
     fn quota_pool_denial_and_backend_failure_map_to_exact_statuses() {
         let closed = pool(sbproxy_ai::QuotaPoolFailureMode::Closed);
         assert_eq!(
-            quota_pool_error_disposition(
+            disposition(
                 &closed,
                 &sbproxy_ai::PoolError::Denied(sbproxy_ai::PoolDeny::PoolExhausted {
                     total_load: 10,
@@ -1375,7 +1352,7 @@ mod quota_pool_dispatch_tests {
             }
         );
         assert_eq!(
-            quota_pool_error_disposition(&closed, &sbproxy_ai::PoolError::BackendUnavailable,),
+            disposition(&closed, &sbproxy_ai::PoolError::BackendUnavailable),
             QuotaPoolErrorDisposition::Reject {
                 status: 503,
                 message: "fair-share quota backend unavailable",
@@ -1384,13 +1361,58 @@ mod quota_pool_dispatch_tests {
 
         let allow = pool(sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved);
         assert_eq!(
-            quota_pool_error_disposition(&allow, &sbproxy_ai::PoolError::BackendUnavailable,),
-            QuotaPoolErrorDisposition::AllowUnreserved
+            disposition(&allow, &sbproxy_ai::PoolError::BackendUnavailable),
+            QuotaPoolErrorDisposition::Admit
         );
         assert!(matches!(
-            quota_pool_error_disposition(&allow, &sbproxy_ai::PoolError::InvalidState),
+            disposition(&allow, &sbproxy_ai::PoolError::InvalidState),
             QuotaPoolErrorDisposition::Reject { status: 503, .. }
         ));
+    }
+
+    /// The legacy `failure_mode` and an explicit `failure_posture` produce
+    /// the same dispositions, and an explicit posture wins when both are
+    /// set. Same helper the realtime path calls, so the two agree by
+    /// construction rather than by review (WOR-2121).
+    #[test]
+    fn an_explicit_failure_posture_overrides_the_legacy_quota_failure_mode() {
+        use sbproxy_config::types::FailureMode;
+
+        // Legacy `allow_unreserved` and explicit `degraded` are the same
+        // answer, which is the migration promise.
+        let legacy = pool(sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved);
+        let mut explicit = pool(sbproxy_ai::QuotaPoolFailureMode::Closed);
+        explicit.failure_posture = Some(FailureMode::Degraded);
+        assert_eq!(
+            disposition(&legacy, &sbproxy_ai::PoolError::BackendUnavailable),
+            disposition(&explicit, &sbproxy_ai::PoolError::BackendUnavailable),
+        );
+        assert_eq!(legacy.failure_posture(), FailureMode::Degraded);
+
+        // The explicit key wins in the other direction too.
+        let mut closed_over_allow = pool(sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved);
+        closed_over_allow.failure_posture = Some(FailureMode::Closed);
+        assert_eq!(
+            disposition(
+                &closed_over_allow,
+                &sbproxy_ai::PoolError::BackendUnavailable
+            ),
+            QuotaPoolErrorDisposition::Reject {
+                status: 503,
+                message: "fair-share quota backend unavailable",
+            }
+        );
+
+        // `open` admits like `degraded` and waives no guarantee, which is
+        // what keeps the fail-open counter off for it.
+        let mut opened = pool(sbproxy_ai::QuotaPoolFailureMode::Closed);
+        opened.failure_posture = Some(FailureMode::Open);
+        assert_eq!(
+            disposition(&opened, &sbproxy_ai::PoolError::BackendUnavailable),
+            QuotaPoolErrorDisposition::Admit
+        );
+        assert!(!opened.failure_posture().guarantee_waived());
+        assert!(legacy.failure_posture().guarantee_waived());
     }
 
     #[tokio::test]
@@ -1520,6 +1542,47 @@ pub(super) fn key_rate_limiter() -> &'static sbproxy_ai::identity::KeyRateLimite
     LIMITER.get_or_init(sbproxy_ai::identity::KeyRateLimiter::new)
 }
 
+/// Turn a key-store outage into a dynamic-key outcome, under the plane's
+/// configured failure posture.
+///
+/// The OIDC-claim path and the bearer path each had their own copy of this
+/// decision, as did the two inbound-key entry points in `request_phase`.
+/// All four now read `key_management.failure_posture` through
+/// [`crate::key_plane::KeyPlane::failure_posture`] (WOR-2121).
+///
+/// An admitting posture returns `NotApplicable`, which hands the request
+/// to the origin's own configured auth rather than admitting it outright.
+/// [`Degraded`](sbproxy_config::types::FailureMode::Degraded) and
+/// [`Open`](sbproxy_config::types::FailureMode::Open) take that same
+/// branch and differ only in whether the lost per-key policy, budget, and
+/// attribution are recorded as lost.
+fn dynamic_key_store_outage(
+    plane: &crate::key_plane::KeyPlane,
+    error: &anyhow::Error,
+) -> DynamicKeyOutcome {
+    let posture = plane.failure_posture();
+    if !posture.admits() {
+        return DynamicKeyOutcome::Deny(503, "key store unavailable".to_string());
+    }
+    if posture.guarantee_waived() {
+        tracing::warn!(
+            error = %error,
+            failure_posture = posture.as_label(),
+            guarantee_waived = true,
+            "key store unavailable; passing through with no per-key policy, budget, or \
+             attribution"
+        );
+    } else {
+        tracing::warn!(
+            error = %error,
+            failure_posture = posture.as_label(),
+            guarantee_waived = false,
+            "key store unavailable; passing through"
+        );
+    }
+    DynamicKeyOutcome::NotApplicable
+}
+
 /// WOR-1555: map a verified OIDC/JWT identity to a stored virtual-key record's
 /// policy, so the bearer-token and OIDC front doors converge on one record.
 ///
@@ -1529,8 +1592,9 @@ pub(super) fn key_rate_limiter() -> &'static sbproxy_ai::identity::KeyRateLimite
 /// is not configured or the token carries no mapped claim. A claim that names a
 /// missing or inactive record DENIES: the identity declared itself governed by
 /// that record, so revoking the record blocks the JWT rather than degrading it
-/// to ungoverned access. A store outage fails closed unless
-/// `failure_mode_allow` is set, mirroring the bearer path.
+/// to ungoverned access. A store outage is resolved by
+/// [`dynamic_key_store_outage`] against `key_management.failure_posture`,
+/// which defaults to closed, mirroring the bearer path.
 async fn resolve_oidc_mapped_key(
     plane: &crate::key_plane::KeyPlane,
     principal: &sbproxy_plugin::Principal,
@@ -1548,14 +1612,7 @@ async fn resolve_oidc_mapped_key(
         return DynamicKeyOutcome::NotApplicable;
     };
     match plane.cache().resolve_key(key_id).await {
-        Err(e) => {
-            if plane.failure_mode_allow() {
-                tracing::warn!(error = %e, "key store unavailable; failure_mode_allow set, passing through");
-                DynamicKeyOutcome::NotApplicable
-            } else {
-                DynamicKeyOutcome::Deny(503, "key store unavailable".to_string())
-            }
-        }
+        Err(e) => dynamic_key_store_outage(plane, &e),
         // Same status for a missing record as the bearer path's unknown id.
         Ok(None) => DynamicKeyOutcome::Deny(401, "invalid key".to_string()),
         Ok(Some(rec)) => {
@@ -1571,8 +1628,8 @@ async fn resolve_oidc_mapped_key(
 /// Resolve an inbound bearer token against the dynamic key plane: parse the
 /// `sbp_<key_id>_<secret>` shape (or the legacy `sk-<key_id>-<secret>`), look
 /// the id up through the cache then store, constant-time verify the secret, and
-/// gate on status/expiry. Fail-closed: a store outage denies unless
-/// `failure_mode_allow` is set.
+/// gate on status/expiry. Fail-closed by default: a store outage is resolved by
+/// [`dynamic_key_store_outage`] against `key_management.failure_posture`.
 async fn resolve_dynamic_virtual_key(
     plane: &crate::key_plane::KeyPlane,
     raw_token: Option<&str>,
@@ -1592,14 +1649,7 @@ async fn resolve_dynamic_virtual_key(
     let conforming_id = sbproxy_keystore::crypto::is_conforming_key_id(key_id);
     let now = chrono::Utc::now();
     match plane.cache().resolve_key(key_id).await {
-        Err(e) => {
-            if plane.failure_mode_allow() {
-                tracing::warn!(error = %e, "key store unavailable; failure_mode_allow set, passing through");
-                DynamicKeyOutcome::NotApplicable
-            } else {
-                DynamicKeyOutcome::Deny(503, "key store unavailable".to_string())
-            }
-        }
+        Err(e) => dynamic_key_store_outage(plane, &e),
         // Unknown id and a wrong secret return the same status so neither is an
         // existence oracle. But only for an id that could plausibly have been
         // minted here: a caller presenting their own `sk-proj-...` provider key
@@ -2579,9 +2629,40 @@ pub(super) async fn handle_ai_proxy(
     ai_span.record("sbproxy.tenant_id", ctx.tenant_id.as_str());
     // WOR-2093: session linkage on the exported span, so key, session,
     // and trace join in the collector.
-    if let Some(session_id) = ctx.session_id.as_ref() {
-        ai_span.record("sbproxy.session_id", session_id.to_string().as_str());
+    let capture_session_id = ctx.session_id.map(|session_id| session_id.to_string());
+    if let Some(session_id) = capture_session_id.as_deref() {
+        ai_span.record("sbproxy.session_id", session_id);
     }
+    // WOR-2139: run identity, so a fan-out of agent hops reconstructs as
+    // one tree instead of a pile of unrelated traces. `session.id` takes
+    // the A2A `contextId` when the hop carried one and the capture
+    // session otherwise; `graph.node.id` / `graph.node.parent_id` carry
+    // this hop and its caller; the trust flag rides alongside because an
+    // untrusted caller names its own run. The capture session keeps its
+    // own `sbproxy.session_id` slot above and is not overwritten: it is
+    // a validated ULID that also keys the semantic cache.
+    //
+    // Phase note. The A2A `contextId` lives in the JSON-RPC request body
+    // and is stamped on the context by `request_body_filter`. This
+    // handler completes inside `request_filter`, which runs earlier, so
+    // on the AI-gateway surface `session.id` normally resolves to the
+    // capture session and `sbproxy.run.id_source` says so. The A2A run
+    // id reaches the terminal access-log line rather than this span.
+    // See the run-identity section of `docs/observability.md`.
+    sbproxy_ai::tracing_spans::record_run_identity(
+        &ai_span,
+        sbproxy_ai::tracing_spans::RunIdentity {
+            a2a_context_id: ctx.a2a_context_id.as_deref(),
+            capture_session_id: capture_session_id.as_deref(),
+            node_id: Some(ctx.request_id.as_str()),
+            parent_node_id: ctx
+                .a2a
+                .as_ref()
+                .and_then(|a2a| a2a.parent_request_id.as_deref()),
+            task_id: ctx.a2a.as_ref().map(|a2a| a2a.task_id.as_str()),
+            identity_verified: ctx.a2a.as_ref().map(|a2a| a2a.identity_verified),
+        },
+    );
 
     // Increment the per-surface request counter and start the latency
     // clock. The latency guard records elapsed time at function exit
@@ -4319,7 +4400,10 @@ pub(super) async fn handle_ai_proxy(
         // a borrow of `plane` (and transitively of `key_plane`) across the
         // `store.reserve(..).await` further down.
         let governance_cfg = plane.governance();
-        let failure_mode = governance_cfg.failure_mode;
+        // Resolved through the accessor, which prefers an explicit
+        // `governance.failure_posture` and converts the legacy
+        // `failure_mode` when it is absent (WOR-2121).
+        let failure_posture = governance_cfg.failure_posture();
         let missing_rate = governance_cfg.missing_rate;
         if let Some(limits) = governance_limits_from_policy(policy) {
             // Capture the owned fields we still need before touching `ctx`
@@ -4444,39 +4528,48 @@ pub(super) async fn handle_ai_proxy(
                 }
                 Err(sbproxy_ai::governance::GovernanceError::BackendUnavailable { backend }) => {
                     // WOR-1835 (task 8): a backend outage is the one reserve
-                    // failure `failure_mode` governs; every other reserve
+                    // failure the posture governs; every other reserve
                     // error below keeps failing open unconditionally.
-                    if governance_admits_on_backend_unavailable(failure_mode) {
+                    if governance_admits_on_backend_unavailable(failure_posture) {
                         warn!(
                             ai.key_id = %key_id,
                             backend,
+                            failure_posture = failure_posture.as_label(),
+                            guarantee_waived = failure_posture.guarantee_waived(),
                             "AI proxy: governance backend unavailable; admitting without \
-                             a reservation (failure_mode: allow_unreserved)"
+                             a reservation"
                         );
-                        // Strict fail-open must be audited (governed limits
-                        // silently stopped being enforced for this request)
-                        // and observable as a metric so an operator watching
-                        // a degraded backend can see how often this fires.
-                        sbproxy_observe::SecurityAuditEntry::policy_violation(
-                            "governance_fail_open",
-                            format!(
-                                "governance backend '{backend}' unavailable; admitted \
-                                 without a reservation"
-                            ),
-                            200,
-                            Some(hostname.to_string()),
-                            ctx.client_ip,
-                            Some(ctx.request_id.to_string()),
-                            Some(session.req_header().method.as_str().to_string()),
-                        )
-                        .with_tenant_id(ctx.tenant_id.as_str())
-                        .with_key_context(
-                            ctx.native_key_provider.clone(),
-                            ctx.inbound_key_mode.as_str(),
-                        )
-                        .with_api_key_id(ctx.accountable_key_id())
-                        .emit();
-                        sbproxy_observe::metrics::record_governance_fail_open(&key_id);
+                        // `degraded` (which is what the legacy
+                        // `allow_unreserved` resolves to) says the governed
+                        // limits this request should have been held to were
+                        // not enforced, so it is audited and counted: an
+                        // operator watching a sick backend needs to see how
+                        // often that happens. A plain `open` admits without
+                        // claiming anything was lost, and records neither.
+                        // That difference is the only thing separating the
+                        // two postures here, and it is real information.
+                        if failure_posture.guarantee_waived() {
+                            sbproxy_observe::SecurityAuditEntry::policy_violation(
+                                "governance_fail_open",
+                                format!(
+                                    "governance backend '{backend}' unavailable; admitted \
+                                     without a reservation"
+                                ),
+                                200,
+                                Some(hostname.to_string()),
+                                ctx.client_ip,
+                                Some(ctx.request_id.to_string()),
+                                Some(session.req_header().method.as_str().to_string()),
+                            )
+                            .with_tenant_id(ctx.tenant_id.as_str())
+                            .with_key_context(
+                                ctx.native_key_provider.clone(),
+                                ctx.inbound_key_mode.as_str(),
+                            )
+                            .with_api_key_id(ctx.accountable_key_id())
+                            .emit();
+                            sbproxy_observe::metrics::record_governance_fail_open(&key_id);
+                        }
                         // No lease: there is no reservation to settle or
                         // release, so `ctx.governance_lease` stays `None`.
                     } else {
@@ -6105,7 +6198,7 @@ pub(super) async fn handle_ai_proxy(
                         config.quota_pool.as_ref(),
                     ) {
                         if let QuotaPoolErrorDisposition::Reject { status, message } =
-                            quota_pool_error_disposition(pool, error)
+                            sbproxy_ai::quota_pool::pool_error_disposition(Some(pool), error)
                         {
                             send_error(session, status, message).await?;
                             return Ok(());
@@ -15011,19 +15104,30 @@ mod governance_reserve_decision_tests {
         );
     }
 
-    // --- governance_admits_on_backend_unavailable (WOR-1835, task 8) ---
+    // --- governance_admits_on_backend_unavailable (WOR-1835, task 8;
+    //     rewired onto `failure_posture` in WOR-2121) ---
+
+    /// A governance block carrying only the legacy `failure_mode`.
+    fn legacy_governance(
+        failure_mode: GovernanceFailureMode,
+    ) -> sbproxy_config::types::KeyGovernanceConfig {
+        sbproxy_config::types::KeyGovernanceConfig {
+            failure_mode,
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn closed_failure_mode_denies_on_backend_unavailable() {
         assert!(!governance_admits_on_backend_unavailable(
-            GovernanceFailureMode::Closed
+            legacy_governance(GovernanceFailureMode::Closed).failure_posture()
         ));
     }
 
     #[test]
     fn allow_unreserved_failure_mode_admits_on_backend_unavailable() {
         assert!(governance_admits_on_backend_unavailable(
-            GovernanceFailureMode::AllowUnreserved
+            legacy_governance(GovernanceFailureMode::AllowUnreserved).failure_posture()
         ));
     }
 
@@ -15034,7 +15138,63 @@ mod governance_reserve_decision_tests {
             GovernanceFailureMode::Closed
         );
         assert!(!governance_admits_on_backend_unavailable(
-            GovernanceFailureMode::default()
+            legacy_governance(GovernanceFailureMode::default()).failure_posture()
+        ));
+    }
+
+    /// The legacy `allow_unreserved` keeps its audit and its counter,
+    /// because it resolves to `degraded` rather than to a plain `open`.
+    /// An operator who explicitly asks for `open` gets the admission
+    /// without the bookkeeping, and that is the only difference between
+    /// the two at this site.
+    #[test]
+    fn degraded_is_distinguishable_from_open_at_the_governance_site() {
+        use sbproxy_config::types::FailureMode;
+
+        let legacy = legacy_governance(GovernanceFailureMode::AllowUnreserved);
+        assert_eq!(legacy.failure_posture(), FailureMode::Degraded);
+        assert!(governance_admits_on_backend_unavailable(
+            legacy.failure_posture()
+        ));
+        assert!(
+            legacy.failure_posture().guarantee_waived(),
+            "the audit event and sbproxy_governance_fail_open_total hang off this"
+        );
+
+        let opened = sbproxy_config::types::KeyGovernanceConfig {
+            failure_posture: Some(FailureMode::Open),
+            ..Default::default()
+        };
+        assert!(governance_admits_on_backend_unavailable(
+            opened.failure_posture()
+        ));
+        assert!(
+            !opened.failure_posture().guarantee_waived(),
+            "a plain open admits and claims nothing, so it records nothing"
+        );
+    }
+
+    /// An explicit posture wins over the legacy field, in both directions.
+    #[test]
+    fn an_explicit_governance_posture_overrides_the_legacy_failure_mode() {
+        use sbproxy_config::types::FailureMode;
+
+        let closed_over_allow = sbproxy_config::types::KeyGovernanceConfig {
+            failure_mode: GovernanceFailureMode::AllowUnreserved,
+            failure_posture: Some(FailureMode::Closed),
+            ..Default::default()
+        };
+        assert!(!governance_admits_on_backend_unavailable(
+            closed_over_allow.failure_posture()
+        ));
+
+        let degraded_over_closed = sbproxy_config::types::KeyGovernanceConfig {
+            failure_mode: GovernanceFailureMode::Closed,
+            failure_posture: Some(FailureMode::Degraded),
+            ..Default::default()
+        };
+        assert!(governance_admits_on_backend_unavailable(
+            degraded_over_closed.failure_posture()
         ));
     }
 }

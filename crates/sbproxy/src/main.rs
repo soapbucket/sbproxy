@@ -1303,6 +1303,17 @@ fn main() {
     // true uptime rather than time-since-first-health-hit.
     sbproxy_observe::mark_process_start();
 
+    // Point the attested meter's self-observation at the `sbproxy_meter_*`
+    // families before any config is compiled. The meter reports through a
+    // seam rather than owning a metrics dependency (it must stay compilable
+    // by an operator who wants the hash chain and nothing else), so nothing
+    // is recorded until somebody installs the receiving end. Doing it here
+    // means the first metered request of a deployment is counted, which is
+    // usually the one somebody is watching. The return value is discarded
+    // because a second install is refused rather than accepted, and this is
+    // the only caller.
+    let _ = sbproxy_observe::meter_metrics::install();
+
     let cli = Cli::parse();
 
     // --- --version / -V / `version` short-circuit ---

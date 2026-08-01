@@ -1134,6 +1134,21 @@ pub struct CompiledPipeline {
     /// runtime and never falls back to the origin's.
     #[cfg(feature = "rag")]
     pub rag_runtimes: crate::rag_runtime::RagRuntimeRegistry,
+    /// The published settlement runtime for this config generation, when
+    /// `proxy.payments` is configured (WOR-2100).
+    ///
+    /// Attached after construction rather than built inside it, because
+    /// publishing is async and proving the store answers has to happen while
+    /// the previous generation is still serving. `None` means settlement is
+    /// not configured, which is the default and leaves the existing
+    /// non-settlement ledger behaviour exactly as it was.
+    ///
+    /// Pinned to the pipeline for the same reason the key plane is: a
+    /// request pins a pipeline at ingress, so a reload cannot move a paid
+    /// request onto a different settlement store than the one that issued
+    /// its challenge.
+    #[cfg(feature = "payments")]
+    pub payments: Option<Arc<crate::billing_runtime::PaymentsRuntime>>,
     /// Immutable route-scoped semantic caches keyed by origin and optional
     /// forward rule (WOR-2099). Populated only for `ai_proxy` actions that
     /// configure `semantic_cache:`; a forward rule without its own block
@@ -1185,6 +1200,17 @@ pub struct CompiledPipeline {
     /// URL) stamped alongside an outbound Web Bot Auth signature when
     /// `proxy.web_bot_auth.directory_url` is set.
     pub web_bot_auth_signature_agent: Option<String>,
+    /// Consumption attestation for this pipeline generation (WOR-2127),
+    /// built once from `proxy.attestation`. `None` when the block is
+    /// absent, when its role is `off`, and always under validation
+    /// construction, which must not create the queue or ledger
+    /// directories on an operator's laptop.
+    pub attestation: Option<Arc<crate::attestation::AttestationRuntime>>,
+    /// Per-origin attestation posture, composed once from the
+    /// proxy-wide role and each origin's override. Parallel to
+    /// [`Self::config`].`origins`, so the request path indexes rather
+    /// than re-deriving precedence per request.
+    pub origin_attestations: Vec<crate::attestation::ResolvedOriginAttestation>,
     /// Compiled idempotency middleware for each origin (None when the
     /// origin has no `idempotency:` block or `enabled = false`).
     /// Parallel to [`Self::config`].`origins`.
@@ -1317,6 +1343,10 @@ impl Default for CompiledPipeline {
             compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry::default(),
             #[cfg(feature = "rag")]
             rag_runtimes: crate::rag_runtime::RagRuntimeRegistry::default(),
+            // Attached by the lifecycle after an async health check, never
+            // by construction. A default pipeline has no settlement.
+            #[cfg(feature = "payments")]
+            payments: None,
             // Default construction must stay pure: no config read, no DNS
             // resolution, no Redis dial, no cluster-state read, and no
             // mesh binding. Test pipelines are built this way constantly.
@@ -1333,6 +1363,8 @@ impl Default for CompiledPipeline {
             outbound_wba: Vec::new(),
             web_bot_auth_signer: None,
             web_bot_auth_signature_agent: None,
+            attestation: None,
+            origin_attestations: Vec::new(),
             idempotencies: Vec::new(),
             cache_store: None,
             origin_cache_stores: HashMap::new(),
@@ -1483,6 +1515,8 @@ impl CompiledPipeline {
         let mut threat_protections = Vec::with_capacity(config.origins.len());
         let mut outbound_creds = Vec::with_capacity(config.origins.len());
         let mut outbound_wba = Vec::with_capacity(config.origins.len());
+        let mut origin_attestations: Vec<crate::attestation::ResolvedOriginAttestation> =
+            Vec::with_capacity(config.origins.len());
 
         for origin in &config.origins {
             // Compile action (required for every origin).
@@ -1626,6 +1660,16 @@ impl CompiledPipeline {
             };
             outbound_creds.push(outbound_cred);
             outbound_wba.push(origin.outbound_web_bot_auth);
+
+            // WOR-2127: compose the proxy-wide attestation role with
+            // this origin's override once, here, rather than per
+            // request. Resolved even when the block is absent, so the
+            // vector stays index-parallel with `config.origins` and the
+            // request path can index it without a bounds dance.
+            origin_attestations.push(crate::attestation::resolve_origin_attestation(
+                config.server.attestation.as_ref(),
+                origin.attestation.as_ref(),
+            ));
         }
 
         // --- Compile per-origin idempotency middleware ---
@@ -1908,6 +1952,27 @@ impl CompiledPipeline {
             PipelineConstructionMode::Validation => None,
         };
 
+        // WOR-2127: lower `proxy.attestation` into the metering
+        // vocabulary. Runtime only, because the queue and the ledger are
+        // filesystem state and `sbproxy validate` must be able to check
+        // a candidate config without creating directories for a proxy
+        // that is not going to run. Everything decidable without a
+        // filesystem was already decided at config compile, so
+        // validation still rejects a broken block.
+        // WOR-2128: the revision goes in here rather than being read at
+        // resolve time. Every route weight this generation produces cites
+        // it, and a weight that cited whatever config happened to be live
+        // when the receipt was written would name a document that did not
+        // price the call.
+        let attestation = match mode {
+            PipelineConstructionMode::Runtime => crate::attestation::prepare_attestation(
+                config.server.attestation.as_ref(),
+                config.server.web_bot_auth.as_ref(),
+                &config_revision,
+            )?,
+            PipelineConstructionMode::Validation => None,
+        };
+
         let pipeline = Self {
             config,
             key_plane,
@@ -1917,6 +1982,11 @@ impl CompiledPipeline {
             compression_runtimes,
             #[cfg(feature = "rag")]
             rag_runtimes,
+            // Attached by the lifecycle after an async health check, never
+            // by construction: publishing starts a worker, and a candidate
+            // that is then discarded must not leave one claiming leases.
+            #[cfg(feature = "payments")]
+            payments: None,
             semantic_caches,
             auths,
             policies,
@@ -1930,6 +2000,8 @@ impl CompiledPipeline {
             outbound_wba,
             web_bot_auth_signer,
             web_bot_auth_signature_agent,
+            attestation,
+            origin_attestations,
             idempotencies,
             cache_store,
             origin_cache_stores,
@@ -2602,6 +2674,7 @@ mod tests {
                 outbound_credential: None,
                 outbound_web_bot_auth: false,
                 observability: None,
+                attestation: None,
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),
@@ -2755,6 +2828,7 @@ mod tests {
                 outbound_credential: None,
                 outbound_web_bot_auth: false,
                 observability: None,
+                attestation: None,
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),

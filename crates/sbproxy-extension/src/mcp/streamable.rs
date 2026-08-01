@@ -2,6 +2,16 @@
 //!
 //! Bidirectional: HTTP POST sends JSON-RPC requests, SSE stream
 //! returns responses. Supports JSON-RPC batching.
+//!
+//! # Trace context
+//!
+//! This transport does not inject `traceparent` as an HTTP header.
+//! SEP-414 trace context is already in the request it receives, merged
+//! into `params._meta` by the federation at construction time, and one
+//! carrier that behaves identically on HTTP and on stdio is worth more
+//! than a header that only two of the three transports could carry.
+//! Adding a header here would reintroduce exactly the per-transport
+//! divergence the `_meta` reservation exists to avoid.
 
 use super::types::{JsonRpcRequest, JsonRpcResponse};
 

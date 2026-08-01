@@ -47,10 +47,32 @@
 //! | Temperature              | `gen_ai.request.temperature`        | n/a                            |
 //! | Max tokens               | `gen_ai.request.max_tokens`         | n/a                            |
 //! | Top-p                    | `gen_ai.request.top_p`              | n/a                            |
+//! | Run grouping key         | n/a                                 | `session.id`                   |
+//! | This hop's node          | n/a                                 | `graph.node.id`                |
+//! | Calling hop's node       | n/a                                 | `graph.node.parent_id`         |
 //!
-//! sbproxy-internal context (routing surface, guardrail category, and bounded
-//! governed-key attribution) lives under the `sbproxy.*` namespace so it does
+//! sbproxy-internal context (routing surface, guardrail category, bounded
+//! governed-key attribution, and the run-identity provenance and trust
+//! flags described below) lives under the `sbproxy.*` namespace so it does
 //! not clash with upstream conventions.
+//!
+//! ## Run identity
+//!
+//! A multi-agent run fans one caller request out across several hops. The
+//! three OpenInference attributes above are what let a trace backend put
+//! those hops back together as one tree, and [`record_run_identity`] is the
+//! single place that writes them. Three sbproxy-namespace fields ride
+//! alongside because OpenInference names no attribute for them:
+//!
+//! - `sbproxy.run.id_source`, which of the two grouping keys filled
+//!   `session.id` (`a2a_context_id` or `capture_session`);
+//! - `sbproxy.a2a.task_id`, the caller-assigned A2A task id;
+//! - `sbproxy.a2a.identity_verified`, whether the hop's identity fields
+//!   came from a source the proxy trusts.
+//!
+//! None of these may ever become a metric label. They are caller-supplied
+//! and unbounded, which is exactly what a span attribute tolerates and a
+//! Prometheus label does not.
 //!
 //! ## Backwards compatibility
 //!
@@ -119,6 +141,12 @@ pub const REQUIRED_OPENINFERENCE_SPAN_FIELDS: &[&str] = &[
     "llm.usage.total_cost",
     "input.value",
     "output.value",
+    // Run identity (WOR-2139). `session.id` is OpenInference's
+    // "key that groups related traces"; the two graph fields are its
+    // node and edge for an agent call graph.
+    "session.id",
+    "graph.node.id",
+    "graph.node.parent_id",
 ];
 
 /// Operation name recorded on the top-level AI request span when no
@@ -199,6 +227,10 @@ pub fn record_tool_outcome(span: &Span, outcome: &str, cost_usd: Option<f64>) {
 ///   call complete (a `tracing::field::Empty` field becomes a settable
 ///   slot on the live span). The tenant slot is populated from
 ///   `RequestContext.tenant_id` at dispatch entry (WOR-1098).
+/// - Empty placeholders for the run-identity set (`session.id`,
+///   `sbproxy.run.id_source`, `graph.node.id`, `graph.node.parent_id`,
+///   `sbproxy.a2a.task_id`, `sbproxy.a2a.identity_verified`), filled by
+///   [`record_run_identity`] at dispatch entry (WOR-2139).
 pub fn ai_request_span(surface: &str, operation: &str, method: &str) -> Span {
     tracing::info_span!(
         "ai.request",
@@ -215,6 +247,19 @@ pub fn ai_request_span(surface: &str, operation: &str, method: &str) -> Span {
         // traffic to its sessions. Filled at dispatch entry when the
         // capture envelope resolved a session id.
         "sbproxy.session_id" = Empty,
+        // WOR-2139: run identity, filled by `record_run_identity`.
+        // `session.id` is OpenInference's grouping key and is a
+        // deliberately separate slot from `sbproxy.session_id` above:
+        // the capture session is a validated ULID with a cardinality
+        // budget that also feeds the semantic-cache key and the
+        // cache-bypass decision, so a caller-chosen run id must not be
+        // written into it. The two coexist.
+        "session.id" = Empty,
+        "sbproxy.run.id_source" = Empty,
+        "graph.node.id" = Empty,
+        "graph.node.parent_id" = Empty,
+        "sbproxy.a2a.task_id" = Empty,
+        "sbproxy.a2a.identity_verified" = Empty,
         // Governed-key route attribution. These four fixed slots are filled
         // after request policy resolution. Free-form tags and metadata are
         // deliberately not declared as span fields.
@@ -520,6 +565,161 @@ pub fn record_request_params(
     }
     if let Some(p) = top_p {
         span.record("gen_ai.request.top_p", p);
+    }
+}
+
+/// Maximum length, in bytes, of a caller-supplied identifier recorded on
+/// a span attribute.
+///
+/// An A2A `contextId`, `taskId`, or parent request id is an arbitrary
+/// string off the wire. A span attribute tolerates an unusual value
+/// (unlike a metric label, which these must never become), but nothing
+/// stops a caller from pushing a megabyte through one unless a cap does.
+/// 128 bytes holds every id shape agent frameworks actually emit (UUID,
+/// ULID, and `<agent>-<uuid>` composites) with room left over.
+pub const MAX_RUN_ID_BYTES: usize = 128;
+
+/// `sbproxy.run.id_source` value when `session.id` came from the A2A
+/// `contextId`.
+const RUN_ID_SOURCE_A2A_CONTEXT: &str = "a2a_context_id";
+
+/// `sbproxy.run.id_source` value when `session.id` fell back to the
+/// capture session.
+const RUN_ID_SOURCE_CAPTURE_SESSION: &str = "capture_session";
+
+/// Truncate a caller-supplied identifier to [`MAX_RUN_ID_BYTES`] without
+/// splitting a UTF-8 character.
+///
+/// Returns the input untouched when it already fits, so the ordinary
+/// path borrows rather than allocates. Callers that persist an id (the
+/// access log, the request context) should cap once at capture so every
+/// downstream surface reports the same bounded string rather than each
+/// reader picking its own limit.
+pub fn cap_run_id(value: &str) -> &str {
+    if value.len() <= MAX_RUN_ID_BYTES {
+        return value;
+    }
+    let cut = value
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .take_while(|idx| *idx <= MAX_RUN_ID_BYTES)
+        .last()
+        .unwrap_or(0);
+    &value[..cut]
+}
+
+/// One hop's identity inside a multi-agent run.
+///
+/// Every field is optional because the pieces come from different
+/// sources at different phases and different trust levels: the A2A
+/// context id is read from the request body, the capture session from
+/// the request envelope, and the parent and task ids from headers behind
+/// the trusted-peer gate. An absent field leaves its span slot untouched
+/// rather than writing an empty string, so a backend can tell "no value"
+/// from "empty value".
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RunIdentity<'a> {
+    /// A2A `contextId` for this hop, when it carried one. Wins the
+    /// `session.id` slot because task ids nest under it, which makes it
+    /// the identifier for one whole run rather than one caller.
+    pub a2a_context_id: Option<&'a str>,
+    /// Capture-session identifier. Fills `session.id` when there is no
+    /// A2A context id, so the attribute is useful for ordinary traffic
+    /// instead of empty on everything that is not an agent hop.
+    pub capture_session_id: Option<&'a str>,
+    /// This hop's own identifier, recorded as `graph.node.id`. The
+    /// proxy's request id, because the A2A wire vocabulary names the
+    /// parent hop and the ancestor chain but never the current hop.
+    pub node_id: Option<&'a str>,
+    /// The calling hop's identifier, recorded as `graph.node.parent_id`.
+    /// Absent or empty means this hop is the root of the call graph.
+    ///
+    /// This is the caller's assertion, in the calling agents' own id
+    /// namespace rather than the proxy's, so the edge only closes
+    /// against a sibling `graph.node.id` when callers propagate the
+    /// request id the proxy echoed to them. Read `identity_verified`
+    /// before treating the claim as authoritative.
+    pub parent_node_id: Option<&'a str>,
+    /// Caller-assigned A2A task id, recorded as `sbproxy.a2a.task_id`.
+    pub task_id: Option<&'a str>,
+    /// Whether the hop's identity fields came from a source the proxy
+    /// trusts. `None` for traffic that carried no A2A envelope at all.
+    pub identity_verified: Option<bool>,
+}
+
+/// Drop `None` and empty strings in one step, so an empty wire value is
+/// treated the same as an absent one.
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|v| !v.is_empty())
+}
+
+/// Record a caller-supplied identifier, truncated to the id cap, and
+/// leave the field untouched when the value is absent or empty.
+fn record_capped_if_present(span: &Span, field: &'static str, value: Option<&str>) {
+    if let Some(value) = non_empty(value) {
+        span.record(field, cap_run_id(value));
+    }
+}
+
+/// Stamp a hop's run identity onto an AI span (WOR-2139).
+///
+/// # `session.id` precedence
+///
+/// OpenInference defines `session.id` as the key that groups related
+/// traces. SBproxy resolves it in this order:
+///
+/// 1. the A2A `contextId` this hop carried, because A2A task ids nest
+///    under it and it therefore names one multi-agent run;
+/// 2. otherwise the capture-session identifier, which groups one
+///    caller's requests.
+///
+/// Both genuinely group related traces, and the fallback is what keeps
+/// the attribute populated for the overwhelming majority of traffic that
+/// is not an agent-to-agent hop. `sbproxy.run.id_source` records which
+/// one won, so a query can tell a run-scoped grouping from a
+/// caller-scoped one without inferring it from the id's shape.
+///
+/// The capture session keeps its own `sbproxy.session_id` slot and is
+/// not overwritten. The two are different concepts: a capture session is
+/// a validated ULID with a cardinality budget that also feeds the
+/// semantic-cache key and the cache-bypass decision, so folding a
+/// caller-chosen run id into it would silently repartition the cache.
+///
+/// # Graph edges
+///
+/// `graph.node.id` is this hop; `graph.node.parent_id` is the hop that
+/// called it. Per OpenInference an unset or empty parent means the node
+/// is the root, so an absent or empty parent leaves the slot untouched
+/// instead of writing a placeholder that a backend would render as a
+/// child of nothing.
+///
+/// # Trust
+///
+/// `sbproxy.a2a.identity_verified` rides alongside the ids on purpose.
+/// An untrusted caller picks its own `contextId`, so it can merge its
+/// spend into somebody else's run or shard one run across unbounded
+/// distinct ids. A run total read without this flag is a number the
+/// caller chose. The `sbproxy_a2a_hops_total` metric already partitions
+/// hops the same way through its `allow:verified` and `allow:unverified`
+/// decision labels.
+///
+/// Every caller-supplied id is truncated to [`MAX_RUN_ID_BYTES`] before
+/// it reaches an attribute.
+pub fn record_run_identity(span: &Span, identity: RunIdentity<'_>) {
+    let session = non_empty(identity.a2a_context_id)
+        .map(|id| (id, RUN_ID_SOURCE_A2A_CONTEXT))
+        .or_else(|| {
+            non_empty(identity.capture_session_id).map(|id| (id, RUN_ID_SOURCE_CAPTURE_SESSION))
+        });
+    if let Some((id, source)) = session {
+        span.record("session.id", cap_run_id(id));
+        span.record("sbproxy.run.id_source", source);
+    }
+    record_capped_if_present(span, "graph.node.id", identity.node_id);
+    record_capped_if_present(span, "graph.node.parent_id", identity.parent_node_id);
+    record_capped_if_present(span, "sbproxy.a2a.task_id", identity.task_id);
+    if let Some(verified) = identity.identity_verified {
+        span.record("sbproxy.a2a.identity_verified", verified);
     }
 }
 
@@ -1009,6 +1209,15 @@ mod tests {
             record_finish_reasons(&span, &["stop"]);
             record_input_content(&span, "hello from conformance");
             record_output_content(&span, "collector received the span");
+            record_run_identity(
+                &span,
+                RunIdentity {
+                    a2a_context_id: Some("run-conformance"),
+                    node_id: Some("req-child"),
+                    parent_node_id: Some("req-parent"),
+                    ..RunIdentity::default()
+                },
+            );
         });
         let spans = snapshot_spans(&layer);
         let span = find_span(&spans, "ai.request");
@@ -1049,6 +1258,245 @@ mod tests {
         assert_field(span, "llm.usage.total_cost", "0.000012");
         assert_field(span, "input.value", "hello from conformance");
         assert_field(span, "output.value", "collector received the span");
+        assert_field(span, "session.id", "run-conformance");
+        assert_field(span, "graph.node.id", "req-child");
+        assert_field(span, "graph.node.parent_id", "req-parent");
+    }
+
+    // --- WOR-2139: run identity ---
+
+    /// Build an `ai.request` span, run `record_run_identity` on it, and
+    /// hand back the captured field map. Every run-identity test drives
+    /// the production pair (`ai_request_span` + `record_run_identity`)
+    /// rather than a bespoke span, because recording into a field the
+    /// real span does not declare is a silent no-op and a bespoke span
+    /// would hide exactly that failure.
+    fn run_identity_fields(identity: RunIdentity<'_>) -> HashMap<String, String> {
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = ai_request_span("chat_completions", OP_CHAT, "POST");
+            record_run_identity(&span, identity);
+        });
+        let spans = snapshot_spans(&layer);
+        find_span(&spans, "ai.request").fields.clone()
+    }
+
+    /// The A2A `contextId` wins the OpenInference grouping slot, and the
+    /// capture session keeps its own separate slot rather than being
+    /// overwritten by it.
+    #[test]
+    fn a2a_context_id_wins_the_session_id_slot() {
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = ai_request_span("chat_completions", OP_CHAT, "POST");
+            // The dispatch path stamps the capture session on its own
+            // slot before recording run identity; mirror that ordering.
+            span.record("sbproxy.session_id", "01JBX0000000000000000CAPT");
+            record_run_identity(
+                &span,
+                RunIdentity {
+                    a2a_context_id: Some("run-7"),
+                    capture_session_id: Some("01JBX0000000000000000CAPT"),
+                    ..RunIdentity::default()
+                },
+            );
+        });
+        let spans = snapshot_spans(&layer);
+        let span = find_span(&spans, "ai.request");
+        assert_field(span, "session.id", "run-7");
+        assert_field(span, "sbproxy.run.id_source", "a2a_context_id");
+        // The two are different concepts and both survive: the capture
+        // session feeds the semantic-cache key, so overloading it would
+        // repartition the cache.
+        assert_field(span, "sbproxy.session_id", "01JBX0000000000000000CAPT");
+    }
+
+    /// With no A2A context id the capture session fills the grouping
+    /// slot, which is what keeps `session.id` populated for the traffic
+    /// that is not an agent hop.
+    #[test]
+    fn capture_session_fills_session_id_without_an_a2a_context() {
+        let fields = run_identity_fields(RunIdentity {
+            capture_session_id: Some("01JBX0000000000000000CAPT"),
+            ..RunIdentity::default()
+        });
+        assert_eq!(
+            fields.get("session.id").map(String::as_str),
+            Some("01JBX0000000000000000CAPT")
+        );
+        assert_eq!(
+            fields.get("sbproxy.run.id_source").map(String::as_str),
+            Some("capture_session")
+        );
+    }
+
+    /// Neither grouping key present leaves the slot unset. Recording an
+    /// empty string instead would make "this request grouped under the
+    /// empty run" indistinguishable from "this request was not grouped".
+    #[test]
+    fn neither_grouping_key_leaves_session_id_unset() {
+        let fields = run_identity_fields(RunIdentity::default());
+        assert!(
+            !fields.contains_key("session.id"),
+            "session.id must stay unset, got {fields:?}"
+        );
+        assert!(
+            !fields.contains_key("sbproxy.run.id_source"),
+            "the source slot must not be stamped without a grouping key"
+        );
+    }
+
+    /// An empty wire value is treated as absent rather than recorded, so
+    /// a caller cannot claim the empty run.
+    #[test]
+    fn an_empty_context_id_falls_through_to_the_capture_session() {
+        let fields = run_identity_fields(RunIdentity {
+            a2a_context_id: Some(""),
+            capture_session_id: Some("01JBX0000000000000000CAPT"),
+            ..RunIdentity::default()
+        });
+        assert_eq!(
+            fields.get("session.id").map(String::as_str),
+            Some("01JBX0000000000000000CAPT")
+        );
+        assert_eq!(
+            fields.get("sbproxy.run.id_source").map(String::as_str),
+            Some("capture_session")
+        );
+    }
+
+    /// Per OpenInference an unset parent means the node is the root, so
+    /// the chain root leaves `graph.node.parent_id` alone and a nested
+    /// hop fills it.
+    #[test]
+    fn graph_parent_is_unset_at_the_root_and_set_on_a_nested_hop() {
+        let root = run_identity_fields(RunIdentity {
+            node_id: Some("req-root"),
+            parent_node_id: None,
+            ..RunIdentity::default()
+        });
+        assert_eq!(
+            root.get("graph.node.id").map(String::as_str),
+            Some("req-root")
+        );
+        assert!(
+            !root.contains_key("graph.node.parent_id"),
+            "the chain root must not claim a parent, got {root:?}"
+        );
+
+        let nested = run_identity_fields(RunIdentity {
+            node_id: Some("req-child"),
+            parent_node_id: Some("req-root"),
+            ..RunIdentity::default()
+        });
+        assert_eq!(
+            nested.get("graph.node.parent_id").map(String::as_str),
+            Some("req-root")
+        );
+
+        // An empty parent is the same statement as an absent one; the
+        // A2A header transport can produce either.
+        let empty_parent = run_identity_fields(RunIdentity {
+            node_id: Some("req-child"),
+            parent_node_id: Some(""),
+            ..RunIdentity::default()
+        });
+        assert!(!empty_parent.contains_key("graph.node.parent_id"));
+    }
+
+    /// Trust is visible wherever a run id is. An untrusted caller names
+    /// its own run, so a consumer that reads the id without the flag is
+    /// reading an attacker-controlled grouping.
+    #[test]
+    fn an_unverified_envelope_is_marked_beside_its_run_id() {
+        let unverified = run_identity_fields(RunIdentity {
+            a2a_context_id: Some("run-7"),
+            task_id: Some("task-3"),
+            identity_verified: Some(false),
+            ..RunIdentity::default()
+        });
+        assert_eq!(
+            unverified.get("session.id").map(String::as_str),
+            Some("run-7")
+        );
+        assert_eq!(
+            unverified
+                .get("sbproxy.a2a.identity_verified")
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            unverified.get("sbproxy.a2a.task_id").map(String::as_str),
+            Some("task-3")
+        );
+
+        let verified = run_identity_fields(RunIdentity {
+            a2a_context_id: Some("run-7"),
+            identity_verified: Some(true),
+            ..RunIdentity::default()
+        });
+        assert_eq!(
+            verified
+                .get("sbproxy.a2a.identity_verified")
+                .map(String::as_str),
+            Some("true")
+        );
+
+        // Non-A2A traffic has no trust claim to make either way, so the
+        // flag stays off the span rather than defaulting to false.
+        let plain = run_identity_fields(RunIdentity {
+            capture_session_id: Some("01JBX0000000000000000CAPT"),
+            ..RunIdentity::default()
+        });
+        assert!(!plain.contains_key("sbproxy.a2a.identity_verified"));
+    }
+
+    /// Caller-supplied ids are capped before they reach an attribute.
+    #[test]
+    fn an_over_long_caller_supplied_id_is_capped() {
+        let long = "z".repeat(MAX_RUN_ID_BYTES * 4);
+        let fields = run_identity_fields(RunIdentity {
+            a2a_context_id: Some(long.as_str()),
+            node_id: Some(long.as_str()),
+            parent_node_id: Some(long.as_str()),
+            task_id: Some(long.as_str()),
+            ..RunIdentity::default()
+        });
+        for field in [
+            "session.id",
+            "graph.node.id",
+            "graph.node.parent_id",
+            "sbproxy.a2a.task_id",
+        ] {
+            let value = fields
+                .get(field)
+                .unwrap_or_else(|| panic!("{field} should be recorded"));
+            assert_eq!(value.len(), MAX_RUN_ID_BYTES, "{field} was not capped");
+        }
+    }
+
+    /// The cap never splits a UTF-8 character, so a multi-byte id
+    /// truncates to a shorter valid string rather than to garbage.
+    #[test]
+    fn capping_respects_utf8_boundaries() {
+        // One ASCII byte then four-byte characters, so no character
+        // boundary lands on the cap and the helper has to walk back.
+        let mut wide = String::from("a");
+        wide.push_str(&"\u{1F680}".repeat(MAX_RUN_ID_BYTES));
+        let capped = cap_run_id(&wide);
+        assert!(capped.len() < MAX_RUN_ID_BYTES, "expected a walk-back cut");
+        assert!(capped.len() > MAX_RUN_ID_BYTES - 4);
+        assert!(wide.starts_with(capped));
+        // Still valid UTF-8 by construction: `&str` slicing on a
+        // non-boundary would have panicked above.
+        assert!(capped.ends_with('\u{1F680}'));
+
+        // A value already inside the cap is returned untouched.
+        assert_eq!(cap_run_id("run-7"), "run-7");
     }
 
     /// `UsageTokens::total()` (WOR-1084) sums every dimension,

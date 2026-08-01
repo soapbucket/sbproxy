@@ -1027,17 +1027,53 @@ fn quote_token_yaml_resolves_secret_ref_secret_via_env_fallback() {
 }
 
 #[test]
-fn quote_token_yaml_without_rails_is_a_config_error() {
+fn quote_token_yaml_without_rails_publishes_a_key_and_no_paywall() {
+    // This used to be a config error, which left a seller who wants signed
+    // receipts and no 402 challenge with no way to configure a signing key
+    // at all. The key and the paywall are separate decisions now.
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "valid_tokens": [],
+        "quote_token": {
+            "key_id": "receipts-only-kid",
+            "seed_hex": "0001020304050607080910111213141516171819202122232425262728293031",
+        }
+    }))
+    .expect("quote_token without rails compiles");
+
+    // The key is published, which is what a buyer fetches to check a
+    // receipt.
+    let jwks = policy.quote_token_jwks().expect("jwks");
+    assert_eq!(jwks["keys"][0]["kid"], "receipts-only-kid");
+
+    // And no multi-rail challenge is offered, not even to an agent that
+    // asked for one. Answering with a 406 listing zero supported rails
+    // would be worse than the single-rail body every other unconfigured
+    // origin sends.
+    let headers = multi_rail_headers("GPTBot/1.0", Some("x402;q=1, mpp;q=0.9"), Some("text/html"));
+    match policy.check("GET", "x.com", "/articles/foo", &headers, None) {
+        AiCrawlDecision::Charge { challenge, .. } => {
+            assert!(challenge.contains("Crawler-Payment"), "{challenge}");
+        }
+        other => panic!("expected the single-rail Charge, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_authored_but_empty_rails_block_is_still_a_config_error() {
+    // An absent `rails:` block is a position (no paywall). A `rails:` block
+    // that names no rail is a typo, and it keeps failing closed.
     let err = AiCrawlControlPolicy::from_config(serde_json::json!({
         "price": 0.001,
         "valid_tokens": [],
+        "rails": {},
         "quote_token": {
             "key_id": "test-kid",
             "seed_hex": "0001020304050607080910111213141516171819202122232425262728293031",
         }
     }))
-    .expect_err("quote_token without rails should fail");
-    assert!(err.to_string().contains("rails"), "{err}");
+    .expect_err("an empty rails block should fail");
+    assert!(err.to_string().contains("at least one rail"), "{err}");
 }
 
 #[test]

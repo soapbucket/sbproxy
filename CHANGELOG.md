@@ -86,6 +86,31 @@ the next version cut.
 
 ### Fixed
 
+- **The `a2a` policy no longer decides on inputs the caller controls.**
+  Chain depth, chain membership, and caller and callee identity were read
+  from `X-A2A-*` request headers with no verification and no ingress
+  stripping, so a caller could send `X-A2A-Chain-Depth: 1` with no chain
+  and clear `max_chain_depth` and cycle detection together, or rename
+  itself off `caller_denylist`. The envelope now comes from the RFC 8693
+  `act` claim chain on the verified principal, which a caller cannot
+  flatten, and the `X-A2A-*` headers are honoured only from a peer in
+  `proxy.trusted_proxies` and stripped from everyone else. Operators
+  relying on the header transport must now list the peer that stamps it;
+  `examples/a2a-protocol/` shows the shape. The policy's `route_glob` is
+  also consulted for the first time: it was parsed, validated, and never
+  read, so the one detection signal a caller could not opt out of did
+  nothing. See [A2A gateway](docs/a2a-gateway.md).
+
+- **`sbproxy_a2a_hops_total` distinguishes verified allows from
+  unverified ones.** The `decision` label emitted a bare `allow` whether
+  the policy had checked a verified delegation chain or waved through an
+  envelope it could not trust, so a fully bypassed policy produced the
+  same green dashboard as a working one. Allows are now
+  `allow:verified` or `allow:unverified`, and a request the policy never
+  engaged on records `skip:undetected` rather than nothing at all.
+  Denials are unchanged. This relabels a `beta`-compatibility metric; no
+  dashboard or alert in this repository reads it.
+
 - **Ollama streaming keeps its stream and its usage accounting.** The
   buffered-relay fallback for streaming requests keyed on `text/event-stream`
   alone, so Ollama's NDJSON (`application/x-ndjson`) success responses were

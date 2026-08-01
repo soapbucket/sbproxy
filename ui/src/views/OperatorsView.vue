@@ -43,6 +43,7 @@ function roleLabel(role: OperatorSummary["role"]): string {
           <tr>
             <th>Username</th>
             <th>Role</th>
+            <th>Meter scope</th>
           </tr>
         </thead>
         <tbody>
@@ -53,6 +54,9 @@ function roleLabel(role: OperatorSummary["role"]): string {
                 {{ roleLabel(op.role) }}
               </span>
             </td>
+            <!-- Where a 403 from /api/meter/* comes from. Without this the
+                 refusal has no explanation anywhere in the console. -->
+            <td class="sb-mono">{{ op.tenant || "all tenants" }}</td>
           </tr>
         </tbody>
       </table>

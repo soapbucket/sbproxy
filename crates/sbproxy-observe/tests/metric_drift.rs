@@ -23,10 +23,13 @@
 //!   increments them.
 
 use sbproxy_capability::scan::{self, ReferenceExemption};
-use sbproxy_capability::{validate_metrics, RegistryError};
+use sbproxy_capability::{
+    validate_metrics, CompatTier, MetricCapability, MetricKind, Registry, RegistryError,
+    SupportLevel, Writer,
+};
 use sbproxy_observe::metric_registry::{
-    tenant_label_gaps, METRICS, REFERENCE_EXEMPTIONS, TENANT_LABEL_EXEMPTIONS,
-    TENANT_SCOPED_METRICS,
+    run_scoped_label_gaps, tenant_label_gaps, METRICS, REFERENCE_EXEMPTIONS,
+    RUN_SCOPED_LABEL_EXEMPTIONS, TENANT_LABEL_EXEMPTIONS, TENANT_SCOPED_METRICS,
 };
 use std::path::{Path, PathBuf};
 
@@ -139,6 +142,91 @@ fn every_tenant_scoped_metric_carries_a_tenant_label() {
          ticketed exemption.",
         &tenant_label_gaps(METRICS, TENANT_SCOPED_METRICS, TENANT_LABEL_EXEMPTIONS),
     );
+}
+
+#[test]
+fn no_metric_carries_a_run_scoped_identifier_label() {
+    // Cardinality enforcement, and the inverse of the tenant guard above:
+    // that one requires a label, this one forbids a family of them. A run
+    // id, task id, context id, session id, or trace id takes one distinct
+    // value per run, forever. On a span or a ledger row that is exactly
+    // right and is how a single run is reconstructed. On a metric it mints
+    // one time series per run, and the series outlive the run by the whole
+    // retention window, so the monitoring system pays for a dimension
+    // nobody can usefully group by.
+    //
+    // Unlike `every_tenant_scoped_metric_carries_a_tenant_label`, this one
+    // has no opt-in list to be forgotten: it scans every entry in METRICS.
+    // The failure mode is somebody adding a label without thinking about
+    // it, and that person is not going to register it for a check either.
+    report(
+        "A metric carries a run-scoped identifier label. The rule was stated in \
+         docs/observability.md, on A2AContext::task_id, and in a2a_body_phase.rs, and \
+         enforced nowhere until this guard. Drop the label and put the identifier on the \
+         span and in the ledger, or add a reviewed, ticketed RUN_SCOPED_LABEL_EXEMPTIONS \
+         entry. Giving the label a cardinality budget is not a fix.",
+        &run_scoped_label_gaps(METRICS, RUN_SCOPED_LABEL_EXEMPTIONS),
+    );
+}
+
+#[test]
+fn the_run_scoped_label_guard_catches_a_run_id_label() {
+    // A guard with no proof it can fail is not a guard. The table passes
+    // today, so the assertion above is satisfied by an empty table, a
+    // broken matcher, or a real absence of violations, and it cannot tell
+    // you which. This fixture pins it to the third.
+    let planted = MetricCapability {
+        name: "sbproxy_run_scoped_fixture_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_fixture"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        // `route` is bounded and fine. `run_id` is the bomb, and
+        // `a2a_task_id` is the qualified spelling that an exact-match-only
+        // list would have missed.
+        labels: &["route", "run_id", "a2a_task_id"],
+        description: "A fixture that must never exist in METRICS.",
+        dead_reason: None,
+    };
+
+    let errors = run_scoped_label_gaps(&[planted], RUN_SCOPED_LABEL_EXEMPTIONS);
+
+    assert_eq!(errors.len(), 1, "the guard did not fire: {errors:?}");
+    assert!(
+        errors[0].message.contains("run_id") && errors[0].message.contains("a2a_task_id"),
+        "both offending labels must be named so one run fixes all of them: {:?}",
+        errors[0]
+    );
+    assert!(
+        !errors[0].message.contains("\"route\""),
+        "a bounded label must not be blamed: {:?}",
+        errors[0]
+    );
+}
+
+#[test]
+fn a_run_scoped_label_exemption_needs_a_reason_and_a_ticket() {
+    // Same rule as the dead-reference allow-list above, for the same
+    // reason: the escape hatch is the thing most likely to be abused, and
+    // an exemption here is a series count that grows with traffic for as
+    // long as the entry survives.
+    for exemption in RUN_SCOPED_LABEL_EXEMPTIONS {
+        let ReferenceExemption { metric, reason } = exemption;
+
+        assert!(
+            reason.len() > 40,
+            "exemption for {metric} needs a real reason, not '{reason}'"
+        );
+        assert!(
+            reason.contains("WOR-"),
+            "exemption for {metric} must name the ticket that removes it: '{reason}'"
+        );
+        assert!(
+            METRICS.iter().any(|m| m.name == *metric),
+            "exemption for {metric} names a metric that is not in the registry"
+        );
+    }
 }
 
 #[test]

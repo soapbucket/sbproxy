@@ -1,6 +1,6 @@
 # scripts/
 
-*Last modified: 2026-07-30*
+*Last modified: 2026-07-31*
 
 Helper scripts that wrap the day-to-day dev loop and the CI runners
 the GitHub workflows invoke. Run from the repository root unless a
@@ -10,7 +10,7 @@ script's header says otherwise.
 
 | Script | What it does | CI workflow |
 |---|---|---|
-| `check.sh` | Local CLAUDE.md gate; prefers cargo-nextest for CI-equivalent non-e2e tests, runs doctests, and cleans high-churn build artifacts on exit. | local |
+| `check.sh` | Local CLAUDE.md gate. Mirrors the lanes in `ci.yml`, `docs-ci.yml`, and `doc-drift.yml`, cheapest phase first; requires cargo-nextest; guards that the working tree still matches HEAD at the end. | local |
 | `cleanup-build-artifacts.sh` | Prune generated docs, nextest output, incremental dirs, and transient logs without deleting dependency build outputs. | local + CI |
 | `run-e2e.sh` | Build the Rust proxy and run the maintained HTTP conformance smoke set. | local + CI |
 | `run-all-e2e.sh` | Build the Rust proxy and audit all 93 cases in the historical HTTP catalog. | local + CI |
@@ -30,6 +30,13 @@ header. Run `<script> --help` to dump the header.
 lane to keep local disk growth bounded. Set `SBPROXY_RELEASE_TESTS=1`
 for release-profile test binaries and `SBPROXY_CHECK_E2E=1` when you
 need to include the full e2e package locally.
+
+It fails when the working tree is dirty at the end of the run, because
+the gate validates the working tree while `git push` ships HEAD. Set
+`SBPROXY_ALLOW_DIRTY_TREE=1` for a deliberate work-in-progress run.
+Every phase it could not run is reprinted as a `SKIPPED PHASES` block
+before the final result; `promtool` and `cargo-deny` are the two
+optional tools that land there. The full env-var list is in `CLAUDE.md`.
 
 `cleanup-build-artifacts.sh --aggressive` additionally removes
 `target/release` after local release-profile experiments. The default

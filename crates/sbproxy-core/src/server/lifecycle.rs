@@ -633,6 +633,10 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
 
     let mut new_pipeline = CompiledPipeline::from_config(compiled)?;
     preflight_default_safety_centroids(&new_pipeline)?;
+    // A settlement runtime that will not start fails the reload before the
+    // pipeline is swapped, so the previous generation keeps serving with its
+    // store and its worker untouched.
+    attach_payments_runtime(&mut new_pipeline)?;
 
     // WOR-196: pick up `listings/*.yaml` from the same Repo (the
     // directory the served `sb.yml` lives in) and stash the loaded
@@ -957,6 +961,56 @@ pub fn install_sighup_handler(config_path: String) {
             }
         }
     });
+}
+
+/// Build and publish the settlement runtime for a freshly compiled pipeline.
+///
+/// A no-op when `proxy.payments` is absent, which is the default and leaves
+/// the existing non-settlement ledger behaviour exactly as it was.
+///
+/// Failure is fatal to the pipeline rather than degrading. Every other
+/// subsystem in this file that fails at boot can serve without itself:
+/// alerting stops evaluating, listings serve empty. Settlement cannot,
+/// because the thing it would degrade to is answering a payer's credential
+/// without a durable record of what was charged.
+///
+/// # Errors
+///
+/// Returns the startup failure, which names the configuration surface the
+/// operator wrote.
+#[cfg(feature = "payments")]
+fn attach_payments_runtime(pipeline: &mut CompiledPipeline) -> anyhow::Result<()> {
+    let Some(payments) = pipeline.config.server.payments.clone() else {
+        return Ok(());
+    };
+    let clustered = pipeline.config.server.cluster.is_some();
+    let runtime = crate::billing_runtime::install(&payments, clustered)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    tracing::info!(
+        rails = ?runtime.rails(),
+        schema_version = runtime.status().schema_version,
+        "payment settlement runtime published",
+    );
+    pipeline.payments = Some(runtime);
+    Ok(())
+}
+
+/// Settlement is not compiled into this build.
+///
+/// A configured `proxy.payments` block still fails, and names the feature,
+/// rather than being parsed and quietly ignored. The configuration crate
+/// carries no `cfg` of its own precisely so this check lives here.
+#[cfg(not(feature = "payments"))]
+fn attach_payments_runtime(pipeline: &mut CompiledPipeline) -> anyhow::Result<()> {
+    if pipeline.config.server.payments.is_some() {
+        anyhow::bail!(
+            "proxy.payments is configured but this binary was built without the `payments` \
+             cargo feature, so it has no settlement store, no authoritative service, and no \
+             recovery worker. Rebuild with `--features payments` plus the flag for each rail \
+             the routes advertise, or remove the block"
+        );
+    }
+    Ok(())
 }
 
 /// SIGHUP handler is a no-op on non-Unix targets.
@@ -1385,6 +1439,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // Compile config into a pipeline with action/auth/policy module instances.
     let mut pipeline = CompiledPipeline::from_config(compiled)?;
     preflight_default_safety_centroids(&pipeline)?;
+    attach_payments_runtime(&mut pipeline)?;
 
     // WOR-196: pick up `listings/*.yaml` from the same Repo (the
     // directory the served `sb.yml` lives in) and stash the loaded
@@ -1869,6 +1924,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                             username: o.username.clone(),
                             password_hash: o.password_hash.clone(),
                             role: o.role,
+                            // WOR-2131: the meter's tenant scope for this
+                            // login. Carried through so the admin surface
+                            // reads it from config rather than from a token.
+                            tenant: o.tenant.clone(),
                         })
                         .collect()
                 })
@@ -3597,6 +3656,7 @@ origins:
             agents_json: None,
             outbound_credential: None,
             outbound_web_bot_auth: false,
+            attestation: None,
             observability: Some(OriginObservabilityConfig {
                 log: OriginObservabilityLogConfig {
                     sinks: Vec::new(),

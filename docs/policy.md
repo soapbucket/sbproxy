@@ -1,5 +1,5 @@
 # Policy engine
-*Last modified: 2026-07-26*
+*Last modified: 2026-07-31*
 
 The policy engine evaluates a list of policies on every request. Each policy returns one of four verdicts: `Allow`, `Deny`, `AllowWithHeaders`, or `Confirm`. The dispatcher folds the per-policy results into a single decision and applies it before the request reaches the upstream.
 
@@ -180,6 +180,8 @@ Depth, cycles, and caller and callee lists are all enforced before the upstream 
 
 Per-route enforcement for agent-to-agent calls. Source: `crates/sbproxy-modules/src/policy/a2a.rs`. The policy fires after authentication and after the resolver chain has populated `caller_agent_id`. Detection runs automatically on two header signals (`Content-Type: application/a2a+json` and `MCP-Method: agents.invoke`); `route_glob` is the operator escape hatch.
 
+Both header signals are the caller's to send or withhold, and an undetected request is allowed, so **set `route_glob` on any route you intend to govern**. Likewise the envelope these checks read is only trusted when it comes from a signed token's RFC 8693 `act` chain or from a peer in `proxy.trusted_proxies`; from anyone else it is discarded and the policy evaluates an empty envelope that trips nothing. [A2A gateway](a2a-gateway.md) covers both in full. It is worth reading before relying on the knobs below.
+
 Knobs:
 
 - `max_chain_depth`: hard ceiling on hops. Capped at 32 regardless of the configured value. Exceeding it returns 429.
@@ -189,6 +191,7 @@ Knobs:
 - `caller_denylist`: agents on this list never get past the policy. Returns 403.
 - `bill_caller_only`: true (default) bills the caller's wallet. Setting false flips to callee-billed semantics; the audit log stamps `pricing_anomaly: callee_billed` on each such transaction.
 - `route_glob`: any request whose path matches is treated as A2A traffic even when the protocol-detection headers are absent.
+- `push_target_allowlist`: hosts permitted as A2A 1.0 push-notification webhook targets even when they resolve to private address space. A2A lets a caller register a URL the upstream agent POSTs task artifacts to, so the default posture refuses private targets and non-HTTP schemes; internal callbacks are legitimate, but the operator names the host rather than getting it implicitly. Refusals return 403 with `a2a_push_target_blocked`.
 
 ```yaml
 policies:
@@ -201,9 +204,15 @@ policies:
     caller_denylist:
       - "agent:bad:actor"
     route_glob: "/agents/**"
+    push_target_allowlist:
+      - "callbacks.internal.example"
 ```
 
-Runnable example: `examples/a2a-protocol/sb.yml`.
+On detected A2A 1.0 routes the proxy buffers the request body so the push-notification target can be validated before it reaches the agent. The v0 drafts have no push-notification surface and are not buffered.
+
+Composing `prompt_injection_v2` on the same origin additionally scans the message the hop carries, with the action chosen by delegation depth. See [prompt-injection-v2.md](prompt-injection-v2.md#the-agent-boundary).
+
+Runnable examples: `examples/a2a-protocol/sb.yml` for the hop policy on its own, `examples/a2a-prompt-injection/sb.yml` for the two composed.
 
 ## See also
 

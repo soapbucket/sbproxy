@@ -40,6 +40,17 @@
 //! panel draws, and the answer it gives is to a question nobody asked. See
 //! `WOR-1896` for the shape of that bug in `snapshot_named`, and the module
 //! doc on `tenant_label_gaps` below for the fix.
+//!
+//! A third guard, `run_scoped_label_gaps`, runs the opposite way. The tenant
+//! one requires a label; this one forbids a family of them. Run ids, task
+//! ids, context ids, session ids, and trace ids take one distinct value per
+//! run, forever, so as label values they mint one time series per run and
+//! the series count grows with traffic rather than with the system. That rule
+//! was stated in three places and enforced in none before `WOR-2139`:
+//! `docs/observability.md` in prose, `A2AContext::task_id` in a doc comment,
+//! and `PROMPT_INJECTION_REASON` in
+//! `crates/sbproxy-core/src/server/a2a_body_phase.rs`, which honoured it only
+//! by never passing one. Prose does not fail a build.
 
 use sbproxy_capability::scan::ReferenceExemption;
 use sbproxy_capability::{
@@ -450,6 +461,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["route", "spec", "decision"],
         description: "A2A hops observed by the proxy, labelled by route, spec, and policy decision.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_a2a_methods_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_a2a_method"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["route", "method"],
+        description: "A2A 1.0 JSON-RPC methods observed by the proxy, labelled by route and method.",
         dead_reason: None,
     },
     MetricCapability {
@@ -1979,6 +2001,90 @@ pub const METRICS: &[MetricCapability] = &[
         description: "MCP upstream IO failures absorbed by deadlines and byte caps, by kind.",
         dead_reason: None,
     },
+    // Attested metering (WOR-2129). Six families under one fresh
+    // `sbproxy_meter_` namespace, chosen rather than extending an existing
+    // prefix so that none of them can collide with a name an earlier
+    // observability wave left behind.
+    //
+    // None of these is the billing record. The signed chain is. OTLP export
+    // drops batches on failure, cumulative counters reset across a restart,
+    // and aggregation windows destroy the individual receipts, so a total
+    // read here can be short by a deploy's worth of traffic with nothing
+    // anywhere saying so. `crates/sbproxy-observe/src/meter_metrics.rs`
+    // states that in its module docs and `docs/observability.md` states it
+    // to operators, because the failure mode is somebody invoicing off a
+    // Grafana panel and being quietly wrong.
+    //
+    // `route` is absent from every label set below and stays absent.
+    // `tenant x route x unit x source x outcome` is a cardinality bomb and
+    // route is by far the largest factor in it. Route lives on the receipt,
+    // which is reachable from the append histogram's trace exemplar.
+    MetricCapability {
+        name: "sbproxy_meter_append_duration_seconds",
+        kind: MetricKind::Histogram,
+        writer: Writer::Recorder("record_meter_append_duration"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &[],
+        description: "Time to append one entry to the meter's signed chain, including lock wait.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_meter_chain_gap_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_meter_chain_gap"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["tenant_id", "failure_mode"],
+        description: "Records the meter owed and could not write, by tenant and the posture in force.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_meter_chain_seq",
+        kind: MetricKind::Gauge,
+        writer: Writer::Recorder("set_meter_chain_seq"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &[],
+        description: "Head sequence number of the meter's signed chain.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_meter_divergence_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_meter_divergence"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["tenant_id"],
+        description: "Windows in which counted units and chained units disagreed, by tenant.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_meter_receipts_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_meter_receipt"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["tenant_id", "outcome", "billable"],
+        description: "Metered attempts, by tenant, outcome, and the operator's billing answer for it.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_meter_units_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_meter_units"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["tenant_id", "unit", "source"],
+        description: "Units the meter counted, by tenant, operator-chosen unit name, and provenance.",
+        dead_reason: None,
+    },
     // Self-observability. If the scrape body fails to encode, the endpoint
     // serves 200 with an empty payload, which looks exactly like a healthy
     // process emitting nothing. This is the one series that has to survive
@@ -2412,6 +2518,81 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["host", "method", "status"],
         description: "Wall-clock latency of one outbound upstream request.",
+        dead_reason: None,
+    },
+    // Payment settlement families. Every label on all six is a closed enum
+    // held in code, not a value copied off a request: `rail` is the
+    // settlement rail, `operation` is the settlement or recovery step,
+    // `outcome` is the durable transition the store committed, and
+    // `provider_class` is the kind of provider rather than the provider.
+    // No payer, tenant, quote, challenge, intent, provider reference,
+    // credential, or provider error string is reachable from any writer
+    // here, which is what keeps a settlement metric from becoming a way to
+    // read who paid for what.
+    MetricCapability {
+        name: "sbproxy_payment_provider_calls_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_payment_provider_call"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["rail", "operation", "provider_class"],
+        description: "Payment provider calls that left the process, by rail, operation, and provider class.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_payment_rail_enabled",
+        kind: MetricKind::Gauge,
+        writer: Writer::Recorder("record_payment_rail_enabled"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["rail"],
+        description: "1 for each settlement rail this build compiled and this configuration registered, 0 otherwise.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_payment_recovery_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_payment_recovery"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["operation", "outcome"],
+        description: "Durable rows the settlement recovery worker moved, by recovery operation and committed outcome.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_payment_settlement_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_payment_settlement"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["rail", "operation", "outcome"],
+        description: "Durable payment settlement transitions, by rail, operation, and committed outcome.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_payment_worker_drain_clean",
+        kind: MetricKind::Gauge,
+        writer: Writer::Recorder("record_payment_worker_drain"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &[],
+        description: "1 when the settlement worker drained inside its shutdown deadline, 0 when it was abandoned mid tick.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_payment_worker_ticks_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_payment_worker_ticks"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &[],
+        description: "Completed settlement recovery worker ticks.",
         dead_reason: None,
     },
     MetricCapability {
@@ -2977,6 +3158,18 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     "sbproxy_inbound_key_requests_total",
     "sbproxy_judge_budget_exhausted_total",
     "sbproxy_label_cardinality_overflow_per_tenant_total",
+    // Every meter family with a tenant dimension. Tenant-relevant is not a
+    // judgement call here: a metering counter exists to say what one
+    // customer owes, and one that merged every customer's units into a
+    // single series would answer a question nobody asked while sitting
+    // under a name that promises otherwise. `sbproxy_meter_chain_seq` and
+    // `sbproxy_meter_append_duration_seconds` are deliberately absent:
+    // both describe the chain and the process rather than a customer, and
+    // neither carries a tenant label to check.
+    "sbproxy_meter_chain_gap_total",
+    "sbproxy_meter_divergence_total",
+    "sbproxy_meter_receipts_total",
+    "sbproxy_meter_units_total",
     "sbproxy_policy_audit_events_dropped_total",
     "sbproxy_rate_limit_suspend_total",
     "sbproxy_rate_limit_total",
@@ -3064,6 +3257,278 @@ pub fn tenant_label_gaps(
                 subject: exemption.metric.to_string(),
                 message: "has a TENANT_LABEL_EXEMPTIONS entry but is not listed in \
                           TENANT_SCOPED_METRICS"
+                    .to_string(),
+            });
+        }
+    }
+
+    errors
+}
+
+// --- Run-scoped label guard (cardinality) ---
+//
+// The tenant guard above asks whether a label is missing. This one asks
+// whether a label should never have been there. They are the two halves of
+// the same question about a label set, and the second is the one that takes
+// a Prometheus server down: a run id is unbounded by construction, one value
+// per run, forever, so the series count tracks traffic rather than the
+// system being measured.
+//
+// This is deliberately a static guard and not a `crate::cardinality` budget
+// entry. The runtime limiter caps unique values per label name and demotes
+// the overflow to `__other__`; a label it has never heard of falls through
+// to the workspace default of 1000. Point that at a run id and you get the
+// worst of both: 1000 dead series per process, then a label whose value is
+// `__other__` for every subsequent run, which reads as data and is not.
+// Adding a budget for `run_id` would be answering "how many run ids may we
+// keep" when the answer is "none". Do not resolve a failure here by giving
+// the offending label a budget.
+
+/// Label names that carry a run-scoped identifier, which no Prometheus
+/// family may use.
+///
+/// Every entry names one value per run, per task, per session, or per trace.
+/// These identifiers are correct and necessary as span attributes and as
+/// ledger and audit fields, where the storage cost is one row per event and
+/// the lookup is by id. On a metric they are a cardinality bomb: the label
+/// mints a fresh time series for a value that will never be observed again,
+/// and the series is retained for the whole retention window.
+///
+/// The list is matched **exactly** (ASCII case-insensitively), not by
+/// substring. Substring matching reads as the stronger rule and is the wrong
+/// one here: `request` is a substring of `request_class`, `run` is a
+/// substring of `runtime` and of `truncated`, and `context` would fail to
+/// catch `ctx_id` anyway, so the pattern buys false positives without buying
+/// coverage. Label names are a short, closed, reviewed vocabulary (113
+/// distinct names across the whole table today), so an exact list is both
+/// auditable and greppable, and a name that belongs on it can simply be
+/// added. Each identifier is listed under every spelling that has ever shown
+/// up in this codebase or in the specs it implements: separated
+/// (`run_id`), run together (`runid`), abbreviated (`ctx_id`), and bare
+/// (`run`). A bare stem is included because a label named `run` or `session`
+/// is an identifier in practice; a bounded dimension has a more specific
+/// name, and `request_class` is exactly what that looks like.
+///
+/// Exact matching alone would still miss a qualified id such as
+/// `parent_request_id`, which is a real field name in `A2AContext` today, so
+/// [`RUN_SCOPED_LABEL_STEMS`] extends the rule to the one structural case
+/// that is safe to generalize.
+pub const RUN_SCOPED_LABEL_NAMES: &[&str] = &[
+    // Run and task identity (the WOR-2139 subject).
+    "run",
+    "run_id",
+    "runid",
+    "task",
+    "task_id",
+    "taskid",
+    // Agent context and conversation identity.
+    "context",
+    "context_id",
+    "contextid",
+    "ctx",
+    "ctx_id",
+    "conversation",
+    "conversation_id",
+    "conversationid",
+    "convo_id",
+    // Session identity.
+    "session",
+    "session_id",
+    "sessionid",
+    "sess_id",
+    // W3C trace context. A span id is worse than a trace id: one value per
+    // operation rather than one per request.
+    "trace",
+    "trace_id",
+    "traceid",
+    "traceparent",
+    "tracestate",
+    "span",
+    "span_id",
+    "spanid",
+    // Request and correlation identity.
+    "request",
+    "request_id",
+    "requestid",
+    "req",
+    "req_id",
+    "reqid",
+    "correlation",
+    "correlation_id",
+    "correlationid",
+    "corr_id",
+];
+
+/// Identifier stems that make a qualified `*_id` label run-scoped.
+///
+/// The one generalization on top of [`RUN_SCOPED_LABEL_NAMES`], and it is
+/// anchored rather than free-floating: a label is run-scoped if it ends in
+/// `_id`, `_uuid`, or `_guid` and the underscore-separated segment
+/// immediately before that suffix is one of these stems. So `a2a_task_id`,
+/// `parent_request_id`, and `agent_run_id` are caught, which matters because
+/// run identity is arriving across this codebase and a qualified spelling is
+/// the likely one.
+///
+/// The anchoring is what keeps it safe. `api_key_id`, `agent_id`, `node_id`,
+/// `policy_id`, `rule_id`, and `tenant_id` are all live labels today and all
+/// pass, because the segment before their suffix is `key`, `agent`, `node`,
+/// `policy`, `rule`, or `tenant`. `request_class` and `retry_class` pass too,
+/// because the rule only fires on an id suffix.
+pub const RUN_SCOPED_LABEL_STEMS: &[&str] = &[
+    "run",
+    "task",
+    "context",
+    "ctx",
+    "session",
+    "sess",
+    "trace",
+    "span",
+    "request",
+    "req",
+    "correlation",
+    "corr",
+    "conversation",
+    "convo",
+];
+
+/// Whether `label` names a run-scoped identifier.
+///
+/// Exact match against [`RUN_SCOPED_LABEL_NAMES`], plus the anchored
+/// `*_<stem>_id` rule described on [`RUN_SCOPED_LABEL_STEMS`]. Both halves
+/// are ASCII case-insensitive so `runId` and `RUN_ID` cannot slip past a
+/// list written in the lowercase Prometheus convention.
+fn is_run_scoped_label(label: &str) -> bool {
+    let lower = label.to_ascii_lowercase();
+
+    if RUN_SCOPED_LABEL_NAMES.contains(&lower.as_str()) {
+        return true;
+    }
+
+    for suffix in ["_id", "_uuid", "_guid"] {
+        let Some(head) = lower.strip_suffix(suffix) else {
+            continue;
+        };
+        let stem = head.rsplit('_').next().unwrap_or(head);
+        if RUN_SCOPED_LABEL_STEMS.contains(&stem) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Families that carry a run-scoped label today, and the ticket that removes
+/// it.
+///
+/// Empty today, because the table is clean today. Kept ready rather than
+/// deleted, mirroring [`REFERENCE_EXEMPTIONS`] and [`TENANT_LABEL_EXEMPTIONS`],
+/// so that a genuine conflict is a reviewed line with a ticket on it rather
+/// than a quiet edit to [`RUN_SCOPED_LABEL_NAMES`]. An entry here is the only
+/// sanctioned way to keep such a label, and it is meant to be embarrassing
+/// enough to be temporary: the series it describes are already being minted
+/// while the entry sits here.
+pub const RUN_SCOPED_LABEL_EXEMPTIONS: &[ReferenceExemption] = &[];
+
+/// Enforce that no family in `metrics` carries a run-scoped identifier label,
+/// unless `exemptions` names it.
+///
+/// **This scans every entry in `metrics`, with no opt-in list.** That is the
+/// deliberate difference from [`tenant_label_gaps`], which only inspects
+/// families a human remembered to name in [`TENANT_SCOPED_METRICS`]. An
+/// opt-in list works for a guard whose subject is a family's *meaning*, which
+/// no table can infer. It does not work here, because the failure mode is
+/// somebody adding a label without thinking about it at all, and a person who
+/// did not think about the cardinality of `run_id` is not going to think
+/// about registering it for the check either. Whitelisting is the escape
+/// hatch, and it is an explicit, ticketed one.
+///
+/// Three failure modes, all collected so a single run surfaces everything
+/// wrong at once:
+///
+/// - a declared metric whose `labels` carry a run-scoped identifier that
+///   `exemptions` does not cover; each new value of that label is a new time
+///   series that will never be written again and will still be held for the
+///   whole retention window, so the cost is paid by the monitoring system
+///   rather than by the change that caused it;
+/// - an exemption naming a metric that is not declared in `metrics` at all (a
+///   typo, or the family was renamed and the rename was not mirrored);
+/// - an exemption naming a metric that carries no run-scoped label, which is
+///   either stale (the label was removed and the entry should have gone with
+///   it) or was never a real violation and should not have been written.
+///
+/// # Why this is not a cardinality budget
+///
+/// `crate::cardinality` is the runtime limiter: it caps unique values per
+/// label name and demotes the overflow to `__other__`. It is the right tool
+/// for a label that is bounded in principle and unbounded in practice, such
+/// as `hostname`. It is the wrong tool here, and reaching for it is the
+/// tempting mistake. A label the budget table has never heard of falls
+/// through to the workspace default of 1000, so a run id would be *admitted*:
+/// 1000 write-once series per process, and then a label reading `__other__`
+/// for every subsequent run, which looks like data and is not. A budget entry
+/// answers "how many run ids may we keep", and the answer is none. Do not
+/// resolve a failure from this function by adding the offending label to
+/// `crate::cardinality::budget_for_label`.
+pub fn run_scoped_label_gaps(
+    metrics: &[MetricCapability],
+    exemptions: &[ReferenceExemption],
+) -> Vec<RegistryError> {
+    let mut errors = Vec::new();
+
+    for metric in metrics {
+        let offending: Vec<&str> = metric
+            .labels
+            .iter()
+            .copied()
+            .filter(|&label| is_run_scoped_label(label))
+            .collect();
+
+        if offending.is_empty() {
+            continue;
+        }
+
+        if exemptions
+            .iter()
+            .any(|exemption| exemption.metric == metric.name)
+        {
+            continue;
+        }
+
+        errors.push(RegistryError {
+            subject: metric.name.to_string(),
+            message: format!(
+                "carries the run-scoped label(s) {offending:?}. A run, task, context, session, \
+                 or trace id takes one distinct value per run, so as a label value it mints one \
+                 time series per run and the series count grows with traffic instead of with the \
+                 system. Put the identifier on the span and in the ledger, where it is correct, \
+                 and partition the metric by a bounded dimension instead (route, outcome, \
+                 reason, decision). Do not give the label a cardinality budget: a budget caps \
+                 the damage at 1000 dead series and then reports __other__ forever. If the label \
+                 genuinely has to stay for now, add a RUN_SCOPED_LABEL_EXEMPTIONS entry naming \
+                 the ticket that removes it."
+            ),
+        });
+    }
+
+    for exemption in exemptions {
+        let Some(metric) = metrics.iter().find(|m| m.name == exemption.metric) else {
+            errors.push(RegistryError {
+                subject: exemption.metric.to_string(),
+                message: "has a RUN_SCOPED_LABEL_EXEMPTIONS entry but is not declared in METRICS"
+                    .to_string(),
+            });
+            continue;
+        };
+
+        if !metric
+            .labels
+            .iter()
+            .any(|&label| is_run_scoped_label(label))
+        {
+            errors.push(RegistryError {
+                subject: exemption.metric.to_string(),
+                message: "has a RUN_SCOPED_LABEL_EXEMPTIONS entry but carries no run-scoped \
+                          label; the exemption is stale, so delete it"
                     .to_string(),
             });
         }
@@ -3254,6 +3719,177 @@ mod tenant_label_gap_tests {
         // tenant_id/tenant/workspace/api_key_id from one of these families,
         // or renames the family without updating this list, fails here.
         let errors = tenant_label_gaps(METRICS, TENANT_SCOPED_METRICS, TENANT_LABEL_EXEMPTIONS);
+        assert_eq!(errors, vec![], "{errors:?}");
+    }
+}
+
+#[cfg(test)]
+mod run_scoped_label_gap_tests {
+    use super::*;
+
+    fn metric(name: &'static str, labels: &'static [&'static str]) -> MetricCapability {
+        MetricCapability {
+            name,
+            kind: MetricKind::Counter,
+            writer: Writer::Recorder("record_thing"),
+            support: SupportLevel::Stable,
+            compat: CompatTier::Beta,
+            registry: Registry::Default,
+            labels,
+            description: "A thing.",
+            dead_reason: None,
+        }
+    }
+
+    #[test]
+    fn a_bounded_label_set_passes() {
+        let metrics = [metric(
+            "sbproxy_thing_total",
+            &["route", "outcome", "reason"],
+        )];
+        assert_eq!(run_scoped_label_gaps(&metrics, &[]), vec![]);
+    }
+
+    #[test]
+    fn every_forbidden_name_is_caught_on_its_own() {
+        for name in RUN_SCOPED_LABEL_NAMES {
+            let labels = std::slice::from_ref(name);
+            let metrics = [metric("sbproxy_thing_total", labels)];
+            let errors = run_scoped_label_gaps(&metrics, &[]);
+            assert_eq!(errors.len(), 1, "label {name:?} was not caught: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn a_forbidden_name_is_caught_whatever_its_case() {
+        let cases: [&'static [&'static str]; 3] = [&["RUN_ID"], &["RunId"], &["Trace_Id"]];
+        for labels in cases {
+            let metrics = [metric("sbproxy_thing_total", labels)];
+            assert_eq!(
+                run_scoped_label_gaps(&metrics, &[]).len(),
+                1,
+                "label {labels:?} was not caught"
+            );
+        }
+    }
+
+    #[test]
+    fn a_qualified_run_scoped_id_is_caught() {
+        // The spelling the run-identity rollout is most likely to produce.
+        // `parent_request_id` is already a field name on `A2AContext`.
+        let cases: [&'static [&'static str]; 5] = [
+            &["a2a_task_id"],
+            &["parent_request_id"],
+            &["agent_run_id"],
+            &["upstream_trace_id"],
+            &["mcp_session_uuid"],
+        ];
+        for labels in cases {
+            let metrics = [metric("sbproxy_thing_total", labels)];
+            let errors = run_scoped_label_gaps(&metrics, &[]);
+            assert_eq!(errors.len(), 1, "{labels:?} was not caught: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn bounded_lookalike_labels_are_not_false_positives() {
+        // Every one of these is either a live label in METRICS today or the
+        // shape a substring match would have wrecked. A guard that cries
+        // wolf here gets deleted by the third person who hits it.
+        let metrics = [metric(
+            "sbproxy_thing_total",
+            &[
+                "request_class",
+                "retry_class",
+                "route_class",
+                "runtime",
+                "truncated",
+                "content_shape",
+                "api_key_id",
+                "key_id",
+                "agent_id",
+                "node_id",
+                "policy_id",
+                "rule_id",
+                "tenant_id",
+                "transition",
+                "close_reason",
+            ],
+        )];
+        assert_eq!(run_scoped_label_gaps(&metrics, &[]), vec![]);
+    }
+
+    #[test]
+    fn the_offending_label_is_named_in_the_error() {
+        let metrics = [metric("sbproxy_thing_total", &["route", "run_id"])];
+        let errors = run_scoped_label_gaps(&metrics, &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains("run_id"), "{:?}", errors[0]);
+        assert!(
+            !errors[0].message.contains("\"route\""),
+            "the bounded label should not be blamed: {:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn a_declared_exemption_suppresses_the_violation() {
+        let metrics = [metric("sbproxy_thing_total", &["run_id"])];
+        let exemptions = [ReferenceExemption {
+            metric: "sbproxy_thing_total",
+            reason: "the label is read by the migration dashboard until the ledger \
+                     view replaces it (WOR-9999).",
+        }];
+        assert_eq!(run_scoped_label_gaps(&metrics, &exemptions), vec![]);
+    }
+
+    #[test]
+    fn an_exemption_for_a_metric_that_is_not_in_violation_is_reported() {
+        let metrics = [metric("sbproxy_thing_total", &["route"])];
+        let exemptions = [ReferenceExemption {
+            metric: "sbproxy_thing_total",
+            reason: "some historical reason that no longer describes this metric.",
+        }];
+        let errors = run_scoped_label_gaps(&metrics, &exemptions);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].message.contains("carries no run-scoped"),
+            "{:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn an_exemption_for_an_undeclared_metric_is_reported() {
+        let metrics: [MetricCapability; 0] = [];
+        let exemptions = [ReferenceExemption {
+            metric: "sbproxy_missing_total",
+            reason: "names a family that no longer exists.",
+        }];
+        let errors = run_scoped_label_gaps(&metrics, &exemptions);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].message.contains("not declared in METRICS"),
+            "{:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn every_violation_is_reported_in_one_run() {
+        let metrics = [
+            metric("sbproxy_one_total", &["run_id"]),
+            metric("sbproxy_two_total", &["task_id"]),
+            metric("sbproxy_three_total", &["route"]),
+        ];
+        let errors = run_scoped_label_gaps(&metrics, &[]);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+    }
+
+    #[test]
+    fn the_real_metric_table_carries_no_run_scoped_label() {
+        // The build-time guard, over the whole table with no opt-in list.
+        let errors = run_scoped_label_gaps(METRICS, RUN_SCOPED_LABEL_EXEMPTIONS);
         assert_eq!(errors, vec![], "{errors:?}");
     }
 }

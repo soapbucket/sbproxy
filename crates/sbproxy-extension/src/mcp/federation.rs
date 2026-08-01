@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 use super::egress::{EgressPolicy, SystemHostResolver};
 use super::sse_client::send_via_sse;
 use super::streamable::send_request;
-use super::types::{JsonRpcRequest, JsonRpcResponse};
+use super::types::{JsonRpcRequest, JsonRpcResponse, META_TRACEPARENT, SEP_414_RESERVED_META_KEYS};
 use sbproxy_security::egress::EgressPurpose;
 
 /// Outcome of [`McpFederation::call_tool_with_policy`].
@@ -819,10 +819,17 @@ impl McpFederation {
                     resource.server_name
                 )
             })?;
+        // SEP-414: a `resources/read` is work done for one inbound
+        // caller, on that caller's thread of execution, so it carries
+        // the trace context the same way `tools/call` does.
+        let trace_pairs = sbproxy_observe::telemetry::propagation_pairs();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "resources/read".to_string(),
-            params: Some(json!({ "uri": resource.upstream_uri })),
+            params: Some(merge_trace_context(
+                json!({ "uri": resource.upstream_uri }),
+                &trace_pairs,
+            )),
             id: Some(json!(1)),
         };
         let resp = self.dispatch_request(server, &req, &[]).await?;
@@ -919,6 +926,13 @@ impl McpFederation {
     /// `workspace_id`) and `None` (for `agent_id`) are the documented
     /// "unset" sentinels.
     ///
+    /// An empty `correlation_id` is not passed to the hook verbatim.
+    /// WOR-2139 resolves it to the active W3C trace id, the same trace
+    /// the upstream receives in `params._meta.traceparent`, so a hook
+    /// verdict and the tool call it gated share a key. It stays empty
+    /// when nothing is traced. A caller that supplies its own value
+    /// keeps it.
+    ///
     /// PR β policy verdict semantics (mirrored in the
     /// [`sbproxy_plugin::mcp`] rustdoc):
     ///
@@ -993,6 +1007,12 @@ impl McpFederation {
 
     /// Policy-aware tool call that also forwards upstream HTTP headers
     /// (run-as-user Authorization) on the wire.
+    ///
+    /// This is where the outbound `tools/call` envelope is built, so it
+    /// is also where SEP-414 trace context is attached: the active
+    /// trace goes into `params._meta` with unprefixed keys, which
+    /// reaches the upstream on every transport including stdio. See
+    /// `merge_trace_context` for why the body rather than a header.
     #[allow(clippy::too_many_arguments)] // policy identity + audit + upstream auth seams
     pub async fn call_tool_with_policy_cause_and_headers(
         &self,
@@ -1018,6 +1038,27 @@ impl McpFederation {
                     federated.server_name
                 )
             })?;
+
+        // WOR-2139: read the active trace context once, up front, and
+        // use it for both things that need it below: the hook's
+        // `correlation_id` and the SEP-414 `_meta` block on the
+        // outbound request. Reading it twice could hand the hook one
+        // trace id and the upstream another if the span changed in
+        // between, which is precisely the correlation failure this
+        // change exists to fix.
+        let trace_pairs = sbproxy_observe::telemetry::propagation_pairs();
+        // The caller's own correlation id wins whenever it set one.
+        // Empty is the documented "unset" sentinel, and every
+        // production caller passes it, so fall back to the active
+        // trace id: it is a real value, and it is the same trace the
+        // upstream is about to receive in `params._meta.traceparent`,
+        // so a hook's logs join to the tool call they gated. Still
+        // empty when nothing is traced.
+        let correlation_id = if correlation_id.is_empty() {
+            trace_id_from_traceparent(&trace_pairs).unwrap_or("")
+        } else {
+            correlation_id
+        };
 
         // PR β: walk registered policy hooks in registration order
         // and take the first non-Allow verdict. With at most one
@@ -1115,10 +1156,13 @@ impl McpFederation {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "tools/call".to_string(),
-            params: Some(json!({
-                "name": tool_name,
-                "arguments": arguments,
-            })),
+            params: Some(merge_trace_context(
+                json!({
+                    "name": tool_name,
+                    "arguments": arguments,
+                }),
+                &trace_pairs,
+            )),
             id: Some(json!(1)),
         };
 
@@ -1231,6 +1275,14 @@ impl McpFederation {
             let mut builder = self
                 .openapi_client
                 .request(http_method.clone(), dest.url.clone());
+            // WOR-2139: an OpenAPI-backed tool dispatches as a plain
+            // REST request, so its carrier is the HTTP header, not the
+            // `_meta` block a JSON-RPC body would have carried. Header
+            // injection is re-applied per redirect attempt so a
+            // followed hop is traced too, and `traceparent` is not a
+            // credential, so it rides along on an authorized redirect
+            // rather than being stripped with the Authorization.
+            builder = sbproxy_observe::telemetry::inject_into_reqwest(builder);
             for (name, value) in upstream_headers {
                 builder = builder.header(name.as_str(), value.as_str());
             }
@@ -1679,6 +1731,92 @@ impl McpFederation {
             }
         });
     }
+}
+
+// --- WOR-2139: SEP-414 trace-context propagation ---
+
+/// Merge the active trace context into a JSON-RPC `params` value's
+/// `_meta` block, per SEP-414.
+///
+/// # Why the body and not a header
+///
+/// MCP has three transports here and only two of them have headers at
+/// all. `dispatch_request` refuses to put anything header-shaped on
+/// the stdio transport, because a local child process has no safe
+/// delivery path for one. `params._meta` rides inside the JSON-RPC
+/// body, so it is the single carrier that reaches every upstream the
+/// gateway can talk to. That is what decides it.
+///
+/// # Why the keys are bare
+///
+/// SEP-414 reserves the trace-context keys inside `_meta` unprefixed,
+/// as a documented exception to MCP's DNS-prefixing rule. See
+/// [`super::types::META_TRACEPARENT`] for the SEP's own statement of
+/// why. The reserved set is the filter: anything a propagator emits
+/// that SEP-414 does not reserve gets no exception from the prefixing
+/// rule, so it is dropped rather than written bare.
+///
+/// # Merging
+///
+/// An existing `_meta` is merged into, never replaced, so a caller's
+/// own metadata survives. The trace keys themselves are authoritative
+/// on this hop and do overwrite: the gateway is the one that knows
+/// which trace this outbound call belongs to, and a stale inbound
+/// `traceparent` left in place would point at the wrong parent. An
+/// existing `_meta` that is not a JSON object is left exactly as it
+/// is; reshaping a caller's value to make room for our own is worse
+/// than propagating nothing.
+///
+/// With nothing to propagate, `params` comes back untouched and no
+/// `_meta` key is created. An empty `_meta` would read downstream as a
+/// broken trace rather than an absent one.
+fn merge_trace_context(params: serde_json::Value, pairs: &[(String, String)]) -> serde_json::Value {
+    let reserved: Vec<(&str, &str)> = pairs
+        .iter()
+        .filter(|(key, _)| SEP_414_RESERVED_META_KEYS.contains(&key.as_str()))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    if reserved.is_empty() {
+        return params;
+    }
+    match params {
+        serde_json::Value::Object(mut obj) => {
+            let meta = obj
+                .entry("_meta")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(meta_obj) = meta.as_object_mut() {
+                for (key, value) in reserved {
+                    meta_obj.insert(
+                        key.to_string(),
+                        serde_json::Value::String(value.to_string()),
+                    );
+                }
+            }
+            serde_json::Value::Object(obj)
+        }
+        // No `_meta` slot exists on a non-object params, and inventing
+        // one would change the method's shape on the wire.
+        other => other,
+    }
+}
+
+/// The 32-hex trace id out of a W3C `traceparent` pair, when the pairs
+/// carry a usable one.
+///
+/// Shape is `version "-" trace-id "-" parent-id "-" flags`. Returns
+/// `None` for a missing, malformed, or all-zero trace id; all-zero is
+/// the value W3C defines as invalid, and treating it as an identifier
+/// would collapse every untraced call onto one correlation key.
+fn trace_id_from_traceparent(pairs: &[(String, String)]) -> Option<&str> {
+    let traceparent = pairs
+        .iter()
+        .find(|(key, _)| key == META_TRACEPARENT)
+        .map(|(_, value)| value.as_str())?;
+    let trace_id = traceparent.split('-').nth(1)?;
+    let usable = trace_id.len() == 32
+        && trace_id.bytes().all(|b| b.is_ascii_hexdigit())
+        && trace_id.bytes().any(|b| b != b'0');
+    usable.then_some(trace_id)
 }
 
 /// Percent-encode a path-parameter value (WOR-1648). Encodes
@@ -2930,6 +3068,203 @@ mod tests {
         assert!(
             !msg.contains("denied by mcp policy hook"),
             "no-op hook must not produce a deny path, got {msg}"
+        );
+    }
+
+    // --- WOR-2139: SEP-414 trace-context propagation ---
+    //
+    // The key names are spelled as literals here rather than through
+    // the `super::types` constants on purpose: these tests pin what
+    // goes on the wire, so renaming a constant must not be able to
+    // change the assertion along with the code it guards.
+
+    fn fake_trace_pairs() -> Vec<(String, String)> {
+        vec![
+            (
+                "traceparent".to_string(),
+                "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+            ),
+            ("tracestate".to_string(), "vendor=1".to_string()),
+        ]
+    }
+
+    #[test]
+    fn wor_2139_tools_call_params_carry_unprefixed_trace_context() {
+        let params = merge_trace_context(
+            json!({"name": "search", "arguments": {"q": "hi"}}),
+            &fake_trace_pairs(),
+        );
+        assert_eq!(
+            params["_meta"]["traceparent"],
+            json!("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+        );
+        assert_eq!(params["_meta"]["tracestate"], json!("vendor=1"));
+        assert!(
+            params["_meta"]
+                .get("io.modelcontextprotocol.traceparent")
+                .is_none(),
+            "a namespaced traceparent is exactly what SEP-414 reserves the bare key to prevent"
+        );
+        // The method's own params are left as the caller built them.
+        assert_eq!(params["name"], json!("search"));
+        assert_eq!(params["arguments"]["q"], json!("hi"));
+    }
+
+    #[test]
+    fn wor_2139_existing_meta_is_merged_not_replaced() {
+        let params = merge_trace_context(
+            json!({
+                "name": "widget",
+                "arguments": {},
+                "_meta": {
+                    "openai/widget": {"templateId": "card"},
+                    "traceparent": "00-11111111111111111111111111111111-2222222222222222-00",
+                }
+            }),
+            &fake_trace_pairs(),
+        );
+        // A caller's unrelated metadata survives the merge.
+        assert_eq!(
+            params["_meta"]["openai/widget"]["templateId"],
+            json!("card")
+        );
+        // The trace keys are authoritative on this hop: the gateway
+        // knows which trace the outbound call belongs to, and a stale
+        // inbound traceparent would name the wrong parent.
+        assert_eq!(
+            params["_meta"]["traceparent"],
+            json!("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+        );
+    }
+
+    #[test]
+    fn wor_2139_no_trace_context_adds_no_meta_key() {
+        let params = merge_trace_context(json!({"name": "search", "arguments": {}}), &[]);
+        assert!(
+            params.get("_meta").is_none(),
+            "an untraced call must carry no _meta at all rather than an empty one: {params}"
+        );
+    }
+
+    #[test]
+    fn wor_2139_keys_sep_414_does_not_reserve_are_dropped() {
+        // Only the SEP-414 set is exempt from MCP's prefixing rule, so
+        // another propagator's output must not be written bare, and
+        // must not conjure an otherwise empty _meta block either.
+        let pairs = vec![
+            ("x-b3-traceid".to_string(), "abc".to_string()),
+            ("uber-trace-id".to_string(), "def".to_string()),
+        ];
+        let params = merge_trace_context(json!({"name": "s", "arguments": {}}), &pairs);
+        assert!(
+            params.get("_meta").is_none(),
+            "unreserved propagator keys must not reach _meta: {params}"
+        );
+    }
+
+    #[test]
+    fn wor_2139_non_object_meta_is_left_untouched() {
+        let params = merge_trace_context(
+            json!({"name": "s", "arguments": {}, "_meta": "opaque"}),
+            &fake_trace_pairs(),
+        );
+        assert_eq!(
+            params["_meta"],
+            json!("opaque"),
+            "reshaping a caller's _meta to make room for ours is worse than propagating nothing"
+        );
+    }
+
+    #[test]
+    fn wor_2139_non_object_params_pass_through() {
+        let params = merge_trace_context(json!("not-an-object"), &fake_trace_pairs());
+        assert_eq!(params, json!("not-an-object"));
+    }
+
+    #[test]
+    fn wor_2139_trace_id_extraction_rejects_unusable_values() {
+        assert_eq!(
+            trace_id_from_traceparent(&fake_trace_pairs()),
+            Some("0af7651916cd43dd8448eb211c80319c")
+        );
+        assert_eq!(trace_id_from_traceparent(&[]), None);
+        let all_zero = vec![(
+            "traceparent".to_string(),
+            "00-00000000000000000000000000000000-b7ad6b7169203331-00".to_string(),
+        )];
+        assert_eq!(
+            trace_id_from_traceparent(&all_zero),
+            None,
+            "W3C defines the all-zero trace id as invalid; accepting it would collapse \
+             every untraced call onto one correlation key"
+        );
+        let malformed = vec![("traceparent".to_string(), "garbage".to_string())];
+        assert_eq!(trace_id_from_traceparent(&malformed), None);
+        let short = vec![("traceparent".to_string(), "00-abc-def-01".to_string())];
+        assert_eq!(trace_id_from_traceparent(&short), None);
+    }
+
+    /// End of the wire, not the helper: an untraced `tools/call` must
+    /// reach the upstream with no `_meta` block at all. Nothing
+    /// installs a `tracing-opentelemetry` layer in this crate's tests,
+    /// so there is no active trace here, which is exactly the case
+    /// being pinned. The traced counterpart is pinned one layer down,
+    /// on `propagation_pairs` in `sbproxy-observe`.
+    #[tokio::test]
+    async fn wor_2139_untraced_tools_call_sends_no_meta_on_the_wire() {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(String::new()));
+        let seen_thread = Arc::clone(&seen);
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping trace-context wire test: loopback bind denied: {err}");
+                return;
+            }
+            Err(err) => panic!("bind failed: {err}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let n = s.read(&mut buf).unwrap_or(0);
+                *seen_thread.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = r#"{"jsonrpc":"2.0","result":{"content":[]},"id":1}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let server = McpServerConfig {
+            name: "trace-up".to_string(),
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+        };
+        let fed = McpFederation::new(vec![server]);
+        let mut tools = HashMap::new();
+        tools.insert("echo".to_string(), make_tool("echo", "trace-up"));
+        fed.seed_tools_for_test(tools);
+
+        fed.call_tool("echo", json!({"q": 1}))
+            .await
+            .expect("tool call must succeed");
+
+        let captured = seen.lock().unwrap().clone();
+        assert!(
+            !captured.contains("_meta"),
+            "an untraced call must not ship an empty or placeholder _meta, got:\n{captured}"
+        );
+        assert!(
+            !captured.to_ascii_lowercase().contains("traceparent"),
+            "no traceparent should appear on any surface of an untraced call, got:\n{captured}"
         );
     }
 }

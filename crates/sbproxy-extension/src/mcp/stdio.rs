@@ -4,6 +4,18 @@
 //! writes one newline-delimited request to stdin, reads one response
 //! line from stdout, and kills the child on timeout or oversized
 //! output. It is deliberately simple and bounded.
+//!
+//! # Trace context
+//!
+//! There is no header surface here at all. A local child process gets
+//! one thing from the gateway, a line of JSON on stdin, which is why
+//! `dispatch_request` refuses to route run-as-user credentials over
+//! this transport. SEP-414 trace context reaches the child anyway,
+//! because it travels inside that line: the federation merges it into
+//! `params._meta` when it builds the request, before any transport
+//! sees it. Nothing needs doing at this layer, and nothing should be
+//! added; a second carrier here would exist on one transport and not
+//! the others.
 
 use std::time::Duration;
 

@@ -16,6 +16,13 @@
 //! - `sbproxy_ai_inter_token_latency_seconds_bucket`
 //! - `sbproxy_ai_request_duration_seconds_bucket`
 //! - `sbproxy_ai_request_duration_attributed_seconds_bucket`
+//! - `sbproxy_meter_append_duration_seconds_bucket`
+//!
+//! The last one is the one that pays for itself twice. A billing spike on a
+//! dashboard reaches the trace, the trace carries `claim_id`, and
+//! `claim_id` resolves to the exact signed receipt, so "why did this tenant
+//! cost so much on Tuesday" stops being a log-grepping exercise. See
+//! [`crate::meter_metrics`].
 //!
 //! Operators MUST run Prometheus with `--enable-feature=exemplar-storage`
 //! and scrape with `application/openmetrics-text` content negotiation.
@@ -155,6 +162,10 @@ fn is_exemplar_metric(metric: &str) -> bool {
             | "sbproxy_ai_inter_token_latency_seconds"
             | "sbproxy_ai_request_duration_seconds"
             | "sbproxy_ai_request_duration_attributed_seconds"
+            // WOR-2129: the attested meter's chain append, so a billing
+            // spike leads to the trace, the trace to a claim_id, and the
+            // claim_id to the signed receipt that priced it.
+            | "sbproxy_meter_append_duration_seconds"
     )
 }
 
@@ -308,6 +319,7 @@ fn leak_metric_base(name: &str) -> &'static str {
         }
         "sbproxy_outbound_request_duration_seconds" => "sbproxy_outbound_request_duration_seconds",
         "sbproxy_audit_emit_duration_seconds" => "sbproxy_audit_emit_duration_seconds",
+        "sbproxy_meter_append_duration_seconds" => "sbproxy_meter_append_duration_seconds",
         _ => "",
     }
 }

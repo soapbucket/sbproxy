@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-08-01*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -214,6 +214,82 @@ principal and tenant, latency, cost) into the same sink stream as
 model spend, so tool spend is queryable next to it. Code-mode calls
 (from the emitted `codemode.ts` runtime) are attributed to the
 code-execution sandbox in the session ledger.
+
+## Trace-context propagation
+
+Every `tools/call` and `resources/read` the gateway forwards carries
+the trace context of the request that caused it, so a tool call in an
+upstream's logs can be joined back to the agent run that made it.
+
+The context travels in the JSON-RPC body, inside the `params._meta`
+block that
+[SEP-414](https://modelcontextprotocol.io/seps/414-request-meta)
+defines, under the key names `traceparent` and `tracestate`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 1,
+  "params": {
+    "name": "gh.search_repos",
+    "arguments": {"q": "sbproxy"},
+    "_meta": {
+      "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+    }
+  }
+}
+```
+
+Those key names are bare. MCP otherwise requires a DNS-style prefix on
+`_meta` keys, and SEP-414 carves out an explicit exception for trace
+context: a namespaced spelling such as
+`io.modelcontextprotocol.traceparent` would break trace and log
+correlation for every tool that already knows what `traceparent`
+means. An upstream reading `_meta` for trace context should read these
+names exactly, with no prefix.
+
+The body carries it rather than an HTTP header because one of the
+three transports has no headers at all. A `transport: stdio` upstream
+is a local child process that receives a line of JSON on stdin and
+nothing else, which is the same reason run-as-user credentials are
+refused on that transport. Putting the context in the body means an
+upstream sees the identical field whether it is reached over
+Streamable HTTP, over SSE, or over stdio.
+
+A `type: openapi` upstream is the one exception, and only because it
+is not MCP on the wire. Those calls dispatch as plain REST requests
+with no JSON-RPC body to hold a `_meta` block, so they carry the same
+context in a standard `traceparent` HTTP header instead. Redirects
+that the egress policy authorizes carry it too.
+
+### Turning it on
+
+There is no MCP-side knob. The context comes from the proxy's own
+tracing, so it appears once `proxy.observability.telemetry.enabled` is
+`true`:
+
+```yaml
+proxy:
+  observability:
+    telemetry:
+      enabled: true
+      endpoint: "http://otel-collector:4317"
+```
+
+With telemetry off there is no trace to propagate, and the gateway
+sends no `_meta` block rather than an empty or placeholder one, so an
+upstream can tell an untraced call from a malformed one. See
+[observability.md](observability.md) for the rest of that block.
+
+### What does not carry it
+
+Catalogue refreshes do not. The `tools/list`, `resources/list`, and
+`initialize` calls the federation makes on its own refresh schedule
+are gateway housekeeping, not work done for a caller. Attributing a
+background refresh to whichever request happened to be in flight when
+the timer fired would be worse than leaving it uncorrelated: the
+result would be wrong rather than absent.
 
 ## Submodules
 

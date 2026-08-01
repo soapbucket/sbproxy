@@ -1,5 +1,5 @@
 # AI Crawl Control + Pay Per Crawl
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-01*
 
 ![GPTBot receiving a 402 challenge, then the article after presenting a Crawler-Payment token](assets/ai-crawl-control.gif)
 
@@ -16,11 +16,13 @@ The OSS proxy emits two challenge shapes:
 1. **Single-rail (default).** A 402 with the `Crawler-Payment` header and a flat JSON body describing the price. This is the path legacy crawlers see.
 2. **Multi-rail (opt-in).** When the agent sends `Accept-Payment:` or one of the multi-rail `Accept` MIME types (`application/sbproxy-multi-rail+json`, `application/x402+json`, `application/mpp+json`), the OSS proxy emits a 402 with `Content-Type: application/sbproxy-multi-rail+json` and a body that lists one entry per rail the operator declared (x402, MPP, Lightning), each with its own quote-token JWS.
 
-The multi-rail body is the wire-format contract. The proxy can negotiate it,
-advertise rails, mint per-rail quote tokens, and respond 406 when the agent's
-preference set has no overlap with the operator's offered rails. Payment
-settlement is not currently part of this repository. For the wire-shape
-contract, see [`402-challenge.md`](402-challenge.md).
+This policy decides which requests are payable and what they cost. It does
+not settle payments. Settlement is a separate block, `proxy.payments`,
+which owns the rails, the durable intent store, and the rule that a paid
+request reaches the origin only after a committed record says the payment
+settled. See [`payment-settlement.md`](payment-settlement.md) for that
+configuration and [`402-challenge.md`](402-challenge.md) for the exact
+bytes of every challenge, credential, error, and receipt.
 
 ## Request flow
 
@@ -328,6 +330,8 @@ What ships now: exemplars on `sbproxy_ledger_redeem_duration_seconds_bucket` car
 ## See also
 
 - [configuration.md](configuration.md#ai_crawl_control) - schema reference.
+- [payment-settlement.md](payment-settlement.md) - `proxy.payments`: rails, durable state, timeouts, reconciliation, and the exact unsupported boundaries.
+- [402-challenge.md](402-challenge.md) - the exact challenge, credential, error, and receipt bytes.
 - [ai-gateway.md](ai-gateway.md) - how this policy interacts with `ai_proxy` upstreams.
 - [observability.md](observability.md) - metrics, logs, traces, dashboards.
 - `examples/ai-crawl-control/` - runnable example.

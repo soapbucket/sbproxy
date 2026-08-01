@@ -1,0 +1,100 @@
+{
+  "requires_capture": {
+    "id": "pi_fixture0000000001",
+    "object": "payment_intent",
+    "status": "requires_capture",
+    "amount": 1250,
+    "amount_capturable": 1250,
+    "amount_received": 0,
+    "currency": "usd",
+    "capture_method": "manual",
+    "livemode": false,
+    "client_secret": "pi_fixture0000000001_secret_fixture",
+    "metadata": {
+      "sbproxy_account_context": "acct_platform",
+      "sbproxy_challenge_id": "sbpi_fixture_intent_0001",
+      "sbproxy_origin_id": "origin-1",
+      "sbproxy_quote_id": "quote-1",
+      "sbproxy_requirement_draft_digest": "DRAFT_DIGEST",
+      "sbproxy_tenant_id": "tenant-1"
+    }
+  },
+  "succeeded": {
+    "id": "pi_fixture0000000001",
+    "object": "payment_intent",
+    "status": "succeeded",
+    "amount": 1250,
+    "amount_capturable": 0,
+    "amount_received": 1250,
+    "currency": "usd",
+    "capture_method": "manual",
+    "livemode": false,
+    "client_secret": "pi_fixture0000000001_secret_fixture",
+    "metadata": {
+      "sbproxy_account_context": "acct_platform",
+      "sbproxy_challenge_id": "sbpi_fixture_intent_0001",
+      "sbproxy_origin_id": "origin-1",
+      "sbproxy_quote_id": "quote-1",
+      "sbproxy_requirement_draft_digest": "DRAFT_DIGEST",
+      "sbproxy_tenant_id": "tenant-1"
+    }
+  },
+  "requires_action": {
+    "id": "pi_fixture0000000001",
+    "object": "payment_intent",
+    "status": "requires_action",
+    "amount": 1250,
+    "amount_received": 0,
+    "currency": "usd",
+    "livemode": false
+  },
+  "processing": {
+    "id": "pi_fixture0000000001",
+    "object": "payment_intent",
+    "status": "processing",
+    "amount": 1250,
+    "amount_received": 0,
+    "currency": "usd",
+    "livemode": false
+  },
+  "canceled": {
+    "id": "pi_fixture0000000001",
+    "object": "payment_intent",
+    "status": "canceled",
+    "amount": 1250,
+    "amount_received": 0,
+    "currency": "usd",
+    "livemode": false
+  },
+  "unknown_status": {
+    "id": "pi_fixture0000000001",
+    "object": "payment_intent",
+    "status": "requires_review",
+    "amount": 1250,
+    "amount_received": 0,
+    "currency": "usd",
+    "livemode": false
+  },
+  "card_declined": {
+    "error": {
+      "type": "card_error",
+      "code": "card_declined",
+      "decline_code": "generic_decline",
+      "message": "Your card was declined."
+    }
+  },
+  "idempotency_conflict": {
+    "error": {
+      "type": "idempotency_error",
+      "code": "idempotency_key_in_use",
+      "message": "There is currently another in-progress request using this Idempotent Key."
+    }
+  },
+  "rate_limited": {
+    "error": {
+      "type": "rate_limit_error",
+      "code": "rate_limit",
+      "message": "Too many requests."
+    }
+  }
+}

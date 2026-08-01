@@ -29,6 +29,13 @@
 //! unrecognized token or a non-string/list result at evaluation time falls
 //! back to the configured `on_error` action (default `allow`, i.e.
 //! fail-open).
+//!
+//! ## Why this site does not take a failure posture
+//!
+//! Most controls in the gateway spell their failure behavior as one of
+//! four posture words (`closed`, `open`, `degraded`, `observe`). This one
+//! deliberately does not, and `AiPolicyConfig::on_error` keeps its own
+//! vocabulary. See that field's documentation for the argument.
 
 use sbproxy_extension::cel::{CelContext, CelEngine, CelExpression, CelValue};
 use serde::Deserialize;
@@ -251,6 +258,64 @@ pub struct AiPolicyConfig {
     /// Action(s) applied when the expression errors or returns an
     /// unrecognized value. Space- or comma-separated tokens. Defaults to
     /// `allow` (fail-open) so a policy bug cannot take the gateway down.
+    ///
+    /// # Why this is not a failure posture
+    ///
+    /// Other controls spell this axis with one of four shared words:
+    /// `closed`, `open`, `degraded`, `observe`. This site keeps its own
+    /// vocabulary on purpose, because it is not a posture. A posture
+    /// answers one question, "does the request proceed", and leaves the
+    /// rest of the pipeline alone. `on_error` is a whole fallback
+    /// decision: an ordered list drawn from the same closed seven-variant
+    /// action set the expression itself emits, so the fallback can route,
+    /// redact, tag, and audit, not merely admit or refuse. Real
+    /// configurations use that:
+    ///
+    /// ```yaml
+    /// on_error: redact route_to:gpt-4o-mini audit:high
+    /// ```
+    ///
+    /// Collapsing that onto four words would delete expressiveness
+    /// operators are already using, and there is no posture word for
+    /// "redact, downgrade the model, and page someone". Two of the seven
+    /// tokens happen to line up, and it is worth knowing which:
+    ///
+    /// | `on_error` | Shared posture | Meaning |
+    /// |---|---|---|
+    /// | `block` | `closed` | Reject the request |
+    /// | `allow` | `open` | Proceed unchanged, claim nothing |
+    ///
+    /// The other five have no posture spelling at all. `degraded` has no
+    /// analogue either: a policy that could not be evaluated made no
+    /// guarantee to waive, because the expression is an operator's own
+    /// rule rather than a control with an advertised outcome. Neither
+    /// does `observe`, because there is no counterfactual to record: the
+    /// expression failed, so there is no decision it would have taken.
+    ///
+    /// This is also not the unvalidated string it looks like. Every
+    /// token is parsed by `parse_action_list` at config-compile time by
+    /// [`CompiledAiPolicy::compile`], which rejects an unknown token, an
+    /// empty list, and a malformed compression selector before the
+    /// policy is ever published. A bad `on_error` is a startup failure,
+    /// not a request-time surprise.
+    ///
+    /// # Why the default is open, and why that is correct
+    ///
+    /// Every other security control in the gateway defaults closed, and
+    /// this one deliberately does not. The rule is that a control
+    /// defaults closed when it enforces a security boundary and open
+    /// only where refusing would take the gateway down over something
+    /// that is not one. This is the second case. `on_error` fires when
+    /// the operator's own CEL expression could not be evaluated: a typo
+    /// in a field path, a type error, a token the closed set does not
+    /// contain. That is a bug in a rule, not evidence that the request
+    /// is dangerous, and the guardrails, budgets, and rate limits that
+    /// do enforce boundaries have already run and are unaffected by it.
+    /// Defaulting closed here would let one malformed expression
+    /// black-hole every request on the route, which is a worse outcome
+    /// than the rule not applying. An operator who wants the strict
+    /// reading sets `on_error: block`, and one who wants the failure
+    /// visible without refusing traffic sets `on_error: allow audit:high`.
     #[serde(default = "default_on_error")]
     pub on_error: String,
 }
@@ -547,6 +612,51 @@ mod tests {
         .unwrap();
         let d = p.evaluate(&AiDecisionView::default());
         assert!(d.is_block(), "non-string result uses on_error");
+    }
+
+    #[test]
+    fn on_error_keeps_its_own_vocabulary_and_its_deliberate_open_default() {
+        // The default is open on purpose, and it is the one place in the
+        // gateway where that is the right call: a bug in an operator's
+        // own expression must not black-hole every request on the route.
+        assert_eq!(default_on_error(), "allow");
+        let document = serde_json::json!({"expression": r#""allow""#});
+        let config: AiPolicyConfig = serde_json::from_value(document).unwrap();
+        assert_eq!(config.on_error, "allow");
+
+        // The two tokens that line up with the shared posture words.
+        assert_eq!(
+            parse_action_list("block").unwrap(),
+            vec![AiPolicyAction::Block]
+        );
+        assert_eq!(
+            parse_action_list("allow").unwrap(),
+            vec![AiPolicyAction::Allow]
+        );
+
+        // The multi-token fallback decision no posture word can express,
+        // which is the reason this site kept its own vocabulary.
+        let actions = parse_action_list("redact route_to:gpt-4o-mini audit:high").unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                AiPolicyAction::Redact,
+                AiPolicyAction::RouteTo("gpt-4o-mini".into()),
+                AiPolicyAction::Audit("high".into()),
+            ]
+        );
+
+        // A posture word is not an action token here. It is rejected at
+        // config-compile time rather than quietly accepted and mapped to
+        // something arbitrary.
+        for posture in ["closed", "open", "degraded", "observe"] {
+            assert!(AiPolicyAction::parse(posture).is_err(), "{posture}");
+            let config = AiPolicyConfig {
+                expression: r#""allow""#.to_string(),
+                on_error: posture.to_string(),
+            };
+            assert!(CompiledAiPolicy::compile(&config).is_err(), "{posture}");
+        }
     }
 
     #[test]

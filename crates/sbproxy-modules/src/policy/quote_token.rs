@@ -68,6 +68,29 @@ pub struct QuoteClaims {
     /// Optional facilitator URL; only set for x402 rails.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub facilitator: Option<String>,
+    /// Durable requirement this quote prices, when settlement is enabled.
+    ///
+    /// The three fields below bind a quote to one payment obligation. They
+    /// are optional so a legacy non-settlement token still parses and still
+    /// verifies; absent means the quote predates settlement and the payment
+    /// path refuses it rather than guessing which requirement it meant.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub requirement_id: Option<String>,
+    /// Unpadded base64url digest of the immutable requirement draft.
+    ///
+    /// Bound separately from [`Self::requirement_digest`] because direct
+    /// Stripe mode has to commit to something before its PaymentIntent
+    /// exists: an identifier cannot be part of its own create request. The
+    /// draft digest is what that mode's metadata carries, and the final
+    /// quote binds it alongside the returned identifier.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub draft_digest: Option<String>,
+    /// Unpadded base64url digest of the complete final requirement.
+    ///
+    /// Covers the provider handle, so it can only be computed after the rail
+    /// has created whatever object the challenge names.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub requirement_digest: Option<String>,
 }
 
 /// JWS protected header.
@@ -278,6 +301,12 @@ impl QuoteTokenSigner {
             price,
             rail: rail.to_string(),
             facilitator,
+            // The legacy issue path prices a route without a durable
+            // requirement behind it. Settlement issues its quote through
+            // the requirement compiler instead, which fills these in.
+            requirement_id: None,
+            draft_digest: None,
+            requirement_digest: None,
         };
         let token = self.sign(&claims)?;
         Ok(IssuedQuote { token, claims })
@@ -375,7 +404,7 @@ impl QuoteTokenVerifier {
         self.public_keys.insert(kid.into(), public_key);
     }
 
-    /// Verify a compact JWS token.
+    /// Verify a compact JWS token and consume its nonce.
     ///
     /// Per the ADR's verification path:
     /// 1. Parse + decode header.
@@ -388,12 +417,102 @@ impl QuoteTokenVerifier {
     /// The caller is responsible for the `price` and `rail` matches, which
     /// depend on the rail-specific redeem context that the verifier does
     /// not own.
+    ///
+    /// This is the legacy non-settlement ledger path. The settlement path
+    /// uses [`Self::verify_claims`] and lets the durable intent transaction
+    /// own single use, because consuming the nonce here would burn the quote
+    /// during signature parsing, before the store has decided whether the
+    /// request is a fresh redemption or a resumable retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Self::verify_claims`] returns, plus
+    /// [`VerifyError::NonceAlreadyConsumed`] for a replayed quote and
+    /// [`VerifyError::NonceStore`] when the store cannot answer.
     pub fn verify(
         &self,
         token: &str,
         expected_route: &str,
         expected_shape: ContentShape,
     ) -> Result<QuoteClaims, VerifyError> {
+        let claims = self.verify_claims(token, expected_route, expected_shape)?;
+        match self.nonce_store.check_and_consume(&claims.nonce) {
+            Ok(NonceCheck::Fresh) => Ok(claims),
+            Ok(NonceCheck::AlreadyConsumed) => Err(VerifyError::NonceAlreadyConsumed(claims.nonce)),
+            // The ADR's async-insert race: the nonce is unknown because the
+            // issuer's insert has not landed yet. The ledger reports this as
+            // `bad_request` to the client; here we translate to the closest
+            // verify error.
+            Ok(NonceCheck::Unknown) => Err(VerifyError::NonceAlreadyConsumed(claims.nonce)),
+            Err(e) => Err(VerifyError::NonceStore(e.to_string())),
+        }
+    }
+
+    /// Authenticate a token and validate its claims without consuming it.
+    ///
+    /// Steps 1 through 5 of [`Self::verify`] and none of step 6. Nothing
+    /// here mutates, so calling it twice on one token answers the same way
+    /// twice.
+    ///
+    /// That is what the settlement path needs. A paid retry has to be
+    /// readable before the proxy knows whether it is a first redemption, a
+    /// resumption of an interrupted one, or a replay, and only the durable
+    /// intent and proof transaction can tell those apart. Burning the nonce
+    /// while parsing the signature would make an interrupted payment
+    /// unresumable: the payer would hold a settled charge and a quote the
+    /// proxy would no longer read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifyError`] for a malformed token, an unknown key, a bad
+    /// signature, an expired or skewed timestamp, or a route or shape that
+    /// is not the one being requested.
+    pub fn verify_claims(
+        &self,
+        token: &str,
+        expected_route: &str,
+        expected_shape: ContentShape,
+    ) -> Result<QuoteClaims, VerifyError> {
+        let claims = self.verify_authenticity(token)?;
+
+        // --- Route + shape match ---
+        if claims.route != expected_route {
+            return Err(VerifyError::RouteMismatch {
+                claim: claims.route.clone(),
+                expected: expected_route.to_string(),
+            });
+        }
+        let expected_shape_str = expected_shape.as_str();
+        if claims.shape != expected_shape_str {
+            return Err(VerifyError::ShapeMismatch {
+                claim: claims.shape.clone(),
+                expected: expected_shape_str.to_string(),
+            });
+        }
+        Ok(claims)
+    }
+
+    /// Authenticate a token and check its timestamps, nothing else.
+    ///
+    /// Steps 1 through 4 of [`Self::verify`]: the token is well formed, was
+    /// signed by a key this verifier holds, and is inside its validity
+    /// window. It says nothing about whether the claims describe the request
+    /// in hand.
+    ///
+    /// The settlement path uses this rather than [`Self::verify_claims`]
+    /// because it binds on different things. A payment is bound to a
+    /// requirement digest, which covers the route, the amount, the rail, the
+    /// recipient, and the provider handle together; checking a content shape
+    /// as well would add nothing and would refuse a paid retry that
+    /// negotiated a different representation of the same paid resource.
+    /// Callers of this method are responsible for their own binding checks
+    /// and must not treat authenticity as authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifyError`] for a malformed token, an unknown key, a bad
+    /// signature, or an expired or skewed timestamp.
+    pub fn verify_authenticity(&self, token: &str) -> Result<QuoteClaims, VerifyError> {
         // --- Parse JWS ---
         let mut parts = token.split('.');
         let header_b64 = parts
@@ -471,32 +590,7 @@ impl QuoteTokenVerifier {
             });
         }
 
-        // --- Route + shape match ---
-        if claims.route != expected_route {
-            return Err(VerifyError::RouteMismatch {
-                claim: claims.route.clone(),
-                expected: expected_route.to_string(),
-            });
-        }
-        let expected_shape_str = expected_shape.as_str();
-        if claims.shape != expected_shape_str {
-            return Err(VerifyError::ShapeMismatch {
-                claim: claims.shape.clone(),
-                expected: expected_shape_str.to_string(),
-            });
-        }
-
-        // --- Nonce single-use ---
-        match self.nonce_store.check_and_consume(&claims.nonce) {
-            Ok(NonceCheck::Fresh) => Ok(claims),
-            Ok(NonceCheck::AlreadyConsumed) => Err(VerifyError::NonceAlreadyConsumed(claims.nonce)),
-            // The ADR's async-insert race: the nonce is unknown because the
-            // issuer's insert has not landed yet. The ledger reports this as
-            // `bad_request` to the client; here we translate to the closest
-            // verify error.
-            Ok(NonceCheck::Unknown) => Err(VerifyError::NonceAlreadyConsumed(claims.nonce)),
-            Err(e) => Err(VerifyError::NonceStore(e.to_string())),
-        }
+        Ok(claims)
     }
 
     /// JWKS publication shape: a JSON object with a `keys` array. Each entry
@@ -840,6 +934,9 @@ mod tests {
             price: fresh_money(),
             rail: "x402".to_string(),
             facilitator: None,
+            requirement_id: None,
+            draft_digest: None,
+            requirement_digest: None,
         };
         let token = signer.sign(&claims).expect("sign");
         let store = Arc::new(InMemoryNonceStore::new()) as Arc<dyn NonceStore>;

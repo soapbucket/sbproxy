@@ -214,6 +214,33 @@ pub struct AccessLogEntry {
     /// Parent session identifier; never auto-generated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// WOR-2139: the A2A `contextId` this hop carried, capped at
+    /// capture. Absent for traffic that carried no A2A envelope.
+    ///
+    /// This is the run-scoped grouping key: A2A task ids nest under a
+    /// context id, so joining log lines on it reassembles one
+    /// multi-agent run. `session_id` above is the caller-scoped key.
+    /// A consumer that wants "the key that groups related traffic"
+    /// should prefer this and fall back to `session_id`, which is the
+    /// same precedence the `session.id` span attribute uses.
+    ///
+    /// Read from the JSON-RPC request body, so it is only present on
+    /// hops whose origin buffers that body (an `a2a` policy on A2A 1.0
+    /// does). It is never a metric label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a2a_context_id: Option<String>,
+    /// WOR-2139: whether the A2A envelope's identity fields came from a
+    /// source the proxy trusts. `None` for non-A2A traffic.
+    ///
+    /// Ships beside `a2a_context_id` on purpose. An untrusted caller
+    /// picks its own `contextId`, so it can merge its usage into another
+    /// caller's run or shard one run across unbounded distinct ids. A
+    /// report that sums by run without filtering on this column is
+    /// summing a number the caller chose. The `sbproxy_a2a_hops_total`
+    /// metric partitions hops the same way through its `allow:verified`
+    /// and `allow:unverified` decision labels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a2a_identity_verified: Option<bool>,
     /// Caller-supplied custom properties from `X-Sb-Property-*`
     /// headers, after caps and redaction. Empty when capture is off
     /// or no headers were sent.
@@ -395,6 +422,21 @@ pub struct AccessLogEntry {
     /// rails or unsettled traffic.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub txhash: Option<String>,
+    /// One-way correlation digest for the settlement receipt that
+    /// authorized this request. Hex, and derived under a domain
+    /// separator from the receipt key, so two log lines for the same
+    /// settled payment carry the same value and nothing in the value
+    /// can be turned back into an intent id, a provider reference, or
+    /// a payer. `None` for unsettled traffic and for every rail that
+    /// did not commit a receipt.
+    ///
+    /// This is the join key an operator uses to go from an access log
+    /// line to a settlement record, and it is deliberately the only
+    /// settlement identifier on the line. `txhash` above is the rail's
+    /// own public hash and is present only where the rail publishes
+    /// one; this field is present for every settled request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement_receipt_digest: Option<String>,
     /// `jti` of the OLP license token presented. `None` when
     /// no license token was presented.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -611,6 +653,8 @@ impl Default for AccessLogEntry {
             user_id_source: None,
             session_id: None,
             parent_session_id: None,
+            a2a_context_id: None,
+            a2a_identity_verified: None,
             properties: BTreeMap::new(),
             workspace_id: String::new(),
             tenant_id: String::new(),
@@ -642,6 +686,7 @@ impl Default for AccessLogEntry {
             rail: None,
             redeemed_token_id: None,
             txhash: None,
+            settlement_receipt_digest: None,
             license_token_id: None,
             cap_token_id: None,
             upstream_host: None,
@@ -821,6 +866,16 @@ impl AccessLogEntryBuilder {
         self.inner.txhash = Some(hash.into());
         self
     }
+    /// Set the one-way settlement receipt correlation digest.
+    ///
+    /// The caller passes an already-derived digest. This stamper does
+    /// no hashing of its own, because a builder that accepted a raw
+    /// receipt key and hashed it would be one refactor away from
+    /// accepting the key and forgetting to.
+    pub fn settlement_receipt_digest(mut self, digest: impl Into<String>) -> Self {
+        self.inner.settlement_receipt_digest = Some(digest.into());
+        self
+    }
     /// Set the OLP license-token jti.
     pub fn license_token_id(mut self, jti: impl Into<String>) -> Self {
         self.inner.license_token_id = Some(jti.into());
@@ -917,6 +972,8 @@ mod tests {
             user_id_source: None,
             session_id: None,
             parent_session_id: None,
+            a2a_context_id: None,
+            a2a_identity_verified: None,
             properties: BTreeMap::new(),
             workspace_id: String::new(),
             tenant_id: String::new(),
@@ -948,6 +1005,7 @@ mod tests {
             rail: None,
             redeemed_token_id: None,
             txhash: None,
+            settlement_receipt_digest: None,
             license_token_id: None,
             cap_token_id: None,
             upstream_host: None,
@@ -1004,6 +1062,37 @@ mod tests {
         assert!(b.get("cost_usd_micros").is_none());
         assert!(b.get("guardrail_category").is_none());
         assert!(b.get("guardrail_action").is_none());
+    }
+
+    /// WOR-2139: the run correlation key reaches the log line, and the
+    /// trust flag reaches it with the key rather than somewhere else.
+    #[test]
+    fn run_identity_columns_serialize_with_their_trust_flag() {
+        let mut entry = minimal_entry();
+        entry.session_id = Some("01JBX0000000000000000CAPT".to_string());
+        entry.a2a_context_id = Some("run-7".to_string());
+        entry.a2a_identity_verified = Some(false);
+        let json = serde_json::to_string(&entry).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(v["a2a_context_id"], "run-7");
+        // An unverified envelope is marked as such wherever the run id
+        // appears: the caller chose this id, so a report that sums by it
+        // without reading this column sums an attacker-chosen number.
+        assert_eq!(v["a2a_identity_verified"], false);
+        // The capture session keeps its own column. The two group
+        // different things (one run vs one caller) and both are needed.
+        assert_eq!(v["session_id"], "01JBX0000000000000000CAPT");
+    }
+
+    /// Non-A2A traffic carries neither column, so an absent trust flag
+    /// is never confused with an asserted-and-unverified one.
+    #[test]
+    fn run_identity_columns_are_omitted_for_non_a2a_traffic() {
+        let json = serde_json::to_string(&minimal_entry()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("a2a_context_id").is_none());
+        assert!(v.get("a2a_identity_verified").is_none());
     }
 
     #[test]
@@ -1209,6 +1298,64 @@ mod tests {
         assert!(v.get("agent_vendor").is_none());
         assert!(v.get("payment_rail").is_none());
         assert!(v.get("content_shape").is_none());
+    }
+
+    #[test]
+    fn settlement_receipt_digest_serializes_and_omits() {
+        // The receipt correlation digest is the only settlement
+        // identifier the access log carries. It has to round-trip under
+        // its exact key, and it has to vanish entirely for unsettled
+        // traffic rather than serializing as null, because a null here
+        // reads as "settled, digest missing".
+        let digest = "a3f1".repeat(16);
+        let mut entry = minimal_entry();
+        entry.rail = Some("x402".to_string());
+        entry.settlement_receipt_digest = Some(digest.clone());
+        let json = serde_json::to_string(&entry).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["rail"], "x402");
+        assert_eq!(v["settlement_receipt_digest"], digest);
+
+        let unsettled = minimal_entry();
+        let json = serde_json::to_string(&unsettled).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("settlement_receipt_digest").is_none());
+    }
+
+    #[test]
+    fn the_settlement_line_carries_no_credential_or_provider_reference() {
+        // Task 9's privacy assertion, pinned where the shape lives. A
+        // settled line carries the rail and a one-way digest. There is no
+        // field for the credential that paid, the provider object that
+        // moved the funds, or the customer the usage was billed to, so
+        // the assertion is about the serialized key set rather than about
+        // one carefully chosen fixture value.
+        let mut entry = minimal_entry();
+        entry.rail = Some("stripe".to_string());
+        entry.settlement_receipt_digest = Some("0".repeat(64));
+        let json = serde_json::to_string(&entry).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let object = value.as_object().unwrap();
+
+        for forbidden in [
+            "client_secret",
+            "macaroon",
+            "rune",
+            "payment_credential",
+            "payment_proof",
+            "spt",
+            "payment_intent_id",
+            "provider_reference",
+            "usage_customer_id",
+            "payer",
+        ] {
+            assert!(
+                !object.contains_key(forbidden),
+                "the access log grew a {forbidden} field"
+            );
+        }
+        assert_eq!(object["rail"], "stripe");
+        assert_eq!(object["settlement_receipt_digest"], "0".repeat(64));
     }
 
     #[test]
