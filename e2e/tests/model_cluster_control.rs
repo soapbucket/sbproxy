@@ -666,9 +666,21 @@ fn wait_for_ports_to_release(nodes: &[NodeSpec]) {
     }
 }
 
+/// Environment for every spawned cluster node: the fake engine
+/// (spawned by the node's model host) reads
+/// `SBPROXY_FAKE_ENGINE_READY_AFTER_PROBES` from its inherited process
+/// environment. Passed per child instead of exported from this test
+/// runner's own environment (WOR-646).
+const NODE_ENV: &[(&str, &str)] = &[("SBPROXY_FAKE_ENGINE_READY_AFTER_PROBES", "20")];
+
+/// Start a cluster node with the fixture's shutdown budget and the
+/// fake-engine environment on the child.
+fn start_node(config: &str) -> Result<ProxyHarness> {
+    ProxyHarness::start_with_workspace_shutdown_grace_and_env(config, &[], 1_000, NODE_ENV)
+}
+
 #[test]
 fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
-    std::env::set_var("SBPROXY_FAKE_ENGINE_READY_AFTER_PROBES", "20");
     let root = tempfile::tempdir().context("create cluster fixture")?;
     let catalog_path = write_model_fixture(root.path())?;
     let fake_engine_path = Path::new(env!("CARGO_BIN_EXE_fake_model_engine"));
@@ -705,8 +717,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
     for (node, config) in nodes.iter().zip(&configs) {
         processes.insert(
             node.node_id,
-            ProxyHarness::start_with_workspace_and_shutdown_grace(config, &[], 1_000)
-                .with_context(|| format!("start {}", node.node_id))?,
+            start_node(config).with_context(|| format!("start {}", node.node_id))?,
         );
     }
 
@@ -752,9 +763,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         .terminate_gracefully(Duration::from_secs(5))
         .context("stop gateway controller")?;
     drop(gateway);
-    let restarted_gateway =
-        ProxyHarness::start_with_workspace_and_shutdown_grace(&configs[1], &[], 1_000)
-            .context("restart gateway controller")?;
+    let restarted_gateway = start_node(&configs[1]).context("restart gateway controller")?;
     processes.insert("gateway-a", restarted_gateway);
     statuses = wait_for_statuses(
         &client,
@@ -951,9 +960,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         },
     );
     validate_config(root.path(), 100, &partitioned_config)?;
-    let mut partitioned =
-        ProxyHarness::start_with_workspace_and_shutdown_grace(&partitioned_config, &[], 1_000)
-            .context("start partitioned worker")?;
+    let mut partitioned = start_node(&partitioned_config).context("start partitioned worker")?;
     wait_for_statuses(
         &client,
         &surviving_admin_ports,
@@ -981,9 +988,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         },
     );
     validate_config(root.path(), 101, &mismatch_config)?;
-    let mut mismatched =
-        ProxyHarness::start_with_workspace_and_shutdown_grace(&mismatch_config, &[], 1_000)
-            .context("start digest-mismatched worker")?;
+    let mut mismatched = start_node(&mismatch_config).context("start digest-mismatched worker")?;
     let mismatch_ports = nodes
         .iter()
         .filter(|node| node.node_id != failed_node_id)
@@ -1000,12 +1005,8 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         .context("stop digest-mismatched worker")?;
     drop(mismatched);
 
-    let recovered = ProxyHarness::start_with_workspace_and_shutdown_grace(
-        &steady_configs[failed_index],
-        &[],
-        1_000,
-    )
-    .context("restart worker with matching deployment policy")?;
+    let recovered = start_node(&steady_configs[failed_index])
+        .context("restart worker with matching deployment policy")?;
     processes.insert(nodes[failed_index].node_id, recovered);
     let recovery = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         wait_for_statuses(
