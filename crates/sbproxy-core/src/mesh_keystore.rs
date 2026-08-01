@@ -360,11 +360,7 @@ impl MeshKeyStore {
     /// minority of a partition must still be able to revoke. The merge
     /// fence keeps the record terminal on every replica that ever sees
     /// it, and anti-entropy carries it across the heal.
-    async fn write_revoked(
-        &self,
-        record: &KeyRecord,
-        register_version: Option<u64>,
-    ) -> Result<()> {
+    async fn write_revoked(&self, record: &KeyRecord, register_version: Option<u64>) -> Result<()> {
         let payload = serde_json::to_vec(record).context("encode revoked key record")?;
         let key = key_state_key(&record.key_id);
         match register_version {
@@ -732,7 +728,10 @@ mod tests {
         assert_eq!(stored.name.as_deref(), Some("first"));
 
         assert_eq!(
-            store.put_key_if_revision(key_record("missing"), 1).await.unwrap(),
+            store
+                .put_key_if_revision(key_record("missing"), 1)
+                .await
+                .unwrap(),
             KeyPolicyCasResult::NotFound
         );
         assert!(store.get_key("missing").await.unwrap().is_none());
@@ -945,26 +944,21 @@ mod tests {
         let key_id = created["key"]["key_id"].as_str().expect("key id").to_string();
 
         // Warm the cache on the minting node.
-        let warmed =
-            crate::key_plane::block_on_keystore(plane.cache().resolve_key(&key_id))
-                .expect("resolve")
-                .expect("record present");
+        let warmed = crate::key_plane::block_on_keystore(plane.cache().resolve_key(&key_id))
+            .expect("resolve")
+            .expect("record present");
         assert_eq!(warmed.status, RecordStatus::Active);
 
-        let resp = crate::admin_keys::dispatch(
-            "POST",
-            &format!("/admin/keys/{key_id}/revoke"),
-            None,
-        )
-        .expect("revoke route");
+        let resp =
+            crate::admin_keys::dispatch("POST", &format!("/admin/keys/{key_id}/revoke"), None)
+                .expect("revoke route");
         assert_eq!(resp.0, 200, "{}", resp.2);
 
         // No TTL wait: the very next resolve already sees the terminal
         // record because the mutation path invalidated the entry.
-        let resolved =
-            crate::key_plane::block_on_keystore(plane.cache().resolve_key(&key_id))
-                .expect("resolve after revoke")
-                .expect("record present");
+        let resolved = crate::key_plane::block_on_keystore(plane.cache().resolve_key(&key_id))
+            .expect("resolve after revoke")
+            .expect("record present");
         assert_eq!(resolved.status, RecordStatus::Revoked);
         assert!(!resolved.is_usable(Utc::now()));
     }

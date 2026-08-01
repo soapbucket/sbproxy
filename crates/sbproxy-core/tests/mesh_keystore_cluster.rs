@@ -267,20 +267,44 @@ async fn a_minority_partition_can_still_revoke_and_peers_deny_after_heal() {
         "the partitioned minority must not serve an allow"
     );
 
-    // The majority still serves the stale record until the heal; that
-    // is the documented eventual bound, not a bug.
+    // The revocation has not crossed the partition: B's shard still
+    // holds the pre-revocation register. Asserted on the shard
+    // directly, because any quorum read from B would consult A and pick
+    // the revocation up through reconciliation, which is exactly the
+    // asymmetry a real partition does not have.
+    let state_key = "keystore:v1:key:compromised";
+    let before_heal = b.shard.fetch(state_key).expect("replica present");
     assert_eq!(
-        mesh_b
-            .get_key("compromised")
-            .await
-            .expect("resolve on B")
-            .expect("present")
-            .status,
-        RecordStatus::Active
+        before_heal.logical_version(),
+        1,
+        "the one-ack revocation must not have reached the cut-off peer"
     );
 
-    // Heal: one anti-entropy round on A pushes the revocation out.
-    substrate_a.maintenance_round().await;
+    // B's own view of the same partition fails closed too: with a
+    // replication factor of two, quorum is both nodes, so neither side
+    // of the split can read. No node serves a false allow meanwhile.
+    let mut cut_b = addrs.clone();
+    cut_b.insert("node-a".to_string(), format!("127.0.0.1:{}", dead_port()));
+    let mesh_b_cut = MeshKeyStore::new(substrate_for(&b, &cut_b, cluster_settings(0)));
+    assert!(
+        mesh_b_cut.get_key("compromised").await.is_err(),
+        "two-of-two quorum reads must fail closed on the other side of the split"
+    );
+
+    // Heal: drive anti-entropy rounds on A until the revocation lands
+    // on B's shard, bounded so a wedged transport fails the test
+    // instead of hanging. No wall-clock waits: every iteration is one
+    // explicit, fully awaited maintenance round.
+    let mut healed = false;
+    for _ in 0..10 {
+        substrate_a.maintenance_round().await;
+        let delivered = b.shard.fetch(state_key).is_some_and(|r| r.logical_version() >= 2);
+        if delivered {
+            healed = true;
+            break;
+        }
+    }
+    assert!(healed, "anti-entropy must deliver the revocation to the peer");
     for (name, store) in [("A", &mesh_a), ("B", &mesh_b)] {
         let resolved = store
             .get_key("compromised")
@@ -372,11 +396,29 @@ async fn a_quarantined_rejoin_holds_authentication_until_its_first_complete_roun
         "unexpected refusal: {error:#}"
     );
 
-    // One complete anti-entropy round against the surviving replica
-    // repopulates the shard and opens the gate.
-    let report = substrate_b2.maintenance_round().await;
-    assert!(report.pulled >= 1, "the round must repopulate the key");
-    assert!(mesh_b2.readiness().ready());
+    // Drive anti-entropy rounds against the surviving replica until the
+    // first complete one opens the gate, bounded so a wedged transport
+    // fails the test instead of hanging. No wall-clock waits: each
+    // iteration is one explicit, fully awaited maintenance round.
+    let mut caught_up = false;
+    for _ in 0..10 {
+        substrate_b2.maintenance_round().await;
+        if mesh_b2.readiness().ready() {
+            caught_up = true;
+            break;
+        }
+    }
+    assert!(
+        caught_up,
+        "a complete anti-entropy round must open the readiness gate"
+    );
+    assert!(
+        substrate_b2
+            .shard()
+            .fetch("keystore:v1:key:durable")
+            .is_some(),
+        "the complete round must have repopulated the quarantined shard from the peer"
+    );
     let resolved = mesh_b2
         .get_key("durable")
         .await
