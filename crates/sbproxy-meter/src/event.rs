@@ -21,7 +21,7 @@
 //!   the byte counts and duration the count was derived from are on the
 //!   receipt too;
 //! - the config that priced the call was not the config that was agreed,
-//!   which [`UnitSource::RouteWeight`] localises through `config_gen`.
+//!   which [`UnitSource::RouteWeight`] localises through `config_revision`.
 //!
 //! The source is an enum and not a string. A string would let a resolver
 //! write whatever provenance flattered it, and would let a new resolver ship
@@ -135,28 +135,45 @@ pub enum Evidence {
         /// Wall-clock milliseconds the request was in flight.
         duration_ms: u64,
     },
-    /// The config generation that supplied the weight. Backs
+    /// The config revision that supplied the weight. Backs
     /// [`UnitSource::RouteWeight`].
     RouteWeight {
-        /// Generation of the configuration that was live when the weight was
-        /// read. This is the field that answers "you priced my call under a
-        /// config I never agreed to".
-        config_gen: u64,
+        /// Short hex tag of the configuration that was live when the weight
+        /// was read, as `sbproxy-core` computes it over the serialised
+        /// document. This is the field that answers "you priced my call
+        /// under a config I never agreed to": it names a specific document,
+        /// so a buyer holding the signed config bundle can look the weight
+        /// up and get the same number rather than being asked to trust one.
+        ///
+        /// A tag rather than a counter. There is no monotonic generation
+        /// number anywhere in this proxy, and inventing one would produce an
+        /// identifier that says a config changed without saying to what.
+        config_revision: String,
     },
     /// What the origin claimed, verbatim. Backs
     /// [`UnitSource::OriginHeader`].
     OriginHeader {
         /// Name of the response header the count was read from.
         header: String,
-        /// The header value exactly as the origin sent it.
+        /// The header value exactly as the origin sent it, or `None` when
+        /// the origin sent no such header at all.
         ///
-        /// Never trimmed, never re-formatted, never re-serialised from the
-        /// parsed number. If the origin sent `" 47 "` or `47.0` or
-        /// `forty-seven`, that is what a buyer needs to see, because the
-        /// disagreement may be about the parse rather than the number. A
-        /// normalising receipt destroys the only record of what actually
-        /// arrived.
-        raw: String,
+        /// Absent and empty are separate statements and the encoding keeps
+        /// them separate. `None` is "we looked and the origin said nothing";
+        /// `Some("")` is "the origin set the header and put nothing in it".
+        /// The first is usually an origin that has not been taught to report
+        /// its own consumption and the second is usually a bug in one that
+        /// has, so an operator chasing a metering gap needs to tell them
+        /// apart before they know who to talk to.
+        ///
+        /// A present value is never trimmed, never re-formatted, and never
+        /// re-serialised from the parsed number. If the origin sent `" 47 "`
+        /// or `47.0` or `forty-seven`, that is what a buyer needs to see,
+        /// because the disagreement may be about the parse rather than the
+        /// number. A normalising receipt destroys the only record of what
+        /// actually arrived.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw: Option<String>,
     },
 }
 
@@ -262,7 +279,7 @@ mod tests {
             47,
             Evidence::OriginHeader {
                 header: "x-rows-returned".to_string(),
-                raw: "47".to_string(),
+                raw: Some("47".to_string()),
             },
         );
 
@@ -281,7 +298,7 @@ mod tests {
             source: UnitSource::Measured,
             evidence: Evidence::OriginHeader {
                 header: "x-rows-returned".to_string(),
-                raw: "47".to_string(),
+                raw: Some("47".to_string()),
             },
         };
 
@@ -307,7 +324,7 @@ mod tests {
                 47,
                 Evidence::OriginHeader {
                     header: "X-Rows-Returned".to_string(),
-                    raw: raw.to_string(),
+                    raw: Some(raw.to_string()),
                 },
             );
 
@@ -319,7 +336,8 @@ mod tests {
                 panic!("origin-header evidence must not change variant in transit");
             };
             assert_eq!(
-                got, raw,
+                got.as_deref(),
+                Some(raw),
                 "the origin's bytes are the evidence; normalising them destroys it"
             );
             assert_eq!(
@@ -327,6 +345,71 @@ mod tests {
                 "the header name is not lowercased either"
             );
         }
+    }
+
+    #[test]
+    fn a_header_the_origin_never_set_is_not_a_header_it_set_to_nothing() {
+        // The two live one field apart on the wire and mean different
+        // things. `raw` absent is "we looked and found no header"; `raw: ""`
+        // is "the origin set the header and left it blank". An encoding that
+        // rendered both as the empty string would erase the only evidence of
+        // which one happened.
+        let absent = Unit::new(
+            "result_row",
+            0,
+            Evidence::OriginHeader {
+                header: "X-Rows-Returned".to_string(),
+                raw: None,
+            },
+        );
+        let blank = Unit::new(
+            "result_row",
+            0,
+            Evidence::OriginHeader {
+                header: "X-Rows-Returned".to_string(),
+                raw: Some(String::new()),
+            },
+        );
+
+        assert_ne!(absent, blank);
+
+        let absent_json: serde_json::Value =
+            serde_json::to_value(&absent).expect("unit serialises");
+        let blank_json: serde_json::Value = serde_json::to_value(&blank).expect("unit serialises");
+
+        assert!(
+            absent_json["evidence"].get("raw").is_none(),
+            "a value the origin never sent must not appear on the receipt as one it did"
+        );
+        assert_eq!(blank_json["evidence"]["raw"], "");
+
+        for unit in [absent, blank] {
+            let json = serde_json::to_string(&unit).expect("unit serialises");
+            let back: Unit = serde_json::from_str(&json).expect("unit deserialises");
+            assert_eq!(back, unit);
+            assert_eq!(back.source, UnitSource::OriginHeader);
+        }
+    }
+
+    #[test]
+    fn route_weight_evidence_names_the_document_that_priced_the_call() {
+        let unit = Unit::new(
+            "search_call",
+            5,
+            Evidence::RouteWeight {
+                config_revision: "9f2c41a0be77".to_string(),
+            },
+        );
+
+        let json = serde_json::to_string(&unit).expect("unit serialises");
+        let back: Unit = serde_json::from_str(&json).expect("unit deserialises");
+
+        assert_eq!(back, unit);
+        assert_eq!(back.source, UnitSource::RouteWeight);
+        let Evidence::RouteWeight { config_revision } = &back.evidence else {
+            panic!("route-weight evidence must not change variant in transit");
+        };
+        assert_eq!(config_revision, "9f2c41a0be77");
     }
 
     #[test]
@@ -346,7 +429,7 @@ mod tests {
         assert_eq!(value["source"], "measured");
         assert_eq!(value["evidence"]["bytes_out"], 12_043);
         assert!(
-            value["evidence"].get("config_gen").is_none(),
+            value["evidence"].get("config_revision").is_none(),
             "untagged evidence must not leak a sibling variant's fields"
         );
     }

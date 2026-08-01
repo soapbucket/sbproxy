@@ -23,9 +23,10 @@ use smallvec::SmallVec;
 
 use crate::snapshot::{CompiledConfig, CompiledOrigin};
 use crate::types::{
-    AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig, AttestationQueueConfig,
-    AttestationRole, ConfigFile, EnforcementMode, FailureMode, L2CacheConfig, L2CacheParams,
-    MessengerSettings, OriginAttestationConfig, RawOriginConfig, WebBotAuthConfig,
+    AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig,
+    AttestationOriginHeaderConfig, AttestationQueueConfig, AttestationRole,
+    AttestationRouteWeightConfig, ConfigFile, EnforcementMode, FailureMode, L2CacheConfig,
+    L2CacheParams, MessengerSettings, OriginAttestationConfig, RawOriginConfig, WebBotAuthConfig,
     ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, MAX_ATTESTATION_QUEUE_ENTRIES,
 };
 
@@ -1842,6 +1843,157 @@ fn validate_attestation(
         None => {}
     }
 
+    validate_attestation_unit_resolvers(&attestation.route_weights, &attestation.origin_headers)?;
+
+    if engaged && attestation.route_weights.is_empty() && attestation.origin_headers.is_empty() {
+        // Not an error. A deployment can legitimately want the record
+        // without the arithmetic: an event per call, an outcome, and a
+        // chain that proves none went missing. It is worth saying out
+        // loud all the same, because an operator who meant to price
+        // something and mistyped the key gets a proxy that meters
+        // diligently and bills nothing, and the receipts look fine.
+        tracing::warn!(
+            "proxy.attestation declares a role but no unit resolvers, so every receipt will \
+             record an outcome with an empty units list. Declare \
+             proxy.attestation.route_weights or proxy.attestation.origin_headers to price \
+             the calls."
+        );
+    }
+
+    Ok(())
+}
+
+/// Reject unit resolver declarations that could not produce a readable
+/// invoice.
+///
+/// The cross-cutting check is the one worth having here: a unit name has
+/// to identify one invoice line. Route weights may repeat a name on
+/// purpose, because several routes priced differently are still one
+/// line, and the most specific match wins. Everything else that repeats
+/// a name produces two entries on one receipt that a buyer cannot tell
+/// apart, and worse, whose provenance differs, which defeats the reason
+/// the units are broken out by source in the first place.
+fn validate_attestation_unit_resolvers(
+    route_weights: &[AttestationRouteWeightConfig],
+    origin_headers: &[AttestationOriginHeaderConfig],
+) -> Result<()> {
+    let mut route_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut seen_routes: std::collections::HashSet<(String, Option<String>, String)> =
+        std::collections::HashSet::new();
+
+    for entry in route_weights {
+        validate_attestation_route_weight(entry)?;
+        let name: &str = entry.name.trim();
+        let method: Option<String> = entry
+            .method
+            .as_deref()
+            .map(|method| method.trim().to_ascii_uppercase());
+        let path: &str = entry.path.trim();
+        if !seen_routes.insert((name.to_string(), method, path.to_string())) {
+            anyhow::bail!(
+                "proxy.attestation.route_weights: `{name}` prices `{path}` twice. Two weights \
+                 for one route on one invoice line have no defensible order, so pick the one \
+                 you meant."
+            );
+        }
+        route_names.insert(name);
+    }
+
+    let mut header_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for entry in origin_headers {
+        validate_attestation_origin_header(entry)?;
+        let name: &str = entry.name.trim();
+        if !header_names.insert(name) {
+            anyhow::bail!(
+                "proxy.attestation.origin_headers: `{name}` is declared twice. One unit name is \
+                 one invoice line, and two headers filling the same line would produce a \
+                 receipt nobody can read."
+            );
+        }
+        if route_names.contains(name) {
+            anyhow::bail!(
+                "proxy.attestation: `{name}` is declared as both a route weight and an origin \
+                 header. One name has to mean one thing on a receipt: a buyer reading two \
+                 `{name}` lines with different provenance cannot tell which number came from \
+                 where, which is the whole reason units carry a source."
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Reject a route weight that names nothing or matches nothing.
+fn validate_attestation_route_weight(entry: &AttestationRouteWeightConfig) -> Result<()> {
+    let name: &str = entry.name.trim();
+    if name.is_empty() {
+        anyhow::bail!(
+            "proxy.attestation.route_weights: every entry needs a non-empty `name`; it is the \
+             invoice line the weight is billed on"
+        );
+    }
+
+    let path: &str = entry.path.trim();
+    if !path.starts_with('/') {
+        anyhow::bail!(
+            "proxy.attestation.route_weights: `{name}` has path {path:?}, which does not start \
+             with `/` and so can never match a request path"
+        );
+    }
+    // A `*` anywhere but the documented suffix is the shape of somebody
+    // expecting glob matching. It would silently match nothing, which is
+    // a route that quietly stops being priced.
+    let stars = path.matches('*').count();
+    if stars > 1 || (stars == 1 && !path.ends_with("/*")) {
+        anyhow::bail!(
+            "proxy.attestation.route_weights: `{name}` has path {path:?}. The only wildcard is \
+             a trailing `/*`, which matches everything below that segment; anywhere else a `*` \
+             is matched literally and the route would silently go unpriced."
+        );
+    }
+
+    if let Some(method) = entry.method.as_deref() {
+        let method: &str = method.trim();
+        if method.is_empty() {
+            anyhow::bail!(
+                "proxy.attestation.route_weights: `{name}` has an empty `method`. Omit the key \
+                 to price every method."
+            );
+        }
+        if !method.bytes().all(|byte| byte.is_ascii_graphic()) {
+            anyhow::bail!(
+                "proxy.attestation.route_weights: `{name}` has method {method:?}, which is not \
+                 an HTTP method token"
+            );
+        }
+    }
+
+    // `weight` is deliberately unchecked. Zero is a real answer (metered
+    // and free) and there is no upper bound worth inventing for a number
+    // the operator is charging themselves against.
+    Ok(())
+}
+
+/// Reject an origin-header rule that names nothing or names a header
+/// that cannot exist.
+fn validate_attestation_origin_header(entry: &AttestationOriginHeaderConfig) -> Result<()> {
+    let name: &str = entry.name.trim();
+    if name.is_empty() {
+        anyhow::bail!(
+            "proxy.attestation.origin_headers: every entry needs a non-empty `name`; it is the \
+             invoice line the origin's count is billed on"
+        );
+    }
+
+    let header: &str = entry.header.trim();
+    if header.is_empty()
+        || http::header::HeaderName::from_bytes(header.to_ascii_lowercase().as_bytes()).is_err()
+    {
+        anyhow::bail!(
+            "proxy.attestation.origin_headers: `{name}` reads {header:?}, which is not a valid \
+             HTTP header name, so no response could ever carry it"
+        );
+    }
     Ok(())
 }
 
@@ -5302,6 +5454,183 @@ origins:
             .err()
             .expect("an empty agreement names no contract");
         assert!(error.to_string().contains("agreement_id"), "got: {error}");
+    }
+
+    // --- WOR-2128: unit resolvers ---
+
+    #[test]
+    fn attestation_resolvers_survive_compilation_in_the_operators_spelling() {
+        let compiled = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    route_weights:\
+             \n      - name: search_call\
+             \n        method: POST\
+             \n        path: /v1/search\
+             \n        weight: 5\
+             \n      - name: search_call\
+             \n        path: /v1/search/*\
+             \n        weight: 1\
+             \n    origin_headers:\
+             \n      - name: result_row\
+             \n        header: X-Rows-Returned",
+        ))
+        .expect("a complete block with resolvers compiles");
+
+        let attestation = compiled
+            .server
+            .attestation
+            .expect("the attestation block survives compilation");
+
+        assert_eq!(attestation.route_weights.len(), 2);
+        assert_eq!(attestation.route_weights[0].name, "search_call");
+        assert_eq!(attestation.route_weights[0].method.as_deref(), Some("POST"));
+        assert_eq!(attestation.route_weights[0].path, "/v1/search");
+        assert_eq!(attestation.route_weights[0].weight, 5);
+        assert_eq!(
+            attestation.route_weights[1].method, None,
+            "an omitted method prices every method"
+        );
+        assert_eq!(attestation.origin_headers.len(), 1);
+        assert_eq!(
+            attestation.origin_headers[0].header, "X-Rows-Returned",
+            "the receipt quotes this back, so the operator's casing is kept"
+        );
+    }
+
+    #[test]
+    fn attestation_one_unit_name_may_not_come_from_two_provenances() {
+        // The check the units-carry-a-source design depends on. Two
+        // `search_call` lines on one receipt, one priced by config and
+        // one asserted by the origin, cannot be told apart by whoever
+        // reads it, which is exactly what the source field is for.
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    route_weights:\
+             \n      - name: search_call\
+             \n        path: /v1/search\
+             \n        weight: 5\
+             \n    origin_headers:\
+             \n      - name: search_call\
+             \n        header: X-Rows-Returned",
+        ))
+        .err()
+        .expect("a name shared across resolvers is not compilable");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("search_call"), "{rendered}");
+        assert!(rendered.contains("provenance"), "{rendered}");
+    }
+
+    #[test]
+    fn attestation_route_priced_twice_on_one_line_fails_config_load() {
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    route_weights:\
+             \n      - name: search_call\
+             \n        method: post\
+             \n        path: /v1/search\
+             \n        weight: 5\
+             \n      - name: search_call\
+             \n        method: POST\
+             \n        path: /v1/search\
+             \n        weight: 9",
+        ))
+        .err()
+        .expect("two weights for one route have no defensible order");
+
+        assert!(
+            error.to_string().contains("twice"),
+            "the method is matched case-insensitively, so these are one route: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_wildcard_outside_the_documented_suffix_fails_config_load() {
+        for path in ["/v1/*/search", "/v1/search*", "/*/x", "/v1/*/*"] {
+            let error = compile_config(&attestation_yaml(&format!(
+                "\n    role: receipt\
+                 \n    route_weights:\
+                 \n      - name: search_call\
+                 \n        path: \"{path}\"\
+                 \n        weight: 5"
+            )))
+            .err()
+            .unwrap_or_else(|| panic!("{path:?} looks like a glob and is not one"));
+
+            assert!(
+                error.to_string().contains("wildcard"),
+                "{path:?}: a `*` that matches literally leaves a route silently unpriced: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn attestation_relative_route_path_fails_config_load() {
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    route_weights:\
+             \n      - name: search_call\
+             \n        path: v1/search\
+             \n        weight: 5",
+        ))
+        .err()
+        .expect("a path that can never match a request path is a typo, not a rule");
+
+        assert!(
+            error.to_string().contains("does not start with"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_unreachable_origin_header_fails_config_load() {
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    origin_headers:\
+             \n      - name: result_row\
+             \n        header: \"X Rows Returned\"",
+        ))
+        .err()
+        .expect("a header name with spaces cannot arrive on a response");
+
+        assert!(
+            error.to_string().contains("valid HTTP header name"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_zero_weight_is_a_metered_free_route() {
+        let compiled = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    route_weights:\
+             \n      - name: health_call\
+             \n        path: /healthz\
+             \n        weight: 0",
+        ))
+        .expect("metered and free is a position an operator is allowed to hold");
+
+        assert_eq!(
+            compiled
+                .server
+                .attestation
+                .expect("attestation present")
+                .route_weights[0]
+                .weight,
+            0
+        );
+    }
+
+    #[test]
+    fn attestation_role_without_resolvers_still_compiles() {
+        // Recording every call and pricing none of it is a legitimate
+        // posture: the chain still proves no call went missing. The
+        // compiler warns and does not refuse.
+        let compiled = compile_config(&attestation_yaml("\n    role: receipt"))
+            .expect("a role without unit resolvers is not an error");
+        let attestation = compiled.server.attestation.expect("attestation present");
+        assert!(attestation.route_weights.is_empty());
+        assert!(attestation.origin_headers.is_empty());
     }
 
     // --- WOR-193: agent_skills schema validation ---

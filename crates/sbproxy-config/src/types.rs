@@ -1079,6 +1079,78 @@ pub struct AttestationLedgerConfig {
     pub path: String,
 }
 
+/// `proxy.attestation.route_weights[]`: one route the operator priced.
+///
+/// The simplest thing an operator can say about what a call costs, and
+/// the only one that needs nothing from anybody: the weight is written
+/// down, so the number is a pure function of the route and the document
+/// it was read from. That document is already signed, so naming its
+/// revision on the receipt is all it takes for a buyer to check the
+/// price themselves. See `sbproxy_meter::RouteWeightTable`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationRouteWeightConfig {
+    /// Unit name that appears on the invoice line, for example
+    /// `search_call`. Repeating a name across entries is how one line
+    /// gets different prices on different routes; see [`Self::path`].
+    pub name: String,
+    /// HTTP method this entry prices, or absent for any method.
+    /// Matched case-insensitively.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// The path this entry prices: either exact (`/v1/search`) or a
+    /// prefix ending in `/*` (`/v1/search/*`), which covers everything
+    /// below that segment and deliberately not the segment itself.
+    ///
+    /// When several entries share a [`Self::name`] and all match, the
+    /// most specific wins: a named method beats an unnamed one, an exact
+    /// path beats a prefix, and a longer prefix beats a shorter one. One
+    /// name still bills one line.
+    pub path: String,
+    /// What one matching call costs.
+    ///
+    /// Zero is allowed and means the route is metered and free, which is
+    /// not the same as having no entry for it. No entry means this line
+    /// does not price the route at all, and the receipt then carries no
+    /// unit rather than a zero.
+    pub weight: u64,
+}
+
+/// `proxy.attestation.origin_headers[]`: one count the upstream reports.
+///
+/// The only unit source that can be wrong without the proxy being wrong,
+/// because the party supplying the number is the party being paid for
+/// it. That is not a reason to refuse it: an API selling result rows has
+/// to bill result rows, and only the origin knows how many there were.
+/// What the proxy does instead is attest rather than vouch. The receipt
+/// records the header name and the value exactly as it arrived, so the
+/// claim on the invoice is "the origin sent this", which is a claim the
+/// proxy can actually stand behind.
+///
+/// There is deliberately no knob for what to do with a value that will
+/// not parse. Substituting a number the proxy counted would put the
+/// proxy's provenance on the origin's claim, and a receipt that cannot
+/// separate "the origin lied" from "the proxy miscounted" is worthless
+/// in the dispute it exists for. A value that does not parse bills zero
+/// and goes on the receipt verbatim. See
+/// `sbproxy_meter::OriginHeaderRule`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationOriginHeaderConfig {
+    /// Unit name that appears on the invoice line, for example
+    /// `result_row`. Unique across every resolver: two units sharing a
+    /// name on one receipt is an invoice line that cannot be read.
+    pub name: String,
+    /// Response header the count is read from. Matched
+    /// case-insensitively, and quoted back on the receipt in the
+    /// spelling written here.
+    ///
+    /// A header rather than a body path. Reading a JSON body means
+    /// buffering one, and what that costs a streaming response is its
+    /// own decision rather than a side effect of a metering key.
+    pub header: String,
+}
+
 /// `proxy.attestation`: the proxy-wide consumption attestation block.
 ///
 /// Off unless [`Self::role`] says otherwise, and inert in every config
@@ -1134,6 +1206,20 @@ pub struct AttestationConfig {
     /// What the operator charges for. Required, and required complete,
     /// when the role is not [`AttestationRole::Off`].
     pub billable: Option<AttestationBillableConfig>,
+    /// Routes priced in this document. See
+    /// [`AttestationRouteWeightConfig`].
+    ///
+    /// A sibling list rather than a variant of one `units:` block, and
+    /// the same goes for [`Self::origin_headers`]. Each resolver has its
+    /// own provenance and its own way of being wrong, so each declares
+    /// itself in its own vocabulary and none of them can be mistaken for
+    /// another when a receipt is read back. It also means the expression
+    /// resolver arrives later as a third list rather than as a variant
+    /// every existing entry has to be retrofitted into.
+    pub route_weights: Vec<AttestationRouteWeightConfig>,
+    /// Counts this proxy reads back from its upstreams. See
+    /// [`AttestationOriginHeaderConfig`].
+    pub origin_headers: Vec<AttestationOriginHeaderConfig>,
 }
 
 impl Default for AttestationConfig {
@@ -1149,6 +1235,8 @@ impl Default for AttestationConfig {
             queue: None,
             ledger: None,
             billable: None,
+            route_weights: Vec::new(),
+            origin_headers: Vec::new(),
         }
     }
 }

@@ -432,7 +432,13 @@ mod tests {
 
     /// A unit asserting one whole completed search, priced by config.
     fn route_weight() -> Unit {
-        Unit::new("search_call", 1, Evidence::RouteWeight { config_gen: 218 })
+        Unit::new(
+            "search_call",
+            1,
+            Evidence::RouteWeight {
+                config_revision: "9f2c41a0be77".to_string(),
+            },
+        )
     }
 
     #[test]
@@ -549,7 +555,7 @@ mod tests {
                 47,
                 Evidence::OriginHeader {
                     header: "x-rows-returned".to_string(),
-                    raw: "47".to_string(),
+                    raw: Some("47".to_string()),
                 },
             ),
         ];

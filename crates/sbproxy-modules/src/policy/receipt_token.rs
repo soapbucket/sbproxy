@@ -249,12 +249,13 @@ pub enum ReceiptEvidence {
         /// Wall-clock milliseconds the request was in flight.
         duration_ms: u64,
     },
-    /// The config generation that supplied the weight. Backs the
+    /// The config revision that supplied the weight. Backs the
     /// `route_weight` source.
     RouteWeight {
-        /// Generation of the configuration that was live when the weight was
-        /// read.
-        config_gen: u64,
+        /// Short hex tag of the configuration that was live when the weight
+        /// was read, so a buyer holding the signed config bundle can look
+        /// the weight up rather than being asked to trust it.
+        config_revision: String,
     },
     /// What the origin claimed, verbatim. Backs the `origin_header` source.
     OriginHeader {
@@ -263,7 +264,12 @@ pub enum ReceiptEvidence {
         /// The header value exactly as the origin sent it, never trimmed and
         /// never re-serialized from the parsed number. The disagreement may
         /// be about the parse rather than the number.
-        raw: String,
+        ///
+        /// Absent when the origin set no such header, which is a different
+        /// statement from setting it to nothing and stays different on the
+        /// wire: the key is omitted rather than emitted as an empty string.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw: Option<String>,
     },
 }
 
@@ -342,8 +348,8 @@ impl From<&Evidence> for ReceiptEvidence {
                 bytes_out: *bytes_out,
                 duration_ms: *duration_ms,
             },
-            Evidence::RouteWeight { config_gen } => Self::RouteWeight {
-                config_gen: *config_gen,
+            Evidence::RouteWeight { config_revision } => Self::RouteWeight {
+                config_revision: config_revision.clone(),
             },
             Evidence::OriginHeader { header, raw } => Self::OriginHeader {
                 header: header.clone(),
@@ -819,7 +825,7 @@ mod tests {
                     source: "origin_header".to_string(),
                     evidence: ReceiptEvidence::OriginHeader {
                         header: "X-Rows-Returned".to_string(),
-                        raw: " 47 ".to_string(),
+                        raw: Some(" 47 ".to_string()),
                     },
                 },
             ],
@@ -1111,13 +1117,30 @@ mod tests {
                     duration_ms: 91,
                 },
             ),
-            Unit::new("api_call", 1, Evidence::RouteWeight { config_gen: 7 }),
+            Unit::new(
+                "api_call",
+                1,
+                Evidence::RouteWeight {
+                    config_revision: "9f2c41a0be77".to_string(),
+                },
+            ),
             Unit::new(
                 "result_row",
                 47,
                 Evidence::OriginHeader {
                     header: "X-Rows-Returned".to_string(),
-                    raw: " 47 ".to_string(),
+                    raw: Some(" 47 ".to_string()),
+                },
+            ),
+            // The origin that never reported. Its receipt has to keep the
+            // `raw` key off the wire entirely, and the conversion is where
+            // that could quietly stop being true.
+            Unit::new(
+                "index_doc",
+                0,
+                Evidence::OriginHeader {
+                    header: "X-Docs-Indexed".to_string(),
+                    raw: None,
                 },
             ),
         ];
@@ -1140,10 +1163,16 @@ mod tests {
                 bytes_out: 12_043,
                 duration_ms: 91,
             },
-            Evidence::RouteWeight { config_gen: 7 },
+            Evidence::RouteWeight {
+                config_revision: "9f2c41a0be77".to_string(),
+            },
             Evidence::OriginHeader {
                 header: "X-Rows-Returned".to_string(),
-                raw: " 47 ".to_string(),
+                raw: Some(" 47 ".to_string()),
+            },
+            Evidence::OriginHeader {
+                header: "X-Docs-Indexed".to_string(),
+                raw: None,
             },
         ] {
             let wire = ReceiptEvidence::from(&evidence);
@@ -1200,7 +1229,7 @@ mod tests {
             47,
             Evidence::OriginHeader {
                 header: "X-Rows-Returned".to_string(),
-                raw: " 47 ".to_string(),
+                raw: Some(" 47 ".to_string()),
             },
         );
         let signer = receipt_signer();
@@ -1218,7 +1247,7 @@ mod tests {
             back.units[0].evidence,
             ReceiptEvidence::OriginHeader {
                 header: "X-Rows-Returned".to_string(),
-                raw: " 47 ".to_string(),
+                raw: Some(" 47 ".to_string()),
             },
             "the origin's bytes survive verbatim, whitespace included"
         );

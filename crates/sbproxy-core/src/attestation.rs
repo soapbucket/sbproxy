@@ -25,6 +25,17 @@
 //! whatever the code happened to do, and nobody finds out what that was
 //! until a buyer asks.
 //!
+//! # The resolvers are lowered, never merged
+//!
+//! `proxy.attestation.route_weights` and
+//! `proxy.attestation.origin_headers` become two independent collections
+//! on [`crate::attestation::AttestationRuntime`], and they stay
+//! independent. A route matched
+//! by both contributes two entries to a receipt's units, one per source,
+//! because the sources have different provenance and summing them
+//! produces a number whose parts can no longer be checked separately.
+//! See [`sbproxy_meter`].
+//!
 //! # Validation mode never touches the disk
 //!
 //! `prepare_attestation` creates the directories the queue and the
@@ -41,11 +52,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use sbproxy_config::types::{
-    AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig, AttestationQueueConfig,
-    AttestationRole, BillableRule, EnforcementMode, FailureMode, OriginAttestationConfig,
-    WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH,
+    AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig,
+    AttestationOriginHeaderConfig, AttestationQueueConfig, AttestationRole,
+    AttestationRouteWeightConfig, BillableRule, EnforcementMode, FailureMode,
+    OriginAttestationConfig, WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH,
 };
-use sbproxy_meter::{Billable, BillableOutcome, OutcomeTable};
+use sbproxy_meter::{
+    Billable, BillableOutcome, OriginHeaderRule, OutcomeTable, RouteWeightRule, RouteWeightTable,
+};
 
 /// The attestation posture one pipeline generation runs under.
 ///
@@ -90,6 +104,22 @@ pub struct AttestationRuntime {
     pub ledger_path: PathBuf,
     /// The operator's complete position on what they charge for.
     pub outcomes: OutcomeTable,
+    /// Routes this generation prices, bound to the revision that priced
+    /// them.
+    ///
+    /// Holding the table here rather than looking weights up against
+    /// whatever config is live when a unit is written is what keeps a
+    /// reload from repricing a call already in flight. A request holds
+    /// the generation that admitted it until it finishes, and the
+    /// revision on the receipt is therefore the revision that actually
+    /// decided the price.
+    pub route_weights: RouteWeightTable,
+    /// Counts this generation reads back from upstream responses.
+    ///
+    /// The one source that can be wrong without the proxy being wrong,
+    /// which is why the resolver attests to what arrived rather than
+    /// vouching for it. See `sbproxy_meter::origin_header`.
+    pub origin_headers: Vec<OriginHeaderRule>,
 }
 
 /// The attestation posture one origin runs under, after the proxy-wide
@@ -114,6 +144,13 @@ pub struct ResolvedOriginAttestation {
 /// Returns `Ok(None)` when the block is absent or its role is
 /// [`AttestationRole::Off`], which is every config that does not opt in.
 ///
+/// `config_revision` is the revision of the document being lowered, and
+/// it is a parameter rather than something read from a global on
+/// purpose. Every route weight this generation produces will cite it,
+/// and a receipt citing a revision other than the one that supplied the
+/// weight is worse than a receipt with no evidence at all, because it
+/// reads as proof.
+///
 /// The queue and ledger directories are created here. That is the side
 /// effect the caller gates on construction mode; see the module docs.
 ///
@@ -129,6 +166,7 @@ pub struct ResolvedOriginAttestation {
 pub(crate) fn prepare_attestation(
     cfg: Option<&AttestationConfig>,
     web_bot_auth: Option<&WebBotAuthConfig>,
+    config_revision: &str,
 ) -> Result<Option<Arc<AttestationRuntime>>> {
     let attestation: &AttestationConfig = match cfg {
         Some(attestation) => attestation,
@@ -184,6 +222,20 @@ pub(crate) fn prepare_attestation(
         ),
     };
 
+    let route_weights: RouteWeightTable = RouteWeightTable::new(
+        config_revision,
+        attestation
+            .route_weights
+            .iter()
+            .map(route_weight_rule)
+            .collect(),
+    );
+    let origin_headers: Vec<OriginHeaderRule> = attestation
+        .origin_headers
+        .iter()
+        .map(origin_header_rule)
+        .collect();
+
     // Boot is the right time to find out the state directory is
     // unwritable. Discovering it at the first claim means the first
     // billable request of the deployment is also the first one that
@@ -200,7 +252,33 @@ pub(crate) fn prepare_attestation(
         queue_max_entries,
         ledger_path,
         outcomes,
+        route_weights,
+        origin_headers,
     })))
+}
+
+/// Lower one configured route weight into the meter's rule.
+///
+/// Every field is copied across explicitly. The config vocabulary and
+/// the metering vocabulary are two types on purpose (see the module
+/// docs), and this is the seam, so a field added on either side has to
+/// be dealt with here rather than silently dropped on the way to a
+/// receipt.
+fn route_weight_rule(entry: &AttestationRouteWeightConfig) -> RouteWeightRule {
+    RouteWeightRule {
+        name: entry.name.clone(),
+        method: entry.method.clone(),
+        path: entry.path.clone(),
+        weight: entry.weight,
+    }
+}
+
+/// Lower one configured origin-header rule into the meter's rule.
+fn origin_header_rule(entry: &AttestationOriginHeaderConfig) -> OriginHeaderRule {
+    OriginHeaderRule {
+        name: entry.name.clone(),
+        header: entry.header.clone(),
+    }
 }
 
 /// Compose the proxy-wide role with one origin's override.
@@ -311,6 +389,11 @@ fn ensure_state_dir(path: &Path, key: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sbproxy_meter::{Evidence, UnitSource};
+
+    /// The revision every test lowers under, standing in for the one the
+    /// pipeline computes over the serialized document.
+    const REVISION: &str = "9f2c41a0be77";
 
     fn complete_billable() -> AttestationBillableConfig {
         AttestationBillableConfig {
@@ -354,13 +437,13 @@ mod tests {
 
     #[test]
     fn an_absent_or_off_block_builds_no_runtime() {
-        assert!(prepare_attestation(None, None)
+        assert!(prepare_attestation(None, None, REVISION)
             .expect("absent block is not an error")
             .is_none());
 
         let off = AttestationConfig::default();
         assert_eq!(off.role, AttestationRole::Off);
-        assert!(prepare_attestation(Some(&off), None)
+        assert!(prepare_attestation(Some(&off), None, REVISION)
             .expect("an off role is not an error")
             .is_none());
     }
@@ -447,7 +530,7 @@ mod tests {
             directory_url: None,
         };
 
-        let runtime = prepare_attestation(Some(&cfg), Some(&signer))
+        let runtime = prepare_attestation(Some(&cfg), Some(&signer), REVISION)
             .expect("a complete block builds")
             .expect("a declared role yields a runtime");
 
@@ -485,11 +568,160 @@ mod tests {
             ..AttestationConfig::default()
         };
 
-        let error = prepare_attestation(Some(&cfg), None)
+        let error = prepare_attestation(Some(&cfg), None, REVISION)
             .expect_err("a receipt with nothing to sign it is not a receipt");
         assert!(
             error.to_string().contains("sign_with"),
             "the error names the key the operator has to fix: {error}"
+        );
+    }
+
+    /// A complete block with whatever resolvers a test wants on it.
+    fn metering_config(
+        route_weights: Vec<AttestationRouteWeightConfig>,
+        origin_headers: Vec<AttestationOriginHeaderConfig>,
+    ) -> AttestationConfig {
+        AttestationConfig {
+            role: AttestationRole::Receipt,
+            sign_with: Some(ATTESTATION_SIGN_WITH_WEB_BOT_AUTH.to_string()),
+            queue: Some(AttestationQueueConfig {
+                path: "claims.q".to_string(),
+                max_entries: 16,
+            }),
+            ledger: Some(AttestationLedgerConfig {
+                path: "receipts.ndjson".to_string(),
+            }),
+            billable: Some(complete_billable()),
+            route_weights,
+            origin_headers,
+            ..AttestationConfig::default()
+        }
+    }
+
+    fn signer() -> WebBotAuthConfig {
+        WebBotAuthConfig {
+            key_id: "sbproxy-2026".to_string(),
+            ed25519_seed_hex: "0".repeat(64),
+            directory_url: None,
+        }
+    }
+
+    #[test]
+    fn declared_resolvers_lower_into_the_metering_vocabulary() {
+        let cfg = metering_config(
+            vec![AttestationRouteWeightConfig {
+                name: "search_call".to_string(),
+                method: Some("POST".to_string()),
+                path: "/v1/search".to_string(),
+                weight: 5,
+            }],
+            vec![AttestationOriginHeaderConfig {
+                name: "result_row".to_string(),
+                header: "X-Rows-Returned".to_string(),
+            }],
+        );
+
+        let runtime = prepare_attestation(Some(&cfg), Some(&signer()), REVISION)
+            .expect("a complete block builds")
+            .expect("a declared role yields a runtime");
+
+        let weights = runtime.route_weights.resolve("POST", "/v1/search");
+        assert_eq!(weights.len(), 1);
+        assert_eq!(weights[0].name, "search_call");
+        assert_eq!(weights[0].count, 5);
+        assert_eq!(weights[0].source, UnitSource::RouteWeight);
+
+        assert_eq!(runtime.origin_headers.len(), 1);
+        let claimed = runtime.origin_headers[0].resolve(Some("47"));
+        assert_eq!(claimed.unit.name, "result_row");
+        assert_eq!(claimed.unit.count, 47);
+        assert_eq!(claimed.unit.source, UnitSource::OriginHeader);
+    }
+
+    #[test]
+    fn route_weights_cite_the_revision_this_generation_was_built_from() {
+        // The pairing this parameter exists to make impossible: weights
+        // from one document citing the revision of another. A generation
+        // gets its revision when it is built, so an in-flight request
+        // holding an older runtime keeps the older tag.
+        let cfg = metering_config(
+            vec![AttestationRouteWeightConfig {
+                name: "search_call".to_string(),
+                method: None,
+                path: "/v1/search".to_string(),
+                weight: 5,
+            }],
+            Vec::new(),
+        );
+
+        let old = prepare_attestation(Some(&cfg), Some(&signer()), REVISION)
+            .expect("builds")
+            .expect("a declared role yields a runtime");
+        let new = prepare_attestation(Some(&cfg), Some(&signer()), "0011223344ff")
+            .expect("builds")
+            .expect("a declared role yields a runtime");
+
+        assert_eq!(
+            old.route_weights.resolve("POST", "/v1/search")[0].evidence,
+            Evidence::RouteWeight {
+                config_revision: REVISION.to_string(),
+            }
+        );
+        assert_eq!(
+            new.route_weights.resolve("POST", "/v1/search")[0].evidence,
+            Evidence::RouteWeight {
+                config_revision: "0011223344ff".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_role_with_no_declared_resolvers_still_builds_an_empty_table() {
+        // Recording the call without pricing it is a legitimate posture,
+        // so this is not an error. The table is empty rather than absent
+        // so the request path has one shape to handle.
+        let cfg = metering_config(Vec::new(), Vec::new());
+
+        let runtime = prepare_attestation(Some(&cfg), Some(&signer()), REVISION)
+            .expect("builds")
+            .expect("a declared role yields a runtime");
+
+        assert!(runtime.route_weights.is_empty());
+        assert!(runtime.origin_headers.is_empty());
+        assert_eq!(runtime.route_weights.config_revision(), REVISION);
+    }
+
+    #[test]
+    fn a_route_priced_and_reported_at_once_yields_one_unit_per_source() {
+        let cfg = metering_config(
+            vec![AttestationRouteWeightConfig {
+                name: "search_call".to_string(),
+                method: None,
+                path: "/v1/search".to_string(),
+                weight: 1,
+            }],
+            vec![AttestationOriginHeaderConfig {
+                name: "result_row".to_string(),
+                header: "X-Rows-Returned".to_string(),
+            }],
+        );
+        let runtime = prepare_attestation(Some(&cfg), Some(&signer()), REVISION)
+            .expect("builds")
+            .expect("a declared role yields a runtime");
+
+        let mut units = runtime.route_weights.resolve("POST", "/v1/search");
+        units.extend(
+            runtime
+                .origin_headers
+                .iter()
+                .map(|rule| rule.resolve(Some("40")).unit),
+        );
+
+        let sources: Vec<UnitSource> = units.iter().map(|unit| unit.source).collect();
+        assert_eq!(
+            sources,
+            vec![UnitSource::RouteWeight, UnitSource::OriginHeader],
+            "two provenances stay two lines; 41 would be one number nobody can check"
         );
     }
 }

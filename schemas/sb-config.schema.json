@@ -5805,6 +5805,22 @@
               "type": "null"
             }
           ]
+        },
+        "route_weights": {
+          "description": "Routes priced in this document. See [`AttestationRouteWeightConfig`].\n\nA sibling list rather than a variant of one `units:` block, and the same goes for [`Self::origin_headers`]. Each resolver has its own provenance and its own way of being wrong, so each declares itself in its own vocabulary and none of them can be mistaken for another when a receipt is read back. It also means the expression resolver arrives later as a third list rather than as a variant every existing entry has to be retrofitted into.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AttestationRouteWeightConfig"
+          }
+        },
+        "origin_headers": {
+          "description": "Counts this proxy reads back from its upstreams. See [`AttestationOriginHeaderConfig`].",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AttestationOriginHeaderConfig"
+          }
         }
       },
       "additionalProperties": false
@@ -6031,6 +6047,59 @@
           ]
         }
       ]
+    },
+    "AttestationRouteWeightConfig": {
+      "description": "`proxy.attestation.route_weights[]`: one route the operator priced.\n\nThe simplest thing an operator can say about what a call costs, and the only one that needs nothing from anybody: the weight is written down, so the number is a pure function of the route and the document it was read from. That document is already signed, so naming its revision on the receipt is all it takes for a buyer to check the price themselves. See `sbproxy_meter::RouteWeightTable`.",
+      "type": "object",
+      "required": [
+        "name",
+        "path",
+        "weight"
+      ],
+      "properties": {
+        "name": {
+          "description": "Unit name that appears on the invoice line, for example `search_call`. Repeating a name across entries is how one line gets different prices on different routes; see [`Self::path`].",
+          "type": "string"
+        },
+        "method": {
+          "description": "HTTP method this entry prices, or absent for any method. Matched case-insensitively.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "The path this entry prices: either exact (`/v1/search`) or a prefix ending in `/*` (`/v1/search/*`), which covers everything below that segment and deliberately not the segment itself.\n\nWhen several entries share a [`Self::name`] and all match, the most specific wins: a named method beats an unnamed one, an exact path beats a prefix, and a longer prefix beats a shorter one. One name still bills one line.",
+          "type": "string"
+        },
+        "weight": {
+          "description": "What one matching call costs.\n\nZero is allowed and means the route is metered and free, which is not the same as having no entry for it. No entry means this line does not price the route at all, and the receipt then carries no unit rather than a zero.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "AttestationOriginHeaderConfig": {
+      "description": "`proxy.attestation.origin_headers[]`: one count the upstream reports.\n\nThe only unit source that can be wrong without the proxy being wrong, because the party supplying the number is the party being paid for it. That is not a reason to refuse it: an API selling result rows has to bill result rows, and only the origin knows how many there were. What the proxy does instead is attest rather than vouch. The receipt records the header name and the value exactly as it arrived, so the claim on the invoice is \"the origin sent this\", which is a claim the proxy can actually stand behind.\n\nThere is deliberately no knob for what to do with a value that will not parse. Substituting a number the proxy counted would put the proxy's provenance on the origin's claim, and a receipt that cannot separate \"the origin lied\" from \"the proxy miscounted\" is worthless in the dispute it exists for. A value that does not parse bills zero and goes on the receipt verbatim. See `sbproxy_meter::OriginHeaderRule`.",
+      "type": "object",
+      "required": [
+        "header",
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "description": "Unit name that appears on the invoice line, for example `result_row`. Unique across every resolver: two units sharing a name on one receipt is an invoice line that cannot be read.",
+          "type": "string"
+        },
+        "header": {
+          "description": "Response header the count is read from. Matched case-insensitively, and quoted back on the receipt in the spelling written here.\n\nA header rather than a body path. Reading a JSON body means buffering one, and what that costs a streaming response is its own decision rather than a side effect of a metering key.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "ProxyTenantConfig": {
       "description": "WOR-1053: declared tenant. PR1 only carries the `id`; PR2+ adds per-tenant `credentials`, `policies`, `vault`, and `observability` blocks alongside the multi-tenant inheritance fan-out.\n\nA reserved tenant id of `__default__` is the synthetic default every origin resolves to when `origin.tenant_id` is absent. The operator never declares `__default__` explicitly; doing so fails config compile.",

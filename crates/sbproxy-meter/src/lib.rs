@@ -53,17 +53,39 @@
 //! actually holds to is the one that matters for compile times and for
 //! layering: nothing here reaches back into the proxy.
 //!
+//! # Three resolvers, and they are added rather than merged
+//!
+//! [`measured`] counts what the proxy saw, [`route_weight`] applies what the
+//! operator wrote down, and [`origin_header`] records what the upstream
+//! claimed. A route can have all three, and when it does the event carries
+//! three entries in [`MeteredEvent::units`] rather than one number that is
+//! their sum.
+//!
+//! That is not a formatting preference. The three have different provenance
+//! and therefore different failure modes, and summing them produces a figure
+//! whose parts can no longer be checked separately. "You billed me 53" is
+//! one unfalsifiable complaint; "you billed me 12 you counted, 1 you priced,
+//! and 40 your upstream asserted" is three claims a person can take apart.
+//! The breakdown is the product, so nothing in this crate adds unit counts
+//! together and nothing should.
+//!
 //! # What is not here yet
 //!
-//! No configuration surface, and no resolvers beyond [`measured`]. Those
-//! arrive in later slices and build on these types.
+//! The expression resolver, which subsumes all three, and which goes last on
+//! purpose: ship it early and every deployment writes expressions, after
+//! which no common case can be optimised or statically checked. The
+//! [`origin_header`] resolver also reads response headers only, not JSON
+//! body paths, because reading a body means buffering one, and what that
+//! costs a streaming response is a decision that deserves its own slice.
 
 #![deny(missing_docs)]
 
 pub mod event;
 pub mod ledger;
 pub mod measured;
+pub mod origin_header;
 pub mod outcome;
+pub mod route_weight;
 
 pub use event::{Evidence, MeteredEvent, Subject, Unit, UnitSource};
 pub use ledger::{
@@ -71,4 +93,66 @@ pub use ledger::{
     LedgerPayload, LedgerVerifyResult, UsageLedger,
 };
 pub use measured::{resolve_measured, MeasuredQuantity, MeasuredRule, Measurement};
+pub use origin_header::{
+    parse_origin_count, resolve_origin_headers, OriginClaim, OriginHeaderRule, ResolvedOriginUnit,
+};
 pub use outcome::{Billable, BillableOutcome, Claim, OutcomeTable, OutcomeTableError};
+pub use route_weight::{RouteWeightRule, RouteWeightTable};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn one_route_metered_three_ways_bills_three_lines_and_not_their_sum() {
+        // The shape of a real receipt for a search API that charges for
+        // egress it delivered, a flat price per call, and the rows its
+        // upstream says it returned.
+        let measurement = Measurement {
+            bytes_in: 512,
+            bytes_out: 12_043,
+            duration_ms: 91,
+        };
+        let measured = resolve_measured(
+            &[MeasuredRule::new(
+                "egress_kib",
+                MeasuredQuantity::BytesOut,
+                NonZeroU64::new(1024).expect("test divisors are non-zero"),
+            )],
+            &measurement,
+        );
+        let weights = RouteWeightTable::new(
+            "9f2c41a0be77",
+            vec![RouteWeightRule::new(
+                "search_call",
+                Some("POST".to_string()),
+                "/v1/search",
+                1,
+            )],
+        );
+        let claimed = resolve_origin_headers(
+            &[OriginHeaderRule::new("result_row", "X-Rows-Returned")],
+            |_| Some("40".to_string()),
+        );
+
+        let mut units: Vec<Unit> = measured;
+        units.extend(weights.resolve("POST", "/v1/search"));
+        units.extend(claimed.into_iter().map(|resolved| resolved.unit));
+
+        let lines: Vec<(&str, u64, UnitSource)> = units
+            .iter()
+            .map(|unit| (unit.name.as_str(), unit.count, unit.source))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                ("egress_kib", 12, UnitSource::Measured),
+                ("search_call", 1, UnitSource::RouteWeight),
+                ("result_row", 40, UnitSource::OriginHeader),
+            ],
+            "53 is not an answer anybody can dispute a part of"
+        );
+        assert!(units.iter().all(Unit::provenance_is_consistent));
+    }
+}

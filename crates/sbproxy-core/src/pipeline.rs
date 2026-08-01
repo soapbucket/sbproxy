@@ -1959,10 +1959,16 @@ impl CompiledPipeline {
         // that is not going to run. Everything decidable without a
         // filesystem was already decided at config compile, so
         // validation still rejects a broken block.
+        // WOR-2128: the revision goes in here rather than being read at
+        // resolve time. Every route weight this generation produces cites
+        // it, and a weight that cited whatever config happened to be live
+        // when the receipt was written would name a document that did not
+        // price the call.
         let attestation = match mode {
             PipelineConstructionMode::Runtime => crate::attestation::prepare_attestation(
                 config.server.attestation.as_ref(),
                 config.server.web_bot_auth.as_ref(),
+                &config_revision,
             )?,
             PipelineConstructionMode::Validation => None,
         };
