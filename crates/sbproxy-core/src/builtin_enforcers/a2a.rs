@@ -110,6 +110,15 @@ impl PolicyEnforcer for A2AEnforcer {
         // reason to spend a JSON parse on their bodies.
         if a2a_ctx.spec == sbproxy_modules::A2ASpec::V1_0 && !req.body().is_empty() {
             if let Some(parsed) = sbproxy_modules::a2a_v1::parse_request(req.body()) {
+                // Method-level visibility, from the closed enum rather
+                // than the caller-supplied wire string: eleven bounded
+                // values instead of an unbounded label. The type is
+                // named rather than inferred so the label's cardinality
+                // bound is legible at the call site.
+                let method: Option<sbproxy_modules::a2a_v1::V1Method> = parsed.method;
+                if let Some(method) = method {
+                    sbproxy_observe::metrics::record_a2a_method(&route, method.as_label());
+                }
                 let push = policy.check_push_notification(&parsed);
                 if !push.is_allow() {
                     let reason = push.reason_label();

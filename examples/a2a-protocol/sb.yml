@@ -85,9 +85,9 @@ proxy:
   # `X-A2A-Caller-Agent-Id` can rename itself off `caller_denylist`.
   #
   # Loopback is listed here so this example is runnable with curl from
-  # the same host. In a real deployment this is the sidecar or mesh
-  # ingress that terminates the caller's connection and stamps the
-  # envelope itself, never a range that reaches untrusted clients.
+  # the same host. In a real deployment this is the mesh ingress that
+  # terminates the caller's connection and stamps the envelope itself,
+  # never a range that reaches untrusted clients.
   #
   # The alternative, and the stronger one, is to skip these headers
   # entirely and let the chain come from a signed token: SBproxy reads

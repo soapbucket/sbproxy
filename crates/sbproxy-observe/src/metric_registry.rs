@@ -453,6 +453,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_a2a_methods_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_a2a_method"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["route", "method"],
+        description: "A2A 1.0 JSON-RPC methods observed by the proxy, labelled by route and method.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_acme_renewal_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_acme_renewal"),

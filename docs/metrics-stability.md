@@ -63,6 +63,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_a2a_chain_depth` | Histogram | `stable` | `beta` | `route`, `spec` | Distribution of A2A chain depth observed at the proxy. |
 | `sbproxy_a2a_denied_total` | Counter | `stable` | `beta` | `route`, `reason` | A2A hops denied by the a2a policy, labelled by route and reason. |
 | `sbproxy_a2a_hops_total` | Counter | `stable` | `beta` | `route`, `spec`, `decision` | A2A hops observed by the proxy, labelled by route, spec, and policy decision. |
+| `sbproxy_a2a_methods_total` | Counter | `stable` | `beta` | `route`, `method` | A2A 1.0 JSON-RPC methods observed by the proxy, labelled by route and method. |
 | `sbproxy_acme_renewal_duration_seconds` | Histogram | `stable` | `beta` | `result` | ACME renewal full-flow duration, by outcome. |
 | `sbproxy_acme_renewals_total` | Counter | `stable` | `beta` | `result` | ACME certificate renewal attempts, by outcome. |
 | `sbproxy_active_connections` | Gauge | `stable` | `stable` | none | Current active connections. |

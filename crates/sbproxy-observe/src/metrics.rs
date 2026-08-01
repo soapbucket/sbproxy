@@ -1694,6 +1694,32 @@ pub fn record_a2a_hop(route: &str, spec: &str, decision: &str) {
         .inc();
 }
 
+/// Record one A2A 1.0 JSON-RPC method invocation.
+///
+/// Separate from `sbproxy_a2a_hops_total` rather than another label on
+/// it: method only exists for the ratified 1.0 spec, so folding it in
+/// would leave an empty dimension on every v0 hop and multiply the
+/// existing series by a value most of them cannot carry.
+///
+/// `method` must come from the closed method enum, never from the raw
+/// wire string. The enum has eleven variants; the wire field is
+/// caller-controlled and unbounded, and would blow up cardinality.
+pub fn record_a2a_method(route: &str, method: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_a2a_methods_total",
+            "A2A 1.0 JSON-RPC methods observed by the proxy, labelled by route and method.",
+            &["route", "method"],
+        )
+        .expect("a2a methods counter registers")
+    });
+    let route = sanitize_label("route", route);
+    counter.with_label_values(&[route.as_ref(), method]).inc();
+}
+
 /// Record an A2A chain depth observation. Surfaces
 /// the depth distribution per route + spec so dashboards can spot
 /// runaway recursion before the depth-cap policy denies.
