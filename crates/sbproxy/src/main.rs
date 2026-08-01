@@ -3160,26 +3160,33 @@ const SERVICE_LABEL: &str = "dev.sbproxy.agent";
 /// Seconds launchd waits for the agent to exit after SIGTERM before it
 /// escalates to SIGKILL.
 ///
-/// launchd's default is 20 seconds, which is shorter than the proxy's own
-/// 30-second default shutdown grace (`SBPROXY_SHUTDOWN_GRACE_MS`). An
-/// agent still draining in-flight requests at 20 seconds would be
-/// SIGKILLed part-way through, skipping every Rust destructor on the
-/// shutdown path. 45 leaves the full drain room to finish; raise it
-/// alongside any increase to the default grace.
+/// launchd's default is 20 seconds, which is far shorter than the proxy's
+/// full drain. The drain has TWO phases of the same length: Pingora sleeps
+/// the whole `grace_period_seconds`, then waits up to
+/// `graceful_shutdown_timeout_seconds` for service runtimes to exit, and
+/// the server sets both to the 30-second default grace
+/// (`SBPROXY_SHUTDOWN_GRACE_MS`), so a shutdown after traffic takes about
+/// 60 seconds end to end. The previous value of 45 only budgeted one
+/// phase, so launchd SIGKILLed a draining agent mid-shutdown, skipping
+/// every Rust destructor including the engine reap (WOR-2167). 90 leaves
+/// the full two-phase drain room to finish; raise it alongside any
+/// increase to the default grace.
 ///
 /// Durable managed-engine ownership separately covers a forced gateway
 /// death; this timeout preserves the preferred graceful path so a normal
 /// `service uninstall` can drain before verifying and clearing ownership.
-const SERVICE_EXIT_TIMEOUT_SECS: u32 = 45;
+const SERVICE_EXIT_TIMEOUT_SECS: u32 = 90;
 
-/// The proxy's default shutdown grace in seconds, which
-/// [`SERVICE_EXIT_TIMEOUT_SECS`] has to exceed. Kept next to it so the
-/// relationship is checked at compile time rather than in a test that
-/// someone has to remember to run.
+/// The proxy's default shutdown grace in seconds. The full drain is two
+/// phases of this length (grace sleep, then runtime exit wait; see
+/// `crates/sbproxy-core/src/server/lifecycle.rs`, which sets both Pingora
+/// fields from the same value), and [`SERVICE_EXIT_TIMEOUT_SECS`] has to
+/// exceed the sum. Kept next to it so the relationship is checked at
+/// compile time rather than in a test that someone has to remember to run.
 const DEFAULT_SHUTDOWN_GRACE_SECS: u32 = 30;
 const _: () = assert!(
-    SERVICE_EXIT_TIMEOUT_SECS > DEFAULT_SHUTDOWN_GRACE_SECS,
-    "launchd would SIGKILL the agent before its shutdown drain could finish"
+    SERVICE_EXIT_TIMEOUT_SECS > 2 * DEFAULT_SHUTDOWN_GRACE_SECS,
+    "launchd would SIGKILL the agent before its two-phase shutdown drain could finish"
 );
 
 /// Filesystem locations the `service` subcommands read and write,

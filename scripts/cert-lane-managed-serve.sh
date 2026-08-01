@@ -49,6 +49,11 @@ bad() { echo "  FAIL $1"; fail=$((fail + 1)); }
 # lane after it.
 PROXY_PID=""
 cleanup() {
+  # start_run runs in a command-substitution subshell, so the outer
+  # PROXY_PID can be empty or stale; the pid file is the durable copy.
+  if [ -z "$PROXY_PID" ] || ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    PROXY_PID="$(cat "$WORK/proxy.pid" 2>/dev/null || true)"
+  fi
   if [ -n "$PROXY_PID" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
     # Prefer the production graceful-shutdown signal. If the bounded
     # cleanup has to escalate, the next managed start's exact ownership
@@ -93,6 +98,12 @@ start_run() {
     --admin-port "$admin" \
     "${cache_args[@]}" >"$log" 2>&1 &
   PROXY_PID=$!
+  # Callers invoke this function inside a command substitution, which is
+  # a subshell: assigning PROXY_PID here never reaches the outer script.
+  # Without the pid file the outer script SIGTERMed an empty pid, called
+  # that a clean exit, and the orphaned gateway squatted the public port
+  # through the release check (WOR-2167).
+  echo "$PROXY_PID" > "$WORK/proxy.pid"
   while [ "$(( $(date +%s) - start ))" -lt "$deadline" ]; do
     if grep -q "is ready on" "$log" 2>/dev/null; then
       echo "$(( $(date +%s) - start ))"
@@ -257,9 +268,18 @@ else
 fi
 
 # --- 6. clean shutdown --------------------------------------------------
+#
+# The pid comes from the file start_run wrote, because start_run runs in a
+# command-substitution subshell and its variables do not survive. The exit
+# window is 90s: the drain is two 30-second phases (grace sleep, then
+# runtime exit wait), so a healthy shutdown after traffic takes about 60s.
+PROXY_PID="$(cat "$WORK/proxy.pid" 2>/dev/null || true)"
+if [ -z "$PROXY_PID" ] || ! kill -0 "$PROXY_PID" 2>/dev/null; then
+  bad "no live gateway pid to SIGTERM; start_run's pid file is missing or stale"
+fi
 kill -TERM "$PROXY_PID" 2>/dev/null
 exit_secs=-1
-for i in $(seq 1 60); do
+for i in $(seq 1 90); do
   if ! kill -0 "$PROXY_PID" 2>/dev/null; then
     exit_secs=$i
     break
@@ -269,7 +289,7 @@ done
 if [ "$exit_secs" -ge 0 ]; then
   ok "SIGTERM exited the gateway cleanly in ${exit_secs}s"
 else
-  bad "the gateway did not exit within 60s of SIGTERM"
+  bad "the gateway did not exit within 90s of SIGTERM"
 fi
 leftover="$(pgrep -f "$CERT_ENGINE_PROC" 2>/dev/null | wc -l | tr -d ' ')"
 if [ "$leftover" -eq 0 ]; then
