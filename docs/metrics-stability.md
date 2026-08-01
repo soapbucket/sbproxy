@@ -91,7 +91,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_ai_compression_value_cost_saved_micros_total` | Counter | `stable` | `beta` | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Gross known-price target-model input cost avoided by successful AI context compression, in micro-USD. |
 | `sbproxy_ai_compression_value_tokens_saved_total` | Counter | `stable` | `beta` | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Estimated target-model input tokens avoided by successful AI context compression. |
 | `sbproxy_ai_context_poisoning_findings_total` | Counter | `stable` | `beta` | `rule_id`, `action` | Context-poisoning guardrail findings. |
-| `sbproxy_ai_cost_dollars_attributed_total` | Counter | `stable` | `beta` | `origin`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id` | AI cost in USD, partitioned by attribution tag. |
+| `sbproxy_ai_cost_dollars_attributed_total` | Counter | `stable` | `beta` | `origin`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | AI cost in USD, partitioned by attribution tag. |
 | `sbproxy_ai_cost_saved_micros_total` | Counter | `stable` | `beta` | `tenant`, `origin`, `model` | Micro-USD avoided by a semantic-cache hit. |
 | `sbproxy_ai_cost_usd_micros_total` | Counter | `stable` | `beta` | `provider`, `model`, `tenant_id` | Derived AI request cost in micro-USD. |
 | `sbproxy_ai_failovers_total` | Counter | `stable` | `beta` | `from_provider`, `to_provider`, `reason` | Provider failover events. |
@@ -134,7 +134,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_ai_surface_request_duration_seconds` | Histogram | `stable` | `stable` | `surface`, `method` | AI request latency partitioned by classified surface. |
 | `sbproxy_ai_surface_requests_total` | Counter | `stable` | `stable` | `surface`, `method` | AI gateway requests partitioned by classified surface. |
 | `sbproxy_ai_token_estimate_error_ratio` | Histogram | `stable` | `beta` | `model` | Relative error of pre-request token estimate vs upstream usage.prompt_tokens. |
-| `sbproxy_ai_tokens_attributed_total` | Counter | `stable` | `beta` | `origin`, `provider`, `model`, `surface`, `direction`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id` | AI tokens consumed, partitioned by attribution tag. |
+| `sbproxy_ai_tokens_attributed_total` | Counter | `stable` | `beta` | `origin`, `provider`, `model`, `surface`, `direction`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | AI tokens consumed, partitioned by attribution tag. |
 | `sbproxy_ai_tokens_saved_total` | Counter | `stable` | `beta` | `tenant`, `origin`, `model`, `kind` | Tokens avoided by a semantic-cache hit. |
 | `sbproxy_ai_ttft_seconds` | Histogram | `stable` | `stable` | `provider`, `model` | AI streaming time to first token. |
 | `sbproxy_ai_usage_parse_miss_total` | Counter | `stable` | `beta` | `provider`, `surface` | 2xx AI responses on a token surface that carried no parseable usage block (budget debited from an estimate). |

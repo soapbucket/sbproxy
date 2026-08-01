@@ -5560,6 +5560,18 @@ impl ProxyHttp for SbProxy {
                 ctx.tenant_id.as_str(),
                 ctx.principal.api_key_id(),
                 &ctx.rollup_properties,
+                // WOR-2140: the realtime surface bills like any other, so
+                // it carries the same agent identity. `billable_id` still
+                // refuses an unverified name, so this cannot become a way
+                // to spend against an agent's budget over a websocket.
+                sbproxy_ai::budget::AgentIdentity {
+                    id: ctx
+                        .a2a
+                        .as_ref()
+                        .map(|a2a| sbproxy_ai::tracing_spans::cap_agent_id(&a2a.caller_agent_id))
+                        .filter(|id| !id.is_empty()),
+                    verified: ctx.a2a.as_ref().is_some_and(|a2a| a2a.identity_verified),
+                },
                 &span,
             );
             info!(
@@ -5808,6 +5820,12 @@ impl ProxyHttp for SbProxy {
                         team: ctx.attribution_tags.team.clone().unwrap_or_default(),
                         api_key_id: ctx.principal.api_key_id().to_string(),
                         project: ctx.attribution_tags.project.clone().unwrap_or_default(),
+                        // WOR-2140: same source as the usage path and the
+                        // `agent_id` metric label. `attribution_tags` only
+                        // carries an agent the proxy verified, so an
+                        // unverified caller rolls up unattributed rather
+                        // than under a name it chose for itself.
+                        agent_id: ctx.attribution_tags.agent_id.clone().unwrap_or_default(),
                         properties: ctx.rollup_properties.clone(),
                     },
                     kind: sbproxy_observe::usage_rollup::RollupKind::Outcome(

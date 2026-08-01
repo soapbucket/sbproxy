@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-01*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -979,7 +979,7 @@ The default is `allow`, and it is the one place in the gateway where defaulting 
 
 ## Budgets
 
-Set token or dollar caps that apply across a workspace, a single virtual key, an end user, a model, an origin, or a metadata tag. The `budget` block sits under `action` and is parsed by `BudgetConfig` in `crates/sbproxy-ai/src/budget.rs`.
+Set token or dollar caps that apply across a workspace, a single virtual key, an end user, a model, an origin, a metadata tag, or a single agent. The `budget` block sits under `action` and is parsed by `BudgetConfig` in `crates/sbproxy-ai/src/budget.rs`.
 
 By default the counters are per-instance (an in-process tracker), so a cluster of N replicas enforces roughly N times a given cap. When the key store runs on Redis (a `key_management` Redis backend, which is the clustered deployment shape), the same Redis also accumulates the spend and enforcement reads the shared total, so the fleet enforces one budget. Nothing extra is configured: cluster-shared budgets turn on whenever a Redis key store is present. If Redis is briefly unreachable the shared read fails open to the local tracker, so the per-instance count stays the floor.
 
@@ -1024,7 +1024,7 @@ action:
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
-| `scope` | enum | required | One of `workspace`, `api_key`, `user`, `model`, `origin`, `tag`. |
+| `scope` | enum | required | One of `workspace`, `api_key`, `user`, `model`, `origin`, `tag`, `agent`. |
 | `max_tokens` | u64 | unset | Total prompt + completion tokens allowed for the scope. |
 | `max_cost_usd` | f64 | unset | Total cost ceiling in USD across all requests in the scope. |
 | `period` | string | unset | One of `daily`, `weekly`, `monthly`, `total`. Window over which usage accumulates. |
@@ -1039,7 +1039,8 @@ action:
   the cheapest configured model it can price; it blocks only when no target is
   available.
 - Setting only `max_tokens` and leaving `max_cost_usd` unset (or vice versa) is supported. A limit with neither field is a no-op.
-- Multiple limits on the same scope with different `period` values (for example daily and monthly) accrue in separate window buckets. Each limit is checked against its own key; the tightest binding that is exceeded fires first in declaration order. There is no separate org/team/project hierarchy tracker: `BudgetScope` is the single enum (`workspace`, `api_key`, `user`, `model`, `origin`, `tag`) used by `BudgetLimit`.
+- Multiple limits on the same scope with different `period` values (for example daily and monthly) accrue in separate window buckets. Each limit is checked against its own key; the tightest binding that is exceeded fires first in declaration order. There is no separate org/team/project hierarchy tracker: `BudgetScope` is the single enum (`workspace`, `api_key`, `user`, `model`, `origin`, `tag`, `agent`) used by `BudgetLimit`.
+- An `agent`-scoped limit keys on the agent-to-agent caller identity, so per-agent spend is enforced rather than only reported. It names an agent only when the proxy verified that identity: asserted by a peer listed in `proxy.trusted_proxies`, or lifted from the RFC 8693 `act` chain of a signed token. An unverified caller names itself, so honouring the name would let it spend to the cap and then rename itself for a fresh allowance, or burn through the budget of an agent whose name it borrowed. Unverified and unidentified spend therefore pools into one shared bucket that is still capped, which is the same `__unattributed__` fallback a request missing `x-user-id` gets. That fails closed: one noisy unverified caller can exhaust the shared bucket, and no unverified caller can reach a named agent's budget. Reporting keeps the finer grain, since the usage ledger records the claimed id and the trust flag either way. This is a different mechanism from the `agent_budget` policy, which rate-limits requests per fingerprinted agent class; this caps spend per asserted agent identity.
 - Realtime WebSocket requests run the same hard-limit preflight before the
   upgrade. `block` returns 402 without an upstream WebSocket handshake, `log`
   permits the upgrade, and `downgrade` replaces every inbound `model` query
@@ -1781,7 +1782,7 @@ two authoritative identity dimensions in addition to provider/model:
 - `tenant_id`: the tenant the request resolved to (`__default__` in single-tenant deployments), taken from the matched origin.
 - `api_key_id`: a stable id for the credential (API key) that authenticated the request and injected its policy. This is the join key that ties spend back to the agent routing traffic through the gateway.
 
-Both are sourced from the resolved principal, never from a request header, so a caller cannot misattribute its own spend. The business attribution tags (`project`, `feature`, `team`, ...) remain caller-overridable through `SB-Attr-*` headers over the credential defaults; the trust dimensions above do not.
+Both are sourced from the resolved principal, never from a request header, so a caller cannot misattribute its own spend. The business attribution tags (`project`, `feature`, `team`, ...) remain caller-overridable through `SB-Attr-*` headers over the credential defaults; the trust dimensions above do not, and neither does `agent_id` (see the next section).
 
 `api_key_id` resolution:
 
@@ -1810,6 +1811,108 @@ tenant/key join is required. Usage sinks and enabled access logs retain
 operator-supplied project, user, tags, and metadata. Request spans and metrics
 use a smaller fixed field set, and security audit events exclude free-form
 metadata.
+
+### Cost per agent
+
+`api_key_id` answers "which credential spent this". It stops answering the
+question you actually have the moment one service runs several agents behind one
+key, which is the normal shape: a planner, a researcher, and a summariser all
+holding the same credential, and a bill that says only that the credential spent
+$4,000.
+
+So spend is also attributed to the agent that spent it, to the run it happened
+inside, and to the workflow that run belongs to.
+
+| Dimension | Where it comes from | Metric label | Usage ledger | Request span | Access log |
+|---|---|---|---|---|---|
+| agent | the resolved agent-to-agent identity (`x-a2a-caller-agent-id`, or an RFC 8693 `act` chain) | `agent_id` | `agent_id` | `sbproxy.a2a.caller_agent_id` | `attribution.agent_id` |
+| run | the A2A `contextId` | none, deliberately | `a2a_context_id` | `session.id` | `a2a_context_id` |
+| workflow | the `SB-Attr-Trace-Id` header | none, deliberately | join through `request_id` | none | `attribution.trace_id` |
+| trust | whether the proxy verified the identity | none | `a2a_identity_verified` | `sbproxy.a2a.identity_verified` | `a2a_identity_verified` |
+
+Only the agent becomes a metric label. An agent id names a member of your agent
+roster, so its distinct values are bounded by how many agents you run. A run id
+or a workflow id takes a fresh value every time, so as a label each one would
+mint a Prometheus time series per run and the series count would grow with your
+traffic instead of with your system. Those two live on the span, the access log,
+and the usage ledger, which is where an unbounded correlation key belongs, and
+the build fails if anyone tries to make either a label.
+
+One caveat on the run column. The A2A `contextId` travels in the JSON-RPC request
+body, and the AI gateway answers the request before the body phase that parses
+it, so on this surface the run id is currently absent and `session.id` falls back
+to the capture session. `sbproxy.run.id_source` on the span says which of the two
+filled it, so a query never has to guess. The agent id has no such gap: it
+arrives in a header and is resolved before dispatch.
+
+With that in place, per-agent burn is one query and no join:
+
+```promql
+# USD per minute, by agent, over the last 5 minutes
+sum by (agent_id) (rate(sbproxy_ai_cost_dollars_attributed_total[5m])) * 60
+
+# The same, split by model, to see which agent is on the expensive one
+sum by (agent_id, model) (rate(sbproxy_ai_cost_dollars_attributed_total[5m])) * 60
+```
+
+#### The agent cannot name itself
+
+There is no `SB-Attr-Agent-Id` header. Sending one is a `400`, the same as any
+other unrecognised `SB-Attr-*` key. (`SB-Attr-Agent` is a different tag and still
+works: it carries `agent_type`, the `runtime` versus `development` bucket.)
+
+The reason is that a caller who can name its own agent can charge its spend to a
+different agent, or invent a fresh agent per request until the label's
+cardinality budget demotes every real agent to `__other__` and the whole view
+goes dark. So `agent_id` is filled from the agent-to-agent identity the proxy
+resolved, and it reaches a metric label only when that identity was verified:
+supplied by a peer in `proxy.trusted_proxies`, or lifted from the RFC 8693 `act`
+chain of a signed token. Spend the gateway could not tie to a verified agent
+still counts, under an empty `agent_id`, which reads as "not attributed" rather
+than as somebody else's bill.
+
+The usage ledger is stricter about this than the metrics are, because it is the
+record you would take to a chargeback argument. It keeps the agent id and the
+run id even when they were not verified, and writes `a2a_identity_verified:
+false` beside them. Dropping the ids would lose real spend; recording them
+without the flag would launder a number the caller chose into a number you
+signed. Filter on that flag before you total anything per agent or per run. It is
+the same trust decision the access log writes as `a2a_identity_verified` and the
+`sbproxy_a2a_hops_total` metric splits with its `allow:verified` and
+`allow:unverified` labels.
+
+Every identifier is capped at 128 bytes, once, at the point the request context
+first records it. The span, the ledger entry, and the metric label then all read
+the same capped string, so a long agent id cannot end up looking like two
+different agents on two different surfaces.
+
+#### Nobody else does this, and here is why that matters
+
+Per-agent cost has no industry convention to follow. That is not a gap we are
+filling ahead of a standard; there is no standard in progress.
+
+OpenTelemetry's GenAI semantic conventions, which this gateway otherwise tracks
+closely (currently pinned at v1.36.0), define no cost attribute and no cost
+metric at all. Tokens are covered. Money is not. So there is no
+`gen_ai.usage.cost` in the spec to be compliant with, and certainly no
+convention for attributing it to an agent.
+
+Observability vendors do not model it either. Langfuse is the clearest case
+because its limit is structural rather than a missing feature: cost lives on
+`generation` and `embedding` observations, and an agent is not one of those, so
+there is no place in the data model for "what this agent cost". You can put an
+agent id in metadata, which is what our Langfuse sink does, but that is a tag on
+a span, not a cost dimension you can roll up.
+
+The part worth insisting on is where the numbers come from. Our token counts and
+USD figures are parsed out of the provider's own response, in
+`crates/sbproxy-ai/src/usage_parser.rs`, at the point the response passes through
+the proxy. They are the provider's numbers, priced against a pinned catalogue
+whose revision is stamped on the span so a re-price can reproduce the original
+math. A tool that only observes the agent protocol never sees the provider
+response. It has to take the agent's word for what it spent, which means an agent
+with a bug, or an agent that never reports at all, is invisible in its own cost
+report. Sitting on the wire is what makes the attribution worth attributing.
 
 ### Request-path prompt accounting
 
@@ -1872,8 +1975,8 @@ The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpo
 | `sbproxy_ai_cost_usd_micros_total` | Counter | `provider`, `model`, `tenant_id` | Derived request cost in micro-USD (`1e-6` USD); mirrored to OTLP as `sbproxy.ai.cost_usd_micros` when `telemetry.export_metrics` is enabled |
 | `sbproxy_ai_request_duration_seconds` | Histogram | `provider`, `model` | End-to-end AI request latency. Now recorded on the live path for every accepted upstream response |
 | `sbproxy_ai_inter_token_latency_seconds` | Histogram | `provider`, `model` | Average inter-token latency (TPOT) per streaming response, derived from the generation window. Completes the TTFT / TPOT / throughput serving triple |
-| `sbproxy_ai_tokens_attributed_total` | Counter | `origin`, `provider`, `model`, `surface`, `direction`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id` | Per-attribution token spend. `sum by (tenant_id, model)` for multi-tenant multi-model token volume |
-| `sbproxy_ai_cost_dollars_attributed_total` | Counter | same as above minus `direction` | Per-attribution USD spend. `sum by (api_key_id)` for per-credential chargeback |
+| `sbproxy_ai_tokens_attributed_total` | Counter | `origin`, `provider`, `model`, `surface`, `direction`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | Per-attribution token spend. `sum by (tenant_id, model)` for multi-tenant multi-model token volume; `sum by (agent_id)` for per-agent volume |
+| `sbproxy_ai_cost_dollars_attributed_total` | Counter | same as above minus `direction` | Per-attribution USD spend. `sum by (api_key_id)` for per-credential chargeback, `sum by (agent_id)` for per-agent chargeback. `agent_id` is empty unless a verified agent identity resolved; see [Cost per agent](#cost-per-agent) |
 | `sbproxy_ai_request_duration_attributed_seconds` | Histogram | `provider`, `model`, `surface`, `tenant_id`, `api_key_id` | Model latency sliceable per tenant / credential / model. `histogram_quantile(0.95, sum by (le, tenant_id, model) (rate(..._bucket[5m])))` |
 | `sbproxy_ai_requests_attributed_total` | Counter | `origin`, `provider`, `model`, `surface`, `tenant_id`, `api_key_id`, `outcome` | One row per request with a closed `outcome` label (`ok`, `guardrail_block`, `content_filter`, `budget_exceeded`, `rate_limited`, `timeout`, `upstream_5xx`, `auth_denied`, `client_error`, `other`). `sum by (tenant_id, outcome)` answers value-vs-waste |
 | `sbproxy_ai_failovers_total` | Counter | `from_provider`, `to_provider`, `reason` | Provider failover events |

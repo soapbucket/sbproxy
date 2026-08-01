@@ -137,6 +137,87 @@ pub enum BudgetScope {
     Origin,
     /// Limit applies per metadata tag value.
     Tag,
+    /// Limit applies per calling agent (WOR-2140).
+    ///
+    /// The agent is the unit of cost here: one bucket per named agent,
+    /// so a per-agent cap is enforced rather than merely reported. The
+    /// identity comes from the A2A envelope's caller agent id, and only
+    /// a *verified* identity gets its own bucket. See
+    /// [`AgentIdentity`] for why, and
+    /// [`BudgetTracker::scope_key`] for the resulting key shape.
+    ///
+    /// Distinct from the `agent_budget` policy, which rate-limits
+    /// requests per agent class resolved by fingerprinting. This scope
+    /// caps *spend* per agent identity asserted on the wire.
+    Agent,
+}
+
+/// The calling agent's identity, as budget scoping and billing see it
+/// (WOR-2140).
+///
+/// `id` is the agent that made the call, taken from the A2A envelope's
+/// caller agent id. `verified` mirrors `A2AContext::identity_verified`:
+/// true only when the fields came from a source the proxy trusts, which
+/// in practice means a verified RFC 8693 `act` chain re-stamped the
+/// caller as the most recent actor.
+///
+/// # Why an unverified agent never gets its own budget bucket
+///
+/// An untrusted caller picks its own agent id. If an agent-scoped budget
+/// honoured that name, two attacks would both work:
+///
+/// 1. **Evasion.** Spend to the cap, rename yourself, and the next
+///    request lands in a fresh bucket with a fresh full allowance. The
+///    budget becomes advisory, and the key space grows without bound
+///    because every invented name mints a tracker entry.
+/// 2. **Poisoning.** Claim to be a verified agent and burn through
+///    somebody else's cap, denying service to the agent whose identity
+///    you borrowed.
+///
+/// So an unverified id is not honoured at all: [`Self::billable_id`]
+/// returns `None` for it, and the scope key falls back to the shared
+/// `__unattributed__` sentinel that [`BudgetTracker::scope_key`] already
+/// uses for a missing `x-user-id` or `x-sbproxy-tag`. That defeats both
+/// attacks at once. Renaming changes nothing, because every unverified
+/// caller shares the one bucket; and no unverified spend can ever reach
+/// a named agent's key, because the named key space is only reachable
+/// with `verified == true`.
+///
+/// The alternative worth weighing was a second key space, something like
+/// `agent:<workspace>:unverified:<id>`. It stops the poisoning attack
+/// but not the evasion one: renaming still buys a fresh allowance, and
+/// the unbounded key growth comes back with it. A budget that a caller
+/// can reset by editing a header is not a budget, so the sentinel wins.
+/// The cost is that one noisy unverified agent can exhaust the shared
+/// bucket for the others, which fails closed. That is the correct
+/// direction for a spend cap, and it is exactly how the existing
+/// unattributed scopes already behave.
+///
+/// Reporting keeps the finer distinction: [`AiBillingEvent`] carries the
+/// claimed `agent_id` alongside `agent_identity_verified` regardless, so
+/// an operator can still see who *said* they were calling. Only
+/// enforcement refuses to trust it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentIdentity<'a> {
+    /// The caller agent id as asserted on the wire. `None` (or empty)
+    /// when the request carried no A2A envelope. Callers cap this to a
+    /// bounded length at capture, the same way run identifiers are
+    /// capped, so an arbitrary wire string cannot inflate a tracker key.
+    pub id: Option<&'a str>,
+    /// Whether `id` came from a source the proxy trusts, mirroring
+    /// `A2AContext::identity_verified`.
+    pub verified: bool,
+}
+
+impl<'a> AgentIdentity<'a> {
+    /// The agent id that may be billed to its own budget bucket.
+    ///
+    /// `Some` only for a non-empty id that arrived verified. Everything
+    /// else is `None`, which routes the spend to the unattributed
+    /// sentinel rather than to a name the caller chose.
+    pub fn billable_id(&self) -> Option<&'a str> {
+        self.id.filter(|id| self.verified && !id.is_empty())
+    }
 }
 
 /// Action taken when a budget limit is exceeded.
@@ -379,6 +460,16 @@ impl BudgetTracker {
     /// Returns `None` when the request lacks the data the scope keys
     /// off (e.g. `User` with no user header set), in which case the
     /// caller should skip enforcement for that limit.
+    ///
+    /// `agent` carries the calling agent's identity for the
+    /// [`BudgetScope::Agent`] scope. Only a verified, non-empty id gets
+    /// its own bucket; see [`AgentIdentity`] for the argument. The id is
+    /// used verbatim, so callers cap it at capture (the same convention
+    /// run identifiers follow) rather than each reader picking a limit.
+    // One argument per scope dimension plus the agent identity. The
+    // count is inherent to the scope inputs, so the lint is not telling
+    // us anything actionable here.
+    #[allow(clippy::too_many_arguments)]
     pub fn scope_key(
         scope: &BudgetScope,
         workspace_id: &str,
@@ -387,6 +478,7 @@ impl BudgetTracker {
         model: Option<&str>,
         origin: Option<&str>,
         tag: Option<&str>,
+        agent: AgentIdentity<'_>,
     ) -> Option<String> {
         // WOR-1143: ApiKey / User / Tag scopes fall back to an
         // `__unattributed__` bucket when the request omits the
@@ -414,6 +506,18 @@ impl BudgetTracker {
                 "tag:{}:{}",
                 workspace_id,
                 tag.unwrap_or(UNATTRIBUTED)
+            )),
+            // WOR-2140: same sentinel behaviour as the scopes above, and
+            // for a stronger reason. A missing header is merely absent
+            // data; an unverified agent id is data the caller authored,
+            // so honouring it would let a caller mint itself a fresh cap
+            // by renaming. `billable_id` returns `None` for anything not
+            // verified and non-empty, which funnels all of it into the
+            // one shared, still-capped bucket.
+            BudgetScope::Agent => Some(format!(
+                "agent:{}:{}",
+                workspace_id,
+                agent.billable_id().unwrap_or(UNATTRIBUTED)
             )),
         }
     }
@@ -1050,11 +1154,28 @@ pub struct AiBillingEvent {
     /// UTC Unix timestamp in seconds when the event was created.
     pub occurred_at_unix_secs: i64,
     /// Budget scope keys this event should be debited against
-    /// (workspace, hostname, user, api-key, tag, model). Derived from
-    /// the existing [`BudgetTracker::scope_key`] machinery so the
+    /// (workspace, hostname, user, api-key, tag, model, agent). Derived
+    /// from the existing [`BudgetTracker::scope_key`] machinery so the
     /// same key shapes flow through both the event bus and the
     /// in-process budget tracker.
     pub scope_keys: Vec<String>,
+    /// WOR-2140: the agent that made the call, as asserted on the wire.
+    /// Empty when the request carried no A2A envelope.
+    ///
+    /// This is the *claimed* id and is recorded whether or not it was
+    /// verified, because a spend report is more useful when it shows who
+    /// said they were calling. Read `agent_identity_verified` before
+    /// treating it as a name you can bill. Enforcement does not: an
+    /// unverified id never reaches an agent-scoped key (see
+    /// [`AgentIdentity`]), so this field can name an agent whose budget
+    /// bucket the event did not touch.
+    #[serde(default)]
+    pub agent_id: String,
+    /// WOR-2140: whether `agent_id` came from a source the proxy trusts,
+    /// mirroring `A2AContext::identity_verified`. False for traffic that
+    /// carried no A2A envelope at all.
+    #[serde(default)]
+    pub agent_identity_verified: bool,
 }
 
 impl AiBillingEvent {
@@ -1073,6 +1194,8 @@ impl AiBillingEvent {
             cost_usd: 0.0,
             occurred_at_unix_secs: now_unix_secs(),
             scope_keys: Vec::new(),
+            agent_id: String::new(),
+            agent_identity_verified: false,
         }
     }
 
@@ -1096,6 +1219,8 @@ impl AiBillingEvent {
             cost_usd: 0.0,
             occurred_at_unix_secs: now_unix_secs(),
             scope_keys: Vec::new(),
+            agent_id: String::new(),
+            agent_identity_verified: false,
         }
     }
 
@@ -1109,6 +1234,20 @@ impl AiBillingEvent {
     /// Attach budget scope keys to the event. Chainable.
     pub fn with_scope_keys(mut self, keys: Vec<String>) -> Self {
         self.scope_keys = keys;
+        self
+    }
+
+    /// Attach the calling agent's identity to the event (WOR-2140).
+    /// Chainable.
+    ///
+    /// The claimed id is recorded even when `verified` is false, so a
+    /// spend report can show an unverified claim as such rather than
+    /// dropping it. It carries no enforcement weight: the scope keys
+    /// were already derived under [`AgentIdentity`]'s rule, which routes
+    /// unverified spend to the unattributed bucket.
+    pub fn with_agent(mut self, agent: AgentIdentity<'_>) -> Self {
+        self.agent_id = agent.id.unwrap_or_default().to_string();
+        self.agent_identity_verified = agent.verified;
         self
     }
 }
@@ -1581,30 +1720,518 @@ mod tests {
         assert_eq!(usage.request_count, 0);
     }
 
+    /// A verified agent identity, the only shape that earns its own
+    /// budget bucket.
+    fn verified_agent(id: &str) -> AgentIdentity<'_> {
+        AgentIdentity {
+            id: Some(id),
+            verified: true,
+        }
+    }
+
+    /// A caller-asserted agent identity that no trusted source backed.
+    fn unverified_agent(id: &str) -> AgentIdentity<'_> {
+        AgentIdentity {
+            id: Some(id),
+            verified: false,
+        }
+    }
+
     #[test]
     fn scope_key_uses_sentinel_bucket_when_header_absent() {
         use BudgetScope::*;
+        let none = AgentIdentity::default();
         // WOR-1143: ApiKey / User / Tag scopes must NOT drop out (return
         // None) when their header is missing, or a request omitting the
         // header escapes the cap. They fall back to a shared, still-capped
         // `__unattributed__` bucket.
         assert_eq!(
-            BudgetTracker::scope_key(&ApiKey, "ws", None, None, None, None, None),
+            BudgetTracker::scope_key(&ApiKey, "ws", None, None, None, None, None, none),
             Some("api_key:ws:__unattributed__".to_string())
         );
         assert_eq!(
-            BudgetTracker::scope_key(&User, "ws", None, None, None, None, None),
+            BudgetTracker::scope_key(&User, "ws", None, None, None, None, None, none),
             Some("user:ws:__unattributed__".to_string())
         );
         assert_eq!(
-            BudgetTracker::scope_key(&Tag, "ws", None, None, None, None, None),
+            BudgetTracker::scope_key(&Tag, "ws", None, None, None, None, None, none),
             Some("tag:ws:__unattributed__".to_string())
         );
         // Present headers still produce their own bucket.
         assert_eq!(
-            BudgetTracker::scope_key(&ApiKey, "ws", Some("k1"), None, None, None, None),
+            BudgetTracker::scope_key(&ApiKey, "ws", Some("k1"), None, None, None, None, none),
             Some("api_key:ws:k1".to_string())
         );
+    }
+
+    #[test]
+    fn agent_scope_key_falls_back_to_the_unattributed_sentinel() {
+        // WOR-2140: an absent agent behaves exactly like an absent
+        // header on the other unattributed-capable scopes, so traffic
+        // that carries no A2A envelope is still capped rather than
+        // dropping out of enforcement.
+        assert_eq!(
+            BudgetTracker::scope_key(
+                &BudgetScope::Agent,
+                "ws",
+                None,
+                None,
+                None,
+                None,
+                None,
+                AgentIdentity::default(),
+            ),
+            Some("agent:ws:__unattributed__".to_string())
+        );
+        // An empty id is the same as no id, verified or not.
+        for verified in [true, false] {
+            assert_eq!(
+                BudgetTracker::scope_key(
+                    &BudgetScope::Agent,
+                    "ws",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    AgentIdentity {
+                        id: Some(""),
+                        verified,
+                    },
+                ),
+                Some("agent:ws:__unattributed__".to_string()),
+                "an empty agent id must not mint its own bucket"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_scope_key_names_the_bucket_only_for_a_verified_identity() {
+        // WOR-2140: the enforceable half. A verified agent gets its own
+        // key; the same name asserted by an untrusted caller does not.
+        assert_eq!(
+            BudgetTracker::scope_key(
+                &BudgetScope::Agent,
+                "ws",
+                None,
+                None,
+                None,
+                None,
+                None,
+                verified_agent("planner"),
+            ),
+            Some("agent:ws:planner".to_string())
+        );
+        assert_eq!(
+            BudgetTracker::scope_key(
+                &BudgetScope::Agent,
+                "ws",
+                None,
+                None,
+                None,
+                None,
+                None,
+                unverified_agent("planner"),
+            ),
+            Some("agent:ws:__unattributed__".to_string()),
+            "an unverified claim must not address the verified agent's key"
+        );
+        // Two verified agents on one workspace never share a bucket, and
+        // one agent's key is workspace-scoped like every other scope.
+        assert_ne!(
+            BudgetTracker::scope_key(
+                &BudgetScope::Agent,
+                "ws",
+                None,
+                None,
+                None,
+                None,
+                None,
+                verified_agent("planner"),
+            ),
+            BudgetTracker::scope_key(
+                &BudgetScope::Agent,
+                "ws",
+                None,
+                None,
+                None,
+                None,
+                None,
+                verified_agent("researcher"),
+            )
+        );
+        assert_ne!(
+            BudgetTracker::scope_key(
+                &BudgetScope::Agent,
+                "ws-a",
+                None,
+                None,
+                None,
+                None,
+                None,
+                verified_agent("planner"),
+            ),
+            BudgetTracker::scope_key(
+                &BudgetScope::Agent,
+                "ws-b",
+                None,
+                None,
+                None,
+                None,
+                None,
+                verified_agent("planner"),
+            )
+        );
+    }
+
+    #[test]
+    fn agent_identity_only_bills_a_verified_non_empty_id() {
+        assert_eq!(verified_agent("planner").billable_id(), Some("planner"));
+        assert_eq!(unverified_agent("planner").billable_id(), None);
+        assert_eq!(
+            AgentIdentity {
+                id: Some(""),
+                verified: true,
+            }
+            .billable_id(),
+            None
+        );
+        assert_eq!(AgentIdentity::default().billable_id(), None);
+    }
+
+    #[test]
+    fn existing_scope_keys_are_unchanged_by_the_agent_dimension() {
+        // WOR-2140 regression: threading an agent identity through
+        // `scope_key` must not move any pre-existing scope's key. A
+        // moved key would silently reset every live budget on upgrade.
+        use BudgetScope::*;
+        for agent in [
+            AgentIdentity::default(),
+            verified_agent("planner"),
+            unverified_agent("planner"),
+        ] {
+            assert_eq!(
+                BudgetTracker::scope_key(&Workspace, "ws", None, None, None, None, None, agent),
+                Some("workspace:ws".to_string())
+            );
+            assert_eq!(
+                BudgetTracker::scope_key(&ApiKey, "ws", Some("k1"), None, None, None, None, agent),
+                Some("api_key:ws:k1".to_string())
+            );
+            assert_eq!(
+                BudgetTracker::scope_key(&User, "ws", None, Some("u1"), None, None, None, agent),
+                Some("user:ws:u1".to_string())
+            );
+            assert_eq!(
+                BudgetTracker::scope_key(
+                    &Model,
+                    "ws",
+                    None,
+                    None,
+                    Some("gpt-4o"),
+                    None,
+                    None,
+                    agent
+                ),
+                Some("model:ws:gpt-4o".to_string())
+            );
+            assert_eq!(
+                BudgetTracker::scope_key(
+                    &Origin,
+                    "ws",
+                    None,
+                    None,
+                    None,
+                    Some("api.example.com"),
+                    None,
+                    agent
+                ),
+                Some("origin:api.example.com".to_string())
+            );
+            assert_eq!(
+                BudgetTracker::scope_key(&Tag, "ws", None, None, None, None, Some("t1"), agent),
+                Some("tag:ws:t1".to_string())
+            );
+            // Model and Origin still drop out entirely without their input.
+            assert_eq!(
+                BudgetTracker::scope_key(&Model, "ws", None, None, None, None, None, agent),
+                None
+            );
+            assert_eq!(
+                BudgetTracker::scope_key(&Origin, "ws", None, None, None, None, None, agent),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn agent_scope_deserializes_from_config() {
+        // WOR-2140: `scope: agent` is the operator-facing spelling.
+        let limit: BudgetLimit = serde_yaml::from_str(
+            "scope: agent\nmax_tokens: 1000\nmax_cost_usd: null\nperiod: daily\n",
+        )
+        .expect("agent-scoped limit parses");
+        assert_eq!(limit.scope, BudgetScope::Agent);
+        assert_eq!(limit.max_tokens, Some(1000));
+        assert_eq!(limit.window(), Some(std::time::Duration::from_secs(86_400)));
+    }
+
+    #[test]
+    fn agent_scoped_budget_accumulates_per_agent_and_fires_at_its_limit() {
+        // WOR-2140: the acceptance criterion. Per-agent spend is
+        // enforceable, not merely reportable: two verified agents accrue
+        // independently and the one that reaches the cap is the one that
+        // trips.
+        let tracker = BudgetTracker::new();
+        let limit = BudgetLimit {
+            scope: BudgetScope::Agent,
+            max_tokens: Some(1_000),
+            max_cost_usd: None,
+            period: None,
+            downgrade_to: None,
+        };
+        let planner = agent_key("ws", verified_agent("planner"));
+        let researcher = agent_key("ws", verified_agent("researcher"));
+        assert_ne!(planner, researcher);
+
+        tracker.record_usage(&planner, 600, 0.06);
+        tracker.record_usage(&researcher, 100, 0.01);
+        assert!(tracker
+            .check_limit(&limit, &planner, &OnExceedAction::Block)
+            .is_none());
+
+        tracker.record_usage(&planner, 400, 0.04);
+        let fired = tracker
+            .check_limit(&limit, &planner, &OnExceedAction::Block)
+            .expect("planner reached its cap");
+        assert!(fired.exceeded);
+        assert_eq!(fired.current_tokens, 1_000);
+        // The other agent is untouched, which is what "per agent" means.
+        assert!(
+            tracker
+                .check_limit(&limit, &researcher, &OnExceedAction::Block)
+                .is_none(),
+            "one agent's spend must not consume another's budget"
+        );
+        assert_eq!(tracker.get_usage(&researcher).tokens, 100);
+    }
+
+    #[test]
+    fn agent_scoped_budget_enforces_a_cost_cap_and_windows_like_other_scopes() {
+        // WOR-2140: the agent scope is not a special case. A dollar cap
+        // fires the same way, and a `daily` period buckets the key so the
+        // budget resets on rollover.
+        let tracker = BudgetTracker::new();
+        let daily = BudgetLimit {
+            scope: BudgetScope::Agent,
+            max_tokens: None,
+            max_cost_usd: Some(5.0),
+            period: Some("daily".to_string()),
+            downgrade_to: None,
+        };
+        let base = agent_key("ws", verified_agent("planner"));
+        let day0 = windowed_key(&base, daily.window(), 0);
+        let day1 = windowed_key(&base, daily.window(), 86_400);
+        assert_ne!(day0, day1);
+
+        tracker.record_usage(&day0, 10, 5.0);
+        let fired = tracker
+            .check_limit(&daily, &day0, &OnExceedAction::Block)
+            .expect("the dollar cap fires");
+        assert!(fired.reason.contains("cost limit exceeded"));
+        assert!(
+            tracker
+                .check_limit(&daily, &day1, &OnExceedAction::Block)
+                .is_none(),
+            "the next window starts the agent's budget fresh"
+        );
+    }
+
+    #[test]
+    fn agent_scope_honours_all_three_on_exceed_actions() {
+        // WOR-2140: block / log / downgrade behave for an agent scope
+        // exactly as they do for the scopes that shipped before it. The
+        // action rides on the config, not on the scope, and this pins
+        // that the agent scope did not accidentally special-case it.
+        let tracker = BudgetTracker::new();
+        let key = agent_key("ws", verified_agent("planner"));
+        tracker.record_usage(&key, 5_000, 0.0);
+
+        let limit = |downgrade_to: Option<&str>| BudgetLimit {
+            scope: BudgetScope::Agent,
+            max_tokens: Some(1_000),
+            max_cost_usd: None,
+            period: None,
+            downgrade_to: downgrade_to.map(str::to_string),
+        };
+
+        let blocked = tracker
+            .check_limit(&limit(None), &key, &OnExceedAction::Block)
+            .expect("block fires");
+        assert!(blocked.exceeded);
+        assert_eq!(blocked.action, OnExceedAction::Block);
+
+        let logged = tracker
+            .check_limit(&limit(None), &key, &OnExceedAction::Log)
+            .expect("log fires");
+        assert!(logged.exceeded);
+        assert_eq!(logged.action, OnExceedAction::Log);
+
+        let downgraded = tracker
+            .check_limit(
+                &limit(Some("gpt-4o-mini")),
+                &key,
+                &OnExceedAction::Downgrade,
+            )
+            .expect("downgrade fires");
+        assert!(downgraded.exceeded);
+        assert_eq!(downgraded.action, OnExceedAction::Downgrade);
+        assert_eq!(downgraded.downgrade_to.as_deref(), Some("gpt-4o-mini"));
+
+        // And the whole-config path agrees with the per-limit one.
+        let config = BudgetConfig {
+            limits: vec![limit(Some("gpt-4o-mini"))],
+            on_exceed: OnExceedAction::Downgrade,
+            soft_landing: None,
+        };
+        let via_config = tracker
+            .check_limits(&config, &key)
+            .expect("check_limits fires for an agent scope too");
+        assert_eq!(via_config.action, OnExceedAction::Downgrade);
+    }
+
+    #[test]
+    fn an_unverified_caller_cannot_spend_against_a_verified_agents_budget() {
+        // WOR-2140, the security case. Two properties, one test:
+        //
+        // 1. Poisoning: an untrusted caller claiming to be `planner`
+        //    must not debit `planner`'s bucket.
+        // 2. Evasion: that same caller must not escape its own cap by
+        //    renaming itself, because every unverified identity shares
+        //    the one unattributed bucket.
+        let tracker = BudgetTracker::new();
+        let limit = BudgetLimit {
+            scope: BudgetScope::Agent,
+            max_tokens: Some(1_000),
+            max_cost_usd: None,
+            period: None,
+            downgrade_to: None,
+        };
+        let honest = agent_key("ws", verified_agent("planner"));
+        let impostor = agent_key("ws", unverified_agent("planner"));
+        assert_ne!(
+            honest, impostor,
+            "an unverified claim must not resolve to the verified key"
+        );
+
+        // The impostor burns well past the cap.
+        tracker.record_usage(&impostor, 10_000, 1.0);
+        assert!(
+            tracker
+                .check_limit(&limit, &honest, &OnExceedAction::Block)
+                .is_none(),
+            "the verified agent's budget must be untouched by the impostor"
+        );
+        assert_eq!(tracker.get_usage(&honest).tokens, 0);
+
+        // Renaming buys the impostor nothing: every alias it invents
+        // lands in the same already-exhausted bucket.
+        for alias in ["planner", "planner-2", "totally-new-name", "🤖"] {
+            assert_eq!(
+                agent_key("ws", unverified_agent(alias)),
+                impostor,
+                "renaming must not mint a fresh unverified bucket"
+            );
+            assert!(
+                tracker
+                    .check_limit(
+                        &limit,
+                        &agent_key("ws", unverified_agent(alias)),
+                        &OnExceedAction::Block
+                    )
+                    .is_some(),
+                "the shared unverified bucket stays exhausted under any alias"
+            );
+        }
+
+        // The verified agent still enforces normally once it spends.
+        tracker.record_usage(&honest, 1_000, 0.0);
+        assert!(tracker
+            .check_limit(&limit, &honest, &OnExceedAction::Block)
+            .is_some());
+    }
+
+    /// The agent-scoped key for `agent` on `workspace_id`, for tests that
+    /// care about accumulation rather than key composition.
+    fn agent_key(workspace_id: &str, agent: AgentIdentity<'_>) -> String {
+        BudgetTracker::scope_key(
+            &BudgetScope::Agent,
+            workspace_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            agent,
+        )
+        .expect("the agent scope always produces a key")
+    }
+
+    #[test]
+    fn billing_event_carries_the_agent_identity() {
+        // WOR-2140: agent identity reaches the billing event, and the
+        // claimed id survives even when it was not verified so a report
+        // can show the claim as unverified rather than dropping it.
+        let event = AiBillingEvent::new(
+            AiSurface::ChatCompletions,
+            "openai",
+            Some("gpt-4o".to_string()),
+            AiUsage::Tokens {
+                input: 10,
+                output: 5,
+                cached_input: 0,
+                cache_creation: 0,
+            },
+        )
+        .with_agent(verified_agent("planner"));
+        assert_eq!(event.agent_id, "planner");
+        assert!(event.agent_identity_verified);
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"agent_id\":\"planner\""));
+        let parsed: AiBillingEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
+
+        // An unverified claim is recorded, and flagged as unverified.
+        let claimed =
+            AiBillingEvent::new(AiSurface::ChatCompletions, "openai", None, AiUsage::PerCall)
+                .with_agent(unverified_agent("planner"));
+        assert_eq!(claimed.agent_id, "planner");
+        assert!(!claimed.agent_identity_verified);
+
+        // No A2A envelope leaves both fields at their zero values.
+        let anonymous =
+            AiBillingEvent::new(AiSurface::ChatCompletions, "openai", None, AiUsage::PerCall);
+        assert!(anonymous.agent_id.is_empty());
+        assert!(!anonymous.agent_identity_verified);
+    }
+
+    #[test]
+    fn billing_event_without_agent_fields_still_deserializes() {
+        // WOR-2140: the two new fields are `serde(default)`, so an event
+        // serialized by an older build still round-trips off the bus.
+        let json = r#"{
+          "surface": "chat_completions",
+          "provider": "openai",
+          "model": "gpt-4o",
+          "usage": {"kind": "tokens", "input": 10, "output": 5},
+          "cost_usd": 0.001,
+          "occurred_at_unix_secs": 1700000000,
+          "scope_keys": ["workspace:ws"]
+        }"#;
+        let parsed: AiBillingEvent = serde_json::from_str(json).expect("legacy event parses");
+        assert!(parsed.agent_id.is_empty());
+        assert!(!parsed.agent_identity_verified);
     }
 
     #[test]
@@ -2090,6 +2717,7 @@ mod tests {
             None,
             None,
             None,
+            AgentIdentity::default(),
         )
         .unwrap();
         let daily_key = windowed_key(&base, daily.window(), now);
@@ -2144,6 +2772,7 @@ mod tests {
             Some("gpt-4o"),
             None,
             None,
+            AgentIdentity::default(),
         )
         .unwrap();
         let mini = BudgetTracker::scope_key(
@@ -2154,6 +2783,7 @@ mod tests {
             Some("gpt-4o-mini"),
             None,
             None,
+            AgentIdentity::default(),
         )
         .unwrap();
         let gpt_key = windowed_key(&gpt, daily.window(), now);

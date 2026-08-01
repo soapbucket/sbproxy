@@ -790,7 +790,11 @@ pub const METRICS: &[MetricCapability] = &[
         support: SupportLevel::Stable,
         compat: CompatTier::Beta,
         registry: Registry::Default,
-        labels: &["origin", "provider", "model", "surface", "project", "feature", "team", "agent_type", "environment", "tenant_id", "api_key_id"],
+        // `agent_id` is appended last: this list is positional, so the
+        // only safe place for a new label is the end. It is the
+        // agent-as-unit dimension, sanitized against the 200-value
+        // budget in `crate::cardinality`, never a run or task id.
+        labels: &["origin", "provider", "model", "surface", "project", "feature", "team", "agent_type", "environment", "tenant_id", "api_key_id", "agent_id"],
         description: "AI cost in USD, partitioned by attribution tag.",
         dead_reason: None,
     },
@@ -1279,7 +1283,11 @@ pub const METRICS: &[MetricCapability] = &[
         support: SupportLevel::Stable,
         compat: CompatTier::Beta,
         registry: Registry::Default,
-        labels: &["origin", "provider", "model", "surface", "direction", "project", "feature", "team", "agent_type", "environment", "tenant_id", "api_key_id"],
+        // See `sbproxy_ai_cost_dollars_attributed_total`: `agent_id`
+        // is appended last because the list is positional, and it
+        // pairs with the same label on the cost counter so one PromQL
+        // sum answers "which agent spent this".
+        labels: &["origin", "provider", "model", "surface", "direction", "project", "feature", "team", "agent_type", "environment", "tenant_id", "api_key_id", "agent_id"],
         description: "AI tokens consumed, partitioned by attribution tag.",
         dead_reason: None,
     },

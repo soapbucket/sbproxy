@@ -2677,6 +2677,22 @@ fn emit_mcp_tool_attribution(
         priority: ctx.ai_lane_priority.map(|p| p.as_str().to_string()),
         // An MCP tool call never runs on a managed local engine.
         engine_version: None,
+        // WOR-2140: a tool call is spend an agent caused, so it carries
+        // the same attribution the model call does. Without this a run's
+        // blast radius would count its model calls and silently omit the
+        // tools those calls invoked, which is the larger number on a
+        // fan-out step.
+        agent_id: ctx.a2a.as_ref().and_then(|a2a| {
+            let id = sbproxy_ai::tracing_spans::cap_agent_id(a2a.caller_agent_id.as_str());
+            (!id.is_empty()).then(|| id.to_string())
+        }),
+        a2a_context_id: ctx.a2a_context_id.clone(),
+        a2a_identity_verified: ctx.a2a.as_ref().map(|a2a| a2a.identity_verified),
+        workflow_id: ctx
+            .attribution_tags
+            .trace_id
+            .clone()
+            .filter(|id| !id.is_empty()),
     };
     for sink in &mcp.usage_sinks {
         sink.record(&event);
