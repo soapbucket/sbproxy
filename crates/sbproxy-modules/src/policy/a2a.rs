@@ -12,6 +12,8 @@
 //! the request filter maps to HTTP responses with the spec-pinned
 //! status codes and JSON bodies.
 
+use anyhow::Context as _;
+use sbproxy_config::types::FailureMode;
 use serde::Deserialize;
 
 use crate::auth::a2a::{A2AContext, DetectedSpec};
@@ -92,6 +94,66 @@ pub struct A2APolicyConfig {
     /// operator has to name the host rather than get it implicitly.
     #[serde(default)]
     pub push_target_allowlist: Vec<String>,
+    /// What this policy does with a request it is attached to but could
+    /// not identify as A2A.
+    ///
+    /// # When this fires
+    ///
+    /// Detection has four inputs: `A2A-Version: 1.x`, `Content-Type:
+    /// application/a2a+json`, `MCP-Method: agents.invoke`, and the
+    /// operator's [`Self::route_glob`]. The first three are the
+    /// caller's to send or withhold. When none of the four matches, the
+    /// policy has nothing to evaluate, and this key decides what
+    /// happens to that request.
+    ///
+    /// # Postures
+    ///
+    /// - `open` (default): admit the request. The A2A policy simply
+    ///   does not apply to traffic it could not identify.
+    /// - `closed`: refuse the request with 403. Every request to a
+    ///   route carrying this policy must be identifiable as A2A.
+    /// - `observe`: admit, and count the request under a decision label
+    ///   that says `closed` would have refused it. The rollout posture:
+    ///   flip to `observe`, watch
+    ///   `sbproxy_a2a_hops_total{decision="observe:undetected"}` for a
+    ///   day, and you know the blast radius of `closed` before you take
+    ///   it.
+    /// - `degraded`: admit, and count the request as one where the A2A
+    ///   guarantee was explicitly not made. Same traffic outcome as
+    ///   `open`, a different label, for operators who want the series to
+    ///   alert on rather than a default they can forget about.
+    ///
+    /// All four are distinguishable on the `decision` label of
+    /// `sbproxy_a2a_hops_total`, so nothing is rejected at compile
+    /// time here: every posture does something this site can express.
+    ///
+    /// # Why the default is `open`
+    ///
+    /// The house rule is closed for anything enforcing a security
+    /// boundary and open only where refusing would turn a non-security
+    /// failure into an outage. This is the second case, narrowly.
+    ///
+    /// A policy is attached per origin, not per path, and it runs on
+    /// every request that origin serves. Defaulting to `closed` would
+    /// mean that the moment an operator upgraded, any origin carrying an
+    /// `a2a` policy would start refusing its health checks, its metrics
+    /// scrape, and every ordinary non-A2A request it also serves. That
+    /// is an outage caused by an upgrade, not a boundary being enforced.
+    ///
+    /// The reason `open` is defensible rather than merely convenient is
+    /// that the gap is closable and visible.
+    /// [`Self::route_glob`] is a detection signal the caller cannot opt
+    /// out of, so an operator who declares the route gets every request
+    /// on it governed regardless of what the caller sends. And an
+    /// undetected request is counted at
+    /// `sbproxy_a2a_hops_total{decision="skip:undetected"}`, so a route
+    /// that is quietly ungoverned shows up on a dashboard instead of
+    /// reading as healthy.
+    ///
+    /// Set `route_glob` first. Reach for `failure_posture: closed` when
+    /// the origin serves agent traffic and nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_posture: Option<FailureMode>,
 }
 
 fn default_max_chain_depth() -> u32 {
@@ -113,9 +175,25 @@ impl Default for A2APolicyConfig {
             bill_caller_only: true,
             route_glob: None,
             push_target_allowlist: Vec::new(),
+            // `None`, not `Some(Open)`. The absent key and an explicit
+            // `open` mean the same thing at runtime, and keeping them
+            // distinct in the struct lets the accessor be the one place
+            // the default is written down.
+            failure_posture: None,
         }
     }
 }
+
+/// Effective failure posture when a policy does not configure one.
+///
+/// Named rather than inlined so the value is greppable and so the
+/// argument for it lives next to it. See
+/// [`A2APolicyConfig::failure_posture`] for the full reasoning: the
+/// short version is that flipping this to `Closed` would make every
+/// origin carrying an `a2a` policy start refusing its ordinary non-A2A
+/// traffic on upgrade, and the gap this leaves is both closable
+/// (`route_glob`) and visible (`decision="skip:undetected"`).
+pub const DEFAULT_A2A_FAILURE_POSTURE: FailureMode = FailureMode::Open;
 
 /// Compiled A2A policy.
 #[derive(Debug, Clone)]
@@ -159,6 +237,16 @@ pub enum A2APolicyDecision {
         /// Caller identifier that matched a denylist entry.
         caller: String,
     },
+    /// The policy is attached to this route but could not identify the
+    /// request as A2A, and the configured failure posture is
+    /// [`FailureMode::Closed`].
+    ///
+    /// Produced by the enforcer rather than by [`A2APolicy::evaluate`]:
+    /// detection runs before evaluation, so by the time `evaluate`
+    /// would be called there is nothing to evaluate against. It lives
+    /// on this enum anyway so the status code, the JSON body, and the
+    /// metric label for every A2A refusal come from one place.
+    Undetected,
 }
 
 impl A2APolicyDecision {
@@ -201,6 +289,7 @@ impl A2APolicyDecision {
             Self::CalleeNotAllowed { .. } => "callee_not_allowed",
             Self::PushTargetBlocked { .. } => "push_target_blocked",
             Self::CallerDenied { .. } => "caller_denied",
+            Self::Undetected => "undetected",
         }
     }
 
@@ -216,6 +305,9 @@ impl A2APolicyDecision {
             // reshaped URL as if the syntax were the problem.
             Self::PushTargetBlocked { .. } => 403,
             Self::CallerDenied { .. } => 403,
+            // 403, not 400. The request is well formed; this origin
+            // just does not serve traffic it cannot identify as A2A.
+            Self::Undetected => 403,
         }
     }
 
@@ -245,6 +337,10 @@ impl A2APolicyDecision {
                 "{{\"error\":\"a2a_caller_denied\",\"caller\":{}}}",
                 json_escape(caller)
             ),
+            // No detail beyond the error code. Telling the caller which
+            // signals detection looks at would be telling it which one
+            // to forge.
+            Self::Undetected => "{\"error\":\"a2a_undetected\"}".to_string(),
         }
     }
 }
@@ -274,9 +370,55 @@ fn json_escape(s: &str) -> String {
 
 impl A2APolicy {
     /// Build the policy from a JSON config value.
+    ///
+    /// Errors are wrapped so they name the policy. Without that, an
+    /// operator who writes `failure_posture: fail_open` gets serde's
+    /// bare "unknown variant" line with no indication of which of the
+    /// origin's policies produced it.
+    ///
+    /// Every [`FailureMode`] variant is meaningful at this site, so
+    /// none is rejected here. See
+    /// [`A2APolicyConfig::failure_posture`].
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        let config: A2APolicyConfig = serde_json::from_value(value)?;
+        let config: A2APolicyConfig = serde_json::from_value(value).context("a2a policy config")?;
         Ok(Self::with_config(config))
+    }
+
+    /// Effective failure posture for requests this policy is attached
+    /// to but could not identify as A2A.
+    ///
+    /// There is no legacy boolean to convert at this site, so the
+    /// fallback is [`DEFAULT_A2A_FAILURE_POSTURE`]. This is the only
+    /// supported read path; the config field holds the raw
+    /// `Option` and callers should not branch on it directly.
+    pub fn failure_posture(&self) -> FailureMode {
+        self.config
+            .failure_posture
+            .unwrap_or(DEFAULT_A2A_FAILURE_POSTURE)
+    }
+
+    /// Metric `decision` label for a request this policy did not detect
+    /// as A2A, under the policy's effective failure posture.
+    ///
+    /// The four postures are deliberately four distinct label values
+    /// rather than one `skip:undetected` with a second label. An
+    /// operator alerting on "this route is ungoverned" and one watching
+    /// a `closed` rollout are asking different questions, and folding
+    /// them together is how a bypass stays invisible on a dashboard.
+    ///
+    /// `open` keeps the exact string it emitted before this knob
+    /// existed, so dashboards and alerts written against
+    /// `decision="skip:undetected"` keep working unchanged.
+    pub fn undetected_decision_label(&self) -> &'static str {
+        match self.failure_posture() {
+            FailureMode::Open => "skip:undetected",
+            FailureMode::Closed => "deny:undetected",
+            // Admitted, and the counterfactual recorded: `closed` would
+            // have refused this request.
+            FailureMode::Observe => "observe:undetected",
+            // Admitted, with the A2A guarantee explicitly not made.
+            FailureMode::Degraded => "degraded:undetected",
+        }
     }
 
     /// Build the policy from a typed config (used by tests and the
@@ -624,6 +766,178 @@ mod tests {
         );
 
         assert!(policy.governs(&headers, "/anything").is_some());
+    }
+
+    // --- Failure posture on undetected traffic (WOR-2120 AC5) ---
+
+    /// Headers with nothing A2A about them, plus a hostile
+    /// `a2a-version` that this build cannot decode. Used by the posture
+    /// tests so every one of them is asking about a request detection
+    /// genuinely cannot classify.
+    fn undetectable_headers() -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        h.insert(
+            http::HeaderName::from_static("a2a-version"),
+            http::HeaderValue::from_static("2.0"),
+        );
+        h
+    }
+
+    /// No key configured means the policy behaves exactly as it did
+    /// before the key existed: an undetected request is allowed and
+    /// counted under the same metric label. This is the compatibility
+    /// pin for every operator upgrading into this change.
+    #[test]
+    fn default_failure_posture_allows_undetected_traffic() {
+        let policy = A2APolicy::with_config(A2APolicyConfig::default());
+
+        assert_eq!(policy.config().failure_posture, None, "no key by default");
+        assert_eq!(policy.failure_posture(), FailureMode::Open);
+        assert!(policy.failure_posture().admits());
+        assert_eq!(
+            policy.undetected_decision_label(),
+            "skip:undetected",
+            "existing dashboards are written against this exact string"
+        );
+    }
+
+    /// An empty config block resolves the same way as the typed
+    /// default. The two paths are separate code and both are shipped.
+    #[test]
+    fn default_failure_posture_is_open_through_from_config_too() {
+        let policy = A2APolicy::from_config(serde_json::json!({})).unwrap();
+        assert_eq!(policy.failure_posture(), DEFAULT_A2A_FAILURE_POSTURE);
+        assert_eq!(policy.failure_posture(), FailureMode::Open);
+    }
+
+    /// `closed` refuses a request the policy could not identify as A2A.
+    /// Asserted end to end: detection really does miss this request,
+    /// the posture really is closed, and the refusal carries the status
+    /// and body the enforcer returns.
+    #[test]
+    fn closed_failure_posture_denies_undetected_traffic() {
+        let policy = A2APolicy::from_config(serde_json::json!({
+            "failure_posture": "closed",
+        }))
+        .unwrap();
+
+        assert!(
+            policy
+                .governs(&undetectable_headers(), "/internal/health")
+                .is_none(),
+            "the premise of this test is that detection misses the request"
+        );
+        assert_eq!(policy.failure_posture(), FailureMode::Closed);
+        assert!(!policy.failure_posture().admits());
+        assert_eq!(policy.undetected_decision_label(), "deny:undetected");
+
+        let decision = A2APolicyDecision::Undetected;
+        assert!(!decision.is_allow());
+        assert_eq!(decision.http_status(), 403);
+        assert_eq!(decision.reason_label(), "undetected");
+        assert_eq!(decision.metric_label(false), "deny:undetected");
+        let body: serde_json::Value = serde_json::from_str(&decision.json_body()).unwrap();
+        assert_eq!(body["error"], "a2a_undetected");
+    }
+
+    /// `observe` admits the request and records what `closed` would
+    /// have done. The counterfactual is the whole point, so it is the
+    /// label that is asserted, not just the allow.
+    #[test]
+    fn observe_failure_posture_allows_and_records_the_counterfactual() {
+        let policy = A2APolicy::from_config(serde_json::json!({
+            "failure_posture": "observe",
+        }))
+        .unwrap();
+
+        assert_eq!(policy.failure_posture(), FailureMode::Observe);
+        assert!(
+            policy.failure_posture().admits(),
+            "observe must not refuse traffic"
+        );
+        assert!(policy.failure_posture().records_counterfactual());
+        assert_eq!(
+            policy.undetected_decision_label(),
+            "observe:undetected",
+            "must be its own series; folding it into skip:undetected \
+             would hide the blast radius of flipping to closed"
+        );
+    }
+
+    /// `degraded` admits while marking the guarantee as not made, and
+    /// is distinguishable from a plain `open` in the metric.
+    #[test]
+    fn degraded_failure_posture_admits_but_marks_the_guarantee_waived() {
+        let policy = A2APolicy::from_config(serde_json::json!({
+            "failure_posture": "degraded",
+        }))
+        .unwrap();
+
+        assert!(policy.failure_posture().admits());
+        assert!(policy.failure_posture().guarantee_waived());
+        assert_eq!(policy.undetected_decision_label(), "degraded:undetected");
+    }
+
+    /// Every posture gets its own decision label. A shared label would
+    /// make "ungoverned by default" and "would have been refused" the
+    /// same series, which is the failure this key exists to surface.
+    #[test]
+    fn every_posture_has_a_distinct_undetected_label() {
+        let mut seen = std::collections::HashSet::new();
+        for posture in ["open", "closed", "observe", "degraded"] {
+            let policy = A2APolicy::from_config(serde_json::json!({
+                "failure_posture": posture,
+            }))
+            .unwrap();
+            assert!(
+                seen.insert(policy.undetected_decision_label()),
+                "duplicate decision label for {posture}"
+            );
+        }
+        assert_eq!(seen.len(), 4);
+    }
+
+    /// A route the operator declared stays governed no matter what the
+    /// caller sends, including a version header this build cannot
+    /// decode. Regression pin for the one-header bypass, asserted here
+    /// (not only in the detection module) because this is the entry
+    /// point the enforcer calls.
+    #[test]
+    fn declared_route_is_governed_regardless_of_caller_headers() {
+        let policy = A2APolicy::with_config(A2APolicyConfig {
+            route_glob: Some("/agents/**".to_string()),
+            ..A2APolicyConfig::default()
+        });
+
+        assert!(
+            policy
+                .governs(&undetectable_headers(), "/agents/invoke")
+                .is_some(),
+            "a caller-chosen header must not remove a declared route from the policy"
+        );
+        assert!(
+            policy
+                .governs(&http::HeaderMap::new(), "/agents/invoke")
+                .is_some(),
+            "nor must sending no headers at all"
+        );
+    }
+
+    /// A misspelled posture value fails config compile with an error
+    /// that names the policy. serde's bare "unknown variant" line does
+    /// not say which of an origin's policies produced it.
+    #[test]
+    fn an_unknown_failure_posture_value_fails_compile_naming_the_policy() {
+        let err = A2APolicy::from_config(serde_json::json!({
+            "failure_posture": "fail_open",
+        }))
+        .expect_err("an unknown posture must not compile");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("a2a policy"), "must name the site: {msg}");
     }
 
     fn hop(agent: &str, rid: &str) -> ChainHop {

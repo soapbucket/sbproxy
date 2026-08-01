@@ -29,6 +29,7 @@ fn pool_config() -> QuotaPoolConfig {
         dimension: QuotaPoolDimension::Request,
         consistency: QuotaPoolConsistency::Strong,
         failure_mode: QuotaPoolFailureMode::Closed,
+        failure_posture: None,
     }
 }
 

@@ -14,7 +14,15 @@
 //! - `"a2a_cycle_detected"`
 //! - `"a2a_callee_not_allowed"`
 //! - `"a2a_caller_denied"`
+//! - `"a2a_undetected"`
 //! - `"a2a"` (catch-all for any future variant)
+//!
+//! A request the policy cannot identify as A2A is routed by the
+//! policy's failure posture rather than being allowed unconditionally.
+//! The default is `open`, which is what shipped before the knob
+//! existed, so an existing config behaves identically. See
+//! `A2APolicyConfig::failure_posture` for why the default is `open`
+//! here and closed almost everywhere else.
 //!
 //! # What this enforcer does not do
 //!
@@ -33,7 +41,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use sbproxy_modules::policy::A2APolicy;
+use sbproxy_modules::policy::{A2APolicy, A2APolicyDecision};
 use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
 
 use crate::context::RequestContext;
@@ -81,17 +89,67 @@ impl PolicyEnforcer for A2AEnforcer {
                 // limits still apply; `identity_verified` stays false.
                 Some(spec) => sbproxy_modules::A2AContext::empty(spec.to_spec()),
                 None => {
-                    // The policy is configured on this route but did not
-                    // engage. Record it: an unbroken stream of allows
-                    // from a policy that never runs is indistinguishable
-                    // from a healthy one, which is how a bypass stays
-                    // invisible on a dashboard.
-                    sbproxy_observe::metrics::record_a2a_hop(
+                    // WOR-2120 AC5: the policy is configured on this
+                    // route but did not engage. Record it either way:
+                    // an unbroken stream of allows from a policy that
+                    // never runs is indistinguishable from a healthy
+                    // one, which is how a bypass stays invisible on a
+                    // dashboard.
+                    //
+                    // The posture decides what happens to the request.
+                    // Each posture gets its own `decision` value, so
+                    // "ungoverned by default", "would have been
+                    // refused", and "refused" are three series rather
+                    // than one, and `open` keeps the string it always
+                    // emitted.
+                    let posture = policy.failure_posture();
+                    let label = policy.undetected_decision_label();
+                    sbproxy_observe::metrics::record_a2a_hop(ctx.hostname.as_ref(), "none", label);
+                    if posture.admits() {
+                        // `observe` promises more than a distinct metric
+                        // series: it admits the request AND records the
+                        // decision the control would otherwise have
+                        // taken. A counter alone cannot say which
+                        // requests those were, so an operator sizing the
+                        // blast radius of flipping this route to
+                        // `closed` would have a number and no way to
+                        // audit it. Emit the counterfactual per request,
+                        // carrying the 403 that `closed` would have
+                        // returned rather than the 200 actually served.
+                        if posture.records_counterfactual() {
+                            let counterfactual = A2APolicyDecision::Undetected;
+                            sbproxy_observe::SecurityAuditEntry::policy_violation(
+                                "a2a_undetected_observed",
+                                "route carries an a2a policy but the request did not identify \
+                                 itself as A2A; admitted because failure_posture is observe, \
+                                 and closed would have refused it",
+                                counterfactual.http_status(),
+                                Some(ctx.hostname.to_string()),
+                                ctx.client_ip,
+                                Some(ctx.request_id.to_string()),
+                                Some(req.method().as_str().to_string()),
+                            )
+                            .emit();
+                        }
+                        return Box::pin(async move { Ok(PolicyDecision::Allow) });
+                    }
+                    // Closed. The origin serves A2A and nothing else,
+                    // and this request did not identify itself as A2A.
+                    let decision = A2APolicyDecision::Undetected;
+                    sbproxy_observe::metrics::record_a2a_denied(
                         ctx.hostname.as_ref(),
-                        "none",
-                        "skip:undetected",
+                        decision.reason_label(),
                     );
-                    return Box::pin(async move { Ok(PolicyDecision::Allow) });
+                    let body = decision.json_body();
+                    let status = decision.http_status();
+                    ctx.a2a_denial_body = Some(body.clone());
+                    ctx.deny_policy_type = Some("a2a_undetected");
+                    return Box::pin(async move {
+                        Ok(PolicyDecision::Deny {
+                            status,
+                            message: body,
+                        })
+                    });
                 }
             },
         };
@@ -161,6 +219,7 @@ impl PolicyEnforcer for A2AEnforcer {
             "cycle" => "a2a_cycle_detected",
             "callee_not_allowed" => "a2a_callee_not_allowed",
             "caller_denied" => "a2a_caller_denied",
+            "undetected" => "a2a_undetected",
             _ => "a2a",
         };
         ctx.deny_policy_type = Some(policy_type);

@@ -3855,9 +3855,20 @@
           "type": "boolean"
         },
         "failure_mode_allow": {
-          "description": "When the store is unreachable, allow the request through in a degraded mode. Default false: fail closed (deny).\n\nNote the polarity this field is named into: `true` here means ALLOW, that is, fail open. Other booleans in this config carry the opposite sense, which is the inconsistency [`FailureMode`] exists to retire.",
+          "description": "Superseded by `failure_posture`. When the store is unreachable, allow the request through in a degraded mode. Default false: fail closed (deny).\n\nNote the polarity this field is named into: `true` here means ALLOW, that is, fail open. Other booleans in this config carry the opposite sense, which is the inconsistency [`FailureMode`] exists to retire.\n\nStill parsed, and still the value used when `failure_posture` is absent, so an existing config keeps behaving exactly as it did. Nothing in the runtime reads this field directly any more: every store-outage decision goes through [`KeyManagementConfig::failure_posture`].",
           "default": false,
           "type": "boolean"
+        },
+        "failure_posture": {
+          "description": "Failure posture for a key-store outage, in the shared [`FailureMode`] vocabulary.\n\nSet this in preference to `failure_mode_allow`. When present it wins; when absent the legacy boolean is converted (`false` becomes `closed`, `true` becomes `degraded`). It is `Option` on purpose, so \"the operator said nothing\" stays distinguishable from \"the operator explicitly asked for the default\".\n\n`closed` refuses with 503. `degraded` and `open` both let the request fall through to the origin's own configured auth, which is what `failure_mode_allow: true` has always done: it is not a blanket admit. `degraded` is the honest label for it, because the request proceeds with no per-key policy, no budget, and no attribution, and that fact is recorded rather than passed over in silence. `observe` is meaningless here and is rejected at config-compile time: an unreachable store produced no counterfactual verdict to record.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FailureMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "oidc_claim_map": {
           "description": "Optional OIDC/JWT claim to virtual-key mapping.",
@@ -4280,11 +4291,22 @@
           "minimum": 0.0
         },
         "failure_mode": {
-          "description": "Behavior when the governance backend cannot serve a reserve call at request time (`GovernanceError::BackendUnavailable`). The default denies the request (fail closed): governed limits must not be silently bypassed by a backend outage. Setting `allow_unreserved` admits the request instead, but every such decision is always audited on the `security_audit` channel and counted on `sbproxy_governance_fail_open_total`.\n\nRead the posture through [`KeyGovernanceConfig::failure_posture`] to get it in the shared [`FailureMode`] vocabulary; `allow_unreserved` reports as `degraded`, since the call proceeds without the reservation this control exists to make.",
+          "description": "Superseded by `failure_posture`. Behavior when the governance backend cannot serve a reserve call at request time (`GovernanceError::BackendUnavailable`). The default denies the request (fail closed): governed limits must not be silently bypassed by a backend outage. Setting `allow_unreserved` admits the request instead, but every such decision is always audited on the `security_audit` channel and counted on `sbproxy_governance_fail_open_total`.\n\nStill parsed, and still the value used when `failure_posture` is absent, so an existing config keeps behaving exactly as it did. Nothing in the runtime reads this field directly any more: the read path goes through [`KeyGovernanceConfig::failure_posture`], which reports `allow_unreserved` as `degraded` because the call proceeds without the reservation this control exists to make.",
           "default": "closed",
           "allOf": [
             {
               "$ref": "#/definitions/GovernanceFailureMode"
+            }
+          ]
+        },
+        "failure_posture": {
+          "description": "Failure posture for a governance backend outage, in the shared [`FailureMode`] vocabulary.\n\nSet this in preference to `failure_mode`. When present it wins; when absent the legacy `failure_mode` value is converted (`closed` stays `closed`, `allow_unreserved` becomes `degraded`). It is `Option` on purpose, so \"the operator said nothing\" stays distinguishable from \"the operator explicitly asked for the default\".\n\n`closed` denies with 503. `degraded` admits without a reservation and records that fact on the `security_audit` channel and on `sbproxy_governance_fail_open_total`. `open` also admits but records neither, which is why `degraded` is the honest spelling of the old `allow_unreserved`. `observe` is meaningless here and is rejected at config-compile time: a reserve call that could not reach its backend produced no counterfactual verdict to record.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FailureMode"
+            },
+            {
+              "type": "null"
             }
           ]
         },
@@ -4356,7 +4378,7 @@
       ]
     },
     "GovernanceFailureMode": {
-      "description": "Behavior when the governance backend cannot serve a reserve call (`sbproxy_ai::governance::GovernanceStore::reserve`).\n\nApplies only to a reserve call that fails with `GovernanceError::BackendUnavailable`. Every other reserve error (invalid request shape, a reservation id reused with different input, a hit against a real governed limit, arithmetic overflow) is unrelated to backend availability and is not affected by this setting.",
+      "description": "Superseded by [`FailureMode`]. Behavior when the governance backend cannot serve a reserve call (`sbproxy_ai::governance::GovernanceStore::reserve`).\n\nApplies only to a reserve call that fails with `GovernanceError::BackendUnavailable`. Every other reserve error (invalid request shape, a reservation id reused with different input, a hit against a real governed limit, arithmetic overflow) is unrelated to backend availability and is not affected by this setting.\n\nKept because `failure_mode: closed | allow_unreserved` is pinned by test and by shipped configs. Read it through [`KeyGovernanceConfig::failure_posture`], never directly.",
       "oneOf": [
         {
           "description": "Deny the request (`503`) when the governance backend is unavailable.",
@@ -4370,6 +4392,39 @@
           "type": "string",
           "enum": [
             "allow_unreserved"
+          ]
+        }
+      ]
+    },
+    "FailureMode": {
+      "description": "What a control does when it cannot reach a decision.\n\nA \"control\" here is anything that gates a request and can itself fail: a policy whose backend is unreachable, a guardrail whose provider times out, a detector that never engaged, a store that cannot be read. The question is always the same, so the knob is too, and it is spelled `failure_posture` everywhere it appears:\n\n```yaml failure_posture: closed     # refuse the request failure_posture: open       # admit it failure_posture: degraded   # admit it, but record that the guarantee was not made failure_posture: observe    # admit it, and record what would have happened ```\n\n# The four postures\n\nOnly [`Closed`](Self::Closed) refuses. The other three all admit the request and differ in what they leave behind, which is the part that matters six months later when someone asks whether a control was actually protecting anything:\n\n- **`open`** admits and claims nothing. Cheapest, and the least recoverable after the fact. - **`degraded`** admits while explicitly marking the guarantee as not made. This is the posture behind the existing `AllowUnreserved` modes: the request proceeds, but no quota was reserved and no governance decision was recorded, and that fact is itself counted so it can be alerted on. - **`observe`** admits and records the decision the control *would* have taken. For rolling a control out against live traffic before letting it refuse anything.\n\n# Relationship to `test_mode` and tag actions\n\n`observe` is deliberately close in spirit to the WAF's `test_mode` and the prompt-injection `Tag` action, and the overlap is worth naming so the two do not drift into meaning different things. They are not the same axis:\n\n- `test_mode` / `Tag` describe what the control does when it **works** and finds a hit. - `failure_posture: observe` describes what it does when it **cannot run at all**.\n\nA control can legitimately be in `test_mode` and still need a failure posture, because \"the detector matched\" and \"the detector was unreachable\" are different events. Where a site already has `test_mode`, leave it alone and let `failure_posture` govern only the cannot-decide path.\n\n# Why this type exists\n\nThe same decision was previously spelled six different ways across the config surface: `fail_open: bool`, `fail_closed: bool`, `failure_mode_allow: bool`, two separately-declared `failure_mode` enums, an `on_failure` enum, and an unvalidated `on_error: String`. Two of those booleans carry **opposite** polarity, so `true` means \"admit\" in one struct and \"refuse\" in another. An operator had to re-derive the meaning at every site, and a reviewer had to check the field name before they could read a diff.\n\nNew and migrated controls take `failure_posture: FailureMode`. The name is deliberately not `failure_mode`: two blocks already declare a field by that exact name carrying a narrower enum, and a test pins that `failure_mode: open` must fail to parse there. One new word that works at every site beats one that collides at two.\n\nThe legacy fields still parse, because [`schema-v1` compatibility] is pinned by test, and each site's `failure_posture()` accessor converts from them when the new key is absent. They carry no `#[deprecated]` attribute on purpose: `-D warnings` would then turn every remaining read into a build failure, including the conversion itself. They are deprecated in prose and by having no other reader left.\n\n# Choosing a default\n\nDefault closed for anything that enforces a security boundary: a control that silently admits traffic when it breaks is worse than no control, because the config still advertises protection and the dashboard still reads green.\n\nDefault open only where refusing would take the gateway down over a non-security concern, and say so at the site. A policy-expression bug should not black-hole every request; an unreachable authorization backend should.\n\n[`schema-v1` compatibility]: https://github.com/soapbucket/sbproxy",
+      "oneOf": [
+        {
+          "description": "Refuse the request. The safe default for anything enforcing a security boundary: a control that silently admits traffic when it breaks is worse than no control, because the config still advertises protection and the dashboard still reads green.",
+          "type": "string",
+          "enum": [
+            "closed"
+          ]
+        },
+        {
+          "description": "Admit the request and claim nothing. Cheapest, and the least recoverable after the fact.",
+          "type": "string",
+          "enum": [
+            "open"
+          ]
+        },
+        {
+          "description": "Admit the request while explicitly marking the guarantee as not made. The posture behind the legacy `AllowUnreserved` modes: the call proceeds, but no quota was reserved and no governance decision was recorded, and that fact is counted so it can be alerted on.",
+          "type": "string",
+          "enum": [
+            "degraded"
+          ]
+        },
+        {
+          "description": "Admit the request and record the decision the control would have taken. For rolling a control out against live traffic before letting it refuse anything.",
+          "type": "string",
+          "enum": [
+            "observe"
           ]
         }
       ]

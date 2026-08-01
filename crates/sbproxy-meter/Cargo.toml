@@ -8,11 +8,22 @@ publish = false
 [features]
 default = []
 
-# Deliberately just serde. This crate must stay compilable by an operator who
-# meters a plain REST API and has no interest in the AI stack, so it depends on
-# none of sbproxy-core, sbproxy-modules, sbproxy-ai, or sbproxy-config.
+# No workspace crate appears here, and none may. This crate must stay
+# compilable by an operator who meters a plain REST API and has no interest in
+# the AI stack, so it depends on none of sbproxy-core, sbproxy-modules,
+# sbproxy-ai, or sbproxy-config. The third-party entries below are what the
+# hash chain in `ledger` costs: hashing, hex, Ed25519, a timestamp, a mutex,
+# JSON, an error type, and a log line.
 [dependencies]
 serde.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+# WOR-1540: Ed25519-signed ledger entries. Same major as the RFC 9421
+# verifier in sbproxy-middleware, declared the way every other crate in this
+# workspace declares it.
+ed25519-dalek = "2"
+chrono.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true

@@ -8,7 +8,7 @@ The `a2a` action proxies agent-to-agent requests to an upstream A2A endpoint. Pa
 Shipped today:
 
 - The `a2a` action: proxies JSON-RPC A2A traffic to the configured upstream `url`, with `host_override` and forwarding-header controls.
-- The `a2a` policy: per-hop checks on the inbound agent-to-agent envelope (chain depth, cycle detection, callee allowlist, caller deny), with per-deny-reason metrics.
+- The `a2a` policy: per-hop checks on the inbound agent-to-agent envelope (chain depth, cycle detection, callee allowlist, caller deny), with per-deny-reason metrics, plus a `failure_posture` knob for requests detection cannot classify.
 - The `a2a_agent_card_rewrite` transform: parses agent-card JSON responses and substitutes upstream URLs with the proxy hostname. Its path-aware wiring into the response pipeline is still pending, so configuring it today passes bodies through unchanged.
 - The typed `AgentCard` parser and the modality negotiators, as library code with no gateway call sites yet (details below).
 
@@ -63,23 +63,109 @@ empty envelope: depth 1, no chain, no caller identity. Nothing trips.
 Watch `sbproxy_a2a_hops_total{decision="allow:unverified"}` for that
 case, and `decision="skip:undetected"` for requests the policy never
 engaged on at all. A route showing only those two is configured but not
-protecting anything.
+protecting anything. The second of those is a knob as well as a
+counter; see [Failure posture](#failure-posture-what-happens-to-a-request-that-is-not-detected).
 
 ## Which requests are treated as A2A
 
-Detection is what decides whether the policy runs. It has three inputs,
+Detection is what decides whether the policy runs. It has four inputs,
 and only one of them is yours:
 
 | Signal | Controlled by | Notes |
 |---|---|---|
+| `A2A-Version: 1.x` | the caller | Ratified A2A 1.0. Rides plain `application/json`, so the header is the only thing that distinguishes it |
 | `Content-Type: application/a2a+json` | the caller | Google A2A draft |
 | `MCP-Method: agents.invoke` | the caller | Anthropic A2A draft |
 | `route_glob` | the operator | Declares a path as A2A regardless of headers |
 
-Because the first two are the caller's to send or withhold, a caller
-that wants to avoid the policy simply sends neither, and an undetected
-request is allowed. **Set `route_glob` on any route you actually intend
-to govern.** It is the only signal a caller cannot opt out of.
+The checks run in that order, and a signal SBproxy cannot interpret
+never cancels the ones after it. An `A2A-Version` naming a major this
+build has not shipped means "do not decode this as 1.x", not "this is
+not A2A traffic": the content type, the MCP method, and above all your
+`route_glob` are still consulted. That ordering matters because the
+alternative is a bypass in one header.
+
+Because the first three signals are the caller's to send or withhold, a
+caller that wants to avoid the policy simply sends none of them. **Set
+`route_glob` on any route you actually intend to govern.** It is the
+only signal a caller cannot opt out of.
+
+## Failure posture: what happens to a request that is not detected
+
+Detection can miss. When it does, `failure_posture` decides what the
+policy does with the request.
+
+```yaml
+policies:
+  - type: a2a
+    route_glob: "/agents/**"
+    max_chain_depth: 5
+    # open (default) | closed | observe | degraded
+    failure_posture: open
+```
+
+| Posture | Traffic | `sbproxy_a2a_hops_total{decision=...}` |
+|---|---|---|
+| `open` (default) | allowed | `skip:undetected` |
+| `closed` | refused, 403, `{"error":"a2a_undetected"}` | `deny:undetected` |
+| `observe` | allowed | `observe:undetected` |
+| `degraded` | allowed | `degraded:undetected` |
+
+`observe` and `degraded` both let the request through, and they answer
+different questions. `observe` is the rollout posture: it counts the
+requests `closed` would have refused, so you can size the blast radius
+of the change before you make it. `degraded` is a steady state: the
+request went through and the A2A guarantee was explicitly not made for
+it, on its own series so you can alert on it rather than on a default
+you will forget about.
+
+Each posture gets its own `decision` value rather than sharing one with
+a second label. A route that is quietly ungoverned and a route that is
+mid-rollout look identical if they land in the same series, which is
+exactly the shape a bypass hides in.
+
+### Why the default is `open`
+
+SBproxy's rule is to fail closed for anything enforcing a security
+boundary, and to fail open only where refusing would turn a
+non-security failure into an outage. This is the second case, and it is
+worth being precise about why.
+
+A policy attaches to an origin, not to a path, and it runs on every
+request that origin serves. If the default were `closed`, then the
+moment you upgraded, every origin carrying an `a2a` policy would begin
+refusing its own health checks, its metrics scrape, and any ordinary
+non-A2A request it happens to also serve. That is an upgrade causing an
+outage, not a boundary being enforced.
+
+What makes `open` defensible rather than merely convenient is that the
+gap it leaves is both closable and visible. `route_glob` is a detection
+signal the caller cannot opt out of, so declaring the route governs
+every request on it whatever the caller sends. And an undetected
+request is counted at `decision="skip:undetected"`, so an ungoverned
+route shows up on a dashboard instead of reading green.
+
+### Closing it
+
+1. Set `route_glob` first. Most of what `closed` would refuse is
+   traffic that should have been detected in the first place, and the
+   glob fixes that without refusing anything.
+2. Set `failure_posture: observe` and watch
+   `sbproxy_a2a_hops_total{decision="observe:undetected"}` for a day.
+   Anything that shows up there is a request `closed` will refuse.
+3. Set `failure_posture: closed` once that series is either empty or
+   only contains traffic you are happy to refuse.
+
+Step 3 is the right end state for an origin that serves agent traffic
+and nothing else. It is the wrong one for an origin where the A2A route
+sits alongside a website.
+
+A note on the shape of the key: the policy block ignores keys it does
+not recognise, so `failure_postures: closed` or `failure-posture:
+closed` compiles and does nothing. Misspell the *value* and config
+compile fails naming the policy; misspell the *key* and you get the
+default. Check the metric after a change rather than trusting that the
+config was read.
 
 ## What the policy reads from the request body
 

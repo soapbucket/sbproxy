@@ -68,32 +68,26 @@ pub struct RealtimeQuotaFailure {
 }
 
 impl RealtimeQuotaFailure {
-    /// Map a pool failure to its client response, or admit the one explicit
-    /// backend-unavailable fail-open mode.
+    /// Map a pool failure to its client response, or `None` when the pool's
+    /// failure posture admits the attempt without a reservation.
+    ///
+    /// This used to be a third, independently written copy of the same
+    /// status mapping the AI dispatch path carries, and the copies had
+    /// already drifted. It now delegates to
+    /// [`sbproxy_ai::quota_pool::pool_error_disposition`], which reads the
+    /// posture through `QuotaPoolConfig::failure_posture` (WOR-2121). The
+    /// realtime path keeps its own type only because Pingora needs the
+    /// exact response stashed on the context before the upstream pipeline
+    /// takes over.
     pub fn from_pool_error(
         config: Option<&sbproxy_ai::QuotaPoolConfig>,
         error: &sbproxy_ai::PoolError,
     ) -> Option<Self> {
-        match error {
-            sbproxy_ai::PoolError::Denied(_) => Some(Self {
-                status: 429,
-                message: "fair-share quota pool exhausted",
-            }),
-            sbproxy_ai::PoolError::BackendUnavailable
-                if config.is_some_and(|config| {
-                    config.failure_mode == sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved
-                }) =>
-            {
-                None
+        match sbproxy_ai::quota_pool::pool_error_disposition(config, error) {
+            sbproxy_ai::quota_pool::PoolErrorDisposition::Admit => None,
+            sbproxy_ai::quota_pool::PoolErrorDisposition::Reject { status, message } => {
+                Some(Self { status, message })
             }
-            sbproxy_ai::PoolError::BackendUnavailable => Some(Self {
-                status: 503,
-                message: "fair-share quota backend unavailable",
-            }),
-            sbproxy_ai::PoolError::InvalidState => Some(Self {
-                status: 503,
-                message: "fair-share quota state unavailable",
-            }),
         }
     }
 }
@@ -1875,6 +1869,7 @@ mod tests {
             dimension: sbproxy_ai::QuotaPoolDimension::Request,
             consistency: sbproxy_ai::QuotaPoolConsistency::Local,
             failure_mode,
+            failure_posture: None,
         }
     }
 
@@ -1913,6 +1908,46 @@ mod tests {
             allow_unreserved.is_none(),
             "allow_unreserved must bypass only backend unavailability"
         );
+    }
+
+    /// An explicit `failure_posture` wins over the legacy `failure_mode`
+    /// on the realtime path too, and the realtime path agrees with the AI
+    /// dispatch path because both now call one helper.
+    #[test]
+    fn realtime_quota_honours_an_explicit_failure_posture() {
+        use sbproxy_config::types::FailureMode;
+
+        // Legacy says reject, explicit posture says admit.
+        let mut config = quota_pool_config(sbproxy_ai::QuotaPoolFailureMode::Closed);
+        config.failure_posture = Some(FailureMode::Degraded);
+        assert!(
+            RealtimeQuotaFailure::from_pool_error(
+                Some(&config),
+                &sbproxy_ai::PoolError::BackendUnavailable
+            )
+            .is_none(),
+            "the explicit posture wins over the legacy field"
+        );
+
+        // Legacy says admit, explicit posture says reject.
+        let mut config = quota_pool_config(sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved);
+        config.failure_posture = Some(FailureMode::Closed);
+        let failure = RealtimeQuotaFailure::from_pool_error(
+            Some(&config),
+            &sbproxy_ai::PoolError::BackendUnavailable,
+        )
+        .expect("an explicit closed posture must reject");
+        assert_eq!(failure.status, 503);
+
+        // A plain `open` admits exactly like `degraded` here. They differ
+        // only in the fail-open counter, which the admission path owns.
+        let mut config = quota_pool_config(sbproxy_ai::QuotaPoolFailureMode::Closed);
+        config.failure_posture = Some(FailureMode::Open);
+        assert!(RealtimeQuotaFailure::from_pool_error(
+            Some(&config),
+            &sbproxy_ai::PoolError::BackendUnavailable
+        )
+        .is_none());
     }
 
     #[test]

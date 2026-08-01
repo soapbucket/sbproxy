@@ -173,13 +173,65 @@ pub(super) enum InboundKeyPhase {
     },
 }
 
+/// Turn a key-store outage into a phase outcome, under the plane's
+/// configured failure posture.
+///
+/// Both inbound-key entry points below (the ordinary header sweep and the
+/// playground impersonation ticket) had their own copy of this decision.
+/// One copy, reading `key_management.failure_posture` through
+/// [`crate::key_plane::KeyPlane::failure_posture`], is the point of
+/// WOR-2121: a posture that only some of its call sites honour is a
+/// posture the operator cannot reason about.
+///
+/// An admitting posture returns [`InboundKeyPhase::NotPresent`], which
+/// falls through to the origin's own configured auth. It is deliberately
+/// not a blanket admit, and never has been.
+///
+/// [`Degraded`](sbproxy_config::types::FailureMode::Degraded) and
+/// [`Open`](sbproxy_config::types::FailureMode::Open) take the same
+/// branch and differ in what they leave behind: `degraded` says the
+/// per-key policy, budget, and attribution this request should have had
+/// were lost, and is logged as such so it can be alerted on. A plain
+/// `open` claims nothing.
+fn inbound_key_store_outage(
+    plane: &crate::key_plane::KeyPlane,
+    error: &anyhow::Error,
+) -> InboundKeyPhase {
+    let posture = plane.failure_posture();
+    if !posture.admits() {
+        return InboundKeyPhase::Deny {
+            status: 503,
+            message: "key store unavailable".to_string(),
+            trust_outcome: AuthTrustOutcome::BackendFailure,
+        };
+    }
+    if posture.guarantee_waived() {
+        tracing::warn!(
+            error = %error,
+            failure_posture = posture.as_label(),
+            guarantee_waived = true,
+            "key store unavailable; falling through to configured auth with no per-key \
+             policy, budget, or attribution"
+        );
+    } else {
+        tracing::warn!(
+            error = %error,
+            failure_posture = posture.as_label(),
+            guarantee_waived = false,
+            "key store unavailable; falling through to configured auth"
+        );
+    }
+    InboundKeyPhase::NotPresent
+}
+
 /// Resolve a minted virtual key out of the configured inbound headers, before
 /// the origin's configured auth provider runs.
 ///
 /// `raw_peer_ip` must come directly from `Session::client_addr`, before trusted
 /// forwarding headers can replace `ctx.client_ip`.
 ///
-/// Fail-closed on a store outage unless `failure_mode_allow` is set. An unknown
+/// A store outage is resolved by [`inbound_key_store_outage`] against
+/// `key_management.failure_posture`, which defaults to closed. An unknown
 /// id and a wrong secret return the same status so neither is an existence
 /// oracle.
 pub(super) async fn resolve_inbound_key(
@@ -227,21 +279,7 @@ pub(super) async fn resolve_inbound_key(
 
     let now = chrono::Utc::now();
     match plane.cache().resolve_key(key_id).await {
-        Err(e) => {
-            if plane.failure_mode_allow() {
-                tracing::warn!(
-                    error = %e,
-                    "key store unavailable; failure_mode_allow set, falling through to configured auth"
-                );
-                InboundKeyPhase::NotPresent
-            } else {
-                InboundKeyPhase::Deny {
-                    status: 503,
-                    message: "key store unavailable".to_string(),
-                    trust_outcome: AuthTrustOutcome::BackendFailure,
-                }
-            }
-        }
+        Err(e) => inbound_key_store_outage(plane, &e),
         Ok(None) => InboundKeyPhase::Deny {
             status: 401,
             message: "invalid key".to_string(),
@@ -322,21 +360,7 @@ async fn resolve_impersonation_ticket(
     };
     let now = chrono::Utc::now();
     Some(match plane.cache().resolve_key(&key_id).await {
-        Err(e) => {
-            if plane.failure_mode_allow() {
-                tracing::warn!(
-                    error = %e,
-                    "key store unavailable; failure_mode_allow set, falling through to configured auth"
-                );
-                InboundKeyPhase::NotPresent
-            } else {
-                InboundKeyPhase::Deny {
-                    status: 503,
-                    message: "key store unavailable".to_string(),
-                    trust_outcome: AuthTrustOutcome::BackendFailure,
-                }
-            }
-        }
+        Err(e) => inbound_key_store_outage(plane, &e),
         Ok(None) => InboundKeyPhase::Deny {
             status: 401,
             message: "invalid key".to_string(),
@@ -5806,6 +5830,93 @@ mod inbound_key_phase_tests {
             resolve_inbound_key(&plane, &headers(&[("x-api-key", &token)]), None, &mut c).await;
 
         assert_denial(outcome, 503, AuthTrustOutcome::BackendFailure);
+    }
+
+    /// A plane over a store that always fails key reads, pinned to `posture`.
+    fn broken_store_plane(
+        posture: sbproxy_config::types::FailureMode,
+    ) -> (crate::key_plane::KeyPlane, String) {
+        let crypto = KeyCrypto::new(b"pep".to_vec(), b"mas".to_vec());
+        let token = crypto.mint_key().token;
+        let store: Arc<dyn KeyStore> = Arc::new(BrokenKeyReadStore {
+            inner: MemoryKeyStore::new(),
+        });
+        let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
+        let plane = crate::key_plane::KeyPlane::from_parts(crypto, cache, false, false, None)
+            .with_failure_posture(posture);
+        (plane, token)
+    }
+
+    /// Every posture, at both inbound-key entry points, from one accessor.
+    ///
+    /// The legacy `failure_mode_allow: false` and `true` resolve to
+    /// `closed` and `degraded`, so the first two rows below are also the
+    /// legacy behaviour, unchanged. An admitting posture returns
+    /// `NotPresent`, which falls through to the origin's configured auth;
+    /// it has never been a blanket admit and still is not.
+    #[tokio::test]
+    async fn the_failure_posture_governs_both_inbound_key_outage_paths() {
+        use sbproxy_config::types::FailureMode;
+
+        for (posture, admits) in [
+            (FailureMode::Closed, false),
+            (FailureMode::Degraded, true),
+            (FailureMode::Open, true),
+        ] {
+            let (plane, token) = broken_store_plane(posture);
+
+            let mut swept = ctx();
+            let outcome =
+                resolve_inbound_key(&plane, &headers(&[("x-api-key", &token)]), None, &mut swept)
+                    .await;
+            if admits {
+                assert!(
+                    matches!(outcome, InboundKeyPhase::NotPresent),
+                    "{posture:?} must fall through, not deny: {outcome:?}"
+                );
+            } else {
+                assert_denial(outcome, 503, AuthTrustOutcome::BackendFailure);
+            }
+
+            // Same decision on the playground impersonation ticket path,
+            // which used to carry its own copy of it.
+            let ticket = crate::admin_playground::ticket::mint("some-key-id");
+            let mut ticketed = loopback_ctx();
+            let outcome = resolve_inbound_key(
+                &plane,
+                &headers(&[("authorization", &format!("Bearer {ticket}"))]),
+                Some(loopback_ip()),
+                &mut ticketed,
+            )
+            .await;
+            if admits {
+                assert!(
+                    matches!(outcome, InboundKeyPhase::NotPresent),
+                    "{posture:?} must fall through on the ticket path too: {outcome:?}"
+                );
+            } else {
+                assert_denial(outcome, 503, AuthTrustOutcome::BackendFailure);
+            }
+        }
+    }
+
+    /// `degraded` and `open` admit the same request and are still not the
+    /// same answer. The difference is what the plane reports about the
+    /// guarantee it did not make, which is what an operator alerts on.
+    #[test]
+    fn degraded_is_distinguishable_from_open_on_the_admitting_path() {
+        use sbproxy_config::types::FailureMode;
+
+        let (degraded, _) = broken_store_plane(FailureMode::Degraded);
+        let (open, _) = broken_store_plane(FailureMode::Open);
+
+        assert!(degraded.failure_posture().admits());
+        assert!(open.failure_posture().admits());
+
+        assert!(degraded.failure_posture().guarantee_waived());
+        assert!(!open.failure_posture().guarantee_waived());
+        assert_eq!(degraded.failure_posture().as_label(), "degraded");
+        assert_eq!(open.failure_posture().as_label(), "open");
     }
 
     #[tokio::test]
