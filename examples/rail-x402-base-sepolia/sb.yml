@@ -52,6 +52,15 @@ proxy:
     # the cap on what a single paid request can pin in memory.
     max_body_bytes: 1048576
 
+    # What happens to a payable request when settlement infrastructure
+    # cannot answer (the durable store errors, a challenge cannot be
+    # prepared). Infrastructure failures only: a rejected, expired, or
+    # replayed payment always stays away from the origin whatever this
+    # says. `closed` (the default) refuses with 503; `open`, `degraded`,
+    # and `observe` admit the request unpaid, each leaving a different
+    # record behind.
+    failure_mode: closed
+
     worker:
       # The background worker recovers. It expires unredeemed challenges,
       # takes back leases whose holder went away, and asks providers about

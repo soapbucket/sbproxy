@@ -24,6 +24,18 @@ settled. See [`payment-settlement.md`](payment-settlement.md) for that
 configuration and [`402-challenge.md`](402-challenge.md) for the exact
 bytes of every challenge, credential, error, and receipt.
 
+With `proxy.payments` configured, the settlement gate takes over this
+policy's 402s: challenges are compiled from the matched tier's price into
+signed payment requirements, persisted as durable intents before the 402
+is written, and rendered in the selected rail's wire shape, with the
+signed quote token in this policy's configured `header`. The in-memory
+`valid_tokens` ledger and the HTTP ledger below then no longer redeem
+those requests, and the legacy `rails:` and `quote_token:` blocks on this
+policy should be dropped in favor of the rails under `proxy.payments`.
+The request-path sequence, the per-rail challenge shapes, and the failure
+posture live in
+[payment-settlement.md](payment-settlement.md#the-request-path-end-to-end).
+
 ## Request flow
 
 ```
