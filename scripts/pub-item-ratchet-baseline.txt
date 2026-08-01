@@ -65,4 +65,4 @@
 # the x402 challenge renderer and header codecs, the Payment Auth
 # challenge binder and credential selector, and the CLN challenge
 # fields.
-305
+313
