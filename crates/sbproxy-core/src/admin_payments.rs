@@ -21,10 +21,15 @@
 //! # What these responses may contain
 //!
 //! Counts, rails, operations, and verdicts. No intent id, quote id, tenant,
-//! provider reference, payer, or amount. The
-//! [`ReconciliationReport`](crate::billing_runtime::ReconciliationReport) type
-//! carries none of those by construction, so a response built from it cannot
-//! leak one even by accident.
+//! provider reference, payer, or amount. The `ReconciliationReport` type a
+//! response is built from carries none of those by construction, so one
+//! cannot leak even by accident.
+//!
+//! The type is deliberately named here rather than linked: this module
+//! compiles on every build so its routes can answer with a reason instead of
+//! a bare 404, while `billing_runtime` exists only behind the `payments`
+//! feature, and an intra-doc link would break the docs lane on a build
+//! without it.
 
 #[cfg(feature = "payments")]
 use crate::billing_runtime::ReconciliationReport;

@@ -51,9 +51,13 @@
 //! the exact cfg its feature implies.
 //!
 //! Stripe settlement and Stripe usage reporting are separate surfaces behind
-//! one feature. [`stripe_payment`] can settle a payment and therefore
-//! authorize origin access; [`stripe_meter`] reports usage and cannot. A
+//! one feature. `stripe_payment` can settle a payment and therefore
+//! authorize origin access; `stripe_meter` reports usage and cannot. A
 //! meter event is never proof that money moved.
+//!
+//! Both are named rather than linked, here and below: they exist only under
+//! the `stripe` feature, and the docs lane builds this crate with its default
+//! empty feature set, where an intra-doc link to either is unresolvable.
 //!
 //! The Payment Auth Stripe charge path additionally needs `mpp`, because the
 //! single use payment token is carried in the pinned draft-01 credential and
