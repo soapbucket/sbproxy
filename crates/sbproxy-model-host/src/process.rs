@@ -2443,9 +2443,13 @@ unsafe fn prepare_engine_child_signal_state(parent_pid: libc::pid_t) -> std::io:
         }
     }
 
-    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    // No PR_SET_PDEATHSIG here. Linux delivers the parent-death signal when
+    // the spawning THREAD exits, not the process, so an engine launched from a
+    // pooled or short-lived thread would be killed the moment that thread
+    // retires. The engine must outlive its launch thread: orphan prevention
+    // before the durable record is the startup gate's read (EOF when the
+    // gateway dies releases nothing and the gate exits 125), and after the
+    // record it is the boot-time reap keyed on pid plus start fingerprint.
     if libc::getppid() != parent_pid {
         libc::_exit(125);
     }
