@@ -83,6 +83,96 @@ Adapted from `examples/mcp-federation/sb.yml`. The wire-format
 struct is `McpActionConfig` in
 `crates/sbproxy-modules/src/action/mcp.rs`.
 
+## Calling it
+
+Eight examples exercise different parts of this page. The one that matches the
+config above, and the one used here, is
+[`examples/mcp-federation/`](../examples/mcp-federation/), because federation
+is what the `mcp` action is for and because it is self-contained: it ships its
+own upstream. For sessions, RBAC and quotas, progressive discovery, OAuth
+discovery, or tool versioning, use the example named for that feature.
+
+It runs as two processes. The first is a mock REST API that stands in for a
+real service; the second is the gateway that federates it:
+
+```bash
+sbproxy serve -f examples/mcp-federation/upstream.yml &
+sbproxy serve -f examples/mcp-federation/sb.yml
+```
+
+Every call below is an HTTP POST of a JSON-RPC envelope to the same URL. The
+`Accept` header must offer both `application/json` and `text/event-stream`,
+because the Streamable HTTP transport chooses between them per response:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080 \
+  -H 'Host: mcp.example.com' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2025-06-18' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-demo","version":"1.0.0"}}}'
+```
+
+```json
+{"jsonrpc":"2.0","result":{"capabilities":{"tools":{"listChanged":true}},"protocolVersion":"2025-06-18","serverInfo":{"name":"my-mcp","version":"1.0.0"}},"id":1}
+```
+
+`serverInfo` echoes the configured `server_info`, and the gateway answers this
+locally without contacting any upstream, so `initialize` succeeds even with
+every federated server down.
+
+`tools/list` is where federation shows:
+
+```json
+{"jsonrpc":"2.0","id":2,"result":{"tools":[{"description":"Search repositories by query.","inputSchema":{"properties":{"q":{"type":"string"}},"required":["q"],"type":"object"},"name":"gh.search_repos"}]}}
+```
+
+One tool, not two. The config federates two servers: `gh`, an OpenAPI-backed
+server pointed at the mock, and `db`, pointed at `postgres.example.com`, a
+reserved placeholder that does not resolve. The catalogue degrades per server
+rather than failing as a whole, so `db` is dropped with a log line and `gh`
+still answers. A federated catalogue that silently shrinks is the failure mode
+to watch for here: check `tools/list` against the servers you configured, not
+against what your client happens to need.
+
+Note that `gh.search_repos` came from an OpenAPI document. Its `inputSchema`
+was derived from the spec's parameters, with no MCP server written for it.
+
+Calling it dispatches a real HTTP request to the mock:
+
+```bash
+-d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"gh.search_repos","arguments":{"q":"sbproxy"}}}'
+```
+
+```json
+{"jsonrpc":"2.0","result":{"content":[{"text":"[{\"full_name\":\"soapbucket/sbproxy\",\"name\":\"sbproxy\",\"stars\":4200},{\"full_name\":\"soapbucket/docs\",\"name\":\"docs\",\"stars\":12}]","type":"text"}],"isError":false},"id":3}
+```
+
+The upstream's JSON is returned as a *string* inside a `text` content block,
+which is what MCP specifies. A client parses that string; it is not a nested
+JSON object.
+
+The two failure shapes are distinct and worth telling apart. A tool the
+`tool_allowlist` guardrail blocks never leaves the proxy:
+
+```json
+{"jsonrpc":"2.0","error":{"code":-32602,"message":"tool 'gh.delete_repo' is blocked by tool_allowlist guardrail"},"id":4}
+```
+
+`-32602` is JSON-RPC "invalid params": the gateway is saying the requested tool
+is not one it will accept. A tool that is simply not in the registry reports
+differently:
+
+```json
+{"jsonrpc":"2.0","error":{"code":-32603,"message":"tool call failed: unknown tool: db.query"},"id":5}
+```
+
+`-32603` is "internal error", and `unknown tool` here is a consequence of `db`
+never answering `tools/list`, not of `db.query` being forbidden. Both are
+`200 OK` at the HTTP layer, as JSON-RPC requires; the error lives in the
+envelope. A client that checks HTTP status alone sees every one of these as a
+success.
+
 ## `mcp` action fields
 
 | Field | Type | Default | Notes |

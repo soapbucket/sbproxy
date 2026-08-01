@@ -20,7 +20,7 @@ The agent public keys are inline hex placeholders in `sb.yml`. Production deploy
 # Unsigned request - 401 with bot_auth: signature required.
 curl -i -H 'Host: blog.local' http://127.0.0.1:8080/article
 # HTTP/1.1 401 Unauthorized
-# bot_auth: signature required
+# {"error":"bot_auth: signature required"}
 ```
 
 ```bash

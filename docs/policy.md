@@ -1,9 +1,65 @@
 # Policy engine
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-01*
 
 The policy engine evaluates a list of policies on every request. Each policy returns one of four verdicts: `Allow`, `Deny`, `AllowWithHeaders`, or `Confirm`. The dispatcher folds the per-policy results into a single decision and applies it before the request reaches the upstream.
 
 This page covers the `semantic_constraint` policy. The full set of built-in policies is listed in [features.md](features.md).
+
+## Calling it
+
+Three examples carry a policy this page touches. The one used here is
+[`examples/cel-policy/`](../examples/cel-policy/), because it is the only one
+that demonstrates the *engine* described above: a policy returning `Deny` and
+the dispatcher turning that verdict into a response. The other two,
+[`ai-policy-cel`](../examples/ai-policy-cel/) and
+[`ai-content-policy-fallback`](../examples/ai-content-policy-fallback/),
+exercise the AI policy plane, which is a different evaluator documented in
+[ai-policy-cel.md](ai-policy-cel.md).
+
+That example runs one `expression` policy admitting a request only when the
+`X-Tenant` header is `acme`, with `deny_status: 403` and
+`deny_message: "tenant not allowed"`:
+
+```bash
+make run CONFIG=examples/cel-policy/sb.yml
+```
+
+A request that satisfies the expression is forwarded and the policy is
+invisible:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' -H 'Host: cel.local' \
+  -H 'X-Tenant: acme' http://127.0.0.1:8080/get
+# 200
+```
+
+One that does not is denied by the dispatcher before the upstream is reached:
+
+```bash
+curl -sS -i -H 'Host: cel.local' http://127.0.0.1:8080/get
+```
+
+```http
+HTTP/1.1 403 Forbidden
+content-type: application/json
+content-length: 30
+
+{"error":"tenant not allowed"}
+```
+
+The configured `deny_message` becomes the value of a single `error` field in a
+JSON body; it is not returned as plain text. `deny_status` sets the status.
+A wrong header value and a missing header produce the identical response,
+because the expression evaluates to false either way rather than erroring.
+
+This is the shape every `Deny` verdict on this page takes. What differs
+between the policies is how the verdict is reached: `semantic_constraint` asks
+a judge backend, `request_validator` checks a body, `concurrent_limit` and
+`rate_limit_budget` check counters, and `expression` evaluates CEL. The
+dispatcher's handling of the result is the same.
+
+`semantic_constraint` is not demonstrated here because it requires a
+configured LLM judge backend to reach a verdict at all.
 
 ## semantic_constraint
 
