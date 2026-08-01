@@ -288,8 +288,10 @@ jobs:
     # Arms scripts/certify-model-host.sh as a required release check by
     # running it for real: boots `sbproxy run` with a managed
     # llama-server on the runner's own Apple Silicon GPU, then drives a
-    # cold completion, a warm completion, and a kill -9 mid-flight
-    # recovery against it. This is the same procedure previously
+    # cold completion, a warm completion, engine kill -9 recovery,
+    # gateway SIGKILL/restart ownership recovery, final SIGTERM
+    # engine/listener cleanup, and the real launchd service-uninstall
+    # lifecycle. This is the same procedure previously
     # recorded by hand in docs/model-host-certification.md's "Apple
     # Metal gate for this PR" section; it now runs on every release
     # instead of relying on a human to run it before merging a PR.
@@ -339,41 +341,97 @@ jobs:
           # a failure.
           CACHE_DIR="/tmp/sbproxy-cert-cache"
           mkdir -p "${CACHE_DIR}"
-          ./target/release/sbproxy run "${MODEL}" \
-            --variant q4_k_m \
-            --cache-dir "${CACHE_DIR}" \
-            --port 48123 \
-            --admin-port 48124 \
-            > /tmp/sbproxy-cert-boot.log 2>&1 &
-          SB_PID=$!
+          OWNERSHIP_DIR="${RUNNER_TEMP}/sbproxy-cert-ownership-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${OWNERSHIP_DIR}"
+          chmod 700 "${OWNERSHIP_DIR}"
+          export SBPROXY_ENGINE_OWNERSHIP_DIR="${OWNERSHIP_DIR}"
+          SB_PID=""
+          SERVICE_ATTEMPTED=0
+
+          ownership_pid() {
+            python3 - "${OWNERSHIP_DIR}" <<'PY'
+          import glob, json, os, sys
+          records = sorted(glob.glob(os.path.join(sys.argv[1], "*.json")), key=os.path.getmtime)
+          if records:
+              with open(records[-1]) as handle:
+                  print(json.load(handle)["engine"]["pid"])
+          PY
+          }
+
+          wait_ready() {
+            local pid="$1" attempts="$2"
+            for _ in $(seq 1 "${attempts}"); do
+              if curl -sf -o /dev/null "http://127.0.0.1:48123/v1/models"; then
+                return 0
+              fi
+              kill -0 "${pid}" 2>/dev/null || return 1
+              sleep 2
+            done
+            return 1
+          }
+
+          wait_exit() {
+            local pid="$1" attempts="$2"
+            for _ in $(seq 1 "${attempts}"); do
+              kill -0 "${pid}" 2>/dev/null || return 0
+              sleep 1
+            done
+            return 1
+          }
+
+          start_sbproxy() {
+            local log="$1"
+            ./target/release/sbproxy run "${MODEL}" \
+              --variant q4_k_m \
+              --cache-dir "${CACHE_DIR}" \
+              --port 48123 \
+              --admin-port 48124 \
+              > "${log}" 2>&1 &
+            SB_PID=$!
+          }
+
+          cleanup() {
+            if [ "${SERVICE_ATTEMPTED}" -eq 1 ]; then
+              ./target/release/sbproxy service uninstall >/dev/null 2>&1 || true
+            fi
+            if [ -n "${SB_PID}" ] && kill -0 "${SB_PID}" 2>/dev/null; then
+              kill -TERM "${SB_PID}" 2>/dev/null || true
+              wait_exit "${SB_PID}" 15 || kill -9 "${SB_PID}" 2>/dev/null || true
+            fi
+            local engine_pid
+            engine_pid="$(ownership_pid 2>/dev/null || true)"
+            if [ -n "${engine_pid}" ] && kill -0 "${engine_pid}" 2>/dev/null; then
+              kill -TERM "${engine_pid}" 2>/dev/null || true
+              sleep 1
+              kill -9 "${engine_pid}" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          start_sbproxy /tmp/sbproxy-cert-boot.log
 
           # Wait for the HTTP port to accept connections. This only
           # proves the process is up; certify-model-host.sh's own
           # cold-call timeout (600s) separately absorbs the time to
           # load the model on first request.
-          ready=0
-          for _ in $(seq 1 60); do
-            if curl -sf -o /dev/null "http://127.0.0.1:48123/v1/models"; then
-              ready=1
-              break
-            fi
-            if ! kill -0 "${SB_PID}" 2>/dev/null; then
-              echo "sbproxy exited before its port came up" >&2
-              break
-            fi
-            sleep 2
-          done
-          if [ "${ready}" -ne 1 ]; then
+          if ! wait_ready "${SB_PID}" 60; then
             echo "sbproxy never opened :48123" >&2
             cat /tmp/sbproxy-cert-boot.log >&2 || true
-            kill "${SB_PID}" 2>/dev/null || true
             exit 1
           fi
 
-          # Best-effort: find the managed llama-server child so the
-          # kill -9 recovery lane runs too. A miss just SKIPs that one
-          # line in certify-model-host.sh; it does not fail the job.
-          ENGINE_PID="$(pgrep -f llama-server | head -n1 || true)"
+          # Derive the supervised engine from sbproxy's exact durable
+          # ownership record, never from an executable-name sweep.
+          ENGINE_PID=""
+          for _ in $(seq 1 60); do
+            ENGINE_PID="$(ownership_pid 2>/dev/null || true)"
+            [ -n "${ENGINE_PID}" ] && break
+            sleep 1
+          done
+          if [ -z "${ENGINE_PID}" ]; then
+            echo "managed engine ownership record was not published" >&2
+            exit 1
+          fi
 
           set +e
           SB_URL="http://127.0.0.1:48123" SB_HOST=127.0.0.1 MODEL="${MODEL}" \
@@ -381,9 +439,128 @@ jobs:
             bash scripts/certify-model-host.sh
           CERT_STATUS=$?
           set -e
+          if [ "${CERT_STATUS}" -ne 0 ]; then
+            exit "${CERT_STATUS}"
+          fi
 
-          kill "${SB_PID}" 2>/dev/null || true
-          exit "${CERT_STATUS}"
+          # SIGKILL the gateway, then start the same managed run again.
+          # The replacement must reap the exact old engine identity before
+          # it launches a new one.
+          ORPHAN_ENGINE_PID="$(ownership_pid)"
+          kill -9 "${SB_PID}"
+          wait "${SB_PID}" 2>/dev/null || true
+          SB_PID=""
+          start_sbproxy /tmp/sbproxy-cert-restart.log
+          if ! wait_ready "${SB_PID}" 90; then
+            echo "replacement sbproxy never became ready" >&2
+            cat /tmp/sbproxy-cert-restart.log >&2 || true
+            exit 1
+          fi
+          REPLACEMENT_ENGINE_PID=""
+          for _ in $(seq 1 60); do
+            REPLACEMENT_ENGINE_PID="$(ownership_pid 2>/dev/null || true)"
+            if [ -n "${REPLACEMENT_ENGINE_PID}" ] \
+              && [ "${REPLACEMENT_ENGINE_PID}" != "${ORPHAN_ENGINE_PID}" ]; then
+              break
+            fi
+            sleep 1
+          done
+          if kill -0 "${ORPHAN_ENGINE_PID}" 2>/dev/null; then
+            echo "replacement left exact orphan engine pid ${ORPHAN_ENGINE_PID} alive" >&2
+            exit 1
+          fi
+          if [ -z "${REPLACEMENT_ENGINE_PID}" ] \
+            || [ "${REPLACEMENT_ENGINE_PID}" = "${ORPHAN_ENGINE_PID}" ]; then
+            echo "replacement engine ownership was not refreshed" >&2
+            exit 1
+          fi
+
+          # Final SIGTERM must reap the replacement engine, clear its record,
+          # and release the public listener for an immediate restart.
+          kill -TERM "${SB_PID}"
+          if ! wait_exit "${SB_PID}" 60; then
+            echo "sbproxy ignored SIGTERM" >&2
+            exit 1
+          fi
+          wait "${SB_PID}" 2>/dev/null || true
+          SB_PID=""
+          if kill -0 "${REPLACEMENT_ENGINE_PID}" 2>/dev/null; then
+            echo "SIGTERM left engine pid ${REPLACEMENT_ENGINE_PID} alive" >&2
+            exit 1
+          fi
+          if find "${OWNERSHIP_DIR}" -name '*.json' -print -quit | grep -q .; then
+            echo "SIGTERM left a managed-engine ownership record behind" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import socket
+          sock = socket.socket()
+          sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          sock.bind(("0.0.0.0", 48123))
+          sock.close()
+          PY
+
+          # Exercise the operator-facing launchd lifecycle itself. The
+          # service starts from a sparse launchd environment, so publish
+          # the exact ownership directory through its supported env file.
+          SERVICE_ENV="${HOME}/Library/Application Support/sbproxy/service/env"
+          mkdir -p "$(dirname "${SERVICE_ENV}")"
+          printf 'SBPROXY_ENGINE_OWNERSHIP_DIR=%s\n' "${OWNERSHIP_DIR}" > "${SERVICE_ENV}"
+          chmod 600 "${SERVICE_ENV}"
+          # From this point on, neither the launchd service nor the uninstall
+          # command may inherit the direct-run override from this shell. The
+          # service env file is the only source of the ownership directory.
+          unset SBPROXY_ENGINE_OWNERSHIP_DIR
+          SERVICE_ATTEMPTED=1
+          ./target/release/sbproxy service install "${MODEL}" \
+            --variant q4_k_m \
+            --cache-dir "${CACHE_DIR}" \
+            --port 48123 \
+            --admin-port 48124 \
+            > /tmp/sbproxy-cert-service-install.log
+
+          SERVICE_READY=0
+          for _ in $(seq 1 90); do
+            if ./target/release/sbproxy service status >/dev/null 2>&1 \
+              && curl -sf -o /dev/null "http://127.0.0.1:48123/v1/models"; then
+              SERVICE_READY=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${SERVICE_READY}" -ne 1 ]; then
+            echo "launchd service never became ready" >&2
+            cat "${HOME}/Library/Logs/sbproxy/service.err.log" >&2 || true
+            exit 1
+          fi
+          SERVICE_ENGINE_PID="$(ownership_pid)"
+          if [ -z "${SERVICE_ENGINE_PID}" ]; then
+            echo "launchd service did not publish managed-engine ownership" >&2
+            exit 1
+          fi
+
+          ./target/release/sbproxy service uninstall --format json \
+            > /tmp/sbproxy-cert-service-uninstall.json
+          SERVICE_ATTEMPTED=0
+          if ./target/release/sbproxy service status >/dev/null 2>&1; then
+            echo "service uninstall left the launchd agent running" >&2
+            exit 1
+          fi
+          if ! wait_exit "${SERVICE_ENGINE_PID}" 15; then
+            echo "service uninstall left engine pid ${SERVICE_ENGINE_PID} alive" >&2
+            exit 1
+          fi
+          if find "${OWNERSHIP_DIR}" -name '*.json' -print -quit | grep -q .; then
+            echo "service uninstall left a managed-engine ownership record behind" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import socket
+          sock = socket.socket()
+          sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          sock.bind(("0.0.0.0", 48123))
+          sock.close()
+          PY
 
       # The engine's bounded stderr tail is what an engine_early_exit
       # failure tells the operator to inspect. The model-host keeps

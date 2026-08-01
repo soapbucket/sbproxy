@@ -6,7 +6,7 @@ Regenerate with:
 
 ```bash
 python3 scripts/scan-pub-item-usage.py --triage \
-  --enterprise ../sbproxy-enterprise > scripts/pub-item-triage.md
+  --external-tree /path/to/api-consumer > scripts/pub-item-triage.md
 ```
 
 ## Verdicts

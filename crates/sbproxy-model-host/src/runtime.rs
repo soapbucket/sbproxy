@@ -1160,30 +1160,14 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                     .map(|catalog_entry| catalog_entry.modality)
             })
             .unwrap_or_default();
-        // WOR-1676: if the entry quantizes the KV cache, the planner
-        // spends the smaller KV term on the fit (so a card can hold a
-        // context it could not at f16 KV). `bytes_per_element()` is
-        // `None` for Auto/F16, which follows the weight quant's default.
-        // WOR-1908: a non-decode modality overrides this to a zero KV
-        // term, so an embedder is sized by weights + overhead, never KV.
-        let kv_bpe = modality.kv_bytes_per_element_override(entry.kv_quant.bytes_per_element());
-        let plan = plan_fit_auto_kv(
-            &*self.probe,
-            &meta,
-            &candidates,
-            seq_len,
-            DEFAULT_OVERHEAD,
-            kv_bpe,
-        )
-        .map_err(|e| RuntimeError::Fit(e.to_string()))?;
-
         // A GGUF source routes to llama.cpp; everything else is
         // safetensors and goes to vLLM. The signal is an explicit
         // `gguf_file` or a ref/repo that names GGUF, the same signal the
         // preflight uses. The fit-planner quant name is not reliable here:
         // a raw safetensors ref can be assigned a GGUF-style default
         // quant, and routing it to llama.cpp then fails with no file to
-        // load (there is no GGUF in a safetensors repo).
+        // load (there is no GGUF in a safetensors repo). Resolved before
+        // the fit because the KV term below depends on the engine.
         let engine_kind = managed
             .as_ref()
             .map(|(artifact, _)| artifact.engine)
@@ -1193,6 +1177,28 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                     || model_ref.hf_repo.to_ascii_lowercase().contains("gguf");
                 entry.engine.resolve(is_gguf, self.container_runtime)
             });
+        // WOR-1676: if the entry quantizes the KV cache, the planner
+        // spends the smaller KV term on the fit (so a card can hold a
+        // context it could not at f16 KV).
+        // WOR-2069: size from what this engine will actually run, not
+        // from what was asked for; vLLM and SGLang substitute fp8 for
+        // int4, so sizing the request would book half the cache the
+        // engine allocates. `bytes_per_element` is `None` for Auto and
+        // for a no-flag engine, which follows the weight quant's default.
+        // WOR-1908: a non-decode modality overrides this to a zero KV
+        // term, so an embedder is sized by weights + overhead, never KV.
+        let effective_kv = crate::config::effective_kv_cache(entry.kv_quant, engine_kind);
+        crate::config::warn_on_kv_substitution(entry.kv_quant, effective_kv, engine_kind, name);
+        let kv_bpe = modality.kv_bytes_per_element_override(effective_kv.bytes_per_element);
+        let plan = plan_fit_auto_kv(
+            &*self.probe,
+            &meta,
+            &candidates,
+            seq_len,
+            DEFAULT_OVERHEAD,
+            kv_bpe,
+        )
+        .map_err(|e| RuntimeError::Fit(e.to_string()))?;
 
         // Admit against the VRAM budget, evicting the models the
         // residency manager chooses. WOR-1672: use the cost-minimizing
@@ -1859,6 +1865,37 @@ mod tests {
         assert!(m.port.is_some(), "ready model has a port");
         assert_eq!(m.keep_alive_secs, Some(1800), "30m keep_alive surfaced");
         assert!(s.vram.used_bytes > 0, "resident model uses budget");
+    }
+
+    #[tokio::test]
+    async fn legacy_fit_books_the_substituted_kv_cost_on_vllm() {
+        // WOR-2069 regression: this legacy `serve:` path used to size
+        // the KV term from the requested mode. vLLM serves `int4` KV as
+        // fp8, so the plan booked half the cache the engine allocates.
+        // Sized from the shared table (`effective_kv_cache`), an int4
+        // request and an fp8 request now plan identical VRAM, while f16
+        // still books its real 2-byte elements. glm-4-flash resolves to
+        // vLLM here: no GGUF signal, and the fixture has a container
+        // runtime.
+        async fn planned_bytes(kv: &str) -> u64 {
+            let rt = l4_runtime(config(&format!(
+                "models:\n  - model: glm-4-flash\n    max_context: 8192\n    kv_quant: {kv}\n"
+            )));
+            rt.ensure_ready("glm-4-flash").await.expect("ready");
+            rt.status_snapshot().await.vram.used_bytes
+        }
+        let int4 = planned_bytes("int4").await;
+        let fp8 = planned_bytes("fp8").await;
+        let f16 = planned_bytes("f16").await;
+        assert!(int4 > 0, "resident model books VRAM");
+        assert_eq!(
+            int4, fp8,
+            "vLLM serves int4 KV as fp8, so the plan must book fp8's cost, not half of it"
+        );
+        assert_ne!(
+            f16, fp8,
+            "the KV lever must still reach the fit: f16 books 2 bytes per element, fp8 books 1"
+        );
     }
 
     #[tokio::test]

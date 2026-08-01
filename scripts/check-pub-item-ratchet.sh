@@ -19,7 +19,7 @@
 # removed the last production caller of one. Both are worth a look:
 #
 #   scripts/scan-pub-item-usage.py --tests-only \
-#     --enterprise ../sbproxy-enterprise
+#     --external-tree /path/to/api-consumer
 #
 # Then pick one:
 #
@@ -29,9 +29,9 @@
 #     in-crate. This is the highest-leverage option: it shrinks the
 #     public surface and hands the item back to `dead_code`, so rustc
 #     polices it for free from then on.
-#   * Delete it, but only after `--enterprise` confirms the out-of-tree
-#     tree does not name it. `MeshBridge` and `BridgeConfig` are the
-#     standing proof that in-tree unreferenced does not mean unused.
+#   * Delete it, but only after `--external-tree` confirms the optional
+#     out-of-tree API consumer does not name it. In-tree unreferenced does
+#     not necessarily mean unused by another checkout.
 #   * Raise the baseline below, with a sentence in the commit message
 #     saying why the new item has to exist before its caller does.
 #
@@ -64,7 +64,7 @@ if [ "$ACTUAL" -gt "$BASELINE" ]; then
   echo >&2
   echo "This went up. Something landed that no production code calls." >&2
   echo "List them with:" >&2
-  echo "  python3 scripts/scan-pub-item-usage.py --tests-only --enterprise ../sbproxy-enterprise" >&2
+  echo "  python3 scripts/scan-pub-item-usage.py --tests-only --external-tree /path/to/api-consumer" >&2
   echo >&2
   echo "See the header of this script for the four ways to resolve it." >&2
   exit 1
