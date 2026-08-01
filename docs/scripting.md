@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Lua, JavaScript, and WASM
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-01*
 
 SBproxy includes four scripting engines for custom logic: CEL (Common Expression Language), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -216,6 +216,8 @@ CEL includes the standard operators (`+`, `-`, `*`, `/`, `%`, `in`, `==`, `!=`, 
 ### 3.3 CEL policy examples
 
 The scripted request gate is the `expression` policy. It takes one CEL expression; `false` (or an evaluation error) denies the request with `deny_status` (default 403) and `deny_message`.
+
+The expression is compiled once, when the config compiles. An expression that does not parse rejects the whole config: at boot the proxy refuses to start, and on a hot reload the candidate config is rejected and the previously active config keeps serving traffic. The error names the origin, the policy, and the bad expression. At request time only evaluation can fail, and an evaluation error (a missing map key, a non-boolean result) denies the request: the expression could not prove the request is allowed.
 
 #### Gate a route on a header value
 
@@ -857,7 +859,7 @@ Validate your config before deployment:
 sbproxy validate sb.yml
 ```
 
-Validation checks the YAML shape and typed fields. Script bodies (CEL expressions, Lua, JavaScript) are strings to the validator; their syntax errors surface at request time in the logs, not at validation time. Exercise a scripted route once in staging before relying on it.
+Validation checks the YAML shape and typed fields, and compiles every `expression` policy, so CEL syntax errors in request gates surface here (and at boot or reload) rather than at request time. Other script bodies (Lua, JavaScript, rate-limit `key:` expressions) are strings to the validator; their syntax errors surface at request time in the logs. Exercise a scripted route once in staging before relying on it.
 
 ### Enabling debug logging
 
@@ -871,7 +873,7 @@ With debug logging on, script failures are logged with the engine, the error mes
 
 | Surface | On error |
 |---|---|
-| `expression` policy | Fails open on a CEL parse error (misconfiguration), fails closed on an evaluation error (the expression could not prove the request is allowed) |
+| `expression` policy | A CEL parse error rejects the config at compile time (boot refuses to start; a reload keeps the previous config active); an evaluation error fails closed and denies the request (the expression could not prove the request is allowed) |
 | Lua / JS modifiers | Error logged per request; the modifier's headers are not applied; the request proceeds |
 | `lua_json` / `js_json` / `javascript` transforms | Error logged per request; the body is left unchanged |
 | `cel` transform | Missing both `on_response` and `headers` fails config compile; runtime evaluation errors leave the body unchanged |

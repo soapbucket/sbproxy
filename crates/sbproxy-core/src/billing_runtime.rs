@@ -265,14 +265,43 @@ pub async fn build_payments_runtime(
     let verifier = sbproxy_modules::policy::quote_token::QuoteTokenVerifier::single_key(
         QUOTE_KEY_ID,
         verifying,
-        nonce_store,
+        Arc::clone(&nonce_store),
     );
+    let requirement_signer = Arc::new(crate::payment_signer::QuoteRequirementSigner::new(
+        quote_signer,
+        verifier,
+    ));
+
+    // The Payment HTTP Authentication binder shares the operator's one
+    // settlement secret with the quote key derivation above; the two
+    // keyspaces stay apart because the quote key is an HKDF output and the
+    // binder MACs under the raw material with its own fixed slot layout.
+    #[cfg(feature = "payment-mpp")]
+    let challenge_binder = match &config.protocols.payment_auth {
+        Some(protocol) => Some(Arc::new(
+            sbproxy_billing::payment_auth::ChallengeBinder::new(
+                &protocol.realm,
+                binding_key.as_bytes(),
+            )
+            .map_err(|source| PaymentsRuntimeError::Billing {
+                surface: "protocols.payment_auth.realm",
+                source: source.into(),
+            })?,
+        )),
+        None => None,
+    };
+
+    let gate = SettlementGateSeam {
+        quote_signer: Arc::clone(&requirement_signer),
+        nonce_store,
+        #[cfg(feature = "payment-mpp")]
+        challenge_binder,
+        failure_mode: config.failure_mode,
+    };
 
     let inputs = PaymentsRuntimeInputs {
-        signer: Arc::new(crate::payment_signer::QuoteRequirementSigner::new(
-            quote_signer,
-            verifier,
-        )),
+        signer: requirement_signer,
+        gate: Some(gate),
         recovery_key: match &config.recovery_encryption {
             Some(recovery) => Some(Zeroizing::new(
                 resolve_secret(&recovery.key, "recovery_encryption.key")?
@@ -393,6 +422,45 @@ pub fn compiled_payment_features() -> Vec<&'static str> {
     features
 }
 
+/// Request-path material the settlement origin gate reads beside the service.
+///
+/// Built in [`build_payments_runtime`] from the same configuration
+/// generation as the service, so the signer that parses a presented quote
+/// token, the nonce ledger that makes one settled challenge serve exactly
+/// once, the Payment HTTP Authentication binder, and the operator's
+/// infrastructure-failure posture can never disagree with the store that
+/// issued the challenge.
+#[derive(Clone)]
+pub struct SettlementGateSeam {
+    /// Parses and authenticates presented quote tokens. Held concretely so
+    /// the gate can read claims; the service only ever sees the
+    /// [`RequirementSigner`] trait.
+    pub quote_signer: Arc<crate::payment_signer::QuoteRequirementSigner>,
+    /// Single-serve ledger for settled challenges. The durable store keeps
+    /// a settled intent redeemable so an interrupted payment can resume;
+    /// this is the request-path consumption on top, burned only after a
+    /// committed receipt authorized a response.
+    pub nonce_store: Arc<dyn sbproxy_modules::policy::quote_token::NonceStore>,
+    /// Issues and verifies `WWW-Authenticate: Payment` challenges. `None`
+    /// when `proxy.payments.protocols.payment_auth` is absent, in which
+    /// case the gate never advertises the `mpp` rail.
+    #[cfg(feature = "payment-mpp")]
+    pub challenge_binder: Option<Arc<sbproxy_billing::payment_auth::ChallengeBinder>>,
+    /// What the gate does when settlement infrastructure cannot answer.
+    /// Payment refusals are never subject to it.
+    pub failure_mode: sbproxy_config::types::FailureMode,
+}
+
+impl std::fmt::Debug for SettlementGateSeam {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("SettlementGateSeam");
+        debug.field("failure_mode", &self.failure_mode);
+        #[cfg(feature = "payment-mpp")]
+        debug.field("challenge_binder", &self.challenge_binder.is_some());
+        debug.finish()
+    }
+}
+
 /// Everything the runtime needs that configuration names but cannot carry.
 ///
 /// Secrets are resolved by the caller and handed over as bytes. This module
@@ -408,6 +476,13 @@ pub struct PaymentsRuntimeInputs {
     /// challenge, so a runtime without one would fail at first request
     /// rather than at startup.
     pub signer: SharedRequirementSigner,
+    /// Request-path gate material, when this runtime will serve requests.
+    ///
+    /// `None` is a valid assembly and simply leaves the request path on the
+    /// legacy ledger behaviour: the admin and worker surfaces never need
+    /// it, and tests that exercise topology or lifecycle rules build
+    /// candidates without a real signer.
+    pub gate: Option<SettlementGateSeam>,
     /// The resolved recovery encryption key, when configuration set one.
     pub recovery_key: Option<Zeroizing<Vec<u8>>>,
     /// The resolved Stripe secret key, when a Stripe rail is configured.
@@ -445,6 +520,7 @@ pub struct PaymentsRuntimeCandidate {
     service: Arc<BillingService>,
     worker_config: WorkerConfig,
     rails: Vec<SettlementRail>,
+    gate: Option<SettlementGateSeam>,
 }
 
 impl PaymentsRuntimeCandidate {
@@ -542,6 +618,7 @@ impl PaymentsRuntimeCandidate {
             service: Arc::new(builder.build()),
             worker_config: worker_config(config),
             rails,
+            gate: inputs.gate.clone(),
         })
     }
 
@@ -626,6 +703,7 @@ impl PaymentsRuntimeCandidate {
             observed,
             observer,
             rails: self.rails,
+            gate: self.gate,
         })
     }
 
@@ -653,6 +731,7 @@ pub struct PaymentsRuntime {
     observed: ObservedStatus,
     observer: tokio::task::JoinHandle<()>,
     rails: Vec<SettlementRail>,
+    gate: Option<SettlementGateSeam>,
 }
 
 impl PaymentsRuntime {
@@ -660,6 +739,16 @@ impl PaymentsRuntime {
     #[must_use]
     pub fn service(&self) -> &Arc<BillingService> {
         &self.service
+    }
+
+    /// Request-path gate material, when this runtime was built for serving.
+    ///
+    /// `None` means the runtime was assembled without a gate (tests,
+    /// hand-built candidates) and the request path keeps its legacy
+    /// challenge behaviour.
+    #[must_use]
+    pub fn gate(&self) -> Option<&SettlementGateSeam> {
+        self.gate.as_ref()
     }
 
     /// The rails that registered an adapter, in a stable order.
@@ -817,6 +906,7 @@ impl PaymentsRuntime {
             observed,
             observer,
             rails: _rails,
+            gate: _gate,
         } = self;
 
         observer.abort();
@@ -1507,6 +1597,7 @@ mod tests {
             challenge_binding_key: "secret://env/SB_PAYMENT_BINDING_KEY".to_string(),
             authorization_timeout_ms: 2_000,
             max_body_bytes: 65_536,
+            failure_mode: sbproxy_config::types::FailureMode::Closed,
             recovery_encryption: None,
             worker: sbproxy_config::payments::PaymentsWorkerConfig::default(),
             protocols: sbproxy_config::payments::PaymentProtocolsConfig::default(),
@@ -1542,6 +1633,7 @@ mod tests {
     fn test_inputs() -> PaymentsRuntimeInputs {
         PaymentsRuntimeInputs {
             signer: Arc::new(StubSigner),
+            gate: None,
             recovery_key: None,
             stripe_api_key: None,
             cln_rune: None,

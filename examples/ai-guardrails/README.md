@@ -1,10 +1,10 @@
 # AI gateway: input and output guardrails
 
-*Last modified: 2026-06-24*
+*Last modified: 2026-08-01*
 
 ![sbproxy blocking a prompt-injection and a PII request before they reach the provider](../../docs/assets/ai-guardrails.gif)
 
-A full guardrail stack on a single Anthropic origin. Three input guardrails inspect the prompt before any upstream call: `injection` uses the built-in pattern set plus a custom phrase, `pii` blocks emails, phone numbers, SSNs, and credit cards, and `jailbreak` adds DAN-style and `evil mode` patterns. Two output guardrails inspect the model response before it returns to the client: a `toxicity` keyword screen plus a `schema` check that requires a top-level JSON object with `summary` (string) and `tags` (array). Every block fires `sbproxy_ai_guardrail_blocks_total{category=...}`.
+A full guardrail stack on a single Anthropic origin. Three input guardrails inspect the prompt before any upstream call: `injection` uses the built-in pattern set plus a custom phrase, `pii` blocks emails, phone numbers, SSNs, and credit cards, and `jailbreak` adds DAN-style and `evil mode` patterns. Two output guardrails inspect the model response before it returns to the client: a `toxicity` keyword screen plus a `schema` check that validates the assistant message content (`choices[].message.content`, not the response envelope) as a JSON object with `summary` (string) and `tags` (array). The full JSON Schema is enforced, so a reply with both keys but the wrong types (say a numeric `summary`) is rejected, and the block reason names the failing path and keyword without echoing the model's output. Every block fires `sbproxy_ai_guardrail_blocks_total{category=...}`.
 
 This example intentionally uses the zero-dependency keyword defaults.
 `jailbreak` and `toxicity` perform case-insensitive substring matching; they

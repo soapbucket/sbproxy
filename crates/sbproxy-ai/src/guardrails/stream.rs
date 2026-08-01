@@ -151,9 +151,16 @@ impl StreamGuardSession {
                     // policy to Close and rejects an explicit Chunk; this
                     // fallback also keeps hand-built test pipelines safe.
                     Guardrail::SafetyClassifier(_) => at_close.push(i),
+                    // WOR-2174: same rule for schema validation. An
+                    // intermediate delta is incomplete JSON, so a
+                    // per-delta verdict would terminate valid streams;
+                    // the complete accumulated result is judged at
+                    // close instead, within the same close-policy
+                    // buffer bound.
+                    Guardrail::Schema(_) => at_close.push(i),
                     Guardrail::AgentAlignment(_) => tool_call.push(i),
-                    // regex / pii / schema / context_poisoning: per
-                    // decoded delta, as the per-chunk path always did.
+                    // regex / pii / context_poisoning: per decoded
+                    // delta, as the per-chunk path always did.
                     _ => per_delta.push(i),
                 },
             }
@@ -516,6 +523,73 @@ mod tests {
         let mut s = StreamGuardSession::new(pipeline_with(entries), None);
         assert!(s.on_content_delta("engage dan").is_none());
         assert!(s.on_close().is_some());
+    }
+
+    /// WOR-2174: schema validation is judged on the complete
+    /// accumulated result at stream close, never on a partial delta.
+    #[test]
+    fn schema_stream_is_judged_at_close_not_per_delta() {
+        let p = pipeline_with(serde_json::json!([{
+            "type": "schema",
+            "schema": {
+                "type": "object",
+                "required": ["summary", "tags"],
+                "properties": {
+                    "summary": {"type": "string"},
+                    "tags": {"type": "array"}
+                }
+            }
+        }]));
+
+        // Each delta alone is incomplete JSON; per-delta evaluation
+        // would have terminated this valid stream.
+        let mut s = StreamGuardSession::new(p.clone(), None);
+        for chunk in [
+            r#"{"summ"#,
+            r#"ary":"a sandwich"#,
+            r#"","tags":["food""#,
+            r#"]}"#,
+        ] {
+            assert!(
+                s.on_content_delta(chunk).is_none(),
+                "chunk {chunk:?} must not block mid-stream"
+            );
+        }
+        assert!(
+            s.on_close().is_none(),
+            "the valid accumulated result must pass at close"
+        );
+
+        // An invalid accumulated result still blocks, at close.
+        let mut s = StreamGuardSession::new(p, None);
+        assert!(s.on_content_delta(r#"{"summary":7,"#).is_none());
+        assert!(s.on_content_delta(r#""tags":"wrong"}"#).is_none());
+        let block = s.on_close().expect("schema verdict lands at close");
+        assert_eq!(block.name, "schema");
+        assert!(
+            !block.reason.contains("wrong"),
+            "reason must not echo the offending value: {}",
+            block.reason
+        );
+    }
+
+    /// WOR-2174: hand-built pipelines without compiled policies fall
+    /// back to Chunk for every guard; the session must still refuse to
+    /// judge schema per delta, mirroring the SafetyClassifier fallback.
+    #[test]
+    fn schema_routes_to_close_even_under_the_chunk_fallback() {
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.output.push(Guardrail::Schema(
+            crate::guardrails::SchemaGuardrail::from_config(&serde_json::json!({
+                "type": "schema",
+                "schema": {"type": "object"}
+            }))
+            .expect("schema guard compiles"),
+        ));
+        let mut s = StreamGuardSession::new(Arc::new(pipeline), None);
+        assert!(s.on_content_delta(r#"{"a"#).is_none());
+        assert!(s.on_content_delta(r#"":1}"#).is_none());
+        assert!(s.on_close().is_none());
     }
 
     /// stream_policy routing: off never evaluates (and counts); close

@@ -127,6 +127,19 @@ pub struct PaymentsConfig {
     /// answered 413 before any challenge or provider work.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: u64,
+    /// What happens to a payable request when settlement infrastructure
+    /// cannot answer: the durable store errors, a challenge cannot be
+    /// prepared, or the signer refuses.
+    ///
+    /// This posture governs infrastructure failures only. A payment
+    /// refusal is never subject to it: a rejected, expired, replayed,
+    /// or unsettled payment always keeps the request away from the
+    /// origin, whatever this is set to. Defaults to `closed`, which
+    /// refuses the request, because settlement enforces a revenue
+    /// boundary and a control that silently admits traffic when it
+    /// breaks is worse than no control.
+    #[serde(default)]
+    pub failure_mode: crate::types::FailureMode,
     /// Encryption for the write-ahead recovery envelopes that make a
     /// crashed Stripe dispatch recoverable. Required whenever the
     /// Stripe settlement rail is enabled.

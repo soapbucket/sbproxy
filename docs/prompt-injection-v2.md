@@ -248,8 +248,10 @@ policies:
 
 The client connects lazily, so the proxy starts even when the sidecar
 is not up yet, and the first request after the sidecar comes online
-succeeds. An invalid `endpoint` is the only error reported at config
-load.
+succeeds. The `detector_config` block is validated at config load and
+rejects an invalid `endpoint` URI, a `threshold` that is not a finite
+number in `[0.0, 1.0]`, a `timeout_ms` of zero, or an empty
+`injection_label`.
 
 ### Fail policy
 
@@ -261,6 +263,16 @@ is handled by `fail_closed`:
 - `fail_closed: true` returns a high-confidence injection. Pair this
   with `action: block` only when a missing verdict should deny the
   request, and budget for the sidecar's availability accordingly.
+
+Malformed responses follow the same posture. Every classification
+response is validated before the detector reads it: it must carry at
+least one label, every label needs a non-empty name that is unique
+within the response (compared case-insensitively), and every score must
+be a finite number between 0.0 and 1.0. A response that fails any of
+these checks is a protocol error and is handled by `fail_closed`
+exactly like a sidecar that is down; it is never interpreted as a clean
+verdict. Labels are ordered highest score first after validation, so
+the verdict does not depend on the order the sidecar sent them in.
 
 ### Running the OSS sidecar
 

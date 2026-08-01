@@ -86,6 +86,121 @@ A `NeedsReconciliation` intent is never retried by the request path. A
 second attempt is how a payer gets charged twice, so the client waits for
 the recovery worker instead.
 
+## The request path, end to end
+
+With `proxy.payments` present, an `ai_crawl_control` 402 is settled
+through the durable machinery above instead of the legacy in-memory
+ledger. The pairing is two blocks with different owners, and the gate is
+the seam between them:
+
+- `ai_crawl_control` decides which requests are payable and what they
+  cost: crawler signatures, free paths, tiers, the price.
+- `proxy.payments` decides how a payment settles: rails, credentials,
+  durable state, timeouts, and the failure posture.
+
+The smallest working pairing is
+[`examples/rail-x402-base-sepolia/sb.yml`](../examples/rail-x402-base-sepolia/sb.yml),
+and every field in it is explained in the reference below.
+
+### The challenge
+
+1. The policy prices the request and denies it. The gate intercepts the
+   402 before it is written.
+2. The gate picks a rail: the client's `Accept-Payment` preference list
+   (`x402`, `mpp`, `lightning`, with q-values) is intersected with the
+   rails `proxy.payments` configures, honoring any per-tier `rails:`
+   floor. No preference means the first configured rail; a preference
+   set with no overlap is a 406 naming the `supported_rails`. Direct
+   Stripe has no `Accept-Payment` token and is selected only when the
+   client expresses no preference, because that mode is an operator
+   opt-in rather than a negotiated one.
+3. The matched price compiles into one normalized requirement, and a
+   durable `Pending` intent is committed before the 402 leaves the
+   proxy. A crash after this point leaves a record, never a dangling
+   provider object.
+4. The 402 is rendered in the rail's own wire shape. Whatever the rail,
+   the signed quote token rides the policy's configured challenge
+   header (`crawler-payment` by default), and the retry re-presents it
+   there verbatim.
+
+| Rail | What the 402 carries beyond the quote token |
+|---|---|
+| x402 | The v2 `PaymentRequired` JSON body (resource, `accepts`, the `sbproxy-requirement` extension) and the same object base64-encoded in `PAYMENT-REQUIRED`. |
+| Payment Auth | One `WWW-Authenticate: Payment` field per offered challenge, `Cache-Control: no-store`, and an informative JSON body. |
+| Direct Stripe | A JSON body whose `challenge` object names the PaymentIntent and carries the one-shot `client_secret`. The secret goes into this immediate response and nowhere else. |
+| Lightning | A JSON body whose `challenge` object carries the BOLT 11 invoice, the payment hash, and the durable label. |
+
+### The retry
+
+1. The quote token from the configured header is authenticated and its
+   claims name the durable intent. A token that does not authenticate,
+   or names no live challenge, gets a fresh 402 and nothing else.
+2. The rail's credential is extracted. x402 reads exactly one
+   `PAYMENT-SIGNATURE` header and takes the canonical scheme payload as
+   the proof. Payment Auth reads exactly one `Authorization: Payment`
+   field; two is a 400, and every refusal on that rail is an
+   `application/problem+json` document under the canonical
+   `https://paymentauth.org/problems/` types. Direct Stripe and
+   Lightning carry no separate credential: the re-presented quote token
+   is the proof, and the provider settles out of band.
+3. The service authorizes: local verification, the durable intent, the
+   proof reservation, one bounded provider interaction, and the
+   committed receipt, in that order.
+4. Exactly one outcome reaches the origin: a committed `Succeeded` row,
+   rechecked at the decision boundary. The durable intent stays
+   redeemable so an interrupted payment can resume, and a single-serve
+   nonce on the request path is what makes one settled payment serve
+   the content exactly once. A second presentation of a settled
+   credential is refused as `proof_replayed`.
+
+### When settlement itself breaks
+
+`failure_mode` owns what happens when the infrastructure, not the
+payment, cannot answer: the store errors, a challenge cannot be
+prepared, the signer refuses. It reuses the shared posture vocabulary
+and defaults to `closed`.
+
+| Posture | A payable request during an infrastructure failure |
+|---|---|
+| `closed` | Refused with 503 and `Retry-After`. The default. |
+| `open` | Admitted unpaid, counted, nothing else recorded. |
+| `degraded` | Admitted unpaid with the waived guarantee logged loudly, so an operator can alert on revenue that went uncollected. |
+| `observe` | Admitted unpaid, with the decision the gate would have taken recorded. For rolling settlement out against live traffic. |
+
+A rejected, expired, replayed, or unsettled payment is never subject to
+this posture. Payment refusals always keep the request away from the
+origin.
+
+### Testing the gate
+
+The decision matrix runs as unit tests against the real SQLite store
+and scripted rails:
+
+```bash
+cargo nextest run -p sbproxy-core \
+  --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln \
+  settlement_gate
+```
+
+The end-to-end proof runs the released binary against a stub Core
+Lightning node and a counting stub origin, and asserts the origin serves
+exactly once per settled payment:
+
+```bash
+CARGO_TARGET_DIR=target/payments cargo build --release -p sbproxy \
+  --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln
+SBPROXY_E2E_PAYMENTS_BIN=target/payments/release/sbproxy \
+  cargo test -p sbproxy-e2e --release --test settlement_gate
+```
+
+> Placeholder: the following response bodies are documented from the
+> renderer rather than captured from a live run, and should be replaced
+> with real output from `examples/rail-x402-base-sepolia/`: the x402 402
+> body, the Lightning and direct-Stripe 402 bodies, one
+> `WWW-Authenticate: Payment` field value, one `problem+json` refusal,
+> the 406 `no_acceptable_rail` body, and the 503
+> `settlement_unavailable` body.
+
 ## Which rail to reach for
 
 | Rail | Reach for it when |
@@ -145,6 +260,7 @@ proxy:
     challenge_binding_key: secret://env/SBPROXY_PAYMENT_BINDING_KEY
     authorization_timeout_ms: 2000
     max_body_bytes: 1048576
+    failure_mode: closed
     recovery_encryption:
       key_id: payments-2026-07
       key: secret://env/SBPROXY_PAYMENT_RECOVERY_KEY
@@ -221,6 +337,7 @@ error rather than a silently ignored setting.
 | `challenge_binding_key` | required | Names the key that binds a challenge to the proxy that issued it. Must be a reference such as `secret://env/NAME`, `env:NAME`, or `file:/path`; an inline key is rejected. Rotating it invalidates every outstanding challenge. |
 | `authorization_timeout_ms` | `2000` | Total budget for the one synchronous provider interaction a paid request gets. Accepted range is 1 through 2000. Lowering it makes the proxy give up sooner, which moves more outcomes into `RetryWait` or `NeedsReconciliation` rather than letting a payer wait. 2000 is also the hard ceiling, because a longer wait turns a paid request into an availability problem for the origin behind it. |
 | `max_body_bytes` | `1048576` | Largest request body the payment path buffers. A paid request with a body is read once in full so its digest can be bound to the challenge, so this caps what one request pins in memory. A larger body is answered 413 before any challenge or provider work. Range is 1 through 1048576. |
+| `failure_mode` | `closed` | What happens to a payable request when settlement infrastructure cannot answer. Infrastructure failures only; a payment refusal always fails closed whatever this says. See the posture table in the request-path section above. |
 
 ### `recovery_encryption`
 

@@ -48,7 +48,7 @@ use sbproxy_modules::policy::quote_token::{QuoteClaims, QuoteTokenSigner, QuoteT
 /// [`QuoteTokenVerifier::verify`] path, which matches `shape` exactly and
 /// consumes the nonce. A token minted for a payment cannot be spent as a
 /// token minted for a free content negotiation.
-const SETTLEMENT_SHAPE: &str = "payment-requirement";
+pub(crate) const SETTLEMENT_SHAPE: &str = "payment-requirement";
 
 /// The audience every quote carries.
 const QUOTE_AUDIENCE: &str = "ledger";
@@ -70,6 +70,19 @@ impl QuoteRequirementSigner {
     #[must_use]
     pub fn jwks_json(&self) -> serde_json::Value {
         self.verifier.jwks_json()
+    }
+
+    /// Reads the authenticated claims out of a presented quote token.
+    ///
+    /// Authenticity only: the signature must verify under a trusted key id.
+    /// Binding the claims to a stored requirement is the durable path's job
+    /// ([`RequirementSigner::verify`] runs there), and nothing here touches
+    /// the nonce store, for the reason the module docs give: parsing a
+    /// retry must never burn the quote.
+    pub(crate) fn verify_claims(&self, token: &str) -> Result<QuoteClaims, BillingError> {
+        self.verifier
+            .verify_authenticity(token)
+            .map_err(|_| BillingError::InvalidProof)
     }
 }
 

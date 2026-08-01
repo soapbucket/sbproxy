@@ -799,7 +799,7 @@ Every built-in output guardrail runs on streaming responses, and the verdicts ma
 |---|---|---|
 | `regex` | yes | runs per decoded delta; set `stream_policy: close` when a pattern must span delta boundaries |
 | `pii` | yes | runs per decoded delta |
-| `schema` | yes | decided on the parsed value |
+| `schema` | yes | the complete accumulated response is validated once, at stream close; per-delta evaluation never runs because an intermediate delta is incomplete JSON |
 | `context_poisoning` | yes | rule matches are per-message |
 | `injection` | yes | case-insensitive substring set, matched over a cumulative window |
 | `toxicity` | yes | keyword mode matches over a cumulative window; classifier mode holds body frames for full-response evaluation at close |
@@ -825,6 +825,32 @@ guardrails:
 ```
 
 `close` defers the check to stream end over the accumulated text. Mid-stream bytes have already reached the client by then, so its guarantees are the recorded verdict, the violation metric, and cache denial, not recall of delivered content. `off` skips the guardrail on streaming responses entirely and increments `sbproxy_ai_stream_guardrail_skipped_total` so the coverage gap stays visible. Violations under any policy increment `sbproxy_ai_stream_guardrail_violations_total`.
+
+`schema` entries default to `stream_policy: close` and reject an explicit `chunk`, for the same reason classifier-mode entries do: the verdict is only meaningful over the complete result. A schema block on a streaming response is therefore a close-time verdict with the close-policy guarantees above; it does not hold body frames back, so it cannot recall bytes the client already received.
+
+### Schema guardrail
+
+`type: schema` on the output side enforces that the model produced structured output matching a JSON Schema ([config](../examples/ai-guardrails/)):
+
+```yaml
+guardrails:
+  output:
+    - type: schema
+      schema:
+        type: object
+        required: [summary, tags]
+        properties:
+          summary:
+            type: string
+          tags:
+            type: array
+```
+
+The schema compiles once, when the configuration is published, and the full compiled schema is enforced on every response: property types, nested `required`, `additionalProperties`, array constraints, `enum` and `const`, numeric and string bounds, and `allOf` / `anyOf` / `oneOf` / `not` composition. In-document `#/...` references resolve. A configuration whose schema is missing, invalid, larger than 64 KiB serialized, nested deeper than 32 levels, or carrying an external `$ref` fails to load with an error naming the problem. Remote reference fetching is disabled outright, the same SSRF posture as the `json_schema` transform and the OpenAPI validator.
+
+The guardrail judges the assistant payload, not the transport envelope. For OpenAI Chat responses that is `choices[].message.content` (multiple choices concatenate in index order), for OpenAI Responses it is the assistant message output items, and for Anthropic Messages it is the text content blocks. This is the same canonical extraction the classifier-backed output guardrails use, so a route that translates between provider formats validates the same payload on every surface. The extracted text is parsed as JSON before validation; when the schema's top-level `type` is exactly `string`, the text is validated directly as a string instance instead. A response the gateway cannot map to an assistant payload fails closed with a `schema` block: an unrecognized response shape, a tool-call-only turn with no content, or a body that is not valid UTF-8.
+
+A block reports the failing JSON path and the schema keyword in the form `Schema validation failed at /summary (keyword: type)`. The offending value never appears in the error, because it is model output that would otherwise be relayed into the client-visible error body. Missing `required` property names are the one exception; those names come from the operator's schema, not from the response.
 
 ### Context-poisoning guardrail
 

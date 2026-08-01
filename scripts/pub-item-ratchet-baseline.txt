@@ -56,4 +56,13 @@
 # attribute. It crosses into sbproxy-core, where the body phase caps at
 # capture so the span and the access log agree on one value. A cap that
 # two crates must agree on is a contract, not an implementation detail.
-321
+#
+# Lowered to 305 on WOR-2143, 2026-08-01: the settlement origin gate
+# landed and the request path now calls the sbproxy-billing surface the
+# WOR-2100 note promised a caller for. Sixteen items gained production
+# consumers: the service (authorize, prepare_requirement, the decision
+# and problem types), derive_intent_id, the requirement and proof types,
+# the x402 challenge renderer and header codecs, the Payment Auth
+# challenge binder and credential selector, and the CLN challenge
+# fields.
+305

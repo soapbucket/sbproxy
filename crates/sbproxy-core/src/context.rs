@@ -745,6 +745,18 @@ pub struct RequestContext {
     /// response so the crawler learns exactly what it paid. `None` when
     /// the request was not a paid Cloudflare-compat crawl.
     pub crawl_charged: Option<String>,
+    /// The `ai_crawl_control` policy that owns this request's crawl
+    /// decision, stashed by the enforcer wrapper when durable settlement
+    /// is active for the pinned pipeline generation (WOR-2143).
+    ///
+    /// The settlement gate at the `check_policies` call site reads
+    /// pricing, tier matching, and the challenge header name through it.
+    /// It stays `None` whenever `proxy.payments` is absent or the policy
+    /// runs in Cloudflare interop mode, so the legacy path keeps its
+    /// exact shape.
+    #[cfg(feature = "payments")]
+    pub crawl_settlement_policy:
+        Option<std::sync::Arc<sbproxy_modules::policy::AiCrawlControlPolicy>>,
 
     // --- Distributed tracing ---
     /// W3C Trace Context for this request (parsed from `traceparent` or generated fresh).
@@ -1586,6 +1598,8 @@ impl RequestContext {
             transform_error_attribution: None,
             crawl_challenge: None,
             crawl_charged: None,
+            #[cfg(feature = "payments")]
+            crawl_settlement_policy: None,
             trace_ctx: None,
             trace_parent_is_remote: false,
             cache_key: None,

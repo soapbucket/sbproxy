@@ -32,8 +32,12 @@ cargo build -p sbproxy --release --features payments,payment-x402
 export SBPROXY_PAYMENT_BINDING_KEY="$(openssl rand -hex 32)"
 ```
 
-The key is named in the config, never inlined. `secret://env/NAME` is one
-of three reference forms; see [docs/secrets.md](../../docs/secrets.md).
+The key is named in the config, never inlined. This example uses
+`env:SBPROXY_PAYMENT_BINDING_KEY`, which reads that exported variable at
+startup with no further configuration; `file:/path` works the same way.
+Provider URIs such as `secret://<backend>/<name>` need a backend declared
+under `proxy.secrets.backends` first, or the proxy refuses to boot. See
+[docs/secrets.md](../../docs/secrets.md).
 
 ## Check the config before running anything
 

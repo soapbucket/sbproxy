@@ -204,6 +204,11 @@ pub mod sb_flags;
 /// memory, Redis, or mesh at runtime; no Cargo feature gates the choice.
 pub mod semantic_cache_runtime;
 pub mod server;
+/// WOR-2143: the settlement origin gate for `ai_crawl_control`. Decides
+/// whether an unpaid crawl request reaches the origin, at the
+/// `check_policies` call site, from durable settlement state.
+#[cfg(feature = "payments")]
+pub(crate) mod settlement_gate;
 /// Synthetic-transaction probe driver. Background task that
 /// fires an in-process request through the compiled handler chain
 /// and feeds the verdict into the `/readyz` synthetic probe cache.

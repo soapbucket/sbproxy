@@ -60,11 +60,13 @@ fn startup_timeout() -> Duration {
 
 const DEFAULT_BINARY_ENV: &str = "SBPROXY_E2E_BIN";
 const NO_DEFAULT_FEATURES_BINARY_ENV: &str = "SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN";
+const PAYMENTS_BINARY_ENV: &str = "SBPROXY_E2E_PAYMENTS_BIN";
 
 #[derive(Debug, Clone, Copy)]
 enum ProxyBinaryFlavor {
     Default,
     NoDefaultFeatures,
+    Payments,
 }
 
 impl ProxyBinaryFlavor {
@@ -72,6 +74,7 @@ impl ProxyBinaryFlavor {
         match self {
             Self::Default => DEFAULT_BINARY_ENV,
             Self::NoDefaultFeatures => NO_DEFAULT_FEATURES_BINARY_ENV,
+            Self::Payments => PAYMENTS_BINARY_ENV,
         }
     }
 
@@ -86,6 +89,10 @@ impl ProxyBinaryFlavor {
                 root.join("target/no-default-features/release/sbproxy"),
                 root.join("target/no-default-features/debug/sbproxy"),
             ],
+            Self::Payments => vec![
+                root.join("target/payments/release/sbproxy"),
+                root.join("target/payments/debug/sbproxy"),
+            ],
         }
     }
 
@@ -97,6 +104,9 @@ impl ProxyBinaryFlavor {
             Self::NoDefaultFeatures => {
                 "run `CARGO_TARGET_DIR=target/no-default-features cargo build -p sbproxy --no-default-features` or set SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN"
             }
+            Self::Payments => {
+                "run `CARGO_TARGET_DIR=target/payments cargo build --release -p sbproxy --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln` or set SBPROXY_E2E_PAYMENTS_BIN"
+            }
         }
     }
 
@@ -104,6 +114,7 @@ impl ProxyBinaryFlavor {
         match self {
             Self::Default => "sbproxy",
             Self::NoDefaultFeatures => "no-default-features sbproxy",
+            Self::Payments => "payments-featured sbproxy",
         }
     }
 }
@@ -165,6 +176,16 @@ pub fn proxy_binary_path() -> PathBuf {
 /// default-feature binary used by the normal suite.
 pub fn proxy_no_default_features_binary_path() -> PathBuf {
     proxy_binary_path_for(ProxyBinaryFlavor::NoDefaultFeatures)
+}
+
+/// Locate a `sbproxy` binary compiled with the payment rail features.
+///
+/// The `SBPROXY_E2E_PAYMENTS_BIN` environment variable wins when set.
+/// Otherwise this looks under `target/payments/`, which keeps the
+/// settlement e2e coverage from overwriting the default-feature binary
+/// used by the normal suite.
+pub fn proxy_payments_binary_path() -> PathBuf {
+    proxy_binary_path_for(ProxyBinaryFlavor::Payments)
 }
 
 /// One-off response shape returned by the harness's HTTP helpers.
@@ -241,12 +262,16 @@ impl ProxyHarness {
     pub fn start_with_yaml_and_env(yaml: &str, env: &[(&str, &str)]) -> anyhow::Result<Self> {
         let port = pick_free_port()?;
         let final_yaml = inject_port(yaml, port)?;
+        let owned: Vec<(&str, String)> = env
+            .iter()
+            .map(|(name, value)| (*name, (*value).to_string()))
+            .collect();
         Self::start_with_resolved_yaml_using_binary(
             &final_yaml,
             port,
             ProxyBinaryFlavor::Default,
             None,
-            env,
+            &owned,
         )
     }
 
@@ -275,6 +300,29 @@ impl ProxyHarness {
             ProxyBinaryFlavor::NoDefaultFeatures,
             None,
             &[],
+        )
+    }
+
+    /// Start a payments-featured proxy with extra child environment
+    /// variables.
+    ///
+    /// Settlement configs name secrets by reference
+    /// (`secret://env/NAME`), and the child resolves them against its
+    /// own environment, so the test hands the values over here instead
+    /// of mutating the test process environment. Build the binary into
+    /// `target/payments/` or set `SBPROXY_E2E_PAYMENTS_BIN`.
+    pub fn start_payments_with_yaml_and_env(
+        yaml: &str,
+        envs: &[(&str, String)],
+    ) -> anyhow::Result<Self> {
+        let port = pick_free_port()?;
+        let final_yaml = inject_port(yaml, port)?;
+        Self::start_with_resolved_yaml_using_binary(
+            &final_yaml,
+            port,
+            ProxyBinaryFlavor::Payments,
+            None,
+            envs,
         )
     }
 
@@ -307,7 +355,7 @@ impl ProxyHarness {
         port: u16,
         binary: ProxyBinaryFlavor,
         shutdown_grace_ms: Option<u64>,
-        env: &[(&str, &str)],
+        envs: &[(&str, String)],
     ) -> anyhow::Result<Self> {
         let bin = proxy_binary_path_for(binary);
         if !bin.is_file() {
@@ -328,15 +376,15 @@ impl ProxyHarness {
 
         let stderr = NamedTempFile::new()?;
         let mut command = Command::new(&bin);
+        // Child-scoped variables: the child process gets them, the
+        // test runner's own environment stays untouched (WOR-646).
+        for (name, value) in envs {
+            command.env(name, value);
+        }
         if let Some(shutdown_grace_ms) = shutdown_grace_ms {
             command
                 .arg("--shutdown-grace-ms")
                 .arg(shutdown_grace_ms.to_string());
-        }
-        // Child-scoped variables: the child process gets them, the
-        // test runner's own environment stays untouched (WOR-646).
-        for (name, value) in env {
-            command.env(name, value);
         }
         let child = command
             .arg("--config")

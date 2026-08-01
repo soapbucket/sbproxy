@@ -3,6 +3,18 @@
 //! Evaluates a CEL expression against the HTTP request context. If the
 //! expression evaluates to `false`, the request is denied with the
 //! configured status code and message.
+//!
+//! ## Failure posture (WOR-2162)
+//!
+//! The CEL source is compiled exactly once, in [`ExpressionPolicy::from_config`],
+//! at config-compile time. Malformed CEL rejects the candidate config
+//! with an error naming the policy and the bad expression; it never
+//! reaches the request path, so there is no compile-error admission
+//! path at evaluation time. Runtime evaluation errors (a missing map
+//! key, a non-boolean result) fail closed: the expression could not
+//! prove the request is allowed, so the request is denied.
+
+use std::sync::Arc;
 
 use serde::Deserialize;
 
@@ -13,6 +25,10 @@ use crate::policy::aipref::AiprefSignal;
 /// Evaluates a CEL expression against the HTTP request context. If the
 /// expression evaluates to `false`, the request is denied with the
 /// configured status code and message.
+///
+/// Construct via [`Self::from_config`] or [`Self::new`]; both compile
+/// the CEL source once and reject malformed expressions, so a value of
+/// this type always carries a valid precompiled program.
 #[derive(Debug, Clone)]
 pub struct ExpressionPolicy {
     /// CEL expression evaluated against the request context.
@@ -21,6 +37,9 @@ pub struct ExpressionPolicy {
     pub deny_status: u16,
     /// Body returned with the deny status code.
     pub deny_message: String,
+    /// The expression compiled once at config-compile time. Shared via
+    /// `Arc` so cloning the policy does not recompile.
+    compiled: Arc<sbproxy_extension::cel::CelExpression>,
 }
 
 fn default_deny_status() -> u16 {
@@ -33,6 +52,10 @@ fn default_deny_msg() -> String {
 
 impl ExpressionPolicy {
     /// Build an ExpressionPolicy from a generic JSON config value.
+    ///
+    /// Compiles the CEL source here, once, so a malformed expression
+    /// rejects the candidate config at compile time instead of being
+    /// carried onto the request path.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
         #[derive(Deserialize)]
         struct Config {
@@ -45,10 +68,22 @@ impl ExpressionPolicy {
         }
 
         let cfg: Config = serde_json::from_value(value)?;
+        Self::new(cfg.expression, cfg.deny_status, cfg.deny_message)
+    }
+
+    /// Build an ExpressionPolicy from its parts, compiling the CEL
+    /// source once. Returns an error naming the policy type and the
+    /// bad expression when the source does not compile.
+    pub fn new(expression: String, deny_status: u16, deny_message: String) -> anyhow::Result<Self> {
+        let engine = sbproxy_extension::cel::CelEngine::new();
+        let compiled = engine.compile(&expression).map_err(|e| {
+            anyhow::anyhow!("policy `expression`: invalid CEL expression {expression:?}: {e}")
+        })?;
         Ok(Self {
-            expression: cfg.expression,
-            deny_status: cfg.deny_status,
-            deny_message: cfg.deny_message,
+            expression,
+            deny_status,
+            deny_message,
+            compiled: Arc::new(compiled),
         })
     }
 
@@ -56,8 +91,9 @@ impl ExpressionPolicy {
     ///
     /// Returns `true` if the request should be allowed, `false` if denied.
     /// Fails closed on evaluation errors (e.g., missing header key) since
-    /// the expression could not prove the request is allowed. Fails open
-    /// only on compilation errors (misconfiguration).
+    /// the expression could not prove the request is allowed. Compile
+    /// errors cannot occur here: the expression was compiled at
+    /// config-compile time by [`Self::from_config`].
     pub fn evaluate(
         &self,
         method: &str,
@@ -193,10 +229,10 @@ impl ExpressionPolicy {
             sbproxy_extension::cel::context::populate_principal_namespace(&mut ctx, principal);
         }
 
-        match engine.compile(&self.expression) {
-            Ok(expr) => engine.eval_bool(&expr, &ctx).unwrap_or(false),
-            Err(_) => true, // Fail open on compile error only
-        }
+        // The expression was compiled once at config-compile time.
+        // Runtime evaluation errors fail closed: the expression could
+        // not prove the request is allowed, so it is denied.
+        engine.eval_bool(&self.compiled, &ctx).unwrap_or(false)
     }
 }
 
@@ -320,15 +356,38 @@ mod tests {
     }
 
     #[test]
-    fn expression_evaluate_fail_open_on_bad_expression() {
-        let policy = ExpressionPolicy::from_config(serde_json::json!({
+    fn expression_from_config_rejects_bad_expression() {
+        // WOR-2162: malformed CEL must reject the config at compile
+        // time. The old behavior stored the source unchecked and then
+        // admitted every request when the per-request compile failed.
+        let err = ExpressionPolicy::from_config(serde_json::json!({
             "expression": "this is not valid CEL !!!"
+        }))
+        .expect_err("malformed CEL must not compile");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expression"),
+            "error must name the policy type: {msg}"
+        );
+        assert!(
+            msg.contains("this is not valid CEL !!!"),
+            "error must quote the bad expression: {msg}"
+        );
+    }
+
+    #[test]
+    fn expression_evaluate_fails_closed_on_runtime_error() {
+        // A non-boolean result is a runtime evaluation error. The
+        // policy keeps its explicit closed posture: the expression
+        // could not prove the request is allowed, so it is denied.
+        let policy = ExpressionPolicy::from_config(serde_json::json!({
+            "expression": "1 + 1"
         }))
         .unwrap();
 
         let headers = http::HeaderMap::new();
-        // Should fail open (return true) on compile error
-        assert!(policy.evaluate("GET", "/", &headers, None, None, "example.com"));
+        assert!(!policy.evaluate("GET", "/", &headers, None, None, "example.com"));
     }
 
     #[test]
@@ -347,11 +406,12 @@ mod tests {
 
     #[test]
     fn expression_policy_evaluate_with_aipref_train_false() {
-        let p = ExpressionPolicy {
-            expression: "request.aipref.train == false".to_string(),
-            deny_status: 403,
-            deny_message: "x".to_string(),
-        };
+        let p = ExpressionPolicy::new(
+            "request.aipref.train == false".to_string(),
+            403,
+            "x".to_string(),
+        )
+        .unwrap();
         let signal = AiprefSignal {
             train: false,
             search: true,
@@ -374,11 +434,12 @@ mod tests {
 
     #[test]
     fn expression_policy_evaluate_with_aipref_default_permissive() {
-        let p = ExpressionPolicy {
-            expression: "request.aipref.train == true".to_string(),
-            deny_status: 403,
-            deny_message: "x".to_string(),
-        };
+        let p = ExpressionPolicy::new(
+            "request.aipref.train == true".to_string(),
+            403,
+            "x".to_string(),
+        )
+        .unwrap();
         let result = p.evaluate_with_aipref(
             "GET",
             "/",
@@ -396,15 +457,16 @@ mod tests {
 
     #[test]
     fn expression_policy_evaluate_with_tls_and_agent_class_views() {
-        let p = ExpressionPolicy {
-            expression: r#"request.agent_class == "openai-gptbot"
+        let p = ExpressionPolicy::new(
+            r#"request.agent_class == "openai-gptbot"
                 && request.agent_id_source == "user_agent"
                 && request.tls.trustworthy
                 && request.tls.ja4 == "t13d1715h2_5b57614c22b0_3d5424432f57""#
                 .to_string(),
-            deny_status: 403,
-            deny_message: "x".to_string(),
-        };
+            403,
+            "x".to_string(),
+        )
+        .unwrap();
         let tls = sbproxy_extension::cel::context::TlsFingerprintView {
             ja3: None,
             ja4: Some("t13d1715h2_5b57614c22b0_3d5424432f57"),
@@ -439,14 +501,15 @@ mod tests {
 
     #[test]
     fn expression_policy_can_allow_untrustworthy_tls_branch() {
-        let p = ExpressionPolicy {
-            expression: r#"!(request.agent_class == "openai-gptbot"
+        let p = ExpressionPolicy::new(
+            r#"!(request.agent_class == "openai-gptbot"
                 && request.tls.trustworthy
                 && size(request.tls.ja4) > 0)"#
                 .to_string(),
-            deny_status: 403,
-            deny_message: "x".to_string(),
-        };
+            403,
+            "x".to_string(),
+        )
+        .unwrap();
         let tls = sbproxy_extension::cel::context::TlsFingerprintView {
             ja3: None,
             ja4: Some("t13d1516h2_8daaf6152771_b1ff8ab2d16f"),
@@ -481,11 +544,12 @@ mod tests {
 
     #[test]
     fn expression_policy_can_branch_on_trust_tier() {
-        let p = ExpressionPolicy {
-            expression: r#"request.trust_tier == "strong""#.to_string(),
-            deny_status: 403,
-            deny_message: "x".to_string(),
-        };
+        let p = ExpressionPolicy::new(
+            r#"request.trust_tier == "strong""#.to_string(),
+            403,
+            "x".to_string(),
+        )
+        .unwrap();
 
         assert!(p.evaluate_with_views(
             "GET",

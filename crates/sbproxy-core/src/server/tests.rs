@@ -3033,6 +3033,78 @@ fn reload_from_config_path_propagates_compile_errors() {
     let _ = format!("{err}");
 }
 
+// --- WOR-2162: a reload carrying invalid CEL is rejected whole ---
+
+#[test]
+fn reload_with_invalid_cel_expression_keeps_the_active_pipeline() {
+    use std::io::Write as _;
+    // Serialise against sibling tests that assert on the process-global
+    // redaction slot the reload path writes through (see the idempotence
+    // test above).
+    let _guard = super::lifecycle::OP_REDACT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let valid_yaml = r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "cel-reload.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#;
+    tmp.write_all(valid_yaml.as_bytes()).unwrap();
+    tmp.flush().unwrap();
+    reload_from_config_path(tmp.path().to_str().unwrap()).expect("valid config reloads");
+    let active_revision = reload::current_pipeline().config_revision.clone();
+
+    // The candidate changes the origin set AND carries a malformed CEL
+    // expression. If the reject phase failed to catch it, the revision
+    // (derived from the origin set) would change.
+    let invalid_yaml = r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "cel-reload-broken.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: expression
+        expression: 'this is not valid CEL !!!'
+"#;
+    std::fs::write(tmp.path(), invalid_yaml).unwrap();
+    let err = reload_from_config_path(tmp.path().to_str().unwrap())
+        .expect_err("invalid CEL must fail the reload");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("cel-reload-broken.test"),
+        "diagnostic must name the origin: {msg}"
+    );
+    assert!(
+        msg.contains("this is not valid CEL !!!"),
+        "diagnostic must quote the bad expression: {msg}"
+    );
+
+    // The previous pipeline stays active: nothing was applied.
+    assert_eq!(
+        reload::current_pipeline().config_revision,
+        active_revision,
+        "a failed reload must leave the previously active pipeline in place",
+    );
+
+    // And a subsequent valid reload still goes through.
+    std::fs::write(tmp.path(), valid_yaml).unwrap();
+    reload_from_config_path(tmp.path().to_str().unwrap())
+        .expect("the node recovers once the config is fixed");
+}
+
 // --- WOR-43: CSP report redaction ---
 
 #[test]

@@ -876,6 +876,7 @@ pub enum TlsFingerprintMode {
 /// CDN-specific header names (`x-forwarded-ja4` is Cloudflare and
 /// Fastly's spelling).
 #[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TlsFingerprintConfig {
     /// Master switch. `false` (the default) disables the capture path
     /// entirely.
@@ -935,46 +936,54 @@ impl TlsFingerprintConfig {
     }
 
     /// Build a [`TlsFingerprintConfig`] from the parsed
-    /// `proxy.extensions.tls_fingerprint` YAML block. Returns
-    /// `Default::default()` (disabled) when the block is absent or
-    /// malformed; a parse failure logs a warning rather than failing
-    /// the whole compile.
+    /// `proxy.extensions.tls_fingerprint` YAML block.
+    ///
+    /// Returns `Ok(Default::default())` (disabled) when the block is
+    /// absent. A block that fails to parse while declaring
+    /// `enabled: true` is a hard compile error (WOR-1161): the operator
+    /// asked for the capture path, so silently disabling it is a
+    /// fail-open. The error carries serde's diagnostic, which names the
+    /// malformed field. A malformed block that does not declare
+    /// `enabled: true` keeps the warn-and-disable path, since the
+    /// disabled outcome matches the operator's stated intent.
     pub fn from_extensions(
         extensions: &std::collections::HashMap<String, serde_yaml::Value>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let Some(block) = extensions.get("tls_fingerprint") else {
-            return Self::default();
+            return Ok(Self::default());
         };
         match serde_yaml::from_value::<TlsFingerprintConfig>(block.clone()) {
             Ok(mut cfg) => {
                 cfg.compile_cidrs();
-                cfg
+                Ok(cfg)
             }
             Err(e) => {
-                // WOR-1161: a malformed block silently falls back to
-                // disabled, which is a fail-open if the operator meant to
-                // turn the feature on. When the raw block has
-                // `enabled: true`, surface the parse error at ERROR (not
-                // warn) so the misconfig cannot hide. (A hard compile
-                // failure needs `from_extensions` to return Result; tracked
-                // as a follow-up.)
-                let was_enabled = block
-                    .get("enabled")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if was_enabled {
-                    tracing::error!(
-                        error = %e,
-                        "proxy.extensions.tls_fingerprint has `enabled: true` but failed to parse; \
-                         TLS-fingerprint capture is DISABLED until the block is fixed",
-                    );
-                } else {
-                    tracing::warn!(
-                        error = %e,
-                        "proxy.extensions.tls_fingerprint failed to parse; capture disabled",
+                // WOR-1161: a malformed block used to fall back to
+                // disabled silently, a fail-open when the operator
+                // meant to turn the feature on. Detect the stated
+                // intent from the raw block: a bare `tls_fingerprint:
+                // true` or an `enabled:` key that reads as true means
+                // the operator wanted capture on, so refuse the config.
+                let wants_capture = block.as_bool() == Some(true)
+                    || match block.get("enabled") {
+                        Some(v) => {
+                            v.as_bool() == Some(true)
+                                || v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true"))
+                        }
+                        None => false,
+                    };
+                if wants_capture {
+                    anyhow::bail!(
+                        "proxy.extensions.tls_fingerprint has `enabled: true` but failed to \
+                         parse: {e}. Refusing to start with TLS-fingerprint capture silently \
+                         disabled; fix or remove the block."
                     );
                 }
-                Self::default()
+                tracing::warn!(
+                    error = %e,
+                    "proxy.extensions.tls_fingerprint failed to parse; capture disabled",
+                );
+                Ok(Self::default())
             }
         }
     }
@@ -1046,8 +1055,10 @@ pub struct AgentDetectConfig {
 impl AgentDetectConfig {
     /// Build from the parsed `proxy.extensions.agent_detect` block.
     /// Returns the disabled default when the block is absent or fails to
-    /// parse; a parse error warns rather than failing the whole compile,
-    /// matching [`TlsFingerprintConfig::from_extensions`].
+    /// parse; a parse error warns rather than failing the whole compile.
+    /// (Unlike [`TlsFingerprintConfig::from_extensions`], which since
+    /// WOR-1161 hard-fails a malformed block that declares
+    /// `enabled: true`.)
     pub fn from_extensions(
         extensions: &std::collections::HashMap<String, serde_yaml::Value>,
     ) -> Self {
@@ -1808,7 +1819,7 @@ impl CompiledPipeline {
         // proxy.extensions[tls_fingerprint] (which the day-6 Item 2
         // migration also fills from legacy features.tls_fingerprint).
         let tls_fingerprint_config =
-            TlsFingerprintConfig::from_extensions(&config.server.extensions);
+            TlsFingerprintConfig::from_extensions(&config.server.extensions)?;
         let agent_detect_config = AgentDetectConfig::from_extensions(&config.server.extensions);
 
         // --- Page Shield raw-report opt-in ---
@@ -2176,7 +2187,15 @@ fn compile_origin_policy_chain(
 ) -> anyhow::Result<Vec<Policy>> {
     let mut chain: Vec<Policy> = policy_configs
         .iter()
-        .map(compile_policy)
+        .map(|cfg| {
+            // WOR-2162: name the origin on a policy compile failure so
+            // an operator can find the offending block (the policy
+            // module's own error names the policy type and, for CEL,
+            // quotes the bad expression).
+            use anyhow::Context as _;
+            compile_policy(cfg)
+                .with_context(|| format!("origin `{origin_id}`: invalid policy config"))
+        })
         .collect::<anyhow::Result<_>>()?;
     if l2_store.is_some() {
         for p in chain.iter_mut() {
@@ -3652,7 +3671,8 @@ proxy:
 origins: {}
 "#;
         let cfg = sbproxy_config::compile_config(yaml).expect("compile");
-        let tls = TlsFingerprintConfig::from_extensions(&cfg.server.extensions);
+        let tls =
+            TlsFingerprintConfig::from_extensions(&cfg.server.extensions).expect("well-formed");
         assert!(tls.enabled);
         assert_eq!(tls.mode, TlsFingerprintMode::Sidecar);
         assert_eq!(tls.sidecar_header_allowlist.len(), 2);
@@ -3730,7 +3750,8 @@ features:
 origins: {}
 "#;
         let cfg = sbproxy_config::compile_config(yaml).expect("compile");
-        let tls = TlsFingerprintConfig::from_extensions(&cfg.server.extensions);
+        let tls =
+            TlsFingerprintConfig::from_extensions(&cfg.server.extensions).expect("well-formed");
         assert!(tls.enabled);
         assert!(tls.header_allowed("x-forwarded-ja4"));
     }
@@ -3776,7 +3797,9 @@ origins: {}
 
     #[test]
     fn tls_fingerprint_config_invalid_block_falls_through_to_default() {
-        // A malformed extensions block must not abort compile_config.
+        // A malformed block that does not declare `enabled: true`
+        // keeps the warn-and-disable path (WOR-1161 only hard-fails
+        // when the operator asked for capture).
         let yaml = r#"
 proxy:
   http_bind_port: 8080
@@ -3786,9 +3809,134 @@ proxy:
 origins: {}
 "#;
         let cfg = sbproxy_config::compile_config(yaml).expect("compile");
-        let tls = TlsFingerprintConfig::from_extensions(&cfg.server.extensions);
+        let tls = TlsFingerprintConfig::from_extensions(&cfg.server.extensions)
+            .expect("no enabled:true, so the block degrades to disabled");
         // Default => disabled (safe).
         assert!(!tls.enabled);
+    }
+
+    #[test]
+    fn tls_fingerprint_malformed_block_with_enabled_true_fails_compile() {
+        // WOR-1161: `enabled: true` plus a parse failure must reject
+        // the config instead of silently disabling capture. The typo'd
+        // field also exercises `deny_unknown_fields`.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  extensions:
+    tls_fingerprint:
+      enabled: true
+      sidecar_headers_allowlist:
+        - x-forwarded-ja4
+origins: {}
+"#;
+        let cfg = sbproxy_config::compile_config(yaml).expect("compile_config only parses YAML");
+        let err = TlsFingerprintConfig::from_extensions(&cfg.server.extensions)
+            .expect_err("enabled:true with a malformed block must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sidecar_headers_allowlist"),
+            "error must name the malformed field: {msg}"
+        );
+        assert!(
+            msg.contains("tls_fingerprint"),
+            "error must name the block: {msg}"
+        );
+
+        // And the failure propagates: the pipeline (boot and reload both
+        // construct through here) refuses the config outright.
+        let cfg = sbproxy_config::compile_config(yaml).expect("compile_config only parses YAML");
+        assert!(
+            CompiledPipeline::from_config(cfg).is_err(),
+            "pipeline construction must reject the malformed enabled:true block"
+        );
+    }
+
+    #[test]
+    fn tls_fingerprint_unknown_field_with_enabled_true_fails_compile() {
+        // A well-formed block with an extra unknown key is a parse
+        // error under deny_unknown_fields; with enabled:true it must
+        // reject the config.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  extensions:
+    tls_fingerprint:
+      enabled: true
+      mode: sidecar
+      not_a_real_field: 1
+origins: {}
+"#;
+        let cfg = sbproxy_config::compile_config(yaml).expect("compile_config only parses YAML");
+        let err = TlsFingerprintConfig::from_extensions(&cfg.server.extensions)
+            .expect_err("unknown field with enabled:true must fail");
+        assert!(
+            err.to_string().contains("not_a_real_field"),
+            "error must name the unknown field: {err}"
+        );
+    }
+
+    // --- WOR-2162: expression policies reject invalid CEL at compile ---
+
+    #[test]
+    fn expression_policy_with_invalid_cel_rejects_the_config() {
+        // The old behavior accepted this config and then ADMITTED every
+        // request when the per-request CEL compile failed. Pipeline
+        // construction (the shared path under boot and reload) must
+        // refuse it with a diagnostic naming the origin, the policy,
+        // and the bad expression.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "cel.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: expression
+        expression: 'this is not valid CEL !!!'
+"#;
+        let cfg = sbproxy_config::compile_config(yaml).expect("yaml parses");
+        // CompiledPipeline has no Debug, so Option::expect replaces expect_err.
+        let err = CompiledPipeline::from_config(cfg)
+            .err()
+            .expect("invalid CEL must reject the candidate config");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cel.local"),
+            "diagnostic must name the origin: {msg}"
+        );
+        assert!(
+            msg.contains("expression"),
+            "diagnostic must name the policy type: {msg}"
+        );
+        assert!(
+            msg.contains("this is not valid CEL !!!"),
+            "diagnostic must quote the bad expression: {msg}"
+        );
+    }
+
+    #[test]
+    fn expression_policy_with_valid_cel_still_compiles() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "cel.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: expression
+        expression: 'request.method == "GET"'
+"#;
+        let cfg = sbproxy_config::compile_config(yaml).expect("yaml parses");
+        CompiledPipeline::from_config(cfg).expect("valid CEL must keep compiling");
     }
 
     // --- response cache store selection ---
