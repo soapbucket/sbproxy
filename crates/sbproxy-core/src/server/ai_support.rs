@@ -860,8 +860,14 @@ pub(crate) enum BudgetGate {
 }
 
 /// Build the list of scope keys to check / record against for a given
-/// AI request. We compute one key per limit so a workspace cap can
-/// coexist with a per-api-key cap on the same origin.
+/// AI request that no caller agent is attributable to.
+///
+/// This is the entry point for spend the proxy incurs on its own behalf
+/// (the context-compression summarizer, for example): there is no A2A
+/// caller to bill, so an `agent`-scoped limit debits the unattributed
+/// bucket. Request paths that can see `ctx.a2a` should call
+/// [`budget_scope_keys_for_agent`] instead so a per-agent cap is
+/// actually enforced rather than pooled.
 pub(crate) fn budget_scope_keys(
     cfg: &sbproxy_ai::BudgetConfig,
     workspace_id: &str,
@@ -871,6 +877,37 @@ pub(crate) fn budget_scope_keys(
     origin: Option<&str>,
     tag: Option<&str>,
 ) -> Vec<(usize, String)> {
+    budget_scope_keys_for_agent(
+        cfg,
+        workspace_id,
+        api_key,
+        user,
+        model,
+        origin,
+        tag,
+        sbproxy_ai::budget::AgentIdentity::default(),
+    )
+}
+
+/// Build the list of scope keys to check / record against for a given
+/// AI request. We compute one key per limit so a workspace cap can
+/// coexist with a per-api-key cap on the same origin.
+///
+/// `agent` is the calling agent's identity (WOR-2140). Only a verified
+/// id earns its own bucket; see [`sbproxy_ai::budget::AgentIdentity`].
+// One argument per scope dimension plus the agent identity; the count is
+// inherent to the scope inputs, hence the deliberate allow.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn budget_scope_keys_for_agent(
+    cfg: &sbproxy_ai::BudgetConfig,
+    workspace_id: &str,
+    api_key: Option<&str>,
+    user: Option<&str>,
+    model: Option<&str>,
+    origin: Option<&str>,
+    tag: Option<&str>,
+    agent: sbproxy_ai::budget::AgentIdentity<'_>,
+) -> Vec<(usize, String)> {
     budget_scope_keys_at(
         cfg,
         workspace_id,
@@ -879,6 +916,7 @@ pub(crate) fn budget_scope_keys(
         model,
         origin,
         tag,
+        agent,
         budget_now_unix_secs(),
     )
 }
@@ -900,17 +938,20 @@ pub(crate) async fn scoped_budget_preflight(
     model: Option<&str>,
     origin: Option<&str>,
     tag: Option<&str>,
+    agent: sbproxy_ai::budget::AgentIdentity<'_>,
 ) -> (Vec<(usize, String)>, BudgetGate) {
-    let keys = budget_scope_keys(cfg, workspace_id, api_key, user, model, origin, tag);
+    let keys =
+        budget_scope_keys_for_agent(cfg, workspace_id, api_key, user, model, origin, tag, agent);
     let shared_spend = super::budget_share::read_shared_for_keys(&keys).await;
     let gate = budget_preflight(cfg, &keys, providers, &shared_spend);
     (keys, gate)
 }
 
-/// [`budget_scope_keys`] with an explicit clock so the rolling-window
-/// bucketing is deterministic under test. `now_unix_secs` is the UTC Unix
-/// time used to pick each limit's window bucket.
-// Mirrors the 7-arg public entry point plus an injected clock; the argument
+/// [`budget_scope_keys_for_agent`] with an explicit clock so the
+/// rolling-window bucketing is deterministic under test.
+/// `now_unix_secs` is the UTC Unix time used to pick each limit's window
+/// bucket.
+// Mirrors the public entry point plus an injected clock; the argument
 // count is inherent to the scope inputs, hence the deliberate allow.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn budget_scope_keys_at(
@@ -921,6 +962,7 @@ pub(super) fn budget_scope_keys_at(
     model: Option<&str>,
     origin: Option<&str>,
     tag: Option<&str>,
+    agent: sbproxy_ai::budget::AgentIdentity<'_>,
     now_unix_secs: u64,
 ) -> Vec<(usize, String)> {
     let mut out = Vec::with_capacity(cfg.limits.len());
@@ -933,6 +975,7 @@ pub(super) fn budget_scope_keys_at(
             model,
             origin,
             tag,
+            agent,
         ) {
             // WOR-1527: bucket the key by this limit's rolling window so a
             // `daily`/`monthly` cap resets per period. Both the check and
@@ -1119,7 +1162,9 @@ pub(super) fn replace_realtime_model_query(
 #[cfg(test)]
 mod budget_preflight_tests {
     use super::{budget_preflight, scoped_budget_preflight, BudgetGate};
-    use sbproxy_ai::budget::{BudgetConfig, BudgetLimit, BudgetScope, OnExceedAction};
+    use sbproxy_ai::budget::{
+        AgentIdentity, BudgetConfig, BudgetLimit, BudgetScope, OnExceedAction,
+    };
     use sbproxy_ai::UsageRecord;
     use std::collections::HashMap;
 
@@ -1220,6 +1265,7 @@ mod budget_preflight_tests {
             None,
             Some("budget-preflight-scoped"),
             None,
+            AgentIdentity::default(),
         )
         .await;
 
@@ -1228,6 +1274,90 @@ mod budget_preflight_tests {
             vec![(0, "workspace:budget-preflight-scoped".to_string())]
         );
         assert!(matches!(gate, BudgetGate::Block { status: 402, .. }));
+    }
+
+    #[tokio::test]
+    async fn agent_scoped_preflight_keys_only_a_verified_agent() {
+        // WOR-2140: the wiring half. An agent-scoped limit produces an
+        // agent key from the request's A2A identity, and an unverified
+        // claim resolves to the shared unattributed bucket rather than
+        // to the named agent's key.
+        let cfg = BudgetConfig {
+            limits: vec![BudgetLimit {
+                scope: BudgetScope::Agent,
+                max_tokens: Some(1_000),
+                max_cost_usd: None,
+                period: Some("total".to_string()),
+                downgrade_to: None,
+            }],
+            on_exceed: OnExceedAction::Block,
+            soft_landing: None,
+        };
+        let host = "agent-preflight";
+
+        let (verified, _) = scoped_budget_preflight(
+            &cfg,
+            &[],
+            host,
+            None,
+            None,
+            None,
+            Some(host),
+            None,
+            AgentIdentity {
+                id: Some("planner"),
+                verified: true,
+            },
+        )
+        .await;
+        assert_eq!(
+            verified,
+            vec![(0, "agent:agent-preflight:planner".to_string())]
+        );
+
+        let (claimed, _) = scoped_budget_preflight(
+            &cfg,
+            &[],
+            host,
+            None,
+            None,
+            None,
+            Some(host),
+            None,
+            AgentIdentity {
+                id: Some("planner"),
+                verified: false,
+            },
+        )
+        .await;
+        assert_eq!(
+            claimed,
+            vec![(0, "agent:agent-preflight:__unattributed__".to_string())],
+            "an unverified claim must not address the verified agent's key"
+        );
+
+        // Traffic with no A2A envelope lands in that same bucket, so the
+        // limit still applies rather than dropping out.
+        let (anonymous, _) = scoped_budget_preflight(
+            &cfg,
+            &[],
+            host,
+            None,
+            None,
+            None,
+            Some(host),
+            None,
+            AgentIdentity::default(),
+        )
+        .await;
+        assert_eq!(anonymous, claimed);
+    }
+
+    #[test]
+    fn agent_scope_has_a_stable_metric_label() {
+        // WOR-2140: the 402 body and the utilization gauge both name the
+        // scope through this label, so it is part of the wire contract.
+        assert_eq!(super::scope_label(&BudgetScope::Agent), "agent");
     }
 }
 
@@ -1283,6 +1413,7 @@ pub(super) fn scope_label(scope: &sbproxy_ai::budget::BudgetScope) -> &'static s
         sbproxy_ai::budget::BudgetScope::Model => "model",
         sbproxy_ai::budget::BudgetScope::Origin => "origin",
         sbproxy_ai::budget::BudgetScope::Tag => "tag",
+        sbproxy_ai::budget::BudgetScope::Agent => "agent",
     }
 }
 
@@ -1718,6 +1849,15 @@ pub(super) fn cached_message_signature_verifier(
     }
 }
 
+/// Emit a billing event for a request that no caller agent is
+/// attributable to.
+///
+/// A thin wrapper over [`emit_ai_billing_event`], which is the
+/// real choke point. Kept for the surfaces that bill outside
+/// `handle_ai_proxy` and therefore have no A2A identity in hand, notably
+/// the realtime WebSocket session-close hook in `proxy_http::logging`.
+/// Anything that can reach `ctx.a2a` should call the agent-aware form so
+/// the spend lands on a named agent rather than the unattributed bucket.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_ai_billing_event(
     origin: &str,
@@ -1731,6 +1871,7 @@ pub(super) fn emit_ai_billing_event(
     tenant_id: &str,
     api_key_id: &str,
     rollup_properties: &std::collections::BTreeMap<String, String>,
+    agent: sbproxy_ai::budget::AgentIdentity<'_>,
     ai_span: &tracing::Span,
 ) -> u64 {
     let cost_usd_micros = cost_usd_to_micros(cost_usd);
@@ -1819,6 +1960,12 @@ pub(super) fn emit_ai_billing_event(
                 team: tags.team.clone().unwrap_or_default(),
                 api_key_id: api_key_id.to_string(),
                 project: tags.project.clone().unwrap_or_default(),
+                // WOR-2140: read off the same `tags.agent_id` the
+                // `agent_id` metric label uses, rather than re-deriving
+                // it from `agent` here. Two derivations is how a
+                // dashboard and a durable rollup end up disagreeing
+                // about which agent spent the money.
+                agent_id: tags.agent_id.clone().unwrap_or_default(),
                 properties: rollup_properties.clone(),
             },
             kind: sbproxy_observe::usage_rollup::RollupKind::Usage {
@@ -1848,7 +1995,11 @@ pub(super) fn emit_ai_billing_event(
     let event =
         sbproxy_ai::budget::AiBillingEvent::from_label(surface_label, provider_name, model, usage)
             .with_cost(cost_usd)
-            .with_scope_keys(scope_keys);
+            .with_scope_keys(scope_keys)
+            // WOR-2140: the agent is the unit of cost. Stamped here so
+            // every sink reading the event off the bus sees the same
+            // identity the budget keys were derived from.
+            .with_agent(agent);
     sbproxy_ai::budget::record_billing_event(&BUDGET_TRACKER, &event);
     // WOR-1809: debug, not info. This fires per billing scope, so one
     // completion can emit a burst of identical lines; the ledger sinks
@@ -1858,6 +2009,11 @@ pub(super) fn emit_ai_billing_event(
         ai.provider = event.provider.as_str(),
         ai.cost_usd = event.cost_usd,
         ai.occurred_at_unix_secs = event.occurred_at_unix_secs,
+        // WOR-2140: `agent_id` is what the caller claimed;
+        // `identity_verified` says whether it was worth believing. Both
+        // are needed to read the line, so neither ships alone.
+        a2a.agent_id = event.agent_id.as_str(),
+        a2a.identity_verified = event.agent_identity_verified,
         "AI billing event"
     );
     cost_usd_micros
@@ -1926,6 +2082,33 @@ fn usage_event_from_context(
             .managed_model_permit
             .as_ref()
             .and_then(|permit| permit.engine_version()),
+        // WOR-2140: agent-as-unit attribution on the durable, verifiable
+        // record. Unlike the metric label, the ledger keeps the *claimed*
+        // id even when it was not verified, because the money was really
+        // spent and dropping the id would lose that. The trust flag rides
+        // beside it so a per-agent total can filter on it. Capped here at
+        // the same limit every other surface uses, so the ledger, the
+        // span, and the metric cannot name three different agents.
+        agent_id: ctx.a2a.as_ref().and_then(|a2a| {
+            let id = sbproxy_ai::tracing_spans::cap_agent_id(a2a.caller_agent_id.as_str());
+            (!id.is_empty()).then(|| id.to_string())
+        }),
+        // Unlike the agent id, this one *is* reachable by the end of the
+        // request: the A2A `contextId` is stamped at the body phase, and
+        // usage events are emitted from the logging hook, which is after
+        // it. So the ledger carries run identity even on surfaces where
+        // the request span was opened too early to see it (WOR-2144).
+        a2a_context_id: ctx.a2a_context_id.clone(),
+        a2a_identity_verified: ctx.a2a.as_ref().map(|a2a| a2a.identity_verified),
+        // The workflow leg. It already reaches the access log through
+        // the attribution tags, but a per-workflow cost figure that has
+        // to hold up in an argument cannot be assembled by joining a
+        // sampled surface to a rotated one.
+        workflow_id: ctx
+            .attribution_tags
+            .trace_id
+            .clone()
+            .filter(|id| !id.is_empty()),
     }
 }
 
@@ -3906,7 +4089,17 @@ mod budget_window_tests {
             soft_landing: None,
         };
         let now = 100_000u64;
-        let keys = budget_scope_keys_at(&cfg, "host", None, None, None, None, None, now);
+        let keys = budget_scope_keys_at(
+            &cfg,
+            "host",
+            None,
+            None,
+            None,
+            None,
+            None,
+            sbproxy_ai::budget::AgentIdentity::default(),
+            now,
+        );
         assert_eq!(keys.len(), 3);
         assert_ne!(keys[0].1, keys[1].1);
         assert_ne!(keys[0].1, keys[2].1);
@@ -3914,7 +4107,17 @@ mod budget_window_tests {
         // The cumulative limit keeps the bare scope key.
         assert_eq!(keys[2].1, "workspace:host");
         // The daily key rolls to a new bucket in the next window...
-        let later = budget_scope_keys_at(&cfg, "host", None, None, None, None, None, now + 86_400);
+        let later = budget_scope_keys_at(
+            &cfg,
+            "host",
+            None,
+            None,
+            None,
+            None,
+            None,
+            sbproxy_ai::budget::AgentIdentity::default(),
+            now + 86_400,
+        );
         assert_ne!(keys[0].1, later[0].1);
         // ...while the cumulative key never rolls.
         assert_eq!(keys[2].1, later[2].1);

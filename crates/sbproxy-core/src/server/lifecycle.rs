@@ -822,6 +822,7 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
     // until both clustering and approximate governance are configured.
     crate::cluster::start_governance_dissemination();
     crate::cluster::start_rate_limit_dissemination();
+    crate::cluster::start_meter_dissemination();
 
     reload::load_pipeline(new_pipeline);
 
@@ -1541,6 +1542,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     );
     crate::cluster::start_governance_dissemination();
     crate::cluster::start_rate_limit_dissemination();
+    crate::cluster::start_meter_dissemination();
 
     // Store in hot-reload slot.
     reload::load_pipeline(pipeline);

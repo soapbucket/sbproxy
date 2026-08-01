@@ -214,9 +214,6 @@ pub fn plan_binary_acquire_with_cuda(
                     .to_string(),
             ),
         },
-        EngineKind::Embedded => BinaryAcquirePlan::Blocked(
-            "the embedded engine runs in-process; there is no binary to acquire".to_string(),
-        ),
         // mistral.rs is the second single-binary release engine
         // (WOR-1861). The concrete asset (and its built-in digest)
         // depends on the probed GPU compute capability, which the driver
@@ -347,15 +344,11 @@ mod tests {
     }
 
     #[test]
-    fn vllm_and_embedded_have_no_binary_release() {
+    fn vllm_has_no_binary_release() {
         // Default vLLM (no acquire block) is not fetched: it stays Blocked
         // so a plain config never triggers a heavy env build.
         assert!(matches!(
             plan_binary_acquire(EngineKind::Vllm, None, None),
-            BinaryAcquirePlan::Blocked(_)
-        ));
-        assert!(matches!(
-            plan_binary_acquire(EngineKind::Embedded, None, None),
             BinaryAcquirePlan::Blocked(_)
         ));
         // ...unless vLLM happens to be on PATH.

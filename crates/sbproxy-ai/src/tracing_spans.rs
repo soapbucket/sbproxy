@@ -61,18 +61,28 @@
 //! A multi-agent run fans one caller request out across several hops. The
 //! three OpenInference attributes above are what let a trace backend put
 //! those hops back together as one tree, and [`record_run_identity`] is the
-//! single place that writes them. Three sbproxy-namespace fields ride
+//! single place that writes them. Four sbproxy-namespace fields ride
 //! alongside because OpenInference names no attribute for them:
 //!
 //! - `sbproxy.run.id_source`, which of the two grouping keys filled
 //!   `session.id` (`a2a_context_id` or `capture_session`);
 //! - `sbproxy.a2a.task_id`, the caller-assigned A2A task id;
+//! - `sbproxy.a2a.caller_agent_id`, which agent made this hop (WOR-2140);
 //! - `sbproxy.a2a.identity_verified`, whether the hop's identity fields
 //!   came from a source the proxy trusts.
 //!
-//! None of these may ever become a metric label. They are caller-supplied
-//! and unbounded, which is exactly what a span attribute tolerates and a
-//! Prometheus label does not.
+//! The run, task, and context ids may never become metric labels. They are
+//! caller-supplied and take one distinct value per run, which is exactly
+//! what a span attribute tolerates and a Prometheus label does not.
+//!
+//! The agent id is the deliberate exception, and only in one direction. It
+//! names a member of the operator's agent roster rather than an occurrence
+//! of a run, so it is bounded by how many agents exist rather than by how
+//! much traffic they send, and `agent_id` is a live metric label with a
+//! cardinality budget already. What makes that safe is the trust flag: only
+//! an agent id the proxy verified is allowed to reach a label, because an
+//! unverified caller names itself and could shard the label into as many
+//! distinct values as it likes. See [`crate::ai_metrics`] for that half.
 //!
 //! ## Backwards compatibility
 //!
@@ -229,8 +239,9 @@ pub fn record_tool_outcome(span: &Span, outcome: &str, cost_usd: Option<f64>) {
 ///   `RequestContext.tenant_id` at dispatch entry (WOR-1098).
 /// - Empty placeholders for the run-identity set (`session.id`,
 ///   `sbproxy.run.id_source`, `graph.node.id`, `graph.node.parent_id`,
-///   `sbproxy.a2a.task_id`, `sbproxy.a2a.identity_verified`), filled by
-///   [`record_run_identity`] at dispatch entry (WOR-2139).
+///   `sbproxy.a2a.task_id`, `sbproxy.a2a.caller_agent_id`,
+///   `sbproxy.a2a.identity_verified`), filled by [`record_run_identity`]
+///   at dispatch entry (WOR-2139, WOR-2140).
 pub fn ai_request_span(surface: &str, operation: &str, method: &str) -> Span {
     tracing::info_span!(
         "ai.request",
@@ -259,6 +270,11 @@ pub fn ai_request_span(surface: &str, operation: &str, method: &str) -> Span {
         "graph.node.id" = Empty,
         "graph.node.parent_id" = Empty,
         "sbproxy.a2a.task_id" = Empty,
+        // WOR-2140: which agent spent this. Named after
+        // `A2AContext::caller_agent_id`, the same way the task slot above
+        // is named after `A2AContext::task_id`, so the span attribute and
+        // the field it came from are one grep apart.
+        "sbproxy.a2a.caller_agent_id" = Empty,
         "sbproxy.a2a.identity_verified" = Empty,
         // Governed-key route attribution. These four fixed slots are filled
         // after request policy resolution. Free-form tags and metadata are
@@ -579,6 +595,18 @@ pub fn record_request_params(
 /// ULID, and `<agent>-<uuid>` composites) with room left over.
 pub const MAX_RUN_ID_BYTES: usize = 128;
 
+/// Maximum length, in bytes, of a caller-supplied agent identifier
+/// recorded on a span attribute, a ledger entry, or a metric label.
+///
+/// Deliberately the same budget as [`MAX_RUN_ID_BYTES`], because it is the
+/// same kind of value arriving from the same kind of place: an
+/// `x-a2a-caller-agent-id` header, an agent id lifted out of a JSON-RPC
+/// body, or an RFC 8693 `act` subject out of a verified token. None of
+/// those is bounded by anything but the sender. The two constants stay
+/// separate rather than one aliasing the other so that changing one budget
+/// later is a decision about that budget, not a silent change to both.
+pub const MAX_AGENT_ID_BYTES: usize = MAX_RUN_ID_BYTES;
+
 /// `sbproxy.run.id_source` value when `session.id` came from the A2A
 /// `contextId`.
 const RUN_ID_SOURCE_A2A_CONTEXT: &str = "a2a_context_id";
@@ -586,6 +614,22 @@ const RUN_ID_SOURCE_A2A_CONTEXT: &str = "a2a_context_id";
 /// `sbproxy.run.id_source` value when `session.id` fell back to the
 /// capture session.
 const RUN_ID_SOURCE_CAPTURE_SESSION: &str = "capture_session";
+
+/// Truncate `value` to at most `max` bytes without splitting a UTF-8
+/// character. The one implementation behind every id cap, so two surfaces
+/// cannot cut the same string at two different places.
+fn cap_id(value: &str, max: usize) -> &str {
+    if value.len() <= max {
+        return value;
+    }
+    let cut = value
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .take_while(|idx| *idx <= max)
+        .last()
+        .unwrap_or(0);
+    &value[..cut]
+}
 
 /// Truncate a caller-supplied identifier to [`MAX_RUN_ID_BYTES`] without
 /// splitting a UTF-8 character.
@@ -596,16 +640,22 @@ const RUN_ID_SOURCE_CAPTURE_SESSION: &str = "capture_session";
 /// downstream surface reports the same bounded string rather than each
 /// reader picking its own limit.
 pub fn cap_run_id(value: &str) -> &str {
-    if value.len() <= MAX_RUN_ID_BYTES {
-        return value;
-    }
-    let cut = value
-        .char_indices()
-        .map(|(idx, _)| idx)
-        .take_while(|idx| *idx <= MAX_RUN_ID_BYTES)
-        .last()
-        .unwrap_or(0);
-    &value[..cut]
+    cap_id(value, MAX_RUN_ID_BYTES)
+}
+
+/// Truncate a caller-supplied agent identifier to [`MAX_AGENT_ID_BYTES`]
+/// without splitting a UTF-8 character (WOR-2140).
+///
+/// The sibling of [`cap_run_id`], and it exists for the same reason: an
+/// agent id is an arbitrary string off the wire, and an agent id is the
+/// key the whole per-agent cost view aggregates on. Cap it once, where the
+/// request context first records it, and hand the capped value to the
+/// span, the ledger, and the metric label. Capping independently at each
+/// reader is how the three end up disagreeing about which agent spent the
+/// money, and a disagreement between a metric and a tamper-evident ledger
+/// is worse than either being wrong on its own.
+pub fn cap_agent_id(value: &str) -> &str {
+    cap_id(value, MAX_AGENT_ID_BYTES)
 }
 
 /// One hop's identity inside a multi-agent run.
@@ -642,6 +692,12 @@ pub struct RunIdentity<'a> {
     pub parent_node_id: Option<&'a str>,
     /// Caller-assigned A2A task id, recorded as `sbproxy.a2a.task_id`.
     pub task_id: Option<&'a str>,
+    /// The agent that made this hop, recorded as
+    /// `sbproxy.a2a.caller_agent_id` (WOR-2140). Taken from
+    /// `A2AContext::caller_agent_id`, which is the caller's own name for
+    /// itself unless a trusted peer or a verified token supplied it, so
+    /// read `identity_verified` before attributing spend to it.
+    pub agent_id: Option<&'a str>,
     /// Whether the hop's identity fields came from a source the proxy
     /// trusts. `None` for traffic that carried no A2A envelope at all.
     pub identity_verified: Option<bool>,
@@ -653,7 +709,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
     value.filter(|v| !v.is_empty())
 }
 
-/// Record a caller-supplied identifier, truncated to the id cap, and
+/// Record a caller-supplied identifier, truncated to the run-id cap, and
 /// leave the field untouched when the value is absent or empty.
 fn record_capped_if_present(span: &Span, field: &'static str, value: Option<&str>) {
     if let Some(value) = non_empty(value) {
@@ -696,15 +752,17 @@ fn record_capped_if_present(span: &Span, field: &'static str, value: Option<&str
 /// # Trust
 ///
 /// `sbproxy.a2a.identity_verified` rides alongside the ids on purpose.
-/// An untrusted caller picks its own `contextId`, so it can merge its
-/// spend into somebody else's run or shard one run across unbounded
-/// distinct ids. A run total read without this flag is a number the
-/// caller chose. The `sbproxy_a2a_hops_total` metric already partitions
-/// hops the same way through its `allow:verified` and `allow:unverified`
-/// decision labels.
+/// An untrusted caller picks its own `contextId` and its own agent id, so
+/// it can merge its spend into somebody else's run or somebody else's
+/// agent total, or shard either across unbounded distinct ids. A run total
+/// or a per-agent total read without this flag is a number the caller
+/// chose. The `sbproxy_a2a_hops_total` metric already partitions hops the
+/// same way through its `allow:verified` and `allow:unverified` decision
+/// labels.
 ///
-/// Every caller-supplied id is truncated to [`MAX_RUN_ID_BYTES`] before
-/// it reaches an attribute.
+/// Every caller-supplied id is truncated before it reaches an attribute:
+/// the run, node, and task ids to [`MAX_RUN_ID_BYTES`], the agent id to
+/// [`MAX_AGENT_ID_BYTES`].
 pub fn record_run_identity(span: &Span, identity: RunIdentity<'_>) {
     let session = non_empty(identity.a2a_context_id)
         .map(|id| (id, RUN_ID_SOURCE_A2A_CONTEXT))
@@ -718,6 +776,9 @@ pub fn record_run_identity(span: &Span, identity: RunIdentity<'_>) {
     record_capped_if_present(span, "graph.node.id", identity.node_id);
     record_capped_if_present(span, "graph.node.parent_id", identity.parent_node_id);
     record_capped_if_present(span, "sbproxy.a2a.task_id", identity.task_id);
+    if let Some(agent_id) = non_empty(identity.agent_id) {
+        span.record("sbproxy.a2a.caller_agent_id", cap_agent_id(agent_id));
+    }
     if let Some(verified) = identity.identity_verified {
         span.record("sbproxy.a2a.identity_verified", verified);
     }
@@ -1416,12 +1477,22 @@ mod tests {
         let unverified = run_identity_fields(RunIdentity {
             a2a_context_id: Some("run-7"),
             task_id: Some("task-3"),
+            agent_id: Some("billing-orchestrator"),
             identity_verified: Some(false),
             ..RunIdentity::default()
         });
         assert_eq!(
             unverified.get("session.id").map(String::as_str),
             Some("run-7")
+        );
+        // The agent id is still recorded, next to the flag that says it
+        // is the caller's word for itself. Dropping it would lose the
+        // spend; recording it alone would launder it.
+        assert_eq!(
+            unverified
+                .get("sbproxy.a2a.caller_agent_id")
+                .map(String::as_str),
+            Some("billing-orchestrator")
         );
         assert_eq!(
             unverified
@@ -1464,6 +1535,7 @@ mod tests {
             node_id: Some(long.as_str()),
             parent_node_id: Some(long.as_str()),
             task_id: Some(long.as_str()),
+            agent_id: Some(long.as_str()),
             ..RunIdentity::default()
         });
         for field in [
@@ -1477,6 +1549,41 @@ mod tests {
                 .unwrap_or_else(|| panic!("{field} should be recorded"));
             assert_eq!(value.len(), MAX_RUN_ID_BYTES, "{field} was not capped");
         }
+        let agent = fields
+            .get("sbproxy.a2a.caller_agent_id")
+            .expect("the agent id should be recorded");
+        assert_eq!(
+            agent.len(),
+            MAX_AGENT_ID_BYTES,
+            "the agent id was not capped"
+        );
+    }
+
+    /// WOR-2140: the agent id is capped once, by one helper, so the span,
+    /// the ledger, and the metric label cannot end up naming three
+    /// different agents for one request. The span assertion above proves
+    /// the span reads that helper; this proves the helper itself agrees
+    /// with the run-id cap it was modelled on, which is the property the
+    /// other two surfaces depend on when they call it directly.
+    #[test]
+    fn the_agent_id_cap_matches_the_run_id_cap() {
+        assert_eq!(
+            MAX_AGENT_ID_BYTES, MAX_RUN_ID_BYTES,
+            "the two budgets are deliberately equal; changing one is a decision, not a drift"
+        );
+        let long = "agent-".to_string() + &"z".repeat(MAX_AGENT_ID_BYTES * 3);
+        assert_eq!(cap_agent_id(&long), cap_run_id(&long));
+        assert_eq!(cap_agent_id(&long).len(), MAX_AGENT_ID_BYTES);
+        // Inside the budget the value is returned untouched, so an
+        // ordinary agent id is never rewritten on its way to a label.
+        assert_eq!(cap_agent_id("billing-orchestrator"), "billing-orchestrator");
+        // And the walk-back is the same one, so a multi-byte agent id
+        // truncates to valid UTF-8 rather than to a broken prefix.
+        let mut wide = String::from("a");
+        wide.push_str(&"\u{1F680}".repeat(MAX_AGENT_ID_BYTES));
+        let capped = cap_agent_id(&wide);
+        assert!(capped.len() < MAX_AGENT_ID_BYTES);
+        assert!(capped.ends_with('\u{1F680}'));
     }
 
     /// The cap never splits a UTF-8 character, so a multi-byte id

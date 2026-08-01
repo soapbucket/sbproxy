@@ -467,13 +467,6 @@
           ]
         },
         {
-          "description": "Force the in-process embedded engine (WOR-1658). `Auto` never resolves to this; the embedded engine is an explicit opt-in because it changes the deployment model (no subprocess) and is only present when the `embedded` feature is compiled.",
-          "type": "string",
-          "enum": [
-            "embedded"
-          ]
-        },
-        {
           "description": "Force mistral.rs (WOR-1861). `Auto` never resolves to this: mistral.rs is an explicit opt-in that stays behind vLLM (safetensors) and llama.cpp (GGUF) until it has certification mileage, and the planner must not prefer it for large MoE prefill workloads.",
           "type": "string",
           "enum": [

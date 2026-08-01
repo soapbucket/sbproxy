@@ -1964,12 +1964,26 @@ impl CompiledPipeline {
         // it, and a weight that cited whatever config happened to be live
         // when the receipt was written would name a document that did not
         // price the call.
+        // WOR-2145: the receipt chain is opened here too, under the same
+        // runtime-only gate and for the same reason. `node_id` is the mesh
+        // identity when a mesh is configured, because that is the key a
+        // cluster-wide gather files chain segments under; with no mesh
+        // there is one chain and the per-process instance id names it.
+        // Matching `admin_meter`'s derivation is load bearing: a chain
+        // written under one id and reported under another is a chain
+        // nobody can attribute.
         let attestation = match mode {
-            PipelineConstructionMode::Runtime => crate::attestation::prepare_attestation(
-                config.server.attestation.as_ref(),
-                config.server.web_bot_auth.as_ref(),
-                &config_revision,
-            )?,
+            PipelineConstructionMode::Runtime => {
+                let node_id = crate::cluster::current_cluster_handle()
+                    .map(|handle| handle.identity().node_id.clone())
+                    .unwrap_or_else(|| crate::identity::instance_id().to_string());
+                crate::attestation::prepare_attestation(
+                    config.server.attestation.as_ref(),
+                    config.server.web_bot_auth.as_ref(),
+                    &config_revision,
+                    &node_id,
+                )?
+            }
             PipelineConstructionMode::Validation => None,
         };
 

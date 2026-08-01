@@ -174,6 +174,10 @@ mod tests {
             tag: None,
             priority: None,
             engine_version: None,
+            agent_id: None,
+            a2a_context_id: None,
+            a2a_identity_verified: None,
+            workflow_id: None,
         }
     }
 

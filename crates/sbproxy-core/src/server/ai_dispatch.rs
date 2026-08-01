@@ -815,6 +815,80 @@ fn merged_request_budget<'a>(
     Some(std::borrow::Cow::Owned(merged))
 }
 
+/// The calling agent's identity for one dispatch (WOR-2140).
+///
+/// `id` is the *claimed* agent id from `A2AContext::caller_agent_id`,
+/// capped once here by [`sbproxy_ai::tracing_spans::cap_agent_id`] so the
+/// span, the billing event, the usage ledger, and the metric label cannot
+/// name three different agents for the same request. `verified` mirrors
+/// `A2AContext::identity_verified`: true only when a trusted peer or a
+/// verified RFC 8693 `act` chain supplied the name.
+///
+/// `ctx.a2a` is available here. The request filter populates it
+/// unconditionally from header detection before any policy or action
+/// runs, so it is in place even though `handle_ai_proxy` terminates the
+/// request inside `request_filter`. `ctx.a2a_context_id` is *not*: that
+/// one is read from the JSON-RPC body at the body phase, which this path
+/// never reaches (WOR-2144). Run correlation on this surface therefore
+/// rides the capture session, not the A2A context id.
+///
+/// Held owned because the dispatcher keeps `ctx` borrowed as `&mut` for
+/// the rest of the request; [`Self::identity`] hands out the borrowed
+/// view the budget and billing APIs take.
+struct BillingAgent {
+    /// Claimed agent id, capped. Empty when the request carried no A2A
+    /// envelope, or carried one with no caller agent id.
+    id: String,
+    /// Whether the claim came from a source the proxy trusts.
+    verified: bool,
+}
+
+impl BillingAgent {
+    /// Read the A2A envelope the request filter stamped on the context.
+    fn from_context(ctx: &RequestContext) -> Self {
+        match ctx.a2a.as_ref() {
+            Some(a2a) => Self {
+                id: sbproxy_ai::tracing_spans::cap_agent_id(a2a.caller_agent_id.as_str())
+                    .to_string(),
+                verified: a2a.identity_verified,
+            },
+            None => Self {
+                id: String::new(),
+                verified: false,
+            },
+        }
+    }
+
+    /// The claimed id, or `None` when the request named no agent.
+    ///
+    /// Recorded on the span and the billing event regardless of trust,
+    /// so a spend report can show an unverified claim as unverified
+    /// rather than losing it.
+    fn claimed_id(&self) -> Option<&str> {
+        (!self.id.is_empty()).then_some(self.id.as_str())
+    }
+
+    /// Borrowed view for budget scoping and the billing choke point.
+    fn identity(&self) -> sbproxy_ai::budget::AgentIdentity<'_> {
+        sbproxy_ai::budget::AgentIdentity {
+            id: self.claimed_id(),
+            verified: self.verified,
+        }
+    }
+
+    /// The id that may be attributed to a *named* agent: verified and
+    /// non-empty.
+    ///
+    /// This is what fills `AttributionTags::agent_id`, which becomes the
+    /// bounded `agent_id` metric label and the durable rollup dimension.
+    /// An unverified caller must never reach it, or it could bill its
+    /// spend to somebody else's agent, or mint a fresh agent per request
+    /// until the label's cardinality budget demotes the real ones.
+    fn attributable_id(&self) -> Option<&str> {
+        self.identity().billable_id()
+    }
+}
+
 fn immutable_budget_key_id(ctx: &RequestContext) -> Option<String> {
     ctx.effective_key_policy
         .as_ref()
@@ -866,6 +940,10 @@ async fn ai_surface_budget_gate(
     let user =
         req_header_value(session, "x-user-id").or_else(|| req_header_value(session, "x-end-user"));
     let tag = req_header_value(session, "x-sbproxy-tag");
+    // WOR-2140: an agent-scoped cap has to bind here too, or a surface
+    // that admits through this gate spends against a per-agent budget it
+    // never consulted.
+    let agent = BillingAgent::from_context(ctx);
     let (_, gate) = scoped_budget_preflight(
         effective_budget.as_ref(),
         &config.providers,
@@ -875,6 +953,7 @@ async fn ai_surface_budget_gate(
         model,
         Some(hostname),
         tag.as_deref(),
+        agent.identity(),
     )
     .await;
     gate
@@ -2649,17 +2728,36 @@ pub(super) async fn handle_ai_proxy(
     // capture session and `sbproxy.run.id_source` says so. The A2A run
     // id reaches the terminal access-log line rather than this span.
     // See the run-identity section of `docs/observability.md`.
+    //
+    // WOR-2140: the agent is the unit of cost, so its identity is read
+    // once here and carried by value for the rest of dispatch. Every
+    // budget key and every billing event downstream derives from this
+    // one read, which is what keeps the enforced budget, the metric, and
+    // the ledger naming the same agent.
+    let billing_agent = BillingAgent::from_context(ctx);
     sbproxy_ai::tracing_spans::record_run_identity(
         &ai_span,
         sbproxy_ai::tracing_spans::RunIdentity {
             a2a_context_id: ctx.a2a_context_id.as_deref(),
             capture_session_id: capture_session_id.as_deref(),
             node_id: Some(ctx.request_id.as_str()),
+            // WOR-2140: refuse a self-parenting edge. `ctx.request_id` is
+            // adopted from the inbound correlation header when one is
+            // present, so a caller that propagates the id the proxy
+            // echoed to it (which is what the docs used to recommend for
+            // closing the edge) arrives with a parent equal to this hop's
+            // own node id. Emitting that would make a cost rollup walk a
+            // cycle, and a tree that says a hop is its own caller is
+            // worse than one that admits the edge is missing. WOR-2157
+            // fixes the root cause by minting a node id the caller
+            // cannot supply.
             parent_node_id: ctx
                 .a2a
                 .as_ref()
-                .and_then(|a2a| a2a.parent_request_id.as_deref()),
+                .and_then(|a2a| a2a.parent_request_id.as_deref())
+                .filter(|parent| *parent != ctx.request_id.as_str()),
             task_id: ctx.a2a.as_ref().map(|a2a| a2a.task_id.as_str()),
+            agent_id: billing_agent.claimed_id(),
             identity_verified: ctx.a2a.as_ref().map(|a2a| a2a.identity_verified),
         },
     );
@@ -2688,6 +2786,16 @@ pub(super) async fn handle_ai_proxy(
         };
     let resolved_request_vk = prepared_identity.resolved_request_key;
     let peer_policy_revision = prepared_identity.policy_revision;
+    // WOR-2140: stamp the agent onto the attribution tags, which is what
+    // feeds the bounded `agent_id` metric label and the durable rollup
+    // dimension. It has to happen after identity resolution, because
+    // that is where a matched credential replaces `ctx.attribution_tags`
+    // wholesale; setting it earlier would be silently discarded. Only a
+    // verified id lands here: an unverified caller must not be able to
+    // bill itself to another agent's series, nor to mint a fresh agent
+    // per request. Its spend is still recorded, against the unattributed
+    // bucket and beside the flag that says the claim was not trusted.
+    ctx.attribution_tags.agent_id = billing_agent.attributable_id().map(str::to_string);
     ai_span.record("sbproxy.policy_version", peer_policy_revision.as_str());
     // WOR-2094: mirror the span's policy revision onto the request
     // context so the admin ring row names the key-policy generation
@@ -3131,6 +3239,7 @@ pub(super) async fn handle_ai_proxy(
             ctx.tenant_id.as_str(),
             ctx.principal.api_key_id(),
             &ctx.rollup_properties,
+            billing_agent.identity(),
             &ai_span,
         );
         return relay_ai_response(
@@ -3409,6 +3518,7 @@ pub(super) async fn handle_ai_proxy(
             ctx.tenant_id.as_str(),
             ctx.principal.api_key_id(),
             &ctx.rollup_properties,
+            billing_agent.identity(),
             &ai_span,
         );
         return relay_ai_response_with_idempotency(
@@ -3955,6 +4065,7 @@ pub(super) async fn handle_ai_proxy(
                 ctx.tenant_id.as_str(),
                 ctx.principal.api_key_id(),
                 &ctx.rollup_properties,
+                billing_agent.identity(),
                 &ai_span,
             );
             if cost_micros > 0 {
@@ -3995,6 +4106,7 @@ pub(super) async fn handle_ai_proxy(
             ctx.tenant_id.as_str(),
             ctx.principal.api_key_id(),
             &ctx.rollup_properties,
+            billing_agent.identity(),
             &ai_span,
         );
         if let Some(block) = multipart_external_output_guardrail_block(
@@ -4281,6 +4393,7 @@ pub(super) async fn handle_ai_proxy(
             model_for_scope,
             Some(hostname),
             tag_header.as_deref(),
+            billing_agent.identity(),
         )
         .await;
         match gate {
@@ -4323,7 +4436,7 @@ pub(super) async fn handle_ai_proxy(
                                     // without clobbering an explicit tag.
                                     ctx.ai_policy_sink_tag
                                         .get_or_insert_with(|| "budget_soft_landing".to_string());
-                                    budget_scope_keys(
+                                    budget_scope_keys_for_agent(
                                         budget_cfg,
                                         hostname,
                                         budget_api_key_id.as_deref(),
@@ -4331,6 +4444,7 @@ pub(super) async fn handle_ai_proxy(
                                         Some(model.as_str()),
                                         Some(hostname),
                                         tag_header.as_deref(),
+                                        billing_agent.identity(),
                                     )
                                 }
                                 _ => keys,
@@ -4357,7 +4471,7 @@ pub(super) async fn handle_ai_proxy(
                 // Recompute scope keys against the rewritten model so
                 // post-dispatch usage records on the chosen model
                 // rather than the original.
-                budget_scope_keys(
+                budget_scope_keys_for_agent(
                     budget_cfg,
                     hostname,
                     budget_api_key_id.as_deref(),
@@ -4365,6 +4479,7 @@ pub(super) async fn handle_ai_proxy(
                     Some(model.as_str()),
                     Some(hostname),
                     tag_header.as_deref(),
+                    billing_agent.identity(),
                 )
             }
         }
@@ -6122,6 +6237,7 @@ pub(super) async fn handle_ai_proxy(
                         ctx.tenant_id.as_str(),
                         ctx.principal.api_key_id(),
                         &ctx.rollup_properties,
+                        billing_agent.identity(),
                         &ai_span,
                     );
                     if (200..300).contains(&o.status) {
@@ -7091,6 +7207,8 @@ pub(super) async fn handle_ai_proxy(
                     api_key_id: ctx.principal.api_key_id().to_string(),
                     rollup_properties: ctx.rollup_properties.clone(),
                     estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
+                    agent_id: billing_agent.id.clone(),
+                    agent_identity_verified: billing_agent.verified,
                 });
                 let router_sink = RouterTokenSink {
                     router: &router,
@@ -7167,6 +7285,8 @@ pub(super) async fn handle_ai_proxy(
                 api_key_id: ctx.principal.api_key_id().to_string(),
                 rollup_properties: ctx.rollup_properties.clone(),
                 estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
+                agent_id: billing_agent.id.clone(),
+                agent_identity_verified: billing_agent.verified,
             });
             let stream_router_sink = RouterTokenSink {
                 router: &router,
@@ -7255,6 +7375,8 @@ pub(super) async fn handle_ai_proxy(
                 api_key_id: ctx.principal.api_key_id().to_string(),
                 rollup_properties: ctx.rollup_properties.clone(),
                 estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
+                agent_id: billing_agent.id.clone(),
+                agent_identity_verified: billing_agent.verified,
             });
             let cache_router_sink = RouterTokenSink {
                 router: &router,
@@ -8299,6 +8421,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 args.tenant_id.as_str(),
                 args.api_key_id.as_str(),
                 &args.rollup_properties,
+                args.agent_identity(),
                 &ai_span,
             );
             if cost_micros > 0 {
@@ -8350,6 +8473,11 @@ pub(super) async fn relay_ai_response_with_cache(
                     .unwrap_or_else(|| router_sink.provider_name.to_string());
                 let surface = ctx.ai_surface.clone().unwrap_or_default();
                 let model_for_event = (!model.is_empty()).then_some(model);
+                // WOR-2140: this branch bills without a budget recorder,
+                // so it re-reads the agent off the context rather than
+                // carrying it in `BudgetRecorderArgs`. Same envelope,
+                // same cap, so the two paths name the same agent.
+                let agent = BillingAgent::from_context(ctx);
                 let cost_micros = emit_ai_billing_event(
                     ctx.hostname.as_str(),
                     surface.as_str(),
@@ -8362,6 +8490,7 @@ pub(super) async fn relay_ai_response_with_cache(
                     ctx.tenant_id.as_str(),
                     ctx.principal.api_key_id(),
                     &ctx.rollup_properties,
+                    agent.identity(),
                     &ai_span,
                 );
                 if cost_micros > 0 {
@@ -8791,6 +8920,27 @@ pub(super) struct BudgetRecorderArgs<'a> {
     /// response carries no parseable `usage` block. `None` for
     /// non-chat surfaces.
     estimated_prompt_tokens: Option<u64>,
+    /// WOR-2140: the claimed agent id, already capped, carried by value
+    /// alongside `tenant_id` and `api_key_id` for the same reason: the
+    /// relay holds the request context only as an `Option<&mut>` and
+    /// cannot re-read it while it owns this bundle. Empty when the
+    /// request carried no A2A envelope.
+    agent_id: String,
+    /// WOR-2140: whether `agent_id` came from a source the proxy
+    /// trusts. Kept beside the id rather than folded into it, because
+    /// the billing event records the claim either way and only
+    /// enforcement cares about the flag.
+    agent_identity_verified: bool,
+}
+
+impl BudgetRecorderArgs<'_> {
+    /// Borrowed view of the agent identity for the billing choke point.
+    fn agent_identity(&self) -> sbproxy_ai::budget::AgentIdentity<'_> {
+        sbproxy_ai::budget::AgentIdentity {
+            id: (!self.agent_id.is_empty()).then_some(self.agent_id.as_str()),
+            verified: self.agent_identity_verified,
+        }
+    }
 }
 
 /// WOR-798: the bundle a relay needs to feed
@@ -10385,6 +10535,7 @@ pub(super) async fn relay_ai_stream(
                     args.tenant_id.as_str(),
                     args.api_key_id.as_str(),
                     &args.rollup_properties,
+                    args.agent_identity(),
                     &ai_span,
                 );
                 // WOR-1835: governed-key settlement. `ai_admission` never
@@ -14787,6 +14938,83 @@ mod dynamic_key_resolution_tests {
         assert!(
             !limiter.check_rate(&vk.key, vk),
             "the third request in the window exceeds the 2 rpm limit"
+        );
+    }
+}
+
+/// WOR-2140: the agent identity the dispatcher reads off the request
+/// context, and the trust rule that decides which surfaces may name it.
+#[cfg(test)]
+mod billing_agent_tests {
+    use super::BillingAgent;
+    use crate::context::RequestContext;
+    use sbproxy_modules::{A2AContext, A2ASpec};
+
+    fn ctx_with_agent(caller_agent_id: &str, identity_verified: bool) -> RequestContext {
+        let mut ctx = RequestContext::new();
+        let mut a2a = A2AContext::empty(A2ASpec::V1_0);
+        a2a.caller_agent_id = caller_agent_id.to_string();
+        a2a.identity_verified = identity_verified;
+        ctx.a2a = Some(a2a);
+        ctx
+    }
+
+    #[test]
+    fn agent_identity_reaches_dispatch_from_the_a2a_envelope() {
+        // `ctx.a2a` is populated from header detection in the request
+        // filter, before any policy or action runs, which is why the
+        // AI-gateway path can read it even though it terminates the
+        // request inside `request_filter`.
+        let agent = BillingAgent::from_context(&ctx_with_agent("planner", true));
+        assert_eq!(agent.claimed_id(), Some("planner"));
+        assert!(agent.verified);
+        assert_eq!(agent.identity().billable_id(), Some("planner"));
+        assert_eq!(agent.attributable_id(), Some("planner"));
+    }
+
+    #[test]
+    fn an_unverified_claim_is_recorded_but_never_attributed() {
+        // The claim reaches the span and the billing event so a report
+        // can show it as unverified; it must not reach the budget key or
+        // the metric label, where it would let a caller bill itself to
+        // another agent's series.
+        let agent = BillingAgent::from_context(&ctx_with_agent("planner", false));
+        assert_eq!(agent.claimed_id(), Some("planner"));
+        assert!(!agent.verified);
+        assert_eq!(
+            agent.identity().billable_id(),
+            None,
+            "an unverified claim must not address a named agent's budget"
+        );
+        assert_eq!(agent.attributable_id(), None);
+    }
+
+    #[test]
+    fn traffic_with_no_a2a_envelope_names_no_agent() {
+        let agent = BillingAgent::from_context(&RequestContext::new());
+        assert_eq!(agent.claimed_id(), None);
+        assert!(!agent.verified);
+        assert_eq!(agent.attributable_id(), None);
+        // An envelope that carries no caller agent id is the same thing.
+        let empty = BillingAgent::from_context(&ctx_with_agent("", true));
+        assert_eq!(empty.claimed_id(), None);
+        assert_eq!(empty.attributable_id(), None);
+    }
+
+    #[test]
+    fn the_agent_id_is_capped_once_at_capture() {
+        // Capping here rather than at each reader is what keeps the
+        // span, the ledger, and the metric label naming one agent.
+        let long = "a".repeat(sbproxy_ai::tracing_spans::MAX_AGENT_ID_BYTES * 3);
+        let agent = BillingAgent::from_context(&ctx_with_agent(&long, true));
+        assert_eq!(
+            agent.id.len(),
+            sbproxy_ai::tracing_spans::MAX_AGENT_ID_BYTES
+        );
+        assert_eq!(
+            agent.id,
+            sbproxy_ai::tracing_spans::cap_agent_id(&long),
+            "capture must use the shared cap, not a second implementation"
         );
     }
 }

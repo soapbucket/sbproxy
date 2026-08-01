@@ -701,7 +701,6 @@ fn fill_legacy_projection(model: &str, entry: &mut CatalogEntry) {
             Some(crate::config::EngineKind::Vllm) => crate::config::EngineChoice::Vllm,
             Some(crate::config::EngineKind::SGLang) => crate::config::EngineChoice::SGLang,
             Some(crate::config::EngineKind::LlamaCpp) => crate::config::EngineChoice::LlamaCpp,
-            Some(crate::config::EngineKind::Embedded) => crate::config::EngineChoice::Embedded,
             Some(crate::config::EngineKind::MistralRs) => crate::config::EngineChoice::MistralRs,
             None => crate::config::EngineChoice::Auto,
         };

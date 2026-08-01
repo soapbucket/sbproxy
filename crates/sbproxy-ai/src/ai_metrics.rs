@@ -1275,6 +1275,13 @@ static AI_TOKENS_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
             // PromQL: `sum by (tenant_id, model) (...)`.
             "tenant_id",
             "api_key_id",
+            // WOR-2140: which agent spent it. Appended last because the
+            // metric registry treats a family's label list as positional
+            // and append-only. Empty unless the gateway resolved a
+            // VERIFIED agent identity, so the distinct values are the
+            // operator's agent roster rather than whatever a caller
+            // decided to call itself. See `record_ai_request_attributed`.
+            "agent_id",
         ]
     )
     .unwrap()
@@ -1303,6 +1310,10 @@ static AI_COST_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
             // See AI_TOKENS_ATTRIBUTED (WOR-1493/WOR-1494).
             "tenant_id",
             "api_key_id",
+            // See AI_TOKENS_ATTRIBUTED (WOR-2140). Appended last, and
+            // in the same position relative to the shared labels, so
+            // `sum by (agent_id)` reads the same on tokens and cost.
+            "agent_id",
         ]
     )
     .unwrap()
@@ -1367,7 +1378,32 @@ pub fn record_ai_outcome_attributed(
 ///
 /// The OSS access log + OTel span pick up the high-cardinality
 /// dimensions (customer, trace_id, okr) elsewhere; the ledger's
-/// Allocate-layer join works off the span's trace_id.
+/// Allocate-layer join works off the span's trace_id, which is also the
+/// workflow key (see [`crate::attribution::AttributionTags::trace_id`]).
+///
+/// # Agent attribution (WOR-2140)
+///
+/// `agent_id` comes off `tags` and rides as the last label on both
+/// counters, so `sum by (agent_id) (rate(sbproxy_ai_cost_dollars_attributed_total[5m]))`
+/// answers "what is each agent costing me per minute" with no join.
+///
+/// Two things are load bearing about which agent ids get here.
+///
+/// The caller cannot pick one. `agent_id` is not settable from an
+/// `SB-Attr-*` header, and the dispatch path fills it only from an
+/// identity the proxy verified. An agent that merely asserts its own
+/// name lands in the empty bucket, which reads as "spend we could not
+/// attribute to a verified agent" rather than as somebody else's bill.
+/// That is also what keeps the label's distinct values bounded by the
+/// operator's agent roster instead of by traffic.
+///
+/// The run and workflow ids never get here at all. A `contextId`, a task
+/// id, and a `trace_id` each take one value per occurrence, so as labels
+/// they mint a time series per run and the series count grows with
+/// traffic. The run and task ids belong on the span and in the usage
+/// ledger, the workflow id on the access log, and that is where they
+/// are. `sbproxy-observe`'s metric-registry guard fails the build if one
+/// of them reaches a label list here.
 #[allow(clippy::too_many_arguments)]
 pub fn record_ai_request_attributed(
     origin: &str,
@@ -1389,6 +1425,11 @@ pub fn record_ai_request_attributed(
     let team = label_or_empty(tags.team.as_deref());
     let agent_type = label_or_empty(tags.agent_type.as_deref());
     let environment = label_or_empty(tags.environment.as_deref());
+    // WOR-2140. Empty when no verified agent identity resolved, which is
+    // the same convention every other optional dimension here uses: the
+    // spend is still counted, in a bucket that says it is not attributed
+    // to an agent rather than one that names the wrong one.
+    let agent_id = label_or_empty(tags.agent_id.as_deref());
 
     let record_token_kind = |direction: &'static str, n: u64| {
         if n == 0 {
@@ -1408,6 +1449,7 @@ pub fn record_ai_request_attributed(
                 environment,
                 tenant_id,
                 api_key_id,
+                agent_id,
             ])
             .inc_by(n as f64);
     };
@@ -1431,6 +1473,7 @@ pub fn record_ai_request_attributed(
                 environment,
                 tenant_id,
                 api_key_id,
+                agent_id,
             ])
             .inc_by(cost);
     }
@@ -2473,6 +2516,142 @@ mod tests {
         assert!(families
             .iter()
             .any(|f| f.name() == "sbproxy_ai_cost_dollars_attributed_total"));
+    }
+
+    /// WOR-2140: the agent that spent it reaches both attributed
+    /// counters as `agent_id`, and nothing run-scoped reaches either.
+    ///
+    /// The second half is the part worth a test rather than a comment.
+    /// `agent_id` is safe as a label because it names a member of the
+    /// operator's agent roster; a run, task, context, or workflow id is
+    /// not, because it takes a fresh value per occurrence and would mint
+    /// one dead time series per run forever. Those ids are on the span
+    /// and in the usage ledger instead. `sbproxy-observe` fails the build
+    /// if one appears in the registry's declared label list, but the
+    /// registry is a hand-maintained table; this asserts against the
+    /// labels the process actually emitted.
+    #[test]
+    fn attributed_spend_carries_the_agent_and_no_run_scoped_id() {
+        use crate::attribution::AttributionTags;
+        // Unique provider + model so the assertions are isolated from
+        // the shared process-wide Prometheus registry.
+        let provider = "agent-attr-test-provider";
+        let model = "agent-attr-test-model";
+        let tags = AttributionTags {
+            project: Some("growth-q3".to_string()),
+            team: Some("platform".to_string()),
+            // The workflow key. It must reach the span and the access
+            // log, and it must NOT reach a label here.
+            trace_id: Some("wf-01J6FQ7X0000000000000000".to_string()),
+            agent_id: Some("billing-orchestrator".to_string()),
+            ..Default::default()
+        };
+        record_ai_request_attributed(
+            "test.origin",
+            provider,
+            model,
+            "chat_completions",
+            "acme-tenant",
+            "sk_deadbeef0003",
+            &tags,
+            100,
+            50,
+            0,
+            0,
+            0,
+            0.25,
+        );
+
+        let families = prometheus::gather();
+        for family in [
+            "sbproxy_ai_tokens_attributed_total",
+            "sbproxy_ai_cost_dollars_attributed_total",
+        ] {
+            let f = families
+                .iter()
+                .find(|f| f.name() == family)
+                .unwrap_or_else(|| panic!("{family} must be registered"));
+            let ours: Vec<_> = f
+                .get_metric()
+                .iter()
+                .filter(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "provider" && l.value() == provider)
+                })
+                .collect();
+            assert!(!ours.is_empty(), "{family} recorded no cell for {provider}");
+            for m in &ours {
+                let labels = m.get_label();
+                assert!(
+                    labels
+                        .iter()
+                        .any(|l| l.name() == "agent_id" && l.value() == "billing-orchestrator"),
+                    "{family} must carry the spending agent, got {labels:?}"
+                );
+                for forbidden in [
+                    "trace_id",
+                    "run_id",
+                    "task_id",
+                    "session_id",
+                    "context_id",
+                    "request_id",
+                    "a2a_context_id",
+                ] {
+                    assert!(
+                        !labels.iter().any(|l| l.name() == forbidden),
+                        "{family} must not carry the run-scoped label {forbidden:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Spend the gateway could not tie to a verified agent still counts,
+    /// under an empty `agent_id`. Dropping the row would hide the spend;
+    /// inventing a value for it would attribute somebody's bill to an
+    /// agent that did not make the call.
+    #[test]
+    fn unattributed_spend_lands_under_an_empty_agent_id() {
+        use crate::attribution::AttributionTags;
+        let provider = "no-agent-test-provider";
+        let model = "no-agent-test-model";
+        record_ai_request_attributed(
+            "test.origin",
+            provider,
+            model,
+            "chat_completions",
+            "acme-tenant",
+            "sk_deadbeef0004",
+            &AttributionTags::default(),
+            10,
+            5,
+            0,
+            0,
+            0,
+            0.5,
+        );
+        let families = prometheus::gather();
+        let f = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_cost_dollars_attributed_total")
+            .expect("cost counter registered");
+        let ours = f
+            .get_metric()
+            .iter()
+            .find(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.name() == "provider" && l.value() == provider)
+            })
+            .expect("the unattributed cell was recorded");
+        assert!(
+            ours.get_label()
+                .iter()
+                .any(|l| l.name() == "agent_id" && l.value().is_empty()),
+            "an unresolved agent must record as empty, not be dropped"
+        );
+        assert!(ours.get_counter().value() >= 0.5);
     }
 
     /// WOR-1095: realtime / audio surfaces land in the attributed

@@ -479,7 +479,6 @@ fn select_engine(
         EngineChoice::Vllm => Some(EngineKind::Vllm),
         EngineChoice::SGLang => Some(EngineKind::SGLang),
         EngineChoice::LlamaCpp => Some(EngineKind::LlamaCpp),
-        EngineChoice::Embedded => Some(EngineKind::Embedded),
         EngineChoice::MistralRs => Some(EngineKind::MistralRs),
     };
     let mut engines = variant.engines.clone();

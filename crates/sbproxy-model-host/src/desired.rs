@@ -453,10 +453,7 @@ pub(crate) fn validate_legacy_managed_compatibility(
         Some(kind) => kind == EngineKind::Vllm,
         None => !matches!(
             entry.engine,
-            EngineChoice::LlamaCpp
-                | EngineChoice::Embedded
-                | EngineChoice::SGLang
-                | EngineChoice::MistralRs
+            EngineChoice::LlamaCpp | EngineChoice::SGLang | EngineChoice::MistralRs
         ),
     };
 

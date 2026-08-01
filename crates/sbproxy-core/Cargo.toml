@@ -34,10 +34,6 @@ gpu-nvidia = ["sbproxy-model-host/gpu-nvidia"]
 gpu-apple = ["sbproxy-model-host/gpu-apple"]
 # Hugging Face weight download for the model host. Same gating.
 model-weights = ["sbproxy-model-host/weights"]
-# WOR-1658: the in-process embedded engine, forwarded to the model host.
-# Off by default (mistral.rs is a large dep tree); `sbproxy doctor`
-# reports whether this build compiled it in.
-embedded = ["sbproxy-model-host/embedded"]
 # Pulls the resolver in `sbproxy-modules::policy::agent_class` and the
 # reverse-DNS verifier in `sbproxy-security::agent_verify` into the
 # request pipeline. Off by default for library consumers; the

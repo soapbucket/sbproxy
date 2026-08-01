@@ -1121,6 +1121,14 @@ fn render_openapi(state: &AdminState, yaml: bool) -> Result<String, String> {
 /// kids land once: the first occurrence wins so two origins sharing
 /// a signer key (operator-managed) do not produce a duplicate entry.
 ///
+/// This aggregation is multi-tenancy, not key rotation, and the two
+/// are easy to mistake for each other because both widen the same
+/// array. Rotation is per-origin and lives in the policy: an origin
+/// with `quote_token.previous_key_id` set hands back two kids of its
+/// own, and that is what keeps a quote issued before a reload
+/// verifying after it. Nothing at this level knows a rotation window
+/// is open, so nothing here can substitute for one.
+///
 /// Served unauthenticated because the published keys are public; the
 /// admin server gates this route ahead of the basic-auth check.
 pub(crate) fn render_quote_keys_jwks() -> (u16, &'static str, String) {
@@ -3065,7 +3073,7 @@ fn windowed_spend_response(
         return (
             400,
             "application/json",
-            r#"{"error":"unknown group_by (provider|model|tenant|team|api_key|project|origin|property:<key>|total)"}"#.to_string(),
+            r#"{"error":"unknown group_by (provider|model|tenant|team|api_key|project|origin|agent|property:<key>|total)"}"#.to_string(),
         );
     };
     let requested_property_key = match &group {
@@ -5341,6 +5349,7 @@ mod tests {
                     team: "growth".to_string(),
                     api_key_id: "sk1".to_string(),
                     project: "p".to_string(),
+                    agent_id: String::new(),
                     properties: std::collections::BTreeMap::from([(
                         "feature".to_string(),
                         "assistant".to_string(),

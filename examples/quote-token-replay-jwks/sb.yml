@@ -85,3 +85,8 @@ origins:
           # Five-minute TTL per A3.2 default. The verifier refuses
           # tokens past `exp`; cooperative agents redeem promptly.
           default_ttl_seconds: 300
+          # To rotate: put the new kid in `key_id` and move this one to
+          # `previous_key_id` (with its seed in `previous_seed_hex` or
+          # `previous_secret_ref`) for one TTL, so quotes issued before
+          # the reload keep verifying. Both kids are published while the
+          # window is open. See the README's "Rotating the signing key".
