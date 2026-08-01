@@ -579,13 +579,13 @@ mod tests {
     #[test]
     fn schema_routes_to_close_even_under_the_chunk_fallback() {
         let mut pipeline = GuardrailPipeline::default();
-        pipeline.output.push(
-            crate::guardrails::compile_guardrail(&serde_json::json!({
+        pipeline.output.push(Guardrail::Schema(
+            crate::guardrails::SchemaGuardrail::from_config(&serde_json::json!({
                 "type": "schema",
                 "schema": {"type": "object"}
             }))
             .expect("schema guard compiles"),
-        );
+        ));
         let mut s = StreamGuardSession::new(Arc::new(pipeline), None);
         assert!(s.on_content_delta(r#"{"a"#).is_none());
         assert!(s.on_content_delta(r#"":1}"#).is_none());
