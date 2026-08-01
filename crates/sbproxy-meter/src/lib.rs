@@ -69,6 +69,16 @@
 //! The breakdown is the product, so nothing in this crate adds unit counts
 //! together and nothing should.
 //!
+//! # The metrics are not the record
+//!
+//! [`metrics`] carries what the meter says about its own health: units
+//! counted, receipts classified, chain head, append latency, and the gaps
+//! where a record was owed and could not be written. None of it is the
+//! billing record. The signed chain is, and the counters are lossy by
+//! construction because a `PeriodicReader` drops a batch when export fails
+//! and a cumulative counter resets when the process restarts. Reconcile
+//! against the chain; operate off the counters.
+//!
 //! # What is not here yet
 //!
 //! The expression resolver, which subsumes all three, and which goes last on
@@ -83,6 +93,7 @@
 pub mod event;
 pub mod ledger;
 pub mod measured;
+pub mod metrics;
 pub mod origin_header;
 pub mod outcome;
 pub mod route_weight;
@@ -93,6 +104,7 @@ pub use ledger::{
     LedgerPayload, LedgerVerifyResult, UsageLedger,
 };
 pub use measured::{resolve_measured, MeasuredQuantity, MeasuredRule, Measurement};
+pub use metrics::{ChainContribution, FailurePosture, MeterObserver};
 pub use origin_header::{
     parse_origin_count, resolve_origin_headers, OriginClaim, OriginHeaderRule, ResolvedOriginUnit,
 };

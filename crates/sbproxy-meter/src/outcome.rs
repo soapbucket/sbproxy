@@ -358,7 +358,13 @@ impl OutcomeTable {
             };
 
             claims[index].attempts.push(event.outcome);
-            claims[index].units.extend(self.billable_units(event));
+            // Computed once and both folded and observed, so the
+            // operational counters describe the same units that reached the
+            // claim rather than a second, independently derived set that
+            // could disagree with it.
+            let billed = self.billable_units(event);
+            crate::metrics::observe_settled_event(event, self.billable(event.outcome), &billed);
+            claims[index].units.extend(billed);
         }
 
         claims

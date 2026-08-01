@@ -111,6 +111,21 @@ pub trait LedgerPayload: Serialize + DeserializeOwned + Clone {
     /// right answer when no stable identifier exists: two genuinely
     /// distinct events must never collapse into one.
     fn dedup_key(&self) -> Option<&str>;
+
+    /// What this payload contributes to the meter's own reconciliation:
+    /// who it is charged to, and how many units it carries.
+    ///
+    /// Defaults to `None`, which opts the payload out of
+    /// `sbproxy_meter_divergence_total` entirely. That is the right default
+    /// rather than a lazy one. Divergence compares units the meter counted
+    /// against units that reached the chain, so a payload that answers one
+    /// side of that comparison and not the other manufactures a
+    /// disagreement instead of detecting one. Implement it only for a
+    /// payload whose units are also counted through
+    /// [`crate::metrics::observe_settled_event`].
+    fn chain_contribution(&self) -> Option<crate::metrics::ChainContribution<'_>> {
+        None
+    }
 }
 
 /// One link in the ledger chain. Serialized as a single JSON line.
@@ -292,6 +307,12 @@ impl<P: LedgerPayload> UsageLedger<P> {
     /// hot path use [`UsageLedger::append`], which swallows and logs
     /// errors per the sink contract.
     pub fn append_checked(&self, event: &P) -> anyhow::Result<Option<LedgerEntry<P>>> {
+        // Started before the lock, not after it. The mutex is the metering
+        // path's backpressure, so time spent waiting for it is exactly the
+        // time `sbproxy_meter_append_duration_seconds` exists to show; a
+        // timer that starts inside the critical section reports a healthy
+        // sub-millisecond write while callers queue behind it.
+        let started = std::time::Instant::now();
         let mut s = self.state.lock();
 
         if let Some(rid) = event.dedup_key() {
@@ -329,6 +350,17 @@ impl<P: LedgerPayload> UsageLedger<P> {
         if let Some(rid) = event.dedup_key() {
             s.seen.insert(rid.to_string());
         }
+        let head_seq = s.seq;
+        // Released before observing. An observer is somebody else's code
+        // running on the metering path, and holding the chain's only lock
+        // across it would make every append wait on a metrics backend.
+        drop(s);
+
+        crate::metrics::observe_chain_append(
+            head_seq,
+            started.elapsed().as_secs_f64(),
+            event.chain_contribution(),
+        );
         Ok(Some(entry))
     }
 
@@ -339,6 +371,21 @@ impl<P: LedgerPayload> UsageLedger<P> {
             Ok(_) => LEDGER_HEALTH.store(1, Ordering::Relaxed),
             Err(e) => {
                 LEDGER_HEALTH.store(2, Ordering::Relaxed);
+                // Degraded is not a guess here, it is what this method is.
+                // `append` swallows the error and lets the caller carry on,
+                // so by the time control reaches this line the request has
+                // already been admitted with the guarantee unmade. A caller
+                // that wants any other posture has to use `append_checked`
+                // and take the branch itself, and report its own gap with
+                // the posture it chose.
+                let tenant_id = event
+                    .chain_contribution()
+                    .map(|contribution| contribution.tenant_id)
+                    .unwrap_or_default();
+                crate::metrics::observe_chain_gap(
+                    tenant_id,
+                    crate::metrics::FailurePosture::Degraded,
+                );
                 tracing::warn!(error = %e, path = %self.path.display(), "usage ledger: append failed");
             }
         }

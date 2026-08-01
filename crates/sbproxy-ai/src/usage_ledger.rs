@@ -65,6 +65,16 @@ pub type UsageLedger = sbproxy_meter::ledger::UsageLedger<LlmUsageEvent>;
 /// Events without one are never deduplicated, which is the safe default:
 /// two calls that both lack a `request_id` are two calls, and collapsing
 /// them would under-report spend rather than over-report it.
+/// `chain_contribution` is deliberately left at its `None` default, which
+/// keeps this chain out of `sbproxy_meter_divergence_total`.
+///
+/// Divergence compares units the meter counted against units that reached
+/// the chain. This chain is a spend record for LLM calls, not an
+/// attestation receipt chain: nothing counts its tokens through the meter's
+/// unit path, so reporting them on the chain side would produce a permanent
+/// one-sided imbalance and an alert that fires forever without anything
+/// being wrong. Implement it when, and only when, the same events are
+/// counted on both sides.
 impl LedgerPayload for LlmUsageEvent {
     fn dedup_key(&self) -> Option<&str> {
         self.request_id.as_deref()

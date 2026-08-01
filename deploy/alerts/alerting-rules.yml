@@ -172,6 +172,84 @@ groups:
             5 min. File ticket; investigate ledger backend latency.
           runbook_url: "https://docs.sbproxy.dev/runbook#rb-ledger-latency"
 
+  # --- Attested meter ---
+  #
+  # Two rules, and the difference between them is the whole design.
+  #
+  # A chain gap is money. The meter owed a record, could not write it, and
+  # the request was served anyway under the configured posture. Nonzero
+  # means revenue went unbilled and no receipt exists to reconstruct it
+  # from, so it pages.
+  #
+  # A divergence is a discrepancy, not a loss. The counter and the chain
+  # disagree, which means either receipts were dropped or something is
+  # writing units outside the chain. Both are worth knowing and neither is
+  # worth failing traffic over, so it files a ticket and never touches the
+  # metering failure_mode.
+  #
+  # Neither rule is a billing source. These counters are lossy telemetry:
+  # OTLP drops batches on export failure and cumulative counters reset
+  # across a restart. Reconcile against the signed chain; alert off these.
+  - name: sbproxy_alerts_meter
+    rules:
+      - alert: SBPROXY-METER-CHAIN-GAP
+        expr: |
+          sum by (tenant_id, failure_mode) (increase(sbproxy_meter_chain_gap_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+          slo_id: SLO-METER-CHAIN
+          runbook_id: RB-METER-CHAIN-GAP
+          window: 5m
+        annotations:
+          summary: "Meter could not write a record it owed (unbilled consumption)"
+          description: |
+            sbproxy_meter_chain_gap_total moved in the last 5 minutes. A
+            request was metered, the receipt could not be written, and the
+            call was served under the configured failure_mode. That
+            consumption is not on any chain and cannot be invoiced.
+            Check disk space and permissions on the ledger path first.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-meter-chain-gap"
+
+      - alert: SBPROXY-METER-DIVERGENCE
+        expr: |
+          sum by (tenant_id) (increase(sbproxy_meter_divergence_total[30m])) > 0
+        for: 15m
+        labels:
+          severity: ticket
+          slo_id: SLO-METER-CHAIN
+          runbook_id: RB-METER-DIVERGENCE
+          window: 30m
+        annotations:
+          summary: "Meter unit counter and signed chain disagree"
+          description: |
+            Units counted for this tenant did not match units that reached
+            the signed chain, past the export window. Either receipts were
+            dropped on the way to the ledger or something is recording
+            units outside the chain. Reconcile the ledger for the affected
+            tenant; the chain is authoritative and the counter is not.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-meter-divergence"
+
+      - alert: SBPROXY-METER-STALLED
+        expr: |
+          sum(increase(sbproxy_meter_receipts_total[15m])) > 0
+          and
+          sum(changes(sbproxy_meter_chain_seq[15m])) == 0
+        for: 15m
+        labels:
+          severity: ticket
+          slo_id: SLO-METER-CHAIN
+          runbook_id: RB-METER-STALLED
+          window: 15m
+        annotations:
+          summary: "Meter is classifying attempts but the chain head is flat"
+          description: |
+            Receipts are being classified while the chain head has not
+            moved for 15 minutes. The append path is stalled, which no
+            counter shows on its own because the counters keep rising.
+            Check sbproxy_meter_append_duration_seconds for backpressure.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-meter-stalled"
+
   # --- Audit-log write ---
   - name: sbproxy_alerts_audit
     rules:

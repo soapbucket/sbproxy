@@ -345,6 +345,27 @@ GET /api/usage/spend?from=1760000000&to=1760086400&group_by=team
 
 The bucket schema doubles as the ingestion contract for external spend pipelines: the same events feed the rollups and the usage sinks, so a durable analytics store can consume the identical dimensions.
 
+### Meter metrics, and why they are not the billing record
+
+When `proxy.attestation` is on, the proxy meters consumption and writes a signed, hash-chained receipt for every settled call. Six families report on that machinery.
+
+| Metric | Labels | What it tells you |
+|---|---|---|
+| `sbproxy_meter_units_total` | `tenant_id`, `unit`, `source` | Units counted, with provenance on the dashboard. `source` is `measured`, `route_weight`, or `origin_header`. |
+| `sbproxy_meter_receipts_total` | `tenant_id`, `outcome`, `billable` | What your billable table is actually doing. Attempts that bill nothing are counted too, so a free call and an unseen call do not look the same. |
+| `sbproxy_meter_chain_gap_total` | `tenant_id`, `failure_mode` | The meter owed a record and could not write it. Nonzero means unbilled consumption. Alert on this one. |
+| `sbproxy_meter_divergence_total` | `tenant_id` | The unit counter and the chain disagree past the export window. |
+| `sbproxy_meter_chain_seq` | none | Chain head. Flat under traffic means a stalled meter, which no counter shows on its own. |
+| `sbproxy_meter_append_duration_seconds` | none | Append latency, including lock wait. This is where backpressure on the metering path becomes visible. |
+
+**These metrics are not the billing record.** The signed chain is. Metrics are lossy by design in three ways that all look like healthy data on a dashboard: OTLP export drops a batch when the collector is unreachable and carries on, cumulative counters reset to zero when the process restarts, and aggregation windows destroy the individual receipts that went into a sum. A total read off a panel can be short by a deploy's worth of traffic with nothing anywhere saying so. Reconcile invoices against the chain. Use these to find out whether the meter is healthy, which is the one question the chain cannot answer about itself.
+
+Both surfaces carry all six: the OTLP push path exports them as `sbproxy.meter.*` instruments when `telemetry.export_metrics` is on, and `/metrics` scrapes them under the names above. The two are not equally reliable under load. `/metrics` degrades at peak volume, and billing visibility that vanishes exactly when volume is highest is worse than no dashboard, because its absence reads as quiet rather than as a gap. Enable the OTLP push path for anything you intend to act on.
+
+`route` is not a label on any of them, on purpose. `tenant x route x unit x source x outcome` is a cardinality bomb and route is by far the largest factor in it. Route lives on the receipt instead, and the receipt is reachable: `sbproxy_meter_append_duration_seconds_bucket` carries a trace exemplar, the trace carries `claim_id`, and `claim_id` names the exact signed receipt. A spike on the panel is three clicks from the document that explains it.
+
+Divergence is an alert, never enforcement. If the counter and the chain disagree, either receipts were dropped or something is recording units outside the chain. Both are worth knowing and neither is worth failing traffic over, so divergence never trips the configured `failure_mode` and never refuses a request. The shipped rules are `SBPROXY-METER-CHAIN-GAP` (page), `SBPROXY-METER-DIVERGENCE` (ticket), and `SBPROXY-METER-STALLED` (ticket) in `deploy/alerts/alerting-rules.yml`.
+
 ## Logs
 
 ### Structured-log schema

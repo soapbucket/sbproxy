@@ -4045,6 +4045,7 @@ dependencies = [
  "regex",
  "reqwest",
  "sbproxy-capability",
+ "sbproxy-meter",
  "sbproxy-plugin",
  "sbproxy-security",
  "sbproxy-util",

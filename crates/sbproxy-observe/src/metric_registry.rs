@@ -2001,6 +2001,90 @@ pub const METRICS: &[MetricCapability] = &[
         description: "MCP upstream IO failures absorbed by deadlines and byte caps, by kind.",
         dead_reason: None,
     },
+    // Attested metering (WOR-2129). Six families under one fresh
+    // `sbproxy_meter_` namespace, chosen rather than extending an existing
+    // prefix so that none of them can collide with a name an earlier
+    // observability wave left behind.
+    //
+    // None of these is the billing record. The signed chain is. OTLP export
+    // drops batches on failure, cumulative counters reset across a restart,
+    // and aggregation windows destroy the individual receipts, so a total
+    // read here can be short by a deploy's worth of traffic with nothing
+    // anywhere saying so. `crates/sbproxy-observe/src/meter_metrics.rs`
+    // states that in its module docs and `docs/observability.md` states it
+    // to operators, because the failure mode is somebody invoicing off a
+    // Grafana panel and being quietly wrong.
+    //
+    // `route` is absent from every label set below and stays absent.
+    // `tenant x route x unit x source x outcome` is a cardinality bomb and
+    // route is by far the largest factor in it. Route lives on the receipt,
+    // which is reachable from the append histogram's trace exemplar.
+    MetricCapability {
+        name: "sbproxy_meter_append_duration_seconds",
+        kind: MetricKind::Histogram,
+        writer: Writer::Recorder("record_meter_append_duration"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &[],
+        description: "Time to append one entry to the meter's signed chain, including lock wait.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_meter_chain_gap_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_meter_chain_gap"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["tenant_id", "failure_mode"],
+        description: "Records the meter owed and could not write, by tenant and the posture in force.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_meter_chain_seq",
+        kind: MetricKind::Gauge,
+        writer: Writer::Recorder("set_meter_chain_seq"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &[],
+        description: "Head sequence number of the meter's signed chain.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_meter_divergence_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_meter_divergence"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["tenant_id"],
+        description: "Windows in which counted units and chained units disagreed, by tenant.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_meter_receipts_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_meter_receipt"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["tenant_id", "outcome", "billable"],
+        description: "Metered attempts, by tenant, outcome, and the operator's billing answer for it.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_meter_units_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_meter_units"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["tenant_id", "unit", "source"],
+        description: "Units the meter counted, by tenant, operator-chosen unit name, and provenance.",
+        dead_reason: None,
+    },
     // Self-observability. If the scrape body fails to encode, the endpoint
     // serves 200 with an empty payload, which looks exactly like a healthy
     // process emitting nothing. This is the one series that has to survive
@@ -3074,6 +3158,18 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     "sbproxy_inbound_key_requests_total",
     "sbproxy_judge_budget_exhausted_total",
     "sbproxy_label_cardinality_overflow_per_tenant_total",
+    // Every meter family with a tenant dimension. Tenant-relevant is not a
+    // judgement call here: a metering counter exists to say what one
+    // customer owes, and one that merged every customer's units into a
+    // single series would answer a question nobody asked while sitting
+    // under a name that promises otherwise. `sbproxy_meter_chain_seq` and
+    // `sbproxy_meter_append_duration_seconds` are deliberately absent:
+    // both describe the chain and the process rather than a customer, and
+    // neither carries a tenant label to check.
+    "sbproxy_meter_chain_gap_total",
+    "sbproxy_meter_divergence_total",
+    "sbproxy_meter_receipts_total",
+    "sbproxy_meter_units_total",
     "sbproxy_policy_audit_events_dropped_total",
     "sbproxy_rate_limit_suspend_total",
     "sbproxy_rate_limit_total",
