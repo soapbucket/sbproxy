@@ -534,11 +534,11 @@ impl OwnershipDirectory {
             path,
             file: unsafe { std::fs::File::from_raw_fd(descriptor) },
         };
-        directory.validate(create)?;
+        directory.validate()?;
         Ok(Some(directory))
     }
 
-    fn validate(&self, tighten_legacy_mode: bool) -> Result<(), EngineDriverError> {
+    fn validate(&self) -> Result<(), EngineDriverError> {
         use std::os::fd::AsRawFd as _;
 
         let metadata = descriptor_stat(self.file.as_raw_fd()).map_err(|error| {
@@ -558,8 +558,14 @@ impl OwnershipDirectory {
                 ),
             ));
         }
+        // Tighten a legacy owner-only mode on every open, not just when the
+        // directory is being created. Pre-hardening binaries created this
+        // directory 0755, so gating the repair on the create path turns the
+        // first boot after an upgrade into a hard failure (WOR-2167). Group-
+        // or world-writable stays a hard error below: that is a tamper risk,
+        // not a legacy artifact.
         let mut mode = metadata.st_mode & 0o777;
-        if tighten_legacy_mode && mode != 0o700 && mode & 0o022 == 0 {
+        if mode != 0o700 && mode & 0o022 == 0 {
             if unsafe { libc::fchmod(self.file.as_raw_fd(), 0o700) } != 0 {
                 return Err(process_ownership_error(
                     "tighten managed-engine ownership directory",
@@ -3024,6 +3030,28 @@ mod tests {
         store
             .ensure_private_directory()
             .expect("a spawn may tighten an owner-only legacy directory");
+        let mode = std::fs::symlink_metadata(&selected)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn ownership_store_tightens_a_legacy_directory_on_the_read_path() {
+        // Boot recovery opens the directory without creating it. A 0755
+        // directory left by a pre-hardening binary must be repaired there
+        // too, or the first boot after an upgrade fails (WOR-2167).
+        let parent = tempfile::tempdir().unwrap();
+        let selected = parent.path().join("managed-engines");
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::set_permissions(&selected, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let store = ProcessOwnershipStore::at(&selected);
+
+        store
+            .record_paths()
+            .expect("a read may tighten an owner-only legacy directory");
         let mode = std::fs::symlink_metadata(&selected)
             .unwrap()
             .permissions()

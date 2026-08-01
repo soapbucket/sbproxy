@@ -311,10 +311,16 @@ LOCAL_LANES="deterministic cpu air_gapped split_cluster symmetric_cluster three_
 
 resolve_binary() {
   SBPROXY_BIN="${SBPROXY_E2E_BIN:-$REPO_ROOT/target/debug/sbproxy}"
-  if [ ! -x "$SBPROXY_BIN" ]; then
+  # Always invoke cargo when certifying the default binary; its freshness
+  # check makes this a no-op on a current build. Gating on existence once
+  # certified a two-day-old binary and hid a real lane failure (WOR-2167).
+  if [ -z "${SBPROXY_E2E_BIN:-}" ]; then
     echo "[certify] building $SBPROXY_BIN"
-    PATH="$HOME/.cargo/bin:$PATH" cargo build -p sbproxy --bin sbproxy \
+    (cd "$REPO_ROOT" && PATH="$HOME/.cargo/bin:$PATH" cargo build -p sbproxy --bin sbproxy) \
       || { echo "[certify] cannot build the proxy binary" >&2; exit 1; }
+  elif [ ! -x "$SBPROXY_BIN" ]; then
+    echo "[certify] SBPROXY_E2E_BIN=$SBPROXY_BIN is not executable" >&2
+    exit 1
   fi
   export SBPROXY_BIN
 }
