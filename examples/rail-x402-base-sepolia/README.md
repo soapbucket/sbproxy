@@ -1,265 +1,221 @@
-# x402 billing rail on Base Sepolia (USDC)
-*Last modified: 2026-07-09*
+# x402 v2 settlement on a priced route
 
-x402 v2 paywall in front of an article origin, wired against a local
-mock x402 facilitator so the example runs end-to-end without touching
-a real testnet. The README covers two paths:
+*Last modified: 2026-08-01*
 
-1. The default stack (mock facilitator). Brings up in seconds; uses
-   no real keys; suitable for CI.
-2. The Base Sepolia opt-in path (`sb-testnet.yml`). Points the proxy
-   at the LF-stewarded Base Sepolia facilitator and uses an EIP-3009
-   `transferWithAuthorization` flow with real (testnet) USDC.
+An article route that costs $0.001 to a declared AI crawler and nothing to
+a reader, with x402 v2 `exact` configured as the settlement rail. The point
+of the example is the boundary: a crawler gets a price, a credential the
+proxy never issued gets nothing, and the origin is never called until a
+durable record says the payment settled.
 
-The stack is shaped after `examples/ai-crawl-tiered/`: one proxy,
-one mock facilitator, one mock origin, all on a private bridge
-network.
+![x402 challenge and the closed failure path](../../docs/assets/payment-settlement.gif)
 
-## How it composes
+## What is in the bundle
 
-| Service                | Image                              | Role                                                                        |
-|------------------------|------------------------------------|-----------------------------------------------------------------------------|
-| sbproxy                | built from `Dockerfile.cloudbuild` | Reverse proxy on `:8080` enforcing `ai_crawl_control` per `sb.yml`.         |
-| mock-x402-facilitator  | `nginx:1.27.3-alpine`              | Stand-in for the LF facilitator. 200s on `/supported`, `/verify`, `/settle`. |
-| mock-origin            | `nginx:1.27.3-alpine`              | Article server. Returns one canned HTML body on `/article`.                  |
+| File | Role |
+|---|---|
+| `sb.yml` | `proxy.payments` with the x402 rail, plus one priced route |
+| `sb-testnet.yml` | The same config pointed at a real facilitator and a funded address |
+| `docker-compose.yml` | Optional containerized run of the same config |
+| `mock-x402-facilitator/` | Optional local stub that answers `/verify` and `/settle` with the pinned v2 shapes |
+| `Makefile` | `run`, `test`, `up`, `down`, `logs` |
+| `smoke.json` | Liveness manifest for `scripts/examples-smoke.sh` |
 
-All three run on a single bridge network (`x402sb`); only `sbproxy`
-publishes a host port (`8080`).
+## Prerequisites
 
-## How the rail composes
-
-The interesting block is `policies[].rails.x402` in `sb.yml`:
-
-```yaml
-rails:
-  x402:
-    chain: base
-    facilitator: http://mock-x402-facilitator:80
-    asset: USDC
-    pay_to: "0x0000000000000000000000000000000000000000"
-    version: "2"
-quote_token:
-  key_id: x402-base-sepolia-2026
-  seed_hex: "1111..."
-  issuer: "https://blog.test.sbproxy.dev"
-  default_ttl_seconds: 300
-```
-
-`rails.x402` is the operator-side configuration: chain, facilitator
-URL, the stablecoin asset to settle in, and the merchant address that
-receives the settled payment. `quote_token` is the proxy's signing
-material; the proxy mints one quote-token JWS per 402 challenge and
-publishes the verifying half at the admin endpoint
-`/.well-known/sbproxy/quote-keys.json` (see
-`examples/quote-token-replay-jwks/` for the JWKS demo).
-
-The proxy emits the multi-rail 402 body whenever the agent opts in
-via either the `Accept-Payment: x402` header or the `Accept:
-application/x402+json` MIME type. Legacy crawlers that send neither
-get the Wave 1 single-rail `Crawler-Payment` body so they keep
-working unchanged.
-
-## How to run (mock facilitator)
+An `sbproxy` binary built with the payment features, and a value for the
+challenge binding key. No wallet, no facilitator account, and no funded
+address are needed for anything on this page.
 
 ```bash
-cd examples/rail-x402-base-sepolia
-docker compose up -d --wait
+cargo build -p sbproxy --release --features payments,payment-x402
+export SBPROXY_PAYMENT_BINDING_KEY="$(openssl rand -hex 32)"
 ```
 
-Tear down:
+The key is named in the config, never inlined. `secret://env/NAME` is one
+of three reference forms; see [docs/secrets.md](../../docs/secrets.md).
+
+## Check the config before running anything
+
+Validation reads shape and cross-field rules only. It resolves no secret,
+opens no SQLite file, and contacts no facilitator, so it runs on a machine
+that holds none of this config's credentials:
 
 ```bash
-docker compose down -v
+sbproxy validate -f examples/rail-x402-base-sepolia/sb.yml
 ```
 
-The `Makefile` wraps the same calls (`make up`, `make down`, `make
-logs`, `make test`).
+Break something on purpose to see how specific the refusal is. Change
+`network` from `eip155:84532` to `base` and validation names the field and
+the reason:
 
-## What to expect
+```text
+proxy.payments.rails.x402.network is "base", which is not a CAIP-2
+identifier; use the `namespace:reference` form such as `eip155:84532`
+rather than a short chain name, because an authoritative payment
+requirement must not depend on a nickname translation
+```
 
-### 1. Browser, no Accept-Payment
+Set `verify_timeout_ms: 1200` alongside `settle_timeout_ms: 1200` and it
+refuses the pair, because both legs share one request-path deadline:
 
-A browser UA never matches the crawler list, so the policy never
-charges and the proxy forwards the request through to the mock
-origin.
+```text
+proxy.payments.rails.x402 verify_timeout_ms + settle_timeout_ms is 2400
+ms, above proxy.payments.authorization_timeout_ms of 2000 ms; the request
+path must finish verify and settle inside one deadline
+```
+
+## Run it
+
+```bash
+sbproxy serve -f examples/rail-x402-base-sepolia/sb.yml
+```
+
+`make run` wraps the same command against `../../target/release/sbproxy`.
+
+### A reader is never charged
+
+No declared crawler User-Agent, so the policy does not price the request
+and the proxy forwards it upstream.
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' \
-     -H 'Host: blog.test.sbproxy.dev' \
-     http://127.0.0.1:8080/article
-# => 200
+  -H 'Host: blog.test.sbproxy.dev' \
+  http://127.0.0.1:8080/article
 ```
 
-### 2. AI crawler, Accept-Payment: x402
-
-The agent opts in via `Accept-Payment: x402`. The policy emits a 402
-with `Content-Type: application/sbproxy-multi-rail+json` and one
-`x402` rail entry in the body. The body carries a per-request
-quote-token JWS the agent verifies against the JWKS document before
-spending anything.
+### A declared crawler gets a price
 
 ```bash
-curl -i \
-     -H 'Host: blog.test.sbproxy.dev' \
-     -H 'User-Agent: GPTBot/1.0' \
-     -H 'Accept-Payment: x402' \
-     http://127.0.0.1:8080/article
-# HTTP/1.1 402 Payment Required
-# Content-Type: application/sbproxy-multi-rail+json
-# {
-#   "rails": [
-#     {
-#       "kind": "x402",
-#       "version": "2",
-#       "chain": "base",
-#       "facilitator": "http://mock-x402-facilitator:80",
-#       "asset": "USDC",
-#       "amount_micros": 1000,
-#       "currency": "USD",
-#       "pay_to": "0x0000...",
-#       "expires_at": "2026-05-02T...",
-#       "quote_token": "eyJhbGc..."
-#     }
-#   ],
-#   "agent_choice_method": "header_negotiation",
-#   "policy": "first_match_wins"
-# }
+curl -is \
+  -H 'Host: blog.test.sbproxy.dev' \
+  -H 'User-Agent: GPTBot/1.0' \
+  http://127.0.0.1:8080/article
 ```
 
-### 3. AI crawler, Accept: application/x402+json
+```http
+HTTP/1.1 402 Payment Required
+Crawler-Payment: realm="ai-crawl" currency="USD" price="0.001"
+Content-Type: application/json
+```
 
-The MIME-type opt-in is equivalent. Useful for SDKs that stream
-content negotiation through `Accept` rather than `Accept-Payment`.
+```json
+{
+  "error": "payment_required",
+  "price": "0.001",
+  "currency": "USD",
+  "target": "blog.test.sbproxy.dev/article",
+  "header": "crawler-payment"
+}
+```
+
+`header` names the request header to set on the retry. A client that sends
+`Accept-Payment: x402` instead gets the x402 challenge described in
+[docs/402-challenge.md](../../docs/402-challenge.md).
+
+### A credential the proxy never issued buys nothing
 
 ```bash
-curl -i \
-     -H 'Host: blog.test.sbproxy.dev' \
-     -H 'User-Agent: GPTBot/1.0' \
-     -H 'Accept: application/x402+json' \
-     http://127.0.0.1:8080/article
-# => 402 with the same multi-rail body, filtered to just the x402 entry.
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H 'Host: blog.test.sbproxy.dev' \
+  -H 'User-Agent: GPTBot/1.0' \
+  -H 'crawler-payment: not-a-token-this-proxy-issued' \
+  http://127.0.0.1:8080/article
 ```
 
-### 4. AI crawler, no opt-in
+The answer is another 402. A credential can never create the intent a
+challenge would have created, so a request with no matching challenge
+fails closed before any facilitator is contacted. The origin is not
+called.
 
-A crawler UA without either signal still gets a 402, but the body is
-the Wave 1 single-rail format with the `Crawler-Payment` header.
-This keeps legacy crawlers working without breaking the new path.
+### The free paths stay free
 
 ```bash
-curl -i \
-     -H 'Host: blog.test.sbproxy.dev' \
-     -H 'User-Agent: GPTBot/1.0' \
-     http://127.0.0.1:8080/article
-# HTTP/1.1 402 Payment Required
-# Crawler-Payment: realm="ai-crawl" currency="USD" price="0.001000"
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H 'Host: blog.test.sbproxy.dev' \
+  -H 'User-Agent: GPTBot/1.0' \
+  http://127.0.0.1:8080/robots.txt
 ```
 
-## Verifying the EIP-3009 flow
+A crawler can always read the site's policy without paying to learn it.
+`/robots.txt`, `/sitemap.xml`, `/security.txt`,
+`/.well-known/security.txt`, and `/crawlers.json` are free regardless of
+config, and `free_paths:` extends that list.
 
-The mock facilitator does not run real signature verification (that
-is what makes the example hermetic), but the proxy still emits a
-quote-token JWS the agent must verify before signing an EIP-3009
-authorization. The end-to-end loop the README walks through is:
+## The two blocks, and who owns what
 
-1. Agent issues a request; receives a 402 with one x402 rail entry.
-2. Agent fetches `/.well-known/sbproxy/quote-keys.json` from the
-   admin port; verifies the JWS in the rail entry against the
-   matching kid.
-3. Agent signs an EIP-3009 `transferWithAuthorization` for the
-   `amount_micros` value listed in the rail entry, paying out to the
-   `pay_to` address on the `chain` listed.
-4. Agent posts the signed authorization to the `facilitator` URL.
-   The mock returns a synthetic `txhash`; the LF facilitator returns
-   the real one.
-5. Agent retries the original request with the `Crawler-Payment`
-   header set to the redeemed quote token. The proxy validates with
-   the in-memory ledger (or the configured HTTP ledger) and
-   forwards.
+`proxy.payments` owns how a payment settles. `ai_crawl_control` owns which
+requests are payable and what they cost. Nothing reads a price, an
+address, a network, or an expiry from two places.
 
-For a full walkthrough against the live Base Sepolia facilitator,
-see `docs/ai-crawl-control.md` (operator-facing billing docs).
+The x402 rail's fields are documented one by one in
+[docs/payment-settlement.md](../../docs/payment-settlement.md). Four are
+worth calling out here because they are the ones people get wrong:
 
-## Simulating reorgs
+- `network` is CAIP-2. `base` is rejected on purpose, because a signed
+  payment requirement must not depend on a nickname translation table.
+- `facilitator_url` is the facilitator's complete API root over HTTPS. The
+  adapter keeps every path segment, strips only trailing slashes, and
+  appends exactly `/verify` or `/settle`. A root of
+  `https://facilitator.example/base/` produces
+  `https://facilitator.example/base/verify` and `.../settle` and nothing
+  else. A root that already ends in `/verify` is rejected rather than
+  normalized.
+- `asset_decimals` drives an exact integer conversion from quote micros.
+  A price that does not convert without remainder is a config error, not a
+  rounding.
+- `breaker.half_open_max` is exactly 1. A second concurrent probe against
+  an unhealthy facilitator can dispatch a settlement whose response nobody
+  is waiting to record.
 
-The mock facilitator honours a `reorg=depth=N` query parameter on
-`/settle`:
+## Point it at a real facilitator
+
+`sb-testnet.yml` is the same configuration with the placeholder
+facilitator root, recipient address, and asset replaced. Nothing in this
+repository spends funds, and CI never runs that file.
 
 ```bash
-curl -s -X POST 'http://localhost:8080/settle?reorg=depth=3'
-# {"settled":true,"txhash":"0xMOCK...","reorg_depth":3}
+export SBPROXY_PAYMENT_BINDING_KEY="$(openssl rand -hex 32)"
+sbproxy validate -f examples/rail-x402-base-sepolia/sb-testnet.yml
 ```
 
-The proxy itself does not re-evaluate redemptions on reorg today
-(Wave 3 ships the rail emission; the agent SDK is responsible for
-re-issuing if the facilitator's response indicates a reorg). The
-field is here so the README walkthrough has a way to demonstrate the
-"facilitator says reorg happened" branch without a real testnet.
+You will need a facilitator that serves the pinned v2 `exact` contract at
+an HTTPS API root, a recipient address on the network you configure, and a
+client that can produce an x402 payload for that scheme. Edit the
+`facilitators`, `pay_to`, `network`, and `asset` fields to match the
+facilitator's published values before serving it.
 
-## Swapping in the Base Sepolia facilitator
+## Inspect the facilitator wire shapes locally
 
-The companion file `sb-testnet.yml` keeps everything except the
-facilitator URL, the merchant `pay_to`, and the quote-token signing
-key as-is. Three operator steps to flip:
-
-First, create `.env.testnet` next to `docker-compose.yml`. The two
-variables feed the `${MERCHANT_ADDRESS}` interpolation and the
-`secret_ref.env` lookup in `sb-testnet.yml`. The values below are
-placeholders; replace both before running:
+The bundled stub answers the two endpoints an x402 rail calls, with the
+pinned v2 response shapes, so you can read them without an account:
 
 ```bash
-cat > .env.testnet <<'EOF'
-# Merchant receive address on Base Sepolia. FAKE placeholder;
-# replace with your own funded testnet wallet address.
-MERCHANT_ADDRESS=0x1111111111111111111111111111111111111111
-# 32-byte Ed25519 quote-token seed, 64 hex chars. FAKE placeholder;
-# replace with a fresh seed from: openssl rand -hex 32
-SBPROXY_QUOTE_TOKEN_SEED_HEX=2222222222222222222222222222222222222222222222222222222222222222
-EOF
+docker compose up -d --wait mock-x402-facilitator
+curl -s -X POST http://127.0.0.1:8081/verify -d '{}'
+curl -s -X POST http://127.0.0.1:8081/settle -d '{}'
 ```
 
-Then bring the stack up with the env file:
+```json
+{"isValid":true}
+{"success":true,"transaction":"0x0000000000000000000000000000000000000000000000000000000000000000","network":"eip155:84532"}
+```
+
+The stub serves plain HTTP, and `facilitator_url` requires HTTPS, so it is
+a wire-shape reference rather than a settlement backend. Point the rail at
+a facilitator that serves TLS.
+
+## Clean up
 
 ```bash
-docker compose --env-file .env.testnet up -d --wait
+make down
 ```
 
-Then mount `sb-testnet.yml` at `/etc/sbproxy/sb.yml` and pass
-`MERCHANT_ADDRESS` and `SBPROXY_QUOTE_TOKEN_SEED_HEX` into the
-container's `environment:` (override `docker-compose.yml`'s
-`volumes:` and `environment:` blocks via a compose override file).
-The proxy talks to
-`https://facilitator.base-sepolia.x402.org` for verification and
-settlement; the mock container is unused on the testnet path.
+## Related
 
-You will need:
-
-- A funded Base Sepolia wallet (the merchant address). USDC test
-  faucet: see the LF documentation linked from
-  `docs/ai-crawl-control.md`.
-- An Ed25519 seed for the quote-token signer. `openssl rand -hex 32`
-  produces a usable seed in 64-char hex form.
-- An agent with Base Sepolia signing capability. The reference
-  client is the LF agent SDK; any wallet that speaks EIP-3009 over
-  the LF facilitator API works.
-
-## Cargo features
-
-The example assumes a default-features `sbproxy` build (which
-includes `tiered-pricing`, `agent-class`, and `http-ledger`). The
-multi-rail emission path is unconditional in the `sbproxy-modules`
-crate; no operator-set cargo feature is needed to enable x402
-itself. The `Dockerfile.cloudbuild` image used by `docker-compose.yml`
-ships the default feature set.
-
-## Related docs
-
-- `docs/402-challenge.md` - wire shape of the single-rail and
-  multi-rail 402 bodies, including the per-rail quote-token JWS.
-- `docs/ai-crawl-control.md` - configuration reference for the
-  `ai_crawl_control` policy, agent classes, ledger, and tiers.
-- `examples/rail-mpp-stripe-test/` - MPP rail counterpart.
-- `examples/multi-rail-accept-payment/` - both rails wired
-  together with q-value negotiation.
-- `examples/quote-token-replay-jwks/` - JWKS endpoint and
-  single-use quote token enforcement.
+- [docs/payment-settlement.md](../../docs/payment-settlement.md) - every `proxy.payments` field, the state table, reconciliation, and the unsupported boundaries.
+- [docs/402-challenge.md](../../docs/402-challenge.md) - the exact challenge, credential, error, and receipt bytes.
+- [docs/ai-crawl-control.md](../../docs/ai-crawl-control.md) - pricing, tiers, agent classes, and the ledger.
+- `examples/rail-mpp-stripe-test/` - Payment HTTP Authentication settling on Stripe.
+- `examples/rail-lightning/` - CLN and LND as alternative backends.
+- `examples/multi-rail-accept-payment/` - several rails on one route.

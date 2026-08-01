@@ -56,8 +56,10 @@ origins:
           - CCBot
 
         # In-memory ledger seed. Every token here redeems exactly
-        # once. Enterprise builds swap in an HTTP-callable ledger
-        # that talks to the payments backend.
+        # once. Swap in the HTTP ledger (`ledger:`) when several
+        # replicas must share one spend, or configure
+        # `proxy.payments` when you want a rail to settle the charge
+        # before the origin is called.
         valid_tokens:
           - token-aaa-001
           - token-aaa-002

@@ -551,7 +551,17 @@ impl AiCrawlControlPolicy {
         // opted in (via Accept-Payment or one of the multi-rail Accept
         // MIME types), emit the multi-rail body. Otherwise fall back to
         // the Wave 1 single-rail format so legacy crawlers keep working.
-        if let Some(plan) = self.multi_rail.as_ref() {
+        //
+        // A plan with no rails is a `quote_token:` block authored on its own,
+        // which configures a signing key and no paywall. Emitting here would
+        // answer an opted-in agent with a 406 listing zero supported rails,
+        // so the empty case takes the single-rail path like any other
+        // unconfigured origin.
+        if let Some(plan) = self
+            .multi_rail
+            .as_ref()
+            .filter(|plan| !plan.configured_rails.is_empty())
+        {
             let accept_payment = headers
                 .get("accept-payment")
                 .or_else(|| headers.get("Accept-Payment"))
@@ -992,48 +1002,63 @@ impl ConfiguredRailForTest {
 }
 
 /// Compile the YAML `rails:` + `quote_token:` blocks into a runtime plan.
+///
 /// Returns `Ok(None)` when neither block is present (the policy stays on
-/// the single-rail path); returns `Err` when one block is present
-/// without the other or when key resolution fails.
+/// the single-rail path); returns `Err` when `rails:` is present without a
+/// `quote_token:` to sign with, or when key resolution fails.
+///
+/// A `quote_token:` block on its own is a valid configuration and compiles
+/// to a plan with an empty rail list. The key is what an operator signs
+/// receipts with and what the JWKS endpoint publishes, and a seller who
+/// wants signed receipts without a 402 challenge should not have to invent
+/// a payment rail they will never charge on in order to get one. With no
+/// rails configured the challenge path never emits a multi-rail body, so
+/// the visible behaviour is unchanged for everybody else.
 fn build_multi_rail_plan(
     rails_yaml: Option<RailsYamlConfig>,
     quote_token_yaml: Option<QuoteTokenYamlConfig>,
 ) -> anyhow::Result<Option<Arc<MultiRailPlan>>> {
-    let Some(rails) = rails_yaml else {
-        if quote_token_yaml.is_some() {
-            anyhow::bail!(
-                "ai_crawl_control: `quote_token:` block without a matching `rails:` block; \
-                 add a `rails:` block (with at least one rail configured) or remove `quote_token:`"
-            );
-        }
-        return Ok(None);
-    };
-    let qt_yaml = quote_token_yaml.ok_or_else(|| {
-        anyhow::anyhow!(
-            "ai_crawl_control: `rails:` block requires a `quote_token:` block so the proxy can \
-             sign per-rail quote tokens"
-        )
-    })?;
-
     // Build the configured rails list in declaration-stable order: x402
     // first when both are configured, mirroring the operator's typical
     // preference (no fees on x402 vs. MPP card-network costs).
-    let mut configured_rails: Vec<ConfiguredRail> = Vec::with_capacity(2);
-    if let Some(x) = rails.x402 {
-        configured_rails.push(ConfiguredRail::X402 {
-            version: x.version,
-            chain: x.chain,
-            facilitator: x.facilitator,
-            asset: x.asset,
-            pay_to: x.pay_to,
-        });
-    }
-    if let Some(m) = rails.mpp {
-        configured_rails.push(ConfiguredRail::Mpp { version: m.version });
-    }
-    if configured_rails.is_empty() {
-        anyhow::bail!("ai_crawl_control.rails: must configure at least one rail (x402 and/or mpp)");
-    }
+    let configured_rails: Vec<ConfiguredRail> = match rails_yaml {
+        Some(rails) => {
+            let mut configured_rails: Vec<ConfiguredRail> = Vec::with_capacity(2);
+            if let Some(x) = rails.x402 {
+                configured_rails.push(ConfiguredRail::X402 {
+                    version: x.version,
+                    chain: x.chain,
+                    facilitator: x.facilitator,
+                    asset: x.asset,
+                    pay_to: x.pay_to,
+                });
+            }
+            if let Some(m) = rails.mpp {
+                configured_rails.push(ConfiguredRail::Mpp { version: m.version });
+            }
+            // An authored-but-empty `rails:` block is still an error. The
+            // operator asked for rails and named none, which is a typo
+            // rather than a position.
+            if configured_rails.is_empty() {
+                anyhow::bail!(
+                    "ai_crawl_control.rails: must configure at least one rail (x402 and/or mpp)"
+                );
+            }
+            configured_rails
+        }
+        None => Vec::new(),
+    };
+
+    let Some(qt_yaml) = quote_token_yaml else {
+        if configured_rails.is_empty() {
+            // Neither block authored: nothing to compile.
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "ai_crawl_control: `rails:` block requires a `quote_token:` block so the proxy can \
+             sign per-rail quote tokens"
+        );
+    };
 
     // --- Quote-token signer ---
     let seed_hex = if let Some(sref) = &qt_yaml.secret_ref {

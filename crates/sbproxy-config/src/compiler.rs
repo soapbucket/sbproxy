@@ -1442,6 +1442,18 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         }
     }
 
+    // Payment settlement. Every rule here is structural or cross-field,
+    // so it holds on a machine that has none of the credentials: no
+    // secret is resolved, no SQLite file is opened, no provider object
+    // is created, and no worker starts. A configured rail whose Cargo
+    // feature is missing is caught later, at runtime assembly, where
+    // the compiled feature set is actually known.
+    if let Some(payments) = config_file.proxy.payments.as_ref() {
+        payments
+            .validate()
+            .context("config compile: proxy.payments")?;
+    }
+
     if let Some(cluster) = crate::cluster::resolve_effective_cluster(&config_file.proxy)
         .context("config compile: proxy cluster")?
     {

@@ -1144,6 +1144,12 @@ pub(super) fn emit_access_log_entry(
         rail: context.rail,
         redeemed_token_id: context.redeemed_token_id,
         txhash: context.txhash,
+        // WOR-2100: the one-way settlement receipt correlation digest.
+        // Stamped by the settlement path, which is the only code that
+        // holds a committed receipt; there is no context slot for it yet,
+        // so a request that did not settle through the billing runtime
+        // reports None rather than an empty string.
+        settlement_receipt_digest: None,
         license_token_id: context.license_token_id,
         cap_token_id: context.cap_token_id,
         upstream_host: context.upstream_host,

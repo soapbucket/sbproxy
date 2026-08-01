@@ -1134,6 +1134,21 @@ pub struct CompiledPipeline {
     /// runtime and never falls back to the origin's.
     #[cfg(feature = "rag")]
     pub rag_runtimes: crate::rag_runtime::RagRuntimeRegistry,
+    /// The published settlement runtime for this config generation, when
+    /// `proxy.payments` is configured (WOR-2100).
+    ///
+    /// Attached after construction rather than built inside it, because
+    /// publishing is async and proving the store answers has to happen while
+    /// the previous generation is still serving. `None` means settlement is
+    /// not configured, which is the default and leaves the existing
+    /// non-settlement ledger behaviour exactly as it was.
+    ///
+    /// Pinned to the pipeline for the same reason the key plane is: a
+    /// request pins a pipeline at ingress, so a reload cannot move a paid
+    /// request onto a different settlement store than the one that issued
+    /// its challenge.
+    #[cfg(feature = "payments")]
+    pub payments: Option<Arc<crate::billing_runtime::PaymentsRuntime>>,
     /// Immutable route-scoped semantic caches keyed by origin and optional
     /// forward rule (WOR-2099). Populated only for `ai_proxy` actions that
     /// configure `semantic_cache:`; a forward rule without its own block
@@ -1317,6 +1332,10 @@ impl Default for CompiledPipeline {
             compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry::default(),
             #[cfg(feature = "rag")]
             rag_runtimes: crate::rag_runtime::RagRuntimeRegistry::default(),
+            // Attached by the lifecycle after an async health check, never
+            // by construction. A default pipeline has no settlement.
+            #[cfg(feature = "payments")]
+            payments: None,
             // Default construction must stay pure: no config read, no DNS
             // resolution, no Redis dial, no cluster-state read, and no
             // mesh binding. Test pipelines are built this way constantly.
@@ -1917,6 +1936,11 @@ impl CompiledPipeline {
             compression_runtimes,
             #[cfg(feature = "rag")]
             rag_runtimes,
+            // Attached by the lifecycle after an async health check, never
+            // by construction: publishing starts a worker, and a candidate
+            // that is then discarded must not leave one claiming leases.
+            #[cfg(feature = "payments")]
+            payments: None,
             semantic_caches,
             auths,
             policies,

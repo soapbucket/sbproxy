@@ -1292,6 +1292,62 @@ pub mod tracing_helper {
 /// without going through the `tracing_helper` sub-module.
 pub use tracing_helper::span;
 
+// --- WOR-2100: payment settlement correlation ---
+
+/// Domain separator for the access log's settlement correlation digest.
+///
+/// Separated so this digest cannot be confused with, or replayed against,
+/// any of the settlement crate's own digests over the same input.
+const RECEIPT_CORRELATION_DOMAIN: &[u8] = b"sbproxy-access-log-receipt-correlation-v1";
+
+/// Build the span covering one settlement rail interaction.
+///
+/// The name is `sbproxy.rail.<verb>`, where `verb` is the settlement or
+/// recovery operation. The rail and the operation are the whole story that
+/// belongs on a span: a payer identifier, a credential, a client secret, a
+/// provider object identifier, or a provider body would all be readable by
+/// anyone with trace access, and none of them is needed to find a slow
+/// facilitator.
+///
+/// `verb` is `&'static str` so a caller cannot format a value into it.
+pub fn settlement_span(verb: &'static str) -> tracing::Span {
+    tracing_helper::span(Pillar::Rail, verb)
+}
+
+/// Derive the one-way correlation digest the access log carries for a
+/// settled payment.
+///
+/// `receipt_key` is the durable receipt's own key. The digest is what goes
+/// on the log line, and the mapping is deliberately one way: two lines for
+/// the same settled payment share a value an operator can group by, and the
+/// value on its own tells an attacker with log access nothing about the
+/// intent, the provider object, or the payer.
+///
+/// Returns lowercase hex of the full 32 bytes. Truncating would make
+/// collisions plausible at a volume this proxy reaches, and a collision
+/// here means two different payments joining into one row.
+///
+/// # Examples
+///
+/// ```
+/// use sbproxy_observe::telemetry::receipt_correlation_digest;
+///
+/// let digest = receipt_correlation_digest("sbpr_example");
+/// assert_eq!(digest.len(), 64);
+/// // Stable for the same receipt, and unrelated to its input's bytes.
+/// assert_eq!(digest, receipt_correlation_digest("sbpr_example"));
+/// assert_ne!(digest, receipt_correlation_digest("sbpr_other"));
+/// assert!(!digest.contains("sbpr_example"));
+/// ```
+pub fn receipt_correlation_digest(receipt_key: &str) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(RECEIPT_CORRELATION_DOMAIN);
+    hasher.update([0u8]);
+    hasher.update(receipt_key.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 /// W3C Trace Context span context.
 #[derive(Debug, Clone)]
 pub struct SpanContext {

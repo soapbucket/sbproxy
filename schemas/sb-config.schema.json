@@ -53,6 +53,7 @@
         "model_host": null,
         "mtls": null,
         "observability": null,
+        "payments": null,
         "response_cache_store": null,
         "scripting": {
           "javascript": {
@@ -651,6 +652,18 @@
           "items": {
             "$ref": "#/definitions/CredentialBlock"
           }
+        },
+        "payments": {
+          "description": "Durable payment settlement. When absent, the proxy keeps its existing non-settlement crawl-ledger behaviour exactly. When present, a paid request reaches the origin only after its durable intent has committed `Succeeded`.\n\nThe block is always parsed, on every build, so `sbproxy validate` reads the same document everywhere. The consumer compares [`crate::payments::PaymentsConfig::required_features`] against its own compiled feature set and fails startup naming the missing feature, so a configured rail that was not compiled in never reaches a first request.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PaymentsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -6193,6 +6206,622 @@
           "minimum": 0.0
         }
       }
+    },
+    "PaymentsConfig": {
+      "description": "`proxy.payments`: durable settlement for paid requests.\n\nAbsent means the proxy keeps its existing non-settlement ledger behaviour exactly. Present means a paid request reaches the origin only after a durable intent has committed `Succeeded`.",
+      "type": "object",
+      "required": [
+        "challenge_binding_key",
+        "state_path"
+      ],
+      "properties": {
+        "state_path": {
+          "description": "Absolute path to the SQLite database that owns intents, attempts, proofs, and receipts. Authoritative for this release: a request is authorized because a row in this file says so.",
+          "type": "string"
+        },
+        "challenge_binding_key": {
+          "description": "Secret reference to the key that binds a challenge to its issuing proxy. Never an inline key.",
+          "type": "string"
+        },
+        "authorization_timeout_ms": {
+          "description": "Total budget for the one synchronous provider interaction a paid request is allowed, in milliseconds. Capped at [`MAX_AUTHORIZATION_TIMEOUT_MS`].",
+          "default": 2000,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "max_body_bytes": {
+          "description": "Largest request body the payment path buffers, in bytes. Bounded by [`MAX_PAYMENT_BODY_BYTES`]; a larger body is answered 413 before any challenge or provider work.",
+          "default": 1048576,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "recovery_encryption": {
+          "description": "Encryption for the write-ahead recovery envelopes that make a crashed Stripe dispatch recoverable. Required whenever the Stripe settlement rail is enabled.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RecoveryEncryptionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "worker": {
+          "description": "Recovery-only background worker. It never performs the settlement that authorizes a request.",
+          "default": {
+            "max_reconcile_batch": 32,
+            "reconcile_interval_ms": 1000,
+            "shutdown_timeout_ms": 5000
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/PaymentsWorkerConfig"
+            }
+          ]
+        },
+        "protocols": {
+          "description": "Wire protocols offered on top of the rails.",
+          "default": {
+            "payment_auth": null
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/PaymentProtocolsConfig"
+            }
+          ]
+        },
+        "rails": {
+          "description": "Settlement rails and their provider credentials.",
+          "default": {
+            "lightning_backend": null,
+            "lightning_cln": null,
+            "lightning_lnd": null,
+            "stripe": null,
+            "x402": null
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/PaymentRailsConfig"
+            }
+          ]
+        },
+        "usage_reporters": {
+          "description": "Usage reporters. A reporter accounts for consumption and can never authorize a request or produce a settlement receipt.",
+          "default": {
+            "stripe_meter": null
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/UsageReportersConfig"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RecoveryEncryptionConfig": {
+      "description": "AES-256-GCM material for the Stripe write-ahead recovery envelope.\n\nThe envelope holds the exact bytes of a Stripe create request so a process that crashed between stamping dispatch and recording the response can replay the byte-equivalent POST under the same idempotency key and recover the original response. It never holds the API key or any authorization header.",
+      "type": "object",
+      "required": [
+        "key",
+        "key_id"
+      ],
+      "properties": {
+        "key_id": {
+          "description": "Identifier stored beside each ciphertext so a rotation can tell which key decrypts which envelope. Outstanding envelopes must be drained or expired before their key id is retired.",
+          "type": "string"
+        },
+        "key": {
+          "description": "Secret reference to the 32-byte key. Structural validation checks only that this names a secret; runtime resolution requires exactly 32 decoded bytes.",
+          "type": "string"
+        },
+        "max_age_hours": {
+          "description": "Hard expiry for an envelope, in hours. Bounded by [`RECOVERY_MAX_AGE_HOURS_RANGE`].",
+          "default": 23,
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "PaymentsWorkerConfig": {
+      "description": "Cadence and shutdown budget for the recovery-only worker.",
+      "type": "object",
+      "properties": {
+        "reconcile_interval_ms": {
+          "description": "Delay between reconciliation sweeps, in milliseconds.",
+          "default": 1000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_reconcile_batch": {
+          "description": "Largest number of records claimed in one sweep.",
+          "default": 32,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "shutdown_timeout_ms": {
+          "description": "Time the worker is given to stop claiming and drain in-flight queries at shutdown, in milliseconds.",
+          "default": 5000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "PaymentProtocolsConfig": {
+      "description": "Wire protocols the proxy speaks on top of its settlement rails.",
+      "type": "object",
+      "properties": {
+        "payment_auth": {
+          "description": "Payment HTTP Authentication. Absent means the proxy never emits a `WWW-Authenticate: Payment` challenge.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PaymentAuthProtocolConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "PaymentAuthProtocolConfig": {
+      "description": "Payment HTTP Authentication, pinned to one draft, one method, and one intent.\n\nThe core draft's intent registry is empty, so the method-specific registration supplies the exact request, credential, and receipt semantics. This release implements only the registered `stripe` plus `charge` pair; it does not invent a generic provider schema.",
+      "type": "object",
+      "required": [
+        "realm"
+      ],
+      "properties": {
+        "draft": {
+          "description": "Draft identifier. Must equal [`PAYMENT_AUTH_DRAFT`]. Declared rather than assumed so a configuration written against a different draft fails loudly instead of producing bytes the client cannot parse.",
+          "default": "draft-ryan-httpauth-payment-01",
+          "type": "string"
+        },
+        "realm": {
+          "description": "Protection space echoed in every challenge and credential. It is the first slot of the challenge binding, so changing it invalidates outstanding challenges.",
+          "type": "string"
+        },
+        "method": {
+          "description": "Payment method token. Must equal [`PAYMENT_AUTH_METHOD`].",
+          "default": "stripe",
+          "type": "string"
+        },
+        "intent": {
+          "description": "Intent token. Must equal [`PAYMENT_AUTH_INTENT`].",
+          "default": "charge",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PaymentRailsConfig": {
+      "description": "Settlement rails and their provider credentials.\n\nEvery block is optional, but an advertised rail with no enabled block, or a Lightning advertisement with two enabled backends and no [`Self::lightning_backend`] selector, fails at load rather than at first request.",
+      "type": "object",
+      "properties": {
+        "x402": {
+          "description": "x402 v2 `exact`.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/X402RailConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stripe": {
+          "description": "Stripe PaymentIntents, used both directly and as the settlement half of Payment Auth `stripe` plus `charge`.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StripeRailConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lightning_cln": {
+          "description": "Core Lightning.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LightningClnRailConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lightning_lnd": {
+          "description": "LND.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LightningLndRailConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lightning_backend": {
+          "description": "Which backend an advertised Lightning rail resolves to. Required when both backends are configured; inferred when exactly one is.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LightningBackend"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "X402RailConfig": {
+      "description": "x402 v2 `exact` rail.",
+      "type": "object",
+      "required": [
+        "asset",
+        "asset_decimals",
+        "facilitators",
+        "max_timeout_seconds",
+        "network",
+        "pay_to",
+        "quote_currency"
+      ],
+      "properties": {
+        "scheme": {
+          "description": "Scheme name. Must equal [`X402_SCHEME`].",
+          "default": "exact",
+          "type": "string"
+        },
+        "network": {
+          "description": "CAIP-2 chain identifier, for example `eip155:84532`. A short chain nickname is rejected: an authoritative payment requirement must not depend on a translation table.",
+          "type": "string"
+        },
+        "asset": {
+          "description": "Asset contract address or identifier on `network`.",
+          "type": "string"
+        },
+        "quote_currency": {
+          "description": "ISO-4217 code the quote is priced in. Every rail a single route advertises must share this value; the proxy performs no currency conversion.",
+          "type": "string"
+        },
+        "asset_decimals": {
+          "description": "Decimal places in the asset's atomic unit. Used for the exact checked conversion from quote micros.",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "pay_to": {
+          "description": "Recipient address on `network`.",
+          "type": "string"
+        },
+        "max_timeout_seconds": {
+          "description": "Value copied into the requirement's `maxTimeoutSeconds`. Bounded by [`X402_MAX_TIMEOUT_SECONDS_RANGE`].",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "extra": {
+          "description": "Scheme-specific extra object copied verbatim into the requirement. Its JCS encoding is bounded by [`MAX_X402_EXTRA_JCS_BYTES`] and is byte-stable, so the client can echo it and the proxy can compare it exactly.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": true
+        },
+        "facilitators": {
+          "description": "Ordered facilitator candidates. Fallback is allowed only by issuing a fresh challenge; a signed requirement is bound to the one facilitator it selected.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/X402FacilitatorConfig"
+          }
+        },
+        "verify_timeout_ms": {
+          "description": "Budget for the `verify` call, in milliseconds.",
+          "default": 700,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "settle_timeout_ms": {
+          "description": "Budget for the `settle` call, in milliseconds.",
+          "default": 1200,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "breaker": {
+          "description": "Breaker around the facilitator.",
+          "default": {
+            "failure_threshold": 3,
+            "half_open_max": 1,
+            "open_ms": 5000
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/BreakerConfig"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "X402FacilitatorConfig": {
+      "description": "One facilitator candidate for the x402 rail.\n\nThe URL is the facilitator's complete API root. The adapter preserves every configured path segment, strips only trailing slashes, and appends exactly `/verify` or `/settle`; it never injects a version or protocol segment of its own.",
+      "type": "object",
+      "required": [
+        "facilitator_url"
+      ],
+      "properties": {
+        "facilitator_url": {
+          "description": "Absolute HTTPS API root. No userinfo, query, or fragment, and no endpoint suffix.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "BreakerConfig": {
+      "description": "Bounded circuit breaker around one provider endpoint.",
+      "type": "object",
+      "properties": {
+        "failure_threshold": {
+          "description": "Consecutive transport failures that open the breaker.",
+          "default": 3,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "open_ms": {
+          "description": "How long the breaker stays open, in milliseconds. Bounded by [`BREAKER_OPEN_MS_RANGE`].",
+          "default": 5000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "half_open_max": {
+          "description": "Probes admitted while half open. Exactly 1 in this release: a second concurrent probe against an unhealthy facilitator can dispatch a settlement nobody is waiting to record.",
+          "default": 1,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "StripeRailConfig": {
+      "description": "Stripe settlement rail.",
+      "type": "object",
+      "required": [
+        "api_key",
+        "business_network_id",
+        "currency_decimals",
+        "payment_method_types",
+        "quote_currency"
+      ],
+      "properties": {
+        "api_key": {
+          "description": "Secret reference to the Stripe secret key. Never inline.",
+          "type": "string"
+        },
+        "api_version": {
+          "description": "Stripe API version. Must equal [`STRIPE_API_VERSION`].",
+          "default": "2026-06-24.dahlia",
+          "type": "string"
+        },
+        "account_context": {
+          "description": "Account routing. Only `platform` is accepted in this release, and no `Stripe-Account` header is sent. Connect routing is deliberately not reachable from a challenge or a credential: a client-controlled destination account would let a payer choose who gets paid.",
+          "default": "platform",
+          "type": "string"
+        },
+        "business_network_id": {
+          "description": "Business network identifier copied into the method details of a Payment Auth request.",
+          "type": "string"
+        },
+        "quote_currency": {
+          "description": "ISO-4217 code the quote is priced in.",
+          "type": "string"
+        },
+        "currency_decimals": {
+          "description": "Declared minor-unit decimals for `quote_currency`. Checked against the built-in ISO-4217 table so a mis-declared currency cannot silently charge a hundred times the quoted price.",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "payment_method_types": {
+          "description": "Payment method types offered on the PaymentIntent.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "direct_payment_intent": {
+          "description": "Optional direct PaymentIntent mode.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DirectPaymentIntentConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "DirectPaymentIntentConfig": {
+      "description": "Direct Stripe PaymentIntent mode.\n\nThe challenge creates a manual-capture PaymentIntent and the credential retry captures it. Preparation must never capture funds or deliver the resource, so `automatic` capture is not accepted.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether the direct PaymentIntent mode is offered.",
+          "default": false,
+          "type": "boolean"
+        },
+        "capture_method": {
+          "description": "Capture mode. Only `manual` is accepted.",
+          "default": "manual",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "LightningClnRailConfig": {
+      "description": "Core Lightning rail, reached over its Unix-socket JSON-RPC.",
+      "type": "object",
+      "required": [
+        "quote_currency",
+        "rune",
+        "settlement_decimals",
+        "socket_path"
+      ],
+      "properties": {
+        "socket_path": {
+          "description": "Absolute path to the `lightning-rpc` Unix socket.",
+          "type": "string"
+        },
+        "rune": {
+          "description": "Secret reference to the rune that authorizes the RPC calls.",
+          "type": "string"
+        },
+        "minimum_version": {
+          "description": "Smallest accepted node version as `major.minor`. Cannot be set below [`MIN_CLN_VERSION`], whose `xpay` label and `listinvoices` status this adapter depends on. Startup checks the live version through `getinfo`.",
+          "default": "26.06",
+          "type": "string"
+        },
+        "quote_currency": {
+          "description": "ISO-4217 or asset code the quote is priced in.",
+          "type": "string"
+        },
+        "settlement_decimals": {
+          "description": "Decimal places in the settlement unit. `11` prices BTC in millisatoshis.",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "invoice_expiry_seconds": {
+          "description": "Invoice lifetime, in seconds. Bounded by [`INVOICE_EXPIRY_SECONDS_RANGE`].",
+          "default": 300,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "LightningLndRailConfig": {
+      "description": "LND rail, reached over gRPC.",
+      "type": "object",
+      "required": [
+        "endpoint",
+        "macaroon",
+        "quote_currency",
+        "settlement_decimals",
+        "tls_certificate_path"
+      ],
+      "properties": {
+        "endpoint": {
+          "description": "gRPC endpoint URL. Must be absolute and TLS-bearing.",
+          "type": "string"
+        },
+        "tls_certificate_path": {
+          "description": "Absolute path to the node's TLS certificate.",
+          "type": "string"
+        },
+        "macaroon": {
+          "description": "Secret reference to the hex-encoded macaroon.",
+          "type": "string"
+        },
+        "quote_currency": {
+          "description": "ISO-4217 or asset code the quote is priced in.",
+          "type": "string"
+        },
+        "settlement_decimals": {
+          "description": "Decimal places in the settlement unit.",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "invoice_expiry_seconds": {
+          "description": "Invoice lifetime, in seconds. Bounded by [`INVOICE_EXPIRY_SECONDS_RANGE`].",
+          "default": 300,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "LightningBackend": {
+      "description": "Which settlement backend serves an advertised Lightning rail.",
+      "oneOf": [
+        {
+          "description": "Core Lightning over its Unix-socket JSON-RPC.",
+          "type": "string",
+          "enum": [
+            "cln"
+          ]
+        },
+        {
+          "description": "LND over gRPC.",
+          "type": "string",
+          "enum": [
+            "lnd"
+          ]
+        }
+      ]
+    },
+    "UsageReportersConfig": {
+      "description": "Usage reporters. Accounting only.",
+      "type": "object",
+      "properties": {
+        "stripe_meter": {
+          "description": "Stripe Meter Events. Meter events record consumption; they never prove that a payment settled and can never move an access intent to `Succeeded`.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StripeMeterReporterConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "StripeMeterReporterConfig": {
+      "description": "Stripe Meter Events reporter.",
+      "type": "object",
+      "required": [
+        "customer_field",
+        "event_name"
+      ],
+      "properties": {
+        "event_name": {
+          "description": "Meter event name registered in the Stripe dashboard.",
+          "type": "string"
+        },
+        "customer_field": {
+          "description": "Field on the request context that carries the Stripe customer identifier.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "RawOriginConfig": {
       "description": "A single origin config as it appears in YAML. Plugin-specific fields are kept as `serde_json::Value` for deferred parsing.",

@@ -2227,6 +2227,12 @@ pub fn handle_admin_request(
     if let Some(response) = crate::admin_cluster::dispatch(method, path, body) {
         return response;
     }
+    // WOR-2100: settlement status and the reconciliation trigger. Takes no
+    // body: the only input is a bounded claim limit in the query string, and
+    // there is no route here that can mark an attempt settled.
+    if let Some(response) = crate::admin_payments::dispatch(method, path) {
+        return response;
+    }
     // Config-authority publication, status, and subscriber management.
     // Deliberately here, behind the operator-auth gate: publishing a
     // config is an operator action. The bundle endpoint subscribers fetch

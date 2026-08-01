@@ -1,233 +1,172 @@
-# Stripe MPP billing rail (test mode)
-*Last modified: 2026-07-09*
+# Payment HTTP Authentication settling on Stripe
 
-Stripe MPP (Merchant Payment Protocol) paywall in front of a markdown
-feed origin, configured to talk to Stripe in test mode. Operators
-bring their own `STRIPE_SECRET_KEY=sk_test_...`; the example never
-ships a real key.
+*Last modified: 2026-08-01*
 
-The README covers two paths:
+A markdown feed that costs $0.005 to a declared AI crawler, charged
+through the IETF Payment authentication scheme with Stripe PaymentIntents
+underneath. The example is where the two halves stay visibly separate:
+`protocols.payment_auth` is the wire protocol, `rails.stripe` is what
+moves the money, and `usage_reporters.stripe_meter` records consumption
+without being able to settle anything.
 
-1. The default stack with Stripe test mode. Requires a Stripe
-   account and a test key; the redemption flow exercises the real
-   Stripe API.
-2. A wiremock fallback. Useful for CI environments that cannot
-   reach the Stripe API or do not have a test key. The wiremock
-   container stands in for `api.stripe.com` and returns
-   PaymentIntents-shaped JSON so the proxy's redemption path stays
-   exercised end-to-end.
+Payment HTTP Authentication is a credential transport, not a network. That
+is why there is no `mpp` rail to configure, and why enabling
+`protocols.payment_auth` without `rails.stripe` is a load error.
 
-## How it composes
+## What is in the bundle
 
-| Service     | Image                              | Role                                                              |
-|-------------|------------------------------------|-------------------------------------------------------------------|
-| sbproxy     | built from `Dockerfile.cloudbuild` | Reverse proxy on `:8080` enforcing `ai_crawl_control` per `sb.yml`. |
-| mock-origin | `nginx:1.27.3-alpine`              | Markdown feed origin. Returns one canned Markdown body on `/feed/*`. |
-| wiremock    | `wiremock/wiremock:3.10.1`         | Optional. Stripe API stand-in when no test key is available.       |
+| File | Role |
+|---|---|
+| `sb.yml` | `protocols.payment_auth`, `rails.stripe`, and the meter reporter |
+| `docker-compose.yml` | `sbproxy` plus a markdown feed origin, and an optional Stripe stand-in |
+| `mock-origin/` | nginx serving one canned markdown body |
+| `wiremock-stripe/` | Stripe-shaped JSON for offline work on the settlement path |
+| `Makefile` | `up`, `up-wiremock`, `down`, `logs`, `test` |
+| `smoke.json` | Liveness manifest for `scripts/examples-smoke.sh` |
 
-`wiremock` lives behind the `wiremock` profile so a default `up`
-does not start it:
+## Prerequisites
+
+Config validation needs nothing at all. Serving needs a binding key, a
+32-byte recovery key, and a Stripe test key.
 
 ```bash
-docker compose up -d --wait                    # Stripe test mode
-docker compose --profile wiremock up -d --wait # Offline / wiremock mode
+cargo build -p sbproxy --release --features payments,payment-mpp,payment-stripe
+sbproxy validate -f examples/rail-mpp-stripe-test/sb.yml
 ```
 
-## How to get a Stripe test key
-
-The full setup is documented in Stripe's dashboard, but the short
-form is:
-
-1. Sign in at <https://dashboard.stripe.com>. New accounts default
-   to test mode.
-2. Open `Developers > API keys` and copy the **Secret key**. It
-   starts with `sk_test_`.
-3. Install the Stripe CLI: `brew install stripe/stripe-cli/stripe`
-   (or follow the platform instructions in the Stripe docs).
-4. `stripe login` to bind the CLI to your test mode account.
-5. `stripe listen --forward-to http://127.0.0.1:8080/_stripe/webhook`
-   to receive webhook events; the CLI prints a one-off `whsec_*`
-   webhook signing secret on first run. Use it as
-   `STRIPE_WEBHOOK_SECRET`.
-
-The example reads both env vars from the operator's shell:
-
 ```bash
+export SBPROXY_PAYMENT_BINDING_KEY="$(openssl rand -hex 32)"
+export SBPROXY_PAYMENT_RECOVERY_KEY="$(openssl rand -hex 32)"
 export STRIPE_SECRET_KEY=sk_test_...
-export STRIPE_WEBHOOK_SECRET=whsec_...
 docker compose up -d --wait
 ```
 
-The proxy's Wave 3 emission path does not call Stripe (the 402 body
-embeds a placeholder `pi_pending_<quote_id>` id; the worker (G3.3)
-creates the real PaymentIntent on the redeem path), so the env vars
-are unused for the 402 walk-through and only matter for the
-end-to-end redemption demo below.
+A test key comes from the Stripe dashboard under `Developers > API keys`;
+new accounts default to test mode. Nothing in this example charges a real
+card, and no key is committed here.
 
-## How to run
+## Why the recovery key is not optional
 
-```bash
-cd examples/rail-mpp-stripe-test
-docker compose up -d --wait
+Enabling `rails.stripe` without `recovery_encryption` fails at load:
+
+```text
+proxy.payments.recovery_encryption is required when
+proxy.payments.rails.stripe is set, because a crashed create must be
+recoverable under the same idempotency key and the Payment Auth form of
+that request contains a single-use payment token
 ```
 
-Tear down:
+A process that dies between stamping a dispatch and recording the response
+leaves a write whose fate is unknown. The only safe resolution is
+replaying byte-identical request bytes under the same idempotency key,
+which means those bytes have to survive the crash, which means they have
+to be encrypted, because in the Payment Auth form they contain a
+single-use payment token. The rail refuses to start without the key that
+seals them.
+
+The key must decode to exactly 32 bytes. Load-time validation only checks
+that the field names a secret; startup checks the length.
+
+## The challenge
 
 ```bash
-docker compose down -v
+curl -is \
+  -H 'Host: feed.test.sbproxy.dev' \
+  -H 'User-Agent: ClaudeBot/1.0' \
+  -H 'Accept-Payment: stripe;intent=charge' \
+  http://127.0.0.1:8080/feed/articles/2026
 ```
 
-The `Makefile` wraps the same calls (`make up`, `make up-wiremock`,
-`make down`, `make logs`, `make test`).
+```http
+HTTP/1.1 402 Payment Required
+Cache-Control: no-store
+WWW-Authenticate: Payment id="...", realm="feed.test.sbproxy.dev", method="stripe", intent="charge", request="...", expires="2026-08-01T12:05:00Z", opaque="..."
+Content-Type: application/problem+json
+```
 
-## What to expect
+`Accept-Payment` is preference only. It carries no token, no signature,
+and no amount, and it never authorizes a request. It picks which challenge
+comes back.
 
-### 1. Browser, no Accept-Payment
+Each offered challenge is its own `WWW-Authenticate` field. Parameters
+appear in a fixed order and every value is quoted.
+[docs/402-challenge.md](../../docs/402-challenge.md) has the full
+parameter table, the seven-slot binding input, and the exact fixture
+bytes.
 
-Browser UA never matches the crawler list, so the policy never
-charges and the proxy forwards to the mock origin.
+## The retry
+
+The client decodes `request`, obtains a single-use payment token for that
+charge, and retries with one `Authorization` field:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' \
-     -H 'Host: feed.test.sbproxy.dev' \
-     -H 'Accept: text/markdown' \
-     http://127.0.0.1:8080/feed/articles/2026
-# => 200
+curl -is \
+  -H 'Host: feed.test.sbproxy.dev' \
+  -H 'User-Agent: ClaudeBot/1.0' \
+  -H "Authorization: Payment $CREDENTIAL" \
+  http://127.0.0.1:8080/feed/articles/2026
 ```
 
-### 2. AI crawler, Accept-Payment: mpp
+Two `Payment` credentials on one request are a 400, not a 402: the request
+is malformed rather than unpaid. A `Bearer` field alongside the `Payment`
+field is skipped rather than rejected, so ordinary authentication still
+works on a paid route.
 
-The agent opts in via `Accept-Payment: mpp`. The policy emits a 402
-with `Content-Type: application/sbproxy-multi-rail+json` and one
-`mpp` rail entry in the body.
+On success the response carries `Cache-Control: private` and one
+`Payment-Receipt` field whose `reference` is the PaymentIntent id, so the
+payment is findable in the Stripe dashboard. No error response ever
+carries a receipt.
 
-```bash
-curl -i \
-     -H 'Host: feed.test.sbproxy.dev' \
-     -H 'User-Agent: ClaudeBot/1.0' \
-     -H 'Accept: text/markdown' \
-     -H 'Accept-Payment: mpp' \
-     http://127.0.0.1:8080/feed/articles/2026
-# HTTP/1.1 402 Payment Required
-# Content-Type: application/sbproxy-multi-rail+json
-# {
-#   "rails": [
-#     {
-#       "kind": "mpp",
-#       "version": "1",
-#       "stripe_payment_intent": "pi_pending_<quote_id>",
-#       "amount_micros": 5000,
-#       "currency": "USD",
-#       "expires_at": "2026-05-02T...",
-#       "quote_token": "eyJhbGc..."
-#     }
-#   ],
-#   "agent_choice_method": "header_negotiation",
-#   "policy": "first_match_wins"
-# }
-```
+## Settlement and usage reporting are different things
 
-`stripe_payment_intent` is a placeholder (`pi_pending_*`) in Wave 3.
-The agent does not confirm the placeholder; it confirms the real
-`pi_*` the worker creates on redeem.
+Both talk to Stripe. Only one can open a route.
 
-### 3. Walking through PaymentIntents end-to-end
+| | PaymentIntents | Meter Events |
+|---|---|---|
+| Config block | `rails.stripe` | `usage_reporters.stripe_meter` |
+| Registry | Settlement adapters | Usage reporters |
+| Can produce a receipt | Yes | No |
+| Can move an intent to `Succeeded` | Yes | No |
+| Runs on | The request path, under one bounded deadline | The worker's queue |
 
-With `STRIPE_SECRET_KEY` set, the agent's redemption flow looks
-like this (the proxy's MPP worker handles the Stripe-side dance):
+The separation is enforced by the types rather than by a code comment. A
+usage reporter has no way to construct a settlement receipt and no way to
+reach the transition that commits one.
 
-1. Agent fetches the URL, receives the 402 with the `mpp` rail
-   entry and a `quote_token` JWS.
-2. Agent fetches `/.well-known/sbproxy/quote-keys.json` from the
-   admin port and verifies the JWS.
-3. Agent posts the quote to the proxy's redeem endpoint. The MPP
-   worker creates a real PaymentIntent against the configured
-   `STRIPE_SECRET_KEY` and returns the `client_secret`.
-4. Agent confirms the PaymentIntent against `api.stripe.com` (or
-   the wiremock if running offline).
-5. Agent retries the original request with the redeemed quote
-   token in the `Crawler-Payment` header. The proxy validates and
-   forwards.
+## Direct PaymentIntent mode
 
-For a full hands-on walkthrough you can fire a synthetic
-`payment_intent.succeeded` from the Stripe CLI:
+`direct_payment_intent.enabled: true` also offers Stripe directly, for
+clients that already speak it. The challenge creates a manual-capture
+PaymentIntent and returns its one-shot client secret in the immediate
+response body. That value is never persisted, never hashed, and never
+logged. The client confirms, retries, and the proxy retrieves, captures,
+and requires `succeeded` before the origin is called.
 
-```bash
-stripe trigger payment_intent.succeeded
-```
+`capture_method: automatic` is rejected at load. Preparing a challenge
+must not take money for a resource that has not been delivered.
 
-The proxy's webhook handler (gated on `STRIPE_WEBHOOK_SECRET`)
-verifies the signature and audits the event.
-
-### 4. Simulating a dispute
-
-Stripe in test mode lets you create disputes synthetically:
-
-```bash
-stripe trigger charge.dispute.created
-```
-
-The agent SDK's response to a dispute is out of scope for the proxy
-(disputes are settled through the Stripe dashboard); the proxy only
-audits the dispute event so the operator has a paper trail.
-
-## Wiremock fallback
-
-When `STRIPE_SECRET_KEY` is not available (CI without Stripe
-credentials, air-gapped network, etc.), the wiremock profile spins
-up a Stripe stand-in:
+## Offline work on the settlement path
 
 ```bash
 docker compose --profile wiremock up -d --wait
 ```
 
-The wiremock container serves Stripe-shaped JSON on the same
-endpoints the worker would call (`POST /v1/payment_intents`,
-`POST /v1/payment_intents/<id>/confirm`). Mappings live under
-`wiremock-stripe/mappings/`. The proxy will not actually call
-wiremock during the 402-emission path on Wave 3, so this profile is
-mostly here for offline development of the redemption side.
+The wiremock container serves Stripe-shaped JSON on the endpoints the rail
+calls. Mappings live under `wiremock-stripe/mappings/`. It is for
+developing against the wire shapes without a Stripe account; it proves
+nothing about settlement, because a stub asserting success is not a
+provider confirming one.
 
-To point a redemption-flow test at the wiremock instead of
-`api.stripe.com`, override the proxy's MPP base URL via env. The
-exact override knob lands with G3.3 (worker); for now the wiremock
-container is wired but unused.
+## Clean up
 
-## What if I do not have a Stripe key?
+```bash
+docker compose down -v
+```
 
-The Wave 3 emission path is independent of Stripe. The proxy mints
-the placeholder `pi_pending_*` id from the quote-token's
-`quote_id`, signs the JWS, and returns the multi-rail body. So
-without a Stripe key:
+## Related
 
-- Liveness probes pass.
-- The 402 emission walkthrough above works exactly as documented.
-- The end-to-end redemption flow does not work, because the worker
-  cannot create a real PaymentIntent.
-
-`scripts/examples-smoke.sh` runs only the liveness check, so this
-example passes CI without a Stripe key. The `smoke.json`
-`skip_unless_env` field is a soft hint for a future smoke runner
-that wants to gate an additional probe on the env var.
-
-## Cargo features
-
-The example assumes a default-features `sbproxy` build (which
-includes `tiered-pricing`, `agent-class`, and `http-ledger`). The
-multi-rail emission path is unconditional in the `sbproxy-modules`
-crate; no operator-set cargo feature is needed to enable MPP itself.
-The `Dockerfile.cloudbuild` image used by `docker-compose.yml` ships
-the default feature set.
-
-## Related docs
-
-- `docs/ai-crawl-control.md` - operator-facing crawl-control and
-  billing reference.
-- `docs/402-challenge.md` - wire shape of the 402 body, the
-  quote-token JWS shape and JWKS publication, and the per-rail
-  asset mapping in the multi-rail body.
-- `examples/rail-x402-base-sepolia/` - x402 rail counterpart.
-- `examples/multi-rail-accept-payment/` - both rails wired
-  together with q-value negotiation.
-- `examples/quote-token-replay-jwks/` - JWKS endpoint and
-  single-use quote token enforcement.
+- [docs/payment-settlement.md](../../docs/payment-settlement.md) - every `proxy.payments` field, the state table, and the unsupported boundaries.
+- [docs/402-challenge.md](../../docs/402-challenge.md) - challenge parameters, credential shape, problem documents, and receipt encoding.
+- `examples/rail-x402-base-sepolia/` - x402 v2 `exact`.
+- `examples/rail-lightning/` - CLN and LND as alternative backends.
+- `examples/multi-rail-accept-payment/` - several rails on one route.

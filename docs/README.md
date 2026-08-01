@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-01*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -69,6 +69,7 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [agent-skills.md](agent-skills.md) - Agent Skills v0.2.0 well-known projection: schema, integrity, archive safety, no-script-execution contract.
 - [cloudflare-code-mode.md](cloudflare-code-mode.md) - typed TypeScript module emission for Cloudflare Code Mode agents over the MCP federation registry.
 - [ai-crawl-control.md](ai-crawl-control.md) - the `ai_crawl_control` policy: Pay Per Crawl token challenge and ledger trait.
+- [payment-settlement.md](payment-settlement.md) - `proxy.payments`: charge for a request and prove it was paid before the origin is called.
 - [content-for-agents.md](content-for-agents.md) - operator guide to agent-aware content delivery: shape negotiation, body transforms, well-known license posture.
 - [rsl.md](rsl.md) - RSL 1.0 licensing cookbook: expressing license stance via YAML and the resulting `/licenses.xml` projection.
 - [web-bot-auth.md](web-bot-auth.md) - the `bot_auth` provider: verifying RFC 9421-signed AI crawlers against a published key directory.
@@ -116,7 +117,8 @@ Point a framework you already run at the gateway: chat completions through the O
 
 ## Reference
 
-- [402-challenge.md](402-challenge.md) - wire-format contract for the `402 Payment Required` body.
+- [payment-settlement.md](payment-settlement.md) - `proxy.payments`: rails, durable intents, the state table that gates origin access, timeouts, reconciliation, and the exact unsupported boundaries.
+- [402-challenge.md](402-challenge.md) - the exact bytes of every payment challenge, credential, problem document, and receipt.
 - [l402.md](l402.md) - L402 (Lightning HTTP 402) macaroon bearer credential surface: issuer, verifier, attenuation, payment-hash binding.
 - [admin-api-reference.md](admin-api-reference.md) - per-route schema for the embedded admin server (`/api/*`, `/admin/*`, and the unauthenticated probe routes).
 - [config-stability.md](config-stability.md) - field stability guarantees and versioning.

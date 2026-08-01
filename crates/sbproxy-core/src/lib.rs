@@ -25,6 +25,11 @@ pub mod admin_compression;
 pub mod admin_keys;
 /// Model-host status admin API (`/admin/model-host/status`), WOR-1665.
 pub mod admin_model_host;
+/// Settlement status and the reconciliation trigger
+/// (`/admin/payments/*`), WOR-2100. Compiled unconditionally so the routes
+/// answer with a clear reason on a build without the `payments` feature
+/// rather than falling through to a bare 404.
+pub mod admin_payments;
 /// Admin chat playground: list configured AI endpoints and run a chat
 /// completion against any of them through the production AI dispatch
 /// path. Handled in the async admin connection handler.
@@ -42,6 +47,13 @@ pub mod admin_ui;
 pub mod agent_class;
 /// Boot wiring for the alert evaluation loop (dispatcher + engine + drain).
 pub mod alerting;
+/// WOR-2100: runtime assembly for authoritative payment settlement.
+///
+/// Opens the durable settlement store, registers the rail adapters this
+/// build compiled, and owns the recovery worker's lifecycle. Feature-gated
+/// by `payments`, so a build without settlement carries none of it.
+#[cfg(feature = "payments")]
+pub mod billing_runtime;
 /// Empty-shell registry for built-in policy
 /// enforcer wrappers.
 ///
@@ -115,6 +127,9 @@ pub mod mesh_cache;
 pub mod model_discovery;
 /// Authenticated private model-plane dispatch primitives.
 pub mod model_plane;
+/// Signs payment requirements into the existing quote JWS.
+#[cfg(feature = "payments")]
+pub mod payment_signer;
 /// Managed-model runtime integration exposed for lifecycle adapters and
 /// black-box reload tests.
 #[doc(hidden)]
