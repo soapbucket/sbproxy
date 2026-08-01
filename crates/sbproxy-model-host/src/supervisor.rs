@@ -76,10 +76,7 @@ impl EngineState {
 /// crate treats it as opaque data the launcher consumes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaunchSpec {
-    /// The engine this spec launches. The launcher dispatches on it:
-    /// an in-process engine ([`crate::config::EngineKind::Embedded`])
-    /// starts a server inside the process instead of spawning
-    /// `program` (WOR-1658).
+    /// The engine this spec launches.
     pub engine: crate::config::EngineKind,
     /// Executable resolved from PATH (or a pinned release). Unused for
     /// an in-process engine.

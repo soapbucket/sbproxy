@@ -1266,11 +1266,6 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                     })?;
                     crate::launch::llama_use_local_model(&mut spec.args, local);
                 }
-                crate::config::EngineKind::Embedded => {
-                    if let Some(model) = spec.args.first_mut() {
-                        *model = ready.snapshot_path.display().to_string();
-                    }
-                }
                 crate::config::EngineKind::MistralRs => {
                     // mistral.rs mirrors vLLM here: retarget `-m` to the
                     // verified immutable snapshot directory (WOR-1861).
@@ -1306,66 +1301,63 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         // compatibility. An explicit CUDA build fails closed because an
         // unknown PATH binary cannot prove CUDA support or source identity.
         // Misconfigured acquisition is caught at config validate/plan time.
-        // In-process engines have no binary to acquire.
-        if !engine_kind.is_in_process() {
-            let prov = self.config.engines.get(&engine_kind);
-            let on_path = crate::llama_release::resolve_on_path(engine_kind.binary_name());
-            match crate::acquire::plan_binary_acquire(engine_kind, prov, on_path) {
-                crate::acquire::BinaryAcquirePlan::OnPath(p)
-                | crate::acquire::BinaryAcquirePlan::Explicit(p) => {
-                    spec.program = p.to_string_lossy().into_owned();
-                }
-                crate::acquire::BinaryAcquirePlan::FetchRelease { tag, accel, sha256 } => {
-                    match self
-                        .acquire_llama_release(&tag, accel, sha256.as_deref())
-                        .await
-                    {
-                        Ok(p) => spec.program = p.to_string_lossy().into_owned(),
-                        Err(e) => tracing::warn!(
-                            engine = engine_kind.binary_name(),
-                            "engine release acquisition failed: {e}; falling back to PATH"
-                        ),
-                    }
-                }
-                crate::acquire::BinaryAcquirePlan::BuildCuda { tag, source_sha256 } => {
-                    let path = self
-                        .acquire_cuda_llama(&tag, &source_sha256)
-                        .await
-                        .map_err(RuntimeError::Launch)?;
-                    spec.program = path.to_string_lossy().into_owned();
-                }
-                crate::acquire::BinaryAcquirePlan::ProvisionUvx { vllm_version } => {
-                    // Fetch uv, then run the Python-package engine (vLLM or
-                    // SGLang) through `uv tool run`. uv sets up (and caches)
-                    // the environment, and the default wheel is CUDA-enabled,
-                    // so this offloads to an NVIDIA GPU on a box that only
-                    // carries the driver. `wrap_uvx` dispatches on the engine.
-                    // Best-effort: on failure, fall back to spawning from PATH.
-                    match self.acquire_uv().await {
-                        Ok(uv) => {
-                            spec = crate::launch::wrap_uvx(
-                                &spec,
-                                &uv.to_string_lossy(),
-                                vllm_version.as_deref(),
-                            );
-                            tracing::info!(
-                                engine = engine_kind.binary_name(),
-                                "running the engine via uvx; the first launch provisions the \
-                                 environment (this can take several minutes and a few GB)"
-                            );
-                        }
-                        Err(e) => tracing::warn!(
-                            engine = engine_kind.binary_name(),
-                            "uv acquisition for the uvx path failed: {e}; falling back to PATH"
-                        ),
-                    }
-                }
-                crate::acquire::BinaryAcquirePlan::Blocked(reason) => {
-                    tracing::debug!(
+        let prov = self.config.engines.get(&engine_kind);
+        let on_path = crate::llama_release::resolve_on_path(engine_kind.binary_name());
+        match crate::acquire::plan_binary_acquire(engine_kind, prov, on_path) {
+            crate::acquire::BinaryAcquirePlan::OnPath(p)
+            | crate::acquire::BinaryAcquirePlan::Explicit(p) => {
+                spec.program = p.to_string_lossy().into_owned();
+            }
+            crate::acquire::BinaryAcquirePlan::FetchRelease { tag, accel, sha256 } => {
+                match self
+                    .acquire_llama_release(&tag, accel, sha256.as_deref())
+                    .await
+                {
+                    Ok(p) => spec.program = p.to_string_lossy().into_owned(),
+                    Err(e) => tracing::warn!(
                         engine = engine_kind.binary_name(),
-                        "engine binary not acquired ({reason}); using PATH"
-                    );
+                        "engine release acquisition failed: {e}; falling back to PATH"
+                    ),
                 }
+            }
+            crate::acquire::BinaryAcquirePlan::BuildCuda { tag, source_sha256 } => {
+                let path = self
+                    .acquire_cuda_llama(&tag, &source_sha256)
+                    .await
+                    .map_err(RuntimeError::Launch)?;
+                spec.program = path.to_string_lossy().into_owned();
+            }
+            crate::acquire::BinaryAcquirePlan::ProvisionUvx { vllm_version } => {
+                // Fetch uv, then run the Python-package engine (vLLM or
+                // SGLang) through `uv tool run`. uv sets up (and caches)
+                // the environment, and the default wheel is CUDA-enabled,
+                // so this offloads to an NVIDIA GPU on a box that only
+                // carries the driver. `wrap_uvx` dispatches on the engine.
+                // Best-effort: on failure, fall back to spawning from PATH.
+                match self.acquire_uv().await {
+                    Ok(uv) => {
+                        spec = crate::launch::wrap_uvx(
+                            &spec,
+                            &uv.to_string_lossy(),
+                            vllm_version.as_deref(),
+                        );
+                        tracing::info!(
+                            engine = engine_kind.binary_name(),
+                            "running the engine via uvx; the first launch provisions the \
+                             environment (this can take several minutes and a few GB)"
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        engine = engine_kind.binary_name(),
+                        "uv acquisition for the uvx path failed: {e}; falling back to PATH"
+                    ),
+                }
+            }
+            crate::acquire::BinaryAcquirePlan::Blocked(reason) => {
+                tracing::debug!(
+                    engine = engine_kind.binary_name(),
+                    "engine binary not acquired ({reason}); using PATH"
+                );
             }
         }
 

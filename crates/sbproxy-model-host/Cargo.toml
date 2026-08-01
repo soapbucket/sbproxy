@@ -34,14 +34,6 @@ weights = ["dep:reqwest"]
 # previously had to fall back to a length-based heuristic for want of
 # this one flag; with it on, local-model callers get an exact count.
 tokenizer = ["dep:tokenizers", "dep:minijinja"]
-# In-process embedded engine (WOR-1658): runs a model inside the gateway
-# with no subprocess, for a single-binary / zero-external-engine deploy.
-# Off by default. Backed by mistral.rs (Gemma, Qwen, Llama, ...) served
-# over a loopback OpenAI endpoint via axum, so the runtime routes to it
-# exactly like a subprocess engine. mistral.rs is a large dependency
-# tree (candle etc.), so it is strictly opt-in and absent from the
-# default build + the lean lockfile path.
-embedded = ["dep:mistralrs", "dep:axum"]
 # Xet-aware weight download through hf-hub's managed client: a chunk
 # already local or shared with another cached file is never re-fetched.
 # Additive to `weights`, not a replacement for it -- hf-hub pulls its
@@ -95,12 +87,6 @@ hf-hub = { version = "1.0", optional = true }
 # extension) so no new lock entries are pulled.
 tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
 minijinja = { workspace = true, optional = true }
-# WOR-1658 embedded engine (feature `embedded`). Large dep tree; opt-in only.
-# WOR-1861: pinned to the v0.9.0 git tag because crates.io still serves 0.8.1.
-# 0.9 brings PagedAttention default-on for CUDA, CUDA graphs, FlashInfer, and
-# prebuilt release binaries; re-pin to a crates.io version once 0.9 publishes.
-mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs", tag = "v0.9.0", optional = true }
-axum = { version = "0.8", optional = true }
 
 # WOR-1829: the GPU/RAM probes read sysctl keys via the sysctlbyname(3)
 # syscall so they work inside sandboxes that block spawning the `sysctl`

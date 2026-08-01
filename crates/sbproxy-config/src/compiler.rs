@@ -24,10 +24,10 @@ use smallvec::SmallVec;
 use crate::snapshot::{CompiledConfig, CompiledOrigin};
 use crate::types::{
     AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig,
-    AttestationOriginHeaderConfig, AttestationQueueConfig, AttestationRole,
-    AttestationRouteWeightConfig, ConfigFile, EnforcementMode, FailureMode, L2CacheConfig,
-    L2CacheParams, MessengerSettings, OriginAttestationConfig, RawOriginConfig, WebBotAuthConfig,
-    ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, MAX_ATTESTATION_QUEUE_ENTRIES,
+    AttestationMeasuredConfig, AttestationOriginHeaderConfig, AttestationQueueConfig,
+    AttestationRole, AttestationRouteWeightConfig, ConfigFile, EnforcementMode, FailureMode,
+    L2CacheConfig, L2CacheParams, MessengerSettings, OriginAttestationConfig, RawOriginConfig,
+    WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, MAX_ATTESTATION_QUEUE_ENTRIES,
 };
 
 const MAX_REDIS_TLS_FILE_BYTES: u64 = 1_048_576;
@@ -1843,9 +1843,17 @@ fn validate_attestation(
         None => {}
     }
 
-    validate_attestation_unit_resolvers(&attestation.route_weights, &attestation.origin_headers)?;
+    validate_attestation_unit_resolvers(
+        &attestation.measured,
+        &attestation.route_weights,
+        &attestation.origin_headers,
+    )?;
 
-    if engaged && attestation.route_weights.is_empty() && attestation.origin_headers.is_empty() {
+    if engaged
+        && attestation.measured.is_empty()
+        && attestation.route_weights.is_empty()
+        && attestation.origin_headers.is_empty()
+    {
         // Not an error. A deployment can legitimately want the record
         // without the arithmetic: an event per call, an outcome, and a
         // chain that proves none went missing. It is worth saying out
@@ -1854,8 +1862,8 @@ fn validate_attestation(
         // diligently and bills nothing, and the receipts look fine.
         tracing::warn!(
             "proxy.attestation declares a role but no unit resolvers, so every receipt will \
-             record an outcome with an empty units list. Declare \
-             proxy.attestation.route_weights or proxy.attestation.origin_headers to price \
+             record an outcome with an empty units list. Declare proxy.attestation.measured, \
+             proxy.attestation.route_weights, or proxy.attestation.origin_headers to price \
              the calls."
         );
     }
@@ -1867,16 +1875,31 @@ fn validate_attestation(
 /// invoice.
 ///
 /// The cross-cutting check is the one worth having here: a unit name has
-/// to identify one invoice line. Route weights may repeat a name on
-/// purpose, because several routes priced differently are still one
-/// line, and the most specific match wins. Everything else that repeats
-/// a name produces two entries on one receipt that a buyer cannot tell
-/// apart, and worse, whose provenance differs, which defeats the reason
-/// the units are broken out by source in the first place.
+/// to identify one invoice line, across all three lists rather than
+/// within each one. Route weights may repeat a name on purpose, because
+/// several routes priced differently are still one line, and the most
+/// specific match wins. Everything else that repeats a name produces two
+/// entries on one receipt that a buyer cannot tell apart, and worse,
+/// whose provenance differs, which defeats the reason the units are
+/// broken out by source in the first place.
 fn validate_attestation_unit_resolvers(
+    measured: &[AttestationMeasuredConfig],
     route_weights: &[AttestationRouteWeightConfig],
     origin_headers: &[AttestationOriginHeaderConfig],
 ) -> Result<()> {
+    let mut measured_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for (index, entry) in measured.iter().enumerate() {
+        validate_attestation_measured(index, entry)?;
+        let name: &str = entry.name.trim();
+        if !measured_names.insert(name) {
+            anyhow::bail!(
+                "proxy.attestation.measured: `{name}` is declared twice. One unit name is one \
+                 invoice line, and two quantities filling the same line would produce a receipt \
+                 nobody can read."
+            );
+        }
+    }
+
     let mut route_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     let mut seen_routes: std::collections::HashSet<(String, Option<String>, String)> =
         std::collections::HashSet::new();
@@ -1896,6 +1919,13 @@ fn validate_attestation_unit_resolvers(
                  you meant."
             );
         }
+        if measured_names.contains(name) {
+            return Err(unit_name_claimed_twice(
+                name,
+                "a measured unit",
+                "a route weight",
+            ));
+        }
         route_names.insert(name);
     }
 
@@ -1910,14 +1940,55 @@ fn validate_attestation_unit_resolvers(
                  receipt nobody can read."
             );
         }
-        if route_names.contains(name) {
-            anyhow::bail!(
-                "proxy.attestation: `{name}` is declared as both a route weight and an origin \
-                 header. One name has to mean one thing on a receipt: a buyer reading two \
-                 `{name}` lines with different provenance cannot tell which number came from \
-                 where, which is the whole reason units carry a source."
-            );
+        if measured_names.contains(name) {
+            return Err(unit_name_claimed_twice(
+                name,
+                "a measured unit",
+                "an origin header",
+            ));
         }
+        if route_names.contains(name) {
+            return Err(unit_name_claimed_twice(
+                name,
+                "a route weight",
+                "an origin header",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// The error for one unit name claimed by two different resolvers.
+///
+/// Written once rather than three times so the three pairings cannot
+/// drift apart in wording; the reason is identical in every one of them.
+fn unit_name_claimed_twice(name: &str, first: &str, second: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "proxy.attestation: `{name}` is declared as both {first} and {second}. One name has to \
+         mean one thing on a receipt: a buyer reading two `{name}` lines with different \
+         provenance cannot tell which number came from where, which is the whole reason units \
+         carry a source."
+    )
+}
+
+/// Reject a measured entry that names nothing or divides by nothing.
+fn validate_attestation_measured(index: usize, entry: &AttestationMeasuredConfig) -> Result<()> {
+    let name: &str = entry.name.trim();
+    if name.is_empty() {
+        anyhow::bail!(
+            "proxy.attestation.measured[{index}].name is empty; every entry needs a non-empty \
+             `name`, because it is the invoice line the count is billed on"
+        );
+    }
+
+    if entry.per == 0 {
+        anyhow::bail!(
+            "proxy.attestation.measured[{index}].per is 0. `per` is a divisor: it says how much \
+             of the raw quantity makes one unit, so a divisor of zero cannot produce a unit \
+             count for `{name}`. Use 1 to bill one unit per observed item, or 1024 to bill \
+             kibibytes."
+        );
     }
 
     Ok(())
@@ -5629,8 +5700,152 @@ origins:
         let compiled = compile_config(&attestation_yaml("\n    role: receipt"))
             .expect("a role without unit resolvers is not an error");
         let attestation = compiled.server.attestation.expect("attestation present");
+        assert!(attestation.measured.is_empty());
         assert!(attestation.route_weights.is_empty());
         assert!(attestation.origin_headers.is_empty());
+    }
+
+    // --- WOR-2145: the measured unit resolver ---
+
+    #[test]
+    fn attestation_measured_units_survive_compilation_with_per_defaulted() {
+        let compiled = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    measured:\
+             \n      - name: api_call\
+             \n        quantity: requests\
+             \n      - name: egress_kib\
+             \n        quantity: bytes_out\
+             \n        per: 1024",
+        ))
+        .expect("a complete block with measured units compiles");
+
+        let attestation = compiled
+            .server
+            .attestation
+            .expect("the attestation block survives compilation");
+
+        assert_eq!(attestation.measured.len(), 2);
+        assert_eq!(attestation.measured[0].name, "api_call");
+        assert_eq!(
+            attestation.measured[0].quantity,
+            crate::types::AttestationMeasuredQuantity::Requests
+        );
+        assert_eq!(
+            attestation.measured[0].per, 1,
+            "an omitted `per` bills one unit per observed item"
+        );
+        assert_eq!(
+            attestation.measured[1].per, 1024,
+            "1024 against bytes_out is what turns bytes into kibibytes"
+        );
+    }
+
+    #[test]
+    fn attestation_every_measured_quantity_spelling_parses() {
+        use crate::types::AttestationMeasuredQuantity as Quantity;
+
+        let compiled = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    measured:\
+             \n      - name: api_call\
+             \n        quantity: requests\
+             \n      - name: ingress_kib\
+             \n        quantity: bytes_in\
+             \n        per: 1024\
+             \n      - name: egress_kib\
+             \n        quantity: bytes_out\
+             \n        per: 1024\
+             \n      - name: compute_second\
+             \n        quantity: duration_ms\
+             \n        per: 1000",
+        ))
+        .expect("every quantity the meter counts is spellable in config");
+
+        let quantities: Vec<Quantity> = compiled
+            .server
+            .attestation
+            .expect("attestation present")
+            .measured
+            .iter()
+            .map(|entry| entry.quantity)
+            .collect();
+
+        assert_eq!(
+            quantities,
+            vec![
+                Quantity::Requests,
+                Quantity::BytesIn,
+                Quantity::BytesOut,
+                Quantity::DurationMs,
+            ],
+            "the config spelling and the metering spelling are the same snake_case"
+        );
+    }
+
+    #[test]
+    fn attestation_measured_divisor_of_zero_fails_config_load() {
+        // `per` reaches the request path as a divisor. Catching zero
+        // here is the difference between a config error and a panic
+        // while a response is being written.
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    measured:\
+             \n      - name: egress_kib\
+             \n        quantity: bytes_out\
+             \n        per: 0",
+        ))
+        .err()
+        .expect("a divisor of zero cannot produce a unit count");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("proxy.attestation.measured[0].per"),
+            "the error names the key the operator has to fix: {rendered}"
+        );
+        assert!(rendered.contains("divisor"), "{rendered}");
+    }
+
+    #[test]
+    fn attestation_measured_without_a_name_fails_config_load() {
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    measured:\
+             \n      - name: \"\"\
+             \n        quantity: requests",
+        ))
+        .err()
+        .expect("a unit with no name has no invoice line to be billed on");
+
+        assert!(
+            error
+                .to_string()
+                .contains("proxy.attestation.measured[0].name"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_measured_name_may_not_be_claimed_by_another_resolver() {
+        // Same rule as the route-weight/origin-header collision, and
+        // for the same reason: two `api_call` lines with different
+        // provenance is a receipt nobody can read.
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    measured:\
+             \n      - name: api_call\
+             \n        quantity: requests\
+             \n    route_weights:\
+             \n      - name: api_call\
+             \n        path: /v1/search\
+             \n        weight: 5",
+        ))
+        .err()
+        .expect("a name shared across resolvers is not compilable");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("api_call"), "{rendered}");
+        assert!(rendered.contains("provenance"), "{rendered}");
     }
 
     // --- WOR-193: agent_skills schema validation ---

@@ -171,8 +171,16 @@ def join_cmd(lines):
     s = " ".join(parts)
     s = re.sub(r"\s+", " ", s).strip()
     # Ensure shell separators survive the line join: '...; do', '...; done'.
-    s = re.sub(r";?\s*\bdo\b", "; do", s, count=1)
-    s = re.sub(r";?\s+done\b", "; done", s)
+    #
+    # Guarded to commands that actually open a shell loop. `do` is also an
+    # ordinary English word, and it turns up inside request bodies: the
+    # ai-rag-local example asks "When do refunds arrive?", which this rewrote
+    # to "When; do refunds arrive?" and recorded a malformed question into the
+    # cassette. Only `for`, `while`, and `until` introduce a `do` that is a
+    # shell keyword.
+    if re.match(r"\s*(for|while|until)\b", s):
+        s = re.sub(r";?\s*\bdo\b", "; do", s, count=1)
+        s = re.sub(r";?\s+done\b", "; done", s)
     for pat, repl in MODEL_FIXES:
         s = pat.sub(repl, s)
     return s

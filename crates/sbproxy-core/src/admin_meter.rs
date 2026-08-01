@@ -33,11 +33,14 @@
 //! - `reporting`: at least one entry exists, so the numbers describe
 //!   traffic.
 //!
-//! Nothing here manufactures a sample to fill the page out. As of this
-//! slice no production code opens the configured ledger or constructs a
-//! receipt, so a correctly configured proxy serving real traffic still
-//! reports `idle`, and that is the honest answer: the operator asked for
-//! receipts and is not getting them.
+//! Nothing here manufactures a sample to fill the page out. The receipts
+//! this view reads are written by
+//! `crate::meter_runtime::record_response`, which shares the chained
+//! payload type with this module rather than declaring its own, so a
+//! reader that agreed only with itself cannot pass while drifting from
+//! what the writer emits. A configured node that has served no billable
+//! traffic reports `idle`, and that stays the honest answer rather than
+//! becoming a row of zeros.
 //!
 //! # A total says what it covers
 //!
@@ -96,13 +99,14 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use sbproxy_meter::coverage::ClusterUsageSummary;
-use sbproxy_meter::ledger::{verify_ledger, LedgerEntry, LedgerPayload};
+use sbproxy_meter::ledger::{verify_ledger, LedgerEntry};
 use sbproxy_meter::segment::ChainSegment;
 use sbproxy_modules::policy::receipt_token::ReceiptClaims;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::admin::AdminPrincipal;
 use crate::meter_cluster::ClusterMeterView;
+use crate::meter_runtime::ChainedReceipt;
 
 /// Cluster-wide unit and coverage report.
 const SUMMARY_PATH: &str = "/api/meter/summary";
@@ -245,33 +249,13 @@ impl GroupBy {
     }
 }
 
-// --- Chain payload ---
-
-/// The document one receipt-chain entry attests to, as this view reads it.
-///
-/// A transparent newtype rather than an implementation of
-/// `sbproxy_meter::ledger::LedgerPayload` on `ReceiptClaims` itself: the
-/// claims type belongs to `sbproxy-modules`, the trait to `sbproxy-meter`,
-/// and deciding on their behalf what a receipt's dedup key is would be
-/// this crate legislating for two others. `serde(transparent)` means the
-/// bytes on disk are `ReceiptClaims`' own bytes, which is what the
-/// re-serialize check in `sbproxy_meter::ledger::verify_ledger` compares
-/// against, so reading through this wrapper cannot change a verdict.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(transparent)]
-struct ChainedReceipt(ReceiptClaims);
-
-impl LedgerPayload for ChainedReceipt {
-    /// The claim id, which every attempt at one unit of work shares.
-    ///
-    /// The same key the chain would dedup on when writing, so a page read
-    /// back through this type folds retries the way the writer did.
-    fn dedup_key(&self) -> Option<&str> {
-        Some(self.0.claim_id.as_str())
-    }
-}
-
 // --- Chain reading ---
+//
+// The payload this view reads is `crate::meter_runtime::ChainedReceipt`,
+// the same type the writer files. It used to be declared here, privately,
+// and moving it was the point: the bytes on disk are an on-disk contract,
+// and a reader with its own copy of the wrapper would agree with itself
+// forever while drifting from whatever the writer actually emits.
 
 /// One line of a unit total, with provenance kept apart from the count.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -654,7 +638,7 @@ fn divergence_total(exposition: &str, scope: Option<&str>) -> u64 {
 /// gather and has since died still reports the head it was last seen at.
 /// A view constructed per request would forget exactly the node an
 /// operator opened this page to ask about.
-fn cluster_view() -> &'static Arc<ClusterMeterView> {
+pub(crate) fn cluster_view() -> &'static Arc<ClusterMeterView> {
     static VIEW: OnceLock<Arc<ClusterMeterView>> = OnceLock::new();
     VIEW.get_or_init(|| Arc::new(ClusterMeterView::new()))
 }

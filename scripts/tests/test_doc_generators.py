@@ -364,6 +364,62 @@ class GenerateExampleTapesTests(TemporaryRepository):
         )
         return config
 
+    def test_the_word_do_in_a_request_body_is_not_a_shell_separator(self) -> None:
+        """A prompt containing "do" must survive the multi-line join.
+
+        The join inserts `; do` so a `for ... do` loop still runs after its
+        newlines are removed. That rewrite used to match the bare word `do`
+        anywhere, so the ai-rag-local example's "When do refunds arrive?"
+        was recorded as "When; do refunds arrive?" and the cassette showed a
+        malformed question. Nothing caught it: the tape was still generated,
+        still current, and still passed `make tapes-check`.
+        """
+        directory = self.root / "examples" / "prose"
+        directory.mkdir()
+        (directory / "sb.yml").write_text(
+            "# Test:\n"
+            "#   curl -s http://127.0.0.1:8080/v1/chat/completions \\\n"
+            '#     -d \'{"messages":[{"role":"user",'
+            '"content":"When do refunds arrive?"}]}\'\n'
+            "proxy:\n"
+            "  http_bind_port: 8080\n"
+            "origins:\n"
+            '  "prose.local":\n'
+            "    action:\n"
+            "      type: ai_proxy\n"
+            "      default_model: claude-3-opus-latest\n"
+        )
+
+        self.run_script("gen-example-tapes.py", "--only", "prose")
+
+        tape = (self.root / "docs" / "tapes" / "prose.tape").read_text()
+        self.assertIn("When do refunds arrive?", tape)
+        self.assertNotIn("When; do", tape)
+
+    def test_a_real_shell_loop_still_gets_its_separator(self) -> None:
+        """The guard must not break the case the rewrite exists for."""
+        directory = self.root / "examples" / "loop"
+        directory.mkdir()
+        (directory / "sb.yml").write_text(
+            "# Test:\n"
+            "#   for i in $(seq 1 3); do\n"
+            "#     curl -s http://127.0.0.1:8080/health\n"
+            "#   done\n"
+            "proxy:\n"
+            "  http_bind_port: 8080\n"
+            "origins:\n"
+            '  "loop.local":\n'
+            "    action:\n"
+            "      type: ai_proxy\n"
+            "      default_model: claude-3-opus-latest\n"
+        )
+
+        self.run_script("gen-example-tapes.py", "--only", "loop")
+
+        tape = (self.root / "docs" / "tapes" / "loop.tape").read_text()
+        self.assertIn("; do", tape)
+        self.assertIn("; done", tape)
+
     def test_check_reports_only_selected_drift_without_writing_files(self) -> None:
         selected = self.write_example("selected", "claude-3-opus-latest")
         other = self.write_example("other", "gemini-1.5-pro")

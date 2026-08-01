@@ -75,6 +75,16 @@ target/release/sbproxy --version
 
 [Documentation index](docs/README.md) groups the guides by first run, traffic type, operations, and reference material. The [`examples/`](examples/) directory contains complete configurations. For the configuration schema, use [configuration.md](docs/configuration.md); for the command surface, use [manual.md](docs/manual.md).
 
+## Acknowledgments
+
+SBproxy is built on the work of several open source projects. Thanks to:
+
+- [Pingora](https://github.com/cloudflare/pingora) - the HTTP proxy framework this gateway's data plane runs on.
+- [vLLM](https://github.com/vllm-project/vllm) and [llama.cpp](https://github.com/ggml-org/llama.cpp) - the inference engines the model host drives.
+- [OWASP Core Rule Set](https://github.com/coreruleset/coreruleset) - the WAF rule set the `waf` policy is built against.
+- [LiteLLM](https://github.com/BerriAI/litellm) - `model_prices_and_context_window.json`, the pricing and context-window dataset the AI gateway consumes for cost accounting.
+- [quick-xml](https://github.com/tafia/quick-xml) and [wasmtime](https://github.com/bytecodealliance/wasmtime) - the XML parser and the WebAssembly runtime behind the scripting surface.
+
 ## Contributing and license
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the contributor workflow. SBproxy is released under [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) and [TRADEMARKS](TRADEMARKS.md).

@@ -916,6 +916,10 @@ const fn default_attestation_failure_mode() -> FailureMode {
     FailureMode::Degraded
 }
 
+const fn default_measured_per() -> u64 {
+    1
+}
+
 /// What part this proxy plays in attesting to consumption.
 ///
 /// The two halves answer the two halves of a billing dispute and are
@@ -1079,6 +1083,81 @@ pub struct AttestationLedgerConfig {
     pub path: String,
 }
 
+/// Which observed quantity a measured unit counts, in the
+/// configuration vocabulary.
+///
+/// A deliberate mirror of `sbproxy_meter::MeasuredQuantity` rather than
+/// a re-export, for the same reason [`BillableRule`] mirrors
+/// `sbproxy_meter::Billable`. The meter crate depends on no other crate
+/// in this workspace, which is what lets an operator metering a plain
+/// REST API compile it without the gateway around it; deriving
+/// [`schemars::JsonSchema`] on its types would end that. So the config
+/// vocabulary lives here, the metering vocabulary lives there, and
+/// `sbproxy-core` converts between them. Both spell the variants the
+/// same way on the wire, so a config written against one reads the same
+/// as a receipt written by the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationMeasuredQuantity {
+    /// The request itself, which is always one. What a flat per-call
+    /// charge is built from.
+    Requests,
+    /// Request bytes received from the client.
+    BytesIn,
+    /// Response bytes written to the client. What was actually written,
+    /// so a response that was cut short bills what crossed the wire.
+    BytesOut,
+    /// Wall-clock milliseconds the request was in flight.
+    DurationMs,
+}
+
+/// `proxy.attestation.measured[]`: one unit the proxy counted itself.
+///
+/// The only unit source with nothing outside the process in it. The
+/// proxy saw the bytes and held the clock, so nobody else contributed
+/// to the number and there is no third party whose word has to be
+/// taken. That is why it is the resolver to reach for first: a route
+/// weight is only as honest as the document it was read from, and an
+/// origin header is only as honest as the party being paid for it,
+/// whereas this one is arithmetic over things that demonstrably
+/// happened.
+///
+/// A partial unit is billed as a whole one. Twelve thousand and
+/// forty-three bytes against a kibibyte rule is twelve units, not
+/// eleven and a bit, because the operator delivered those bytes and
+/// there is no fraction of a kibibyte to hand back. See
+/// `sbproxy_meter::MeasuredRule`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationMeasuredConfig {
+    /// Unit name that appears on the invoice line, for example
+    /// `egress_kib`. Unique across every resolver: two units sharing a
+    /// name on one receipt is an invoice line that cannot be read.
+    pub name: String,
+    /// The observed quantity this entry counts. See
+    /// [`AttestationMeasuredQuantity`].
+    pub quantity: AttestationMeasuredQuantity,
+    /// How much of the raw quantity makes one unit.
+    ///
+    /// This is the key that turns bytes into kibibytes: `1024` against
+    /// [`AttestationMeasuredQuantity::BytesOut`] bills one unit per
+    /// kibibyte written. A divisor rather than a multiplier because the
+    /// raw quantity is always the smaller currency and the invoice line
+    /// is always the larger one. Nobody sells thousandths of a request,
+    /// but plenty of people sell kibibytes and compute-seconds, and
+    /// writing `per: 1000` against `duration_ms` says "a second" in the
+    /// units the proxy actually observed rather than asking the
+    /// operator to express a rate as a fraction.
+    ///
+    /// Defaults to `1`, which bills one unit per observed item and is
+    /// the only sensible reading of an entry that omits it. Zero is
+    /// rejected at config compile: a divisor of zero has no answer to
+    /// fall back on, and the request path is the wrong place to find
+    /// that out.
+    #[serde(default = "default_measured_per")]
+    pub per: u64,
+}
+
 /// `proxy.attestation.route_weights[]`: one route the operator priced.
 ///
 /// The simplest thing an operator can say about what a call costs, and
@@ -1206,16 +1285,24 @@ pub struct AttestationConfig {
     /// What the operator charges for. Required, and required complete,
     /// when the role is not [`AttestationRole::Off`].
     pub billable: Option<AttestationBillableConfig>,
+    /// Units this proxy counted for itself. See
+    /// [`AttestationMeasuredConfig`].
+    ///
+    /// Listed first because it is the resolver that needs nothing from
+    /// anybody, and a receipt is easier to argue about when an
+    /// unarguable line is sitting next to the contested ones.
+    pub measured: Vec<AttestationMeasuredConfig>,
     /// Routes priced in this document. See
     /// [`AttestationRouteWeightConfig`].
     ///
     /// A sibling list rather than a variant of one `units:` block, and
-    /// the same goes for [`Self::origin_headers`]. Each resolver has its
-    /// own provenance and its own way of being wrong, so each declares
-    /// itself in its own vocabulary and none of them can be mistaken for
-    /// another when a receipt is read back. It also means the expression
-    /// resolver arrives later as a third list rather than as a variant
-    /// every existing entry has to be retrofitted into.
+    /// the same goes for [`Self::measured`] and [`Self::origin_headers`].
+    /// Each resolver has its own provenance and its own way of being
+    /// wrong, so each declares itself in its own vocabulary and none of
+    /// them can be mistaken for another when a receipt is read back. It
+    /// also means the expression resolver arrives later as a fourth list
+    /// rather than as a variant every existing entry has to be
+    /// retrofitted into.
     pub route_weights: Vec<AttestationRouteWeightConfig>,
     /// Counts this proxy reads back from its upstreams. See
     /// [`AttestationOriginHeaderConfig`].
@@ -1235,6 +1322,7 @@ impl Default for AttestationConfig {
             queue: None,
             ledger: None,
             billable: None,
+            measured: Vec::new(),
             route_weights: Vec::new(),
             origin_headers: Vec::new(),
         }

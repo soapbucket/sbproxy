@@ -43,8 +43,6 @@ pub mod deployment;
 pub mod deployment_store;
 pub mod desired;
 pub mod device_residency;
-#[cfg(feature = "embedded")]
-pub mod embedded;
 pub mod engine_driver;
 pub mod fit;
 pub mod foreign_cache;

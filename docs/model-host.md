@@ -788,7 +788,7 @@ Each entry accepts these settings.
 | `model` | Catalog id (`qwen3-32b`) or a raw `hf:Org/Repo[:QUANT]` reference. Required. |
 | `name` | Client-facing model id that routing, budgets, and the ledger see. Defaults to the catalog id, and is required for a raw `hf:` reference. |
 | `variant` | Exact catalog v2 artifact variant to run. Omitting it lets the worker select a compatible variant. |
-| `engine` | Engine to serve with: `auto` (default), `vllm`, `sglang`, `llama_cpp`, `embedded`, or `mistralrs`. |
+| `engine` | Engine to serve with: `auto` (default), `vllm`, `sglang`, `llama_cpp`, or `mistralrs`. |
 | `modality` | Task the model performs: `chat` (default), `embedding`, `rerank`, `speech_to_text`, `text_to_speech`, or `image`. It drives the engine's task flag (`embedding` serves `--task embed`, `rerank` serves `--task score`) and zeroes the KV-cache term in the fit. Set it to serve an embedding or rerank model from a raw `hf:` reference, which has no catalog entry to carry the modality. |
 | `max_context` | Context length to plan VRAM for and pass to the engine. |
 | `keep_alive` | Idle time before the engine unloads, as a duration like `30m` or `1h`. Omitting it keeps the engine resident until eviction. |
