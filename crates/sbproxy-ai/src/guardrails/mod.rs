@@ -471,11 +471,16 @@ impl GuardrailPipeline {
     }
 
     /// Check output content. Returns first block encountered.
+    ///
+    /// Classifier-backed guards and the schema guardrail judge the
+    /// canonical assistant payload extracted by
+    /// [`assistant_response_text`]; every other guard inspects the raw
+    /// body.
     pub fn check_output(&self, content: &str) -> Option<GuardrailBlock> {
-        let classifier_subject = assistant_response_text(content);
+        let canonical_subject = assistant_response_text(content);
         for guard in &self.output {
             let block = match guard {
-                Guardrail::SafetyClassifier(classifier) => match classifier_subject.as_deref() {
+                Guardrail::SafetyClassifier(classifier) => match canonical_subject.as_deref() {
                     Some(subject) => classifier.check_output(subject),
                     None => Some(GuardrailBlock {
                         name: classifier.name().to_string(),
@@ -484,6 +489,23 @@ impl GuardrailPipeline {
                                  failed closed",
                             classifier.name()
                         ),
+                    }),
+                },
+                // WOR-2174: the schema guardrail validates the
+                // structured assistant payload, not the transport
+                // envelope. Validating the whole client body rejected
+                // valid structured output for lacking envelope keys
+                // that no model response would ever carry. A body the
+                // gateway cannot map to an assistant payload (an
+                // unrecognized shape, or a tool-call-only turn with no
+                // content) fails closed, mirroring the classifiers.
+                Guardrail::Schema(schema) => match canonical_subject.as_deref() {
+                    Some(subject) => schema.check(subject),
+                    None => Some(GuardrailBlock {
+                        name: "schema".to_string(),
+                        reason: "schema guardrail could not extract a canonical assistant \
+                                 response; failed closed"
+                            .to_string(),
                     }),
                 },
                 _ => guard.check(content),
@@ -508,6 +530,15 @@ impl GuardrailPipeline {
                         classifier.name()
                     ),
                 }),
+                // WOR-2174: invalid UTF-8 can never hold the valid
+                // JSON a schema guard expects; fail closed rather
+                // than treating it as a harmless non-match.
+                Guardrail::Schema(_) => Some(GuardrailBlock {
+                    name: "schema".to_string(),
+                    reason: "schema guardrail could not decode a canonical assistant response; \
+                             failed closed"
+                        .to_string(),
+                }),
                 _ => None,
             }),
         }
@@ -518,8 +549,14 @@ impl GuardrailPipeline {
 ///
 /// Buffered responses can leave the gateway in OpenAI Chat, Anthropic
 /// Messages, or OpenAI Responses shape. Classifier-backed output safety
-/// guards must classify the same text in every shape and in streaming
-/// mode, while non-classifier guards continue to inspect the raw body.
+/// guards and the schema guardrail (WOR-2174) must judge the same
+/// canonical assistant payload in every shape and in streaming mode,
+/// while the remaining guards continue to inspect the raw body. This is
+/// the guardrail-side mirror of the translation hub's normalization
+/// (`crate::format`): OpenAI Chat contributes `choices[].message.content`
+/// in choice-index order, OpenAI Responses contributes its assistant
+/// message output items, and Anthropic Messages contributes its text
+/// content blocks.
 fn assistant_response_text(content: &str) -> Option<String> {
     fn append_content(value: &serde_json::Value, out: &mut String) -> bool {
         match value {
@@ -1130,6 +1167,153 @@ mod tests {
                 expected
             );
         }
+    }
+
+    // --- schema guardrail canonical-payload checks (WOR-2174) ---
+
+    fn schema_pipeline() -> GuardrailPipeline {
+        let cfg: GuardrailsConfig = serde_json::from_value(serde_json::json!({
+            "output": [{
+                "type": "schema",
+                "schema": {
+                    "type": "object",
+                    "required": ["summary", "tags"],
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "tags": {"type": "array"}
+                    }
+                }
+            }]
+        }))
+        .expect("config parses");
+        compile_pipeline(&cfg).expect("pipeline compiles")
+    }
+
+    #[test]
+    fn schema_output_validates_openai_assistant_payload_not_envelope() {
+        let pipeline = schema_pipeline();
+        // The envelope itself has no summary/tags keys, so the old
+        // whole-body check rejected every valid response.
+        let valid = serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "{\"summary\":\"ok\",\"tags\":[\"a\"]}"
+                },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+        assert!(
+            pipeline.check_output(&valid).is_none(),
+            "valid structured output inside the envelope must pass"
+        );
+
+        // Same envelope, wrong-typed payload: blocks with a low-leak
+        // reason naming path and keyword, not the offending value.
+        let invalid = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "{\"summary\":7,\"tags\":\"wrong\"}"
+                }
+            }]
+        })
+        .to_string();
+        let block = pipeline
+            .check_output(&invalid)
+            .expect("wrong-typed payload must block");
+        assert_eq!(block.name, "schema");
+        assert!(
+            !block.reason.contains("wrong"),
+            "reason must not echo the offending value: {}",
+            block.reason
+        );
+    }
+
+    #[test]
+    fn schema_output_validates_anthropic_and_responses_payloads() {
+        let pipeline = schema_pipeline();
+        let anthropic = serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "{\"summary\":\"ok\",\"tags\":[]}"}
+            ]
+        })
+        .to_string();
+        assert!(
+            pipeline.check_output(&anthropic).is_none(),
+            "Anthropic Messages shape validates the same payload"
+        );
+
+        let responses = serde_json::json!({
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "{\"summary\":\"ok\",\"tags\":[]}"}
+                ]
+            }]
+        })
+        .to_string();
+        assert!(
+            pipeline.check_output(&responses).is_none(),
+            "OpenAI Responses shape validates the same payload"
+        );
+
+        let bad_anthropic = serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "{\"summary\":\"ok\"}"}]
+        })
+        .to_string();
+        assert!(
+            pipeline.check_output(&bad_anthropic).is_some(),
+            "a payload missing required keys blocks in every shape"
+        );
+    }
+
+    #[test]
+    fn schema_output_fails_closed_without_a_canonical_payload() {
+        let pipeline = schema_pipeline();
+        // No recognizable assistant payload: not one of the three
+        // response shapes the gateway normalizes.
+        let block = pipeline
+            .check_output(r#"{"data":[{"embedding":[0.25]}]}"#)
+            .expect("unrecognized shapes fail closed");
+        assert_eq!(block.name, "schema");
+        assert!(block.reason.contains("failed closed"), "{}", block.reason);
+
+        // Invalid UTF-8 fails closed too.
+        let block = pipeline
+            .check_output_bytes(&[0xff, 0xfe, 0xfd])
+            .expect("invalid UTF-8 fails closed");
+        assert_eq!(block.name, "schema");
+        assert!(block.reason.contains("failed closed"), "{}", block.reason);
+    }
+
+    #[test]
+    fn invalid_schema_fails_pipeline_compilation() {
+        let cfg: GuardrailsConfig = serde_json::from_value(serde_json::json!({
+            "output": [{
+                "type": "schema",
+                "schema": {"$ref": "https://example.com/schema.json"}
+            }]
+        }))
+        .expect("config parses");
+        let error = validate_pipeline_config(&cfg)
+            .expect_err("a remote $ref must fail config validation")
+            .to_string();
+        assert!(error.contains("external $ref"), "error: {error}");
+        assert!(
+            compile_pipeline(&cfg).is_err(),
+            "compilation must fail the same way"
+        );
     }
 
     #[test]
