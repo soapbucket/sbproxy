@@ -4313,10 +4313,14 @@ impl ProxyHttp for SbProxy {
                                                     label = %result.label,
                                                     "blocked: detector matched request body"
                                                 );
+                                                // WOR-2159: honour the
+                                                // configured content type,
+                                                // as the ai_proxy and A2A
+                                                // block paths already do.
                                                 failed = Some((
                                                     403,
                                                     p.block_body().to_string(),
-                                                    "text/plain; charset=utf-8".to_string(),
+                                                    p.block_content_type().to_string(),
                                                 ));
                                                 break;
                                             }
