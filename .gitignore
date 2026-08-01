@@ -27,3 +27,8 @@ node_modules/
 # in docs/model-host-certification.md, not in git: the logs are large,
 # machine-specific, and can carry generated admin passwords.
 .cert-evidence/
+
+# Python bytecode from scripts/tests. Regenerated on every run and
+# tagged with the interpreter version, so it churns per machine.
+__pycache__/
+*.pyc

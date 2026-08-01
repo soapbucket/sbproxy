@@ -20,7 +20,7 @@ Type `export PS1='$ '; clear`
 Enter
 Show
 
-Type `curl http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.localhost' -H 'Content-Type: application/json' -d '{ "model": "fixture-chat", "messages": [{"role": "user", "content": "When; do refunds arrive?"}] }'`
+Type `curl http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.localhost' -H 'Content-Type: application/json' -d '{ "model": "fixture-chat", "messages": [{"role": "user", "content": "When do refunds arrive?"}] }'`
 Enter
 Sleep 3.5s
 
