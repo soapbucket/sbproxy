@@ -11,6 +11,7 @@ name: CI
 #   obs-budgets    (~5 min) e2e cardinality + redaction, observability paths only
 #   ui             (~40 s)  node typecheck + vitest
 #   supply-chain   (~50 s)  cargo-deny
+#   embed-admin-ui (~6 min) SPA build + the release binary's feature union
 #   build / test   (~5 s)   aggregator; the required status check
 #
 # The dominant cost here is rustc, not test execution: 8763 tests run in
@@ -304,6 +305,66 @@ jobs:
           npm run typecheck
           npm run test -- --run
 
+  embed-admin-ui:
+    name: release feature (embed-admin-ui)
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.ui == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      # WOR-2133: this combination is what every release image builds
+      # (Dockerfile.cloudbuild, Dockerfile.gateway, Dockerfile.worker all run
+      # `cargo build --bin sbproxy --features embed-admin-ui --locked`), and
+      # until now nothing on a PR compiled it. `embed-admin-ui` is in no
+      # default feature set, so `cargo build --workspace`,
+      # `cargo clippy --workspace --all-targets`, and `scripts/check.sh` all
+      # miss it, and a break reaches a tag instead of a PR. It cost ten
+      # compile errors that only showed up in `docker compose build`.
+      #
+      # Why this lane is worth its runner minutes rather than a one-off fix:
+      # the workspace resolves TWO prometheus versions. 0.13.4 arrives through
+      # the pingora fork (pingora-core), 0.14 is the workspace pin, and
+      # sbproxy-core has both in its graph. Which one a given metric call
+      # resolves through depends on feature unification, which is exactly what
+      # this feature changes. The reported errors ("expected `&[&String]`,
+      # found `&[&str; 4]`", pointing into prometheus-0.14.0/src/vec.rs) are
+      # that ambiguity surfacing. They do not reproduce on this commit, but
+      # nothing has deduplicated the two versions, so the hazard is latent and
+      # only a lane that compiles this union will catch its return.
+      #
+      # Its own job with its own cache key, per the one-package-selection
+      # rule in CLAUDE.md: this feature union differs from the `test` lane's,
+      # so sharing that job would recompile the graph on the critical path.
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: embed-admin-ui
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      # `include_dir!` reads ui/dist at compile time, so the SPA has to exist
+      # before cargo runs. Without it the build fails inside the macro and
+      # never reaches the code this lane is here to check.
+      - name: build the admin SPA
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      # `cargo check` rather than `cargo build`: this lane exists to catch
+      # type and feature-resolution breakage, which check finds. Codegen for
+      # the real release binary is the release-build job's work, and paying
+      # for it twice on every PR is what the profile split above avoids.
+      - name: check the release feature union
+        run: cargo check --bin sbproxy --features embed-admin-ui --locked
+
   supply-chain:
     name: supply chain (cargo-deny)
     runs-on: ubuntu-latest
@@ -367,7 +428,7 @@ jobs:
   required:
     name: build / test
     if: always()
-    needs: [changes, test, lint, obs-budgets, ui, supply-chain]
+    needs: [changes, test, lint, obs-budgets, ui, supply-chain, embed-admin-ui]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

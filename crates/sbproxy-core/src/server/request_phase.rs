@@ -3221,14 +3221,14 @@ pub(super) async fn request_filter(
                 // AI crawl control: 402 with the configured
                 // challenge header and a JSON body the crawler
                 // can introspect for price + retry instructions.
-                let (header_name, challenge, body) =
-                    ctx.crawl_challenge.take().unwrap_or_else(|| {
-                        (
-                            "crawler-payment".to_string(),
-                            "Crawler-Payment realm=\"ai-crawl\"".to_string(),
-                            error_json_body(&msg),
-                        )
-                    });
+                let rendered = ctx.crawl_challenge.take().unwrap_or_else(|| {
+                    crate::context::PaymentResponse::json_with_header(
+                        "crawler-payment",
+                        "Crawler-Payment realm=\"ai-crawl\"".to_string(),
+                        error_json_body(&msg),
+                    )
+                });
+                let body = rendered.body;
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(3)).map_err(|e| {
                         Error::because(
@@ -3237,18 +3237,14 @@ pub(super) async fn request_filter(
                             e,
                         )
                     })?;
-                // G3.4 multi-rail emits the response via the same
-                // crawl_challenge slot but uses the sentinel
-                // header_name `Content-Type` to signal "stamp this
-                // value as Content-Type, skip the Crawler-Payment
-                // header". Wave 1 single-rail keeps the original
-                // behaviour: Content-Type is application/json and
-                // header_name carries the Crawler-Payment value.
-                if header_name.eq_ignore_ascii_case("content-type") {
-                    let _ = header.insert_header("content-type", &challenge);
-                } else {
-                    let _ = header.insert_header("content-type", "application/json");
-                    let _ = header.insert_header(header_name, &challenge);
+                // The policy already decided the exact content type and
+                // every header. Repeated names are appended rather than
+                // replaced, because Payment HTTP Authentication offers one
+                // `WWW-Authenticate` field per challenge and collapsing them
+                // into one field is a different, non-conforming message.
+                let _ = header.insert_header("content-type", &rendered.content_type);
+                for (name, value) in &rendered.headers {
+                    let _ = header.append_header(name.clone(), value);
                 }
                 // Content-Length is required so HTTP/1.1 keep-alive
                 // clients know where the body ends without waiting
@@ -3269,7 +3265,7 @@ pub(super) async fn request_filter(
                 let body = ctx
                     .crawl_challenge
                     .take()
-                    .map(|(_, _, body)| body)
+                    .map(|rendered| rendered.body)
                     .unwrap_or_else(|| error_json_body(&msg));
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(2)).map_err(|e| {
@@ -3295,7 +3291,7 @@ pub(super) async fn request_filter(
                 let body = ctx
                     .crawl_challenge
                     .take()
-                    .map(|(_, _, body)| body)
+                    .map(|rendered| rendered.body)
                     .unwrap_or_else(|| error_json_body(&msg));
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(2)).map_err(|e| {
@@ -3320,7 +3316,7 @@ pub(super) async fn request_filter(
                 let body = ctx
                     .crawl_challenge
                     .take()
-                    .map(|(_, _, body)| body)
+                    .map(|rendered| rendered.body)
                     .unwrap_or_else(|| error_json_body(&msg));
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(3)).map_err(|e| {
