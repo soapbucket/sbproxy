@@ -3870,6 +3870,7 @@ dependencies = [
  "hex",
  "hmac",
  "http",
+ "rustix 0.38.44",
  "sbproxy-capability",
  "sbproxy-observe",
  "sbproxy-platform",
