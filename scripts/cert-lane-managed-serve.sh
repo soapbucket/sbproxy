@@ -12,7 +12,7 @@
 #   4. status reports engine, engine version, selected devices, a memory
 #      breakdown, the engine port, and the verified artifact digest
 #   5. stop drains, reaps the engine process, and keeps the snapshot
-#   6. SIGINT exits the gateway cleanly and leaves no engine orphaned
+#   6. SIGTERM exits the gateway cleanly and leaves no engine orphaned
 #   7. a second run reuses the cache: same digest, no re-download, and
 #      materially faster to ready
 #
@@ -50,9 +50,10 @@ bad() { echo "  FAIL $1"; fail=$((fail + 1)); }
 PROXY_PID=""
 cleanup() {
   if [ -n "$PROXY_PID" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
-    # SIGINT, not SIGKILL: graceful stop is what reaps the engine
-    # children. SIGKILL orphans them.
-    kill -INT "$PROXY_PID" 2>/dev/null || true
+    # Prefer the production graceful-shutdown signal. If the bounded
+    # cleanup has to escalate, the next managed start's exact ownership
+    # recovery is the fallback.
+    kill -TERM "$PROXY_PID" 2>/dev/null || true
     for _ in $(seq 1 30); do
       kill -0 "$PROXY_PID" 2>/dev/null || break
       sleep 1
@@ -256,7 +257,7 @@ else
 fi
 
 # --- 6. clean shutdown --------------------------------------------------
-kill -INT "$PROXY_PID" 2>/dev/null
+kill -TERM "$PROXY_PID" 2>/dev/null
 exit_secs=-1
 for i in $(seq 1 60); do
   if ! kill -0 "$PROXY_PID" 2>/dev/null; then
@@ -266,9 +267,9 @@ for i in $(seq 1 60); do
   sleep 1
 done
 if [ "$exit_secs" -ge 0 ]; then
-  ok "SIGINT exited the gateway cleanly in ${exit_secs}s"
+  ok "SIGTERM exited the gateway cleanly in ${exit_secs}s"
 else
-  bad "the gateway did not exit within 60s of SIGINT"
+  bad "the gateway did not exit within 60s of SIGTERM"
 fi
 leftover="$(pgrep -f "$CERT_ENGINE_PROC" 2>/dev/null | wc -l | tr -d ' ')"
 if [ "$leftover" -eq 0 ]; then

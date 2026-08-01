@@ -580,12 +580,12 @@ fn verified_gguf_path(request: &LaunchRequest) -> Result<&Path, EngineDriverErro
     }
 }
 
+/// Map a KV-quant mode to llama.cpp's `--cache-type-{k,v}` value, or
+/// `None` for the f16 default. Delegates to the shared table so this
+/// driver, the launch template, and the fit planner cannot disagree
+/// about what the engine runs (WOR-2069).
 fn llama_cache_type(quant: KvCacheQuant) -> Option<&'static str> {
-    match quant {
-        KvCacheQuant::Auto | KvCacheQuant::F16 => None,
-        KvCacheQuant::Fp8 | KvCacheQuant::Int8 => Some("q8_0"),
-        KvCacheQuant::Int4 => Some("q4_0"),
-    }
+    crate::config::effective_kv_cache(quant, crate::config::EngineKind::LlamaCpp).flag_value
 }
 
 fn unix_time_ms() -> Result<u64, EngineDriverError> {

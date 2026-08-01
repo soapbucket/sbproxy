@@ -1243,6 +1243,20 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     use pingora_core::server::Server;
     use pingora_proxy::http_proxy_service;
 
+    // Recover exact engines left by a prior forced gateway exit before
+    // reading desired state. This also cleans up when the replacement
+    // configuration no longer contains a model host, and keeps recovery
+    // ahead of listener bind and any replacement-engine spawn.
+    let recovered_engines =
+        sbproxy_model_host::reap_stale_managed_engines(std::time::Duration::from_secs(5))
+            .map_err(|error| anyhow::anyhow!("recover stale managed engines at boot: {error}"))?;
+    if recovered_engines > 0 {
+        tracing::info!(
+            recovered_engines,
+            "recovered stale managed engines before gateway boot"
+        );
+    }
+
     // Load and compile the config.
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {}", config_path, e))?;
@@ -1848,6 +1862,26 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         }
     }
 
+    // Bind every public endpoint before handing the service to Pingora's
+    // background runtimes. A bind failure is a startup error with an exit
+    // code, not a panic in a detached listener task while the main signal
+    // loop remains alive. Pingora retains these exact sockets, so there is
+    // no probe/drop/rebind race between this check and `Server::run`.
+    //
+    // Tokio network resources retain the reactor on which they were
+    // created. Keep this one-thread runtime alive and driven for the whole
+    // server lifetime while Pingora's service tasks accept from the
+    // prepared listeners.
+    let listener_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("sbproxy-listener-reactor")
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("build public-listener runtime: {error}"))?;
+    listener_runtime
+        .block_on(proxy_service.prepare_listeners())
+        .map_err(|error| anyhow::anyhow!("bind public listener: {error}"))?;
+
     server.add_service(proxy_service);
 
     // Spawn the embedded admin HTTP server on `proxy.admin.port`
@@ -2220,6 +2254,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // subprocesses. `run()` returns after the same signal-driven lifecycle,
     // allowing the model-runtime guard below to stop every engine first.
     server.run(pingora_core::server::RunArgs::default());
+    drop(listener_runtime);
     drop(_model_plane_shutdown);
     drop(_model_runtime_shutdown);
     // Flush any spans still queued in the batch span processor; export

@@ -144,6 +144,16 @@ the next version cut.
   survive expiry or a restart), and fails to start when `cache.tier: none` leaves
   nothing to propagate through. A single node with no seeds keeps the embedded
   default. See [`docs/key-management.md`](docs/key-management.md).
+- **The legacy `serve:` fit path books the KV cost the engine will run.** The
+  1.9.0 fix that made the fit planner and the engine drivers share one KV
+  table missed the single-node runtime behind a legacy `serve:` block, which
+  still sized its KV term from the requested `kv_quant`: `int4` on vLLM
+  booked 0.5 bytes per element while the engine allocated fp8 at 1.0,
+  halving the planned cache. That path now sizes from the shared table and
+  logs the same substitution warning, the single-replica managed activation
+  path warns too instead of substituting silently, and the llama.cpp
+  driver's own dtype mapping now derives from the table instead of
+  restating it. See [`docs/gpu-fit-planning.md`](docs/gpu-fit-planning.md).
 
 ## [1.9.0] - 2026-07-28
 
