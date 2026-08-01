@@ -75,6 +75,13 @@ if [ ! -f ui/node_modules/.package-lock.json ] || [ ui/package-lock.json -nt ui/
 fi
 (cd ui && npm run typecheck && npm run test -- --run)
 
+step "standalone workspace lockfiles are current"
+# The bench harnesses and the config-source fixture are their own
+# workspaces that path-depend on this one, so a dependency added here
+# leaves their lockfiles stale. No other step in this gate opens them,
+# which is why that drift used to reach CI untouched.
+bash "$ROOT/scripts/check-nested-lockfiles.sh"
+
 step "config schema and reader coverage"
 bash "$ROOT/scripts/check-config-schema.sh"
 bash "$ROOT/scripts/check-config-readers.sh"
