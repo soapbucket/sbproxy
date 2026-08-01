@@ -3855,7 +3855,7 @@
           "type": "boolean"
         },
         "failure_mode_allow": {
-          "description": "When the store is unreachable, allow the request through in a degraded mode. Default false: fail closed (deny).",
+          "description": "When the store is unreachable, allow the request through in a degraded mode. Default false: fail closed (deny).\n\nNote the polarity this field is named into: `true` here means ALLOW, that is, fail open. Other booleans in this config carry the opposite sense, which is the inconsistency [`FailureMode`] exists to retire.",
           "default": false,
           "type": "boolean"
         },
@@ -4280,7 +4280,7 @@
           "minimum": 0.0
         },
         "failure_mode": {
-          "description": "Behavior when the governance backend cannot serve a reserve call at request time (`GovernanceError::BackendUnavailable`). The default denies the request (fail closed): governed limits must not be silently bypassed by a backend outage. Setting `allow_unreserved` admits the request instead, but every such decision is always audited on the `security_audit` channel and counted on `sbproxy_governance_fail_open_total`.",
+          "description": "Behavior when the governance backend cannot serve a reserve call at request time (`GovernanceError::BackendUnavailable`). The default denies the request (fail closed): governed limits must not be silently bypassed by a backend outage. Setting `allow_unreserved` admits the request instead, but every such decision is always audited on the `security_audit` channel and counted on `sbproxy_governance_fail_open_total`.\n\nRead the posture through [`KeyGovernanceConfig::failure_posture`] to get it in the shared [`FailureMode`] vocabulary; `allow_unreserved` reports as `degraded`, since the call proceeds without the reservation this control exists to make.",
           "default": "closed",
           "allOf": [
             {

@@ -1662,6 +1662,13 @@ pub struct KeyGovernanceConfig {
     /// admits the request instead, but every such decision is always
     /// audited on the `security_audit` channel and counted on
     /// `sbproxy_governance_fail_open_total`.
+    ///
+    ///
+    /// Read the posture through
+    /// [`KeyGovernanceConfig::failure_posture`] to get it in the shared
+    /// [`FailureMode`] vocabulary; `allow_unreserved` reports as
+    /// `degraded`, since the call proceeds without the reservation this
+    /// control exists to make.
     #[serde(default)]
     pub failure_mode: GovernanceFailureMode,
     /// Behavior when a governed key carries a `total_micro_usd` limit but
@@ -1690,6 +1697,223 @@ impl Default for KeyGovernanceConfig {
             missing_rate: GovernanceMissingRatePolicy::default(),
             key_introspection: false,
             require_governed_key: false,
+        }
+    }
+}
+
+/// Behavior when the governance backend cannot serve a reserve call
+/// (`sbproxy_ai::governance::GovernanceStore::reserve`).
+///
+/// What a control does when it cannot reach a decision.
+///
+/// A "control" here is anything that gates a request and can itself
+/// fail: a policy whose backend is unreachable, a guardrail whose
+/// provider times out, a detector that never engaged, a store that
+/// cannot be read. The question is always the same, so the knob is too:
+///
+/// ```yaml
+/// failure_mode: closed     # refuse the request
+/// failure_mode: open       # admit it
+/// failure_mode: degraded   # admit it, but record that the guarantee was not made
+/// failure_mode: observe    # admit it, and record what would have happened
+/// ```
+///
+/// # The four postures
+///
+/// Only [`Closed`](Self::Closed) refuses. The other three all admit the
+/// request and differ in what they leave behind, which is the part that
+/// matters six months later when someone asks whether a control was
+/// actually protecting anything:
+///
+/// - **`open`** admits and claims nothing. Cheapest, and the least
+///   recoverable after the fact.
+/// - **`degraded`** admits while explicitly marking the guarantee as
+///   not made. This is the posture behind the existing
+///   `AllowUnreserved` modes: the request proceeds, but no quota was
+///   reserved and no governance decision was recorded, and that fact is
+///   itself counted so it can be alerted on.
+/// - **`observe`** admits and records the decision the control *would*
+///   have taken. For rolling a control out against live traffic before
+///   letting it refuse anything.
+///
+/// # Relationship to `test_mode` and tag actions
+///
+/// `observe` is deliberately close in spirit to the WAF's `test_mode`
+/// and the prompt-injection `Tag` action, and the overlap is worth
+/// naming so the two do not drift into meaning different things. They
+/// are not the same axis:
+///
+/// - `test_mode` / `Tag` describe what the control does when it
+///   **works** and finds a hit.
+/// - `failure_mode: observe` describes what it does when it **cannot
+///   run at all**.
+///
+/// A control can legitimately be in `test_mode` and still need a
+/// failure posture, because "the detector matched" and "the detector
+/// was unreachable" are different events. Where a site already has
+/// `test_mode`, leave it alone and let `failure_mode` govern only the
+/// cannot-decide path.
+///
+/// # Why this type exists
+///
+/// The same decision was previously spelled six different ways across
+/// the config surface: `fail_open: bool`, `fail_closed: bool`,
+/// `failure_mode_allow: bool`, two separately-declared `failure_mode`
+/// enums, an `on_failure` enum, and an unvalidated `on_error: String`.
+/// Two of those booleans carry **opposite** polarity, so `true` means
+/// "admit" in one struct and "refuse" in another. An operator had to
+/// re-derive the meaning at every site, and a reviewer had to check the
+/// field name before they could read a diff.
+///
+/// New controls take `fail: FailMode`. The legacy fields still parse,
+/// because [`schema-v1` compatibility] is pinned by test, but they are
+/// deprecated in favour of this one.
+///
+/// # Choosing a default
+///
+/// Default closed for anything that enforces a security boundary: a
+/// control that silently admits traffic when it breaks is worse than no
+/// control, because the config still advertises protection and the
+/// dashboard still reads green.
+///
+/// Default open only where refusing would take the gateway down over a
+/// non-security concern, and say so at the site. A policy-expression
+/// bug should not black-hole every request; an unreachable authorization
+/// backend should.
+///
+/// [`schema-v1` compatibility]: https://github.com/soapbucket/sbproxy
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureMode {
+    /// Refuse the request. The safe default for anything enforcing a
+    /// security boundary: a control that silently admits traffic when
+    /// it breaks is worse than no control, because the config still
+    /// advertises protection and the dashboard still reads green.
+    #[default]
+    Closed,
+    /// Admit the request and claim nothing. Cheapest, and the least
+    /// recoverable after the fact.
+    Open,
+    /// Admit the request while explicitly marking the guarantee as not
+    /// made. The posture behind the legacy `AllowUnreserved` modes: the
+    /// call proceeds, but no quota was reserved and no governance
+    /// decision was recorded, and that fact is counted so it can be
+    /// alerted on.
+    Degraded,
+    /// Admit the request and record the decision the control would have
+    /// taken. For rolling a control out against live traffic before
+    /// letting it refuse anything.
+    Observe,
+}
+
+impl FailureMode {
+    /// True when this posture lets the request proceed.
+    ///
+    /// Three of the four postures admit; they differ in what they leave
+    /// behind, not in whether traffic flows. Callers deciding "do I
+    /// return Deny" want this; callers deciding "what do I record" want
+    /// to match on the variant.
+    pub fn admits(self) -> bool {
+        !matches!(self, Self::Closed)
+    }
+
+    /// True when the control should record what it would have done.
+    pub fn records_counterfactual(self) -> bool {
+        matches!(self, Self::Observe)
+    }
+
+    /// True when the request proceeds without the guarantee this
+    /// control exists to provide. Separately countable from a plain
+    /// `Open` so an operator can alert on lost guarantees specifically.
+    pub fn guarantee_waived(self) -> bool {
+        matches!(self, Self::Degraded)
+    }
+
+    /// Build from a legacy `fail_open`-style boolean, where `true`
+    /// means admit. Use at call sites migrating off such a field so the
+    /// polarity conversion lives in one place rather than being
+    /// re-derived per site.
+    pub fn from_fail_open(fail_open: bool) -> Self {
+        if fail_open {
+            Self::Open
+        } else {
+            Self::Closed
+        }
+    }
+
+    /// Build from a legacy `fail_closed`-style boolean, where `true`
+    /// means refuse. The inverse polarity of [`Self::from_fail_open`],
+    /// and the reason both constructors are named rather than left to a
+    /// bare `if` at each site.
+    pub fn from_fail_closed(fail_closed: bool) -> Self {
+        if fail_closed {
+            Self::Closed
+        } else {
+            Self::Open
+        }
+    }
+
+    /// Stable label for metrics and audit events.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+            Self::Degraded => "degraded",
+            Self::Observe => "observe",
+        }
+    }
+}
+
+/// What a control does when it *does* reach a decision and that
+/// decision is "refuse".
+///
+/// This is the second of two axes, and keeping them apart is the point.
+/// [`FailureMode`] answers "the control could not run, now what".
+/// `EnforcementMode` answers "the control ran, it matched, now what".
+/// Those are different events and an operator needs both: a detector
+/// can reasonably be in `observe` while it is being tuned, and still
+/// need to fail closed when its backend disappears.
+///
+/// This type replaces the ad-hoc spellings of the same idea that grew
+/// per policy: the WAF's `test_mode: bool`, the prompt-injection
+/// `Tag` action, and similar. They all meant "match, but do not
+/// block". `observe` is spelled the same here as in [`FailureMode`] on
+/// purpose, so one word means one thing across the config surface.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementMode {
+    /// Refuse the request when the control matches.
+    #[default]
+    Block,
+    /// Admit the request but record the match. The rollout posture.
+    Observe,
+}
+
+impl EnforcementMode {
+    /// True when a match should refuse the request.
+    pub fn blocks(self) -> bool {
+        matches!(self, Self::Block)
+    }
+
+    /// Build from a legacy `test_mode`-style boolean, where `true`
+    /// means "log but do not block".
+    pub fn from_test_mode(test_mode: bool) -> Self {
+        if test_mode {
+            Self::Observe
+        } else {
+            Self::Block
+        }
+    }
+
+    /// Stable label for metrics and audit events.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Observe => "observe",
         }
     }
 }
@@ -1753,6 +1977,24 @@ impl KeyGovernanceConfigError {
 }
 
 impl KeyGovernanceConfig {
+    /// This control's posture expressed in the shared [`FailureMode`]
+    /// vocabulary.
+    ///
+    /// A read-side adapter only: the wire field is still
+    /// `failure_mode: closed | allow_unreserved`, and this does not
+    /// change what parses. It exists so call sites and metrics can speak
+    /// one vocabulary while the per-site wire formats are migrated
+    /// separately, and so `allow_unreserved` is recorded as what it
+    /// actually is. The request proceeds without the reservation this
+    /// control exists to make, which is [`FailureMode::Degraded`] rather
+    /// than a plain open.
+    pub fn failure_posture(&self) -> FailureMode {
+        match self.failure_mode {
+            GovernanceFailureMode::Closed => FailureMode::Closed,
+            GovernanceFailureMode::AllowUnreserved => FailureMode::Degraded,
+        }
+    }
+
     /// Reservation lease duration converted to runtime milliseconds.
     pub fn lease_ttl_millis(&self) -> Result<u64, KeyGovernanceConfigError> {
         self.lease_ttl_secs.checked_mul(1_000).ok_or_else(|| {
@@ -2237,6 +2479,12 @@ pub struct KeyManagementConfig {
     pub allow_api_override: bool,
     /// When the store is unreachable, allow the request through in a degraded
     /// mode. Default false: fail closed (deny).
+    ///
+    ///
+    /// Note the polarity this field is named into: `true` here means
+    /// ALLOW, that is, fail open. Other booleans in this config carry
+    /// the opposite sense, which is the inconsistency [`FailureMode`]
+    /// exists to retire.
     #[serde(default)]
     pub failure_mode_allow: bool,
     /// Optional OIDC/JWT claim to virtual-key mapping.
