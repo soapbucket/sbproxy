@@ -100,8 +100,8 @@ rag-vector-weaviate = ["rag", "sbproxy-rag/vector-weaviate"]
 # still parses so `sbproxy validate` reads the same file on every build.
 # The runtime assembly is where a configured-but-not-compiled rail becomes
 # a startup failure naming the missing feature.
-payments = ["dep:sbproxy-billing", "sbproxy-billing/runtime"]
-payment-mpp = ["payments", "sbproxy-billing/mpp"]
+payments = ["dep:sbproxy-billing", "sbproxy-billing/runtime", "sbproxy-modules/payments"]
+payment-mpp = ["payments", "sbproxy-billing/mpp", "sbproxy-modules/payment-mpp"]
 payment-stripe = ["payments", "sbproxy-billing/stripe"]
 payment-x402 = ["payments", "sbproxy-billing/x402"]
 payment-lightning-cln = ["payments", "sbproxy-billing/lightning-cln"]

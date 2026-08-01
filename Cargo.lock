@@ -9325,6 +9325,7 @@ dependencies = [
  "reqwest 0.12.28",
  "ring",
  "sbproxy-ai",
+ "sbproxy-billing",
  "sbproxy-cache",
  "sbproxy-classifier-client",
  "sbproxy-classifiers",

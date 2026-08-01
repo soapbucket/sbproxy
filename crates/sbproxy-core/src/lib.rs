@@ -122,6 +122,9 @@ pub mod mesh_cache;
 pub mod model_discovery;
 /// Authenticated private model-plane dispatch primitives.
 pub mod model_plane;
+/// Signs payment requirements into the existing quote JWS.
+#[cfg(feature = "payments")]
+pub mod payment_signer;
 /// Managed-model runtime integration exposed for lifecycle adapters and
 /// black-box reload tests.
 #[doc(hidden)]

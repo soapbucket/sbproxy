@@ -28,6 +28,9 @@ pub mod ip_filter;
 pub mod object_authz;
 pub mod openapi_validation;
 pub mod page_shield;
+/// Compiles one priced route into one signed payment requirement.
+#[cfg(feature = "payments")]
+pub mod payment_requirement;
 pub mod prompt_injection_v2;
 pub mod quote_token;
 pub mod rate_limit;
