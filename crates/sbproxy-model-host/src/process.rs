@@ -106,10 +106,10 @@ impl ProcessOwnershipStore {
     fn production() -> Self {
         #[cfg(test)]
         {
-            return Self::at(std::env::temp_dir().join(format!(
+            Self::at(std::env::temp_dir().join(format!(
                 "sbproxy-managed-engine-tests-{}",
                 std::process::id()
-            )));
+            )))
         }
         #[cfg(not(test))]
         if let Some(path) =
