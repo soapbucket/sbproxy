@@ -82,6 +82,7 @@ pub enum ManagedColdStartPolicy {
 
 /// Chunked-prefill tuning for a managed deployment.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedChunkedPrefill {
     /// Explicit prefill chunk size (the engine's `max-num-batched-tokens`).
     /// Omit to leave it to the engine default.
@@ -95,6 +96,7 @@ pub struct ManagedChunkedPrefill {
 
 /// One desired local model deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedDeploymentConfig {
     /// Logical ID from the certified model catalog.
     pub model: String,
@@ -245,6 +247,7 @@ pub enum ManagedEngineAcceleration {
 
 /// Provisioning policy for one managed inference engine.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedEngineConfig {
     /// Launch mechanism.
     #[serde(default)]
@@ -271,6 +274,7 @@ pub struct ManagedEngineConfig {
 
 /// Content-addressed model cache policy.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ModelHostCacheConfig {
     /// Cache directory. Omission uses the platform default.
     #[serde(default)]
@@ -285,6 +289,7 @@ pub struct ModelHostCacheConfig {
 
 /// Canonical model-host desired state under `proxy.model_host`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ModelHostControlConfig {
     /// System authoritative for desired-state mutations.
     #[serde(default)]

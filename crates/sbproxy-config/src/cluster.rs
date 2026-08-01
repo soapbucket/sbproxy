@@ -71,6 +71,7 @@ pub enum ClusterSecurityMode {
 
 /// Canonical peer-security configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterSecurityConfig {
     /// Selected peer-security mode.
     pub mode: ClusterSecurityMode,
@@ -104,6 +105,7 @@ pub struct ClusterSecurityConfig {
 
 /// Optional one-time enrollment authority configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterEnrollmentConfig {
     /// Durable authority directory created by `sbproxy cluster init`.
     pub authority_dir: String,
@@ -114,6 +116,7 @@ pub struct ClusterEnrollmentConfig {
 
 /// Signed deployment-authority configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterDeploymentAuthorityConfig {
     /// Ed25519 private signing-key file, valid only on an authority node.
     #[serde(default)]
@@ -124,6 +127,7 @@ pub struct ClusterDeploymentAuthorityConfig {
 
 /// Stable `proxy.cluster` configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     /// Logical cluster identity. Every member must use the same value.
     pub cluster_id: String,
@@ -203,6 +207,7 @@ pub enum ClusterConsistencyLevel {
 /// to `<state_dir>/replicated-state.redb` so a restarted node serves its
 /// committed records from disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterReplicationConfig {
     /// Copies kept per record. Clamped to cluster size at placement time.
     #[serde(default = "default_replication_factor")]

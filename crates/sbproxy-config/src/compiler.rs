@@ -1259,17 +1259,28 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         );
     }
 
-    // WOR-1140: parse through `serde_ignored` so a misspelled key is a
-    // hard boot error rather than a silent drop that takes the field's
-    // (often protection-disabling) default. `serde_ignored` only reports
-    // keys that a *typed* struct ignores; the schema's deliberate
-    // arbitrary-key blocks (`proxy.extensions` / origin `extensions` are
-    // `HashMap<String, Value>`, and `action` / `policies` / `transforms`
-    // / `authentication` / `variables` are opaque `serde_json::Value`
-    // handed to the module layer) accept any key, so they are not
-    // flagged. The `sbproxy serve` boot path runs `compile_config`, so
-    // this gate fires on boot and reload, not just the `validate`
-    // subcommand.
+    // WOR-1140: two layers reject misspelled keys, so a typo is a hard
+    // boot error rather than a silent drop that takes the field's
+    // (often protection-disabling) default.
+    //
+    // The first layer is `#[serde(deny_unknown_fields)]` on every
+    // struct in the config schema below the root: an unknown nested key
+    // fails the typed parse itself, including inside tagged enums
+    // (`credentials[].policies[]`, `secrets.backends[]`, ...) whose
+    // buffered content `serde_ignored` cannot see into. The root
+    // `ConfigFile` deliberately stays permissive because the archived
+    // Go v0.1.x schema was a flat single-origin file whose keys all sit
+    // at the top level; those fall through to the second layer.
+    //
+    // The second layer is this `serde_ignored` pass, which reports the
+    // top-level leftovers so they can warn (v1 compat) below. The
+    // schema's deliberate arbitrary-key blocks (`proxy.extensions` /
+    // origin `extensions` are `HashMap<String, Value>`, and `action` /
+    // `policies` / `transforms` / `authentication` / `variables` are
+    // opaque `serde_json::Value` handed to the module layer) accept any
+    // key under either layer. The `sbproxy serve` boot path runs
+    // `compile_config`, so both gates fire on boot and reload, not just
+    // the `validate` subcommand.
     let mut unknown_keys: Vec<String> = Vec::new();
     let mut config_file: ConfigFile = {
         let de = serde_yaml::Deserializer::from_str(&yaml);
@@ -2280,31 +2291,23 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
     };
 
     // Deserialize the raw `response_cache` JSON (if any) into a typed struct.
-    // Parse errors are downgraded to "no cache" with a warning so that a
-    // malformed block does not break the whole pipeline.
     //
-    // The one exception is a block that mentions `encryption`. Silently
-    // dropping that would disable caching for the origin, which fails
-    // safe, but it would also swallow a directive the operator wrote
-    // specifically to protect data. An operator who typo'd a key
-    // reference deserves an error, not a cache that quietly stopped
-    // existing.
+    // WOR-1140: a parse failure here is a hard compile error. This block
+    // used to downgrade to "no cache" with a warning, but with
+    // `deny_unknown_fields` on `ResponseCacheConfig` a misspelled key
+    // would have turned into a silently disabled cache, which is the
+    // exact silent-drop failure mode this ticket removes. An operator
+    // who authored a `response_cache:` block gets the block they wrote
+    // or an error naming what is wrong with it.
     let response_cache: Option<crate::types::ResponseCacheConfig> = match &config.response_cache {
         Some(v) => match serde_json::from_value::<crate::types::ResponseCacheConfig>(v.clone()) {
             Ok(cfg) => Some(cfg),
             Err(e) => {
-                if v.get("encryption").is_some() {
-                    anyhow::bail!(
-                        "origin '{hostname}': response_cache declares an `encryption` block but \
-                         the block failed to parse: {e}"
-                    );
-                }
-                tracing::warn!(
-                    hostname = %hostname,
-                    error = %e,
-                    "ignoring response_cache: failed to deserialize config block"
+                anyhow::bail!(
+                    "origin '{hostname}': response_cache block failed to parse: {e}. Fix the \
+                     block (or remove it); a malformed cache config is rejected rather than \
+                     silently ignored."
                 );
-                None
             }
         },
         None => None,

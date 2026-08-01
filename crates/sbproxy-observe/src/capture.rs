@@ -35,6 +35,7 @@ use crate::request_event::UserIdSource;
 /// "capture on, no echo, no redaction" baseline; operators tune via
 /// `sb.yml`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PropertiesConfig {
     /// Master switch. When `false`, [`capture_properties`] returns an
     /// empty map regardless of headers.
@@ -105,6 +106,7 @@ impl PropertiesConfig {
 
 /// Redaction rules for captured property values.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RedactConfig {
     /// Exact-match keys whose values are replaced with `"[redacted]"`.
     /// Match is case-insensitive on the lowercased captured key.
@@ -283,6 +285,7 @@ pub enum AutoGenerate {
 
 /// Per-origin sessions configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionsConfig {
     /// Master capture switch. When `false`, callers see no session ID
     /// regardless of headers or auto-generation policy.
@@ -431,6 +434,7 @@ pub fn capture_parent_session_id(headers: &HeaderMap) -> (Option<Ulid>, SessionD
 
 /// Per-origin user-ID configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UserConfig {
     /// Master capture switch. When `false`, [`capture_user_id`] always
     /// returns `None`.
@@ -473,6 +477,7 @@ impl Default for UserConfig {
 /// See `docs/A30.md` (decision log) for the rationale on why this
 /// path drops rather than rejects.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetConfig {
     /// Maximum admissions per window. Exceeding this floors further
     /// admissions in the same window to drop-with-metric.
