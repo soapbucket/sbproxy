@@ -3769,6 +3769,7 @@ dependencies = [
  "sbproxy-config",
  "sbproxy-extension",
  "sbproxy-httpkit",
+ "sbproxy-meter",
  "sbproxy-model-host",
  "sbproxy-platform",
  "sbproxy-plugin",
@@ -3923,6 +3924,21 @@ dependencies = [
  "bytes",
  "parking_lot",
  "reqwest",
+]
+
+[[package]]
+name = "sbproxy-meter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "ed25519-dalek",
+ "hex",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tracing",
 ]
 
 [[package]]

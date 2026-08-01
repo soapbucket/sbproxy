@@ -12,9 +12,10 @@
 //!
 //! Neither answer is worth anything if the number being signed cannot say
 //! where it came from. That is what this crate is for. It owns the metered
-//! event, the outcome table, and the unit resolvers. Chaining and signing
-//! land on top of it later and sign this vocabulary rather than inventing
-//! their own, so a buyer needs one verifier rather than two.
+//! event, the outcome table, the unit resolvers, and, in [`ledger`], the
+//! hash chain and the signing that turn those records into something a
+//! buyer can check. Chaining sits on top of the vocabulary rather than
+//! inventing its own, so a buyer needs one verifier rather than two.
 //!
 //! # Provenance is the point
 //!
@@ -38,26 +39,36 @@
 //! them. A table that silently fills the gap is a billing rule nobody agreed
 //! to, which is the defect the whole design exists to prevent.
 //!
-//! # A true leaf
+//! # A leaf of the workspace, not of the dependency tree
 //!
-//! The crate depends on `serde` and nothing else. It deliberately does not
-//! depend on `sbproxy-core`, `sbproxy-modules`, `sbproxy-ai`, or
-//! `sbproxy-config`. An operator metering a plain REST API should not have to
-//! compile the AI gateway to do it, and the existing usage ledger is typed to
-//! LLM tokens for exactly that reason.
+//! The crate depends on no other crate in this workspace. It deliberately
+//! does not depend on `sbproxy-core`, `sbproxy-modules`, `sbproxy-ai`, or
+//! `sbproxy-config`, because an operator metering a plain REST API should
+//! not have to compile the AI gateway to do it.
+//!
+//! It does take third-party crates, and [`ledger`] is why: hashing needs
+//! `sha2` and `hex`, signing needs `ed25519-dalek`, an entry needs a
+//! timestamp from `chrono`, and writing one under a lock needs
+//! `parking_lot`, `serde_json`, `anyhow`, and `tracing`. The rule the crate
+//! actually holds to is the one that matters for compile times and for
+//! layering: nothing here reaches back into the proxy.
 //!
 //! # What is not here yet
 //!
-//! No hash chain, no receipt signing, no configuration surface, and no
-//! resolvers beyond [`measured`]. Those arrive in later slices and build on
-//! these types.
+//! No configuration surface, and no resolvers beyond [`measured`]. Those
+//! arrive in later slices and build on these types.
 
 #![deny(missing_docs)]
 
 pub mod event;
+pub mod ledger;
 pub mod measured;
 pub mod outcome;
 
 pub use event::{Evidence, MeteredEvent, Subject, Unit, UnitSource};
+pub use ledger::{
+    ledger_health, verify_ledger, verifying_key_from_seed_hex, LedgerEntry, LedgerHealth,
+    LedgerPayload, LedgerVerifyResult, UsageLedger,
+};
 pub use measured::{resolve_measured, MeasuredQuantity, MeasuredRule, Measurement};
 pub use outcome::{Billable, BillableOutcome, Claim, OutcomeTable, OutcomeTableError};
