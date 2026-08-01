@@ -3716,8 +3716,8 @@ fn default_container_image(kind: EngineKind) -> Option<&'static str> {
     match kind {
         EngineKind::Vllm => Some(crate::vllm_driver::DEFAULT_VLLM_IMAGE),
         EngineKind::SGLang => Some(crate::sglang_driver::DEFAULT_SGLANG_IMAGE),
-        // Binary engines (and the in-process one) have no container path.
-        EngineKind::LlamaCpp | EngineKind::Embedded | EngineKind::MistralRs => None,
+        // Binary engines have no container path.
+        EngineKind::LlamaCpp | EngineKind::MistralRs => None,
     }
 }
 
@@ -3780,7 +3780,6 @@ fn provisioning_for(
         EngineKind::SGLang => sbproxy_config::ManagedEngineKind::SGLang,
         EngineKind::LlamaCpp => sbproxy_config::ManagedEngineKind::LlamaCpp,
         EngineKind::MistralRs => sbproxy_config::ManagedEngineKind::MistralRs,
-        EngineKind::Embedded => return EngineProvisioning::default(),
     };
     // WOR-1917: when the operator has not configured this engine under
     // `engines:`, a container-capable Python engine defaults to a
@@ -4383,10 +4382,9 @@ mod provisioning_tests {
 
     #[test]
     fn container_first_default_skips_non_container_engines() {
-        // llama.cpp and the embedded engine have no container-first default
-        // even when a container runtime is present.
+        // llama.cpp has no container-first default even when a container
+        // runtime is present.
         assert!(container_first_default(EngineKind::LlamaCpp, true, None).is_none());
-        assert!(container_first_default(EngineKind::Embedded, true, None).is_none());
     }
 
     #[test]

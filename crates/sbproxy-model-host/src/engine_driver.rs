@@ -544,7 +544,6 @@ impl LaunchRequest {
                 ArtifactFormat::Safetensors | ArtifactFormat::Pickle
             ),
             EngineKind::LlamaCpp => self.artifact.metadata.format == ArtifactFormat::Gguf,
-            EngineKind::Embedded => self.artifact.metadata.format == ArtifactFormat::Safetensors,
             // Safetensors-only for now: GGUF stays llama.cpp's certified
             // lane (WOR-1861).
             EngineKind::MistralRs => self.artifact.metadata.format == ArtifactFormat::Safetensors,

@@ -2448,6 +2448,15 @@ impl ProxyHttp for SbProxy {
         // this hook once per upstream response.
         ctx.upstream_first_byte_at = Some(std::time::Instant::now());
 
+        // WOR-2145: snapshot the response headers the attestation config
+        // meters, before this hook starts rewriting headers of its own.
+        // The evidence on a receipt has to be what the origin actually
+        // sent: a value read after the proxy edited it would be the
+        // proxy quoting itself and calling it the upstream's claim.
+        // A no-op unless this origin writes receipts and declares
+        // origin-header rules.
+        crate::meter_runtime::capture_origin_headers(ctx, upstream_response);
+
         // --- WOR-808: RSL `Link: rel="license"` discovery header ---
         //
         // When the origin publishes an RSL document (it has an
@@ -3539,6 +3548,43 @@ impl ProxyHttp for SbProxy {
             }
         }
 
+        // --- WOR-2145: refuse rather than serve work we cannot bill ---
+        //
+        // This is the last point at which the meter can refuse anything.
+        // The receipt itself is cut in `logging`, which runs after the
+        // response has been written and cannot recall a single byte, so
+        // `failure_mode: closed` has to make its decision here, on the
+        // strength of whether the chain is writable at all.
+        //
+        // Rewriting the status is not enough on its own. The body is
+        // suppressed in `response_body_filter` through `meter_refused`,
+        // because a 503 delivered with the upstream's body attached
+        // hands the buyer exactly the value the seller has just declared
+        // itself unable to record.
+        //
+        // Only `closed` reaches this branch. `degraded`, `open`, and
+        // `observe` all admit, and each leaves its own kind of trace
+        // when the receipt is cut.
+        if crate::meter_runtime::preflight_refuses(ctx) {
+            ctx.meter_refused = true;
+            ctx.response_status = Some(503);
+            upstream_response
+                .set_status(http::StatusCode::SERVICE_UNAVAILABLE)
+                .ok();
+            // A suppressed body is an empty body, and it has to say so.
+            // Leaving the upstream's framing in place would advertise
+            // bytes that are never sent and hang the client waiting for
+            // them.
+            upstream_response.remove_header("content-encoding");
+            upstream_response.remove_header("transfer-encoding");
+            let _ = upstream_response.insert_header("content-length", "0");
+            tracing::warn!(
+                tenant_id = %ctx.tenant_id,
+                host = %ctx.hostname,
+                "attestation: refusing under failure_mode closed; the receipt chain is not writable"
+            );
+        }
+
         // Phase-timing capture: snapshot the moment response_filter
         // returns. Paired with `ctx.upstream_first_byte_at` (set at
         // the top of this hook), this is the response-filter phase
@@ -4467,6 +4513,18 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // WOR-2145: the meter refused this response in `response_filter`
+        // under `failure_mode: closed`. Drop every chunk so the buyer
+        // receives none of the work the proxy cannot record.
+        //
+        // Ahead of the byte accounting below on purpose. `bytes_out` is
+        // the evidence behind a measured unit, so it has to be what
+        // actually crossed the wire and not what the upstream offered.
+        if ctx.meter_refused {
+            *body = None;
+            return Ok(None);
+        }
+
         // Track outbound body bytes for the access log. Counts what
         // the client receives, including transformed / fallback /
         // cached bodies, since those are what downstream egress
@@ -5607,6 +5665,34 @@ impl ProxyHttp for SbProxy {
         // WOR-1541: fold the realized outcome into the routing feedback
         // store (no-op unless the origin uses outcome-aware routing).
         record_routing_feedback(ctx);
+
+        // WOR-2145: cut the attested consumption receipt.
+        //
+        // Here rather than in `response_filter` because this is the
+        // first point at which the facts a receipt states are all
+        // final: the status after every override, the bytes that
+        // actually crossed the wire, and whether the client stayed to
+        // receive them. Metering off the response header would bill
+        // intent rather than delivery.
+        //
+        // A downstream error source is the client going away. That is a
+        // different commercial event from the origin failing, and the
+        // outcome table prices the two separately, so the distinction
+        // is carried rather than flattened into "something went wrong".
+        //
+        // No-op unless this origin's resolved role writes receipts.
+        {
+            let client_disconnected =
+                e.is_some_and(|error| *error.esource() == pingora_error::ErrorSource::Downstream);
+            let path = session.req_header().uri.path().to_string();
+            crate::meter_runtime::record_response(
+                ctx,
+                &method,
+                &path,
+                status_u16,
+                client_disconnected,
+            );
+        }
 
         // --- Wave 3 / G1.6 wire: per-agent labels on the hot path ---
         //

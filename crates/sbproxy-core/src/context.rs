@@ -528,6 +528,30 @@ pub struct RequestContext {
     /// fallback bodies, and cached responses are included.
     pub response_body_bytes: u64,
 
+    // --- Attested metering (WOR-2145) ---
+    /// Values of the response headers `proxy.attestation.origin_headers`
+    /// names, captured in `response_filter` because the upstream response
+    /// header is out of scope by the time the receipt is cut.
+    ///
+    /// Only the configured header names are copied, so a deployment with
+    /// no origin-header rules allocates nothing. Absent and empty are kept
+    /// apart: a name with no entry here is a header the origin never sent,
+    /// which is a different statement from one it sent empty, and the
+    /// receipt's evidence encodes that difference. Filled by
+    /// `crate::meter_runtime::capture_origin_headers` and read once by
+    /// `crate::meter_runtime::record_response`.
+    pub meter_origin_headers: Vec<(String, String)>,
+
+    /// Set when the meter refused this response under
+    /// `failure_mode: closed`, so the body filter drops every chunk
+    /// instead of delivering work the proxy cannot bill for.
+    ///
+    /// Refusing has to suppress the body, not just rewrite the status.
+    /// A 503 with the upstream's body still attached would hand the
+    /// buyer exactly the value the seller just declared itself unable to
+    /// record, which is the one outcome `closed` exists to prevent.
+    pub meter_refused: bool,
+
     // --- Request mirror state ---
     /// Captured-at-`request_filter` parameters for a request whose
     /// mirror should fire from `request_body_filter` (so the body
@@ -1519,6 +1543,8 @@ impl RequestContext {
             body_bytes_seen: 0,
             request_body_bytes: 0,
             response_body_bytes: 0,
+            meter_origin_headers: Vec::new(),
+            meter_refused: false,
             mirror_pending: None,
             auth_result: None,
             trust_tier: sbproxy_modules::auth::TrustTier::Anonymous,

@@ -30,6 +30,10 @@ SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI m
 - [getting-started-sovereign-multicloud.md](getting-started-sovereign-multicloud.md) - use Kubernetes, sidecars, and secret backends.
 - [use-case-own-openrouter.md](use-case-own-openrouter.md) - run a provider gateway on your own credentials.
 - [use-case-coding-assistant.md](use-case-coding-assistant.md) - point a coding assistant at a local model.
+- [use-case-connect-codex.md](use-case-connect-codex.md) - connect Codex CLI to a governed gateway.
+- [use-case-connect-cursor.md](use-case-connect-cursor.md) - connect Cursor to a governed gateway.
+- [use-case-connect-cline.md](use-case-connect-cline.md) - connect Cline to a governed gateway.
+- [use-case-connect-copilot.md](use-case-connect-copilot.md) - connect GitHub Copilot BYOK to a governed gateway.
 - [use-case-production-ops.md](use-case-production-ops.md) - move from a laptop deployment to operational ownership.
 
 ## Route AI, APIs, and tools

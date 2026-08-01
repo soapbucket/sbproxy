@@ -5814,8 +5814,16 @@
             }
           ]
         },
+        "measured": {
+          "description": "Units this proxy counted for itself. See [`AttestationMeasuredConfig`].\n\nListed first because it is the resolver that needs nothing from anybody, and a receipt is easier to argue about when an unarguable line is sitting next to the contested ones.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AttestationMeasuredConfig"
+          }
+        },
         "route_weights": {
-          "description": "Routes priced in this document. See [`AttestationRouteWeightConfig`].\n\nA sibling list rather than a variant of one `units:` block, and the same goes for [`Self::origin_headers`]. Each resolver has its own provenance and its own way of being wrong, so each declares itself in its own vocabulary and none of them can be mistaken for another when a receipt is read back. It also means the expression resolver arrives later as a third list rather than as a variant every existing entry has to be retrofitted into.",
+          "description": "Routes priced in this document. See [`AttestationRouteWeightConfig`].\n\nA sibling list rather than a variant of one `units:` block, and the same goes for [`Self::measured`] and [`Self::origin_headers`]. Each resolver has its own provenance and its own way of being wrong, so each declares itself in its own vocabulary and none of them can be mistaken for another when a receipt is read back. It also means the expression resolver arrives later as a fourth list rather than as a variant every existing entry has to be retrofitted into.",
           "default": [],
           "type": "array",
           "items": {
@@ -6052,6 +6060,69 @@
           "type": "string",
           "enum": [
             "collapse"
+          ]
+        }
+      ]
+    },
+    "AttestationMeasuredConfig": {
+      "description": "`proxy.attestation.measured[]`: one unit the proxy counted itself.\n\nThe only unit source with nothing outside the process in it. The proxy saw the bytes and held the clock, so nobody else contributed to the number and there is no third party whose word has to be taken. That is why it is the resolver to reach for first: a route weight is only as honest as the document it was read from, and an origin header is only as honest as the party being paid for it, whereas this one is arithmetic over things that demonstrably happened.\n\nA partial unit is billed as a whole one. Twelve thousand and forty-three bytes against a kibibyte rule is twelve units, not eleven and a bit, because the operator delivered those bytes and there is no fraction of a kibibyte to hand back. See `sbproxy_meter::MeasuredRule`.",
+      "type": "object",
+      "required": [
+        "name",
+        "quantity"
+      ],
+      "properties": {
+        "name": {
+          "description": "Unit name that appears on the invoice line, for example `egress_kib`. Unique across every resolver: two units sharing a name on one receipt is an invoice line that cannot be read.",
+          "type": "string"
+        },
+        "quantity": {
+          "description": "The observed quantity this entry counts. See [`AttestationMeasuredQuantity`].",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AttestationMeasuredQuantity"
+            }
+          ]
+        },
+        "per": {
+          "description": "How much of the raw quantity makes one unit.\n\nThis is the key that turns bytes into kibibytes: `1024` against [`AttestationMeasuredQuantity::BytesOut`] bills one unit per kibibyte written. A divisor rather than a multiplier because the raw quantity is always the smaller currency and the invoice line is always the larger one. Nobody sells thousandths of a request, but plenty of people sell kibibytes and compute-seconds, and writing `per: 1000` against `duration_ms` says \"a second\" in the units the proxy actually observed rather than asking the operator to express a rate as a fraction.\n\nDefaults to `1`, which bills one unit per observed item and is the only sensible reading of an entry that omits it. Zero is rejected at config compile: a divisor of zero has no answer to fall back on, and the request path is the wrong place to find that out.",
+          "default": 1,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "AttestationMeasuredQuantity": {
+      "description": "Which observed quantity a measured unit counts, in the configuration vocabulary.\n\nA deliberate mirror of `sbproxy_meter::MeasuredQuantity` rather than a re-export, for the same reason [`BillableRule`] mirrors `sbproxy_meter::Billable`. The meter crate depends on no other crate in this workspace, which is what lets an operator metering a plain REST API compile it without the gateway around it; deriving [`schemars::JsonSchema`] on its types would end that. So the config vocabulary lives here, the metering vocabulary lives there, and `sbproxy-core` converts between them. Both spell the variants the same way on the wire, so a config written against one reads the same as a receipt written by the other.",
+      "oneOf": [
+        {
+          "description": "The request itself, which is always one. What a flat per-call charge is built from.",
+          "type": "string",
+          "enum": [
+            "requests"
+          ]
+        },
+        {
+          "description": "Request bytes received from the client.",
+          "type": "string",
+          "enum": [
+            "bytes_in"
+          ]
+        },
+        {
+          "description": "Response bytes written to the client. What was actually written, so a response that was cut short bills what crossed the wire.",
+          "type": "string",
+          "enum": [
+            "bytes_out"
+          ]
+        },
+        {
+          "description": "Wall-clock milliseconds the request was in flight.",
+          "type": "string",
+          "enum": [
+            "duration_ms"
           ]
         }
       ]

@@ -972,7 +972,6 @@ enum ModelEngineArg {
     #[value(name = "sglang")]
     SGLang,
     LlamaCpp,
-    Embedded,
     #[value(name = "mistralrs")]
     MistralRs,
 }
@@ -984,7 +983,6 @@ impl From<ModelEngineArg> for sbproxy_model_host::EngineChoice {
             ModelEngineArg::Vllm => Self::Vllm,
             ModelEngineArg::SGLang => Self::SGLang,
             ModelEngineArg::LlamaCpp => Self::LlamaCpp,
-            ModelEngineArg::Embedded => Self::Embedded,
             ModelEngineArg::MistralRs => Self::MistralRs,
         }
     }
@@ -3042,9 +3040,6 @@ fn prepare_run(args: &RunArgs) -> anyhow::Result<PreparedRun> {
                 "acceleration": acceleration,
             })
         }
-        sbproxy_model_host::EngineKind::Embedded => {
-            anyhow::bail!("catalog resolved the unsupported embedded managed engine")
-        }
         sbproxy_model_host::EngineKind::MistralRs => serde_json::json!({
             // Binary engine like llama.cpp: PATH-first with the pinned
             // upstream prebuilt release as the fallback (WOR-1861).
@@ -3707,7 +3702,6 @@ fn engine_kind_name(engine: sbproxy_model_host::EngineKind) -> &'static str {
         sbproxy_model_host::EngineKind::Vllm => "vllm",
         sbproxy_model_host::EngineKind::SGLang => "sglang",
         sbproxy_model_host::EngineKind::LlamaCpp => "llama_cpp",
-        sbproxy_model_host::EngineKind::Embedded => "embedded",
         sbproxy_model_host::EngineKind::MistralRs => "mistralrs",
     }
 }
@@ -5122,7 +5116,6 @@ fn engine_choice_name(engine: sbproxy_model_host::EngineChoice) -> &'static str 
         sbproxy_model_host::EngineChoice::Vllm => "vllm",
         sbproxy_model_host::EngineChoice::SGLang => "sglang",
         sbproxy_model_host::EngineChoice::LlamaCpp => "llama_cpp",
-        sbproxy_model_host::EngineChoice::Embedded => "embedded",
         sbproxy_model_host::EngineChoice::MistralRs => "mistralrs",
     }
 }
