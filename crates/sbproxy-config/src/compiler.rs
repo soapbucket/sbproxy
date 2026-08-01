@@ -4363,10 +4363,8 @@ origins:
     #[test]
     fn compile_config_with_env_variables() {
         // Set a test environment variable.
-        let _env = crate::test_env::EnvVarGuard::set(&[(
-            "TEST_ENV_VALUE_COMPILE",
-            Some("from-env-42"),
-        )]);
+        let _env =
+            crate::test_env::EnvVarGuard::set(&[("TEST_ENV_VALUE_COMPILE", Some("from-env-42"))]);
         let yaml = r#"
 origins:
   "envvar.test":

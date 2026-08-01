@@ -577,8 +577,11 @@ mod tests {
     fn kubeconfig_auth_uses_the_explicit_path_and_leaves_kubeconfig_env_alone() {
         let directory = tempfile::tempdir().expect("fixture directory");
         let decoy = write_kubeconfig(directory.path(), "decoy", "https://decoy.invalid:6443");
-        let selected =
-            write_kubeconfig(directory.path(), "selected", "https://selected.invalid:6443");
+        let selected = write_kubeconfig(
+            directory.path(),
+            "selected",
+            "https://selected.invalid:6443",
+        );
 
         let decoy_env = decoy.to_string_lossy().into_owned();
         let _env = crate::test_env::EnvVarGuard::set(&[("KUBECONFIG", Some(decoy_env.as_str()))]);
@@ -610,10 +613,16 @@ mod tests {
     #[test]
     fn concurrent_kubeconfig_loads_cannot_cross_select_clusters() {
         let directory = tempfile::tempdir().expect("fixture directory");
-        let path_a =
-            write_kubeconfig(directory.path(), "cluster-a", "https://cluster-a.invalid:6443");
-        let path_b =
-            write_kubeconfig(directory.path(), "cluster-b", "https://cluster-b.invalid:6443");
+        let path_a = write_kubeconfig(
+            directory.path(),
+            "cluster-a",
+            "https://cluster-a.invalid:6443",
+        );
+        let path_b = write_kubeconfig(
+            directory.path(),
+            "cluster-b",
+            "https://cluster-b.invalid:6443",
+        );
 
         let load_repeatedly = |path: std::path::PathBuf| {
             std::thread::spawn(move || {

@@ -10274,10 +10274,8 @@ mod tests {
         .unwrap();
         let caller_shell = paths.env_file.parent().unwrap().join("from-caller-shell");
         let caller_shell = caller_shell.display().to_string();
-        let _env = EnvVarGuard::set(&[(
-            "SBPROXY_ENGINE_OWNERSHIP_DIR",
-            Some(caller_shell.as_str()),
-        )]);
+        let _env =
+            EnvVarGuard::set(&[("SBPROXY_ENGINE_OWNERSHIP_DIR", Some(caller_shell.as_str()))]);
 
         let selected = service_engine_ownership_directory(&paths).unwrap();
 

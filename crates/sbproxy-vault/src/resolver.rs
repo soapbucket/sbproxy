@@ -203,10 +203,8 @@ mod tests {
 
     #[test]
     fn resolve_env_var_pattern() {
-        let _env = crate::test_env::EnvVarGuard::set(&[(
-            "TEST_RESOLVER_ENV",
-            Some("from_environment"),
-        )]);
+        let _env =
+            crate::test_env::EnvVarGuard::set(&[("TEST_RESOLVER_ENV", Some("from_environment"))]);
         let resolver = resolver_no_backend();
         assert_eq!(
             resolver.resolve("${TEST_RESOLVER_ENV}").unwrap(),
