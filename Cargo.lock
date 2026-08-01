@@ -5264,7 +5264,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 [[package]]
 name = "pingora-cache"
 version = "0.8.1"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4b680518682a4a5e968a66dd1055fbd15073af44"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#b9d6f91d2dd34bc4138bd2967027cc5c7bf64db0"
 dependencies = [
  "ahash",
  "async-trait",
@@ -5300,7 +5300,7 @@ dependencies = [
 [[package]]
 name = "pingora-core"
 version = "0.8.1"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4b680518682a4a5e968a66dd1055fbd15073af44"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#b9d6f91d2dd34bc4138bd2967027cc5c7bf64db0"
 dependencies = [
  "ahash",
  "async-trait",
@@ -5353,12 +5353,12 @@ dependencies = [
 [[package]]
 name = "pingora-error"
 version = "0.8.1"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4b680518682a4a5e968a66dd1055fbd15073af44"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#b9d6f91d2dd34bc4138bd2967027cc5c7bf64db0"
 
 [[package]]
 name = "pingora-header-serde"
 version = "0.8.1"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4b680518682a4a5e968a66dd1055fbd15073af44"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#b9d6f91d2dd34bc4138bd2967027cc5c7bf64db0"
 dependencies = [
  "bytes",
  "http 1.4.0",
@@ -5373,7 +5373,7 @@ dependencies = [
 [[package]]
 name = "pingora-http"
 version = "0.8.1"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4b680518682a4a5e968a66dd1055fbd15073af44"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#b9d6f91d2dd34bc4138bd2967027cc5c7bf64db0"
 dependencies = [
  "bytes",
  "http 1.4.0",
@@ -5383,7 +5383,7 @@ dependencies = [
 [[package]]
 name = "pingora-lru"
 version = "0.8.1"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4b680518682a4a5e968a66dd1055fbd15073af44"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#b9d6f91d2dd34bc4138bd2967027cc5c7bf64db0"
 dependencies = [
  "arrayvec",
  "hashbrown 0.17.0",
@@ -5394,7 +5394,7 @@ dependencies = [
 [[package]]
 name = "pingora-pool"
 version = "0.8.1"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4b680518682a4a5e968a66dd1055fbd15073af44"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#b9d6f91d2dd34bc4138bd2967027cc5c7bf64db0"
 dependencies = [
  "crossbeam-queue",
  "log",
@@ -5408,7 +5408,7 @@ dependencies = [
 [[package]]
 name = "pingora-proxy"
 version = "0.8.1"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4b680518682a4a5e968a66dd1055fbd15073af44"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#b9d6f91d2dd34bc4138bd2967027cc5c7bf64db0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5430,7 +5430,7 @@ dependencies = [
 [[package]]
 name = "pingora-runtime"
 version = "0.8.1"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4b680518682a4a5e968a66dd1055fbd15073af44"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#b9d6f91d2dd34bc4138bd2967027cc5c7bf64db0"
 dependencies = [
  "once_cell",
  "rand 0.8.6",
@@ -5441,7 +5441,7 @@ dependencies = [
 [[package]]
 name = "pingora-rustls"
 version = "0.8.1"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4b680518682a4a5e968a66dd1055fbd15073af44"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#b9d6f91d2dd34bc4138bd2967027cc5c7bf64db0"
 dependencies = [
  "log",
  "no_debug",
@@ -5457,7 +5457,7 @@ dependencies = [
 [[package]]
 name = "pingora-timeout"
 version = "0.8.1"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4b680518682a4a5e968a66dd1055fbd15073af44"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#b9d6f91d2dd34bc4138bd2967027cc5c7bf64db0"
 dependencies = [
  "once_cell",
  "parking_lot",

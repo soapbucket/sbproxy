@@ -1,6 +1,6 @@
 # GPU fit planning
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-01*
 
 When you name a model, the fit planner decides which quantization to
 run on the GPU you have, and it refuses a configuration the card cannot
@@ -46,19 +46,22 @@ parameters set the VRAM, active parameters set the speed.
 KV-cache quantization is a lever here, but how much it buys depends on
 the engine, because not every engine has a kernel for every mode.
 
-| `kv_quant` | vLLM | SGLang | llama.cpp |
-|---|---|---|---|
-| `auto` | weight-quant default | weight-quant default | weight-quant default |
-| `f16` | 2 bytes | 2 bytes | 2 bytes |
-| `fp8` | 1 byte (`fp8`) | 1 byte (`fp8_e5m2`) | 1 byte (`q8_0`) |
-| `int8` | 1 byte, served as `fp8` | 1 byte, served as `fp8_e5m2` | 1 byte (`q8_0`) |
-| `int4` | **1 byte, served as `fp8`** | **1 byte, served as `fp8_e5m2`** | 0.5 bytes (`q4_0`) |
+| `kv_quant` | vLLM | SGLang | llama.cpp | mistral.rs |
+|---|---|---|---|---|
+| `auto` | weight-quant default | weight-quant default | weight-quant default | weight-quant default |
+| `f16` | 2 bytes | 2 bytes | 2 bytes | 2 bytes |
+| `fp8` | 1 byte (`fp8`) | 1 byte (`fp8_e5m2`) | 1 byte (`q8_0`) | weight-quant default |
+| `int8` | 1 byte, served as `fp8` | 1 byte, served as `fp8_e5m2` | 1 byte (`q8_0`) | weight-quant default |
+| `int4` | **1 byte, served as `fp8`** | **1 byte, served as `fp8_e5m2`** | 0.5 bytes (`q4_0`) | weight-quant default |
 
 So `int4` halves the KV term on llama.cpp and does nothing beyond `fp8`
-on the CUDA engines, which expose only fp8 KV variants. The planner
-sizes what the engine will really run, and the log says so when it
-substitutes, so a request for a mode an engine lacks costs you accuracy
-in the plan rather than an out-of-memory failure at first token.
+on the CUDA engines, which expose only fp8 KV variants; mistral.rs
+takes no KV dtype flag at all, so a low-precision request there keeps
+the engine default and books no saving. The planner sizes what the
+engine will really run, and when it substitutes it logs a warning
+naming the requested mode, the dtype it serves instead, and the
+engine, so a request for a mode an engine lacks costs you accuracy in
+the plan rather than an out-of-memory failure at first token.
 
 Quantizing the cache trades a little quality for capacity either way,
 so it stays opt-in.

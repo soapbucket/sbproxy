@@ -20,8 +20,8 @@ tests".
 **A candidate list, not a defect list.** Four different things land in
 it, and only one of them is a deletion:
 
-1. Consumed by the out-of-tree enterprise crate. Pass `--enterprise` to
-   cross-check; without it, this script cannot tell you and says so.
+1. Consumed by an optional out-of-tree API consumer. Pass `--external-tree`
+   to cross-check; without it, this script cannot tell you and says so.
 2. Over-exposed rather than dead: used inside its own file, so the fix is
    narrowing visibility, which also hands the item back to `dead_code`.
 3. Reachable through serde or schemars rather than a Rust caller. Config
@@ -40,7 +40,7 @@ right one: this list should be safe to work through, not exhaustive.
     scripts/scan-pub-item-usage.py --tests-only       # the highest-value slice
     scripts/scan-pub-item-usage.py --json             # machine-readable
     scripts/scan-pub-item-usage.py --count tests-only # one integer, for CI
-    scripts/scan-pub-item-usage.py --enterprise ../sbproxy-enterprise
+    scripts/scan-pub-item-usage.py --external-tree /path/to/api-consumer
 """
 
 from __future__ import annotations
@@ -229,13 +229,12 @@ def collect_references(
     return production, tests
 
 
-def enterprise_names(root: Path) -> set[str]:
-    """Every identifier the out-of-tree tree mentions.
+def external_tree_names(root: Path) -> set[str]:
+    """Every identifier an optional external consumer tree mentions.
 
-    In-tree unreferenced does not mean unused. `MeshBridge` and
-    `BridgeConfig` are both flagged by this scan and both live in the
-    enterprise tree; deleting them would break a build that is not in
-    this repository.
+    In-tree unreferenced does not mean unused. A public item can be absent
+    from this repository's call sites while remaining part of an API consumed
+    by another checkout; deleting it would break a build this scan cannot see.
     """
     found: set[str] = set()
     word = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
@@ -269,7 +268,7 @@ def verdict_for(item: dict) -> tuple[str, str]:
     """
     if item.get("recorded"):
         return (item["recorded"]["verdict"], item["recorded"]["reason"])
-    if item.get("in_enterprise"):
+    if item.get("in_external_tree"):
         return (
             "keep",
             "named by the out-of-tree consumer tree; deleting it breaks a build "
@@ -311,12 +310,12 @@ def emit_triage(tests_only: list[dict], unreferenced: list[dict], cross_checked:
     print()
     print("```bash")
     print("python3 scripts/scan-pub-item-usage.py --triage \\")
-    print("  --enterprise ../sbproxy-enterprise > scripts/pub-item-triage.md")
+    print("  --external-tree /path/to/api-consumer > scripts/pub-item-triage.md")
     print("```")
     print()
     if not cross_checked:
-        print("**This table was generated without the enterprise cross-check, so its")
-        print("`keep` column is wrong. Regenerate it with `--enterprise` before acting")
+        print("**This table was generated without the external-tree cross-check, so its")
+        print("`keep` column is wrong. Regenerate it with `--external-tree` before acting")
         print("on anything here.**")
         print()
     print("## Verdicts")
@@ -368,9 +367,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default=None, help="workspace root (default: this script's repo)")
     parser.add_argument(
-        "--enterprise",
+        "--external-tree",
         default=None,
-        help="path to the out-of-tree consumer tree, cross-checked before any deletion",
+        help="path to an out-of-tree API consumer, cross-checked before any deletion",
     )
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     parser.add_argument(
@@ -400,7 +399,9 @@ def main() -> int:
     definitions = collect_definitions(rust_files(crates), repo)
     production, tests = collect_references(all_files, set(definitions), repo)
 
-    ent = enterprise_names(Path(args.enterprise).resolve()) if args.enterprise else None
+    external_names = (
+        external_tree_names(Path(args.external_tree).resolve()) if args.external_tree else None
+    )
 
     # How often each name appears in its own defining file beyond the
     # definition itself. A non-zero count means the item is used, just
@@ -428,8 +429,8 @@ def main() -> int:
         own = definition["file"]
         outside_prod = production.get(name, set()) - {own}
         outside_test = tests.get(name, set()) - {own}
-        if ent is not None:
-            definition["in_enterprise"] = name in ent
+        if external_names is not None:
+            definition["in_external_tree"] = name in external_names
         definition["used_in_own_file"] = in_file_uses.get(name, 0)
         if not outside_prod and not outside_test:
             unreferenced.append(definition)
@@ -468,7 +469,7 @@ def main() -> int:
     selected = tests_only if args.tests_only else unreferenced
 
     if args.triage:
-        emit_triage(tests_only, unreferenced, ent is not None)
+        emit_triage(tests_only, unreferenced, external_names is not None)
         return 0
 
     if args.json:
@@ -481,12 +482,12 @@ def main() -> int:
 
     print(f"pub items never named outside their own file: {len(unreferenced)}")
     print(f"pub items named only by test code:            {len(tests_only)}")
-    if ent is None:
-        print("enterprise cross-check:                       NOT RUN (pass --enterprise)")
+    if external_names is None:
+        print("external-tree cross-check:                    NOT RUN (pass --external-tree)")
         print("  Nothing here is safe to delete without it.")
     else:
-        shared = sum(1 for i in unreferenced if i.get("in_enterprise"))
-        print(f"enterprise cross-check:                       {shared} of these appear out of tree")
+        shared = sum(1 for i in unreferenced if i.get("in_external_tree"))
+        print(f"external-tree cross-check:                    {shared} of these appear out of tree")
     print()
     print("By crate, worst first:")
     for crate, count in sorted(by_crate.items(), key=lambda kv: -kv[1]):
@@ -494,8 +495,8 @@ def main() -> int:
     print()
     for item in selected:
         flag = ""
-        if item.get("in_enterprise"):
-            flag = "  [in enterprise tree, do not delete]"
+        if item.get("in_external_tree"):
+            flag = "  [in external tree, do not delete]"
         elif item.get("derives") and any(
             "Deserialize" in d or "JsonSchema" in d for d in item["derives"]
         ):
