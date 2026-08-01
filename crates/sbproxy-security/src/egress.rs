@@ -536,10 +536,8 @@ mod tests {
         let pinned = addr([104, 18, 1, 1], 443);
         // One address is still pinned, one is new. The connector could
         // pick either, so the whole dial must be refused.
-        let resolver = SequenceResolver::new(vec![
-            vec![pinned],
-            vec![pinned, addr([10, 0, 0, 5], 443)],
-        ]);
+        let resolver =
+            SequenceResolver::new(vec![vec![pinned], vec![pinned, addr([10, 0, 0, 5], 443)]]);
 
         let dest = auth
             .authorize(

@@ -3033,7 +3033,10 @@ mod tests {
 
         let resolver = RebindResolver::new(vec![
             ("hop-one.invalid", vec![vec![hop_one_addr]]),
-            ("hop-two.invalid", vec![vec![authorize_addr], vec![rebound_addr]]),
+            (
+                "hop-two.invalid",
+                vec![vec![authorize_addr], vec![rebound_addr]],
+            ),
         ]);
         let fed = McpFederation::new(vec![]);
         let backing = enforce_openapi_backing(

@@ -474,8 +474,10 @@ mod tests {
     #[test]
     fn allow_by_default_destination_is_unpinned_at_dial_time() {
         let policy = EgressPolicy::allow_all("action");
-        let resolver =
-            MapResolver::new(vec![("api.example.com", vec![addr([93, 184, 216, 34], 443)])]);
+        let resolver = MapResolver::new(vec![(
+            "api.example.com",
+            vec![addr([93, 184, 216, 34], 443)],
+        )]);
 
         let dest = policy
             .authorize(
@@ -532,8 +534,10 @@ mod tests {
         };
         let authorize_resolver =
             MapResolver::new(vec![("api.example.com", vec![addr([104, 18, 1, 1], 443)])]);
-        let rebound_resolver =
-            MapResolver::new(vec![("api.example.com", vec![addr([93, 184, 216, 34], 443)])]);
+        let rebound_resolver = MapResolver::new(vec![(
+            "api.example.com",
+            vec![addr([93, 184, 216, 34], 443)],
+        )]);
 
         let dest = policy
             .authorize(
