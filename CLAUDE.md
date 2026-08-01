@@ -1,5 +1,5 @@
 # sbproxy (Rust workspace)
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-01*
 
 The active implementation of sbproxy. Cargo workspace with ~20
 crates under `crates/`, an e2e suite under `e2e/`, examples under
@@ -18,6 +18,7 @@ ten-minute build.
 | Tracker placeholders | `grep -rn 'WOR-XXX' crates/ --include='*.rs' --include='*.toml'` (any hit fails) |
 | pub-item ratchet | `bash scripts/check-pub-item-ratchet.sh` |
 | Spec citations | `bash scripts/check-spec-citations.sh` |
+| Env mutation | `bash scripts/check-env-mutation.sh` |
 | Doc drift | `bash scripts/check-doc-drift.sh` |
 | Tapes + GIF wiring | `make tapes-check` |
 | Doc configs | `python3 scripts/sync-doc-configs.py --check` |

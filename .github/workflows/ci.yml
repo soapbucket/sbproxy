@@ -239,6 +239,15 @@ jobs:
             exit 1
           fi
 
+      # Reject process-global env mutation outside the documented
+      # per-crate test helpers. Production code must not call
+      # std::env::set_var / remove_var at all; the semantic race those
+      # calls carry is why Rust 2024 makes them unsafe. Shares one
+      # script with scripts/check.sh so the local gate fails on the
+      # same violation.
+      - name: no process-global env mutation outside test helpers
+        run: bash scripts/check-env-mutation.sh
+
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

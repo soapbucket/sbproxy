@@ -169,6 +169,13 @@ bash "$ROOT/scripts/check-pub-item-ratchet.sh"
 step "spec citation hygiene"
 bash "$ROOT/scripts/check-spec-citations.sh"
 
+# CI: ci.yml lint lane, "no process-global env mutation outside test
+# helpers" (WOR-646). Pure grep. Production code must not call
+# std::env::set_var / remove_var; tests go through the per-crate
+# EnvVarGuard in src/test_env.rs.
+step "no process-global env mutation outside test helpers"
+bash "$ROOT/scripts/check-env-mutation.sh"
+
 # CI: doc-drift.yml. Guards the provider-count, routing-strategy, and
 # unimplemented-feature claims in user-facing docs.
 step "doc drift"
