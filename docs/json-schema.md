@@ -1,5 +1,5 @@
 # JSON Schema for `sb.yml`
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-01*
 
 SBproxy publishes a generated JSON Schema for the typed `sb.yml` envelope.
 Editors that understand the schema (VS Code with the YAML extension, the
@@ -51,6 +51,60 @@ config format; it teaches the editor what to flag.
 * **Enum hints**. Closed enums (`admin.operators[].role:
   read_only | admin`) drop down the allowed values.
 * **Inline docs**. Rust field comments land in the schema's `description`.
+
+## Calling it
+
+The runnable configuration is
+[`examples/json-schema/`](../examples/json-schema/). The interesting part is
+line 1, the `# yaml-language-server: $schema=` directive; the rest is a
+minimal single-origin proxy.
+
+Editor autocomplete cannot be shown here, but the schema that drives it can be
+checked outside an editor, which is also how you would wire it into CI. Point
+any JSON Schema validator at it:
+
+```bash
+python3 -c '
+import json, yaml, jsonschema
+schema = json.load(open("schemas/sb-config.schema.json"))
+doc = yaml.safe_load(open("examples/json-schema/sb.yml"))
+for e in jsonschema.Draft7Validator(schema).iter_errors(doc):
+    print("/".join(map(str, e.path)), e.message)
+'
+```
+
+That prints nothing for the shipped config. Change `http_bind_port: 8080` to
+`http_bind_port: "hello"`, the exact case the section above says underlines
+red, and it prints:
+
+```
+proxy/http_bind_port 'hello' is not of type 'integer'
+```
+
+The path is the same one your editor highlights, because it is the same
+schema.
+
+The binary is the second opinion, and it does not read the schema at all. It
+compiles the config through the real Rust types:
+
+```bash
+sbproxy validate examples/json-schema/sb.yml
+# ok: examples/json-schema/sb.yml is a valid sbproxy config
+```
+
+The same broken file fails with a message carrying the line and column:
+
+```
+validate: config '/tmp/bad.yml' did not compile:
+failed to parse config YAML: proxy.http_bind_port: invalid type: string "hello", expected u16 at line 23 column 19
+```
+
+Both agree because the schema is generated from those same Rust types, which
+is the property that keeps the editor from drifting from the binary. They are
+not interchangeable, though: the schema catches shape errors as you type, and
+`sbproxy validate` catches everything the schema deliberately leaves opaque,
+including the module payloads described next. Use the schema in your editor
+and `sbproxy validate` in CI.
 
 ## Opaque module payloads
 
