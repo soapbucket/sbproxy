@@ -111,6 +111,63 @@ origins:
 Only `embedding` and `vector_store` are required. Everything else has a
 default, and a minimal block carries just those two sections.
 
+### Calling it
+
+Send an ordinary chat request. Nothing about the client changes: no
+embedding call, no vector-store client, no extra headers.
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.localhost' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "fixture-chat",
+    "messages": [{"role": "user", "content": "When do refunds arrive?"}]
+  }'
+```
+
+The walkthrough's fixture answers only when the retrieved sentence is
+already in the request it receives, so this response is proof that
+retrieval happened inside the gateway rather than a claim that it did:
+
+```json
+{
+  "id": "chatcmpl-fixture-0001",
+  "object": "chat.completion",
+  "created": 0,
+  "model": "fixture-chat",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Refunds take five business days."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {"prompt_tokens": 42, "completion_tokens": 8, "total_tokens": 50}
+}
+```
+
+The user never typed that sentence. The gateway embedded the question,
+searched `support-docs` with the tenant filter, injected the chunk it
+found, and the model echoed it back.
+
+Stop the fixture and repeat the request to see the other half of the
+contract. Retrieval fails, `mode: fail_closed` turns that into a 502,
+and the model is never called:
+
+```json
+{
+  "error": {
+    "type": "rag_retrieval_failed",
+    "code": "rag_retrieval_failed",
+    "message": "retrieval context was unavailable"
+  }
+}
+```
+
 ### The query
 
 | Field | Default | Meaning |
