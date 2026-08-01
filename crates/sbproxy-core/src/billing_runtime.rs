@@ -1507,6 +1507,7 @@ mod tests {
             challenge_binding_key: "secret://env/SB_PAYMENT_BINDING_KEY".to_string(),
             authorization_timeout_ms: 2_000,
             max_body_bytes: 65_536,
+            failure_mode: sbproxy_config::types::FailureMode::Closed,
             recovery_encryption: None,
             worker: sbproxy_config::payments::PaymentsWorkerConfig::default(),
             protocols: sbproxy_config::payments::PaymentProtocolsConfig::default(),
