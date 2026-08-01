@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "ConfigFile",
-  "description": "Top-level config file structure (sb.yml).",
+  "description": "Top-level config file structure (sb.yml).\n\nThis is the one container in the schema without `#[serde(deny_unknown_fields)]` (WOR-1140). The archived Go v0.1.x schema was a flat single-origin file whose keys all sit at the top level, and the schema-v1 compatibility promise (`v1_compat::v1_fixtures_compile_unmodified`) keeps those files compiling. Unknown top-level keys therefore warn via the `serde_ignored` pass in [`crate::compile_config`] instead of failing the parse; every nested container rejects unknown keys outright.",
   "type": "object",
   "properties": {
     "source": {
@@ -193,7 +193,8 @@
                 "local"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Clone a git repository and read a single file inside it as the config text.",
@@ -253,7 +254,8 @@
               "format": "uint64",
               "minimum": 0.0
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Compose a base source with one or more overlays. Each overlay is merged onto the accumulated result in the order it appears in the list.",
@@ -285,7 +287,8 @@
                 "$ref": "#/definitions/ConfigSource"
               }
             }
-          }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -678,7 +681,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AcmeConfig": {
       "description": "ACME (Automatic Certificate Management Environment) configuration for automatic TLS.",
@@ -726,7 +730,8 @@
           "format": "uint32",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "Http3Config": {
       "description": "HTTP/3 (QUIC) configuration.\n\nThe shape is reserved for forward compatibility. The config compiler accepts an omitted or disabled block, but rejects `enabled: true` because this build does not serve HTTP/3. Native support is tracked in WOR-1969.",
@@ -751,7 +756,8 @@
           "format": "uint32",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "MetricsConfig": {
       "description": "Metrics collection configuration.",
@@ -775,7 +781,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "MetricsCardinalityConfig": {
       "description": "Per-label metrics cardinality overrides.",
@@ -790,7 +797,8 @@
           "format": "uint",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ObservabilityConfig": {
       "description": "Top-level observability block grouping live log extensions, telemetry, and durable usage rollups. The legacy process-logger fields under `log` remain parseable but are not installed into the tracing subscriber.",
@@ -832,7 +840,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ObservabilityLogConfig": {
       "description": "Subset of `sbproxy-observe::LoggingConfig` that lands in the public config schema. Kept in `sbproxy-config` so the YAML round-trips through serde without dragging a serde dependency back into the observe crate.",
@@ -894,7 +903,8 @@
             "$ref": "#/definitions/CustomLogFieldConfig"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ObservabilitySamplingConfig": {
       "description": "Per-level sample rates for the structured-log emitter.",
@@ -927,7 +937,8 @@
           ],
           "format": "double"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ObservabilityRedactConfig": {
       "description": "Operator-extensible redaction config. Sits under `proxy.observability.log.redact:` (today) and will surface at tenant and origin scopes once multi-tenant scaffolding lands.",
@@ -961,7 +972,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ObservabilityRedactPattern": {
       "description": "One named regex mask. `name` is reported on cardinality / counter metrics; `replacement` defaults to `[REDACTED:<NAME>]` when empty.",
@@ -987,7 +999,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ObservabilityPiiConfig": {
       "description": "Operator-controlled PII redaction at the log layer. Mirrors the per-origin `PiiConfig` used by the AI handler but applies to every emitted log line, regardless of origin.",
@@ -1016,7 +1029,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ObservabilitySinkConfig": {
       "description": "WOR-1045: one declared log sink. Multiple sinks fan out from a single emit; a tenant-scoped sink only receives lines whose resolved `Principal.tenant_id` matches the tenant scope. PR1 lands the schema and uniqueness validation; dispatch wiring lands in PR2.\n\n## Field schema\n\n* `name` is unique within the declaring scope. The same name may appear once at proxy scope and once at tenant scope; cross-scope collisions are intentional (a tenant `acme-loki` sink is a different thing from the proxy `acme-loki` sink). * `target` selects which internal channel feeds this sink: `access_log`, `error_log`, `audit_log`, `trace_exporter`, `external_log`. The channel maps 1:1 onto the existing `sbproxy_observe::logging::Sink` enum. * `format` is the wire shape: `compact | pretty | json`. When omitted the parent `proxy.observability.log.format` decides. * `output` is the where: `stdout | stderr | file`. `otlp` lands under WOR-1046; `syslog` is a planned follow-up. * `profile` is the redaction shape: `internal` keeps JA3/JA4 and raw query strings; `external` strips them. Tenant-scoped sinks default to `external` because the operator usually does not control the downstream backend.",
@@ -1059,7 +1073,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ObservabilitySinkOutput": {
       "description": "WOR-1045 + WOR-1046: tagged-union of supported sink output types. Each variant carries its own configuration.\n\nVariants: `stdout`, `stderr`, `file`, `otlp`. `syslog` remains a planned follow-up. Unknown `type:` values fail compilation.",
@@ -1077,7 +1092,8 @@
                 "stdout"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Write to process stderr. Useful for routing the audit channel separately from access on systemd-journald.",
@@ -1092,7 +1108,8 @@
                 "stderr"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Append to a file with optional rotation. Reuses the access-log rotation stack (`sbproxy_observe::access_log` rotation + gzip path).",
@@ -1140,7 +1157,8 @@
                 "null"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "WOR-1046: forward the rendered structured-log line to an OTLP log collector. The exporter wraps `opentelemetry_otlp::LogExporter` and ships records through a `BatchLogProcessor`. When `transport` and `timeout_secs` are omitted the sink inherits the values already declared on the top-level `telemetry:` block so a single operator config does not have to repeat collector coordinates.",
@@ -1178,7 +1196,8 @@
               "format": "uint64",
               "minimum": 0.0
             }
-          }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -1214,7 +1233,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ObservabilityTelemetryConfig": {
       "description": "Subset of `sbproxy-observe::TelemetryConfig` exposed in the YAML.",
@@ -1323,7 +1343,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "UsageRollupsConfig": {
       "description": "Durable spend-rollup configuration (hour and day usage buckets in an embedded database, so the admin spend API serves windowed history that survives restarts). Buckets are keyed by provider, model, tenant, team, credential id, and project, and aggregate request counts, tokens, cost, and an outcome split. Rows carry no prompt content and no raw key material, so the file is safe to back up. Aggregation is deterministic.",
@@ -1356,7 +1377,8 @@
           "format": "uint32",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AlertingConfig": {
       "description": "Top-level alerting configuration block.",
@@ -1370,7 +1392,8 @@
             "$ref": "#/definitions/AlertChannelConfig"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AlertChannelConfig": {
       "description": "Configuration for a single alert notification channel.",
@@ -1406,7 +1429,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AdminConfig": {
       "description": "Configuration for the embedded read-only admin/stats API server.",
@@ -1520,7 +1544,8 @@
             "$ref": "#/definitions/AdminOperator"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "PromptPersistenceEncryptionConfig": {
       "description": "At-rest encryption settings for the prompt-persistence redb file.\n\nPersisted `NamedPrompt` records are sealed with AES-256-GCM before they reach redb. Keys stay readable because hydration is a prefix scan over `prompts:<host>:<name>`, and the key is authenticated as associated data so a sealed value cannot be moved to another host or prompt name.\n\nSame reference syntax and the same no-plaintext-fallback rule as [`ResponseCacheEncryptionConfig`]: a key that is missing, unresolvable, or shorter than 16 bytes aborts startup. That is deliberately stricter than the surrounding prompt-persistence behaviour, where an unreadable file only degrades to ephemeral mutations. An unreadable file loses saved prompts; a key the operator asked for and cannot supply would silently write secrets in the clear.\n\nDerived under its own HKDF purpose, so pointing this and the response cache at one operator secret still yields two unrelated keys.",
@@ -1547,7 +1572,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AdminTlsConfig": {
       "description": "TLS material for the admin server (WOR-1717): filesystem paths to a PEM certificate chain and its matching private key. Both are required together; supplying `tls` makes the admin server, including the built-in UI, serve HTTPS instead of plaintext HTTP.",
@@ -1565,7 +1591,8 @@
           "description": "Path to the PEM private key file (PKCS#8 or RSA).",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AdminOperator": {
       "description": "An admin operator identity with a role, for RBAC (WOR-1716).",
@@ -1600,7 +1627,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AdminRole": {
       "description": "Admin RBAC role (WOR-1716). `read_only` may call read (GET) endpoints only; `admin` may call every admin route.",
@@ -1706,7 +1734,8 @@
             "$ref": "#/definitions/ManagedDeploymentConfig"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ModelHostAuthority": {
       "description": "System that owns the model-host desired state.",
@@ -1765,7 +1794,8 @@
           "format": "uint",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ManagedEngineConfig": {
       "description": "Provisioning policy for one managed inference engine.",
@@ -1831,7 +1861,8 @@
           "format": "uint64",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ManagedEngineLaunch": {
       "description": "How a managed engine process is provisioned and launched.",
@@ -2106,7 +2137,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ManagedPullPolicy": {
       "description": "Model artifact download policy.",
@@ -2243,7 +2275,8 @@
           "format": "uint64",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ClusterConfig": {
       "description": "Stable `proxy.cluster` configuration.",
@@ -2406,7 +2439,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ClusterRole": {
       "description": "Stable role assigned to one cluster node.",
@@ -2500,7 +2534,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ClusterSecurityMode": {
       "description": "Peer-security mode for the cluster substrate.",
@@ -2556,7 +2591,8 @@
           "default": false,
           "type": "boolean"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ClusterDeploymentAuthorityConfig": {
       "description": "Signed deployment-authority configuration.",
@@ -2577,7 +2613,8 @@
           "description": "Ed25519 public verification-key file installed on every node.",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ClusterReplicationConfig": {
       "description": "Replicated durable state substrate configuration (WOR-1947).\n\nEnabling this block requires `state_dir`: the replica shard persists to `<state_dir>/replicated-state.redb` so a restarted node serves its committed records from disk.",
@@ -2636,7 +2673,8 @@
           "format": "uint",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ClusterConsistencyLevel": {
       "description": "Consistency level for replicated state reads and writes.",
@@ -2925,7 +2963,8 @@
             "$ref": "#/definitions/SecretBackendConfig"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "HashiCorpSecretsConfig": {
       "description": "Legacy HashiCorp Vault connection settings.\n\nThe OSS resolver consumes the `hashicorp` variant in [`SecretsConfig::backends`], not this compatibility block.",
@@ -2951,7 +2990,8 @@
           "default": "secret",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "RotationConfig": {
       "description": "Reserved secret-rotation configuration.\n\nNo OSS scheduler consumes this compatibility block.",
@@ -2971,7 +3011,8 @@
           "format": "uint64",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "SecretBackendConfig": {
       "description": "One named secret backend for provider-URI resolution (WOR-1767).\n\nConfig-native (does not depend on the vault crate). The binary builds a vault manager from these at boot.",
@@ -3002,7 +3043,8 @@
                 "type": "string"
               }
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "A YAML/JSON secrets file, referenced as `secretfile://<name>/<key>`.",
@@ -3036,7 +3078,8 @@
                 }
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "HashiCorp Vault KV, referenced as `vault://<name>/<path>`.",
@@ -3102,7 +3145,8 @@
                 }
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "AWS Secrets Manager, referenced as `awssm://<name>/<secret-id>`.",
@@ -3151,7 +3195,8 @@
                 }
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "GCP Secret Manager, referenced as `gcpsm://<name>/<secret>`.",
@@ -3206,7 +3251,8 @@
                 }
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Azure Key Vault, referenced as `azurekv://<name>/<secret>`.",
@@ -3250,7 +3296,8 @@
                 }
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Kubernetes Secrets, referenced as `k8ssecret://<name>/<secret>/<key>`.",
@@ -3294,7 +3341,8 @@
                 }
               ]
             }
-          }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -3357,7 +3405,8 @@
               "description": "Vault token (may be `${ENV}`).",
               "type": "string"
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "AppRole role_id + secret_id.",
@@ -3390,7 +3439,8 @@
                 "null"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Kubernetes service-account JWT exchange.",
@@ -3426,7 +3476,8 @@
                 "null"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -3464,7 +3515,8 @@
                 "null"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "The AWS default credential chain (env, instance profile, ...).",
@@ -3479,7 +3531,8 @@
                 "default_chain"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Assume an IAM role for cross-account access.",
@@ -3515,7 +3568,8 @@
                 "null"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -3546,7 +3600,8 @@
                   "description": "Path to the key file.",
                   "type": "string"
                 }
-              }
+              },
+              "additionalProperties": false
             }
           },
           "additionalProperties": false
@@ -3568,7 +3623,8 @@
                   "description": "The key JSON.",
                   "type": "string"
                 }
-              }
+              },
+              "additionalProperties": false
             }
           },
           "additionalProperties": false
@@ -3590,7 +3646,8 @@
                   "description": "Path to the external-account file.",
                   "type": "string"
                 }
-              }
+              },
+              "additionalProperties": false
             }
           },
           "additionalProperties": false
@@ -3624,7 +3681,8 @@
                   "description": "Client id of the user-assigned identity.",
                   "type": "string"
                 }
-              }
+              },
+              "additionalProperties": false
             }
           },
           "additionalProperties": false
@@ -3664,7 +3722,8 @@
                     "null"
                   ]
                 }
-              }
+              },
+              "additionalProperties": false
             }
           },
           "additionalProperties": false
@@ -3694,7 +3753,8 @@
                 "in_cluster"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "A kubeconfig file.",
@@ -3722,7 +3782,8 @@
                 "null"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -3928,7 +3989,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "KeyStoreConfig": {
       "description": "`key_management.store:` block.",
@@ -3983,7 +4045,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "KeyStoreBackend": {
       "description": "Which store backend backs the key plane.",
@@ -4073,7 +4136,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "SecretsManagerProvider": {
       "description": "External secrets manager backing the `secrets_manager` store backend. Only writable managers are supported (HashiCorp Vault, AWS Secrets Manager, and an in-memory `local` store for dev/tests).",
@@ -4163,7 +4227,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "KeyCacheTier": {
       "description": "Which optional second cache tier sits behind the in-memory L1.",
@@ -4262,7 +4327,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "MeshPeerTlsConfig": {
       "description": "`key_management.cache.mesh.peer_tls:` mutual-TLS material (file paths) for the mesh peer transport.",
@@ -4290,7 +4356,8 @@
           "default": "sbproxy-mesh",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "KeyGovernanceConfig": {
       "description": "`key_management.governance:` admission, accounting, and introspection controls for governed virtual keys.",
@@ -4509,7 +4576,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "KeyInboundConfig": {
       "description": "`key_management.inbound:` block. Controls which request headers are swept for a minted key, and whether a route refuses requests that carry none.\n\nThe header a key arrives in is a property of the calling tool, not of the key: to know which header holds the key you would have to have resolved it already. So extraction is configured per route here rather than per key.",
@@ -4611,7 +4679,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "InboundHeaderConfig": {
       "description": "One entry in `key_management.inbound.headers:`.",
@@ -4629,7 +4698,8 @@
           "default": "",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ProviderHintConfig": {
       "description": "One rule mapping an inbound credential's shape to a provider label, for attribution of native (non-minted) keys.",
@@ -4665,7 +4735,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "NativeKeyPolicyConfig": {
       "description": "Default admission policy for caller-owned native provider keys.\n\nNative keys cannot carry an SBproxy policy record because the caller, not the operator, owns their secret. This block supplies the equivalent default policy for every native key recognized by `provider_hints`. Leaving it absent fails closed for recognized native-key traffic.",
@@ -4744,7 +4815,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "OidcClaimMapConfig": {
       "description": "`key_management.oidc_claim_map:` block.",
@@ -4757,7 +4829,8 @@
           "description": "The verified JWT/OIDC claim whose value names the virtual-key record to resolve, so the bearer-token and OIDC front doors converge on one record.",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "KeySeedConfig": {
       "description": "`key_management.seed:` block: declarative records applied at boot.",
@@ -4779,7 +4852,8 @@
             "$ref": "#/definitions/SeedCredentialConfig"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "SeedKeyConfig": {
       "description": "A seeded inbound virtual key.",
@@ -5004,7 +5078,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "SeedCredentialConfig": {
       "description": "A seeded upstream credential.",
@@ -5065,7 +5140,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "L2CacheConfig": {
       "description": "Top-level shared-state / L2 cache backend configuration.\n\nTurns rate-limit buckets and response-cache entries into cluster-wide shared state so multiple proxy replicas coordinate against the same counters and cache pool. YAML key: `l2_cache_settings`.",
@@ -5092,7 +5168,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "L2CacheParams": {
       "description": "Driver-specific parameters for the [`L2CacheConfig`].\n\nKept separate from `L2CacheConfig` so future drivers can add fields (auth, pool size) without churning the parent struct.",
@@ -5127,7 +5204,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "CacheReserveConfig": {
       "description": "Top-level Cache Reserve configuration.\n\nCache Reserve is a long-tail cold tier sitting under the per-origin response cache. Items evicted from the hot cache are admitted into the reserve subject to a sample rate and size threshold; on a hot miss the proxy consults the reserve before going to origin and promotes the entry back into the hot tier on hit.\n\nBackend selection is open-ended via [`CacheReserveBackendConfig`] so the in-tree memory / filesystem / redis backends can be extended without touching this schema.",
@@ -5170,7 +5248,8 @@
           "format": "uint64",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "CacheReserveBackendConfig": {
       "description": "Backend selector for [`CacheReserveConfig`].\n\nTagged externally on `type`. The built-in variants are listed below; out-of-tree builds may register additional types via their own startup path (the in-tree pipeline ignores unknown types after logging a warning).",
@@ -5188,7 +5267,8 @@
                 "memory"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Filesystem-backed reserve. One file per key under `path`.",
@@ -5208,7 +5288,8 @@
               "description": "Root directory under which entries are written.",
               "type": "string"
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Redis-backed reserve.",
@@ -5236,7 +5317,8 @@
                 "null"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Catch-all for backends registered out-of-tree (e.g. an `s3` backend). The in-tree pipeline ignores these with a warning; an out-of-tree startup hook intercepts the variant before the warning fires.",
@@ -5251,7 +5333,8 @@
                 "other"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -5282,7 +5365,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ResponseCacheBackendConfig": {
       "description": "Backend selector for [`ResponseCacheStoreConfig`].\n\nTagged externally on `type`. This is a closed set: unlike `cache_reserve`, the response-cache store has no out-of-tree registration path, so an unrecognized `type` is a parse error rather than a silent fallback.",
@@ -5300,7 +5384,8 @@
                 "memory"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "One file per entry under `path`, named by the SHA-256 of the cache key. Survives a restart and is shared by every process pointed at the same directory. Prefix purge is unavailable because keys are hashed into filenames, so `invalidate_on_mutation` is a no-op on this backend and entries fall out by TTL.",
@@ -5327,7 +5412,8 @@
               "format": "uint64",
               "minimum": 0.0
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Memcached over the ASCII protocol. Shared across replicas. Stale-while-revalidate and prefix purge are both unavailable: memcached expires items server-side and offers no key scan.",
@@ -5354,7 +5440,8 @@
               "format": "uint16",
               "minimum": 0.0
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Redis, reusing the connection configured under `proxy.l2_cache`. Selecting this without an `l2_cache` block is a startup error.",
@@ -5369,7 +5456,8 @@
                 "redis"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -5407,7 +5495,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "PerOriginKeyMode": {
       "description": "How the response cache treats an origin that declares no key of its own.\n\nBoth modes bind the origin into the AEAD associated data, so cross-origin isolation is cryptographic in both. The difference is whether tenants share master key material.",
@@ -5462,7 +5551,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "CorrelationIdConfig": {
       "description": "Correlation-ID propagation policy.\n\nThe proxy mints a per-request correlation identifier early in the request lifecycle. With the default policy:\n\n1. If the inbound request carries `header` (default `X-Request-Id`), its value is adopted as the request's correlation ID. This lets upstream callers (a frontend, an API client, another proxy) correlate their traces with ours. 2. Otherwise the proxy generates a 32-hex-character UUID v4 and uses that. 3. The chosen value is set on the upstream request (under the same header name) so the upstream sees the same correlation ID the proxy used in its logs / webhooks. 4. The chosen value is echoed back to the client on the response, unless `echo_response` is `false`.",
@@ -5483,7 +5573,8 @@
           "default": true,
           "type": "boolean"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "MtlsListenerConfig": {
       "description": "mTLS client certificate verification on the HTTPS listener.\n\nWhen set, the proxy configures the OpenSSL `SslAcceptor` underneath Pingora's `add_tls_with_settings` to verify the client certificate against the configured CA bundle.\n\nWhat we expose to the upstream after a successful handshake: * `X-Client-Cert-Verified: 1` * `X-Client-Cert-Organization: <Subject's O field, when present>` * `X-Client-Cert-Serial: <hex serial>` * `X-Client-Cert-Fingerprint: <hex sha256 of the cert>`\n\nCN and SAN extraction is a follow-up because Pingora 0.8's `SslDigest` does not expose the parsed Subject CN directly. When `require: true`, requests without a valid client cert are rejected during the TLS handshake and never reach `request_filter`.",
@@ -5509,7 +5600,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "SyntheticProbeConfig": {
       "description": "Configuration for the in-process synthetic-transaction probe.\n\nWhen enabled, a background task fires a request through the compiled pipeline against the configured `hostname` on a fixed cadence. The request never leaves the process: the synthetic origin is required to use a non-network action (typically `static`, `mock`, `echo`, or `noop`) so `/readyz` can verify the handler chain end to end without making the readiness check dependent on a real upstream.\n\nThe probe verdict is reported as a `synthetic_pipeline` component in the `/readyz` body and increments `sbproxy_synthetic_probe_failures_total{reason}` whenever the driver records a failure.",
@@ -5551,7 +5643,8 @@
           "format": "uint64",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ScriptingConfig": {
       "description": "Per-engine scripting sandbox limits, exposed under the `proxy.scripting:` block of sb.yml.\n\nThe Lua sub-block is installed into the live engine. The JavaScript sub-block remains parseable for compatibility but `JsEngine::new` uses its built-in defaults; CEL and WebAssembly manage their own budgets separately.",
@@ -5587,7 +5680,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "LuaScriptingConfig": {
       "description": "Lua scripting runtime configuration. Wraps the sandbox limits so future Lua-specific tunables (preloaded libraries, request-binding budgets, etc.) have a stable home.",
@@ -5606,7 +5700,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "LuaSandboxConfig": {
       "description": "Sandbox configuration applied to every Lua script invocation.\n\nThree knobs:\n\n* `max_execution_ms` is a wall-clock budget enforced through the Luau interrupt callback. Once exceeded, the script is aborted with an `Error::external` propagated back to the caller. * `max_memory_mb` caps the Lua VM's total allocator footprint. Allocations past the limit fail the script with `Error::MemoryError`, which is far cheaper than letting a runaway script OOM the proxy process. * `allow_patterns` gates the Lua pattern API (`string.find`, `string.match`, `string.gmatch`). The pattern engine has known pathological inputs that can lock a worker, so operators who do not need patterns can drop them entirely.\n\nThe on-the-wire field uses `max_memory_mb` (megabytes) because that is the unit operators reason about; the engine converts to bytes internally.",
@@ -5631,7 +5726,8 @@
           "default": true,
           "type": "boolean"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "JsScriptingConfig": {
       "description": "JavaScript engine config block (`proxy.scripting.javascript:`).\n\nRetained so existing configs keep parsing. Programmatic callers may pass this sandbox to `JsEngine::with_sandbox`, but the YAML boot path does not.",
@@ -5650,7 +5746,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "JsSandboxConfig": {
       "description": "JavaScript sandbox limits enforced on every script execution.\n\nThe `budget_ms` field is the CPU time budget for a single `execute` / `call_function` / `match_request` / `waf_match` call. QuickJS calls the engine's interrupt handler periodically during evaluation; when the elapsed wall-clock time exceeds `budget_ms` the interrupt handler returns `true`, which aborts the script with an uncatchable exception that surfaces in Rust as a structured timeout error.\n\nThe `memory_mb` and `stack_kb` fields are passed through to `Runtime::set_memory_limit` and `Runtime::set_max_stack_size` respectively. They guard against runaway allocations and deeply recursive scripts in the same way the CPU budget guards against `while (true) {}`.",
@@ -5677,7 +5774,8 @@
           "format": "uint",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "HttpClientTimeoutsConfig": {
       "description": "Tunable client-side timeouts for the proxy's outbound HTTP helpers.\n\nSeveral internal code paths build pooled `reqwest::Client` instances to call out to operator-controlled services: forward-auth services, callback / webhook receivers, mirror destinations, stale-while- revalidate refreshes against origin upstreams, and Web Bot Auth directory lookups. Each helper used to bake a `Duration::from_secs` literal into a `LazyLock`-built client, which meant operators had to fork the binary to extend a timeout for a slow auth service or shorten one for an aggressive deadline budget.\n\nAll fields default to the prior hardcoded values so existing configs see no behaviour change. Operators only set a field here to nudge a specific timeout.\n\nExample:\n\n```yaml proxy: http_client_timeouts: forward_auth_client_secs: 60 callback_client_secs: 15 ```",
@@ -5718,7 +5816,8 @@
           "format": "uint64",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "WebBotAuthConfig": {
       "description": "Web Bot Auth signing identity for the proxy. See the [`ProxyServerConfig::web_bot_auth`] field.\n\nThe proxy holds one Ed25519 keypair, identified by `key_id`. Its public half is published in the hosted signatures directory; its private seed signs outbound requests to upstreams that require Web Bot Auth. Treat `ed25519_seed_hex` as a secret (source it via an env interpolation rather than committing it).",
@@ -5744,7 +5843,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AttestationConfig": {
       "description": "`proxy.attestation`: the proxy-wide consumption attestation block.\n\nOff unless [`Self::role`] says otherwise, and inert in every config that does not mention it. When a role is set, the queue, the ledger, and a complete [`AttestationBillableConfig`] all become required, because a role with any of them missing is a proxy that claims to meter and does not.",
@@ -6217,7 +6317,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "CredentialBlock": {
       "description": "Canonical credentials block. Sits under `proxy.credentials`, `tenants[].credentials`, or `origins[].credentials`. A request resolves matching credentials by walking origin -> tenant -> proxy scopes; the first scope that produces a match for the request's principal serves the credential.\n\nThe credential carries:\n\n* Which provider produces it (`type`, `provider`). * Where the secret material lives (`key`, a provider-specific secret reference such as `vault://`, `awssm://`, `gcpsm://`, `azurekv://`, `k8ssecret://`, `secretfile://`, or `secret://`, or a legacy `${ENV}` / `file:` reference). * Which inbound principals can use it (`principals` selectors). * Per-credential attribution metadata (`attrs`). * Allow / deny model lists that stack on top of the origin-level allowlist (most-restrictive wins). * Per-credential sub-policies (rate limit, PII redaction, ...).",
@@ -6332,7 +6433,8 @@
         "inject_mcp": {
           "description": "WOR-1646: inject a federated MCP gateway's live catalogue as this credential's tool surface. Raw passthrough of the `InjectMcpRef` shape (`{ref, format, filter}`) on the underlying `VirtualKeyConfig`; resolved at request time."
         }
-      }
+      },
+      "additionalProperties": false
     },
     "PrincipalSelector": {
       "description": "Selector matching an inbound principal to a credential. At least one field must be set; an entirely empty selector is rejected at compile.",
@@ -6386,7 +6488,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "CredentialAttrs": {
       "description": "Attribution attributes copied onto matched principals.",
@@ -6452,7 +6555,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "CredentialBudget": {
       "description": "Per-credential budget. The token and cost caps are lowered into the live credential registry. `reset` remains a reserved, compatibility-only field and does not install a reset schedule.",
@@ -6485,7 +6589,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "CredentialModels": {
       "description": "Model allow / deny lists scoped to this credential. Stacks on top of the origin-level allowlist. Most-restrictive wins.",
@@ -6507,7 +6612,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "CredentialPolicy": {
       "description": "Sub-policy attached to a credential. Closed enum; out-of-tree policies plug in through the existing plugin registry rather than widening this enum.",
@@ -6535,7 +6641,8 @@
               "format": "uint64",
               "minimum": 0.0
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Require PII redaction for the named rule set on every request served by this credential. The names match `sbproxy_security::pii::default_rules`.",
@@ -6558,7 +6665,8 @@
                 "type": "string"
               }
             }
-          }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -6590,7 +6698,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "TenantObservabilityLogConfig": {
       "description": "Tenant-scope `log:` sub-block. Mirrors the proxy-scope `ObservabilityLogConfig`; today exposes the redaction leaf plus the tenant-scoped sinks fan-out (WOR-1045 PR2). The dispatcher routes every record whose resolved `Principal.tenant_id` matches this tenant into each declared sink; cross-tenant records never reach here.",
@@ -6621,7 +6730,8 @@
             "$ref": "#/definitions/CustomLogFieldConfig"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "TenantObservabilityRedactConfig": {
       "description": "Tenant-scope `redact:` sub-block. Today only `pii:` is honoured; the field-key and pattern overrides remain proxy-scope only because they touch the rendered JSON, which is tenant-agnostic in the emitter.",
@@ -6659,7 +6769,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "TenantCardinalityConfig": {
       "description": "WOR-1067: per-tenant cardinality budget. The runtime installs one dedicated label-value tracker per declared tenant; overflows on tenant B do not touch tenant A's accepted-value set. The `__default__` tenant continues to use the proxy-wide `CardinalityLimiter` (in `sbproxy-observe`) so single-tenant deployments stay bit-for-bit identical to pre-WOR-1067 behaviour.",
@@ -6674,7 +6785,8 @@
           "format": "uint32",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "PaymentsConfig": {
       "description": "`proxy.payments`: durable settlement for paid requests.\n\nAbsent means the proxy keeps its existing non-settlement ledger behaviour exactly. Present means a paid request reaches the origin only after a durable intent has committed `Succeeded`.",
@@ -7732,7 +7844,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "RequestModifierConfig": {
       "description": "Request modifier entry.\n\nEach modifier entry can contain one or more of: `headers`, `url`, `query`, `method`, `body`, or `lua_script`. Multiple modifier entries in the list are applied in order.",
@@ -7810,7 +7923,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "HeaderModifiers": {
       "description": "Header modification operations (set, add, remove).",
@@ -7840,7 +7954,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "UrlModifier": {
       "description": "URL path rewrite configuration.",
@@ -7858,7 +7973,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "PathRewrite": {
       "description": "Path rewrite: replace a substring in the path.",
@@ -7876,7 +7992,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "PathReplace": {
       "description": "A simple string-replace operation on the URL path.",
@@ -7894,7 +8011,8 @@
           "description": "The replacement string.",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "QueryModifier": {
       "description": "Query parameter modification operations.",
@@ -7924,7 +8042,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "BodyModifier": {
       "description": "Body replacement configuration for request modifiers.",
@@ -7942,7 +8061,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ResponseModifierConfig": {
       "description": "Response modifier entry.\n\nEach modifier entry can contain one or more of: `headers`, `status`, `body`, or `lua_script`. Multiple modifier entries in the list are applied in order.",
@@ -8000,7 +8120,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "StatusOverride": {
       "description": "Status code override for response modifiers.",
@@ -8023,7 +8144,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ResponseBodyModifier": {
       "description": "Body replacement configuration for response modifiers.",
@@ -8041,7 +8163,8 @@
           "description": "Replace the response body with this JSON value.",
           "default": null
         }
-      }
+      },
+      "additionalProperties": false
     },
     "CorsConfig": {
       "description": "CORS configuration.",
@@ -8102,7 +8225,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "HstsConfig": {
       "description": "HSTS configuration.",
@@ -8125,7 +8249,8 @@
           "default": false,
           "type": "boolean"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "CompressionConfig": {
       "description": "Compression configuration.",
@@ -8161,7 +8286,8 @@
           "format": "uint32",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "SessionConfig": {
       "description": "Session configuration.",
@@ -8207,7 +8333,8 @@
           "default": false,
           "type": "boolean"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "PropertiesConfig": {
       "description": "Per-origin properties capture configuration. Defaults match the \"capture on, no echo, no redaction\" baseline; operators tune via `sb.yml`.",
@@ -8243,7 +8370,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "RedactConfig": {
       "description": "Redaction rules for captured property values.",
@@ -8265,7 +8393,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "SessionsConfig": {
       "description": "Per-origin sessions configuration.",
@@ -8304,7 +8433,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AutoGenerate": {
       "description": "Auto-generation policy for session IDs when the caller does not supply one.",
@@ -8352,7 +8482,8 @@
           "format": "uint64",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "UserConfig": {
       "description": "Per-origin user-ID configuration.",
@@ -8382,7 +8513,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "RawForwardRule": {
       "description": "One forward rule on an origin: a set of matcher entries plus the inline child origin to dispatch to when any entry hits.\n\nCompiled at config-load time. The runtime walks the `rules` of each forward rule against the incoming request and uses the first matching entry's `origin`. Within a single entry the present matchers (path, header, query) are ANDed; across entries they are ORed.",
@@ -8415,7 +8547,8 @@
             "$ref": "#/definitions/Parameter"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ForwardRuleMatcher": {
       "description": "One match entry inside a forward rule's `rules:` list.\n\nEach entry may carry any combination of `path`, `header`, and `query` matchers. Within a single entry the matchers are ANDed: every present matcher must succeed for the entry to fire. Across entries in the same rule the semantics are OR: any matching entry triggers the rule. The shorthand `match: <prefix>` is equivalent to `path: { prefix: ... }`.",
@@ -8465,7 +8598,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "PathMatcher": {
       "description": "A path matcher inside a forward rule.\n\nExactly one of `prefix`, `exact`, `template`, or `regex` should be set. Precedence when more than one is provided: `template` > `regex` > `exact` > `prefix`. Templates and regex are evaluated lazily, so origins that only use prefix/exact pay no regex cost.\n\nTemplate syntax (`/users/{id}/posts/{post_id}`) supports named segments, catch-all (`/static/{*rest}`), and optional per-segment regex constraints (`/users/{id:[0-9]+}`). Constraint compilation happens at config-load time; the runtime only re-validates constrained params after the trie match.",
@@ -8503,7 +8637,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "HeaderMatcher": {
       "description": "Match a request header by exact value or value prefix.\n\nExactly one of `value` or `prefix` should be set. When both are present `value` wins (exact comparison). Header name matching is case-insensitive per RFC 7230; value comparison is case-sensitive.",
@@ -8532,7 +8667,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "QueryMatcher": {
       "description": "Match a query string parameter by exact value.\n\nThe query string is parsed as `application/x-www-form-urlencoded`. The matcher succeeds if any occurrence of `name` equals `value`. When `value` is omitted the matcher succeeds whenever the parameter is present at all.",
@@ -8553,7 +8689,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ForwardRuleOrigin": {
       "description": "Inline child origin used when a forward rule fires. Carries the action plus optional request modifiers. Compatibility metadata fields remain parseable but are not copied into the compiled child origin.",
@@ -8605,7 +8742,8 @@
             "$ref": "#/definitions/RequestModifierConfig"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "Parameter": {
       "description": "An OpenAPI 3.0 Parameter Object declared on a forward rule.\n\nField names and shapes mirror the OpenAPI spec exactly so emission is a direct passthrough. The `schema` field is kept as `serde_json::Value` because the OpenAPI Schema Object is large and we forward it verbatim.",
@@ -8644,7 +8782,8 @@
           "description": "OpenAPI Schema Object (e.g. `{ \"type\": \"integer\", \"format\": \"int64\" }`). Forwarded verbatim into the emitted spec.",
           "default": null
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ParameterLocation": {
       "description": "Location of an OpenAPI parameter (`in:` field).\n\nMatches the OpenAPI 3.0 enum exactly. `cookie` is intentionally not supported here yet because the gateway has no per-cookie capture story.",
@@ -8702,7 +8841,8 @@
           "default": false,
           "type": "boolean"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "StatusSpec": {
       "description": "Status code spec for an [`ErrorPageEntry`]. Either a single integer (`status: 401`) or a list (`status: [401, 403]`). The list form is the historical authored shape; the single-int form is a sugar.",
@@ -8746,7 +8886,8 @@
           "default": true,
           "type": "boolean"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ProxyStatusConfig": {
       "description": "RFC 9209 `Proxy-Status` response header configuration.\n\nWhen `enabled`, the proxy stamps a structured `Proxy-Status` header on every non-2xx response. The header carries the proxy identity, the upstream status, and an optional `error` parameter derived from the upstream failure mode. Operators consuming the header can diagnose forwarding errors without scraping the body.\n\nSpec: <https://www.rfc-editor.org/rfc/rfc9209.html>.",
@@ -8765,7 +8906,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "MirrorConfig": {
       "description": "Per-origin shadow-traffic configuration.\n\nWhen set on an origin, the proxy fires a fire-and-forget copy of each request at `url` and discards the response. The primary upstream is never blocked by mirror delivery. Useful for safe rollouts of new backends and replay-driven testing.",
@@ -8803,7 +8945,8 @@
           "format": "uint",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "MessageSignaturesConfig": {
       "description": "RFC 9421 HTTP Message Signatures verification configuration.\n\nWhen `verify: true`, the proxy enforces RFC 9421 signature verification on every inbound request to this origin. Requests without a valid `Signature-Input` + `Signature` header pair matching the configured `key_id` are rejected with `401 Unauthorized` and `WWW-Authenticate: Signature` before any downstream auth provider runs.\n\n`algorithm` is `hmac_sha256` or `ed25519`. `key` carries the shared secret (HMAC) or the base64/hex-encoded raw 32-byte public key (Ed25519). `required_components` is the optional set of canonical components every accepted signature must cover. `clock_skew_seconds` defaults to 30s.\n\nSpec: <https://www.rfc-editor.org/rfc/rfc9421.html>.",
@@ -8846,7 +8989,8 @@
           "format": "uint64",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "OlpConfig": {
       "description": "`/introspect` (RFC 7662) is deferred to a follow-up PR because it requires a revocation / nonce store.",
@@ -8906,7 +9050,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "OlpIntrospectConfig": {
       "description": "WOR-808 PR9: RFC 7662 OAuth Token Introspection + RFC 7009 Token Revocation configuration for the OLP issuer.\n\nWhen this block is present the proxy exposes:\n\n* `POST /.well-known/olp/introspect`: RFC 7662 §2 introspection. Returns `{ \"active\": true, ... }` for valid + un-revoked tokens issued by this origin's signing key, mirroring every OLP claim. Returns `{ \"active\": false }` for any token that does not verify, has expired, or has been revoked (§2.2 forbids leaking the reason). * `POST /.well-known/olp/revoke`: RFC 7009 §2. Writes the token's `jti` to the configured revocation store with a TTL that matches the token's remaining lifetime, so subsequent introspections return `active: false`.\n\nBoth endpoints share one `auth` policy because the same actor that can ask \"is this token active\" should also be able to assert \"this token is no longer trusted.\" Rate-limiting on `active: false` responses (RFC 7662 §2.1 scan-attack defence) and DPoP-bound confirmation checks ship in a follow-up PR.",
@@ -8959,7 +9104,8 @@
           "default": true,
           "type": "boolean"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "OlpIntrospectAuth": {
       "description": "Auth policy for the introspect + revoke endpoints. Three modes:\n\n* `self` (default): the caller proves possession of the token by sending the same value in `Authorization: License <token>` *and* in the `token=` form parameter. Reasonable for the common \"RP introspects tokens it already holds\" case and requires no operator credential management. * `basic`: HTTP Basic with operator-managed credentials. Pass `{ username, password_hash }` pairs in `clients`; passwords are stored as Argon2id hashes. RFC 7662 §2.1's \"client authentication\" path. * `none`: no auth. ONLY appropriate for fully-private deployments behind a service mesh that already authenticates the caller. The proxy logs a `warn!` at startup when this is selected.",
@@ -8977,7 +9123,8 @@
                 "self"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "HTTP Basic with operator-managed credentials.",
@@ -9000,7 +9147,8 @@
                 "$ref": "#/definitions/OlpIntrospectBasicClient"
               }
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "No auth (private-deployment escape hatch).",
@@ -9015,7 +9163,8 @@
                 "none"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -9035,7 +9184,8 @@
           "description": "Argon2id hash of the password (PHC string format, as produced by `argon2 -t 3 -m 65536 -p 4 -i`). The proxy verifies with the same parameters; supports secret references via the secret-resolver pass.",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "OlpRevocationStoreConfig": {
       "description": "Revocation-store backend selector.",
@@ -9053,7 +9203,8 @@
                 "memory"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "On-disk redb file. Single-process; survives restart, ACID. Production default for single-replica deployments.",
@@ -9073,7 +9224,8 @@
               "description": "Filesystem path to the redb file. The path is created on first use; the operator MUST ensure the directory is writable by the proxy user.",
               "type": "string"
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Redis (shared across replicas). Use for horizontally-scaled deployments where a token revoked on one replica must be observed by all the others.",
@@ -9093,7 +9245,8 @@
               "description": "`redis://` connection URL. Pool size and timeouts inherit the workspace `redis` defaults.",
               "type": "string"
             }
-          }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -9152,7 +9305,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "IdempotencyConfig": {
       "description": "RFC 8594-style idempotency middleware configuration.\n\nWhen `enabled`, the proxy reads an idempotency key from the configured request header (default: `Idempotency-Key`), hashes the request body for conflict detection, and serves cached responses on retries. Workspace-isolated keys mean two workspaces using the same key never collide. The middleware engages only on the listed HTTP methods; defaults to POST, PUT, and PATCH.\n\nBacked by `sbproxy_middleware::idempotency` (the cache backend trait + memory / Redis impls). For Redis-backed clusters set `backend: redis`; the cache binds to the cluster L2 store at compile time. Single-instance deployments leave `backend: memory` (the default).",
@@ -9231,7 +9385,8 @@
           "format": "uint",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "IdempotencyBackend": {
       "description": "Cache backend for [`IdempotencyConfig`].",
@@ -9277,7 +9432,8 @@
           "format": "uint32",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AgentSkillEntry": {
       "description": "One entry in an origin's `agent_skills:` advertisement.\n\nThe shape mirrors the v0.2.0 manifest entry described at `https://schemas.agentskills.io/discovery/0.2.0/schema.json`: every entry carries a stable name, a kind discriminator, a human description, and the URL the agent fetches to retrieve the artifact. A `digest` field is computed at config-load time by hashing the resolved artifact bytes; the per-request handler re-hashes the body on every serve and refuses to ship a tampered artifact.\n\nThe optional safety knobs (`max_decompression_ratio`, `max_entries`, `max_expanded_bytes`, `max_clock_skew_secs`) cap archive parsing so a malicious origin cannot zip-bomb a downstream agent. All four have sensible defaults, and v1 configs that omit `agent_skills:` pay nothing for the new schema field.",
@@ -9366,7 +9522,8 @@
           "format": "uint32",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AgentsJsonConfig": {
       "description": "Per-origin agents.json manifest configuration (WOR-820). See the [`RawOriginConfig::agents_json`] field and the agents.json v0.1 spec at <https://github.com/wild-card-ai/agents-json>.",
@@ -9407,7 +9564,8 @@
           ],
           "items": true
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AgentsJsonInfo": {
       "description": "The `info` block of an agents.json manifest.",
@@ -9430,7 +9588,8 @@
           "default": "",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "OutboundCredentialSchema": {
       "description": "Schema-only mirror of the deferred outbound credential enum. Runtime parsing remains in `sbproxy-modules`; this keeps generated editor tooling precise without introducing a crate dependency cycle.",
@@ -9680,7 +9839,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "OriginObservabilityLogConfig": {
       "description": "Origin-scope `log:` sub-block. Mirrors the proxy-scope and tenant-scope shape; exposes redaction plus origin-scoped sinks (WOR-1045 PR2). The dispatcher routes every record whose stamped `route` matches this origin's hostname into each declared sink.",
@@ -9711,7 +9871,8 @@
             "$ref": "#/definitions/CustomLogFieldConfig"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "OriginObservabilityRedactConfig": {
       "description": "Origin-scope `redact:` sub-block. Carries the per-origin overrides for the field-key denylist (WOR-1042 `fields:`, additive), the operator regex pass (WOR-1042 `patterns:` + `disable:`), and the rule-driven PII redactor (WOR-1043 `pii:`).",
@@ -9749,7 +9910,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AccessLogConfig": {
       "description": "Structured-JSON access-log emission, off by default.\n\nWhen `enabled` is true, every completed request emits one JSON line via the tracing `access_log` target after status, method, and sampling filters are applied. The actual record shape is `AccessLogEntry` in `sbproxy-observe`; this struct only governs whether and which records are emitted.\n\nFilter semantics: - `status_codes` empty matches every status; non-empty restricts to the listed codes. - `methods` empty matches every method; non-empty restricts to the listed methods (case-insensitive on emit). - `sample_rate` is applied last and accepts a value in `[0.0, 1.0]`.",
@@ -9829,7 +9991,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "CaptureHeadersConfig": {
       "description": "Allowlist-driven header capture for the access log.\n\nLists are matched after lowercasing both the configured names and the inbound header names. Two pattern shapes are accepted:\n\n* Exact name (`\"user-agent\"`, `\"x-cache\"`). * `\"*\"` to capture every header (subject to the sensitive-header denylist below). * Trailing-glob (`\"x-ratelimit-*\"`) to capture every header whose name starts with the prefix before the `*`. Only one trailing `*` is supported; embedded wildcards are treated as literal.\n\nA hardcoded denylist of sensitive headers (`authorization`, `cookie`, `set-cookie`, `proxy-authorization`, `x-api-key`) is excluded from `*` and glob matches. To capture one of these, list it by exact name; the proxy logs a `WARN` at config load so the choice is visible.",
@@ -9876,7 +10039,8 @@
           "default": false,
           "type": "boolean"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AccessLogOutputConfig": {
       "description": "Access-log output sink.",
@@ -9914,7 +10078,8 @@
           "default": false,
           "type": "boolean"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AgentClassesConfig": {
       "description": "Top-level `agent_classes:` block. Tunes the agent-class resolver the binary constructs at startup and threads through the request pipeline.\n\nThe block is fully optional: when absent the binary builds the resolver from `AgentClassCatalog::defaults()` plus the default resolver tuning. Most operators leave it untouched.",
@@ -9955,7 +10120,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "HostedFeedConfig": {
       "description": "Hosted-feed source for the agent-class catalog.\n\nReserved so YAML written against the `hosted-feed` or `merged` shapes parses cleanly. The OSS runtime does not fetch, refresh, or verify this feed; selecting either catalog value warns and falls back to the embedded defaults.",
@@ -9976,7 +10142,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AgentClassResolverConfig": {
       "description": "Resolver-tuning knobs for the agent-class chain.\n\nAll fields have sensible defaults: rDNS verification on, bot-auth keyid lookup on, 10 000-entry verdict cache. Operators set fields only when they need to disable a specific signal (typically rDNS in environments without a working PTR resolver).",
@@ -9999,7 +10166,8 @@
           "format": "uint",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "RateLimitsConfig": {
       "description": "WOR-1130: top-level workspace rate-limit budget configuration.",
@@ -10039,7 +10207,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "WorkspaceBudgetConfig": {
       "description": "WOR-1130: the per-workspace request budget.",
@@ -10069,7 +10238,8 @@
           "format": "uint32",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "RateLimitEscalationConfig": {
       "description": "WOR-1130: throttle -> auto-suspend escalation tuning.",
@@ -10089,7 +10259,8 @@
           "format": "uint32",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "RateLimitClockMode": {
       "description": "WOR-1130: clock source for the rate-limit budget.",
@@ -10123,7 +10294,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AuditSinkKind": {
       "description": "WOR-1130: accepted audit sink names.",
@@ -10170,7 +10342,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "SessionLedgerSinkKind": {
       "description": "WOR-1186: session-ledger sink kinds.",
@@ -10279,7 +10452,8 @@
           "format": "uint64",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "UpdateChannel": {
       "description": "Which release stream `sbproxy update` follows for the binary and the managed inference engines (WOR-1804).",
