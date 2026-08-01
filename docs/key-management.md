@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-01*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -30,7 +30,7 @@ proxy:
   key_management:
     enabled: true
     store:
-      backend: embedded              # embedded | redis | secrets_manager
+      backend: embedded              # embedded | redis | secrets_manager | mesh
       # node-local: see "Clustered deployments" below before using this
       # on more than one node
       path: /var/lib/sbproxy/keystore.redb
@@ -326,13 +326,122 @@ vault, which reads external secrets you do not own.
   from `token_env`), `aws` (default credential chain), or `local` (in-memory, for
   dev and tests). Only writable managers are supported; read-only backends are
   not offered here.
+- `mesh`: the cluster's own replicated state substrate is the system of record,
+  so a key minted on one node resolves on its peers with no Redis and no
+  external secrets manager. Requires `proxy.cluster` with a `replication`
+  block. See [The mesh backend](#the-mesh-backend) for the guarantees and the
+  full configuration.
+
+### The mesh backend
+
+`backend: mesh` puts the keystore on the same quorum-replicated, durable
+substrate the cluster already runs for its own state
+([mesh-replication.md](mesh-replication.md)). Every record is written to
+`replication.factor` nodes and acknowledged only after a majority committed it
+to disk, so the fleet needs no external store at all.
+
+The consistency levels are pinned by the backend and are not configurable:
+writes and reads run at quorum, and revocation is written at one
+acknowledgement. The only knobs that apply come from the cluster's existing
+`replication` block, which the keystore shares with every other consumer of
+the substrate.
+
+```yaml
+proxy:
+  cluster:
+    cluster_id: prod
+    node_id: gw-1
+    seeds: ["gw-2:7946"]                 # the peers this node joins
+    state_dir: /var/lib/sbproxy/cluster  # durable identity + replica shard
+    security:
+      mode: mtls
+      shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
+      cert_file: /var/lib/sbproxy/cluster/node.pem
+      key_file: /var/lib/sbproxy/cluster/node-key.pem
+      ca_file: /var/lib/sbproxy/cluster/ca.pem
+      server_name: sbproxy-mesh
+    replication:
+      factor: 2                          # copies per key record
+      anti_entropy_interval_secs: 30     # repair cadence after partitions
+      tombstone_gc_grace_secs: 86400     # also the rejoin quarantine bound
+  key_management:
+    enabled: true
+    store:
+      backend: mesh                      # no url, no path: the cluster is the store
+    cache:
+      ttl_secs: 60                       # per-node resolution cache (see below)
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: env:SBPROXY_KEY_MASTER
+```
+
+Each component earns its place:
+
+- `proxy.cluster` is required. Selecting `backend: mesh` on a node with no
+  cluster fails at config validation, because a mesh keystore on a node with
+  no mesh is an embedded keystore with extra steps.
+- `proxy.cluster.replication` is where the keystore's records physically live:
+  the durable replica shard under `state_dir`. The `factor` is how many nodes
+  hold each record; `anti_entropy_interval_secs` bounds how long a healed
+  partition takes to reconverge; `tombstone_gc_grace_secs` doubles as the
+  rejoin quarantine window described below. There are no keystore-specific
+  consistency knobs on purpose.
+- `store.backend: mesh` is the whole store surface. No URL, no file path, no
+  credentials to a third system.
+- `cache.ttl_secs` is the per-node resolution cache every backend has. For
+  this backend it is also half of the revocation propagation bound, so
+  shortening it tightens cluster-wide denial.
+- `crypto.pepper` and `crypto.master_key` matter more here than on a
+  single-node store: every node verifies hashes and opens envelopes minted by
+  every other node, so all nodes must be configured with the same values.
+
+What the backend guarantees, stated exactly:
+
+| Guarantee | `mesh` backend |
+|---|---|
+| Acknowledged mint survives any minority failure | Yes. Writes are quorum-acknowledged and durable on a majority before success is reported. |
+| Revocation visible cluster-wide | Eventual: bounded by `anti_entropy_interval_secs` plus `cache.ttl_secs`. Redis is bounded by `cache.ttl_secs` alone, because its pub/sub invalidation pushes to every node. |
+| Revisioned policy CAS | Write-then-verify: the backend reads at quorum, writes, reads back, and reports success only if its exact write won. Never a false success; a false conflict is possible and the caller retries. |
+| Mint from a partitioned minority | No. A minority cannot reach a write quorum, so the mint fails. |
+| Revoke from a partitioned minority | Yes. Revocation is written at one acknowledgement, and anti-entropy carries it across the heal. |
+
+If you need synchronous cluster-wide denial, the mesh backend is the wrong
+tool: use the `redis` backend, whose invalidation channel drops the record
+from every node's cache the moment it changes.
+
+One security rule is enforced at mint time: a credential whose material is
+raw plaintext is refused, with an error naming the credential, because the
+substrate would copy the secret onto every replica's disk. Hand the API or the
+seed a `secret` (sealed into an AEAD envelope under the master key) or a
+`vault_ref`; both replicate safely. Key records are unaffected, since they
+only ever store an HMAC of the secret.
+
+Three operational behaviors to know:
+
+- **A failed mint must not be assumed not-to-have-happened.** A mint that
+  errored below quorum may still have landed on some replicas, and
+  anti-entropy will propagate that record later. It is inert litter, because
+  the caller never received the token, but it exists: reconcile by listing
+  (`GET /admin/keys`), which fails loudly rather than returning a partial
+  fleet view.
+- **Revocation is terminal, and the substrate enforces it.** A revoked record
+  can never merge back to a usable one, not even against a stale replica
+  pushing a higher-version copy. Rotating a compromised key id means minting a
+  new id; there is no un-revocation.
+- **A node returning from a long absence holds authentication until it
+  catches up.** A node offline longer than `tombstone_gc_grace_secs` rejoins
+  with a quarantined (wiped) shard and refuses keystore reads until its first
+  complete anti-entropy round finishes; with the default `closed` failure
+  posture that is a 503, not a false allow or a false deny. The admin health
+  registry reports the same state through the `keystore` component on
+  `/readyz`.
 
 ### Clustered deployments
 
 A key minted on one node is resolvable on every node only when the store itself
-is shared, which `redis` and `secrets_manager` are. The `embedded` backend is a
-redb file on local disk, so a key minted on node A is written only to node A and
-node B cannot resolve it.
+is shared, which `redis`, `secrets_manager`, and `mesh` are. The `embedded`
+backend is a redb file on local disk, so a key minted on node A is written only
+to node A and node B cannot resolve it.
 
 A shared `cache.tier` changes how bad that is, though it does not make the store
 shared. Both the `mesh` and `redis` tiers propagate records to peers, so a key
@@ -351,9 +460,12 @@ So a node declaring `proxy.cluster.seeds` with `key_management.enabled: true` an
   minted key is invisible to peers from the moment it is created. Minting keys
   that silently do not work elsewhere is worse than not starting.
 
-For a durable cluster-wide keystore, set `store.backend` to `redis` or
-`secrets_manager`. A single node with no seeds keeps the embedded default and
-needs no change.
+For a durable cluster-wide keystore, set `store.backend` to `redis`,
+`secrets_manager`, or `mesh`. A single node with no seeds keeps the embedded
+default and needs no change. The `mesh` backend has the reverse requirement,
+checked at config validation: selecting it without `proxy.cluster` (or without
+its `replication` block) refuses to start, because there is no substrate for
+the records to live on.
 
 One gap worth knowing: the check fires on nodes that declare seeds. A node others
 join, which has no seeds of its own, is not itself classified, though every node
@@ -375,6 +487,7 @@ revision as one atomic operation.
 | `embedded` | Supported in one redb write transaction. The guarantee is local to that store file. |
 | `redis` | Supported in one server-side Redis operation. The revision update and cache-invalidation publication advance together. |
 | `secrets_manager` | Not supported by the common secrets-manager interface. `PATCH`, block, unblock, revoke, and rotate fail closed with `409` instead of performing a racy read-then-write. |
+| `mesh` | Supported as write-then-verify, not an atomic primitive: read at quorum, write, read back, and report success only if this node's write won the deterministic merge. Never a false success; a concurrent loser sees `409` and retries. |
 
 Creation and deletion are separate operations. In particular,
 `DELETE /admin/keys/{id}` is not guarded by `policy_revision`; coordinate
@@ -411,8 +524,9 @@ request -> L1 in-memory cache -> L2 tier (redis/mesh, optional) -> store
 The mesh tier makes the L2 a gossip cluster instead of Redis: a SWIM membership
 protocol feeds a consistent-hash ring, and reads and writes route to the replica
 that owns a key, so the resolution order is L1, then the mesh cache, then the
-store. A durable shared store still sits behind it as the source of truth (Redis,
-or a secrets manager for a Redis-free fleet); the mesh keeps the cache coherent.
+store. A durable shared store still sits behind it as the source of truth
+(Redis, a secrets manager, or the mesh store backend for a fully self-contained
+fleet); the mesh tier keeps the cache coherent.
 Governed-key spend and rate counters are separate from this cache tier: see
 [Governed admission: strict and approximate](#governed-admission-strict-and-approximate)
 for how approximate mode merges each node's settled usage. Bootstrap the mesh

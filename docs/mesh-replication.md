@@ -1,6 +1,6 @@
 # Replicated cluster state
 
-*Last modified: 2026-07-20*
+*Last modified: 2026-08-01*
 
 The mesh's typed-state cache routes every key to a single owner and keeps
 everything in memory. That is fine for best-effort caching, but it cannot
@@ -14,13 +14,16 @@ keeps removed data removed.
 This substrate is infrastructure for cluster-internal state, not a
 feature you turn on to change what a request does. Configuring
 `replication` provisions the substrate and its admin surface without
-changing any request-path behavior on its own. One public feature can
-select it explicitly: `compression.state.backend: mesh` stores AI
-compression session summaries on this substrate, and requires this
-block to be configured. Redis remains the default and recommended
+changing any request-path behavior on its own. Two public features can
+select it explicitly, and both require this block to be configured:
+`compression.state.backend: mesh` stores AI compression session
+summaries on it, and `key_management.store.backend: mesh` makes it the
+keystore's system of record. Redis remains the default and recommended
 compression state backend; see
 [ai-context-compression.md](ai-context-compression.md) for the
-when-to-choose guidance and the consistency differences.
+when-to-choose guidance and the consistency differences, and
+[key-management.md](key-management.md) for the keystore backend's
+pinned consistency and guarantees.
 
 The mesh it extends *is* on the request path today, just not through
 this replicated layer: [`examples/model-cluster-symmetric`](../examples/model-cluster-symmetric)
