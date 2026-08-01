@@ -3900,8 +3900,10 @@ origins:
         expression: 'this is not valid CEL !!!'
 "#;
         let cfg = sbproxy_config::compile_config(yaml).expect("yaml parses");
+        // CompiledPipeline has no Debug, so Option::expect replaces expect_err.
         let err = CompiledPipeline::from_config(cfg)
-            .expect_err("invalid CEL must reject the candidate config");
+            .err()
+            .expect("invalid CEL must reject the candidate config");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("cel.local"),
