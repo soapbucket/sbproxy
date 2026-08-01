@@ -63,6 +63,12 @@ const routes = [
     meta: { title: "Spend", documentation: "ai-usage-ledger" },
   },
   {
+    path: "/meter",
+    name: "meter",
+    component: () => import("./views/MeterView.vue"),
+    meta: { title: "Meter", documentation: "ai-usage-ledger" },
+  },
+  {
     path: "/ai-performance",
     name: "ai-performance",
     component: () => import("./views/AiPerformanceView.vue"),

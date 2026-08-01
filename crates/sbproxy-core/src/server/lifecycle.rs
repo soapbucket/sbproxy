@@ -1924,6 +1924,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                             username: o.username.clone(),
                             password_hash: o.password_hash.clone(),
                             role: o.role,
+                            // WOR-2131: the meter's tenant scope for this
+                            // login. Carried through so the admin surface
+                            // reads it from config rather than from a token.
+                            tenant: o.tenant.clone(),
                         })
                         .collect()
                 })

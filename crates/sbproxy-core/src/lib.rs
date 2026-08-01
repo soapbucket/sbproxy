@@ -23,6 +23,13 @@ pub mod admin_compression;
 /// WOR-1553/1554: key + credential lifecycle REST API mounted on the
 /// admin server (`/admin/keys`, `/admin/credentials`).
 pub mod admin_keys;
+/// Attested-metering operator surface (`/api/meter/*`), WOR-2131: units
+/// with their provenance, the mesh coverage a total was assembled from,
+/// a cursor-paged window on the receipt chain, and chain verification.
+/// Every response says whether attestation is off, idle, or reporting
+/// before it says a number, because a page of zeros cannot tell those
+/// three apart.
+pub mod admin_meter;
 /// Model-host status admin API (`/admin/model-host/status`), WOR-1665.
 pub mod admin_model_host;
 /// Settlement status and the reconciliation trigger

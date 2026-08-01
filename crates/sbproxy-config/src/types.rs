@@ -4664,6 +4664,19 @@ pub struct AdminOperator {
     /// Role governing which admin actions this operator may perform.
     #[serde(default)]
     pub role: AdminRole,
+    /// Billing tenant whose metered consumption this operator may read
+    /// (WOR-2131). Absent means the whole deployment, which is what every
+    /// operator written before this field existed keeps getting.
+    ///
+    /// A receipt names one buyer's traffic, so the meter routes treat a
+    /// cross-tenant read as a disclosure rather than a reporting mistake:
+    /// naming a tenant here narrows `/api/meter/*` to that tenant and
+    /// refuses a request for any other. The scope is read from this
+    /// document on every request rather than carried in the session token,
+    /// so revoking it is a config reload rather than a wait for tokens to
+    /// expire.
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 /// Admin RBAC role (WOR-1716). `read_only` may call read (GET) endpoints

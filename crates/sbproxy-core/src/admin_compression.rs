@@ -1077,6 +1077,7 @@ mod tests {
             role,
             via_session,
             csrf: via_session.then(|| "csrf-a".to_string()),
+            tenant: None,
         }
     }
 

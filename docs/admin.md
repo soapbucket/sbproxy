@@ -1,6 +1,6 @@
 # Admin server
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-01*
 
 sbproxy has a built-in admin server: a small control-plane HTTP endpoint,
 separate from the data plane, for operating a running proxy. It exposes
@@ -164,6 +164,10 @@ proxy:
       - username: deployer
         password_hash: ${DEPLOYER_PASSWORD_HASH}
         role: admin        # every route
+      - username: acme-billing
+        password_hash: ${ACME_BILLING_PASSWORD_HASH}
+        role: read_only
+        tenant: acme       # may read only acme's metered consumption
 ```
 
 A `read_only` operator can read config, metrics, logs, and status but cannot
@@ -172,6 +176,18 @@ pass the general Admin gate emit a structured event on the
 `sbproxy::admin::audit` tracing target with the operator's identity. Session
 establishment, discovery, and logout use their route-specific behavior.
 Persistence depends on the configured tracing sink.
+
+`tenant` is a separate question from `role`, and both apply. The role says
+whether an operator may change anything; `tenant` says whose metered
+consumption they may see. Naming one narrows the `/api/meter/*` routes to
+that tenant: a request with no `tenant=` parameter resolves to their own,
+and one naming anybody else is refused with `403` rather than filtered to
+an empty result, because an empty result reads as "that tenant used
+nothing" and somebody will believe it. Leaving `tenant` unset is the
+default and means the whole deployment. The scope is read from config on
+every request, so removing it from an operator takes effect on the next
+reload rather than when their session expires. The console's Operators
+page shows the scope in force.
 
 The pepper `password_hash` is verified against comes from
 `key_management.crypto.pepper` when that's set. Without it, `password_hash`

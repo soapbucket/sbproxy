@@ -92,6 +92,15 @@ pub struct AdminOperator {
     pub password_hash: String,
     /// Role governing which admin actions this operator may perform.
     pub role: AdminRole,
+    /// Billing tenant whose metered consumption this operator may read
+    /// (WOR-2131). `None` is the whole deployment.
+    ///
+    /// Orthogonal to [`AdminOperator::role`], and deliberately so: the role
+    /// answers "may they change anything", and this answers "whose numbers
+    /// are they allowed to see". A full-access operator pinned to one tenant
+    /// is a normal arrangement for a reseller, and collapsing the two
+    /// questions into one field would make it unexpressible.
+    pub tenant: Option<String>,
 }
 
 impl Default for AdminConfig {
@@ -608,11 +617,13 @@ impl AdminState {
                         .map(|s| s.contains(&sess.nonce))
                         .unwrap_or(false);
                     if !revoked {
+                        let tenant = self.operator_tenant(&sess.username);
                         return Some(AdminPrincipal {
                             username: sess.username,
                             role: sess.role,
                             via_session: true,
                             csrf: Some(sess.nonce),
+                            tenant,
                         });
                     }
                 }
@@ -626,10 +637,28 @@ impl AdminState {
                     role: AdminRole::Admin,
                     via_session: false,
                     csrf: None,
+                    // The top-level credential is the deployment's own
+                    // operator, not a tenant's, so it is never narrowed.
+                    // A reseller who wants a scoped login configures one
+                    // under `proxy.admin.operators`.
+                    tenant: None,
                 });
             }
         }
         None
+    }
+
+    /// The billing tenant `username` is narrowed to, if any (WOR-2131).
+    ///
+    /// Looks the operator up by name in the live config rather than trusting
+    /// anything the caller presented, so a scope can only ever come from the
+    /// document an operator edits and reloads.
+    fn operator_tenant(&self, username: &str) -> Option<String> {
+        self.config
+            .operators
+            .iter()
+            .find(|operator| operator.username == username)
+            .and_then(|operator| operator.tenant.clone())
     }
 
     /// Verify login credentials against the top-level admin and the
@@ -849,6 +878,14 @@ pub struct AdminPrincipal {
     /// The session nonce, which the client must echo in `X-CSRF-Token`
     /// on state-changing requests. `None` for Basic auth.
     pub csrf: Option<String>,
+    /// The single billing tenant this operator may read metered
+    /// consumption for, or `None` for the whole deployment (WOR-2131).
+    ///
+    /// Resolved from `proxy.admin.operators` on every request rather than
+    /// decoded from the session token. A token minted before the operator
+    /// was narrowed would otherwise keep the old, wider scope until it
+    /// expired, which turns a config change into a delayed one.
+    pub tenant: Option<String>,
 }
 
 /// WOR-1777: the `Set-Cookie` + `X-CSRF-Token` headers that upgrade a
@@ -2102,6 +2139,15 @@ fn escape_json(s: &str) -> String {
 struct OperatorSummary {
     username: String,
     role: AdminRole,
+    /// The billing tenant this login is narrowed to on the meter routes
+    /// (WOR-2131), omitted when it may read the whole deployment.
+    ///
+    /// Worth surfacing rather than leaving implicit: a scoped operator who
+    /// gets a `403` from `/api/meter/*` needs somewhere in the console that
+    /// says why, and the answer is a line in config they cannot see from
+    /// the page that refused them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tenant: Option<String>,
 }
 
 // --- Request Handler ---
@@ -2465,6 +2511,7 @@ pub fn handle_admin_request(
             .map(|o| OperatorSummary {
                 username: o.username.clone(),
                 role: o.role,
+                tenant: o.tenant.clone(),
             })
             .collect();
         return match serde_json::to_string(&summaries) {
@@ -3788,6 +3835,20 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
         }
     }
 
+    // WOR-2131: the meter's operator surface. Dispatched here rather than
+    // in `handle_admin_request` for two reasons that both matter. The
+    // cluster-wide gather is asynchronous, and the routes are tenant-scoped
+    // from the resolved principal, which the synchronous handler is not
+    // given: it receives an auth header that a session-authenticated
+    // request has already had rewritten to the top-level admin credential,
+    // so scoping there would read every operator as unscoped.
+    if let Some(response) = crate::admin_meter::dispatch(method, path, principal.as_ref()).await {
+        let _ =
+            write_admin_response_headed(sock, response.0, response.1, response.2.as_bytes(), &cors)
+                .await;
+        return;
+    }
+
     // WOR-1753: chat playground. Handled here (not in
     // `handle_admin_request`) because the chat call awaits the AI client.
     // Both routes require authentication; the chat POST is a mutation, so
@@ -4333,6 +4394,7 @@ mod tests {
             role: AdminRole::Admin,
             via_session: false,
             csrf: None,
+            tenant: None,
         };
         let headers = basic_session_upgrade_headers(&signer, &basic, false, now);
 
@@ -4368,6 +4430,7 @@ mod tests {
             role: AdminRole::Admin,
             via_session: true,
             csrf: Some("n".into()),
+            tenant: None,
         };
         assert!(basic_session_upgrade_headers(&signer, &via_session, false, now).is_empty());
 
@@ -5434,6 +5497,7 @@ mod tests {
                     &crate::key_plane::default_admin_operator_pepper(),
                 ),
                 role: AdminRole::ReadOnly,
+                tenant: None,
             }],
             ..AdminConfig::default()
         });
@@ -5924,6 +5988,7 @@ mod tests {
                     &crate::key_plane::default_admin_operator_pepper(),
                 ),
                 role: AdminRole::ReadOnly,
+                tenant: None,
             }],
             ..AdminConfig::default()
         });
@@ -5955,6 +6020,7 @@ mod tests {
                     &crate::key_plane::default_admin_operator_pepper(),
                 ),
                 role: AdminRole::ReadOnly,
+                tenant: None,
             }],
             ..AdminConfig::default()
         });
@@ -6927,6 +6993,7 @@ origins:
                 username: "ro".to_string(),
                 password_hash: hash,
                 role: AdminRole::ReadOnly,
+                tenant: None,
             }],
             ..AdminConfig::default()
         };
@@ -6952,6 +7019,7 @@ origins:
                 username: "ro".to_string(),
                 password_hash: String::new(),
                 role: AdminRole::ReadOnly,
+                tenant: None,
             }],
             ..AdminConfig::default()
         };
@@ -6969,6 +7037,7 @@ origins:
                 username: "ro".to_string(),
                 password_hash: "not-valid-hex-zzz".to_string(),
                 role: AdminRole::ReadOnly,
+                tenant: None,
             }],
             ..AdminConfig::default()
         };
@@ -7517,11 +7586,13 @@ origins:
                 username: "viewer".to_string(),
                 password_hash: sbproxy_keystore::crypto::hash_secret("viewer-secret", &pepper),
                 role: AdminRole::ReadOnly,
+                tenant: None,
             },
             AdminOperator {
                 username: "oncall".to_string(),
                 password_hash: sbproxy_keystore::crypto::hash_secret("oncall-secret", &pepper),
                 role: AdminRole::Admin,
+                tenant: None,
             },
         ];
         let state = AdminState::new(cfg);
@@ -7547,6 +7618,78 @@ origins:
         assert_eq!(users[2]["role"], "admin");
     }
 
+    /// A configured tenant scope has to survive as far as the resolved
+    /// principal, because that is the only thing the meter routes read.
+    ///
+    /// It is looked up by username on every request rather than decoded
+    /// from the session token, so narrowing an operator takes effect on
+    /// the next reload rather than whenever their token happens to
+    /// expire. The two assertions below are that lookup working and the
+    /// top-level admin credential staying unscoped.
+    #[test]
+    fn a_configured_operator_tenant_reaches_the_resolved_principal() {
+        let mut cfg = make_state().config.clone();
+        cfg.operators = vec![AdminOperator {
+            username: "acme-billing".to_string(),
+            password_hash: "deadbeef".to_string(),
+            role: AdminRole::ReadOnly,
+            tenant: Some("acme".to_string()),
+        }];
+        let state = AdminState::new(cfg);
+
+        let (token, _) =
+            state
+                .session_signer
+                .mint("acme-billing", AdminRole::ReadOnly, 3600, unix_now());
+        let scoped = state
+            .resolve_principal(None, Some(&format!("sb_admin_session={token}")))
+            .expect("the session resolves");
+        assert_eq!(scoped.username, "acme-billing");
+        assert_eq!(scoped.tenant.as_deref(), Some("acme"));
+
+        let admin = state
+            .resolve_principal(Some(&basic_auth("admin", "secret")), None)
+            .expect("the top-level credential resolves");
+        assert_eq!(
+            admin.tenant, None,
+            "the deployment's own operator is not a tenant's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_scoped_operator_is_refused_another_tenants_meter() {
+        // End to end through the connection handler, because the scope is
+        // resolved there and a route that read it from the query string
+        // instead would pass a unit test and leak in production.
+        let mut cfg = make_state().config.clone();
+        cfg.operators = vec![AdminOperator {
+            username: "acme-billing".to_string(),
+            password_hash: "deadbeef".to_string(),
+            role: AdminRole::ReadOnly,
+            tenant: Some("acme".to_string()),
+        }];
+        let state = AdminState::new(cfg);
+        let (token, _) =
+            state
+                .session_signer
+                .mint("acme-billing", AdminRole::ReadOnly, 3600, unix_now());
+
+        let response = send_admin_request(
+            state,
+            format!(
+                "GET /api/meter/summary?tenant=globex HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"
+            ),
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+        assert!(response.contains("acme"), "{response}");
+        assert!(
+            !response.contains("globex"),
+            "the refusal must not echo the tenant they asked about: {response}"
+        );
+    }
+
     #[test]
     fn operators_route_lists_usernames_and_roles_without_hashes() {
         let mut cfg = make_state().config.clone();
@@ -7554,6 +7697,7 @@ origins:
             username: "ro".to_string(),
             password_hash: "deadbeef".to_string(),
             role: AdminRole::ReadOnly,
+            tenant: None,
         }];
         let state = AdminState::new(cfg);
         let auth = basic_auth("admin", "secret");
