@@ -2,8 +2,9 @@
 //!
 //! Default-deny allowlists per [`EgressPurpose`], DNS-pinned
 //! [`AuthorizedDestination`]s, and a [`GovernedHttpClient`] contract that
-//! never auto-follows redirects. Later lanes (G2/GS) adopt call sites;
-//! this module ships pure library primitives only.
+//! never auto-follows redirects. Call sites adopt these primitives per
+//! purpose; dial paths close the resolve-to-connect window through
+//! [`EgressAuthorizer::verify_dial_addrs`] immediately before connect.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -174,19 +175,14 @@ impl EgressAuthorizer {
 
     /// Confirm a dial address matches the pin set (DNS-rebind defense).
     ///
-    /// **This has no production call site.** The authorizer resolves a
-    /// destination and records its pinned addresses, but nothing calls
-    /// back here before dialling, so the rebind window between resolve
-    /// and connect is currently unguarded. Its own tests cover the
-    /// function; they do not cover the path that should be using it.
-    ///
-    /// Kept rather than deleted because the defence is wanted, not
-    /// obsolete. The allow is deliberate: narrowing the visibility is what
-    /// made the gap visible in the first place, and reverting to `pub` to
-    /// silence rustc would hide it again. Tracked at
-    /// <https://linear.app/soapbucket/issue/WOR-2080>.
-    #[allow(dead_code)]
-    pub(crate) fn verify_pinned(
+    /// Runs at dial time, immediately before a connector is handed an
+    /// address for `destination`. [`Self::verify_dial_addrs`] is the
+    /// usual entry point: it re-resolves the host and pushes every
+    /// candidate address through this check, so an answer that changed
+    /// between authorization and connect is refused with
+    /// [`EgressDenied::DnsPinMismatch`] instead of being dialled
+    /// (WOR-2080).
+    pub fn verify_pinned(
         &self,
         destination: &AuthorizedDestination,
         dial: &SocketAddr,
@@ -196,6 +192,40 @@ impl EgressAuthorizer {
         } else {
             Err(EgressDenied::DnsPinMismatch)
         }
+    }
+
+    /// Verify the dial addresses for `destination` immediately before
+    /// connect (DNS-rebind defense, WOR-2080).
+    ///
+    /// Re-resolves the destination host through `resolver` and checks
+    /// every returned address against the pin set recorded at authorize
+    /// time via [`Self::verify_pinned`]. All addresses must be pinned:
+    /// a connector may pick any address it is handed, so one unpinned
+    /// address in the answer refuses the whole dial rather than
+    /// trusting the connector's choice. On success the verified
+    /// addresses are returned so the caller can hand them, and only
+    /// them, to its connector (resolve-override) instead of letting the
+    /// HTTP stack re-resolve on its own.
+    pub fn verify_dial_addrs(
+        &self,
+        destination: &AuthorizedDestination,
+        resolver: &dyn HostResolver,
+    ) -> Result<Vec<SocketAddr>, EgressDenied> {
+        let url = &destination.url;
+        let host = url.host_str().ok_or(EgressDenied::MissingHost)?;
+        let port = url
+            .port_or_known_default()
+            .ok_or(EgressDenied::DisallowedPort)?;
+        let addrs = resolver
+            .resolve(host, port)
+            .map_err(|_| EgressDenied::DnsResolutionFailed)?;
+        if addrs.is_empty() {
+            return Err(EgressDenied::DnsResolutionFailed);
+        }
+        for addr in &addrs {
+            self.verify_pinned(destination, addr)?;
+        }
+        Ok(addrs)
     }
 
     fn authorize_inner(
@@ -368,6 +398,30 @@ mod tests {
         }
     }
 
+    /// Resolver that hands out one answer per call, in order, so a test
+    /// can change the DNS answer between authorization and dial.
+    struct SequenceResolver {
+        answers: std::sync::Mutex<std::collections::VecDeque<Vec<SocketAddr>>>,
+    }
+
+    impl SequenceResolver {
+        fn new(answers: Vec<Vec<SocketAddr>>) -> Self {
+            Self {
+                answers: std::sync::Mutex::new(answers.into_iter().collect()),
+            }
+        }
+    }
+
+    impl HostResolver for SequenceResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<SocketAddr>, ()> {
+            self.answers
+                .lock()
+                .expect("test lock")
+                .pop_front()
+                .ok_or(())
+        }
+    }
+
     fn addr(ip: [u8; 4], port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])), port)
     }
@@ -430,6 +484,95 @@ mod tests {
         assert_eq!(
             auth.verify_pinned(&dest, &addr([8, 8, 8, 8], 443)),
             Err(EgressDenied::DnsPinMismatch)
+        );
+    }
+
+    #[test]
+    fn dial_time_verification_accepts_a_stable_dns_answer() {
+        let auth = EgressAuthorizer::new(ai_provider_https_443(&["api.openai.com"]));
+        let pinned = vec![addr([104, 18, 1, 1], 443), addr([104, 18, 1, 2], 443)];
+        let resolver = SequenceResolver::new(vec![pinned.clone(), pinned.clone()]);
+
+        let dest = auth
+            .authorize(
+                EgressPurpose::AiProvider,
+                "https://api.openai.com/v1/chat",
+                &resolver,
+            )
+            .expect("listed host must authorize");
+        let dial = auth
+            .verify_dial_addrs(&dest, &resolver)
+            .expect("unchanged answer must verify");
+        assert_eq!(dial, pinned, "verified dial set must equal the pin set");
+    }
+
+    #[test]
+    fn dial_time_rebind_is_refused_with_dns_pin_mismatch() {
+        let auth = EgressAuthorizer::new(ai_provider_https_443(&["api.openai.com"]));
+        // Authorize sees the public answer; the dial-time answer has
+        // been rebound to an internal address.
+        let resolver = SequenceResolver::new(vec![
+            vec![addr([104, 18, 1, 1], 443)],
+            vec![addr([10, 0, 0, 5], 443)],
+        ]);
+
+        let dest = auth
+            .authorize(
+                EgressPurpose::AiProvider,
+                "https://api.openai.com/v1/chat",
+                &resolver,
+            )
+            .expect("listed host must authorize");
+        assert_eq!(
+            auth.verify_dial_addrs(&dest, &resolver),
+            Err(EgressDenied::DnsPinMismatch),
+            "a rebound answer must refuse, not dial"
+        );
+    }
+
+    #[test]
+    fn dial_time_partially_rebound_answer_is_refused() {
+        let auth = EgressAuthorizer::new(ai_provider_https_443(&["api.openai.com"]));
+        let pinned = addr([104, 18, 1, 1], 443);
+        // One address is still pinned, one is new. The connector could
+        // pick either, so the whole dial must be refused.
+        let resolver = SequenceResolver::new(vec![
+            vec![pinned],
+            vec![pinned, addr([10, 0, 0, 5], 443)],
+        ]);
+
+        let dest = auth
+            .authorize(
+                EgressPurpose::AiProvider,
+                "https://api.openai.com/v1/chat",
+                &resolver,
+            )
+            .expect("listed host must authorize");
+        assert_eq!(
+            auth.verify_dial_addrs(&dest, &resolver),
+            Err(EgressDenied::DnsPinMismatch),
+            "one unpinned address must refuse the whole dial"
+        );
+    }
+
+    #[test]
+    fn dial_time_resolution_failure_is_refused() {
+        let auth = EgressAuthorizer::new(ai_provider_https_443(&["api.openai.com"]));
+        // Only the authorize-time answer exists; the dial-time
+        // resolution fails outright.
+        let resolver = SequenceResolver::new(vec![vec![addr([104, 18, 1, 1], 443)]]);
+
+        let dest = auth
+            .authorize(
+                EgressPurpose::AiProvider,
+                "https://api.openai.com/v1/chat",
+                &resolver,
+            )
+            .expect("listed host must authorize");
+        assert_eq!(
+            auth.verify_dial_addrs(&dest, &resolver),
+            Err(EgressDenied::DnsResolutionFailed),
+            "a failed dial-time resolution must refuse"
         );
     }
 

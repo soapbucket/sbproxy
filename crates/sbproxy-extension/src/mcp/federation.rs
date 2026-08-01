@@ -18,7 +18,7 @@ use super::egress::{EgressPolicy, SystemHostResolver};
 use super::sse_client::send_via_sse;
 use super::streamable::send_request;
 use super::types::{JsonRpcRequest, JsonRpcResponse, META_TRACEPARENT, SEP_414_RESERVED_META_KEYS};
-use sbproxy_security::egress::EgressPurpose;
+use sbproxy_security::egress::{AuthorizedDestination, EgressPurpose, HostResolver};
 
 /// Outcome of [`McpFederation::call_tool_with_policy`].
 ///
@@ -269,6 +269,11 @@ pub struct McpFederation {
     max_response_bytes: usize,
     /// Supervision deadline for local stdio MCP exchanges.
     stdio_timeout: std::time::Duration,
+    /// TCP connect deadline, kept so per-dial pinned OpenAPI clients
+    /// (WOR-2080) carry the same bounds as the shared clients.
+    connect_timeout: std::time::Duration,
+    /// Whole-request deadline, kept for the same per-dial clients.
+    request_timeout: std::time::Duration,
     /// Monotonic catalogue generation. Bumps once per refresh that
     /// actually changed the tool or resource registry (content
     /// digest short-circuit), so consumers can key caches on it and
@@ -389,6 +394,8 @@ impl McpFederation {
             openapi_client,
             max_response_bytes: io.max_response_bytes,
             stdio_timeout: io.request_timeout,
+            connect_timeout: io.connect_timeout,
+            request_timeout: io.request_timeout,
             generation: std::sync::atomic::AtomicU64::new(0),
             tools_generation: std::sync::atomic::AtomicU64::new(0),
             resources_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1207,6 +1214,30 @@ impl McpFederation {
         arguments: &serde_json::Value,
         upstream_headers: &[(String, String)],
     ) -> anyhow::Result<McpCallOutcome> {
+        self.call_openapi_tool_with_resolver(
+            server,
+            backing,
+            federated_name,
+            arguments,
+            upstream_headers,
+            &SystemHostResolver,
+        )
+        .await
+    }
+
+    /// [`Self::call_openapi_tool`] with an injected resolver, so tests
+    /// can simulate a DNS answer that changes between authorization and
+    /// dial without live DNS (WOR-2080). Production always passes
+    /// [`SystemHostResolver`].
+    async fn call_openapi_tool_with_resolver(
+        &self,
+        server: &McpServerConfig,
+        backing: &OpenApiBacking,
+        federated_name: &str,
+        arguments: &serde_json::Value,
+        upstream_headers: &[(String, String)],
+        resolver: &dyn HostResolver,
+    ) -> anyhow::Result<McpCallOutcome> {
         let bare = federated_name
             .strip_prefix(&format!("{}.", server.name))
             .unwrap_or(federated_name);
@@ -1236,10 +1267,9 @@ impl McpFederation {
         let url = Url::parse(&format!("{base}{path}"))
             .map_err(|e| anyhow::anyhow!("invalid OpenAPI REST URL for {federated_name}: {e}"))?;
         // Deny unlisted hosts before any I/O (WOR-1791 / G2).
-        let resolver = SystemHostResolver;
         let mut dest = backing
             .egress_policy
-            .authorize(EgressPurpose::OpenApiTool, url.as_str(), &resolver)
+            .authorize(EgressPurpose::OpenApiTool, url.as_str(), resolver)
             .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))?;
 
         let leftovers: serde_json::Map<String, serde_json::Value> = args_obj
@@ -1272,9 +1302,13 @@ impl McpFederation {
 
         let mut redirects = 0usize;
         let resp = loop {
-            let mut builder = self
-                .openapi_client
-                .request(http_method.clone(), dest.url.clone());
+            // WOR-2080: immediately before connect, re-verify this
+            // hop's dial addresses against the pins recorded when the
+            // destination was authorized, and hand the connector only
+            // the verified set. A DNS answer that changed since the
+            // egress check refuses here instead of being dialled.
+            let client = self.openapi_dial_client(backing, &dest, resolver)?;
+            let mut builder = client.request(http_method.clone(), dest.url.clone());
             // WOR-2139: an OpenAPI-backed tool dispatches as a plain
             // REST request, so its carrier is the HTTP header, not the
             // `_meta` block a JSON-RPC body would have carried. Header
@@ -1313,9 +1347,11 @@ impl McpFederation {
                 anyhow::bail!("openapi REST call to {} exceeded redirect limit", dest.url);
             }
             // Re-authorize redirect target before any second connect.
+            // The loop top then re-verifies the new hop's pins before
+            // its dial, so every hop gets the same rebind defense.
             let (next, _strip) = backing
                 .egress_policy
-                .authorize_redirect(&dest, location, &resolver)
+                .authorize_redirect(&dest, location, resolver)
                 .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))?;
             dest = next;
         };
@@ -1329,6 +1365,44 @@ impl McpFederation {
             "content": [{"type": "text", "text": text}],
             "isError": !status.is_success(),
         })))
+    }
+
+    /// Build the client for one OpenAPI dial of `dest` (WOR-2080).
+    ///
+    /// A pinned destination gets a per-dial client whose resolver
+    /// override carries exactly the verified pin set, so the connector
+    /// cannot re-resolve the host on its own; a rebound DNS answer is
+    /// refused with the closed `DnsPinMismatch` reason before any
+    /// connect. An unpinned destination (legacy allow-by-default
+    /// egress records no pins) keeps the shared re-resolving client,
+    /// preserving pre-WOR-2080 behaviour for that explicit opt-out.
+    fn openapi_dial_client(
+        &self,
+        backing: &OpenApiBacking,
+        dest: &AuthorizedDestination,
+        resolver: &dyn HostResolver,
+    ) -> anyhow::Result<reqwest::Client> {
+        let Some(addrs) = backing
+            .egress_policy
+            .verified_dial_addrs(dest, resolver)
+            .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))?
+        else {
+            return Ok(self.openapi_client.clone());
+        };
+        let host = dest
+            .url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("authorized OpenAPI URL lost its host"))?;
+        // Unlike the constructor's shared clients, a builder failure
+        // here must not fall back to a default client: a default
+        // client would re-resolve and silently drop the pin defense.
+        reqwest::Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .timeout(self.request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(host, &addrs)
+            .build()
+            .map_err(|e| anyhow::anyhow!("pinned OpenAPI client construction failed: {e}"))
     }
 
     /// Dispatch a request to an upstream server using the configured transport.
@@ -2728,6 +2802,270 @@ mod tests {
         assert!(
             rendered.contains("RedirectToUnlistedHost"),
             "expected RedirectToUnlistedHost, got: {rendered}"
+        );
+    }
+
+    // --- WOR-2080: dial-time DNS pin verification ---
+
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    /// One-shot loopback HTTP fixture for the WOR-2080 dial tests:
+    /// serves `response` to the first connection and records whether it
+    /// was contacted at all. `None` means loopback binds are denied in
+    /// this sandbox and the test should skip (same posture as the
+    /// existing redirect-escape test).
+    fn dial_fixture(response: String) -> Option<(SocketAddr, Arc<AtomicBool>)> {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping pinned-dial egress test: loopback bind denied: {err}");
+                return None;
+            }
+            Err(err) => panic!("bind failed: {err}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let was_hit = Arc::new(AtomicBool::new(false));
+        let hit = Arc::clone(&was_hit);
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut s, _)) = listener.accept() {
+                hit.store(true, Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(response.as_bytes());
+            }
+        });
+        Some((addr, was_hit))
+    }
+
+    fn ok_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn enforce_openapi_backing(host: &str, port: u16, hosts: Vec<String>) -> OpenApiBacking {
+        let mut routes = HashMap::new();
+        routes.insert(
+            "getPet".to_string(),
+            ("GET".to_string(), "/pets/{id}".to_string()),
+        );
+        OpenApiBacking {
+            base_url: format!("http://{host}:{port}"),
+            tools: vec![],
+            routes,
+            egress_policy: EgressPolicy {
+                // allow_private so loopback fixture pins authorize.
+                mode: crate::mcp::EgressMode::Enforce,
+                hosts,
+                suffixes: vec![],
+                allow_private: true,
+                scope: "server:api".to_string(),
+            },
+        }
+    }
+
+    fn server_for_backing(backing: &OpenApiBacking) -> McpServerConfig {
+        McpServerConfig {
+            name: "api".to_string(),
+            url: backing.base_url.clone(),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: Some(backing.clone()),
+        }
+    }
+
+    /// Resolver whose per-host answers are handed out in order, holding
+    /// the last one, so a test can rebind "DNS" between the authorize
+    /// and dial resolutions.
+    struct RebindResolver {
+        answers: Mutex<HashMap<String, Vec<Vec<SocketAddr>>>>,
+    }
+
+    impl RebindResolver {
+        fn new(entries: Vec<(&str, Vec<Vec<SocketAddr>>)>) -> Self {
+            Self {
+                answers: Mutex::new(
+                    entries
+                        .into_iter()
+                        .map(|(h, a)| (h.to_string(), a))
+                        .collect(),
+                ),
+            }
+        }
+    }
+
+    impl HostResolver for RebindResolver {
+        fn resolve(&self, host: &str, _port: u16) -> Result<Vec<SocketAddr>, ()> {
+            let mut map = self.answers.lock().expect("test lock");
+            let queue = map.get_mut(host).ok_or(())?;
+            if queue.len() > 1 {
+                Ok(queue.remove(0))
+            } else {
+                queue.first().cloned().ok_or(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openapi_tool_dials_the_verified_pin_for_a_synthetic_host() {
+        // "pin-dial.invalid" is unresolvable by system DNS, so a
+        // response from the loopback fixture proves the connector
+        // dialled the verified pin override, not a live re-resolution.
+        let body = r#"{"ok":true}"#;
+        let Some((addr, was_hit)) = dial_fixture(ok_response(body)) else {
+            return;
+        };
+
+        let resolver = RebindResolver::new(vec![("pin-dial.invalid", vec![vec![addr]])]);
+        let fed = McpFederation::new(vec![]);
+        let backing = enforce_openapi_backing(
+            "pin-dial.invalid",
+            addr.port(),
+            vec!["pin-dial.invalid".to_string()],
+        );
+        let server = server_for_backing(&backing);
+
+        let outcome = fed
+            .call_openapi_tool_with_resolver(
+                &server,
+                &backing,
+                "getPet",
+                &json!({"id": "1"}),
+                &[],
+                &resolver,
+            )
+            .await
+            .expect("pinned dial must reach the fixture");
+        let McpCallOutcome::Allowed(value) = outcome else {
+            panic!("expected an allowed outcome");
+        };
+        assert_eq!(
+            value.pointer("/content/0/text").and_then(|v| v.as_str()),
+            Some(body),
+            "the fixture body must round-trip through the pinned dial"
+        );
+        assert_eq!(
+            value.pointer("/isError").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert!(
+            was_hit.load(Ordering::SeqCst),
+            "the pinned fixture must have served the call"
+        );
+    }
+
+    #[tokio::test]
+    async fn openapi_tool_refuses_a_dns_answer_that_changed_before_dial() {
+        // Authorization pins the first fixture's address; the
+        // dial-time answer has been rebound to the second fixture. The
+        // calling path must refuse with the closed DnsPinMismatch and
+        // contact neither address.
+        let Some((pinned_addr, pinned_hit)) = dial_fixture(ok_response("{}")) else {
+            return;
+        };
+        let Some((rebound_addr, rebound_hit)) = dial_fixture(ok_response("{}")) else {
+            return;
+        };
+
+        let resolver = RebindResolver::new(vec![(
+            "pin-rebind.invalid",
+            vec![vec![pinned_addr], vec![rebound_addr]],
+        )]);
+        let fed = McpFederation::new(vec![]);
+        let backing = enforce_openapi_backing(
+            "pin-rebind.invalid",
+            pinned_addr.port(),
+            vec!["pin-rebind.invalid".to_string()],
+        );
+        let server = server_for_backing(&backing);
+
+        let err = fed
+            .call_openapi_tool_with_resolver(
+                &server,
+                &backing,
+                "getPet",
+                &json!({"id": "1"}),
+                &[],
+                &resolver,
+            )
+            .await
+            .expect_err("a rebound DNS answer must be refused");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("DnsPinMismatch"),
+            "expected DnsPinMismatch, got: {rendered}"
+        );
+        assert!(
+            !pinned_hit.load(Ordering::SeqCst),
+            "refusal must occur before any connect"
+        );
+        assert!(
+            !rebound_hit.load(Ordering::SeqCst),
+            "the rebound address must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn openapi_tool_refuses_a_rebound_redirect_hop() {
+        // Hop one is stable and serves a redirect to a second allowed
+        // host. That hop is re-authorized as a new destination (one
+        // answer) and then rebinds before its own dial; the chain must
+        // refuse with DnsPinMismatch instead of following the rebound
+        // answer.
+        let Some((rebound_addr, rebound_hit)) = dial_fixture(ok_response("{}")) else {
+            return;
+        };
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://hop-two.invalid:{}/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            rebound_addr.port()
+        );
+        let Some((hop_one_addr, hop_one_hit)) = dial_fixture(redirect) else {
+            return;
+        };
+        // Hop two's authorize-time answer; the refusal fires before its
+        // dial, so no listener sits behind it.
+        let authorize_addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        let resolver = RebindResolver::new(vec![
+            ("hop-one.invalid", vec![vec![hop_one_addr]]),
+            ("hop-two.invalid", vec![vec![authorize_addr], vec![rebound_addr]]),
+        ]);
+        let fed = McpFederation::new(vec![]);
+        let backing = enforce_openapi_backing(
+            "hop-one.invalid",
+            hop_one_addr.port(),
+            vec!["hop-one.invalid".to_string(), "hop-two.invalid".to_string()],
+        );
+        let server = server_for_backing(&backing);
+
+        let err = fed
+            .call_openapi_tool_with_resolver(
+                &server,
+                &backing,
+                "getPet",
+                &json!({"id": "1"}),
+                &[],
+                &resolver,
+            )
+            .await
+            .expect_err("a rebound redirect hop must be refused");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("DnsPinMismatch"),
+            "expected DnsPinMismatch, got: {rendered}"
+        );
+        assert!(
+            hop_one_hit.load(Ordering::SeqCst),
+            "hop one must have served the redirect"
+        );
+        assert!(
+            !rebound_hit.load(Ordering::SeqCst),
+            "the rebound hop-two address must never be contacted"
         );
     }
 

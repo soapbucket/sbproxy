@@ -152,6 +152,37 @@ impl EgressPolicy {
         authorizer.authorize_redirect(from, location, resolver)
     }
 
+    /// Verify the dial addresses for a destination this policy
+    /// authorized, immediately before connect (DNS-rebind defense,
+    /// WOR-2080).
+    ///
+    /// Returns `Ok(None)` for unpinned destinations: legacy
+    /// allow-by-default authorization records no pins, by explicit
+    /// operator choice, so there is nothing to hold the dial to.
+    /// Pinned destinations re-resolve through `resolver` and every
+    /// returned address is checked against the pin set; an answer that
+    /// changed since authorization refuses with
+    /// [`EgressDenied::DnsPinMismatch`], never a silent re-resolve.
+    /// `Ok(Some(addrs))` is the exact address set the connector must
+    /// dial (resolve-override).
+    pub fn verified_dial_addrs(
+        &self,
+        destination: &AuthorizedDestination,
+        resolver: &dyn HostResolver,
+    ) -> Result<Option<Vec<SocketAddr>>, EgressDenied> {
+        if destination.pinned_addrs.is_empty() {
+            return Ok(None);
+        }
+        let host = destination
+            .url
+            .host_str()
+            .ok_or(EgressDenied::MissingHost)
+            .map(normalize_host)?;
+        let authorizer = self.authorizer_for(destination.purpose, &host, &destination.url)?;
+        let verified = authorizer.verify_dial_addrs(destination, resolver)?;
+        Ok(Some(verified))
+    }
+
     fn host_permitted(&self, host: &str) -> bool {
         self.hosts.iter().any(|h| normalize_host(h) == host)
             || self.suffixes.iter().any(|s| suffix_matches(host, s))
@@ -438,6 +469,84 @@ mod tests {
             .authorize_redirect(&from, "https://evil.example/steal", &resolver)
             .expect_err("redirect escape must be denied");
         assert_eq!(err, EgressDenied::RedirectToUnlistedHost);
+    }
+
+    #[test]
+    fn allow_by_default_destination_is_unpinned_at_dial_time() {
+        let policy = EgressPolicy::allow_all("action");
+        let resolver =
+            MapResolver::new(vec![("api.example.com", vec![addr([93, 184, 216, 34], 443)])]);
+
+        let dest = policy
+            .authorize(
+                EgressPurpose::OpenApiTool,
+                "https://api.example.com/v1",
+                &resolver,
+            )
+            .expect("legacy allow-by-default must authorize");
+        assert!(
+            policy
+                .verified_dial_addrs(&dest, &resolver)
+                .expect("unpinned destination must not error")
+                .is_none(),
+            "allow-by-default records no pins, so dial-time has nothing to verify"
+        );
+    }
+
+    #[test]
+    fn dial_time_stable_answer_returns_the_pin_set() {
+        let policy = EgressPolicy {
+            mode: EgressMode::Enforce,
+            hosts: vec!["api.example.com".to_string()],
+            suffixes: vec![],
+            allow_private: false,
+            scope: "server:api".to_string(),
+        };
+        let pinned = vec![addr([104, 18, 1, 1], 443)];
+        let resolver = MapResolver::new(vec![("api.example.com", pinned.clone())]);
+
+        let dest = policy
+            .authorize(
+                EgressPurpose::OpenApiTool,
+                "https://api.example.com/v1",
+                &resolver,
+            )
+            .expect("listed host must authorize");
+        assert_eq!(
+            policy
+                .verified_dial_addrs(&dest, &resolver)
+                .expect("unchanged answer must verify"),
+            Some(pinned),
+            "the verified dial set is the pin set"
+        );
+    }
+
+    #[test]
+    fn dial_time_rebind_is_refused_through_the_policy() {
+        let policy = EgressPolicy {
+            mode: EgressMode::Enforce,
+            hosts: vec!["api.example.com".to_string()],
+            suffixes: vec![],
+            allow_private: false,
+            scope: "server:api".to_string(),
+        };
+        let authorize_resolver =
+            MapResolver::new(vec![("api.example.com", vec![addr([104, 18, 1, 1], 443)])]);
+        let rebound_resolver =
+            MapResolver::new(vec![("api.example.com", vec![addr([93, 184, 216, 34], 443)])]);
+
+        let dest = policy
+            .authorize(
+                EgressPurpose::OpenApiTool,
+                "https://api.example.com/v1",
+                &authorize_resolver,
+            )
+            .expect("listed host must authorize");
+        assert_eq!(
+            policy.verified_dial_addrs(&dest, &rebound_resolver),
+            Err(EgressDenied::DnsPinMismatch),
+            "a rebound answer must refuse before any connect"
+        );
     }
 
     #[test]
