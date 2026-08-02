@@ -1,0 +1,122 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Routing strategies, against two upstreams that say which one they are.
+#
+# A registered RoutingStrategy runs before the configured `algorithm` and
+# picks from the already-filtered eligible targets. This config wires
+# three origins onto the same pair of replicas so each documented
+# behaviour is one curl away:
+#
+#   gpu.local     - `gpu-aware` reading targets[].metadata.gpu_utilization
+#   percent.local - the same strategy with the percent typo the strategy
+#                   ignores, so its round-robin fallback runs instead
+#   lora.local    - `lora-aware` reading targets[].metadata.loaded_adapters
+#
+# The replicas are the example's own fixture.py, listening on 18091 and
+# 18092 and reporting `replica-a` / `replica-b` in the body. Without
+# distinct upstreams a strategy's selection is not observable at all.
+#
+# Run:
+#   # The example ships its own two upstreams. Start them first.
+#   python3 examples/routing-strategies/fixture.py &
+#   make run CONFIG=examples/routing-strategies/sb.yml
+#
+# Test:
+#   # gpu-aware picks the lowest valid utilization every time: replica-b.
+#   for i in 1 2 3 4; do curl -s -H 'Host: gpu.local' http://127.0.0.1:8080/infer; echo; done
+#
+#   # Same metadata key, values of 72 and 31 instead of 0.72 and 0.31.
+#   # Out of [0.0, 1.0], so both are ignored and the strategy round-robins.
+#   for i in 1 2 3 4; do curl -s -H 'Host: percent.local' http://127.0.0.1:8080/infer; echo; done
+#
+#   # lora-aware prefers the replica that already has the adapter warm.
+#   curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: alice-tone' http://127.0.0.1:8080/infer
+#   curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: carol-voice' http://127.0.0.1:8080/infer
+#
+#   # No eligible replica advertises this adapter, so the strategy defers
+#   # and `algorithm: least_connections` picks.
+#   curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: nobody-has-this' http://127.0.0.1:8080/infer
+
+# sbproxy-docs:begin
+proxy:
+  http_bind_port: 8080
+
+  # Only because the demo replicas run on this machine: the SSRF guard
+  # refuses private upstream addresses unless allowlisted. A production
+  # config pointing at real replicas does not need this block.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '127.0.0.1/32'
+
+origins:
+  # --- gpu-aware, with a usable signal -------------------------------
+  "gpu.local":
+    action:
+      type: load_balancer
+
+      # The fallback selector. It never runs here, because gpu-aware
+      # always finds a valid reading to prefer.
+      algorithm: round_robin
+
+      # `lb_method: plugin` is a compatibility marker and requires
+      # `strategy`; `strategy` is the field that selects and compiles
+      # the registered implementation. An unknown name fails config
+      # compilation rather than silently falling back.
+      lb_method: plugin
+      strategy: gpu-aware
+
+      targets:
+        - url: http://127.0.0.1:18091
+          metadata:
+            # The strategy is a pure consumer of this number. It does
+            # not poll GPUs, scrape metrics, or invent a value when one
+            # is missing. Operators generate it and hot-reload it.
+            gpu_utilization: 0.72
+        - url: http://127.0.0.1:18092
+          metadata:
+            gpu_utilization: 0.31
+
+  # --- gpu-aware, with the signal an operator typo'd -----------------
+  "percent.local":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      lb_method: plugin
+      strategy: gpu-aware
+      targets:
+        - url: http://127.0.0.1:18091
+          metadata:
+            # 72 percent written as 72 rather than 0.72. Outside
+            # [0.0, 1.0], so the strategy ignores it rather than
+            # treating a busy replica as the least loaded one.
+            gpu_utilization: 72
+        - url: http://127.0.0.1:18092
+          metadata:
+            gpu_utilization: 31
+
+  # --- lora-aware ----------------------------------------------------
+  "lora.local":
+    action:
+      type: load_balancer
+
+      # Runs when lora-aware defers, which it does whenever no eligible
+      # replica advertises the requested adapter.
+      algorithm: least_connections
+
+      lb_method: plugin
+      strategy: lora-aware
+
+      targets:
+        - url: http://127.0.0.1:18091
+          metadata:
+            # The adapter inventory the strategy reads. SBproxy does not
+            # discover this from upstreams; operators generate it from
+            # their source of truth and apply it through hot reload.
+            loaded_adapters:
+              - alice-tone
+              - bob-style
+        - url: http://127.0.0.1:18092
+          metadata:
+            loaded_adapters:
+              - carol-voice
+# sbproxy-docs:end

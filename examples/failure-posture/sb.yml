@@ -1,0 +1,94 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# A failure posture, degrading for real.
+#
+# The virtual key store is pointed at a Redis that is deliberately not
+# running, so every key lookup fails the way it would during a real
+# outage. `key_management.failure_posture` decides what happens next.
+# This config runs `degraded`: the request is admitted, the per-key
+# policy, budget, and attribution the virtual key would have carried are
+# recorded as lost, and the caller still has to satisfy the origin's own
+# `authentication:` block.
+#
+# That last part is the point. `degraded` is not a blanket admit. It
+# hands the request to the auth the origin already had; a caller who
+# cannot pass that still gets a 401.
+#
+# The default posture, `closed`, denies with 503 instead. Change the one
+# line below and rerun to watch the same two requests both fail.
+#
+# Nothing else needs to be installed. The absent Redis is the outage.
+#
+# Run:
+#   make run CONFIG=examples/failure-posture/sb.yml
+#
+# Test:
+#   # 200 - the store is down, the posture admits, and the origin's own
+#   # bearer auth recognises this token.
+#   curl -i -H 'Host: keys.local' \
+#        -H 'Authorization: Bearer sbp_a1b2c3d4e5f60718_9f3c1d2e4b5a6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d' \
+#        http://127.0.0.1:8080/
+#
+#   # 401 - same shape, same dead store, same posture. The origin's auth
+#   # does not know this token, so `degraded` admits nothing.
+#   curl -i -H 'Host: keys.local' \
+#        -H 'Authorization: Bearer sbp_0f1e2d3c4b5a6978_1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809' \
+#        http://127.0.0.1:8080/
+#
+#   # 401 - no credential at all.
+#   curl -i -H 'Host: keys.local' http://127.0.0.1:8080/
+#
+# Watch the proxy log while those run. Every admitted request logs
+# `failure_posture=degraded guarantee_waived=true`, which is the record
+# `open` would not have left behind.
+
+# sbproxy-docs:begin
+proxy:
+  http_bind_port: 8080
+
+  key_management:
+    enabled: true
+
+    # The dependency, and it is down. Port 6399 has nothing listening on
+    # it, on purpose: an outage you can reproduce by installing nothing.
+    # A production config points this at a Redis that is actually there.
+    store:
+      backend: redis
+      url: redis://127.0.0.1:6399
+
+    # closed   - deny with 503 rather than let a governed key go
+    #            ungoverned. The default, and the right answer when the
+    #            key plane is the only thing standing between callers
+    #            and a provider bill.
+    # degraded - admit, fall through to the origin's own auth, and say
+    #            in the log that the guarantee was not made.
+    # open     - admit and say nothing. Same request outcome as
+    #            `degraded`, no evidence six months from now.
+    #
+    # `observe` is rejected at config-compile time here: a store that
+    # could not be read produced no verdict to record.
+    failure_posture: degraded
+
+origins:
+  "keys.local":
+    # The auth the origin already had. When the key plane is healthy a
+    # minted key resolves before this runs and carries its own policy;
+    # when the store is down and the posture admits, this is what is
+    # left, and it is why `degraded` is not the same as "allow".
+    #
+    # Demo tokens. They are shaped like minted keys (`sbp_` + 16 hex +
+    # `_` + 64 hex) so the inbound header sweep picks them up and
+    # actually tries the store.
+    authentication:
+      type: bearer
+      tokens:
+        - sbp_a1b2c3d4e5f60718_9f3c1d2e4b5a6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d
+
+    # Served by the proxy itself so the demo has no upstream to run.
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        served: true
+        note: "admitted under failure_posture: degraded, with no per-key policy or budget"
+# sbproxy-docs:end

@@ -1,9 +1,19 @@
 # Supported providers
-*Last modified: 2026-07-27*
+*Last modified: 2026-08-02*
 
 SBproxy ships native adapters for 72 LLM providers behind one OpenAI-compatible API. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them. Most adapters speak the OpenAI wire format and pass through unchanged. Anthropic, Bedrock, and Gemini use in-tree translators for OpenAI-shaped chat or embedding clients; SageMaker, Oracle, Watsonx, and other `Custom` formats pass through in their native shape.
 
 The catalog is plain YAML and you can extend it yourself: see [Extending the provider catalog](#extending-the-provider-catalog).
+
+This page is a catalog, not a walkthrough. The table below is hand-maintained against
+`crates/sbproxy-ai/data/ai_providers.yml`, and it records what each entry says about a provider,
+not the result of calling one: base URLs and auth headers change on the provider's schedule and
+every row would need a live account to exercise. For a request that actually crosses the gateway,
+[ai-gateway.md](ai-gateway.md) is the reference and
+[`examples/ai-gateway-quickstart/`](../examples/ai-gateway-quickstart/) is the shortest runnable
+config. [vercel-ai-sdk.md](vercel-ai-sdk.md), [langchain.md](langchain.md),
+[pydantic-ai.md](pydantic-ai.md), and [mastra.md](mastra.md) each ship a runnable example that
+needs no provider account.
 
 ## Native providers
 

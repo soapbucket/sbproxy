@@ -1,0 +1,33 @@
+# Stack for the `failure-posture` example. One container, on purpose.
+#
+#   sbproxy - the gateway, mounting ./sb.yml read-only on :8080.
+#
+# There is deliberately no Redis service here. The example's whole
+# subject is what the proxy does when the virtual key store cannot be
+# reached, and the cheapest honest way to make a dependency unreachable
+# is not to run it.
+#
+# Bring up:    docker compose up -d --wait
+# Tear down:   docker compose down -v
+
+services:
+  sbproxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cloudbuild
+    image: sbproxy-failure-posture:local
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    environment:
+      # The store outage logs at WARN on every admitted request. Keep the
+      # level low enough to read it.
+      - SB_LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s

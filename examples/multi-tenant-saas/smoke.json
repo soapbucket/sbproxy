@@ -1,0 +1,136 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "cases": [
+    {
+      "name": "acme resolves its own copy of openai-shared",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Host": "acme.local",
+          "Content-Type": "application/json",
+          "Authorization": "Bearer sk-acme-shared"
+        },
+        "body": {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"model": "gpt-4o-mini", "choices": [{"message": {"content": "fixture response"}}]}
+        }
+      }
+    },
+    {
+      "name": "the proxy default is shadowed at acme, so its key does not resolve there",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Host": "acme.local",
+          "Content-Type": "application/json",
+          "Authorization": "Bearer sk-shared-default"
+        },
+        "body": {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+      },
+      "expect": {"status": 401}
+    },
+    {
+      "name": "beta added a credential rather than shadowing one",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Host": "beta.local",
+          "Content-Type": "application/json",
+          "Authorization": "Bearer sk-beta-experimental"
+        },
+        "body": {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"model": "gpt-4o", "choices": [{"message": {"content": "fixture response"}}]}
+        }
+      }
+    },
+    {
+      "name": "so the proxy default still resolves at beta",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Host": "beta.local",
+          "Content-Type": "application/json",
+          "Authorization": "Bearer sk-shared-default"
+        },
+        "body": {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"model": "gpt-4o-mini", "choices": [{"message": {"content": "fixture response"}}]}
+        }
+      }
+    },
+    {
+      "name": "with its own narrower model allow list still applied",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Host": "beta.local",
+          "Content-Type": "application/json",
+          "Authorization": "Bearer sk-shared-default"
+        },
+        "body": {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+      },
+      "expect": {
+        "status": 403,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"error": "model 'gpt-4o' is not allowed for this key"}
+        }
+      }
+    },
+    {
+      "name": "an origin with no tenant_id sees the proxy defaults",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Host": "shared.local",
+          "Content-Type": "application/json",
+          "Authorization": "Bearer sk-shared-default"
+        },
+        "body": {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"model": "gpt-4o-mini", "choices": [{"message": {"content": "fixture response"}}]}
+        }
+      }
+    },
+    {
+      "name": "and a tenant-scoped credential does not leak to it",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Host": "shared.local",
+          "Content-Type": "application/json",
+          "Authorization": "Bearer sk-beta-experimental"
+        },
+        "body": {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+      },
+      "expect": {"status": 401}
+    }
+  ],
+  "audit_check": false
+}

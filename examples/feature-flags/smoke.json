@@ -1,0 +1,80 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "cases": [
+    {
+      "name": "allow_list wins over a bucket outside the rollout",
+      "request": {
+        "method": "GET",
+        "path": "/checkout",
+        "headers": {"Host": "flags.local", "X-User": "alice@acme.io"}
+      },
+      "expect": {
+        "status": 200,
+        "body": {"type": "jsonShape", "shape": {"checkout": "new"}}
+      }
+    },
+    {
+      "name": "block_list wins over a bucket inside the rollout",
+      "request": {
+        "method": "GET",
+        "path": "/checkout",
+        "headers": {"Host": "flags.local", "X-User": "carol@acme.io"}
+      },
+      "expect": {"status": 403}
+    },
+    {
+      "name": "a key on both lists is blocked, because block wins over allow",
+      "request": {
+        "method": "GET",
+        "path": "/checkout",
+        "headers": {"Host": "flags.local", "X-User": "mallory@acme.io"}
+      },
+      "expect": {"status": 403}
+    },
+    {
+      "name": "bucket 22 is under the 25 percent cutoff",
+      "request": {
+        "method": "GET",
+        "path": "/checkout",
+        "headers": {"Host": "flags.local", "X-User": "ken@acme.io"}
+      },
+      "expect": {
+        "status": 200,
+        "body": {"type": "jsonShape", "shape": {"checkout": "new"}}
+      }
+    },
+    {
+      "name": "the same key buckets the same way on a second call",
+      "request": {
+        "method": "GET",
+        "path": "/checkout",
+        "headers": {"Host": "flags.local", "X-User": "ken@acme.io"}
+      },
+      "expect": {
+        "status": 200,
+        "body": {"type": "jsonShape", "shape": {"checkout": "new"}}
+      }
+    },
+    {
+      "name": "bucket 28 is over the cutoff, so the flag default decides",
+      "request": {
+        "method": "GET",
+        "path": "/checkout",
+        "headers": {"Host": "flags.local", "X-User": "ivan@acme.io"}
+      },
+      "expect": {"status": 403}
+    },
+    {
+      "name": "no bucketing key at all fails closed",
+      "request": {
+        "method": "GET",
+        "path": "/checkout",
+        "headers": {"Host": "flags.local"}
+      },
+      "expect": {"status": 403}
+    }
+  ],
+  "audit_check": false
+}

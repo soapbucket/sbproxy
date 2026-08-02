@@ -1,0 +1,90 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Edge feature flags, one rule at a time.
+#
+# One flag, four rules, and a CEL policy that gates a route on it. The
+# bucketing key is the `X-User` request header, so every branch of the
+# rule grammar is reachable from a curl command:
+#
+#   block_list -> allow_list -> rollout_percent -> default
+#
+# The buckets below are not guesses. `hash(flag_name | key) % 100` is
+# FNV-1a 64-bit, so the bucket for any (flag, key) pair is fixed and the
+# same on every machine and after every restart. The comments record the
+# bucket each demo key lands in.
+#
+# The proxy serves the flagged route itself, so there is no upstream to
+# run and nothing to install.
+#
+# Run:
+#   make run CONFIG=examples/feature-flags/sb.yml
+#
+# Test:
+#   # 200 - allow_list wins over a bucket of 76, which is outside the rollout.
+#   curl -i -H 'Host: flags.local' -H 'X-User: alice@acme.io' http://127.0.0.1:8080/checkout
+#
+#   # 403 - block_list wins over a bucket of 17, which is inside the rollout.
+#   curl -i -H 'Host: flags.local' -H 'X-User: carol@acme.io' http://127.0.0.1:8080/checkout
+#
+#   # 403 - mallory is on both lists. Block wins, which is the safe answer.
+#   curl -i -H 'Host: flags.local' -H 'X-User: mallory@acme.io' http://127.0.0.1:8080/checkout
+#
+#   # 200 - no list entry; bucket 22 is under the 25% cutoff.
+#   curl -i -H 'Host: flags.local' -H 'X-User: ken@acme.io' http://127.0.0.1:8080/checkout
+#
+#   # 403 - no list entry; bucket 28 is over the cutoff, so `default: false` decides.
+#   curl -i -H 'Host: flags.local' -H 'X-User: ivan@acme.io' http://127.0.0.1:8080/checkout
+#
+#   # 403 - no bucketing key at all. The expression cannot prove the
+#   # request is allowed, so it is denied.
+#   curl -i -H 'Host: flags.local' http://127.0.0.1:8080/checkout
+
+# sbproxy-docs:begin
+flags:
+  - name: new-checkout
+
+    # What a key with no matching rule gets. Also what a key over the
+    # rollout cutoff gets, which is why flipping this to `true` turns a
+    # 25% rollout into a 100% rollout with a 25% carve-out.
+    default: false
+
+    rules:
+      # Always false. Wins over every other rule, including allow_list.
+      block_list:
+        - carol@acme.io      # bucket 17: inside the rollout, still off
+        - mallory@acme.io    # also on the allow list below
+
+      # Always true, unless the key is also blocked.
+      allow_list:
+        - alice@acme.io      # bucket 76: outside the rollout, still on
+        - mallory@acme.io    # the deliberate collision block_list exists to settle
+
+      # Sticky: `fnv1a64(name | key) % 100 < 25`. The same key lands in
+      # the same bucket on every replica and across restarts, so a user
+      # inside the rollout stays inside it.
+      rollout_percent: 25
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "flags.local":
+    # The flagged route. In a real deployment this is the new code path
+    # and the unflagged origin next to it is the old one; here it is a
+    # static body so the flag decision is the only moving part.
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        checkout: new
+        note: "flag_enabled(\"new-checkout\", X-User) evaluated true for this caller"
+
+    policies:
+      # `flag_enabled(name, key)` reads the process-wide store the
+      # `flags:` block above seeded at boot. A reload replaces the whole
+      # store at once, so a reader never sees half of an old rule set.
+      - type: expression
+        expression: 'flag_enabled("new-checkout", request.headers["x-user"])'
+        deny_status: 403
+        deny_message: "new-checkout is off for this bucketing key"
+# sbproxy-docs:end

@@ -1,0 +1,89 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Cache Reserve: the cold tier under the response cache.
+#
+# The hot tier here holds exactly one entry. That is not a tuning
+# recommendation, it is what makes the reserve observable in four curl
+# commands: fetch /a, fetch it again from the hot tier, fetch /b to push
+# /a out of the hot tier, then fetch /a again and watch it come back from
+# the reserve instead of the upstream.
+#
+# The `x-sbproxy-cache` response header names the tier that answered:
+# absent on a miss, `HIT` from the hot tier, `HIT-RESERVE` from the cold
+# tier. The `upstream_hits` counter in the body is the second witness:
+# the demo upstream counts the requests that actually reached it, so a
+# number that does not move is proof the tier answered.
+#
+# Run:
+#   # The example ships its own upstream. Start it first, then the proxy.
+#   rm -rf /tmp/sbproxy-cache-reserve
+#   python3 examples/cache-reserve/fixture.py &
+#   make run CONFIG=examples/cache-reserve/sb.yml
+#
+# Test:
+#   # 1. Miss. No cache header, upstream_hits 1.
+#   curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a
+#
+#   # 2. Hot hit. x-sbproxy-cache: HIT, upstream_hits still 1.
+#   curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a
+#
+#   # 3. A second path fills the one-entry hot tier and evicts /a from it.
+#   curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/b
+#
+#   # 4. Reserve hit. x-sbproxy-cache: HIT-RESERVE, upstream_hits still 1,
+#   #    and the entry is promoted back into the hot tier on the way out.
+#   curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a
+
+# sbproxy-docs:begin
+proxy:
+  http_bind_port: 8080
+
+  # Only because the demo upstream runs on this machine: the SSRF guard
+  # refuses private upstream addresses unless allowlisted. A production
+  # config pointing at a real origin does not need this block.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '127.0.0.1/32'
+
+  cache_reserve:
+    enabled: true
+
+    # One body file plus a metadata JSON beside it per key, fanned out
+    # by SHA-256 hash, so the reserve survives a restart. The other two
+    # backends are `memory`, which survives nothing, and a networked one
+    # whose entries expire server-side. See docs/cache-reserve.md.
+    backend:
+      type: filesystem
+      path: /tmp/sbproxy-cache-reserve
+
+    # Mirror every hot-cache write. Production reserves on a paid object
+    # store want a low rate; a filesystem reserve can afford 1.0 because
+    # the writes are local.
+    sample_rate: 1.0
+
+    # Skip entries whose TTL is under this. The default of 3600 exists so
+    # short-lived entries are not carried into a cold tier they will
+    # outlive by seconds; this demo's entries are long-lived anyway.
+    min_ttl: 1
+
+    # Skip bodies over 1 MiB. `0` disables the cap.
+    max_size_bytes: 1048576
+
+origins:
+  "cache.local":
+    action:
+      type: proxy
+      # The example ships its own upstream: python3 fixture.py
+      url: http://127.0.0.1:18090
+
+    response_cache:
+      enabled: true
+      ttl_secs: 3600
+      cacheable_status: [200]
+
+      # Entries, not bytes, and deliberately absurd. One entry means the
+      # next distinct path evicts the previous one, which is what turns
+      # the reserve from a thing you have to wait out into a thing you
+      # can see in the next curl. Real deployments leave this at 10000.
+      max_size: 1
+# sbproxy-docs:end

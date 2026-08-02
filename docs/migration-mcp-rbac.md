@@ -1,6 +1,15 @@
 # Migrating MCP tool access policies
 
-*Last modified: 2026-06-02*
+*Last modified: 2026-08-02*
+
+This is a migration record for one breaking change, kept so an operator upgrading from a config
+written before it can find the shape their file needs to become. It is reference material: the
+before-and-after pairs below are configuration, not a walkthrough, and there is no outcome to run
+because the outcome is that your existing config keeps working.
+
+For the current policy surface as a thing you configure rather than a thing you migrate to, read
+[mcp.md](mcp.md); [`examples/mcp-rbac-quotas/`](../examples/mcp-rbac-quotas/) is the same policy
+as a runnable config.
 
 ## BREAKING CHANGE: MCP default-deny
 

@@ -27,6 +27,41 @@ What happens when each dependency that SBproxy talks to is unavailable, and how 
    config-compile time with a message naming the key, rather than accepting
    it and picking something else for you.
 
+## Watch one degrade
+
+A posture is a claim about a dependency you do not have when you need it, which makes it easy to write down and hard to check. [`examples/failure-posture/`](../examples/failure-posture/) makes the dependency genuinely unavailable, by the cheapest honest method: it points the virtual key store at a Redis that is not running, and does not run one.
+
+```bash
+cd examples/failure-posture
+docker compose up -d --wait
+```
+
+The config sets `failure_posture: degraded`. The first request presents a token the origin's own `authentication:` block knows:
+
+```bash
+curl -i -H 'Host: keys.local' \
+     -H 'Authorization: Bearer sbp_a1b2c3d4e5f60718_9f3c1d2e4b5a6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d' \
+     http://127.0.0.1:8080/
+```
+
+<!-- CAPTURE: curl -i -H 'Host: keys.local' -H 'Authorization: Bearer sbp_a1b2c3d4e5f60718_9f3c1d2e4b5a6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d' http://127.0.0.1:8080/ -->
+
+The second presents a token of the same shape that the origin does not know. Same dead store, same posture, different answer, because `degraded` fell through to the origin's auth rather than admitting anything:
+
+```bash
+curl -i -H 'Host: keys.local' \
+     -H 'Authorization: Bearer sbp_0f1e2d3c4b5a6978_1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809' \
+     http://127.0.0.1:8080/
+```
+
+<!-- CAPTURE: curl -i -H 'Host: keys.local' -H 'Authorization: Bearer sbp_0f1e2d3c4b5a6978_1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809' http://127.0.0.1:8080/ -->
+
+The admitted request is the one that leaves a record. This is the whole difference between `degraded` and `open`:
+
+<!-- CAPTURE: cd examples/failure-posture && docker compose logs sbproxy 2>&1 | grep -m 2 'failure_posture' -->
+
+Change the one line to `failure_posture: closed`, the default, and both requests become `503 key store unavailable` without reaching the origin's auth at all.
+
 ## Matrix
 
 | Dependency | When down | Fallback | Recovery | Metrics |
@@ -38,7 +73,7 @@ What happens when each dependency that SBproxy talks to is unavailable, and how 
 | Token-pruning classifier sidecar | Connection failure, timeout, unknown model, or invalid extractive output | `token_prune` fails open at its lever boundary. The primary request keeps the last committed messages, and later entries such as `window_fit` still run. | The route connects lazily again on the next eligible request | `sbproxy_ai_compression_lever_total{lever="token_prune"}`, `sbproxy_ai_compression_requests_total`, `sbproxy_ai_compression_duration_seconds` |
 | Virtual key store (`key_management.store`) | Connection / read failure | `key_management.failure_posture` decides it, and all four inbound-key paths (header sweep, playground ticket, bearer token, OIDC claim map) read the same value. The default `closed` denies with `503`. `degraded` and `open` both fall through to the origin's own configured auth, which is not a blanket admit; they differ in whether the lost per-key policy, budget, and attribution are recorded as lost. | Auto on the next successful store read; the cache never caches an error | None dedicated; logged at WARN with `failure_posture` and `guarantee_waived` fields |
 | Governed-key budget backend (`key_management.governance.backend`, strict tier only) | Connection / command failure | Only affects keys governed under `consistency: strict`. The default `approximate` tier does not depend on this backend at all; its per-node counters keep disseminating over the cluster mesh. For a strict key, a reserve call that cannot reach the backend denies the request (`503`) by default (`failure_posture: closed`); `degraded` admits it without a reservation and audits the fact; `open` admits it and records nothing. A settle call on an already-admitted request is unaffected by the posture and stays best-effort. | Auto-reconnect; enforcement resumes on the next successful call | `sbproxy_governance_fail_open_total{key_id}` on `degraded`; also logged at WARN (admit/deny) or DEBUG (other reserve/settle errors) |
-| Fair-share quota accounting backend (`quota_pools[].consistency: approximate \| strong`) | Connection / command failure | `quota_pools[].failure_posture` decides it, on the AI dispatch path and the realtime WebSocket path alike. The default `closed` rejects with `503`. `degraded` admits the attempt with no reservation held and counts it; `open` admits and counts nothing. A real quota denial (`429`) and inconsistent pool state (`503`) never consult the posture. | Auto-reconnect; accounting resumes on the next successful call | `sbproxy_ai_quota_pool_fail_open_total{pool}` on `degraded` |
+| Fair-share quota accounting backend (`quota_pool.consistency: approximate \| strong`) | Connection / command failure | `quota_pool.failure_posture` decides it, on the AI dispatch path and the realtime WebSocket path alike. The default `closed` rejects with `503`. `degraded` admits the attempt with no reservation held and counts it; `open` admits and counts nothing. A real quota denial (`429`) and inconsistent pool state (`503`) never consult the posture. | Auto-reconnect; accounting resumes on the next successful call | `sbproxy_ai_quota_pool_fail_open_total{pool}` on `degraded` |
 | ACME CA (Let's Encrypt) | Renewal request fails | Existing cert keeps serving until expiry. With no usable cert, an HTTP-01 self-signed bootstrap is served and an `ERROR` is logged loudly. | Retry with exponential backoff (1m to 24h) | `sbproxy_acme_renewals_total{result}` |
 | Upstream DNS (`service_discovery`) | Resolver timeout / NXDOMAIN | The cached A/AAAA set keeps serving past TTL until the next refresh succeeds. New unseen hostnames fall back to Pingora's connect-time resolver. | Auto on next refresh | None dedicated; resolver failures are logged at WARN |
 | Vault / secrets backend (`proxy.secrets.backends`) | Fetch fails | Unresolved provider URI references fail startup; backend-local caches retain already resolved values where supported. | Backend reconnect/re-fetch behavior | `sbproxy_vault_resolution_total{backend,result}` |
@@ -329,9 +364,9 @@ The older `failure_mode_allow: bool` still parses and is used only when `failure
 
 ### Fair-share quota accounting backend
 
-**When down:** a quota pool running `consistency: approximate` or `strong` cannot reach its shared accounting backend, so a reserve or settle call fails with a backend-unavailable error.
+**When down:** a quota pool running `consistency: approximate` or `strong` cannot reach its shared accounting backend, so a reserve or settle call fails with a backend-unavailable error. The pool is declared on the AI action, not at proxy scope, so a deployment with several AI origins can run a different posture per origin.
 
-**Fallback:** `quota_pools[].failure_posture` decides it, on the AI dispatch path and the realtime WebSocket path alike (both call one mapping, so they cannot drift apart). The default `closed` rejects with `503`. `degraded` admits the attempt with no reservation held and counts it on `sbproxy_ai_quota_pool_fail_open_total{pool}`; `open` admits and counts nothing. The posture applies only to backend unavailability: a real quota denial still returns `429`, and inconsistent reservation state still returns `503`, because a pool whose accounting is contradictory cannot be said to have admitted anything.
+**Fallback:** `quota_pool.failure_posture` decides it, on the AI dispatch path and the realtime WebSocket path alike (both call one mapping, so they cannot drift apart). The default `closed` rejects with `503`. `degraded` admits the attempt with no reservation held and counts it on `sbproxy_ai_quota_pool_fail_open_total{pool}`; `open` admits and counts nothing. The posture applies only to backend unavailability: a real quota denial still returns `429`, and inconsistent reservation state still returns `503`, because a pool whose accounting is contradictory cannot be said to have admitted anything.
 
 **Log level:** none dedicated; the fail-open counter is the signal.
 
@@ -339,10 +374,12 @@ The older `failure_mode_allow: bool` still parses and is used only when `failure
 
 **Config:**
 ```yaml
-proxy:
-  ai:
-    quota_pools:
-      - name: shared-upstream
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      quota_pool:
+        name: shared-upstream
         total_limit: 1000
         weights: {team-a: 3, team-b: 1}
         policy: burst

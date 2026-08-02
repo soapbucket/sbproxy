@@ -1,5 +1,5 @@
 # Cache Reserve
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-02*
 
 Cache Reserve is a long-tail cold tier sitting under the per-origin response cache. Items evicted from the hot cache are admitted into the reserve subject to a sample rate and size threshold; on a hot miss the proxy consults the reserve before falling through to origin and promotes the entry back into the hot tier on hit.
 
@@ -58,6 +58,50 @@ The filter runs before any reserve I/O happens so a misconfigured admission wind
 4. On the response path, every cacheable upstream reply lands in the hot tier; the reserve admits a sampled subset that passes the TTL and size filters.
 5. When a hot entry's TTL is exhausted (and it's outside any SWR window), the entry is mirrored to the reserve before being deleted from the hot tier so the long-tail content gets a second life.
 6. `POST` / `PUT` / `PATCH` / `DELETE` invalidations evict the no-Vary canonical reserve key alongside the hot-tier prefix sweep. Vary-based variants in the reserve must wait for natural expiry; the trait surface is intentionally narrow so backends like S3 don't need to scan keys.
+
+## Seeing the tiers
+
+The reserve only shows itself once an entry has left the hot tier, which normally means waiting out an eviction window. [`examples/cache-reserve/`](../examples/cache-reserve/) shortens that to one request by setting `response_cache.max_size: 1`, so the next distinct path pushes the previous one out. The example's upstream counts the requests that actually reach it, so the cache header and the body agree or the demo is lying.
+
+```bash
+cd examples/cache-reserve
+docker compose up -d --wait
+```
+
+First fetch of `/a`: both tiers empty, the request reaches the upstream, and `upstream_hits` reads 1.
+
+```bash
+curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a
+```
+
+<!-- CAPTURE: curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a -->
+
+Second fetch: the hot tier answers, and the counter has not moved.
+
+```bash
+curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a
+```
+
+<!-- CAPTURE: curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a -->
+
+Now fetch `/b`, which fills the one-entry hot tier and pushes `/a` out of it, then fetch `/a` again. It comes back from the reserve, and the upstream still has not been asked twice:
+
+```bash
+curl -s -o /dev/null -H 'Host: cache.local' http://127.0.0.1:8080/b
+curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a
+```
+
+<!-- CAPTURE: curl -s -o /dev/null -H 'Host: cache.local' http://127.0.0.1:8080/b; curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a -->
+
+The reserve hit promotes the entry back into the hot tier on the way out, so the read after it is a plain `HIT` rather than another reserve round trip:
+
+```bash
+curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a
+```
+
+<!-- CAPTURE: curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a -->
+
+`docker compose down -v` tears it down. `max_size: 1` is a demo device, not a recommendation; leave it at the default of 10000 and let the reserve catch what falls out on its own.
 
 ## Backend trait
 
@@ -150,5 +194,6 @@ The `crates/sbproxy-cache/src/reserve/composer.rs` module also exposes a synchro
 
 ## See also
 
+- [`examples/cache-reserve/`](../examples/cache-reserve/) - the runnable three-state walkthrough above.
 - [configuration.md](configuration.md#response-cache) - response cache schema.
 - `crates/sbproxy-cache/src/reserve/mod.rs` - backend trait + OSS implementations.
