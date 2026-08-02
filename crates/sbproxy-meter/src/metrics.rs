@@ -49,6 +49,20 @@
 //! meter genuinely could not write what it owed, which
 //! [`MeterObserver::chain_gap`] reports and which is the marker that says
 //! revenue went unbilled.
+//!
+//! # A receipt that contradicts itself is refused, not tolerated
+//!
+//! [`MeterObserver::incoherent_receipt`] is the third failure this module
+//! reports, and it is the only one that is about a record that *was*
+//! written. Signing and chaining establish that a receipt is authentic and
+//! unmodified; neither establishes that it is coherent. A unit declaring
+//! `measured` while carrying an origin header is a number the upstream
+//! supplied wearing the provenance of a number the proxy counted itself,
+//! and it survives every signature check there is.
+//!
+//! So the decode paths refuse one, and the refusal is counted here with the
+//! tenant it was charged to. See [`observe_incoherent_receipt`] for why the
+//! posture on that refusal is fixed rather than configurable.
 
 use std::sync::OnceLock;
 
@@ -107,9 +121,36 @@ pub struct ChainContribution<'a> {
     pub units: u64,
 }
 
+/// One receipt line that cannot be true, and who it was charged to.
+///
+/// Returned by [`crate::ledger::LedgerPayload::provenance_conflict`] and
+/// carried into the log line and the counter, so a refusal names the tenant
+/// whose invoice the contradictory line would have reached rather than
+/// landing in an unattributed global total.
+///
+/// Every field is borrowed. This is built on a path that has already
+/// decided to refuse, but it is built while walking a chain file that may
+/// have millions of entries, and a diagnostic that allocated per entry
+/// would be paid for by every healthy chain as well as by the broken one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProvenanceConflict<'a> {
+    /// The billing account the contradictory line was charged to.
+    pub tenant_id: &'a str,
+    /// Operator-chosen unit name on the contradictory line.
+    pub unit: &'a str,
+    /// The provenance the line declared, exactly as it appears on the wire.
+    ///
+    /// A `&str` rather than a [`UnitSource`], because the wire field is a
+    /// string and the interesting case includes a value that is not one of
+    /// the three this vocabulary defines.
+    pub declared_source: &'a str,
+    /// The provenance the line's evidence actually supports.
+    pub evidence_source: &'static str,
+}
+
 /// Where the meter's self-observation goes.
 ///
-/// Six methods, five of which map one-to-one onto a metric family. The
+/// Seven methods, six of which map one-to-one onto a metric family. The
 /// exception is [`MeterObserver::chained`], which has no family of its own
 /// and exists to feed the counter-versus-chain comparison; publishing it
 /// would put a second authoritative-looking unit total on a dashboard next
@@ -138,6 +179,15 @@ pub trait MeterObserver: Send + Sync {
     /// The meter owed a record and could not write it. Nonzero means
     /// revenue went unbilled, which is the thing worth alerting on.
     fn chain_gap(&self, tenant_id: &str, failure_mode: FailurePosture);
+
+    /// A decoded receipt was refused because it contradicted itself.
+    ///
+    /// Distinct from [`MeterObserver::chain_gap`], which says a record was
+    /// owed and never written. This one says a record was written, is
+    /// authentically signed, and cannot be believed. Folding the two into
+    /// one family would leave an operator unable to tell "my disk filled
+    /// up" from "something is laundering provenance onto my chain".
+    fn incoherent_receipt(&self, tenant_id: &str, failure_mode: FailurePosture);
 
     /// The chain head after a successful append. Flat under traffic means a
     /// stalled meter, which no counter can show on its own.
@@ -200,6 +250,42 @@ pub fn observe_chain_gap(tenant_id: &str, failure_mode: FailurePosture) {
     }
 }
 
+/// Report that a decoded receipt was refused for contradicting itself.
+///
+/// # Why the posture is fixed at `closed`
+///
+/// Every other failure in this crate hands the decision to the operator's
+/// `failure_posture`, and this one deliberately does not. That key answers
+/// "what happens to traffic when the meter cannot write what it owes", and
+/// a reader has no traffic in front of it to admit or refuse: by the time
+/// anything decodes a receipt the request it describes is long over. The
+/// only decision left is whether to believe the document, and a document
+/// that contradicts itself is closer to a corrupt record than to a policy
+/// denial. `degraded` would mean "count it anyway and mark the guarantee
+/// waived", which on this failure means folding a laundered number into a
+/// tenant's total; `open` would mean counting it silently. Neither is a
+/// position an operator should be able to take by accident, so the record
+/// is always refused and the label says so.
+///
+/// The operator's configured posture still governs the consequence, one
+/// layer out. An incoherent entry makes
+/// [`crate::ledger::UsageLedger::open`] refuse the whole chain, and
+/// `proxy.attestation.failure_mode` then decides what that does to traffic
+/// through the machinery that already exists for an unopenable chain.
+///
+/// # This counts refusals, not distinct receipts
+///
+/// One bad entry sitting in a chain file is refused again on every read
+/// that reaches it, so a polled dashboard moves this counter on every poll.
+/// That is deliberate. The condition is permanent until somebody edits the
+/// chain, and an alert that goes quiet while the bad entry is still there
+/// would be worse than one that keeps firing.
+pub fn observe_incoherent_receipt(tenant_id: &str) {
+    if let Some(observer) = observer() {
+        observer.incoherent_receipt(tenant_id, FailurePosture::Closed);
+    }
+}
+
 /// Report a successful append: the new chain head, how long it took, and
 /// what the entry contributes to the divergence comparison.
 pub fn observe_chain_append(seq: u64, seconds: f64, contribution: Option<ChainContribution<'_>>) {
@@ -252,6 +338,9 @@ mod tests {
         }
         fn chain_gap(&self, tenant_id: &str, failure_mode: FailurePosture) {
             self.push(format!("gap {tenant_id} {}", failure_mode.as_str()));
+        }
+        fn incoherent_receipt(&self, tenant_id: &str, failure_mode: FailurePosture) {
+            self.push(format!("incoherent {tenant_id} {}", failure_mode.as_str()));
         }
         fn chain_head(&self, seq: u64) {
             self.push(format!("head {seq}"));
@@ -353,6 +442,16 @@ mod tests {
                 "append".to_string(),
                 "chained acme 1".to_string(),
             ]
+        );
+
+        // A refused receipt is attributed to the tenant it would have been
+        // charged to, and always under `closed`; see
+        // `observe_incoherent_receipt` for why that posture is not the
+        // operator's to relax.
+        observe_incoherent_receipt("acme");
+        assert_eq!(
+            recorder().drain(),
+            vec!["incoherent acme closed".to_string()]
         );
     }
 

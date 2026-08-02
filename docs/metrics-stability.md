@@ -203,6 +203,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_meter_chain_gap_total` | Counter | `stable` | `beta` | `tenant_id`, `failure_mode` | Records the meter owed and could not write, by tenant and the posture in force. |
 | `sbproxy_meter_chain_seq` | Gauge | `stable` | `beta` | none | Head sequence number of the meter's signed chain. |
 | `sbproxy_meter_divergence_total` | Counter | `stable` | `beta` | `tenant_id` | Windows in which counted units and chained units disagreed, by tenant. |
+| `sbproxy_meter_incoherent_receipts_total` | Counter | `stable` | `beta` | `tenant_id`, `failure_mode` | Receipts refused on decode because a unit's declared provenance contradicts its evidence, by tenant and the posture in force. |
 | `sbproxy_meter_receipts_total` | Counter | `stable` | `beta` | `tenant_id`, `outcome`, `billable` | Metered attempts, by tenant, outcome, and the operator's billing answer for it. |
 | `sbproxy_meter_units_total` | Counter | `stable` | `beta` | `tenant_id`, `unit`, `source` | Units the meter counted, by tenant, operator-chosen unit name, and provenance. |
 | `sbproxy_metrics_render_failures_total` | Counter | `stable` | `beta` | `reason` | Failures to encode the Prometheus scrape body. |

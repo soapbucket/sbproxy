@@ -2020,7 +2020,8 @@ pub const METRICS: &[MetricCapability] = &[
         description: "MCP upstream IO failures absorbed by deadlines and byte caps, by kind.",
         dead_reason: None,
     },
-    // Attested metering (WOR-2129). Six families under one fresh
+    // Attested metering (WOR-2129, extended by WOR-2211). Seven families
+    // under one fresh
     // `sbproxy_meter_` namespace, chosen rather than extending an existing
     // prefix so that none of them can collide with a name an earlier
     // observability wave left behind.
@@ -2080,6 +2081,25 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Proxy,
         labels: &["tenant_id"],
         description: "Windows in which counted units and chained units disagreed, by tenant.",
+        dead_reason: None,
+    },
+    // The odd one out in this block, and the reason it is its own family
+    // rather than another `failure_mode` value on the chain gap: every
+    // other meter failure is about a record that could not be written, and
+    // this one is about a record that was written, is authentically signed,
+    // and still cannot be believed. A unit declaring `measured` while
+    // carrying an origin header survives the hash chain and the Ed25519
+    // signature, because neither of those asks whether a document agrees
+    // with itself. The decode paths refuse one; this counts the refusal.
+    MetricCapability {
+        name: "sbproxy_meter_incoherent_receipts_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_meter_incoherent_receipt"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["tenant_id", "failure_mode"],
+        description: "Receipts refused on decode because a unit's declared provenance contradicts its evidence, by tenant and the posture in force.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3214,6 +3234,7 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     // neither carries a tenant label to check.
     "sbproxy_meter_chain_gap_total",
     "sbproxy_meter_divergence_total",
+    "sbproxy_meter_incoherent_receipts_total",
     "sbproxy_meter_receipts_total",
     "sbproxy_meter_units_total",
     "sbproxy_policy_audit_events_dropped_total",

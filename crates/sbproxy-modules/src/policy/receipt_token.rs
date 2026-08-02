@@ -412,6 +412,150 @@ fn unit_source_wire_name(source: UnitSource) -> String {
     .to_string()
 }
 
+/// Read a wire source name back into the metering vocabulary.
+///
+/// The inverse of [`unit_source_wire_name`], and pinned to it by
+/// `wire_source_names_round_trip_through_the_metering_vocabulary`, because
+/// two functions that must agree and are written out separately are two
+/// functions that will eventually disagree.
+///
+/// `None` for anything outside the three. That is not a parse failure to be
+/// tolerated: the receipt's `source` is a `String` so that a verifier
+/// compiled today can still *read* a receipt written after the vocabulary
+/// grows, and a reader that cannot name the source also cannot check the
+/// evidence against it. See [`ReceiptUnit::provenance_is_consistent`].
+fn unit_source_from_wire_name(name: &str) -> Option<UnitSource> {
+    match name {
+        "measured" => Some(UnitSource::Measured),
+        "route_weight" => Some(UnitSource::RouteWeight),
+        "origin_header" => Some(UnitSource::OriginHeader),
+        _ => None,
+    }
+}
+
+/// Lift wire evidence back into the metering vocabulary.
+///
+/// The inverse of the `From<&Evidence> for ReceiptEvidence` impl above, and
+/// exhaustive with no wildcard arm and no `..` for the same reason it is: a
+/// variant added on either side has to stop this build until somebody
+/// decides what it means, rather than being quietly dropped on the way in.
+///
+/// A free function rather than a `From` impl. Both directions of this
+/// conversion exist now, and writing one as an impl and the other as a
+/// function keeps the outbound direction (which decides what a stranger
+/// parses) visibly separate from the inbound one (which only ever feeds a
+/// local check).
+fn metered_evidence(evidence: &ReceiptEvidence) -> Evidence {
+    match evidence {
+        ReceiptEvidence::Measured {
+            bytes_in,
+            bytes_out,
+            duration_ms,
+        } => Evidence::Measured {
+            bytes_in: *bytes_in,
+            bytes_out: *bytes_out,
+            duration_ms: *duration_ms,
+        },
+        ReceiptEvidence::RouteWeight { config_revision } => Evidence::RouteWeight {
+            config_revision: config_revision.clone(),
+        },
+        ReceiptEvidence::OriginHeader { header, raw } => Evidence::OriginHeader {
+            header: header.clone(),
+            raw: raw.clone(),
+        },
+    }
+}
+
+impl ReceiptUnit {
+    /// Whether this unit's declared source agrees with the evidence it
+    /// carries.
+    ///
+    /// # Why this exists at all
+    ///
+    /// A signature says a receipt is authentic. A hash chain says it was
+    /// not edited afterwards. Neither says it is coherent, and the two
+    /// fields this method compares travel separately on the wire precisely
+    /// so that a buyer can see both. A unit reading `source: "measured"`
+    /// while carrying an origin header is a number the upstream supplied
+    /// wearing the provenance of a number the proxy counted itself, and it
+    /// survives every integrity check there is. `measured` is the top of
+    /// the trust order, so that is the direction laundering would go.
+    ///
+    /// # The decision is the meter's, not this module's
+    ///
+    /// The unit is lifted back into [`sbproxy_meter`]'s own vocabulary and
+    /// [`Unit::provenance_is_consistent`] answers. Re-deriving the rule
+    /// here would give one property two implementations, and the entire
+    /// reason the wire types are separate types is that they must never
+    /// disagree with the internal ones about the same receipt. The lift
+    /// clones the evidence, which is paid once per unit on a decode path
+    /// that has already parsed a whole JSON document.
+    ///
+    /// Note the struct literal below, where the rest of this codebase uses
+    /// [`Unit::new`]. That is the point: `Unit::new` derives the source
+    /// from the evidence and so can never build an inconsistent unit, which
+    /// would make this check unable to fail. The declared source has to be
+    /// carried across verbatim for there to be anything to compare.
+    ///
+    /// # A source outside the vocabulary is inconsistent
+    ///
+    /// [`ReceiptUnit::source`] is a `String` so a verifier compiled today
+    /// can still read a receipt written after a fourth source ships. That
+    /// forward compatibility is about parsing, not about believing: a
+    /// reader that cannot name the source cannot check the evidence against
+    /// it either, and `source: "expression"` beside route-weight evidence
+    /// is a contradiction whichever way it arose. Such a unit is refused,
+    /// and the day a fourth source lands both this module and the meter
+    /// learn about it together, because the conversions between them match
+    /// exhaustively.
+    pub fn provenance_is_consistent(&self) -> bool {
+        let Some(declared) = unit_source_from_wire_name(&self.source) else {
+            return false;
+        };
+        Unit {
+            name: self.name.clone(),
+            count: self.count,
+            source: declared,
+            evidence: metered_evidence(&self.evidence),
+        }
+        .provenance_is_consistent()
+    }
+
+    /// The wire spelling of the source this unit's evidence actually
+    /// supports.
+    ///
+    /// The other half of a refusal message: [`ReceiptUnit::source`] says
+    /// what was claimed and this says what was proved, so an operator reads
+    /// the contradiction rather than the word "invalid".
+    ///
+    /// Exhaustive with no wildcard arm, and it borrows the meter's own
+    /// spellings rather than repeating this module's, because nothing this
+    /// returns is ever written to a receipt. It is a diagnostic.
+    pub fn evidence_source(&self) -> &'static str {
+        match self.evidence {
+            ReceiptEvidence::Measured { .. } => UnitSource::Measured,
+            ReceiptEvidence::RouteWeight { .. } => UnitSource::RouteWeight,
+            ReceiptEvidence::OriginHeader { .. } => UnitSource::OriginHeader,
+        }
+        .as_str()
+    }
+}
+
+impl ReceiptClaims {
+    /// The first unit on this receipt whose declared provenance disagrees
+    /// with its evidence, or `None` when the receipt is coherent.
+    ///
+    /// First rather than all of them. This is asked on decode paths that
+    /// refuse the whole receipt on the first answer, so collecting the rest
+    /// would allocate a list nobody reads. An operator who fixes the first
+    /// contradiction and reads again is told about the second.
+    pub fn provenance_conflict(&self) -> Option<&ReceiptUnit> {
+        self.units
+            .iter()
+            .find(|unit| !unit.provenance_is_consistent())
+    }
+}
+
 /// JWS protected header for a receipt token.
 ///
 /// A sibling of the quote token's private header struct rather than a shared
@@ -462,6 +606,28 @@ pub enum ReceiptVerifyError {
     /// Signature did not validate against the resolved public key.
     #[error("signature invalid")]
     SignatureInvalid,
+    /// The signature checked out and the receipt still contradicts itself:
+    /// a unit declares one provenance while carrying the evidence of
+    /// another.
+    ///
+    /// Deliberately not folded into [`ReceiptVerifyError::Malformed`]. A
+    /// malformed token is one this verifier could not read; this one it
+    /// read perfectly, and every integrity check passed. The two send a
+    /// holder to different people: malformed is "your copy is damaged",
+    /// this is "the party that signed this produced a claim that cannot be
+    /// true".
+    #[error(
+        "incoherent provenance: unit `{unit}` declares `{declared_source}` while carrying \
+         evidence for `{evidence_source}`"
+    )]
+    IncoherentProvenance {
+        /// Operator-chosen unit name on the contradictory line.
+        unit: String,
+        /// The provenance the line declared.
+        declared_source: String,
+        /// The provenance the line's evidence actually supports.
+        evidence_source: &'static str,
+    },
 }
 
 // --- Signer ---
@@ -637,10 +803,19 @@ impl ReceiptTokenVerifier {
     /// 3. Resolve `kid` against the JWKS.
     /// 4. Verify the Ed25519 signature over the original textual segments.
     /// 5. Decode the claims.
+    /// 6. Refuse a receipt that contradicts itself.
     ///
-    /// There is no step 6. No expiry check, no skew check, and nothing
-    /// consumed: this method is a pure function of the token and the key
-    /// set, and calling it twice returns the same answer twice.
+    /// Step 6 is the one that is not about the token. Steps 1 to 5 answer
+    /// "did the party holding this key produce these exact bytes", and a
+    /// signed receipt can answer yes while claiming a unit was `measured`
+    /// and attaching the origin's own header as proof. That claim is not
+    /// checkable, which is the one thing the evidence was put on the
+    /// receipt to make it. See
+    /// [`ReceiptUnit::provenance_is_consistent`].
+    ///
+    /// There is still no expiry check, no skew check, and nothing consumed:
+    /// this method is a pure function of the token and the key set, and
+    /// calling it twice returns the same answer twice.
     pub fn verify(&self, token: &str) -> Result<ReceiptClaims, ReceiptVerifyError> {
         // --- Parse JWS ---
         let mut parts = token.split('.');
@@ -702,6 +877,30 @@ impl ReceiptTokenVerifier {
         // --- Decode claims ---
         let claims: ReceiptClaims = serde_json::from_slice(&payload_bytes)
             .map_err(|e| ReceiptVerifyError::Malformed(format!("claims decode: {e}")))?;
+
+        // --- Refuse a receipt that disagrees with itself ---
+        //
+        // After the signature on purpose. Reaching here means the document
+        // is exactly what its signer produced, so a contradiction found now
+        // is the signer's, not a transmission fault, and that is what makes
+        // it worth counting rather than retrying.
+        if let Some(unit) = claims.provenance_conflict() {
+            let evidence_source = unit.evidence_source();
+            sbproxy_meter::metrics::observe_incoherent_receipt(&claims.subject.tenant);
+            tracing::warn!(
+                tenant_id = %claims.subject.tenant,
+                claim_id = %claims.claim_id,
+                unit = %unit.name,
+                declared_source = %unit.source,
+                %evidence_source,
+                "receipt-token: a correctly signed receipt contradicts its own provenance"
+            );
+            return Err(ReceiptVerifyError::IncoherentProvenance {
+                unit: unit.name.clone(),
+                declared_source: unit.source.clone(),
+                evidence_source,
+            });
+        }
 
         Ok(claims)
     }
@@ -1294,6 +1493,144 @@ mod tests {
                 .expect("str")
                 .starts_with("sha-256=:"),
             "padded standard base64 inside the structured-fields wrapper"
+        );
+    }
+
+    // --- Provenance coherence (WOR-2211) ---
+
+    #[test]
+    fn wire_source_names_round_trip_through_the_metering_vocabulary() {
+        // Covers the case neither exhaustive match can see: an existing
+        // spelling changed on one side and not the other. The two functions
+        // are written out separately so this module owns what a stranger
+        // parses, and two hand-written tables that must agree are two
+        // tables that will eventually not.
+        for source in [
+            UnitSource::Measured,
+            UnitSource::RouteWeight,
+            UnitSource::OriginHeader,
+        ] {
+            let wire = unit_source_wire_name(source);
+            assert_eq!(
+                unit_source_from_wire_name(&wire),
+                Some(source),
+                "`{wire}` must read back as the source it was written from"
+            );
+            assert_eq!(
+                wire,
+                source.as_str(),
+                "receipt and meter must spell a unit source the same way"
+            );
+        }
+
+        assert_eq!(
+            unit_source_from_wire_name("expression"),
+            None,
+            "a source outside the vocabulary has no reading, which is why it is refused"
+        );
+    }
+
+    #[test]
+    fn a_unit_whose_source_disagrees_with_its_evidence_is_not_consistent() {
+        // The laundering shape: the origin's own number wearing the
+        // provenance of one the proxy counted itself.
+        let laundered = ReceiptUnit {
+            name: "result_row".to_string(),
+            count: 40_000,
+            source: "measured".to_string(),
+            evidence: ReceiptEvidence::OriginHeader {
+                header: "X-Rows-Returned".to_string(),
+                raw: Some("40000".to_string()),
+            },
+        };
+
+        assert!(!laundered.provenance_is_consistent());
+        assert_eq!(laundered.evidence_source(), "origin_header");
+
+        // And a source nobody in this vocabulary can name. Forward
+        // compatibility is about parsing a receipt, not about believing
+        // one: a reader that cannot name the source cannot check the
+        // evidence against it either.
+        let unknown = ReceiptUnit {
+            source: "expression".to_string(),
+            ..laundered.clone()
+        };
+        assert!(!unknown.provenance_is_consistent());
+    }
+
+    #[test]
+    fn every_unit_a_signed_receipt_normally_carries_is_consistent() {
+        // The other half. `sample_claims` is the shape the proxy actually
+        // writes, so a check that refused it would be a check that refused
+        // everything.
+        let claims = sample_claims();
+        assert!(claims
+            .units
+            .iter()
+            .all(ReceiptUnit::provenance_is_consistent));
+        assert!(claims.provenance_conflict().is_none());
+    }
+
+    #[test]
+    fn a_correctly_signed_receipt_that_contradicts_itself_is_refused_on_verify() {
+        // Signed with the real key and verified through the real verifier,
+        // so every integrity check passes on the way to the refusal. That
+        // is the point: a signature says who wrote the document, not that
+        // the document can be true.
+        let signer = receipt_signer();
+        let mut claims = sample_claims();
+        claims.units = vec![ReceiptUnit {
+            name: "result_row".to_string(),
+            count: 40_000,
+            source: "measured".to_string(),
+            evidence: ReceiptEvidence::OriginHeader {
+                header: "X-Rows-Returned".to_string(),
+                raw: Some("40000".to_string()),
+            },
+        }];
+        let token = signer.sign(&claims).expect("sign");
+
+        let verifier = ReceiptTokenVerifier::single_key(KID, signer.verifying_key());
+        let outcome = verifier.verify(&token);
+
+        // Matched on a reference and by variant rather than compared with
+        // `assert_eq!`, so the assertion says "refused for this reason" and
+        // not "refused". `Malformed` would be the wrong reason and would
+        // send a holder to check their copy of a document that arrived
+        // perfectly.
+        assert!(
+            matches!(
+                &outcome,
+                Err(ReceiptVerifyError::IncoherentProvenance { .. })
+            ),
+            "a receipt that contradicts itself must be refused for that reason: {outcome:?}"
+        );
+        let Err(ReceiptVerifyError::IncoherentProvenance {
+            unit,
+            declared_source,
+            evidence_source,
+        }) = &outcome
+        else {
+            unreachable!("guarded by the assertion above");
+        };
+        assert_eq!(unit.as_str(), "result_row");
+        assert_eq!(declared_source.as_str(), "measured");
+        assert_eq!(*evidence_source, "origin_header");
+    }
+
+    #[test]
+    fn a_coherent_receipt_still_verifies_after_the_coherence_check_landed() {
+        let signer = receipt_signer();
+        let claims = sample_claims();
+        let token = signer.sign(&claims).expect("sign");
+
+        let verifier = ReceiptTokenVerifier::single_key(KID, signer.verifying_key());
+
+        assert_eq!(
+            verifier
+                .verify(&token)
+                .expect("a coherent receipt verifies"),
+            claims
         );
     }
 }
