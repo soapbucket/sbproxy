@@ -364,6 +364,38 @@ impl ValueLedger {
         })
     }
 
+    /// Record one completion that spilled to cloud for `model`, adding what
+    /// it really cost at `price`.
+    ///
+    /// Keyed on the local serve entry that was displaced, not on whatever
+    /// the answering provider bills under, so the saving and the spend land
+    /// in the same lane and subtract. Best effort for the same reason as
+    /// [`Self::record_local`]: a storage error must not fail the request
+    /// being priced.
+    pub fn record_cloud(
+        &self,
+        model: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        price: CloudPrice,
+    ) {
+        if let Err(error) = self.try_record_cloud(model, prompt_tokens, completion_tokens, price) {
+            tracing::warn!(error = %error, model, "value ledger: record_cloud failed");
+        }
+    }
+
+    fn try_record_cloud(
+        &self,
+        model: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        price: CloudPrice,
+    ) -> anyhow::Result<()> {
+        self.try_update_lane(model, |split| {
+            split.record_cloud(prompt_tokens, completion_tokens, price);
+        })
+    }
+
     /// Record target-model input value delivered by one applied compression
     /// lever. The operation is best effort and never changes local or cloud
     /// completion counts.
