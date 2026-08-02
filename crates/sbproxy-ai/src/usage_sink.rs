@@ -579,7 +579,12 @@ impl UsageSink for LangfuseSink {
         let client = self.client.clone();
         let egress = self.egress.clone();
         tokio::spawn(async move {
-            let request = match client.post(&url).basic_auth(pk, Some(sk)).json(&body).build() {
+            let request = match client
+                .post(&url)
+                .basic_auth(pk, Some(sk))
+                .json(&body)
+                .build()
+            {
                 Ok(request) => request,
                 Err(e) => {
                     tracing::warn!(error = %e, "usage sink: langfuse request build failed");

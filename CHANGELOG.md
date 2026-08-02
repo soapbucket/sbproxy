@@ -285,6 +285,34 @@ the next version cut.
 
 ### Changed
 
+- **Outbound HTTP no longer follows a redirect without re-authorizing it,
+  and the AI provider client no longer follows one at all.** The AI
+  client, the webhook, Langfuse, and Datadog usage sinks, the MCP token
+  exchange, and engine artifact downloads all followed redirects inside
+  `reqwest` with no second look, so a host allowlist only ever covered
+  hop one. Each of them now runs an explicit hop loop: every hop is
+  authorized from scratch, an off-allowlist target is reported
+  separately from a hop-one refusal, and the chain is capped at ten.
+  Credentials are stripped when a hop leaves its origin, keyed on
+  whether the header is marked sensitive, which matters because
+  `reqwest` strips `Authorization` and nothing else: `x-api-key`,
+  `api-key`, and `DD-API-KEY` were riding along. **A provider base URL
+  that depended on a 301 to add a trailing slash will now fail instead
+  of silently working.** Point the config at the URL the provider
+  actually serves.
+- **Egress authorization resolves DNS for real.** These same consumers
+  ran their egress gate against a fixed synthetic resolver that always
+  answered `93.184.216.34`. Because that address is public and always
+  resolves, the private-address rule and the resolution-failure rule
+  were unreachable: an allowlisted hostname pointing at
+  `169.254.169.254` passed the gate. Resolution now goes through a
+  cached system resolver with a 30 second TTL, shared between the
+  authorize step and the verify step so a mismatch means the answer
+  genuinely changed. Refusals are counted by
+  `sbproxy_egress_refused_total{purpose, reason, tenant, origin}`.
+  Dial-time pinning on the shared long-lived clients is deliberately
+  still open; `docs/threat-model.md` records that exemption, its
+  residual risk, and the two ways to close it.
 - **Admin operator passwords are now hashed at rest [BREAKING].**
   `proxy.admin.operators[].password` is replaced by `password_hash`, an
   HMAC-SHA256 hash (hex-encoded) using the same pepper the inbound key

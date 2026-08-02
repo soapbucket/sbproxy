@@ -963,7 +963,10 @@ mod tests {
             &resolver,
         )
         .expect("a same-origin hop is the one redirect an unconfigured path may follow");
-        assert_eq!(hop.url.as_str(), "https://api.openai.com/v1/chat/completions");
+        assert_eq!(
+            hop.url.as_str(),
+            "https://api.openai.com/v1/chat/completions"
+        );
         assert!(!hop.strip_credentials);
         assert!(hop.pinned_addrs.is_empty(), "no authorizer means no pins");
     }
@@ -1014,10 +1017,8 @@ mod tests {
 
     #[test]
     fn hop_with_an_authorizer_pins_the_redirect_target() {
-        let auth = EgressAuthorizer::new(ai_provider_https_443(&[
-            "api.openai.com",
-            "cdn.openai.com",
-        ]));
+        let auth =
+            EgressAuthorizer::new(ai_provider_https_443(&["api.openai.com", "cdn.openai.com"]));
         let pinned = vec![addr([104, 18, 2, 2], 443)];
         let resolver = MapResolver::new(vec![
             ("api.openai.com", vec![addr([104, 18, 1, 1], 443)]),
@@ -1046,17 +1047,22 @@ mod tests {
         let auth = EgressAuthorizer::new(ai_provider_https_443(&["api.openai.com"]));
         let resolver = MapResolver::new(vec![]);
         let from = Url::parse("https://api.openai.com/v1/chat").expect("test url");
-        assert_eq!(
-            evaluate_hop(
-                Some(&auth),
-                EgressPurpose::AiProvider,
-                &from,
-                "https://api.openai.com/again",
-                MAX_REDIRECT_HOPS + 1,
-                RedirectRule::SameOriginOnly,
-                &resolver,
-            ),
-            Err(EgressDenied::TooManyRedirects)
+        // Matched rather than compared: `RedirectHop` is deliberately
+        // not `PartialEq`, and deriving it to make one test read
+        // slightly better would widen a public type's contract for the
+        // convenience of an assertion.
+        let outcome = evaluate_hop(
+            Some(&auth),
+            EgressPurpose::AiProvider,
+            &from,
+            "https://api.openai.com/again",
+            MAX_REDIRECT_HOPS + 1,
+            RedirectRule::SameOriginOnly,
+            &resolver,
+        );
+        assert!(
+            matches!(outcome, Err(EgressDenied::TooManyRedirects)),
+            "the hop cap must fire before resolution is attempted"
         );
     }
 
@@ -1078,9 +1084,7 @@ mod tests {
             let label = reason.as_label();
             assert!(!label.is_empty());
             assert!(
-                label
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c == '_'),
+                label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
                 "label must be a bounded identifier, got {label}"
             );
         }

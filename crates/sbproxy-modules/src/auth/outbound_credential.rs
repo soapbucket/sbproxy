@@ -797,15 +797,9 @@ pub async fn resolve_cached_isolated(
         }
     }
 
-    let cred = resolve_with_egress_for_origin(
-        cfg,
-        http,
-        subject_token,
-        secret_lookup,
-        egress,
-        origin_id,
-    )
-    .await?;
+    let cred =
+        resolve_with_egress_for_origin(cfg, http, subject_token, secret_lookup, egress, origin_id)
+            .await?;
     // Cache only when the endpoint reported a lifetime; reuse it until
     // 30s before expiry to avoid serving a token that dies in flight.
     if let Some(secs) = cred.expires_in {

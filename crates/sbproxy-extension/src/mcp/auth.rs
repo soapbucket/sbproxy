@@ -366,16 +366,15 @@ async fn mint_token_exchange(
     // IdP hostname that resolves onto the pod network.
     let endpoint_host = token_endpoint.host_str().unwrap_or("unset").to_string();
     if let Some(auth) = egress {
-        auth.authorize(EgressPurpose::TokenExchange, endpoint, &CachedSystemResolver)
-            .map_err(|denied| {
-                record_egress_refused(
-                    EgressPurpose::TokenExchange,
-                    denied,
-                    tenant,
-                    &endpoint_host,
-                );
-                UpstreamAuthError::EgressDenied
-            })?;
+        auth.authorize(
+            EgressPurpose::TokenExchange,
+            endpoint,
+            &CachedSystemResolver,
+        )
+        .map_err(|denied| {
+            record_egress_refused(EgressPurpose::TokenExchange, denied, tenant, &endpoint_host);
+            UpstreamAuthError::EgressDenied
+        })?;
     }
 
     let key = cache_key(endpoint, audience, subject_id, subject_token);

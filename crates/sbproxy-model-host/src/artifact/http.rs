@@ -239,21 +239,14 @@ impl HttpArtifactTransport {
                 &CachedSystemResolver,
             )
             .map_err(|denied| {
-                record_egress_refused(
-                    EgressPurpose::ModelArtifact,
-                    denied,
-                    "unset",
-                    origin_label,
-                );
+                record_egress_refused(EgressPurpose::ModelArtifact, denied, "unset", origin_label);
                 format!("egress denied: {denied:?}")
             })?;
             let Some(mut replay) = replay else {
                 return Ok(response);
             };
             if next.strip_credentials {
-                replay
-                    .headers_mut()
-                    .remove(reqwest::header::AUTHORIZATION);
+                replay.headers_mut().remove(reqwest::header::AUTHORIZATION);
             }
             *replay.url_mut() = next.url;
             request = replay;
@@ -279,7 +272,12 @@ impl ArtifactTransport for HttpArtifactTransport {
             &CachedSystemResolver,
         )
         .map_err(|denied| {
-            record_egress_refused(EgressPurpose::ModelArtifact, denied, "unset", &artifact_host);
+            record_egress_refused(
+                EgressPurpose::ModelArtifact,
+                denied,
+                "unset",
+                &artifact_host,
+            );
             ArtifactError::Transport(format!("egress denied: {denied:?}"))
         })?;
 
