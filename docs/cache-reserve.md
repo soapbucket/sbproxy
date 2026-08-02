@@ -74,7 +74,19 @@ First fetch of `/a`: both tiers empty, the request reaches the upstream, and `up
 curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a
 ```
 
-<!-- CAPTURE: curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a -->
+```
+HTTP/1.1 200 OK
+Server: BaseHTTP/0.6 Python/3.14.4
+Date: Sun, 02 Aug 2026 05:24:12 GMT
+Content-Type: application/json
+Content-Length: 108
+X-Sb-Session-Id: 01KZ0EW1FFHFESCXYK4687AV05
+traceparent: 00-85d311d8846e44a699871ae90933ab2e-c1e6dd2060f44c10-01
+X-Request-Id: 019fc0ee05ee7290bcfd97ce6adcc171
+Connection: keep-alive
+
+{"path":"/a","upstream_hits":1,"note":"this number only moves when the request really reached the upstream"}
+```
 
 Second fetch: the hot tier answers, and the counter has not moved.
 
@@ -82,7 +94,20 @@ Second fetch: the hot tier answers, and the counter has not moved.
 curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a
 ```
 
-<!-- CAPTURE: curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a -->
+```
+HTTP/1.1 200 OK
+server: BaseHTTP/0.6 Python/3.14.4
+Date: Sun, 02 Aug 2026 05:24:12 GMT
+content-type: application/json
+content-length: 108
+x-sb-session-id: 01KZ0EW1FFHFESCXYK4687AV05
+traceparent: 00-85d311d8846e44a699871ae90933ab2e-c1e6dd2060f44c10-01
+x-request-id: 019fc0ee05ee7290bcfd97ce6adcc171
+x-sbproxy-cache: HIT
+Connection: keep-alive
+
+{"path":"/a","upstream_hits":1,"note":"this number only moves when the request really reached the upstream"}
+```
 
 Now fetch `/b`, which fills the one-entry hot tier and pushes `/a` out of it, then fetch `/a` again. It comes back from the reserve, and the upstream still has not been asked twice:
 
@@ -91,7 +116,20 @@ curl -s -o /dev/null -H 'Host: cache.local' http://127.0.0.1:8080/b
 curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a
 ```
 
-<!-- CAPTURE: curl -s -o /dev/null -H 'Host: cache.local' http://127.0.0.1:8080/b; curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a -->
+```
+HTTP/1.1 200 OK
+server: BaseHTTP/0.6 Python/3.14.4
+Date: Sun, 02 Aug 2026 05:24:12 GMT
+content-type: application/json
+content-length: 108
+x-sb-session-id: 01KZ0EW1FFHFESCXYK4687AV05
+traceparent: 00-85d311d8846e44a699871ae90933ab2e-c1e6dd2060f44c10-01
+x-request-id: 019fc0ee05ee7290bcfd97ce6adcc171
+x-sbproxy-cache: HIT-RESERVE
+Connection: keep-alive
+
+{"path":"/a","upstream_hits":1,"note":"this number only moves when the request really reached the upstream"}
+```
 
 The reserve hit promotes the entry back into the hot tier on the way out, so the read after it is a plain `HIT` rather than another reserve round trip:
 
@@ -99,7 +137,20 @@ The reserve hit promotes the entry back into the hot tier on the way out, so the
 curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a
 ```
 
-<!-- CAPTURE: curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a -->
+```
+HTTP/1.1 200 OK
+server: BaseHTTP/0.6 Python/3.14.4
+Date: Sun, 02 Aug 2026 05:24:12 GMT
+content-type: application/json
+content-length: 108
+x-sb-session-id: 01KZ0EW1FFHFESCXYK4687AV05
+traceparent: 00-85d311d8846e44a699871ae90933ab2e-c1e6dd2060f44c10-01
+x-request-id: 019fc0ee05ee7290bcfd97ce6adcc171
+x-sbproxy-cache: HIT
+Connection: keep-alive
+
+{"path":"/a","upstream_hits":1,"note":"this number only moves when the request really reached the upstream"}
+```
 
 `docker compose down -v` tears it down. `max_size: 1` is a demo device, not a recommendation; leave it at the default of 10000 and let the reserve catch what falls out on its own.
 

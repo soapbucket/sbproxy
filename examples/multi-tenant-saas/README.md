@@ -1,5 +1,7 @@
 # Multi-tenant SaaS: three credential scopes, resolved per request
 
+![Multi-tenant SaaS: three credential scopes, resolved per request](../../docs/assets/multi-tenant-saas.gif)
+
 The runnable half of [docs/multi-tenant.md](../../docs/multi-tenant.md). One binary, three tenants, one shared upstream. Credentials are declared at three scopes and resolution walks origin to tenant to proxy, most-specific-wins by name.
 
 That rule is invisible from a config listing and obvious from a curl, so this config makes each half of it reachable:
@@ -36,7 +38,9 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions -H 'Host: acme.local' \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-<!-- CAPTURE: curl -sS http://127.0.0.1:8080/v1/chat/completions -H 'Host: acme.local' -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-acme-shared' -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}' -->
+```
+{"id":"chatcmpl-fixture","object":"chat.completion","created":0,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"fixture response"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}
+```
 
 The proxy default carries the same credential name, so acme's copy shadowed it. At acme's origin that key does not exist:
 
@@ -46,9 +50,17 @@ curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H 'Host: acme.local' \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-<!-- CAPTURE: curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H 'Host: acme.local' -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-shared-default' -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}' -->
+```
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+content-length: 40
+Date: Sun, 02 Aug 2026 05:24:23 GMT
+Connection: close
 
-Beta declared a credential under a new name, which adds rather than replaces. Both keys work at beta's origin, and each keeps its own model allow list:
+{"error":"governed credential required"}
+```
+
+Beta declared a credential under a new name, which adds rather than replaces. Both keys resolve at beta's origin, and each keeps its own model allow list, so the shared key refuses a model beta's own key is allowed:
 
 ```bash
 curl -sS http://127.0.0.1:8080/v1/chat/completions -H 'Host: beta.local' \
@@ -59,7 +71,10 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions -H 'Host: beta.local' \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-<!-- CAPTURE: curl -sS http://127.0.0.1:8080/v1/chat/completions -H 'Host: beta.local' -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-beta-experimental' -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'; echo; curl -sS http://127.0.0.1:8080/v1/chat/completions -H 'Host: beta.local' -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-shared-default' -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}' -->
+```
+{"id":"chatcmpl-fixture","object":"chat.completion","created":0,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"fixture response"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}
+{"error":"model 'gpt-4o' is not allowed for this key"}
+```
 
 `shared.local` declares no `tenant_id`, so it resolves to the synthetic `__default__` tenant: the proxy defaults, and nothing a tenant declared:
 
@@ -69,11 +84,25 @@ curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H 'Host: shared.local' \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-<!-- CAPTURE: curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H 'Host: shared.local' -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-beta-experimental' -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}' -->
+```
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+content-length: 40
+Date: Sun, 02 Aug 2026 05:24:23 GMT
+Connection: close
+
+{"error":"governed credential required"}
+```
 
 Every request the proxy served is filed under the tenant that served it. After the calls above, the attribution counter carries one series per tenant:
 
-<!-- CAPTURE: curl -s http://127.0.0.1:8080/metrics | grep '^sbproxy_ai_requests_attributed_total' -->
+```
+sbproxy_ai_requests_attributed_total{api_key_id="",model="",origin="acme.local",outcome="auth_denied",provider="",surface="chat_completions",tenant_id="acme-corp"} 2
+sbproxy_ai_requests_attributed_total{api_key_id="",model="",origin="shared.local",outcome="auth_denied",provider="",surface="chat_completions",tenant_id="__default__"} 2
+sbproxy_ai_requests_attributed_total{api_key_id="cfg:9:acme-corp:10:acme.local:openai-shared",model="gpt-4o-mini",origin="acme.local",outcome="ok",provider="openai",surface="chat_completions",tenant_id="acme-corp"} 2
+sbproxy_ai_requests_attributed_total{api_key_id="cfg:9:beta-corp:10:beta.local:openai-experimental",model="gpt-4o",origin="beta.local",outcome="ok",provider="openai",surface="chat_completions",tenant_id="beta-corp"} 1
+sbproxy_ai_requests_attributed_total{api_key_id="cfg:9:beta-corp:10:beta.local:openai-shared",model="",origin="beta.local",outcome="auth_denied",provider="",surface="chat_completions",tenant_id="beta-corp"} 1
+```
 
 Run the checked smoke cases from the repository root with:
 

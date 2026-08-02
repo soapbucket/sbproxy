@@ -192,7 +192,12 @@ docker compose up -d --wait
 for i in 1 2 3 4; do curl -s -H 'Host: gpu.local' http://127.0.0.1:8080/infer; echo; done
 ```
 
-<!-- CAPTURE: for i in 1 2 3 4; do curl -s -H 'Host: gpu.local' http://127.0.0.1:8080/infer; echo; done -->
+```
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+```
 
 The `percent.local` origin carries the same two targets with `72` and `31` in that field, the percent-versus-fraction typo. Both are outside `[0.0, 1.0]`, so the strategy ignores them rather than reading a busy replica as the idle one, and its deterministic round robin runs instead:
 
@@ -200,7 +205,12 @@ The `percent.local` origin carries the same two targets with `72` and `31` in th
 for i in 1 2 3 4; do curl -s -H 'Host: percent.local' http://127.0.0.1:8080/infer; echo; done
 ```
 
-<!-- CAPTURE: for i in 1 2 3 4; do curl -s -H 'Host: percent.local' http://127.0.0.1:8080/infer; echo; done -->
+```
+{"target":"replica-a","path":"/infer","adapter_requested":""}
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+{"target":"replica-a","path":"/infer","adapter_requested":""}
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+```
 
 `lora-aware` prefers the replica advertising the requested adapter, and returns no selection when none does, at which point the configured `algorithm` picks from the same eligible slice:
 
@@ -209,6 +219,9 @@ curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: alice-tone' http://127.0.0.1:8
 curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: nobody-has-this' http://127.0.0.1:8080/infer
 ```
 
-<!-- CAPTURE: curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: alice-tone' http://127.0.0.1:8080/infer; echo; curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: nobody-has-this' http://127.0.0.1:8080/infer -->
+```
+{"target":"replica-a","path":"/infer","adapter_requested":"alice-tone"}
+{"target":"replica-a","path":"/infer","adapter_requested":"nobody-has-this"}
+```
 
 `docker compose down -v` tears it down.

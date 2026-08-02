@@ -60,7 +60,15 @@ docker compose up -d --wait
 curl -i -H 'Host: flags.local' -H 'X-User: alice@acme.io' http://127.0.0.1:8080/checkout
 ```
 
-<!-- CAPTURE: curl -i -H 'Host: flags.local' -H 'X-User: alice@acme.io' http://127.0.0.1:8080/checkout -->
+```
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 97
+Date: Sun, 02 Aug 2026 05:08:17 GMT
+Connection: keep-alive
+
+{"checkout":"new","note":"flag_enabled(\"new-checkout\", X-User) evaluated true for this caller"}  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+```
 
 `mallory@acme.io` is on the allow list and the block list, the collision the rule order exists to settle. Block wins, so the typo lands on the safe side:
 
@@ -68,7 +76,15 @@ curl -i -H 'Host: flags.local' -H 'X-User: alice@acme.io' http://127.0.0.1:8080/
 curl -i -H 'Host: flags.local' -H 'X-User: mallory@acme.io' http://127.0.0.1:8080/checkout
 ```
 
-<!-- CAPTURE: curl -i -H 'Host: flags.local' -H 'X-User: mallory@acme.io' http://127.0.0.1:8080/checkout -->
+```
+HTTP/1.1 403 Forbidden
+content-type: application/json
+content-length: 54
+Date: Sun, 02 Aug 2026 05:08:17 GMT
+Connection: keep-alive
+
+{"error":"new-checkout is off for this bucketing key"}  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+```
 
 `ken@acme.io` is on no list. Bucket 22 is under the cutoff, and it is under the cutoff every time:
 
@@ -77,7 +93,11 @@ for i in 1 2 3; do curl -s -o /dev/null -w '%{http_code}\n' \
   -H 'Host: flags.local' -H 'X-User: ken@acme.io' http://127.0.0.1:8080/checkout; done
 ```
 
-<!-- CAPTURE: for i in 1 2 3; do curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: flags.local' -H 'X-User: ken@acme.io' http://127.0.0.1:8080/checkout; done -->
+```
+200
+200
+200
+```
 
 `ivan@acme.io` buckets at 28, over the cutoff, so `default: false` decides. Send no `X-User` at all and the expression cannot prove the request is allowed, so it is denied:
 
@@ -86,7 +106,10 @@ curl -s -o /dev/null -w 'ivan %{http_code}\n' -H 'Host: flags.local' -H 'X-User:
 curl -s -o /dev/null -w 'no key %{http_code}\n' -H 'Host: flags.local' http://127.0.0.1:8080/checkout
 ```
 
-<!-- CAPTURE: curl -s -o /dev/null -w 'ivan %{http_code}\n' -H 'Host: flags.local' -H 'X-User: ivan@acme.io' http://127.0.0.1:8080/checkout; curl -s -o /dev/null -w 'no key %{http_code}\n' -H 'Host: flags.local' http://127.0.0.1:8080/checkout -->
+```
+ivan 403
+no key 403
+```
 
 `docker compose down -v` tears it down.
 
@@ -104,7 +127,13 @@ Because it is one function over two strings, you can work out which side of a ro
 python3 -c 'P=0x100000001b3; M=(1<<64)-1; f=lambda s: __import__("functools").reduce(lambda h,b: ((h^b)*P)&M, s, 0xcbf29ce484222325); [print(k, f(b"new-checkout|"+k.encode())%100) for k in ["alice@acme.io","carol@acme.io","mallory@acme.io","ken@acme.io","ivan@acme.io"]]'
 ```
 
-<!-- CAPTURE: python3 -c 'P=0x100000001b3; M=(1<<64)-1; f=lambda s: __import__("functools").reduce(lambda h,b: ((h^b)*P)&M, s, 0xcbf29ce484222325); [print(k, f(b"new-checkout|"+k.encode())%100) for k in ["alice@acme.io","carol@acme.io","mallory@acme.io","ken@acme.io","ivan@acme.io"]]' -->
+```
+alice@acme.io 76
+carol@acme.io 17
+mallory@acme.io 6
+ken@acme.io 22
+ivan@acme.io 28
+```
 
 ## Hot reloading
 

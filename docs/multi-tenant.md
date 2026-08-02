@@ -173,7 +173,9 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions -H 'Host: acme.local' \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-<!-- CAPTURE: curl -sS http://127.0.0.1:8080/v1/chat/completions -H 'Host: acme.local' -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-acme-shared' -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}' -->
+```
+{"id":"chatcmpl-fixture","object":"chat.completion","created":0,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"fixture response"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}
+```
 
 The proxy default carries the same name, so at acme's origin it is shadowed and its key is not a key:
 
@@ -183,7 +185,15 @@ curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H 'Host: acme.local' \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-<!-- CAPTURE: curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H 'Host: acme.local' -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-shared-default' -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}' -->
+```
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+content-length: 40
+Date: Sun, 02 Aug 2026 05:24:23 GMT
+Connection: close
+
+{"error":"governed credential required"}
+```
 
 Beta declared a new name instead, which adds rather than shadows, so both keys resolve at beta's origin. And `shared.local`, which declares no `tenant_id`, resolves to `__default__` and refuses beta's tenant-scoped key:
 
@@ -193,11 +203,23 @@ curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H 'Host: shared.local' \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-<!-- CAPTURE: curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H 'Host: shared.local' -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-beta-experimental' -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}' -->
+```
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+content-length: 40
+Date: Sun, 02 Aug 2026 05:24:23 GMT
+Connection: close
+
+{"error":"governed credential required"}
+```
 
 Each served request is filed under the tenant that served it, which is what makes per-tenant spend reporting possible:
 
-<!-- CAPTURE: curl -s http://127.0.0.1:8080/metrics | grep '^sbproxy_ai_requests_attributed_total' -->
+```
+sbproxy_ai_requests_attributed_total{api_key_id="",model="",origin="acme.local",outcome="auth_denied",provider="",surface="chat_completions",tenant_id="acme-corp"} 1
+sbproxy_ai_requests_attributed_total{api_key_id="",model="",origin="shared.local",outcome="auth_denied",provider="",surface="chat_completions",tenant_id="__default__"} 1
+sbproxy_ai_requests_attributed_total{api_key_id="cfg:9:acme-corp:10:acme.local:openai-shared",model="gpt-4o-mini",origin="acme.local",outcome="ok",provider="openai",surface="chat_completions",tenant_id="acme-corp"} 1
+```
 
 `docker compose down -v` tears it down.
 

@@ -1,5 +1,7 @@
 # Routing strategies, against upstreams that say who they are
 
+![Routing strategies, against upstreams that say who they are](../../docs/assets/routing-strategies.gif)
+
 The runnable half of [docs/routing-strategies.md](../../docs/routing-strategies.md). A registered `RoutingStrategy` runs before the load balancer's configured `algorithm` and picks from the already-filtered eligible targets. Which target it picked is invisible when every target is the same address, so this example ships two replicas that report their own name.
 
 Three origins share that pair, one per documented behaviour:
@@ -33,7 +35,12 @@ docker compose up -d --wait
 for i in 1 2 3 4; do curl -s -H 'Host: gpu.local' http://127.0.0.1:8080/infer; echo; done
 ```
 
-<!-- CAPTURE: for i in 1 2 3 4; do curl -s -H 'Host: gpu.local' http://127.0.0.1:8080/infer; echo; done -->
+```
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+```
 
 `percent.local` carries the same key with values of `72` and `31`, which is the percent-versus-fraction typo. Both are outside `[0.0, 1.0]`, so the strategy ignores them instead of treating a busy replica as the least loaded one, and falls back to a round robin across the healthy slice:
 
@@ -41,7 +48,12 @@ for i in 1 2 3 4; do curl -s -H 'Host: gpu.local' http://127.0.0.1:8080/infer; e
 for i in 1 2 3 4; do curl -s -H 'Host: percent.local' http://127.0.0.1:8080/infer; echo; done
 ```
 
-<!-- CAPTURE: for i in 1 2 3 4; do curl -s -H 'Host: percent.local' http://127.0.0.1:8080/infer; echo; done -->
+```
+{"target":"replica-a","path":"/infer","adapter_requested":""}
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+{"target":"replica-a","path":"/infer","adapter_requested":""}
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+```
 
 `lora-aware` prefers the replica that already has the requested adapter warm. The hint rides on `X-LoRA-Adapter` or `?adapter=`:
 
@@ -50,7 +62,10 @@ curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: alice-tone' http://127.0.0.1:8
 curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: carol-voice' http://127.0.0.1:8080/infer; echo
 ```
 
-<!-- CAPTURE: curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: alice-tone' http://127.0.0.1:8080/infer; echo; curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: carol-voice' http://127.0.0.1:8080/infer; echo -->
+```
+{"target":"replica-a","path":"/infer","adapter_requested":"alice-tone"}
+{"target":"replica-b","path":"/infer","adapter_requested":"carol-voice"}
+```
 
 Ask for an adapter nobody advertises and the strategy returns no selection rather than inventing one. `algorithm: least_connections` picks from the same eligible slice:
 
@@ -58,7 +73,9 @@ Ask for an adapter nobody advertises and the strategy returns no selection rathe
 curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: nobody-has-this' http://127.0.0.1:8080/infer
 ```
 
-<!-- CAPTURE: curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: nobody-has-this' http://127.0.0.1:8080/infer -->
+```
+{"target":"replica-a","path":"/infer","adapter_requested":"nobody-has-this"}
+```
 
 Run the checked smoke cases from the repository root with:
 

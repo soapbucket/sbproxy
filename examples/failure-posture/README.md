@@ -29,7 +29,15 @@ curl -i -H 'Host: keys.local' \
      http://127.0.0.1:8080/
 ```
 
-<!-- CAPTURE: curl -i -H 'Host: keys.local' -H 'Authorization: Bearer sbp_a1b2c3d4e5f60718_9f3c1d2e4b5a6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d' http://127.0.0.1:8080/ -->
+```
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 99
+Date: Sun, 02 Aug 2026 05:08:14 GMT
+Connection: keep-alive
+
+{"note":"admitted under failure_posture: degraded, with no per-key policy or budget","served":true}  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+```
 
 The same shape, the same dead store, the same posture, a token the origin does not know:
 
@@ -39,11 +47,21 @@ curl -i -H 'Host: keys.local' \
      http://127.0.0.1:8080/
 ```
 
-<!-- CAPTURE: curl -i -H 'Host: keys.local' -H 'Authorization: Bearer sbp_0f1e2d3c4b5a6978_1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809' http://127.0.0.1:8080/ -->
+```
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+content-length: 24
+Date: Sun, 02 Aug 2026 05:08:14 GMT
+Connection: keep-alive
+
+{"error":"unauthorized"}  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+```
 
 Every admitted request leaves the record that separates `degraded` from `open`:
 
-<!-- CAPTURE: cd examples/failure-posture && docker compose logs sbproxy 2>&1 | grep -m 2 'failure_posture' -->
+```
+
+```
 
 Run the checked smoke cases from the repository root with:
 

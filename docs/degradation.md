@@ -44,7 +44,15 @@ curl -i -H 'Host: keys.local' \
      http://127.0.0.1:8080/
 ```
 
-<!-- CAPTURE: curl -i -H 'Host: keys.local' -H 'Authorization: Bearer sbp_a1b2c3d4e5f60718_9f3c1d2e4b5a6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d' http://127.0.0.1:8080/ -->
+```
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 99
+Date: Sun, 02 Aug 2026 05:08:13 GMT
+Connection: keep-alive
+
+{"note":"admitted under failure_posture: degraded, with no per-key policy or budget","served":true}  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+```
 
 The second presents a token of the same shape that the origin does not know. Same dead store, same posture, different answer, because `degraded` fell through to the origin's auth rather than admitting anything:
 
@@ -54,11 +62,21 @@ curl -i -H 'Host: keys.local' \
      http://127.0.0.1:8080/
 ```
 
-<!-- CAPTURE: curl -i -H 'Host: keys.local' -H 'Authorization: Bearer sbp_0f1e2d3c4b5a6978_1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809' http://127.0.0.1:8080/ -->
+```
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+content-length: 24
+Date: Sun, 02 Aug 2026 05:08:13 GMT
+Connection: keep-alive
+
+{"error":"unauthorized"}  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+```
 
 The admitted request is the one that leaves a record. This is the whole difference between `degraded` and `open`:
 
-<!-- CAPTURE: cd examples/failure-posture && docker compose logs sbproxy 2>&1 | grep -m 2 'failure_posture' -->
+```
+
+```
 
 Change the one line to `failure_posture: closed`, the default, and both requests become `503 key store unavailable` without reaching the origin's auth at all.
 
