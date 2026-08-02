@@ -799,12 +799,15 @@ pub(super) async fn request_filter(
     // already deletes the headers when the peer is untrusted, so
     // a downstream client cannot forge its own fingerprint.
     //
-    // `trustworthy` defaults to whatever
-    // `sbproxy_tls::classify_trustworthy` returns against the
-    // resolved client IP and the per-origin CIDR config; the
-    // header-supplied value (when present) wins because the
-    // sidecar is in a better position to know whether it actually
-    // saw a direct client.
+    // `trustworthy` is decided by
+    // `TlsFingerprintConfig::resolve_trustworthy` against the
+    // resolved client IP and the pre-parsed per-origin CIDR sets.
+    // Absent any operator CIDR rules it defaults to the sidecar's
+    // assertion, and to `true` when the sidecar made none: this code
+    // is only reachable from a peer in `proxy.trusted_proxies`. An
+    // operator narrows that with `untrusted_client_cidrs` (which
+    // outranks the sidecar) or `trustworthy_client_cidrs` (which,
+    // once non-empty, decides on its own).
     #[cfg(feature = "tls-fingerprint")]
     if peer_trusted {
         // Wave 5 day-6 Item 3: read the typed TlsFingerprintConfig
@@ -857,26 +860,10 @@ pub(super) async fn request_filter(
             {
                 // Resolve trustworthy: operator-configured CIDR
                 // sets win over the sidecar's hint when the
-                // resolved client IP falls in either set.
-                let mut trustworthy = trustworthy_override.unwrap_or(true);
-                if let Some(client_ip) = ctx.client_ip {
-                    let untrusted = tls_cfg.untrusted_cidrs();
-                    if untrusted.iter().any(|cidr| cidr.contains(client_ip)) {
-                        trustworthy = false;
-                    } else {
-                        let trustworthy_set = tls_cfg.trustworthy_cidrs();
-                        if !trustworthy_set.is_empty()
-                            && trustworthy_set.iter().any(|cidr| cidr.contains(client_ip))
-                        {
-                            trustworthy = true;
-                        } else if !trustworthy_set.is_empty() {
-                            // No match in either set + operator
-                            // explicitly configured a trust list:
-                            // conservative default per A5.1.
-                            trustworthy = false;
-                        }
-                    }
-                }
+                // resolved client IP falls in either set. The CIDR
+                // sets were parsed at config load; this is a
+                // membership check on the request path, nothing more.
+                let trustworthy = tls_cfg.resolve_trustworthy(trustworthy_override, ctx.client_ip);
                 ctx.tls_fingerprint = Some(sbproxy_tls::TlsFingerprint {
                     ja3,
                     ja4,
@@ -925,12 +912,13 @@ pub(super) async fn request_filter(
                     http::Version::HTTP_3 => "3",
                     _ => "0.9",
                 };
-                let header_names: Vec<&str> =
-                    req.headers.keys().map(|name| name.as_str()).collect();
+                // The names are hashed in wire order and nothing else
+                // reads them, so hand `compute_ja4h` the key iterator
+                // rather than collecting a Vec to re-iterate.
                 fp.ja4h = Some(sbproxy_tls::compute_ja4h(
                     method,
                     version_label,
-                    header_names.iter().copied(),
+                    req.headers.keys().map(|name| name.as_str()),
                 ));
             }
         }

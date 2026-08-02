@@ -21,10 +21,6 @@ tls-fingerprint = []
 sbproxy-config.workspace = true
 sbproxy-platform.workspace = true
 
-# CIDR matching for trustworthy / untrusted client IP ranges.
-# Used by the per-origin trustworthy classifier.
-ipnetwork.workspace = true
-
 # Hex encoding for JA3/JA4 outputs.
 hex.workspace = true
 

@@ -7629,7 +7629,6 @@ dependencies = [
  "h3-quinn",
  "hex",
  "http 1.4.0",
- "ipnetwork",
  "lru",
  "md-5",
  "object_store",

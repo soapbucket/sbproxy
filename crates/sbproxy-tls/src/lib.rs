@@ -14,9 +14,7 @@ pub mod h3_listener;
 pub mod mtls;
 pub mod ocsp;
 
-pub use fingerprint::{
-    classify_trustworthy, compute_ja4h, parse_client_hello, TlsFingerprint, TrustworthyConfig,
-};
+pub use fingerprint::{compute_ja4h, parse_client_hello, TlsFingerprint};
 
 use std::sync::Arc;
 use std::time::Duration;

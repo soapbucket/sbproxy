@@ -48,8 +48,6 @@
 //! is 50-100 microseconds per handshake on a typical 300-500 byte
 //! ClientHello.
 
-use std::net::IpAddr;
-
 // --- Public types ---
 
 /// TLS fingerprint bundle attached to a `RequestContext`.
@@ -66,7 +64,8 @@ use std::net::IpAddr;
 /// - [`Self::ja4s`] is populated on the outbound TLS session to the
 ///   upstream (left as `None` today; outbound lands later).
 /// - [`Self::trustworthy`] is computed from the per-origin CIDR
-///   config in `sb.yml` by [`classify_trustworthy`].
+///   config in `sb.yml` by the proxy's request entry hook (see
+///   `TlsFingerprintConfig::resolve_trustworthy` in `sbproxy-core`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct TlsFingerprint {
     /// JA3 fingerprint: 32-character lowercase hex MD5 of the JA3
@@ -194,9 +193,11 @@ const TLS_HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
 ///
 /// Returns a [`TlsFingerprint`] with `ja3` and `ja4` populated on
 /// success. `ja4h` and `ja4s` stay `None` (those are filled later in
-/// the pipeline). `trustworthy` defaults to `false`; callers should
-/// run [`classify_trustworthy`] against the request's client IP and
-/// the per-origin config.
+/// the pipeline). `trustworthy` defaults to `false` here; the proxy
+/// decides the shipped value from the request's client IP and the
+/// per-origin CIDR config (`TlsFingerprintConfig::resolve_trustworthy`
+/// in `sbproxy-core`), and that decision defaults to `true` when no
+/// rule applies.
 ///
 /// On parse failure the returned [`TlsFingerprint`] has all hash
 /// fields `None`. Failure does not panic and does not log; the
@@ -639,11 +640,17 @@ where
     input.push('|');
     input.push_str(version);
     input.push('|');
-    let names: Vec<String> = headers
-        .into_iter()
-        .map(|h| h.to_ascii_lowercase())
-        .collect();
-    input.push_str(&names.join(","));
+    // Lowercase into the hash input directly. Collecting a `Vec<String>`
+    // to `join` cost one allocation per header name on every request
+    // (WOR-1699); the bytes written are identical either way, since
+    // `char::to_ascii_lowercase` maps exactly what `str::to_ascii_lowercase`
+    // maps and leaves everything else alone.
+    for (i, name) in headers.into_iter().enumerate() {
+        if i > 0 {
+            input.push(',');
+        }
+        input.extend(name.chars().map(|c| c.to_ascii_lowercase()));
+    }
 
     let digest = Sha256::digest(input.as_bytes());
     let hex_full = hex::encode(digest);
@@ -651,85 +658,16 @@ where
 }
 
 // --- Trustworthy classifier ---
-
-/// CIDR config governing whether a fingerprint is trustworthy.
-///
-/// Operators populate this from the per-origin
-/// `features.tls_fingerprint.{trustworthy,untrusted}_client_cidrs`
-/// blocks in `sb.yml`. The lists are evaluated in order:
-///
-/// 1. If `client_ip` matches any entry in `untrusted`, return
-///    `false`.
-/// 2. Else if `client_ip` matches any entry in `trustworthy`, return
-///    `true`.
-/// 3. Else default to `false` (conservative).
-#[derive(Debug, Clone, Default)]
-pub struct TrustworthyConfig {
-    /// CIDR ranges where direct clients arrive (no CDN / MITM).
-    pub trustworthy: Vec<ipnetwork::IpNetwork>,
-    /// CIDR ranges known to terminate TLS upstream of the proxy
-    /// (CDN egress, corporate MITM, VPN).
-    pub untrusted: Vec<ipnetwork::IpNetwork>,
-}
-
-impl TrustworthyConfig {
-    /// Build a [`TrustworthyConfig`] from string CIDR lists.
-    /// Invalid entries are skipped with a `tracing::warn!`.
-    pub fn from_strings(trustworthy: &[String], untrusted: &[String]) -> Self {
-        let trustworthy = trustworthy
-            .iter()
-            .filter_map(|s| match s.parse::<ipnetwork::IpNetwork>() {
-                Ok(n) => Some(n),
-                Err(e) => {
-                    tracing::warn!(
-                        cidr = %s,
-                        error = %e,
-                        "skipping invalid trustworthy_client_cidrs entry"
-                    );
-                    None
-                }
-            })
-            .collect();
-        let untrusted = untrusted
-            .iter()
-            .filter_map(|s| match s.parse::<ipnetwork::IpNetwork>() {
-                Ok(n) => Some(n),
-                Err(e) => {
-                    tracing::warn!(
-                        cidr = %s,
-                        error = %e,
-                        "skipping invalid untrusted_client_cidrs entry"
-                    );
-                    None
-                }
-            })
-            .collect();
-        Self {
-            trustworthy,
-            untrusted,
-        }
-    }
-}
-
-/// Resolve the trustworthy flag for a given client IP against the
-/// per-origin CIDR rules.
-///
-/// Default is `false` (conservative) when `client_ip` is `None` or
-/// no rule matches. See [`TrustworthyConfig`] for the matching
-/// order.
-pub fn classify_trustworthy(cfg: &TrustworthyConfig, client_ip: Option<IpAddr>) -> bool {
-    let ip = match client_ip {
-        Some(ip) => ip,
-        None => return false,
-    };
-    if cfg.untrusted.iter().any(|n| n.contains(ip)) {
-        return false;
-    }
-    if cfg.trustworthy.iter().any(|n| n.contains(ip)) {
-        return true;
-    }
-    false
-}
+//
+// There is no classifier here. `TrustworthyConfig` and
+// `classify_trustworthy` used to live at this spot, parsing the
+// operator's CIDR strings on every call and defaulting an unmatched
+// client to `false`. Nothing ever called them: the shipped decision is
+// `sbproxy_core::pipeline::TlsFingerprintConfig::resolve_trustworthy`,
+// which reads CIDR sets parsed once at config load and defaults to
+// `true`. Deleted on WOR-1699 rather than adopted, because adopting it
+// would have flipped a security-relevant default that nothing had asked
+// to flip.
 
 // --- GREASE filtering (RFC 8701) ---
 
@@ -1003,63 +941,12 @@ mod tests {
         assert!(fp.ja4.is_some());
     }
 
-    #[test]
-    fn classify_trustworthy_default_is_false() {
-        let cfg = TrustworthyConfig::default();
-        assert!(!classify_trustworthy(&cfg, None));
-        assert!(!classify_trustworthy(
-            &cfg,
-            Some("203.0.113.10".parse().unwrap())
-        ));
-    }
-
-    #[test]
-    fn classify_trustworthy_matches_explicit_cidr() {
-        let cfg = TrustworthyConfig::from_strings(&["203.0.113.0/24".to_string()], &[]);
-        assert!(classify_trustworthy(
-            &cfg,
-            Some("203.0.113.10".parse().unwrap())
-        ));
-        assert!(!classify_trustworthy(
-            &cfg,
-            Some("198.51.100.10".parse().unwrap())
-        ));
-    }
-
-    #[test]
-    fn classify_trustworthy_untrusted_overrides_trustworthy() {
-        // An IP listed in BOTH trustworthy and untrusted resolves to
-        // false because untrusted is checked first (conservative).
-        let cfg = TrustworthyConfig::from_strings(
-            &["203.0.113.0/24".to_string()],
-            &["203.0.113.10/32".to_string()],
-        );
-        assert!(!classify_trustworthy(
-            &cfg,
-            Some("203.0.113.10".parse().unwrap())
-        ));
-        // Other IPs in the trustworthy block stay trustworthy.
-        assert!(classify_trustworthy(
-            &cfg,
-            Some("203.0.113.11".parse().unwrap())
-        ));
-    }
-
-    #[test]
-    fn classify_trustworthy_handles_ipv6() {
-        let cfg = TrustworthyConfig::from_strings(&["2001:db8::/32".to_string()], &[]);
-        assert!(classify_trustworthy(
-            &cfg,
-            Some("2001:db8::1".parse().unwrap())
-        ));
-    }
-
-    #[test]
-    fn trustworthy_config_skips_invalid_cidrs() {
-        let cfg =
-            TrustworthyConfig::from_strings(&["bogus".to_string(), "10.0.0.0/8".to_string()], &[]);
-        assert_eq!(cfg.trustworthy.len(), 1);
-    }
+    // The `classify_trustworthy` tests that used to sit here went with
+    // the function on WOR-1699. Their subject matter moved to
+    // `sbproxy-core`'s pipeline tests, which exercise the classifier the
+    // request path actually calls: `trustworthy_defaults_to_true_without_an_override`,
+    // `untrusted_cidr_overrides_a_sidecar_trustworthy_header`, and
+    // `a_configured_trust_list_decides_on_its_own`.
 
     #[test]
     fn is_grease_recognises_canonical_values() {

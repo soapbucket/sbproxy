@@ -14,20 +14,38 @@ pub fn ip_in_cidrs(ip: &IpAddr, cidrs: &[IpNetwork]) -> bool {
 
 /// Parse a list of CIDR strings into IpNetwork objects, skipping invalid entries.
 ///
-/// Each unparseable entry is logged at WARN level so that misconfigured
-/// allow/deny lists do not silently lose rules. The function still returns
-/// only the valid entries; callers that need strict-mode behavior should
-/// validate beforehand.
-pub fn parse_cidrs(cidrs: &[String]) -> Vec<IpNetwork> {
+/// Call this once at config load and keep the result. The request path
+/// borrows the parsed set for a membership check with [`ip_in_cidrs`];
+/// it must never re-parse the operator's strings per request.
+///
+/// `field` is the config key the list came from (`trusted_proxies`,
+/// `upstream.allow_private_cidrs`, `trustworthy_client_cidrs`). It is
+/// recorded both in the message and as a `field` key so an operator
+/// reading the log knows which list lost a rule. Each unparseable entry
+/// is logged at WARN level so that misconfigured allow/deny lists do not
+/// silently lose rules. The function still returns only the valid
+/// entries; callers that need strict-mode behavior should validate
+/// beforehand.
+///
+/// ```
+/// # use sbproxy_security::parse_cidrs;
+/// let nets = parse_cidrs(["10.0.0.0/8", "nope"], "trusted_proxies");
+/// assert_eq!(nets.len(), 1);
+/// ```
+pub fn parse_cidrs<'a, I>(cidrs: I, field: &str) -> Vec<IpNetwork>
+where
+    I: IntoIterator<Item = &'a str>,
+{
     cidrs
-        .iter()
+        .into_iter()
         .filter_map(|s| match s.parse::<IpNetwork>() {
             Ok(net) => Some(net),
             Err(e) => {
                 warn!(
                     cidr = %s,
                     error = %e,
-                    "skipping unparseable CIDR entry; rule will be ignored"
+                    field = %field,
+                    "ignoring invalid {field} entry"
                 );
                 None
             }
@@ -63,26 +81,35 @@ mod tests {
 
     #[test]
     fn test_ip_in_cidrs_match() {
-        let cidrs = parse_cidrs(&["10.0.0.0/8".to_string(), "192.168.0.0/16".to_string()]);
+        let cidrs = parse_cidrs(["10.0.0.0/8", "192.168.0.0/16"], "trusted_proxies");
         let ip: IpAddr = "10.1.2.3".parse().unwrap();
         assert!(ip_in_cidrs(&ip, &cidrs));
     }
 
     #[test]
     fn test_ip_in_cidrs_no_match() {
-        let cidrs = parse_cidrs(&["10.0.0.0/8".to_string()]);
+        let cidrs = parse_cidrs(["10.0.0.0/8"], "trusted_proxies");
         let ip: IpAddr = "172.16.0.1".parse().unwrap();
         assert!(!ip_in_cidrs(&ip, &cidrs));
     }
 
     #[test]
     fn test_parse_cidrs_skips_invalid() {
-        let cidrs = parse_cidrs(&[
-            "10.0.0.0/8".to_string(),
-            "not-a-cidr".to_string(),
-            "192.168.1.0/24".to_string(),
-        ]);
+        let cidrs = parse_cidrs(
+            ["10.0.0.0/8", "not-a-cidr", "192.168.1.0/24"],
+            "trusted_proxies",
+        );
         assert_eq!(cidrs.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_cidrs_accepts_owned_strings() {
+        // The config-load callers hold `Vec<String>`; borrowing through
+        // `String::as_str` must keep working without an intermediate
+        // allocation.
+        let owned = vec!["10.0.0.0/8".to_string(), "bogus".to_string()];
+        let cidrs = parse_cidrs(owned.iter().map(String::as_str), "trustworthy_client_cidrs");
+        assert_eq!(cidrs.len(), 1);
     }
 
     #[test]

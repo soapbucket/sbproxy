@@ -913,21 +913,35 @@ pub struct TlsFingerprintConfig {
     untrusted_cidrs_compiled: Vec<ipnetwork::IpNetwork>,
 }
 
+thread_local! {
+    /// Number of TLS-fingerprint CIDR lists parsed on this thread.
+    ///
+    /// Parsing an operator's CIDR strings is a config-load activity; the
+    /// request path only ever does a membership check against the parsed
+    /// set. The counter makes that testable the same way
+    /// `sbproxy_extension::cel` counts expression compiles: a test loads
+    /// a config, records the count, drives the classification path, and
+    /// asserts the count did not move. Thread-local rather than global so
+    /// a parallel test run cannot make one test's count depend on
+    /// another's.
+    static CIDR_PARSE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Reads the current thread's TLS-fingerprint CIDR parse count.
+#[cfg(test)]
+pub(crate) fn cidr_parse_count_on_this_thread() -> u64 {
+    CIDR_PARSE_COUNT.with(std::cell::Cell::get)
+}
+
 impl TlsFingerprintConfig {
     /// Parse the CIDR string lists into their compiled forms once, at
     /// config load. Invalid entries are dropped with a warn (moved here
-    /// from the per-request path, WOR-1699).
+    /// from the per-request path, WOR-1699), which is also where an
+    /// operator can still act on the message.
     fn compile_cidrs(&mut self) {
-        fn parse(list: &[String], label: &str) -> Vec<ipnetwork::IpNetwork> {
-            list.iter()
-                .filter_map(|s| match s.parse::<ipnetwork::IpNetwork>() {
-                    Ok(n) => Some(n),
-                    Err(e) => {
-                        tracing::warn!(cidr = %s, error = %e, "ignoring invalid {label} entry");
-                        None
-                    }
-                })
-                .collect()
+        fn parse(list: &[String], field: &str) -> Vec<ipnetwork::IpNetwork> {
+            CIDR_PARSE_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+            sbproxy_security::parse_cidrs(list.iter().map(String::as_str), field)
         }
         self.trustworthy_cidrs_compiled =
             parse(&self.trustworthy_client_cidrs, "trustworthy_client_cidrs");
@@ -991,14 +1005,63 @@ impl TlsFingerprintConfig {
     /// Pre-parsed [`Self::trustworthy_client_cidrs`], compiled once at
     /// config load (WOR-1699). Empty when the field is unset, equivalent
     /// to "no trust list".
-    pub fn trustworthy_cidrs(&self) -> &[ipnetwork::IpNetwork] {
+    pub(crate) fn trustworthy_cidrs(&self) -> &[ipnetwork::IpNetwork] {
         &self.trustworthy_cidrs_compiled
     }
 
     /// Pre-parsed [`Self::untrusted_client_cidrs`], compiled once at
     /// config load (WOR-1699).
-    pub fn untrusted_cidrs(&self) -> &[ipnetwork::IpNetwork] {
+    pub(crate) fn untrusted_cidrs(&self) -> &[ipnetwork::IpNetwork] {
         &self.untrusted_cidrs_compiled
+    }
+
+    /// Decide whether a captured fingerprint is trustworthy.
+    ///
+    /// This is the single trust-classification decision for the sidecar
+    /// capture path; the request entry hook calls it and stores the
+    /// result on [`sbproxy_tls::TlsFingerprint::trustworthy`].
+    ///
+    /// `sidecar_override` is the parsed `x-sbproxy-tls-trustworthy`
+    /// header, `None` when the trusted sidecar did not assert one.
+    /// `client_ip` is the resolved client IP after the forwarded-header
+    /// trust boundary has run.
+    ///
+    /// The order is:
+    ///
+    /// 1. Start from the sidecar's assertion, defaulting to `true` when
+    ///    it made none. The sidecar only reaches this code from a peer
+    ///    in `proxy.trusted_proxies`, so absent any operator CIDR rules
+    ///    its capture is taken at face value.
+    /// 2. A client IP inside [`Self::untrusted_client_cidrs`] forces
+    ///    `false`, outranking the sidecar. That list is how an operator
+    ///    names CDN egress and corporate MITM pools.
+    /// 3. Otherwise, when [`Self::trustworthy_client_cidrs`] is
+    ///    non-empty, the answer is membership in it: an operator who
+    ///    took the trouble to enumerate direct-client ranges is stating
+    ///    that everything else is not a direct client. An empty trust
+    ///    list is not that statement, so it leaves step 1 standing.
+    ///
+    /// The `true` default in step 1 is deliberate and is pinned by
+    /// `trustworthy_defaults_to_true_without_an_override`. It is not the
+    /// conservative choice; it is the shipped one, and the capture path
+    /// is only reachable behind the trusted-peer check.
+    pub fn resolve_trustworthy(
+        &self,
+        sidecar_override: Option<bool>,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> bool {
+        let trustworthy = sidecar_override.unwrap_or(true);
+        let Some(ip) = client_ip else {
+            return trustworthy;
+        };
+        if sbproxy_security::ip_in_cidrs(&ip, self.untrusted_cidrs()) {
+            return false;
+        }
+        let trust_list = self.trustworthy_cidrs();
+        if trust_list.is_empty() {
+            return trustworthy;
+        }
+        sbproxy_security::ip_in_cidrs(&ip, trust_list)
     }
 
     /// Whether the named header should be honoured as a trust-bounded
@@ -1816,18 +1879,10 @@ impl CompiledPipeline {
 
         // Pre-parse trusted_proxies CIDRs once at compile time so the
         // request path can do a constant-time membership check.
-        let trusted_proxy_cidrs: Vec<ipnetwork::IpNetwork> = config
-            .server
-            .trusted_proxies
-            .iter()
-            .filter_map(|s| match s.parse::<ipnetwork::IpNetwork>() {
-                Ok(net) => Some(net),
-                Err(e) => {
-                    tracing::warn!(cidr = %s, error = %e, "ignoring invalid trusted_proxies CIDR");
-                    None
-                }
-            })
-            .collect();
+        let trusted_proxy_cidrs: Vec<ipnetwork::IpNetwork> = sbproxy_security::parse_cidrs(
+            config.server.trusted_proxies.iter().map(String::as_str),
+            "trusted_proxies",
+        );
 
         // Hash a stable view of the loaded origin set so webhook
         // receivers can tell which config revision fired the event. We
@@ -1877,20 +1932,10 @@ impl CompiledPipeline {
             .and_then(|v| v.get("allow_private_cidrs"))
             .and_then(|v| v.as_sequence())
             .map(|seq| {
-                seq.iter()
-                    .filter_map(|entry| entry.as_str())
-                    .filter_map(|s| match s.parse::<ipnetwork::IpNetwork>() {
-                        Ok(n) => Some(n),
-                        Err(e) => {
-                            tracing::warn!(
-                                cidr = %s,
-                                error = %e,
-                                "ignoring invalid upstream.allow_private_cidrs entry",
-                            );
-                            None
-                        }
-                    })
-                    .collect()
+                sbproxy_security::parse_cidrs(
+                    seq.iter().filter_map(|entry| entry.as_str()),
+                    "upstream.allow_private_cidrs",
+                )
             })
             .unwrap_or_default();
 
@@ -3786,6 +3831,135 @@ origins: {}
         assert_eq!(trustworthy_cidrs.len(), 1);
         let untrusted_cidrs = tls.untrusted_cidrs();
         assert_eq!(untrusted_cidrs.len(), 1);
+    }
+
+    // --- WOR-1699: trust classification on the fingerprint fast path ---
+    //
+    // These pin the behavior the request entry hook used to spell out
+    // inline. The consolidation onto `resolve_trustworthy` is only safe
+    // if the answers are unchanged, and the default in particular had
+    // nothing holding it in place: the one written-down default in the
+    // workspace lived on a dead `sbproxy-tls` helper that said `false`,
+    // the opposite of what ships.
+
+    fn tls_cfg_with(trustworthy: &[&str], untrusted: &[&str]) -> TlsFingerprintConfig {
+        let mut cfg = TlsFingerprintConfig {
+            enabled: true,
+            trustworthy_client_cidrs: trustworthy.iter().map(|s| s.to_string()).collect(),
+            untrusted_client_cidrs: untrusted.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        cfg.compile_cidrs();
+        cfg
+    }
+
+    #[test]
+    fn trustworthy_defaults_to_true_without_an_override() {
+        // The capture path is only reachable from a peer already in
+        // `proxy.trusted_proxies`, so an unqualified capture is taken at
+        // face value. Flipping this to `false` would silently drop every
+        // deployment that has a sidecar but no CIDR lists out of the
+        // trustworthy tier.
+        let cfg = tls_cfg_with(&[], &[]);
+        assert!(cfg.resolve_trustworthy(None, None), "no ip, no override");
+        assert!(
+            cfg.resolve_trustworthy(None, Some("203.0.113.10".parse().unwrap())),
+            "an ip that matches no rule does not lower the default"
+        );
+        // The default is exactly that, a default: the sidecar still wins.
+        assert!(!cfg.resolve_trustworthy(Some(false), None));
+        assert!(!cfg.resolve_trustworthy(Some(false), Some("203.0.113.10".parse().unwrap())));
+        assert!(cfg.resolve_trustworthy(Some(true), None));
+
+        // Same answer for the disabled default value of the type, which
+        // is what a config with no `tls_fingerprint` block produces.
+        assert!(TlsFingerprintConfig::default().resolve_trustworthy(None, None));
+    }
+
+    #[test]
+    fn untrusted_cidr_overrides_a_sidecar_trustworthy_header() {
+        // CDN egress and corporate MITM pools are named here, and the
+        // sidecar sitting inside one of them cannot vouch for itself.
+        let cfg = tls_cfg_with(&["203.0.113.0/24"], &["203.0.113.10/32"]);
+        assert!(!cfg.resolve_trustworthy(Some(true), Some("203.0.113.10".parse().unwrap())));
+        // Membership in untrusted beats membership in trustworthy.
+        assert!(cfg.resolve_trustworthy(None, Some("203.0.113.11".parse().unwrap())));
+    }
+
+    #[test]
+    fn a_configured_trust_list_decides_on_its_own() {
+        // A non-empty trustworthy list is the operator stating which
+        // ranges are direct clients, so a miss is a `false` even when
+        // the sidecar asserted `true`. An empty list is not that
+        // statement and leaves the default standing (asserted above).
+        let cfg = tls_cfg_with(&["203.0.113.0/24"], &[]);
+        assert!(cfg.resolve_trustworthy(None, Some("203.0.113.10".parse().unwrap())));
+        assert!(!cfg.resolve_trustworthy(Some(true), Some("198.51.100.10".parse().unwrap())));
+        // A match promotes a sidecar `false`, which is what the inline
+        // code did before the consolidation.
+        assert!(cfg.resolve_trustworthy(Some(false), Some("203.0.113.10".parse().unwrap())));
+    }
+
+    #[test]
+    fn ipv6_client_ips_classify_against_ipv6_cidrs() {
+        let cfg = tls_cfg_with(&["2001:db8::/32"], &[]);
+        assert!(cfg.resolve_trustworthy(None, Some("2001:db8::1".parse().unwrap())));
+        assert!(!cfg.resolve_trustworthy(None, Some("2001:dba::1".parse().unwrap())));
+    }
+
+    #[test]
+    fn invalid_cidr_entries_are_dropped_at_load_and_leave_the_rest_standing() {
+        let cfg = tls_cfg_with(&["bogus", "10.0.0.0/8"], &[]);
+        assert_eq!(cfg.trustworthy_cidrs().len(), 1);
+        assert!(cfg.resolve_trustworthy(None, Some("10.1.2.3".parse().unwrap())));
+    }
+
+    #[test]
+    fn fingerprint_cidrs_parse_at_config_load_and_never_per_request() {
+        // The whole point of the compiled fields: a config generation
+        // pays one parse per list, and the request path pays none. If a
+        // future refactor moves a `parse::<IpNetwork>()` back onto the
+        // classification path, this fails.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  extensions:
+    tls_fingerprint:
+      enabled: true
+      trustworthy_client_cidrs:
+        - 203.0.113.0/24
+      untrusted_client_cidrs:
+        - 198.51.100.0/24
+origins: {}
+"#;
+        let before = cidr_parse_count_on_this_thread();
+        let compiled = sbproxy_config::compile_config(yaml).expect("compile");
+        let tls = TlsFingerprintConfig::from_extensions(&compiled.server.extensions)
+            .expect("well-formed");
+        let after = cidr_parse_count_on_this_thread();
+        assert_eq!(after - before, 2, "one parse per configured list, at load");
+
+        let direct: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+        let cdn: std::net::IpAddr = "198.51.100.10".parse().unwrap();
+        for _ in 0..100 {
+            assert!(tls.resolve_trustworthy(None, Some(direct)));
+            assert!(!tls.resolve_trustworthy(Some(true), Some(cdn)));
+        }
+        assert_eq!(
+            cidr_parse_count_on_this_thread(),
+            after,
+            "no parse per classification"
+        );
+
+        // Cloning the config into a new pipeline generation does not
+        // re-parse either; the compiled sets come along.
+        let cloned = tls.clone();
+        assert!(cloned.resolve_trustworthy(None, Some(direct)));
+        assert_eq!(
+            cidr_parse_count_on_this_thread(),
+            after,
+            "no parse on clone"
+        );
     }
 
     // --- WOR-706: AgentDetectConfig roundtrip tests ---
