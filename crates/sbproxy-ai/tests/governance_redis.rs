@@ -76,7 +76,13 @@ fn state_scripts_are_one_key_redis_time_contracts() {
     assert!(COMMON_LUA.contains("HGETALL"));
     assert!(COMMON_LUA.contains("HDEL"));
 
-    for operation in [RESERVE_LUA, RENEW_LUA, SETTLE_LUA, RELEASE_LUA, SNAPSHOT_LUA] {
+    for operation in [
+        RESERVE_LUA,
+        RENEW_LUA,
+        SETTLE_LUA,
+        RELEASE_LUA,
+        SNAPSHOT_LUA,
+    ] {
         assert!(operation.contains("#KEYS ~= 1"));
         assert!(!operation.contains("KEYS[2]"));
         assert!(!operation.contains("redis.call('EVAL'"));
