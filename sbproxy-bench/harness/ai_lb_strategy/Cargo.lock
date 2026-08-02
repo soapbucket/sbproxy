@@ -4101,6 +4101,7 @@ dependencies = [
  "hex",
  "http",
  "ipnetwork",
+ "jsonschema",
  "mlua",
  "once_cell",
  "parking_lot",

@@ -945,6 +945,176 @@ impl FetchContext {
     }
 }
 
+/// One Git working tree requested by a callback-oriented consumer.
+///
+/// The credential field is a secret reference, never a secret value. The
+/// corresponding resolved value must already be present in
+/// [`FetchContext::credentials`]. Keeping the context in the request preserves
+/// the two-argument [`materialize_git_tree`] interface while allowing callers
+/// and tests to inject the existing cloning machinery.
+pub struct GitTreeRequest<'a> {
+    /// Repository URL before credential interpolation.
+    pub repo: &'a str,
+    /// Full commit SHA or signature-verified reference to materialize.
+    pub revision: Option<&'a str>,
+    /// Optional secret reference declared for this repository.
+    pub credential: Option<&'a str>,
+    /// Whether the selected revision must carry a verifiable signature.
+    pub verify_signature: bool,
+    /// Hard timeout for cloning and revision verification.
+    pub timeout: Duration,
+    /// Shared cloning, credential, and temporary-directory context.
+    pub fetch_context: &'a FetchContext,
+}
+
+impl std::fmt::Debug for GitTreeRequest<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GitTreeRequest")
+            .field("repo", &redact_repo(self.repo))
+            .field("revision", &self.revision)
+            .field("has_credential", &self.credential.is_some())
+            .field("verify_signature", &self.verify_signature)
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A verified Git checkout borrowed for the duration of one callback.
+pub struct MaterializedGitTree<'a> {
+    root: &'a Path,
+    revision: &'a ResolvedRevision,
+}
+
+impl MaterializedGitTree<'_> {
+    /// Return the root of the temporary checkout.
+    #[must_use]
+    pub const fn root(&self) -> &Path {
+        self.root
+    }
+
+    /// Return the verified resolved revision for this checkout.
+    #[must_use]
+    pub const fn revision(&self) -> &ResolvedRevision {
+        self.revision
+    }
+}
+
+/// Materialize a verified Git tree and invoke a callback while it exists.
+///
+/// Clone timeout, credential injection, revision pin verification, signature
+/// verification, and cleanup all use the same [`Cloner`] implementation as
+/// configuration sources. The temporary checkout is dropped after the
+/// callback returns, including when the callback returns an error.
+///
+/// # Errors
+///
+/// Returns the caller's error type for invalid requests, clone or verification
+/// failures, temporary-directory failures, and callback failures. A declared
+/// credential without a resolved value fails before any fetch is attempted.
+pub fn materialize_git_tree<T, E>(
+    request: GitTreeRequest<'_>,
+    callback: impl for<'tree> FnOnce(MaterializedGitTree<'tree>) -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<ConfigSourceError>,
+{
+    if request.repo.trim().is_empty() {
+        return Err(
+            ConfigSourceError::Invalid("Git tree repository must not be empty".to_owned()).into(),
+        );
+    }
+    if request.timeout.is_zero() || request.timeout > MAX_FETCH_TIMEOUT {
+        return Err(ConfigSourceError::Invalid(format!(
+            "Git tree timeout must be between 1 and {} seconds",
+            MAX_FETCH_TIMEOUT.as_secs()
+        ))
+        .into());
+    }
+
+    request.fetch_context.cloner.preflight().map_err(E::from)?;
+    let tempdir = request.fetch_context.new_tempdir().map_err(E::from)?;
+    let dest = tempdir.path().join("repo");
+    let scratch = tempdir.path().join("scratch");
+    std::fs::create_dir_all(&dest)
+        .map_err(|error| ConfigSourceError::Clone(format!("mkdir target: {error}")))
+        .map_err(E::from)?;
+    std::fs::create_dir_all(&scratch)
+        .map_err(|error| ConfigSourceError::Clone(format!("mkdir scratch: {error}")))
+        .map_err(E::from)?;
+
+    let resolved_credential = request
+        .credential
+        .and_then(|_| request.fetch_context.credentials.get(request.repo))
+        .map(String::as_str);
+    if request.credential.is_some() && resolved_credential.is_none() {
+        return Err(ConfigSourceError::Invalid(format!(
+            "a credential is declared for {} but no resolved credential was supplied",
+            redact_repo(request.repo)
+        ))
+        .into());
+    }
+    let authenticated_repo = repo_with_credential(request.repo, resolved_credential);
+    let fetch = FetchRequest {
+        repo: &authenticated_repo,
+        revision: request.revision,
+        timeout: request.timeout,
+        verify_signature: request.verify_signature,
+        dest: &dest,
+        scratch: &scratch,
+    };
+    let revision = request
+        .fetch_context
+        .cloner
+        .fetch(&fetch)
+        .map_err(|error| sanitize_materialization_error(error, resolved_credential))
+        .map_err(E::from)?;
+    callback(MaterializedGitTree {
+        root: &dest,
+        revision: &revision,
+    })
+}
+
+fn sanitize_materialization_error(
+    error: ConfigSourceError,
+    resolved_credential: Option<&str>,
+) -> ConfigSourceError {
+    fn clean(mut detail: String, credential: Option<&str>) -> String {
+        if let Some(credential) = credential.filter(|value| !value.is_empty()) {
+            detail = detail.replace(credential, "[redacted]");
+        }
+        scrub_credentials(&detail)
+    }
+
+    match error {
+        ConfigSourceError::Clone(detail) => {
+            ConfigSourceError::Clone(clean(detail, resolved_credential))
+        }
+        ConfigSourceError::Read(detail) => {
+            ConfigSourceError::Read(clean(detail, resolved_credential))
+        }
+        ConfigSourceError::Merge(detail) => {
+            ConfigSourceError::Merge(clean(detail, resolved_credential))
+        }
+        ConfigSourceError::MissingGitBinary(detail) => {
+            ConfigSourceError::MissingGitBinary(clean(detail, resolved_credential))
+        }
+        ConfigSourceError::Timeout(detail) => {
+            ConfigSourceError::Timeout(clean(detail, resolved_credential))
+        }
+        ConfigSourceError::RevisionMismatch(detail) => {
+            ConfigSourceError::RevisionMismatch(clean(detail, resolved_credential))
+        }
+        ConfigSourceError::Signature(detail) => {
+            ConfigSourceError::Signature(clean(detail, resolved_credential))
+        }
+        ConfigSourceError::Invalid(detail) => {
+            ConfigSourceError::Invalid(clean(detail, resolved_credential))
+        }
+        ConfigSourceError::RecursionLimit => ConfigSourceError::RecursionLimit,
+    }
+}
+
 /// Resolve a [`ConfigSource`] to a YAML/TOML config text.
 ///
 /// The result is the same flavour of text the caller would have
@@ -1192,53 +1362,27 @@ fn load_git(
         )));
     }
 
-    // Preflight before the tempdir so a host with no git says so
-    // instead of leaving an empty directory behind.
-    fetch_ctx.cloner.preflight()?;
-
-    let tempdir = fetch_ctx.new_tempdir()?;
-    let dest = tempdir.path().join("repo");
-    let scratch = tempdir.path().join("scratch");
-    std::fs::create_dir_all(&dest)
-        .map_err(|e| ConfigSourceError::Clone(format!("mkdir target: {e}")))?;
-    std::fs::create_dir_all(&scratch)
-        .map_err(|e| ConfigSourceError::Clone(format!("mkdir scratch: {e}")))?;
-
-    let resolved_credential = spec
-        .credential
-        .and_then(|_| fetch_ctx.credentials.get(spec.repo))
-        .map(String::as_str);
-    if spec.credential.is_some() && resolved_credential.is_none() {
-        return Err(ConfigSourceError::Invalid(format!(
-            "source.credential is set for {} but no resolved credential was supplied; the \
-             reference must resolve through a secret backend before the fetch runs",
-            redact_repo(spec.repo)
-        )));
-    }
-    let authenticated_repo = repo_with_credential(spec.repo, resolved_credential);
-
-    let request = FetchRequest {
-        repo: &authenticated_repo,
-        revision: spec.revision,
-        timeout: spec.timeout,
-        verify_signature: spec.verify_signature,
-        dest: &dest,
-        scratch: &scratch,
-    };
-    let resolved = fetch_ctx.cloner.fetch(&request)?;
-
-    let file_path = dest.join(relative);
-    let text = std::fs::read_to_string(&file_path).map_err(|e| {
-        ConfigSourceError::Read(format!(
-            "'{}' at {} in {}: {e}",
-            spec.path,
-            resolved.commit,
-            redact_repo(spec.repo)
-        ))
-    })?;
-    // `tempdir` is dropped here, cleaning up the cloned tree.
-    drop(tempdir);
-    Ok((text, resolved))
+    materialize_git_tree(
+        GitTreeRequest {
+            repo: spec.repo,
+            revision: spec.revision,
+            credential: spec.credential,
+            verify_signature: spec.verify_signature,
+            timeout: spec.timeout,
+            fetch_context: fetch_ctx,
+        },
+        |tree| {
+            let text = std::fs::read_to_string(tree.root().join(relative)).map_err(|error| {
+                ConfigSourceError::Read(format!(
+                    "'{}' at {} in {}: {error}",
+                    spec.path,
+                    tree.revision().commit,
+                    redact_repo(spec.repo)
+                ))
+            })?;
+            Ok((text, tree.revision().clone()))
+        },
+    )
 }
 
 /// Merge two YAML documents shallow-deep: maps are merged by key with
@@ -1640,5 +1784,100 @@ mod tests {
         assert!(err.to_string().contains("git"), "{err}");
         assert!(err.is_unreachable());
         assert_eq!(err.metric_label(), "unreachable");
+    }
+
+    #[test]
+    fn materialized_git_tree_lives_through_callback_then_is_removed() {
+        let mut repos: HashMapOfRepos = std::collections::HashMap::new();
+        repos.insert(
+            "https://example.test/extensions.git".into(),
+            vec![("bundles/a/bundle.yaml", "kind: Bundle\n")],
+        );
+        let (ctx, _cloner) = ctx_with(FixtureCloner::new(repos));
+        let observed = Arc::new(Mutex::new(None));
+        let capture = observed.clone();
+
+        let revision = materialize_git_tree(
+            GitTreeRequest {
+                repo: "https://example.test/extensions.git",
+                revision: Some(&"a".repeat(40)),
+                credential: None,
+                verify_signature: false,
+                timeout: Duration::from_secs(60),
+                fetch_context: &ctx,
+            },
+            move |tree| {
+                assert!(tree.root().join("bundles/a/bundle.yaml").is_file());
+                *capture.lock().unwrap() = Some(tree.root().to_owned());
+                Ok::<_, ConfigSourceError>(tree.revision().clone())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(revision.commit, "a".repeat(40));
+        let path = observed.lock().unwrap().clone().unwrap();
+        assert!(!path.exists(), "temporary checkout survived callback");
+    }
+
+    #[test]
+    fn materialized_git_tree_is_removed_when_callback_errors() {
+        let mut repos: HashMapOfRepos = std::collections::HashMap::new();
+        repos.insert(
+            "https://example.test/extensions.git".into(),
+            vec![("bundle.yaml", "kind: Bundle\n")],
+        );
+        let (ctx, _cloner) = ctx_with(FixtureCloner::new(repos));
+        let observed = Arc::new(Mutex::new(None));
+        let capture = observed.clone();
+
+        let error = materialize_git_tree(
+            GitTreeRequest {
+                repo: "https://example.test/extensions.git",
+                revision: Some(&"a".repeat(40)),
+                credential: None,
+                verify_signature: false,
+                timeout: Duration::from_secs(60),
+                fetch_context: &ctx,
+            },
+            move |tree| {
+                *capture.lock().unwrap() = Some(tree.root().to_owned());
+                Err::<(), _>(ConfigSourceError::Read(
+                    "fixture callback rejected tree".into(),
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ConfigSourceError::Read(_)));
+        let path = observed.lock().unwrap().clone().unwrap();
+        assert!(!path.exists(), "temporary checkout survived callback error");
+    }
+
+    #[test]
+    fn git_tree_request_debug_and_errors_hide_credentials() {
+        let mut repos: HashMapOfRepos = std::collections::HashMap::new();
+        repos.insert(
+            "https://example.test/private.git".into(),
+            vec![("bundle.yaml", "kind: Bundle\n")],
+        );
+        let (ctx, _cloner) = ctx_with(FixtureCloner::new(repos));
+        let pinned_revision = "a".repeat(40);
+        let request = GitTreeRequest {
+            repo: "https://secret-user@example.test/private.git",
+            revision: Some(&pinned_revision),
+            credential: Some("env:VERY_PRIVATE_TOKEN"),
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+            fetch_context: &ctx,
+        };
+
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("secret-user"), "{debug}");
+        assert!(!debug.contains("VERY_PRIVATE_TOKEN"), "{debug}");
+        let error = materialize_git_tree(request, |_| Ok::<_, ConfigSourceError>(())).unwrap_err();
+        let displayed = error.to_string();
+        assert!(displayed.contains("credential"), "{displayed}");
+        assert!(!displayed.contains("secret-user"), "{displayed}");
+        assert!(!displayed.contains("VERY_PRIVATE_TOKEN"), "{displayed}");
     }
 }

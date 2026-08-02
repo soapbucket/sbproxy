@@ -1,0 +1,15 @@
+//! Immutable extension bundle discovery and lookup.
+//!
+//! Candidate registries own executable bytes, parsed manifests, compiled
+//! configuration schemas, and safe provenance. Loading never mutates the
+//! process-wide static plugin registries.
+
+mod loader;
+mod registry;
+#[cfg(test)]
+mod tests;
+
+pub use loader::{BundleLoadError, DynamicBundleRegistry, MAX_BUNDLE_ARTIFACT_BYTES};
+pub use registry::{
+    BundleConfigValidationError, BundleProvenance, BundleRegistry, LoadedBundleHook,
+};

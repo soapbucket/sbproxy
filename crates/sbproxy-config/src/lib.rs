@@ -89,9 +89,9 @@ pub use schema::{config_json_schema, CONFIG_SCHEMA_FILE};
 pub use snapshot::*;
 pub use source::{
     credential_references, is_full_commit_sha, load_from_source, load_source_blocking,
-    parse_source_head, redact_repo, refresh_interval, resolve_document, scrub_credentials, Cloner,
-    ConfigSourceError, FetchContext, FetchRequest, GitBinaryCloner, ResolvedDocument,
-    ResolvedRevision, MAX_RECURSION_DEPTH,
+    materialize_git_tree, parse_source_head, redact_repo, refresh_interval, resolve_document,
+    scrub_credentials, Cloner, ConfigSourceError, FetchContext, FetchRequest, GitBinaryCloner,
+    GitTreeRequest, MaterializedGitTree, ResolvedDocument, ResolvedRevision, MAX_RECURSION_DEPTH,
 };
 pub use types::*;
 pub use validate::{
