@@ -12,6 +12,34 @@ the next version cut.
 
 ### Added
 
+- **A configured usage reporter now receives live proxy traffic.**
+  `proxy.payments.usage_reporters.stripe_meter` shipped with a reporter,
+  a durable queue, and a worker that drains it, and with nothing that
+  produced an event. An operator could configure the block, pass
+  validation, pass startup, serve traffic, and bill nothing. The request
+  path now enqueues each billable unit immediately after the meter
+  settles the request receipt, billing from that settlement rather than
+  re-deriving it, so a cache hit or a policy block is charged or not
+  charged according to the same outcome table the signed receipt used.
+  The HTTP call to the provider stays in the background worker: a served
+  request writes one durable row and stops, so no request ever waits on
+  Stripe. Two counters describe it, `sbproxy_usage_bridge_enqueued_total`
+  and `sbproxy_usage_bridge_gap_total`, both labelled by tenant. See
+  [`docs/payment-settlement.md`](docs/payment-settlement.md).
+
+  **`usage_reporters.stripe_meter` gains two required fields, `source`
+  and `unit` [BREAKING].** A config with a `stripe_meter` block and no
+  `source` no longer parses. There is deliberately no default: one
+  request can produce a request receipt, an AI usage record, and a
+  record per MCP tool call, and two of those can describe the same sale,
+  so billing both against one meter charges the customer twice. An
+  unstated answer there *is* the double charge, and a default would be
+  this proxy picking a side of a commercial argument on the operator's
+  behalf. Set `source` to `http`, `ai`, or `mcp`, and `unit` to the unit
+  that meter bills. An operator who wants both dimensions configures two
+  meter events. The block shipped one day before this change, so the
+  affected population should be close to nobody.
+
 - **mistral.rs is a subprocess engine kind.** `engine: mistralrs` drives the
   upstream v0.9 `mistralrs` CLI as a supervised subprocess over its
   OpenAI-compatible surface, acquired exactly like llama.cpp: PATH-first,
