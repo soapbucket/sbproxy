@@ -197,7 +197,7 @@ proxy:
     params:
       dsn: redis://localhost:6379
 
-  # Opaque per-server extensions consumed by enterprise / third-party crates.
+  # Opaque per-server extensions consumed by out-of-tree crates.
   extensions: { ... }
 
 # Agent classification catalog and resolver tuning
@@ -247,7 +247,7 @@ origins:
 | `access_log` | object | unset | Structured JSON access-log configuration. |
 | `agent_classes` | object | unset | Agent catalog selection and resolver tuning. |
 | `rate_limits` | object | unset | Workspace-wide budget and auto-suspend state. Separate from per-origin policies. |
-| `audit` | object | unset | Compatibility audit configuration. `audit.sink` is config-only; OSS audit rows remain in memory and tracing. |
+| `audit` | object | unset | Compatibility audit configuration. `audit.sink` is config-only; audit rows remain in memory and tracing. |
 | `session_ledger` | object | unset | MCP tool-call session-ledger emission. |
 | `flags` | list | `[]` | Process-wide feature flags exposed to CEL. |
 | `update` | object | stable channel, automatic checks off | Binary and managed-engine update policy. |
@@ -347,7 +347,7 @@ proxy:
 | `web_bot_auth` | object | unset | Process-wide Ed25519 identity for outbound Web Bot Auth signing and public-key discovery. |
 | `tenants` | list | `[]` | Declared tenants referenced by `origins.*.tenant_id`. |
 | `credentials` | list | `[]` | Proxy-scope credentials inherited by tenant and origin scopes. |
-| `extensions` | object | | Opaque map for enterprise / third-party top-level config blocks. OSS never parses these. |
+| `extensions` | object | | Opaque map for out-of-tree top-level config blocks. The proxy never parses them. |
 
 ### HTTP client timeouts
 
@@ -941,7 +941,7 @@ origins:
 | `web_bot_auth_publish` | object | | Publish a Web Bot Auth key directory and Signature Agent Card on this origin. |
 | `idempotency` | object | | RFC 8594 idempotency middleware. See [Idempotency](#idempotency). |
 | `connection_pool` | object | | Config-only. Pingora's built-in upstream pool settings apply. |
-| `extensions` | object | | Opaque map for enterprise / third-party origin-level blocks. |
+| `extensions` | object | | Opaque map for out-of-tree origin-level blocks. |
 | `expose_openapi` | bool | false | Publish this origin's generated OpenAPI document at its well-known paths. |
 | `stream_safety` | list | `[]` | Per-origin streaming-safety rule identifiers. |
 | `default_content_shape` | string | `html` | Default projection shape when the request has no concrete `Accept` preference. |
@@ -1015,7 +1015,7 @@ origins:
 | `properties.rollup_keys` | list | `[]` | Explicit property keys promoted into durable usage-rollup dimensions. At most five. |
 | `sessions.capture` | bool | `true` | Capture caller-supplied session and parent-session ULIDs. |
 | `sessions.auto_generate` | enum | `anonymous` | `never`, `anonymous`, or `always`. |
-| `sessions.ttl_seconds` | int | `86400` | Reserved compatibility hint. No OSS consumer expires the request ring from this value. |
+| `sessions.ttl_seconds` | int | `86400` | Reserved compatibility hint. Nothing in the runtime expires the request ring from this value. |
 | `sessions.budget` | object | unset | Optional per-workspace cap for automatically generated session IDs. Caller-supplied IDs are not gated. |
 | `user.capture` | bool | `true` | Capture the resolved user identifier. |
 | `user.max_length` | int | `256` | Maximum captured user-ID length. |
@@ -1940,7 +1940,7 @@ transparent configuration.
 
 ### storage
 
-Serve files from an object storage backend (S3, GCS, Azure Blob, or local filesystem). The OSS runtime builds an `object_store` backend at config-load time and serves `GET` and `HEAD` requests with content metadata, byte-range responses, and optional `index_file` fallback for directory paths. Unsupported methods return `405`, missing objects return `404`, and transient backend failures return `502`.
+Serve files from an object storage backend (S3, GCS, Azure Blob, or local filesystem). The runtime builds an `object_store` backend at config-load time and serves `GET` and `HEAD` requests with content metadata, byte-range responses, and optional `index_file` fallback for directory paths. Unsupported methods return `405`, missing objects return `404`, and transient backend failures return `502`.
 
 ```yaml
 origins:
@@ -2049,7 +2049,7 @@ The `authentication` block is a sibling of `action`, not nested inside it. It co
 
 `bot_auth` verifies cryptographically-signed AI agents per RFC 9421 + the IETF Web Bot Auth draft. Full reference: [web-bot-auth.md](web-bot-auth.md).
 
-Anything else falls through to the inventory-based auth plugin registry, so a linked third-party crate can register additional types (`oauth`, `oauth_introspection`, `oauth_client_credentials`, `ext_authz`, `biscuit`, `saml`, ...) without patching the OSS engine. Plugins register on the typed `AuthPluginRegistration` channel and surface through the standard `authentication.type` config field.
+Anything else falls through to the inventory-based auth plugin registry, so a linked third-party crate can register additional types (`oauth`, `oauth_introspection`, `oauth_client_credentials`, `ext_authz`, `biscuit`, `saml`, ...) without patching the proxy. Plugins register on the typed `AuthPluginRegistration` channel and surface through the standard `authentication.type` config field.
 
 ### api_key
 
@@ -2677,7 +2677,7 @@ policies:
 | `currency` | string | `USD` | ISO-4217 code surfaced in the challenge. |
 | `header` | string | `crawler-payment` | Header carrying the payment token. |
 | `crawler_user_agents` | list | major AI crawler defaults | Case-insensitive substring matches against User-Agent. Empty list treats every GET/HEAD as a crawler. |
-| `valid_tokens` | list | `[]` | Seeds the in-memory single-use ledger. Enterprise replaces this with an HTTP-callable ledger. |
+| `valid_tokens` | list | `[]` | Seeds the in-memory single-use ledger, which is per process. A fleet that has to spend one token across replicas configures the HTTP ledger client instead; see [ai-crawl-control.md](ai-crawl-control.md#http-ledger). |
 
 Only `GET` and `HEAD` are subject to charging. `POST`/`PUT`/`PATCH`/`DELETE` bypass.
 
@@ -2699,7 +2699,7 @@ policies:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `provider` | string | `static` | OSS only ships `static`. Enterprise extends with `hibp` (k-anonymity range query). |
+| `provider` | string | `static` | `static` is the only provider that ships. Any other value, `hibp` included, is rejected at config load. |
 | `action` | string | `tag` | `tag` stamps the configured header on the upstream request. `block` returns `403`. |
 | `header` | string | `exposed-credential-check` | Header name when `action: tag`. |
 | `passwords` | list | `[]` | Plaintext passwords. Hashed at compile time; the source strings are not retained on the policy. |
@@ -2710,7 +2710,7 @@ The policy refuses to compile when no list is supplied. SHA-1 uppercase hex matc
 
 ### page_shield
 
-Stamps a Content Security Policy header on every proxied response and runs an intake endpoint at `/__sbproxy/csp-report` for browser-emitted violation reports. Reports are logged structured under the `sbproxy::page_shield` tracing target so logpush sinks (and the enterprise Connection Monitor, F3.20) pick them up.
+Stamps a Content Security Policy header on every proxied response and runs an intake endpoint at `/__sbproxy/csp-report` for browser-emitted violation reports. Reports are logged structured under the `sbproxy::page_shield` tracing target so logpush sinks pick them up.
 
 ```yaml
 policies:
@@ -3898,7 +3898,7 @@ origins:
 ## Connection pool
 
 `origins.*.connection_pool` is retained for config compatibility but is not
-applied by the OSS runtime. Pingora's built-in upstream connection-pool
+applied by the runtime. Pingora's built-in upstream connection-pool
 behavior remains in effect regardless of the three parsed values. Do not use
 this block to enforce a connection cap, idle timeout, or maximum lifetime.
 
@@ -4136,7 +4136,7 @@ origins:
 | `headers.enabled` | bool | false | When true, emit `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` on responses. |
 | `headers.include_retry_after` | bool | false | When true, emit `Retry-After` on 429 responses. |
 
-The origin-level `rate_limit_headers` block is accepted for forward compatibility but ignored by the OSS runtime.
+The origin-level `rate_limit_headers` block is accepted for forward compatibility but ignored by the runtime.
 
 ---
 
@@ -4177,7 +4177,7 @@ origins:
 
 The `traffic_capture` block is reserved for request mirroring and capture configuration. There is no consumer for it in the open-source binary. The field is accepted on the origin so configs that target a future release or an external capture hook validate without errors. Set the block only when an out-of-tree component reads it.
 
-For shadow traffic that is wired into the OSS request path, use [`mirror`](#request-mirror) instead.
+For shadow traffic that is wired into the request path, use [`mirror`](#request-mirror) instead.
 
 ---
 
@@ -4661,7 +4661,7 @@ backend, schedule re-resolution, provide a dual-value grace window, or change
 failure behavior. Use [the named-backend guide](secrets.md) for every supported
 backend and URI shape.
 
-The `extensions` map at both the proxy and the origin level holds opaque blocks consumed by enterprise / third-party crates. OSS does not parse them.
+The `extensions` map at both the proxy and the origin level holds opaque blocks consumed by out-of-tree crates. The proxy does not parse them.
 
 ### Secret reference URI schemes
 

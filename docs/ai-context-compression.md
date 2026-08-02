@@ -1,6 +1,6 @@
 # AI context compression
 
-*Last modified: 2026-07-29*
+*Last modified: 2026-08-02*
 
 SBproxy can transform an AI chat request through an ordered, route-local
 compression pipeline before provider selection and dispatch. A route can keep
@@ -202,7 +202,7 @@ still runs against the unchanged input.
 
 ### Sidecar token pruning
 
-`token_prune` sends marked `format="text"` chunk bodies to the OSS classifier
+`token_prune` sends marked `format="text"` chunk bodies to the classifier
 sidecar's `Compress` RPC. The sidecar runs an operator-supplied
 LLMLingua-2-compatible token classifier and returns text assembled from source
 spans. SBproxy validates the returned counts, checks that the text is

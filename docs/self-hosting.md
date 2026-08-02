@@ -1,6 +1,6 @@
 # Self-hosting SBproxy
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-02*
 
 One binary to self-host your AI gateway, and the same binary runs the
 models. OpenRouter proved that teams want unified routing, fallbacks,
@@ -275,21 +275,21 @@ stores a fleet needs are in
 
 ## OpenRouter parity map
 
-What OpenRouter offers, the SBproxy equivalent, and what the enterprise
-tier adds on top. Honest about the gap: OpenRouter brokers a
-400-plus-model hosted marketplace; we route to 72 hosted providers plus
-your own GPUs.
+What OpenRouter offers and the SBproxy equivalent. Honest about the gap:
+OpenRouter brokers a 400-plus-model hosted marketplace; we route to 72
+hosted providers plus your own GPUs. Everything in the right-hand column
+is in the same Apache-2.0 binary.
 
-| OpenRouter | SBproxy | Enterprise adds |
-|---|---|---|
-| Unified API across providers | One OpenAI/Anthropic-shaped API across 72 providers plus local engines | Same |
-| Model catalog | Model manifest (source, pinning, digests, pull policy) | Curated allowlist, signed |
-| Fallback + provider routing preferences | Fallback chain, cost/latency routing, prefix-affinity, least-token-usage | GPU-aware and prefix-cache-aware routing across a node fleet |
-| Virtual keys | Virtual keys with per-key scopes | Tenants, RBAC |
-| Spend limits and accounting | Budgets, hierarchical quotas, usage ledger, dollars-saved report at `/admin/model-host/value` | Audit trail, per-tenant accounting |
-| Zero-data-retention routing | `no_prompt_training` provider flag + `x-sbproxy-disallow-prompt-training` request header | Air-gapped: guardrails, redaction, and generation all local |
-| Bring your own key | Provider keys plus a credential resolver (env, secret stores, vault) | Managed key rotation, mesh-distributed key cache |
-| 400-plus hosted-model marketplace | 72 hosted providers plus models on your GPUs | Same providers, fleet placement |
+| OpenRouter | SBproxy |
+|---|---|
+| Unified API across providers | One OpenAI/Anthropic-shaped API across 72 providers plus local engines |
+| Model catalog | Model manifest: source, pinning, sha256 digests, pull policy |
+| Fallback + provider routing preferences | Fallback chain, cost/latency routing, prefix-affinity, least-token-usage, and placement across a meshed node fleet |
+| Virtual keys | Virtual keys with per-key scopes and tenant RBAC, minted, revoked, and rotated at runtime, cached across the mesh |
+| Spend limits and accounting | Budgets, hierarchical quotas, per-tenant accounting, a hash-chained signed usage ledger, and a dollars-saved report at `/admin/model-host/value` |
+| Zero-data-retention routing | `no_prompt_training` provider flag, the `x-sbproxy-disallow-prompt-training` request header, and a fully air-gapped mode where guardrails, redaction, and generation all run on your own hardware |
+| Bring your own key | Provider keys plus a credential resolver (env, secret stores, vault) |
+| 400-plus hosted-model marketplace | 72 hosted providers plus models on your GPUs |
 
 ## Runnable examples
 

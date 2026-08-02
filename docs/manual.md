@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -1082,7 +1082,7 @@ In environments without cgroup CPU quotas (bare metal, macOS), the proxy falls b
 
 SBproxy initializes subsystems in a fixed order. A config or pipeline
 compile error aborts startup; most optional subsystems (telemetry, key
-plane, enterprise hooks) log and degrade instead of blocking.
+plane, pipeline lifecycle hooks) log and degrade instead of blocking.
 
 1. **Config load and compile**: reads the single YAML file named by
    `--config` / `SB_CONFIG_FILE`, interpolates `${ENV}` references, and
@@ -1586,7 +1586,7 @@ testing:
 
 ## 8. Connection tuning
 
-Pingora owns the OSS runtime's upstream connection pool. The legacy
+Pingora owns the runtime's upstream connection pool. The legacy
 per-origin `connection_pool` shape remains parseable for config compatibility,
 but none of its values are installed into Pingora today.
 
@@ -1666,7 +1666,7 @@ Status codes:
 | 500 | Pipeline compile or filesystem read failed. |
 | 503 | Admin server is running without a configured `config_path` (typical for embedded test fixtures). |
 
-The reload endpoint uses the same auth, IP filter, and rate limiter as the read-only admin routes. The single-flight guard means a manual reload during a file-watcher reload does not race; one wins, the other returns `409`. This is the integration point the OSS Kubernetes operator uses to drive hot-reload on `kubectl apply` instead of triggering a rolling restart - see [kubernetes.md](kubernetes.md).
+The reload endpoint uses the same auth, IP filter, and rate limiter as the read-only admin routes. The single-flight guard means a manual reload during a file-watcher reload does not race; one wins, the other returns `409`. This is the integration point the Kubernetes operator uses to drive hot-reload on `kubectl apply` instead of triggering a rolling restart - see [kubernetes.md](kubernetes.md).
 
 For the complete per-route schema of every admin endpoint (`/api/requests`, `/api/health`, `/api/health/targets`, `/api/stats`, `/api/openapi.{json,yaml}`, `/admin/reload`, `/admin/drift`, plus the unauthenticated probe routes), see [admin-api-reference.md](admin-api-reference.md).
 

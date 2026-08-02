@@ -1,6 +1,6 @@
 # Agent Skills v0.2.0
 
-*Last modified: 2026-05-09*
+*Last modified: 2026-08-02*
 
 SBproxy serves an Agent Skills v0.2.0 discovery manifest at
 `/.well-known/agent-skills/index.json`. Cooperative agents fetch the
@@ -202,6 +202,6 @@ visibility filter, and the digest contract end-to-end.
 ## See also
 
 - [`mcp.md`](mcp.md) for the broader MCP gateway story.
-- [`threat-model.md`](threat-model.md) for the OSS trust boundaries
+- [`threat-model.md`](threat-model.md) for the trust boundaries
   that constrain the digest verifier.
 - [`features.md`](features.md) for the projection family overview.

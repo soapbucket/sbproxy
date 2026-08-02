@@ -1,6 +1,6 @@
 # Admin UI
 
-*Last modified: 2026-07-30*
+*Last modified: 2026-08-02*
 
 The built-in admin UI is a Vue 3 + Vite single-page app that drives the
 same [admin API](admin-api-reference.md) any curl script can call. It
@@ -791,7 +791,7 @@ operator workflow in this table.
 
 | Capability without a dedicated view | Available today | Disposition |
 |---|---|---|
-| MCP servers, tools, versions, risk, and quarantine | Config, Logs, Metrics, and session linkage | Fold server/tool inventory and bounded failure reasons into the OSS Agent and Tool Traffic follow-up, WOR-2079. |
+| MCP servers, tools, versions, risk, and quarantine | Config, Logs, Metrics, and session linkage | Fold server/tool inventory and bounded failure reasons into the Agent and Tool Traffic follow-up, WOR-2079. |
 | A2A hops and denials; Agent Skills integrity | Config plus raw metrics and audit events | Fold runtime health into WOR-2079. Keep declarative Agent Skills authoring in Config. |
 | Agent identity and trust; AI crawler verification; RSL/CAP payment outcomes; Web Bot Auth | Overview health, Config, Logs, Metrics, Spend, and the bundled Grafana AI-traffic dashboard | Fold the embedded-console traffic and paid/blocked summaries into WOR-2079. Keep RSL terms and crawler policy authoring in Config. |
 | Outbound credentials and DPoP proofs | Credentials, Config, and redacted Logs | Keep proof policy declarative. Credential health remains a candidate under the broader console-coverage epic, WOR-1958. |

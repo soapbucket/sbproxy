@@ -1,6 +1,6 @@
 # How SBproxy compares
 
-*Last modified: 2026-07-27*
+*Last modified: 2026-08-02*
 
 SBproxy is an AI gateway that governs traffic in both directions. Most AI gateways only handle the calls your apps make out to models; SBproxy also governs the AI agents and crawlers coming in to your APIs and content, and because it is a real reverse proxy it handles the rest of your API traffic on the same runtime. This page is honest about where SBproxy fits and where you should pick something else.
 
@@ -110,7 +110,7 @@ SBproxy reaches 200+ models through 72 native providers behind one OpenAI-compat
 | Virtual keys hashed at rest + runtime revoke | Yes (HMAC + pepper, admin API) | Varies |
 | Upstream creds encrypted at rest | Yes (AEAD envelope or vault ref) | Varies |
 | Verifiable, signed usage ledger | Yes | No |
-| OSS clustering substrate (gossip mesh, no Postgres) | Yes | No |
+| Clustering substrate (gossip mesh, no Postgres) | Yes | No |
 | Scripting | CEL + Lua + WASM + JS | No |
 | Rate limiting | Built-in (node-local; cluster-wide needs a shared backend) | Built-in |
 | Response caching | Built-in (memory, file, memcached, redis) | 7 backends |

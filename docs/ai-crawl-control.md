@@ -1,5 +1,5 @@
 # AI Crawl Control + Pay Per Crawl
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 ![GPTBot receiving a 402 challenge, then the article after presenting a Crawler-Payment token](assets/ai-crawl-control.gif)
 
@@ -11,10 +11,10 @@ The implementation ships an in-memory ledger seeded from config and an HTTPS-onl
 
 ## Challenge body
 
-The OSS proxy emits two challenge shapes:
+The proxy emits two challenge shapes:
 
 1. **Single-rail (default).** A 402 with the `Crawler-Payment` header and a flat JSON body describing the price. This is the path legacy crawlers see.
-2. **Multi-rail (opt-in).** When the agent sends `Accept-Payment:` or one of the multi-rail `Accept` MIME types (`application/sbproxy-multi-rail+json`, `application/x402+json`, `application/mpp+json`), the OSS proxy emits a 402 with `Content-Type: application/sbproxy-multi-rail+json` and a body that lists one entry per rail the operator declared (x402, MPP, Lightning), each with its own quote-token JWS.
+2. **Multi-rail (opt-in).** When the agent sends `Accept-Payment:` or one of the multi-rail `Accept` MIME types (`application/sbproxy-multi-rail+json`, `application/x402+json`, `application/mpp+json`), the proxy emits a 402 with `Content-Type: application/sbproxy-multi-rail+json` and a body that lists one entry per rail the operator declared (x402, MPP, Lightning), each with its own quote-token JWS.
 
 This policy decides which requests are payable and what they cost. It does
 not settle payments. Settlement is a separate block, `proxy.payments`,
@@ -230,7 +230,7 @@ The first tier whose `route_pattern` matches wins. When no tier matches, the pol
 
 ## HTTP ledger
 
-The OSS in-memory ledger (`valid_tokens:`) is fine for tests, fixed-token issuance, or one-off content gates. Production deployments with multiple proxy replicas need a network-callable ledger so one token spends across all nodes. The HTTP ledger client speaks a JSON-over-HTTPS protocol with HMAC-SHA256 envelope signatures over a fixed eight-line canonical form.
+The in-memory ledger (`valid_tokens:`) is fine for tests, fixed-token issuance, or one-off content gates. Production deployments with multiple proxy replicas need a network-callable ledger so one token spends across all nodes. The HTTP ledger client speaks a JSON-over-HTTPS protocol with HMAC-SHA256 envelope signatures over a fixed eight-line canonical form.
 
 ```yaml
 policies:
@@ -418,7 +418,7 @@ What ships now: exemplars on `sbproxy_ledger_redeem_duration_seconds_bucket` car
 ## Limitations
 
 - Detection is User-Agent based by default. Crawlers that lie about their UA bypass the check unless reverse-DNS or Web Bot Auth signals catch them; layer this with bot-detection or WAF policies for defence in depth.
-- The OSS in-memory ledger is single-process. Multi-replica deployments without an HTTP ledger need sticky session affinity to one replica.
+- The in-memory ledger is single-process. Multi-replica deployments without an HTTP ledger need sticky session affinity to one replica.
 - `content_shape` is advisory. The field flows through metrics and the redeem payload but is not yet used as a tier filter.
 - Per-agent pricing requires the agent-class resolver to be enabled; the resolver runs unconditionally by default, but operators who explicitly disable it fall back to UA-only matching and lose the per-vendor distinction.
 

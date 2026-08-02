@@ -1,6 +1,6 @@
 # Migrating from LiteLLM
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-02*
 
 ![The importer translating a LiteLLM config, then a completion served through the migrated result](assets/migrate-litellm.gif)
 
@@ -81,7 +81,7 @@ sbproxy validate sb.yml
 | Unknown keys under `litellm_params`, `router_settings`, `litellm_settings`, `general_settings`, or the top-level document | warned (never silently dropped) |
 | `os.environ/VAR` (anywhere) | `${VAR}` |
 | `general_settings.master_key` | proxy authentication (configure manually) |
-| `general_settings.database_url` | runtime key/spend store (enterprise) |
+| `general_settings.database_url` | not needed: the runtime key/spend store is built in (`proxy.key_management.store`) |
 | `guardrails[]` | a built-in or external guardrail adapter (review per entry) |
 
 ## Worked example

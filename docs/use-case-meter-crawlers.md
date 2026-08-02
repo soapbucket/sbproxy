@@ -1,6 +1,6 @@
 # AI crawlers are reading your site for free
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-02*
 
 ![An unsigned crawler gets 401, a signed crawler gets a 402 price challenge, a payment token redeems once for a 200, and the replay is charged again](assets/use-case-meter-crawlers.gif)
 
@@ -12,7 +12,7 @@ One origin with two independent gates in front of it. The first gate is identity
 
 By the end you will have watched four requests on the wire: an unsigned crawler challenged with `401`, a signed crawler without payment challenged with `402`, the same crawler served with `200` after presenting a token, and the replayed token refused with a fresh `402`.
 
-This walkthrough uses the Apache-2.0 code in this repository. It covers 402 challenge bodies, multi-rail negotiation, quote-token JWS, and the two token ledgers: in-memory for one process and JSON over HTTPS for a fleet. Here, "paying" means redeeming a token seeded in the configuration. A production deployment issues tokens from its billing system through the HTTPS ledger client. Settlement adapters belong in the same OSS project as they become available.
+This walkthrough uses the Apache-2.0 code in this repository. It covers 402 challenge bodies, multi-rail negotiation, quote-token JWS, and the two token ledgers: in-memory for one process and JSON over HTTPS for a fleet. Here, "paying" means redeeming a token seeded in the configuration. A production deployment issues tokens from its billing system through the HTTPS ledger client. Settlement adapters live in the same binary behind per-rail cargo features; see [payment-settlement.md](payment-settlement.md).
 
 ## Prerequisites
 
@@ -92,7 +92,7 @@ This is the identity gate. Crawlers that participate in Web Bot Auth sign every 
           - demo-tok-003
 ```
 
-This is the meter. A `GET` or `HEAD` from any User-Agent on the list, arriving without a redeemable token in the `crawler-payment` header, gets a `402` whose body names the price and the retry header. `valid_tokens` seeds the OSS in-memory ledger: three tokens, each spendable once, per process. That is deliberate for a demo and wrong for a fleet; multiple replicas need the HTTPS ledger client from [ai-crawl-control.md](ai-crawl-control.md) so one token spends across all nodes. Because `bot_auth` runs first, the ledger only ever hears from crawlers whose identity already checked out.
+This is the meter. A `GET` or `HEAD` from any User-Agent on the list, arriving without a redeemable token in the `crawler-payment` header, gets a `402` whose body names the price and the retry header. `valid_tokens` seeds the in-memory ledger: three tokens, each spendable once, per process. That is deliberate for a demo and wrong for a fleet; multiple replicas need the HTTPS ledger client from [ai-crawl-control.md](ai-crawl-control.md) so one token spends across all nodes. Because `bot_auth` runs first, the ledger only ever hears from crawlers whose identity already checked out.
 
 ## Run it
 

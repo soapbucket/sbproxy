@@ -1,6 +1,6 @@
 # Listings
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-02*
 
 A `Listing` is a published, versioned view of an existing Resource (an
 origin, an MCP server, or a docs surface). Listings live in the same
@@ -73,7 +73,7 @@ Field reference:
 | `apiVersion` | yes | Must be `sbproxy.dev/v1`. |
 | `kind` | yes | Must be `Listing`. Other manifest kinds in the same `listings/` directory load as errors. |
 | `metadata.name` | yes | Unique within a single Repo. The plan path is `listings.<name>`. |
-| `metadata.labels` | no | Free-form label map. The OSS proxy does not interpret labels. |
+| `metadata.labels` | no | Free-form label map. The proxy does not interpret labels. |
 | `spec.type` | yes | One of `api`, `mcp`, `docs`. Other values pass parsing and surface as `unknown-listing-type` warnings so the schema can grow before the validator does. |
 | `spec.status` | yes | One of `draft`, `published`, `retired`. Other values surface as `unknown-listing-status` warnings. |
 | `spec.resources` | yes | Non-empty. Each entry references a Resource and pins a revision. |
@@ -109,8 +109,8 @@ revision:
   value: "abc1234"
 ```
 
-Plan-validation rule: the pinned SHA must exist in the Repo. The OSS
-proxy ships a no-op resolver that accepts every SHA so the plan
+Plan-validation rule: the pinned SHA must exist in the Repo. The proxy
+ships a no-op resolver that accepts every SHA so the plan
 surface stays self-contained; callers that link a real
 `RevisionResolver` (the future k8s controller, the hosted-Catalog
 surface) get the strict existence check.
@@ -159,7 +159,7 @@ Rules enforced today:
 - `invalid-listing-resource-ref` (error): the ref is not in
   `<kind>/<name>` form.
 - `forward-compatible-listing-resource` (warn): `mcp/<name>` or
-  `docs/<name>` references that the OSS schema does not yet wire up.
+  `docs/<name>` references that the schema does not yet wire up.
 - `missing-listing-revision-sha`,
   `missing-listing-revision-branch`,
   `missing-listing-revision-tag` (error): the revision pin does not
@@ -222,5 +222,5 @@ Run it like any other example:
 make run CONFIG=examples/listing-primitive/sb.yml
 ```
 
-The Listing is not on the data path in OSS today: it is the input the
+The Listing is not on the data path today: it is the input the
 hosted-Catalog surface and the agent-skills extension will consume.
