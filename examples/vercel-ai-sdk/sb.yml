@@ -1,0 +1,62 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# The gateway half of docs/vercel-ai-sdk.md, runnable without a provider
+# account. Same origin, credential, and allow list as the doc; the one
+# difference is that the openai provider points at a local OpenAI-shaped
+# fixture (fixture.py) instead of api.openai.com, so the wiring runs
+# end to end with no real key.
+#
+# The AI SDK client from the doc works against this config unchanged:
+#   createOpenAICompatible({ name: "sbproxy",
+#     baseURL: "http://127.0.0.1:8080/v1", apiKey: "sk-your-virtual-key" })
+#
+# Run:
+#   cd examples/vercel-ai-sdk
+#   docker compose up -d --wait
+#
+# Test (the curl equivalent of the doc's generateText call):
+#   curl -sS http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Content-Type: application/json' \
+#     -H 'Authorization: Bearer sk-your-virtual-key' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"In one sentence, what does an AI gateway do?"}]}'
+#
+# Test (a model outside the credential allow list is refused with 403):
+#   curl -sS -i http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Content-Type: application/json' \
+#     -H 'Authorization: Bearer sk-your-virtual-key' \
+#     -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Try the expensive model."}]}'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "127.0.0.1":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          provider_type: openai
+          # The fixture ignores the credential; the field exists because
+          # OpenAI-shaped provider configuration carries one. The doc's
+          # version of this file uses ${OPENAI_API_KEY} here instead.
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18080/v1
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+    credentials:
+      - name: ai-sdk-app
+        type: ai_provider
+        provider: openai
+        # Placeholder demo value so the doc's client snippet runs
+        # unchanged. Invent your own value in production and keep it
+        # identical in the client and here.
+        key: sk-your-virtual-key
+        attrs:
+          project: ai-sdk
+          tags: [ai-sdk-app]
+          budget:
+            max_tokens: 1000000
+            max_cost_usd: 25
+        models:
+          allow: [gpt-4o-mini]

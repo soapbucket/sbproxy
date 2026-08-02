@@ -21,14 +21,33 @@
 #   ai.budget.fraction, ai.budget.exceeded
 #   ai.tokens.input_est
 #
-# Setup:
-#   export OPENAI_API_KEY=sk-...
-#   make run CONFIG=examples/ai-policy-cel/sb.yml
+# `ai.principal.tier` is resolved from the request's attribution tags, and
+# attribution is stamped on the governed-credential path: the request must
+# authenticate with a declared credential (the virtual key below) for the
+# `SB-Attr-Risk-Tier` header to reach the policy. An unkeyed request has an
+# empty tier and never matches the "free" branch.
+#
+# The provider points at a local OpenAI-shaped fixture (fixture.py) that
+# echoes the dispatched model back, so both policy branches are observable
+# without a provider account.
+#
+# Run:
+#   cd examples/ai-policy-cel
+#   docker compose up -d --wait
 #
 # Test (a free-tier request for gpt-4o is rerouted to gpt-4o-mini):
 #   curl -s http://127.0.0.1:8080/v1/chat/completions \
 #     -H 'Host: ai.local' -H 'Content-Type: application/json' \
+#     -H 'Authorization: Bearer sk-demo-app-key' \
 #     -H 'SB-Attr-Risk-Tier: free' \
+#     -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}' \
+#     | jq -r '.model'
+#
+# Test (any other tier keeps the requested model):
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'Content-Type: application/json' \
+#     -H 'Authorization: Bearer sk-demo-app-key' \
+#     -H 'SB-Attr-Risk-Tier: standard' \
 #     -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}' \
 #     | jq -r '.model'
 
@@ -44,7 +63,12 @@ origins:
       providers:
         - name: openai
           provider_type: openai
-          api_key: ${OPENAI_API_KEY}
+          # The fixture ignores the credential; the field exists because
+          # OpenAI-shaped provider configuration carries one. Against the
+          # real provider this would be ${OPENAI_API_KEY}.
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18080/v1
+          allow_private_base_url: true
           default_model: gpt-4o-mini
           models:
             - gpt-4o
@@ -69,3 +93,19 @@ origins:
         # Defaults to allow (fail-open) so a policy bug cannot take the
         # gateway down.
         on_error: allow
+
+    # The governed credential that activates attribution. Requests
+    # authenticate with `Authorization: Bearer sk-demo-app-key`; the
+    # matched principal is what the `SB-Attr-Risk-Tier` header rides on,
+    # which is where `ai.principal.tier` comes from.
+    credentials:
+      - name: demo-app
+        type: ai_provider
+        provider: openai
+        # Placeholder demo value. Invent your own in production.
+        key: sk-demo-app-key
+        attrs:
+          project: cel-policy-demo
+          tags: [ai-policy-cel]
+        models:
+          allow: [gpt-4o, gpt-4o-mini]

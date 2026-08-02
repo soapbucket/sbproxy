@@ -1,0 +1,38 @@
+# Stack for the `ai-policy-cel` example. SBproxy shares the fixture
+# service's network namespace so the sb.yml can reach the OpenAI-shaped
+# fixture on 127.0.0.1:18080, and the fixture service publishes 8080
+# because the gateway owns that listener.
+#
+# Bring up:    docker compose up -d --wait
+# Tear down:   docker compose down -v
+
+services:
+  fixture:
+    image: python:3.12-alpine
+    command: ["python3", "/fixture.py"]
+    volumes:
+      - ./fixture.py:/fixture.py:ro
+    ports:
+      # SBproxy shares this service's network namespace, so this publishes it.
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+
+  sbproxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cloudbuild
+    image: sbproxy-ai-policy-cel:local
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    network_mode: service:fixture
+    environment:
+      FIXTURE_API_KEY: fixture-local-token
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    depends_on:
+      fixture:
+        condition: service_healthy

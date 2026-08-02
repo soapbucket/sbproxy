@@ -1,0 +1,25 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "cases": [
+    {
+      "name": "static body round-trips through the wasm echo module",
+      "request": {
+        "method": "GET",
+        "path": "/",
+        "headers": {
+          "Host": "wasm.local"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "headers": {
+          "content-type": "text/plain",
+          "content-length": "^18$"
+        }
+      }
+    }
+  ],
+  "audit_check": false
+}

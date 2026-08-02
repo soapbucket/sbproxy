@@ -1,0 +1,20 @@
+# Stack for the `wasm-transform` example. One container: the gateway
+# with the example config and the pre-built echo module mounted at the
+# same relative path the config uses (`examples/wasm/echo-rust/echo.wasm`,
+# resolved from the container's working directory `/`).
+#
+# Bring up:    docker compose up -d --wait
+# Tear down:   docker compose down -v
+
+services:
+  sbproxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cloudbuild
+    image: sbproxy-wasm-transform:local
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+      - ../wasm/echo-rust/echo.wasm:/examples/wasm/echo-rust/echo.wasm:ro

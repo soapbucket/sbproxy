@@ -1,6 +1,6 @@
 # AI policy plane (CEL)
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-08-02*
 
 The AI policy plane is one sandboxed CEL expression that expresses
 cross-cutting rules over the AI decision pipeline. Instead of spreading a
@@ -92,7 +92,7 @@ for the shared grammar and rejection rules.
 | `ai.provider` | string | Leading routing candidate. |
 | `ai.principal.tenant` | string | Tenant the request resolved to. |
 | `ai.principal.api_key_id` | string | Authenticated key id. |
-| `ai.principal.tier` | string | Principal risk tier (from the `SB-Attr-Risk-Tier` tag). |
+| `ai.principal.tier` | string | Principal risk tier (from the `SB-Attr-Risk-Tier` tag). Attribution tags are stamped on the governed-credential path, so the request must authenticate with a declared credential for the header to reach the policy; unkeyed requests have an empty tier. |
 | `ai.guardrails.flagged` | bool | Whether any enforcing security guardrail flagged the request. |
 | `ai.guardrails.flagged_count` | int | Number of enforcing security guardrails that flagged. |
 | `ai.guardrails.labels` | list | Security verdict labels plus non-enforcing routing labels such as prompt classes. |
@@ -115,7 +115,47 @@ produce the multi-verdict set and live burn rate the policy fuses.
 ## Try it
 
 The runnable example is in
-[`examples/ai-policy-cel/`](../examples/ai-policy-cel/).
+[`examples/ai-policy-cel/`](../examples/ai-policy-cel/). Its provider
+points at a local OpenAI-shaped fixture that echoes the dispatched model
+back, so both branches of the policy are observable without a provider
+account:
+
+```bash
+cd examples/ai-policy-cel
+docker compose up -d --wait
+```
+
+The example declares a `demo-app` credential because `ai.principal.tier`
+resolves from the request's attribution tags, and attribution is stamped
+on the governed-credential path: the `SB-Attr-Risk-Tier` header only
+reaches the policy on a request that authenticates with a declared
+credential. A free-tier request for the expensive model comes back
+rerouted:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.local' -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk-demo-app-key' \
+  -H 'SB-Attr-Risk-Tier: free' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}' \
+  | jq -r '.model'
+```
+
+<!-- CAPTURE: curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-demo-app-key' -H 'SB-Attr-Risk-Tier: free' -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}' | jq -r '.model' -->
+
+Any other tier takes the policy's else branch and keeps the requested
+model:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.local' -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk-demo-app-key' \
+  -H 'SB-Attr-Risk-Tier: standard' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}' \
+  | jq -r '.model'
+```
+
+<!-- CAPTURE: curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-demo-app-key' -H 'SB-Attr-Risk-Tier: standard' -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}' | jq -r '.model' -->
 
 ![a request without a tenant header rejected 403, then an unlisted X-Tenant: stranger rejected before any provider call](assets/ai-cel-tenant-gate.gif)
 

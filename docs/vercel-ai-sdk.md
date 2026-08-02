@@ -1,6 +1,6 @@
 # Vercel AI SDK with SBproxy
 
-*Last modified: 2026-07-12*
+*Last modified: 2026-08-02*
 
 An AI SDK application normally talks to providers directly: the provider package calls `api.openai.com`, and each MCP tool server is a separate connection with its own credentials. Point both sides at an SBproxy you run and every model call and every tool call crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. On the AI SDK side the change is one provider instance with a `baseURL` and one MCP client pointed at the gateway.
 
@@ -65,6 +65,34 @@ origins:
 Origin keys match the `Host` header and hostname matching strips the port, so `"127.0.0.1"` matches a client whose base URL is `http://127.0.0.1:8080`. When the gateway runs elsewhere, key the origin with the hostname your application uses. The real provider key comes from the environment through `${OPENAI_API_KEY}` interpolation; never put a raw provider key in the file.
 
 Be precise about what the virtual key does here. When a request arrives with `Authorization: Bearer sk-your-virtual-key`, the gateway matches it to the `ai-sdk-app` credential, enforces the `models.allow` list (a request for a model outside the list is rejected with 403 before any upstream call), stamps the request with the credential's `project` and `tags` for attribution in metrics and the ledger, and swaps in the real `${OPENAI_API_KEY}` before calling the provider. Your application never holds the provider key. The `attrs.budget` block is attribution metadata that surfaces as attribution labels on the `sbproxy_ai_*_attributed_total` metrics; enforced spend ceilings live in an action-level `budget:` block. The virtual key is not inbound authentication by itself either: anyone who can reach the listener and guess a key could present it, so add an `authentication` block to the origin when the gateway is reachable beyond localhost. [ai-gateway.md](ai-gateway.md) covers all of this in depth.
+
+## Run it without a provider account
+
+The repository ships this page's gateway config as a runnable example in [`examples/vercel-ai-sdk/`](../examples/vercel-ai-sdk/), with the `openai` provider pointed at a local OpenAI-shaped fixture instead of `api.openai.com`. The virtual key match, the `models.allow` gate, and the provider dispatch all run for real; only the model is canned (it answers `fixture response` and echoes the model name back). Boot it and send the curl equivalent of what `generateText` puts on the wire:
+
+```bash
+cd examples/vercel-ai-sdk
+docker compose up -d --wait
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk-your-virtual-key' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"In one sentence, what does an AI gateway do?"}]}'
+```
+
+<!-- CAPTURE: curl -sS http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-your-virtual-key' -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"In one sentence, what does an AI gateway do?"}]}' -->
+
+Ask for a model outside the credential's allow list and the gateway refuses before any upstream call:
+
+```bash
+curl -sS -i http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk-your-virtual-key' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Try the expensive model."}]}'
+```
+
+<!-- CAPTURE: curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-your-virtual-key' -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Try the expensive model."}]}' -->
+
+The `app.mjs` snippet above works against the same stack unchanged. `docker compose down -v` tears it down.
 
 ## MCP tools through the gateway
 

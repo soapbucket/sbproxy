@@ -1,6 +1,6 @@
 # LangChain with SBproxy
 
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-02*
 
 A LangChain application normally talks to providers directly: `langchain-openai` calls `api.openai.com`, and each tool server is a separate connection with its own credentials. Point both sides at an SBproxy you run and every model call and every tool call crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. On the LangChain side the change is a base URL on the model and one server entry for tools.
 
@@ -96,6 +96,34 @@ Either way, the request shows up in the gateway's access log, counts against the
 
 - `curl` is an alias for `Invoke-WebRequest` there, and it rejects flags like `-H`. Call `curl.exe` explicitly (real curl ships with Windows 10 and later).
 - `export` is a Unix shell builtin. Set the provider key with `$env:OPENAI_API_KEY = "sk-proj-..."` instead. When the gateway runs in Docker, pass the variable into the container with `-e OPENAI_API_KEY` or `--env-file secrets.env` on the `docker run` command line. If you write an env file, save it as UTF-8 without a byte order mark: Docker silently ignores every line of the UTF-16 files that Windows PowerShell 5's `>` redirection produces by default.
+
+## Run it without a provider account
+
+The repository ships this page's gateway config as a runnable example in [`examples/langchain/`](../examples/langchain/), with the `openai` provider pointed at a local OpenAI-shaped fixture instead of `api.openai.com`. The virtual key match, the `models.allow` gate, and the provider dispatch all run for real; only the model is canned (it answers `fixture response` and echoes the model name back). Boot it and send the same curl check as above:
+
+```bash
+cd examples/langchain
+docker compose up -d --wait
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk-your-virtual-key' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Say hello."}]}'
+```
+
+<!-- CAPTURE: curl -sS http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-your-virtual-key' -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Say hello."}]}' -->
+
+Ask for a model outside the credential's allow list and the gateway refuses before any upstream call:
+
+```bash
+curl -sS -i http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk-your-virtual-key' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Try the expensive model."}]}'
+```
+
+<!-- CAPTURE: curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-your-virtual-key' -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Try the expensive model."}]}' -->
+
+The `chat.py` script above works against the same stack unchanged. `docker compose down -v` tears it down.
 
 ## Anthropic and every other provider
 

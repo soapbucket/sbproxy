@@ -1,0 +1,56 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "cases": [
+    {
+      "name": "free tier asking for gpt-4o is rerouted to gpt-4o-mini",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Host": "ai.local",
+          "Content-Type": "application/json",
+          "Authorization": "Bearer sk-demo-app-key",
+          "SB-Attr-Risk-Tier": "free"
+        },
+        "body": {
+          "model": "gpt-4o",
+          "messages": [{"role": "user", "content": "Hi"}]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"model": "gpt-4o-mini", "choices": [{"message": {"content": "fixture response"}}]}
+        }
+      }
+    },
+    {
+      "name": "any other tier keeps the requested model",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Host": "ai.local",
+          "Content-Type": "application/json",
+          "Authorization": "Bearer sk-demo-app-key",
+          "SB-Attr-Risk-Tier": "standard"
+        },
+        "body": {
+          "model": "gpt-4o",
+          "messages": [{"role": "user", "content": "Hi"}]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"model": "gpt-4o", "choices": [{"message": {"content": "fixture response"}}]}
+        }
+      }
+    }
+  ],
+  "audit_check": false
+}

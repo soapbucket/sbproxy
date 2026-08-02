@@ -1,6 +1,6 @@
 # WASM transform development guide
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-02*
 
 This guide covers writing WebAssembly modules for sbproxy's `wasm`
 transform. Two minimal example modules live in `examples/wasm/`,
@@ -124,6 +124,23 @@ origins:
         timeout_ms: 500
         max_memory_pages: 256
 ```
+
+This is `examples/wasm-transform/sb.yml`, runnable as shipped against
+the checked-in echo module. Start it from the repository root (the
+relative `module_path` resolves from the working directory) and fetch
+the transformed body:
+
+```bash
+make run CONFIG=examples/wasm-transform/sb.yml
+curl -i -H 'Host: wasm.local' http://127.0.0.1:8080/
+```
+
+<!-- CAPTURE: curl -i -H 'Host: wasm.local' http://127.0.0.1:8080/ -->
+
+The static body went through the module's stdin and came back from its
+stdout unchanged, because echo copies one to the other. Any other
+wasm32-wasi binary in `module_path` does its own work in the same
+position.
 
 Field reference:
 

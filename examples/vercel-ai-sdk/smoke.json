@@ -1,0 +1,52 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "cases": [
+    {
+      "name": "the doc's generateText call reaches the fixture model",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer sk-your-virtual-key"
+        },
+        "body": {
+          "model": "gpt-4o-mini",
+          "messages": [{"role": "user", "content": "In one sentence, what does an AI gateway do?"}]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"model": "gpt-4o-mini", "choices": [{"message": {"content": "fixture response"}}]}
+        }
+      }
+    },
+    {
+      "name": "a model outside the credential allow list is refused before dispatch",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer sk-your-virtual-key"
+        },
+        "body": {
+          "model": "gpt-4o",
+          "messages": [{"role": "user", "content": "Try the expensive model."}]
+        }
+      },
+      "expect": {
+        "status": 403,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"error": "model 'gpt-4o' is not allowed for this key"}
+        }
+      }
+    }
+  ],
+  "audit_check": false
+}
