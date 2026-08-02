@@ -70,6 +70,7 @@ pub struct LoadedBundleHook {
     pub(crate) manifest: Arc<BundleManifest>,
     pub(crate) hook: BundleHook,
     pub(crate) artifact: Arc<[u8]>,
+    pub(crate) javascript_source: Option<Arc<str>>,
     pub(crate) sha256: String,
     pub(crate) config_validator: Option<Arc<JSONSchema>>,
     pub(crate) provenance: BundleProvenance,
@@ -105,6 +106,11 @@ impl LoadedBundleHook {
     #[must_use]
     pub fn artifact(&self) -> &[u8] {
         &self.artifact
+    }
+
+    /// Return the source prepared once for a JavaScript runtime hook.
+    pub(crate) fn prepared_javascript_source(&self) -> Option<&Arc<str>> {
+        self.javascript_source.as_ref()
     }
 
     /// Return the lowercase SHA-256 digest computed from [`Self::artifact`].

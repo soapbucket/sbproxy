@@ -21,6 +21,7 @@ use sbproxy_plugin::{
 };
 use sha2::{Digest, Sha256};
 
+use super::javascript::prepare_javascript_artifact;
 use super::registry::{lookup, BundleProvenance, BundleRegistry, LoadedBundleHook};
 
 /// Largest executable artifact accepted by the bundle loader.
@@ -33,7 +34,7 @@ pub struct BundleLoadError {
 }
 
 impl BundleLoadError {
-    fn new(stage: &'static str, detail: impl AsRef<str>) -> Self {
+    pub(crate) fn new(stage: &'static str, detail: impl AsRef<str>) -> Self {
         let prefix_len = "bundle.: ".len() + stage.len();
         Self {
             stage,
@@ -387,11 +388,21 @@ impl<'a> Candidate<'a> {
 
         let manifest = Arc::new(manifest);
         let mut prepared = Vec::with_capacity(hooks.len());
-        for hook in hooks {
+        for hook in &hooks {
             let key = (hook.kind, hook.type_name.clone());
-            let validator = compile_schema(&manifest.name, &hook)?;
-            prepared.push((key, hook, validator));
+            let validator = compile_schema(&manifest.name, hook)?;
+            prepared.push((key, hook.clone(), validator));
         }
+        let javascript_source = if manifest.runtime == BundleRuntime::Javascript {
+            Some(prepare_javascript_artifact(
+                &artifact,
+                &manifest.entry,
+                &hooks,
+                &manifest.sandbox,
+            )?)
+        } else {
+            None
+        };
 
         let source = provenance.source();
         let runtime = inventory_runtime(manifest.runtime);
@@ -408,6 +419,7 @@ impl<'a> Candidate<'a> {
                 manifest: manifest.clone(),
                 hook: hook.clone(),
                 artifact: artifact.clone(),
+                javascript_source: javascript_source.clone(),
                 sha256: digest.clone(),
                 config_validator: validator,
                 provenance: provenance.clone(),

@@ -24,6 +24,13 @@ mlua.workspace = true
 
 # JavaScript scripting engine
 rquickjs.workspace = true
+swc_common.workspace = true
+swc_ecma_ast.workspace = true
+swc_ecma_codegen.workspace = true
+swc_ecma_parser.workspace = true
+swc_ecma_transforms_base.workspace = true
+swc_ecma_transforms_typescript.workspace = true
+swc_ecma_visit.workspace = true
 
 # WebAssembly scripting engine (wasmtime + WASI).
 wasmtime.workspace = true

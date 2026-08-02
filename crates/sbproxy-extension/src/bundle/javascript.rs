@@ -1,0 +1,1709 @@
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
+
+use base64::Engine as _;
+use bytes::{Bytes, BytesMut};
+use rquickjs::promise::MaybePromise;
+use rquickjs::{Context, Function, Module, Object, Runtime, Value as JavascriptValue};
+use sbproxy_config::{BundleHook, BundleHookKind, BundleRuntime, BundleSandbox};
+use sbproxy_plugin::{
+    ActionHandler, ActionOutcome, PluginError, PluginResult, PolicyDecision, PolicyEnforcer,
+    TransformContext, TransformHandler,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use swc_common::{sync::Lrc, FileName, Globals, Mark, SourceMap, GLOBALS};
+use swc_ecma_ast::{Callee, EsVersion, ModuleDecl, Program};
+use swc_ecma_codegen::{text_writer::JsWriter, Config as CodegenConfig, Emitter};
+use swc_ecma_parser::{parse_file_as_module, EsSyntax, Syntax, TsSyntax};
+use swc_ecma_transforms_base::{fixer::fixer, resolver};
+use swc_ecma_transforms_typescript::strip;
+use swc_ecma_visit::{Visit, VisitWith};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+
+use super::{BundleLoadError, LoadedBundleHook};
+use crate::js::arm_watchdog;
+
+/// Version placed on every JavaScript hook request and response envelope.
+pub const JAVASCRIPT_ENVELOPE_VERSION: &str = "sbproxy-envelope/v1";
+
+const MAX_POLICY_MESSAGE_BYTES: usize = 4 * 1024;
+const MAX_ACTION_HEADERS: usize = 64;
+const MAX_JAVASCRIPT_WORKERS: usize = 4;
+const QUEUE_SLOTS_PER_WORKER: usize = 2;
+
+#[derive(Clone, Copy)]
+struct RuntimeLimits {
+    budget_ms: u64,
+    memory_bytes: usize,
+    stack_bytes: usize,
+    max_input_bytes: usize,
+    max_output_bytes: usize,
+}
+
+impl RuntimeLimits {
+    fn from_sandbox(sandbox: &BundleSandbox) -> Result<Self, BundleLoadError> {
+        Ok(Self {
+            budget_ms: sandbox.budget_ms,
+            memory_bytes: checked_limit(sandbox.memory_mb, 1024 * 1024, "memory")?,
+            stack_bytes: checked_limit(sandbox.stack_kb, 1024, "stack")?,
+            max_input_bytes: usize::try_from(sandbox.max_buffer_bytes)
+                .map_err(|_| BundleLoadError::new("javascript", "input limit is unsupported"))?,
+            max_output_bytes: usize::try_from(sandbox.max_output_bytes)
+                .map_err(|_| BundleLoadError::new("javascript", "output limit is unsupported"))?,
+        })
+    }
+}
+
+fn checked_limit(value: u64, multiplier: usize, name: &str) -> Result<usize, BundleLoadError> {
+    usize::try_from(value)
+        .ok()
+        .and_then(|value| value.checked_mul(multiplier))
+        .ok_or_else(|| BundleLoadError::new("javascript", format!("{name} limit is unsupported")))
+}
+
+#[derive(Clone)]
+struct JavascriptProgram {
+    source: Arc<str>,
+    export: Arc<str>,
+    hook_kind: &'static str,
+    type_name: Arc<str>,
+    config: Arc<Value>,
+    limits: RuntimeLimits,
+}
+
+impl std::fmt::Debug for JavascriptProgram {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JavascriptProgram")
+            .field("source_bytes", &self.source.len())
+            .field("export", &self.export)
+            .field("hook_kind", &self.hook_kind)
+            .field("type_name", &self.type_name)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeFailure {
+    Timeout,
+    Code(&'static str),
+}
+
+impl RuntimeFailure {
+    fn into_plugin_error(self) -> PluginError {
+        match self {
+            Self::Timeout => PluginError::Timeout,
+            Self::Code(code) => {
+                PluginError::Internal(anyhow::anyhow!("javascript bundle hook failed: {code}"))
+            }
+        }
+    }
+}
+
+struct JavascriptJob {
+    program: JavascriptProgram,
+    input: Vec<u8>,
+    reply: oneshot::Sender<Result<Vec<u8>, RuntimeFailure>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+struct JavascriptExecutor {
+    sender: mpsc::Sender<JavascriptJob>,
+    admission: Arc<Semaphore>,
+}
+
+impl JavascriptExecutor {
+    fn start(worker_count: usize, queue_capacity: usize) -> Self {
+        let worker_count = worker_count.max(1);
+        let queue_capacity = queue_capacity.max(1);
+        let (sender, receiver) = mpsc::channel(queue_capacity);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for worker_index in 0..worker_count {
+            let receiver = Arc::clone(&receiver);
+            std::thread::Builder::new()
+                .name(format!("sbproxy-js-worker-{worker_index}"))
+                .spawn(move || javascript_worker(receiver))
+                .expect("JavaScript worker thread should start");
+        }
+        Self {
+            sender,
+            admission: Arc::new(Semaphore::new(worker_count + queue_capacity)),
+        }
+    }
+
+    async fn execute(
+        &self,
+        program: JavascriptProgram,
+        input: Vec<u8>,
+    ) -> Result<Vec<u8>, RuntimeFailure> {
+        let permit = Arc::clone(&self.admission)
+            .acquire_owned()
+            .await
+            .map_err(|_| RuntimeFailure::Code("runtime_unavailable"))?;
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(JavascriptJob {
+                program,
+                input,
+                reply,
+                _permit: permit,
+            })
+            .await
+            .map_err(|_| RuntimeFailure::Code("runtime_unavailable"))?;
+        response
+            .await
+            .map_err(|_| RuntimeFailure::Code("runtime_unavailable"))?
+    }
+}
+
+fn default_executor() -> JavascriptExecutor {
+    let worker_count = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(2)
+        .clamp(1, MAX_JAVASCRIPT_WORKERS);
+    JavascriptExecutor::start(worker_count, worker_count * QUEUE_SLOTS_PER_WORKER)
+}
+
+static JAVASCRIPT_EXECUTOR: LazyLock<JavascriptExecutor> = LazyLock::new(default_executor);
+
+fn javascript_worker(receiver: Arc<Mutex<mpsc::Receiver<JavascriptJob>>>) {
+    let mut runtime = None;
+    loop {
+        let job = {
+            let mut receiver = receiver
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            receiver.blocking_recv()
+        };
+        let Some(job) = job else {
+            return;
+        };
+        if runtime.is_none() {
+            runtime = WorkerRuntime::new().ok();
+        }
+        let (result, poisoned) = match runtime.as_mut() {
+            Some(runtime) => runtime.invoke(&job.program, &job.input),
+            None => (Err(RuntimeFailure::Code("runtime_unavailable")), true),
+        };
+        if poisoned {
+            runtime = None;
+        }
+        let _ = job.reply.send(result);
+    }
+}
+
+struct WorkerRuntime {
+    runtime: Runtime,
+    interrupt: Arc<AtomicBool>,
+}
+
+enum InvokeFailure {
+    Guest,
+    OutputLimit,
+}
+
+impl From<rquickjs::Error> for InvokeFailure {
+    fn from(_: rquickjs::Error) -> Self {
+        Self::Guest
+    }
+}
+
+impl WorkerRuntime {
+    fn new() -> rquickjs::Result<Self> {
+        let runtime = Runtime::new()?;
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let handler_interrupt = Arc::clone(&interrupt);
+        runtime.set_interrupt_handler(Some(Box::new(move || {
+            handler_interrupt.load(Ordering::Relaxed)
+        })));
+        Ok(Self { runtime, interrupt })
+    }
+
+    fn invoke(
+        &mut self,
+        program: &JavascriptProgram,
+        input: &[u8],
+    ) -> (Result<Vec<u8>, RuntimeFailure>, bool) {
+        self.runtime.set_memory_limit(program.limits.memory_bytes);
+        self.runtime.set_max_stack_size(program.limits.stack_bytes);
+        let watchdog = arm_watchdog(
+            Arc::clone(&self.interrupt),
+            Duration::from_millis(program.limits.budget_ms),
+        );
+        let result = Context::full(&self.runtime)
+            .map_err(InvokeFailure::from)
+            .and_then(|context| {
+                context.with(|context| {
+                    invoke_in_context(
+                        &context,
+                        &program.source,
+                        &program.export,
+                        input,
+                        program.limits.max_output_bytes,
+                    )
+                })
+            })
+            .map_err(|failure| match failure {
+                InvokeFailure::Guest => RuntimeFailure::Code("guest_exception"),
+                InvokeFailure::OutputLimit => RuntimeFailure::Code("output_limit"),
+            });
+        let interrupted = watchdog.interrupted();
+        drop(watchdog);
+        self.interrupt.store(false, Ordering::Relaxed);
+        if interrupted {
+            return (Err(RuntimeFailure::Timeout), true);
+        }
+        let poisoned = result.is_err();
+        (result, poisoned)
+    }
+}
+
+fn invoke_in_context(
+    context: &rquickjs::Ctx<'_>,
+    source: &str,
+    export: &str,
+    input: &[u8],
+    max_output_bytes: usize,
+) -> Result<Vec<u8>, InvokeFailure> {
+    let globals = context.globals();
+    globals.remove("eval")?;
+    globals.remove("Function")?;
+
+    let module = Module::declare(context.clone(), "sbproxy-bundle.js", source.as_bytes())?;
+    let (module, ready) = module.eval()?;
+    ready.finish::<()>()?;
+    let function: Function = module.get(export)?;
+
+    let input = std::str::from_utf8(input).map_err(|_| InvokeFailure::Guest)?;
+    let json: Object = globals.get("JSON")?;
+    let parse: Function = json.get("parse")?;
+    let input: JavascriptValue = parse.call((input,))?;
+    let result: MaybePromise = function.call((input,))?;
+    let result: JavascriptValue = result.finish()?;
+    let stringify: Function = json.get("stringify")?;
+    let serialized: JavascriptValue = stringify.call((result,))?;
+    let serialized = serialized
+        .into_string()
+        .ok_or(rquickjs::Error::Unknown)?
+        .to_string()?;
+    if serialized.len() > max_output_bytes {
+        return Err(InvokeFailure::OutputLimit);
+    }
+    Ok(serialized.into_bytes())
+}
+
+fn preflight_exports(
+    source: &str,
+    exports: &[&str],
+    limits: RuntimeLimits,
+) -> Result<(), BundleLoadError> {
+    let runtime = WorkerRuntime::new()
+        .map_err(|_| BundleLoadError::new("javascript", "QuickJS runtime could not be created"))?;
+    runtime.runtime.set_memory_limit(limits.memory_bytes);
+    runtime.runtime.set_max_stack_size(limits.stack_bytes);
+    let watchdog = arm_watchdog(
+        Arc::clone(&runtime.interrupt),
+        Duration::from_millis(limits.budget_ms),
+    );
+    enum PreflightFailure {
+        Module,
+        Export,
+    }
+    let result = Context::full(&runtime.runtime)
+        .map_err(|_| PreflightFailure::Module)
+        .and_then(|context| {
+            context.with(|context| {
+                let globals = context.globals();
+                globals
+                    .remove("eval")
+                    .map_err(|_| PreflightFailure::Module)?;
+                globals
+                    .remove("Function")
+                    .map_err(|_| PreflightFailure::Module)?;
+                let module =
+                    Module::declare(context.clone(), "sbproxy-bundle.js", source.as_bytes())
+                        .map_err(|_| PreflightFailure::Module)?;
+                let (module, ready) = module.eval().map_err(|_| PreflightFailure::Module)?;
+                ready.finish::<()>().map_err(|_| PreflightFailure::Module)?;
+                for export in exports {
+                    let _: Function = module.get(*export).map_err(|_| PreflightFailure::Export)?;
+                }
+                Ok(())
+            })
+        });
+    let interrupted = watchdog.interrupted();
+    drop(watchdog);
+    if interrupted {
+        return Err(BundleLoadError::new(
+            "javascript",
+            "bundle initialization exceeded its time budget",
+        ));
+    }
+    result.map_err(|failure| match failure {
+        PreflightFailure::Module => {
+            BundleLoadError::new("javascript", "bundle module could not be evaluated")
+        }
+        PreflightFailure::Export => BundleLoadError::new(
+            "javascript",
+            "declared export is missing or is not a function",
+        ),
+    })
+}
+
+pub(super) fn prepare_javascript_artifact(
+    artifact: &[u8],
+    entry: &str,
+    hooks: &[BundleHook],
+    sandbox: &BundleSandbox,
+) -> Result<Arc<str>, BundleLoadError> {
+    let source = std::str::from_utf8(artifact)
+        .map_err(|_| BundleLoadError::new("javascript", "source must be UTF-8"))?;
+    let source = if entry.ends_with(".ts") {
+        transpile_typescript(source, entry)?
+    } else {
+        validate_direct_javascript(source, entry)?;
+        source.to_owned()
+    };
+    let exports = hooks
+        .iter()
+        .filter_map(|hook| hook.export.as_deref())
+        .collect::<Vec<_>>();
+    preflight_exports(&source, &exports, RuntimeLimits::from_sandbox(sandbox)?)?;
+    Ok(Arc::from(source))
+}
+
+/// Transpile one dependency-free TypeScript module to ES2020 JavaScript.
+///
+/// Imports are rejected because the proxy has no package manager or module
+/// resolver. A bundle that uses dependencies must supply one prebuilt flat
+/// JavaScript artifact.
+///
+/// # Errors
+///
+/// Returns a bounded load error for invalid TypeScript, imports, or code
+/// generation failures. Source text and filenames are not included in errors.
+pub fn transpile_typescript(source: &str, filename: &str) -> Result<String, BundleLoadError> {
+    let (source_map, program) =
+        parse_javascript_program(source, filename, Syntax::Typescript(TsSyntax::default()))?;
+    reject_imports(&program)?;
+    let program = GLOBALS.set(&Globals::default(), || {
+        let unresolved_mark = Mark::new();
+        let top_level_mark = Mark::new();
+        program
+            .apply(resolver(unresolved_mark, top_level_mark, true))
+            .apply(strip(unresolved_mark, top_level_mark))
+            .apply(fixer(None))
+    });
+
+    let mut output = Vec::new();
+    {
+        let mut emitter = Emitter {
+            cfg: CodegenConfig::default().with_target(EsVersion::Es2020),
+            cm: source_map.clone(),
+            comments: None,
+            wr: JsWriter::new(source_map, "\n", &mut output, None),
+        };
+        emitter
+            .emit_program(&program)
+            .map_err(|_| BundleLoadError::new("javascript", "TypeScript code generation failed"))?;
+    }
+    String::from_utf8(output)
+        .map_err(|_| BundleLoadError::new("javascript", "TypeScript output was not UTF-8"))
+}
+
+fn validate_direct_javascript(source: &str, filename: &str) -> Result<(), BundleLoadError> {
+    let (_, program) = parse_javascript_program(source, filename, Syntax::Es(EsSyntax::default()))?;
+    reject_imports(&program)
+}
+
+fn parse_javascript_program(
+    source: &str,
+    filename: &str,
+    syntax: Syntax,
+) -> Result<(Lrc<SourceMap>, Program), BundleLoadError> {
+    let source_map: Lrc<SourceMap> = Default::default();
+    let source_file = source_map.new_source_file(
+        FileName::Custom(filename.to_owned()).into(),
+        source.to_owned(),
+    );
+    let mut recovered = Vec::new();
+    let module = parse_file_as_module(
+        &source_file,
+        syntax,
+        EsVersion::Es2020,
+        None,
+        &mut recovered,
+    )
+    .map_err(|_| BundleLoadError::new("javascript", "source is not valid ES2020"))?;
+    if !recovered.is_empty() {
+        return Err(BundleLoadError::new(
+            "javascript",
+            "source is not valid ES2020",
+        ));
+    }
+    Ok((source_map, Program::Module(module)))
+}
+
+#[derive(Default)]
+struct ImportDetector {
+    found: bool,
+}
+
+impl Visit for ImportDetector {
+    fn visit_module_decl(&mut self, declaration: &ModuleDecl) {
+        self.found |= match declaration {
+            ModuleDecl::Import(_) | ModuleDecl::ExportAll(_) | ModuleDecl::TsImportEquals(_) => {
+                true
+            }
+            ModuleDecl::ExportNamed(named) => named.src.is_some(),
+            _ => false,
+        };
+        declaration.visit_children_with(self);
+    }
+
+    fn visit_call_expr(&mut self, expression: &swc_ecma_ast::CallExpr) {
+        self.found |= matches!(expression.callee, Callee::Import(_));
+        expression.visit_children_with(self);
+    }
+}
+
+fn reject_imports(program: &Program) -> Result<(), BundleLoadError> {
+    let mut detector = ImportDetector::default();
+    program.visit_with(&mut detector);
+    if detector.found {
+        return Err(BundleLoadError::new(
+            "javascript",
+            "imports are unavailable; bundle dependencies into one prebuilt single-file .js artifact",
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_program(
+    hook: &LoadedBundleHook,
+    expected_kind: BundleHookKind,
+    config: Value,
+) -> Result<(String, JavascriptProgram), BundleLoadError> {
+    if hook.manifest().runtime != BundleRuntime::Javascript || hook.hook().kind != expected_kind {
+        return Err(BundleLoadError::new(
+            "javascript",
+            "hook kind does not match the requested JavaScript adapter",
+        ));
+    }
+    let export = hook.hook().export.as_deref().ok_or_else(|| {
+        BundleLoadError::new("javascript", "JavaScript hook needs a declared export")
+    })?;
+    let mut config = config;
+    if let Some(schema) = hook.hook().config_schema.as_ref() {
+        apply_schema_defaults(&mut config, schema);
+    }
+    hook.validate_config(&config)
+        .map_err(|error| BundleLoadError::new("config", error.to_string()))?;
+
+    let source = hook.prepared_javascript_source().ok_or_else(|| {
+        BundleLoadError::new("javascript", "bundle has no prepared JavaScript artifact")
+    })?;
+    let limits = RuntimeLimits::from_sandbox(&hook.manifest().sandbox)?;
+    let type_name = hook.hook().type_name.clone();
+    Ok((
+        type_name.clone(),
+        JavascriptProgram {
+            source: Arc::clone(source),
+            export: Arc::from(export),
+            hook_kind: hook_kind_label(expected_kind),
+            type_name: Arc::from(type_name),
+            config: Arc::new(config),
+            limits,
+        },
+    ))
+}
+
+const fn hook_kind_label(kind: BundleHookKind) -> &'static str {
+    match kind {
+        BundleHookKind::Policy => "policy",
+        BundleHookKind::Transform => "transform",
+        BundleHookKind::Action => "action",
+        BundleHookKind::AiToolCall => "ai_tool_call",
+        BundleHookKind::AiGuardrailInput => "ai_guardrail_input",
+        BundleHookKind::AiGuardrailOutput => "ai_guardrail_output",
+        BundleHookKind::AiStreamEvent => "ai_stream_event",
+        BundleHookKind::AiClose => "ai_close",
+        BundleHookKind::ProxyWasm => "proxy_wasm",
+    }
+}
+
+fn apply_schema_defaults(value: &mut Value, schema: &Value) {
+    if value.is_null() {
+        if let Some(default) = schema.get("default") {
+            *value = default.clone();
+        }
+    }
+    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+        for branch in branches {
+            apply_schema_defaults(value, branch);
+        }
+    }
+    if let (Some(object), Some(properties)) = (
+        value.as_object_mut(),
+        schema.get("properties").and_then(Value::as_object),
+    ) {
+        for (name, property_schema) in properties {
+            if !object.contains_key(name) {
+                if let Some(default) = property_schema.get("default") {
+                    object.insert(name.clone(), default.clone());
+                }
+            }
+            if let Some(property_value) = object.get_mut(name) {
+                apply_schema_defaults(property_value, property_schema);
+            }
+        }
+    }
+    if let (Some(items), Some(item_schema)) = (value.as_array_mut(), schema.get("items")) {
+        for item in items {
+            apply_schema_defaults(item, item_schema);
+        }
+    }
+}
+
+fn request_value(request: &http::Request<Bytes>, maximum: usize) -> Result<Value, RuntimeFailure> {
+    if request.body().len() > maximum {
+        return Err(RuntimeFailure::Code("input_limit"));
+    }
+    let headers = request
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| json!([name.as_str(), value]))
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "method": request.method().as_str(),
+        "uri": request.uri().to_string(),
+        "headers": headers,
+        "body_base64": base64::engine::general_purpose::STANDARD.encode(request.body()),
+    }))
+}
+
+fn serialize_envelope(envelope: &Value, maximum: usize) -> Result<Vec<u8>, RuntimeFailure> {
+    let bytes = serde_json::to_vec(envelope).map_err(|_| RuntimeFailure::Code("input_invalid"))?;
+    if bytes.len() > maximum {
+        return Err(RuntimeFailure::Code("input_limit"));
+    }
+    Ok(bytes)
+}
+
+async fn invoke_program(
+    program: &JavascriptProgram,
+    envelope: Value,
+) -> Result<Vec<u8>, PluginError> {
+    let input = serialize_envelope(&envelope, program.limits.max_input_bytes)
+        .map_err(RuntimeFailure::into_plugin_error)?;
+    JAVASCRIPT_EXECUTOR
+        .execute(program.clone(), input)
+        .await
+        .map_err(RuntimeFailure::into_plugin_error)
+}
+
+fn hook_envelope(payload_name: &str, program: &JavascriptProgram, payload: Value) -> Value {
+    let mut envelope = json!({
+        "version": JAVASCRIPT_ENVELOPE_VERSION,
+        "hook": {
+            "kind": program.hook_kind,
+            "type": program.type_name.as_ref(),
+        },
+        "config": program.config.as_ref(),
+    });
+    envelope
+        .as_object_mut()
+        .expect("literal JavaScript envelope should be an object")
+        .insert(payload_name.to_owned(), payload);
+    envelope
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyWire {
+    version: String,
+    decision: String,
+    #[serde(default)]
+    status: Option<u16>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+}
+
+fn decode_policy(bytes: &[u8]) -> Result<PolicyDecision, RuntimeFailure> {
+    let response: PolicyWire =
+        serde_json::from_slice(bytes).map_err(|_| RuntimeFailure::Code("invalid_envelope"))?;
+    if response.version != JAVASCRIPT_ENVELOPE_VERSION {
+        return Err(RuntimeFailure::Code("invalid_version"));
+    }
+    match response.decision.as_str() {
+        "allow"
+            if response.status.is_none()
+                && response.message.is_none()
+                && response.headers.is_empty() =>
+        {
+            Ok(PolicyDecision::Allow)
+        }
+        "deny" => {
+            if !response.headers.is_empty() {
+                return Err(RuntimeFailure::Code("invalid_envelope"));
+            }
+            let status = response
+                .status
+                .filter(|status| (400..=599).contains(status))
+                .ok_or(RuntimeFailure::Code("invalid_envelope"))?;
+            let message = response
+                .message
+                .filter(|message| message.len() <= MAX_POLICY_MESSAGE_BYTES)
+                .ok_or(RuntimeFailure::Code("invalid_envelope"))?;
+            Ok(PolicyDecision::Deny { status, message })
+        }
+        "allow_with_headers" if response.status.is_none() && response.message.is_none() => {
+            validate_headers(&response.headers)?;
+            Ok(PolicyDecision::AllowWithHeaders {
+                headers: response.headers,
+            })
+        }
+        _ => Err(RuntimeFailure::Code("invalid_envelope")),
+    }
+}
+
+fn validate_headers(headers: &[(String, String)]) -> Result<(), RuntimeFailure> {
+    if headers.len() > MAX_ACTION_HEADERS {
+        return Err(RuntimeFailure::Code("invalid_envelope"));
+    }
+    for (name, value) in headers {
+        http::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| RuntimeFailure::Code("invalid_envelope"))?;
+        http::header::HeaderValue::from_str(value)
+            .map_err(|_| RuntimeFailure::Code("invalid_envelope"))?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransformWire {
+    version: String,
+    body_base64: String,
+}
+
+fn decode_body(bytes: &[u8], maximum: usize) -> Result<Vec<u8>, RuntimeFailure> {
+    let response: TransformWire =
+        serde_json::from_slice(bytes).map_err(|_| RuntimeFailure::Code("invalid_envelope"))?;
+    if response.version != JAVASCRIPT_ENVELOPE_VERSION {
+        return Err(RuntimeFailure::Code("invalid_version"));
+    }
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(response.body_base64)
+        .map_err(|_| RuntimeFailure::Code("invalid_envelope"))?;
+    if body.len() > maximum {
+        return Err(RuntimeFailure::Code("output_limit"));
+    }
+    Ok(body)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionWire {
+    version: String,
+    outcome: String,
+    #[serde(default)]
+    status: Option<u16>,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+    #[serde(default)]
+    body_base64: Option<String>,
+}
+
+fn decode_action(bytes: &[u8], maximum: usize) -> Result<ActionOutcome, RuntimeFailure> {
+    let response: ActionWire =
+        serde_json::from_slice(bytes).map_err(|_| RuntimeFailure::Code("invalid_envelope"))?;
+    if response.version != JAVASCRIPT_ENVELOPE_VERSION {
+        return Err(RuntimeFailure::Code("invalid_version"));
+    }
+    match response.outcome.as_str() {
+        "proxy"
+            if response.status.is_none()
+                && response.headers.is_empty()
+                && response.body_base64.is_none() =>
+        {
+            Ok(ActionOutcome::Proxy)
+        }
+        "response" => {
+            let status = response
+                .status
+                .filter(|status| (100..=599).contains(status))
+                .ok_or(RuntimeFailure::Code("invalid_envelope"))?;
+            validate_headers(&response.headers)?;
+            let body = response
+                .body_base64
+                .ok_or(RuntimeFailure::Code("invalid_envelope"))
+                .and_then(|body| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(body)
+                        .map_err(|_| RuntimeFailure::Code("invalid_envelope"))
+                })?;
+            if body.len() > maximum {
+                return Err(RuntimeFailure::Code("output_limit"));
+            }
+            Ok(ActionOutcome::Response {
+                status,
+                headers: response.headers,
+                body: Bytes::from(body),
+            })
+        }
+        _ => Err(RuntimeFailure::Code("invalid_envelope")),
+    }
+}
+
+/// Buffered JavaScript policy adapter backed by the shared worker pool.
+pub struct JavascriptPolicyAdapter {
+    type_name: String,
+    program: JavascriptProgram,
+}
+
+impl std::fmt::Debug for JavascriptPolicyAdapter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JavascriptPolicyAdapter")
+            .field("type_name", &self.type_name)
+            .field("program", &self.program)
+            .finish()
+    }
+}
+
+/// Build a policy adapter from a validated JavaScript bundle hook.
+///
+/// # Errors
+///
+/// Returns a bounded load error for a mismatched hook, invalid attachment
+/// config, invalid source, missing export, or failed module initialization.
+pub fn build_javascript_policy(
+    hook: &LoadedBundleHook,
+    config: Value,
+) -> Result<JavascriptPolicyAdapter, BundleLoadError> {
+    let (type_name, program) = prepare_program(hook, BundleHookKind::Policy, config)?;
+    Ok(JavascriptPolicyAdapter { type_name, program })
+}
+
+impl PolicyEnforcer for JavascriptPolicyAdapter {
+    fn policy_type(&self) -> &str {
+        &self.type_name
+    }
+
+    fn enforce(
+        &self,
+        request: &http::Request<Bytes>,
+        _context: &mut dyn std::any::Any,
+    ) -> Pin<Box<dyn std::future::Future<Output = PluginResult<PolicyDecision>> + Send + '_>> {
+        let request = request_value(request, self.program.limits.max_input_bytes);
+        Box::pin(async move {
+            let request = request.map_err(RuntimeFailure::into_plugin_error)?;
+            let output = invoke_program(
+                &self.program,
+                hook_envelope("request", &self.program, request),
+            )
+            .await?;
+            decode_policy(&output).map_err(RuntimeFailure::into_plugin_error)
+        })
+    }
+}
+
+/// Buffered JavaScript body-transform adapter backed by the shared worker pool.
+pub struct JavascriptTransformAdapter {
+    type_name: String,
+    program: JavascriptProgram,
+}
+
+impl std::fmt::Debug for JavascriptTransformAdapter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JavascriptTransformAdapter")
+            .field("type_name", &self.type_name)
+            .field("program", &self.program)
+            .finish()
+    }
+}
+
+/// Build a transform adapter from a validated JavaScript bundle hook.
+///
+/// # Errors
+///
+/// Returns a bounded load error under the same contract as
+/// [`build_javascript_policy`].
+pub fn build_javascript_transform(
+    hook: &LoadedBundleHook,
+    config: Value,
+) -> Result<JavascriptTransformAdapter, BundleLoadError> {
+    let (type_name, program) = prepare_program(hook, BundleHookKind::Transform, config)?;
+    Ok(JavascriptTransformAdapter { type_name, program })
+}
+
+impl TransformHandler for JavascriptTransformAdapter {
+    fn transform_type(&self) -> &str {
+        &self.type_name
+    }
+
+    fn apply<'a>(
+        &'a self,
+        body: &'a mut BytesMut,
+        content_type: Option<&'a str>,
+        context: &'a TransformContext<'a>,
+    ) -> Pin<Box<dyn std::future::Future<Output = PluginResult<()>> + Send + 'a>> {
+        let input = if body.len() > self.program.limits.max_input_bytes {
+            Err(RuntimeFailure::Code("input_limit"))
+        } else {
+            Ok(json!({
+                "body_base64": base64::engine::general_purpose::STANDARD.encode(&body[..]),
+                "content_type": content_type,
+                "origin": context.origin,
+            }))
+        };
+        Box::pin(async move {
+            let input = input.map_err(RuntimeFailure::into_plugin_error)?;
+            let output =
+                invoke_program(&self.program, hook_envelope("body", &self.program, input)).await?;
+            let replacement = decode_body(&output, self.program.limits.max_output_bytes)
+                .map_err(RuntimeFailure::into_plugin_error)?;
+            body.clear();
+            body.extend_from_slice(&replacement);
+            Ok(())
+        })
+    }
+}
+
+/// Buffered JavaScript action adapter backed by the shared worker pool.
+pub struct JavascriptActionAdapter {
+    type_name: String,
+    program: JavascriptProgram,
+}
+
+impl std::fmt::Debug for JavascriptActionAdapter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JavascriptActionAdapter")
+            .field("type_name", &self.type_name)
+            .field("program", &self.program)
+            .finish()
+    }
+}
+
+/// Build an action adapter from a validated JavaScript bundle hook.
+///
+/// # Errors
+///
+/// Returns a bounded load error under the same contract as
+/// [`build_javascript_policy`].
+pub fn build_javascript_action(
+    hook: &LoadedBundleHook,
+    config: Value,
+) -> Result<JavascriptActionAdapter, BundleLoadError> {
+    let (type_name, program) = prepare_program(hook, BundleHookKind::Action, config)?;
+    Ok(JavascriptActionAdapter { type_name, program })
+}
+
+impl ActionHandler for JavascriptActionAdapter {
+    fn handler_type(&self) -> &str {
+        &self.type_name
+    }
+
+    fn handle(
+        &self,
+        request: &mut http::Request<Bytes>,
+        _context: &mut dyn std::any::Any,
+    ) -> Pin<Box<dyn std::future::Future<Output = PluginResult<ActionOutcome>> + Send + '_>> {
+        let request = request_value(request, self.program.limits.max_input_bytes);
+        Box::pin(async move {
+            let request = request.map_err(RuntimeFailure::into_plugin_error)?;
+            let output = invoke_program(
+                &self.program,
+                hook_envelope("request", &self.program, request),
+            )
+            .await?;
+            decode_action(&output, self.program.limits.max_output_bytes)
+                .map_err(RuntimeFailure::into_plugin_error)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use bytes::{Bytes, BytesMut};
+    use sbproxy_config::{BundleHookKind, ExtensionBundlesConfig};
+    use sbproxy_plugin::{
+        ActionHandler, ActionOutcome, PolicyDecision, PolicyEnforcer, TransformContext,
+        TransformHandler,
+    };
+    use serde_json::{json, Value};
+    use tempfile::TempDir;
+
+    use super::{
+        build_javascript_action, build_javascript_policy, build_javascript_transform,
+        decode_policy, hook_envelope, prepare_program, request_value, serialize_envelope,
+        transpile_typescript, JavascriptExecutor, JAVASCRIPT_ENVELOPE_VERSION,
+    };
+    use crate::bundle::{BundleRegistry, DynamicBundleRegistry, LoadedBundleHook};
+
+    struct HookFixture {
+        _directory: TempDir,
+        registry: Arc<DynamicBundleRegistry>,
+        kind: BundleHookKind,
+        type_name: String,
+    }
+
+    impl HookFixture {
+        fn hook(&self) -> &LoadedBundleHook {
+            match self.kind {
+                BundleHookKind::Policy => self.registry.policy(&self.type_name),
+                BundleHookKind::Transform => self.registry.transform(&self.type_name),
+                BundleHookKind::Action => self.registry.action(&self.type_name),
+                _ => unreachable!("fixture supports request hooks only"),
+            }
+            .expect("fixture hook should be loaded")
+        }
+    }
+
+    fn fixture(
+        kind: BundleHookKind,
+        entry: &str,
+        source: &str,
+        sandbox: &str,
+        config_schema: &str,
+    ) -> HookFixture {
+        try_fixture(kind, entry, source, sandbox, config_schema).expect("fixture should load")
+    }
+
+    fn try_fixture(
+        kind: BundleHookKind,
+        entry: &str,
+        source: &str,
+        sandbox: &str,
+        config_schema: &str,
+    ) -> Result<HookFixture, crate::bundle::BundleLoadError> {
+        let directory = TempDir::new().unwrap();
+        let bundle = directory.path().join("fixture");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let kind_name = match kind {
+            BundleHookKind::Policy => "policy",
+            BundleHookKind::Transform => "transform",
+            BundleHookKind::Action => "action",
+            _ => unreachable!("fixture supports request hooks only"),
+        };
+        let type_name = format!("javascript_{kind_name}_fixture");
+        std::fs::write(bundle.join(entry), source).unwrap();
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            format!(
+                "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: javascript-fixture\nversion: 1.0.0\nruntime: javascript\nentry: {entry}\nhooks:\n  - kind: {kind_name}\n    type: {type_name}\n    export: run\n{config_schema}{sandbox}"
+            ),
+        )
+        .unwrap();
+        let config = ExtensionBundlesConfig {
+            bundles_dir: Some(directory.path().display().to_string()),
+            sources: Vec::new(),
+        };
+        let registry = DynamicBundleRegistry::load(&config, directory.path(), &BTreeSet::new())?;
+        Ok(HookFixture {
+            _directory: directory,
+            registry,
+            kind,
+            type_name,
+        })
+    }
+
+    fn request(body: &'static [u8]) -> http::Request<Bytes> {
+        http::Request::builder()
+            .method("POST")
+            .uri("https://test.sbproxy.dev/widgets")
+            .header("x-plan", "free")
+            .body(Bytes::from_static(body))
+            .unwrap()
+    }
+
+    fn allow_source() -> &'static str {
+        include_str!("testdata/javascript/direct-policy.js")
+    }
+
+    #[test]
+    fn javascript_transpiles_typescript_once_for_es2020() {
+        let output = transpile_typescript(
+            r#"
+                type Input = { user?: { plan?: string } };
+                export function run(input: Input): string {
+                    return input.user?.plan ?? "free";
+                }
+            "#,
+            "entry.ts",
+        )
+        .unwrap();
+
+        assert!(!output.contains("type Input"));
+        assert!(!output.contains("input: Input"));
+        assert!(output.contains("input.user?.plan ?? \"free\""));
+    }
+
+    #[test]
+    fn javascript_candidate_keeps_one_prepared_typescript_artifact() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.ts",
+            include_str!("testdata/javascript/typed-policy.ts"),
+            "",
+            "",
+        );
+        let prepared = fixture
+            .hook()
+            .prepared_javascript_source()
+            .expect("JavaScript hook should retain prepared source");
+        assert!(!prepared.contains("type Input"));
+        assert!(prepared.contains("input.config?.enabled"));
+    }
+
+    #[test]
+    fn javascript_rejects_typescript_imports_with_build_guidance() {
+        let error = transpile_typescript(
+            "import { thing } from 'dependency'; export function run() { return thing; }",
+            "entry.ts",
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "bundle.javascript: imports are unavailable; bundle dependencies into one prebuilt single-file .js artifact"
+        );
+    }
+
+    #[test]
+    fn javascript_loads_a_direct_javascript_export() {
+        let fixture = fixture(BundleHookKind::Policy, "entry.js", allow_source(), "", "");
+        let adapter = build_javascript_policy(fixture.hook(), json!({})).unwrap();
+        assert_eq!(adapter.policy_type(), fixture.type_name);
+    }
+
+    #[test]
+    fn javascript_rejects_direct_imports_reexports_and_dynamic_imports() {
+        let sources = [
+            "import { thing } from 'dependency'; export function run() { return thing; }",
+            "export { thing } from 'dependency'; export function run() { return {}; }",
+            "export function run() { return import('dependency'); }",
+        ];
+        for source in sources {
+            let error = match try_fixture(BundleHookKind::Policy, "entry.js", source, "", "") {
+                Ok(_) => panic!("importing fixture should fail candidate load"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.to_string(),
+                "bundle.javascript: imports are unavailable; bundle dependencies into one prebuilt single-file .js artifact"
+            );
+        }
+    }
+
+    #[test]
+    fn javascript_rejects_a_missing_manifest_export() {
+        let error = match try_fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            "export function another_name() { return {}; }",
+            "",
+            "",
+        ) {
+            Ok(_) => panic!("missing export should fail candidate load"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "bundle.javascript: declared export is missing or is not a function"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_policy_allows_and_denies() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                export function run(input) {
+                    const free = input.request.headers.some(
+                        ([name, value]) => name === "x-plan" && value === "free"
+                    );
+                    return free
+                        ? { version: "sbproxy-envelope/v1", decision: "deny", status: 403, message: "upgrade required" }
+                        : { version: "sbproxy-envelope/v1", decision: "allow" };
+                }
+            "#,
+            "",
+            "",
+        );
+        let adapter = build_javascript_policy(fixture.hook(), json!({})).unwrap();
+        let mut context = ();
+
+        let denied = adapter
+            .enforce(&request(b"hello"), &mut context)
+            .await
+            .unwrap();
+        assert_eq!(
+            denied,
+            PolicyDecision::Deny {
+                status: 403,
+                message: "upgrade required".to_owned(),
+            }
+        );
+
+        let paid = http::Request::builder()
+            .uri("https://test.sbproxy.dev/widgets")
+            .header("x-plan", "paid")
+            .body(Bytes::new())
+            .unwrap();
+        assert_eq!(
+            adapter.enforce(&paid, &mut context).await.unwrap(),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_envelope_identifies_hook_and_keeps_config_top_level() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                export function run(input) {
+                    const valid = input.version === "sbproxy-envelope/v1"
+                        && input.hook.kind === "policy"
+                        && input.hook.type === "javascript_policy_fixture"
+                        && !("config" in input.hook)
+                        && input.config.threshold === 3
+                        && input.request.method === "POST";
+                    return valid
+                        ? { version: "sbproxy-envelope/v1", decision: "allow" }
+                        : { version: "sbproxy-envelope/v1", decision: "deny", status: 500, message: "wrong envelope" };
+                }
+            "#,
+            "",
+            "",
+        );
+        let adapter = build_javascript_policy(fixture.hook(), json!({"threshold": 3})).unwrap();
+        let mut context = ();
+        assert_eq!(
+            adapter.enforce(&request(b""), &mut context).await.unwrap(),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_policy_supports_bounded_allow_headers() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                export function run() {
+                    return {
+                        version: "sbproxy-envelope/v1",
+                        decision: "allow_with_headers",
+                        headers: [["sunset", "Wed, 21 Oct 2026 07:28:00 GMT"]]
+                    };
+                }
+            "#,
+            "",
+            "",
+        );
+        let adapter = build_javascript_policy(fixture.hook(), json!({})).unwrap();
+        let mut context = ();
+        assert_eq!(
+            adapter.enforce(&request(b""), &mut context).await.unwrap(),
+            PolicyDecision::AllowWithHeaders {
+                headers: vec![(
+                    "sunset".to_owned(),
+                    "Wed, 21 Oct 2026 07:28:00 GMT".to_owned()
+                )]
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_policy_rejects_unbounded_or_invalid_allow_headers() {
+        let fixtures = [
+            fixture(
+                BundleHookKind::Policy,
+                "entry.js",
+                r#"
+                    export function run() {
+                        return {
+                            version: "sbproxy-envelope/v1",
+                            decision: "allow_with_headers",
+                            headers: Array.from({ length: 65 }, () => ["x-bundle", "ok"])
+                        };
+                    }
+                "#,
+                "",
+                "",
+            ),
+            fixture(
+                BundleHookKind::Policy,
+                "entry.js",
+                r#"
+                    export function run() {
+                        return {
+                            version: "sbproxy-envelope/v1",
+                            decision: "allow_with_headers",
+                            headers: [["bad header", "value"]]
+                        };
+                    }
+                "#,
+                "",
+                "",
+            ),
+            fixture(
+                BundleHookKind::Policy,
+                "entry.js",
+                r#"
+                    export function run() {
+                        return {
+                            version: "sbproxy-envelope/v1",
+                            decision: "allow_with_headers",
+                            headers: [["x-bundle", "bad\r\nvalue"]]
+                        };
+                    }
+                "#,
+                "",
+                "",
+            ),
+        ];
+        for fixture in fixtures {
+            let adapter = build_javascript_policy(fixture.hook(), json!({})).unwrap();
+            let mut context = ();
+            let error = adapter
+                .enforce(&request(b""), &mut context)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "javascript bundle hook failed: invalid_envelope"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_transform_replaces_a_buffered_body() {
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"rewritten");
+        let fixture = fixture(
+            BundleHookKind::Transform,
+            "entry.js",
+            &format!(
+                "export function run(input) {{ return {{ version: \"{JAVASCRIPT_ENVELOPE_VERSION}\", body_base64: \"{encoded}\" }}; }}"
+            ),
+            "",
+            "",
+        );
+        let adapter = build_javascript_transform(fixture.hook(), json!({})).unwrap();
+        let mut body = BytesMut::from(&b"original"[..]);
+        adapter
+            .apply(
+                &mut body,
+                Some("text/plain"),
+                &TransformContext::new("test.sbproxy.dev"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"rewritten");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_action_returns_a_bounded_structured_response() {
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"queued");
+        let fixture = fixture(
+            BundleHookKind::Action,
+            "entry.js",
+            &format!(
+                r#"export function run(input) {{
+                    return {{
+                        version: "{JAVASCRIPT_ENVELOPE_VERSION}",
+                        outcome: "response",
+                        status: 202,
+                        headers: [["content-type", "text/plain"]],
+                        body_base64: "{encoded}"
+                    }};
+                }}"#
+            ),
+            "",
+            "",
+        );
+        let adapter = build_javascript_action(fixture.hook(), json!({})).unwrap();
+        let mut req = request(b"");
+        let mut context = ();
+        let outcome = adapter.handle(&mut req, &mut context).await.unwrap();
+        assert_eq!(
+            outcome,
+            ActionOutcome::Response {
+                status: 202,
+                headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+                body: Bytes::from_static(b"queued"),
+            }
+        );
+    }
+
+    #[test]
+    fn javascript_applies_schema_defaults_before_validation() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                export function run(input) {
+                    if (input.config.threshold === 3) {
+                        return { version: "sbproxy-envelope/v1", decision: "allow" };
+                    }
+                    return { version: "sbproxy-envelope/v1", decision: "deny", status: 500, message: "default missing" };
+                }
+            "#,
+            "",
+            "    config_schema:\n      type: object\n      additionalProperties: false\n      required: [threshold]\n      properties:\n        threshold:\n          type: integer\n          default: 3\n",
+        );
+        build_javascript_policy(fixture.hook(), json!({})).unwrap();
+    }
+
+    #[test]
+    fn javascript_rejects_attachment_config_that_misses_its_schema() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            allow_source(),
+            "",
+            "    config_schema:\n      type: object\n      additionalProperties: false\n      required: [threshold]\n      properties:\n        threshold:\n          type: integer\n",
+        );
+        let error =
+            build_javascript_policy(fixture.hook(), json!({"threshold": "three"})).unwrap_err();
+        assert!(error
+            .to_string()
+            .starts_with("bundle.config: bundle hook configuration is invalid: value at `"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_reports_thrown_exceptions_without_guest_text() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            "export function run() { throw new Error('private guest detail'); }",
+            "",
+            "",
+        );
+        let adapter = build_javascript_policy(fixture.hook(), json!({})).unwrap();
+        let mut context = ();
+        let error = adapter
+            .enforce(&request(b""), &mut context)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "javascript bundle hook failed: guest_exception"
+        );
+        assert!(!error.to_string().contains("private guest detail"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_accepts_an_async_export_without_host_io() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                export async function run() {
+                    await Promise.resolve();
+                    return { version: "sbproxy-envelope/v1", decision: "allow" };
+                }
+            "#,
+            "",
+            "",
+        );
+        let adapter = build_javascript_policy(fixture.hook(), json!({})).unwrap();
+        let mut context = ();
+        assert_eq!(
+            adapter.enforce(&request(b""), &mut context).await.unwrap(),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_rejects_a_response_from_another_envelope_version() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                export function run() {
+                    return { version: "sbproxy-envelope/v2", decision: "allow" };
+                }
+            "#,
+            "",
+            "",
+        );
+        let adapter = build_javascript_policy(fixture.hook(), json!({})).unwrap();
+        let mut context = ();
+        let error = adapter
+            .enforce(&request(b""), &mut context)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "javascript bundle hook failed: invalid_version"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_interrupts_a_runaway_hook() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            "export function run() { while (true) {} }",
+            "sandbox:\n  budget_ms: 10\n",
+            "",
+        );
+        let adapter = build_javascript_policy(fixture.hook(), json!({})).unwrap();
+        let mut context = ();
+        let started = Instant::now();
+        let error = adapter
+            .enforce(&request(b""), &mut context)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, sbproxy_plugin::PluginError::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_enforces_the_output_cap() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                export function run() {
+                    return { version: "sbproxy-envelope/v1", decision: "allow", padding: "x".repeat(5000) };
+                }
+            "#,
+            "sandbox:\n  max_output_bytes: 256\n",
+            "",
+        );
+        let adapter = build_javascript_policy(fixture.hook(), json!({})).unwrap();
+        let mut context = ();
+        let error = adapter
+            .enforce(&request(b""), &mut context)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "javascript bundle hook failed: output_limit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_enforces_the_serialized_input_cap() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            allow_source(),
+            "sandbox:\n  max_buffer_bytes: 256\n",
+            "",
+        );
+        let adapter = build_javascript_policy(fixture.hook(), json!({})).unwrap();
+        let request = http::Request::builder()
+            .uri("https://test.sbproxy.dev/widgets")
+            .body(Bytes::from(vec![b'x'; 300]))
+            .unwrap();
+        let mut context = ();
+        let error = adapter.enforce(&request, &mut context).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "javascript bundle hook failed: input_limit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_enforces_the_memory_ceiling_and_recovers() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                export function run(input) {
+                    if (input.config.allocate) {
+                        const chunks = [];
+                        while (true) chunks.push(new ArrayBuffer(1048576));
+                    }
+                    return { version: "sbproxy-envelope/v1", decision: "allow" };
+                }
+            "#,
+            "sandbox:\n  budget_ms: 500\n  memory_mb: 4\n",
+            "",
+        );
+        let allocating =
+            build_javascript_policy(fixture.hook(), json!({"allocate": true})).unwrap();
+        let healthy = build_javascript_policy(fixture.hook(), json!({"allocate": false})).unwrap();
+        let mut context = ();
+        let error = allocating
+            .enforce(&request(b""), &mut context)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "javascript bundle hook failed: guest_exception"
+        );
+        assert_eq!(
+            healthy.enforce(&request(b""), &mut context).await.unwrap(),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_discards_a_poisoned_single_worker_runtime() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                export function run(input) {
+                    if (input.config.runaway) while (true) {}
+                    return { version: "sbproxy-envelope/v1", decision: "allow" };
+                }
+            "#,
+            "sandbox:\n  budget_ms: 10\n",
+            "",
+        );
+        let (_, runaway) = prepare_program(
+            fixture.hook(),
+            BundleHookKind::Policy,
+            json!({"runaway": true}),
+        )
+        .unwrap();
+        let (_, healthy) = prepare_program(
+            fixture.hook(),
+            BundleHookKind::Policy,
+            json!({"runaway": false}),
+        )
+        .unwrap();
+        let executor = JavascriptExecutor::start(1, 1);
+        let request = request_value(&request(b""), runaway.limits.max_input_bytes).unwrap();
+        let runaway_input = hook_envelope("request", &runaway, request.clone());
+        let runaway_input =
+            serialize_envelope(&runaway_input, runaway.limits.max_input_bytes).unwrap();
+        assert_eq!(
+            executor.execute(runaway, runaway_input).await,
+            Err(super::RuntimeFailure::Timeout)
+        );
+
+        let healthy_input = hook_envelope("request", &healthy, request);
+        let healthy_input =
+            serialize_envelope(&healthy_input, healthy.limits.max_input_bytes).unwrap();
+        let output = executor.execute(healthy, healthy_input).await.unwrap();
+        assert_eq!(decode_policy(&output).unwrap(), PolicyDecision::Allow);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_does_not_carry_globals_between_requests() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                let calls = 0;
+                export function run() {
+                    calls += 1;
+                    return calls === 1
+                        ? { version: "sbproxy-envelope/v1", decision: "allow" }
+                        : { version: "sbproxy-envelope/v1", decision: "deny", status: 500, message: "state leaked" };
+                }
+            "#,
+            "",
+            "",
+        );
+        let adapter = build_javascript_policy(fixture.hook(), json!({})).unwrap();
+        let mut context = ();
+        for _ in 0..2 {
+            assert_eq!(
+                adapter.enforce(&request(b""), &mut context).await.unwrap(),
+                PolicyDecision::Allow
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_pool_saturation_does_not_block_a_tokio_worker() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                export function run() {
+                    const until = Date.now() + 40;
+                    while (Date.now() < until) {}
+                    return { version: "sbproxy-envelope/v1", decision: "allow" };
+                }
+            "#,
+            "sandbox:\n  budget_ms: 200\n",
+            "",
+        );
+        let adapter = Arc::new(
+            build_javascript_policy(fixture.hook(), Value::Object(Default::default())).unwrap(),
+        );
+        let ticker = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Instant::now()
+        });
+        let mut calls = Vec::new();
+        for _ in 0..32 {
+            let adapter = Arc::clone(&adapter);
+            calls.push(tokio::spawn(async move {
+                let mut context = ();
+                adapter.enforce(&request(b""), &mut context).await
+            }));
+        }
+        let ticked_at = tokio::time::timeout(Duration::from_millis(150), ticker)
+            .await
+            .expect("Tokio timer should run while JavaScript admission waits")
+            .unwrap();
+        assert!(ticked_at.elapsed() < Duration::from_secs(1));
+        for call in calls {
+            call.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "local benchmark"]
+    async fn javascript_bundle_benchmark() {
+        let mut cold_load_us = Vec::new();
+        for _ in 0..20 {
+            let started = Instant::now();
+            let fixture = fixture(BundleHookKind::Policy, "entry.js", allow_source(), "", "");
+            let _adapter = build_javascript_policy(fixture.hook(), json!({})).unwrap();
+            cold_load_us.push(started.elapsed().as_micros());
+        }
+
+        let fixture = fixture(BundleHookKind::Policy, "entry.js", allow_source(), "", "");
+        let adapter = build_javascript_policy(fixture.hook(), json!({})).unwrap();
+        let mut context = ();
+        for _ in 0..50 {
+            adapter.enforce(&request(b""), &mut context).await.unwrap();
+        }
+        let mut warm_us = Vec::new();
+        for _ in 0..500 {
+            let started = Instant::now();
+            adapter.enforce(&request(b""), &mut context).await.unwrap();
+            warm_us.push(started.elapsed().as_micros());
+        }
+        cold_load_us.sort_unstable();
+        warm_us.sort_unstable();
+        let cold_median = cold_load_us[cold_load_us.len() / 2];
+        let warm_p50 = warm_us[warm_us.len() / 2];
+        let warm_p99 = warm_us[(warm_us.len() * 99 / 100).min(warm_us.len() - 1)];
+        println!(
+            "javascript benchmark: cold_load_median_us={cold_median} warm_p50_us={warm_p50} warm_p99_us={warm_p99} warm_samples={}",
+            warm_us.len()
+        );
+    }
+}

@@ -13,6 +13,7 @@ use tempfile::TempDir;
 use super::{BundleLoadError, BundleRegistry, DynamicBundleRegistry};
 
 const COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const VALID_JAVASCRIPT: &[u8] = b"export function run() {}";
 
 type CloneCalls = Arc<Mutex<Vec<(String, Option<String>, bool)>>>;
 
@@ -144,13 +145,13 @@ fn sources_process_bundles_dir_first_then_declarations_in_order() {
         &base.path().join("short"),
         "bundle",
         &manifest("short-bundle", "policy", "collision", None),
-        b"short",
+        VALID_JAVASCRIPT,
     );
     write_bundle(
         &base.path().join("declared-one"),
         "bundle",
         &manifest("declared-one", "policy", "collision", None),
-        b"one",
+        VALID_JAVASCRIPT,
     );
     let config = ExtensionBundlesConfig {
         bundles_dir: Some("short".to_owned()),
@@ -176,13 +177,13 @@ fn collision_rejects_whole_candidate_against_dynamic_and_reserved_names() {
         temp.path(),
         "a",
         &manifest("bundle-a", "policy", "claimed", None),
-        b"a",
+        VALID_JAVASCRIPT,
     );
     write_bundle(
         temp.path(),
         "b",
         &manifest("bundle-b", "policy", "claimed", None),
-        b"b",
+        VALID_JAVASCRIPT,
     );
     let error =
         DynamicBundleRegistry::load(&local_config(temp.path()), temp.path(), &BTreeSet::new())
@@ -211,13 +212,13 @@ fn reverse_creation_order_still_reports_lexical_bundle_as_earlier_registration()
         temp.path(),
         "z-created-first",
         &manifest("lexical-z", "policy", "ordered_collision", None),
-        b"z",
+        VALID_JAVASCRIPT,
     );
     write_bundle(
         temp.path(),
         "a-created-last",
         &manifest("lexical-a", "policy", "ordered_collision", None),
-        b"a",
+        VALID_JAVASCRIPT,
     );
 
     let error =
@@ -281,13 +282,13 @@ fn kind_is_part_of_the_collision_key() {
         temp.path(),
         "policy",
         &manifest("policy-bundle", "policy", "shared", None),
-        b"policy",
+        VALID_JAVASCRIPT,
     );
     write_bundle(
         temp.path(),
         "action",
         &manifest("action-bundle", "action", "shared", None),
-        b"action",
+        VALID_JAVASCRIPT,
     );
 
     let registry =
@@ -313,19 +314,19 @@ fn proxy_wasm_and_ai_lookups_map_kinds_and_sort_ai_hooks() {
         temp.path(),
         "z-ai-created-first",
         &manifest("z-ai", "ai_close", "z_close", None),
-        b"z",
+        VALID_JAVASCRIPT,
     );
     write_bundle(
         temp.path(),
         "a-ai-created-last",
         &manifest("a-ai", "ai_close", "a_close", None),
-        b"a",
+        VALID_JAVASCRIPT,
     );
     write_bundle(
         temp.path(),
         "m-ai-tool",
         &manifest("m-ai", "ai_tool_call", "tool_call", None),
-        b"tool",
+        VALID_JAVASCRIPT,
     );
 
     let registry =
@@ -372,14 +373,14 @@ fn intentional_in_root_nested_entry_loads() {
             .replace("entry: entry.js", "entry: assets/entry.js"),
     )
     .unwrap();
-    std::fs::write(bundle.join("assets/entry.js"), b"nested bytes").unwrap();
+    std::fs::write(bundle.join("assets/entry.js"), VALID_JAVASCRIPT).unwrap();
 
     let registry =
         DynamicBundleRegistry::load(&local_config(temp.path()), temp.path(), &BTreeSet::new())
             .unwrap();
     assert_eq!(
         registry.policy("nested_policy").unwrap().artifact(),
-        b"nested bytes"
+        VALID_JAVASCRIPT
     );
 }
 
@@ -420,7 +421,7 @@ fn attachment_validation_error_never_echoes_instance_secrets() {
         "    export: run\n",
         "    export: run\n    config_schema:\n      type: object\n      properties:\n        enabled:\n          type: boolean\n",
     );
-    write_bundle(temp.path(), "bundle", &schema_manifest, b"entry");
+    write_bundle(temp.path(), "bundle", &schema_manifest, VALID_JAVASCRIPT);
     let registry =
         DynamicBundleRegistry::load(&local_config(temp.path()), temp.path(), &BTreeSet::new())
             .unwrap();

@@ -13,8 +13,8 @@
 //! for compatibility, but the OSS boot path does not pass it to
 //! [`JsEngine`]:
 //!
-//! * **CPU time budget** (`budget_ms`, default 100 ms): a watchdog
-//!   timer flips an atomic flag after the budget elapses. The
+//! * **CPU time budget** (`budget_ms`, default 100 ms): the shared watchdog
+//!   scheduler flips an atomic flag after the budget elapses. The
 //!   interrupt handler installed on the QuickJS runtime polls that
 //!   flag and aborts execution with an uncatchable exception, which
 //!   surfaces in Rust as [`JsExecutionError::Interrupt`]. This is the
@@ -27,11 +27,10 @@
 //!   QuickJS via `Runtime::set_max_stack_size`. Guards against
 //!   deeply recursive scripts.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+use std::collections::{BinaryHeap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rquickjs::function::Rest;
@@ -39,6 +38,132 @@ use rquickjs::{Array, Context, Function, Object, Runtime, String as JsString, Va
 use thiserror::Error;
 
 pub use sbproxy_config::types::JsSandboxConfig;
+
+struct WatchdogEntry {
+    deadline: Instant,
+    sequence: u64,
+    interrupt: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+}
+
+impl PartialEq for WatchdogEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.sequence == other.sequence
+    }
+}
+
+impl Eq for WatchdogEntry {}
+
+impl PartialOrd for WatchdogEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WatchdogEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .deadline
+            .cmp(&self.deadline)
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+
+struct SharedWatchdog {
+    sender: mpsc::Sender<WatchdogEntry>,
+    sequence: AtomicU64,
+}
+
+impl SharedWatchdog {
+    fn start() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("sbproxy-js-watchdog".to_owned())
+            .spawn(move || run_watchdog(receiver))
+            .expect("JavaScript watchdog thread should start");
+        Self {
+            sender,
+            sequence: AtomicU64::new(0),
+        }
+    }
+
+    fn arm(&self, interrupt: Arc<AtomicBool>, budget: Duration) -> WatchdogGuard {
+        interrupt.store(false, Ordering::Relaxed);
+        let done = Arc::new(AtomicBool::new(false));
+        let entry = WatchdogEntry {
+            deadline: Instant::now() + budget,
+            sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
+            interrupt: Arc::clone(&interrupt),
+            done: Arc::clone(&done),
+        };
+        if self.sender.send(entry).is_err() {
+            interrupt.store(true, Ordering::Relaxed);
+        }
+        WatchdogGuard { interrupt, done }
+    }
+}
+
+fn run_watchdog(receiver: mpsc::Receiver<WatchdogEntry>) {
+    let mut deadlines = BinaryHeap::new();
+    loop {
+        while deadlines
+            .peek()
+            .is_some_and(|entry: &WatchdogEntry| entry.deadline <= Instant::now())
+        {
+            let entry = deadlines.pop().expect("peeked watchdog entry should exist");
+            if !entry.done.load(Ordering::Relaxed) {
+                entry.interrupt.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let received = if let Some(entry) = deadlines.peek() {
+            receiver.recv_timeout(entry.deadline.saturating_duration_since(Instant::now()))
+        } else {
+            match receiver.recv() {
+                Ok(entry) => {
+                    deadlines.push(entry);
+                    continue;
+                }
+                Err(_) => return,
+            }
+        };
+
+        match received {
+            Ok(entry) => deadlines.push(entry),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+static SHARED_WATCHDOG: LazyLock<SharedWatchdog> = LazyLock::new(SharedWatchdog::start);
+
+/// One scheduled JavaScript deadline.
+///
+/// Dropping the guard cancels the deadline. Every JavaScript runtime in this
+/// crate uses the same scheduler thread.
+pub(crate) struct WatchdogGuard {
+    interrupt: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+}
+
+impl WatchdogGuard {
+    /// Report whether the scheduler reached this deadline.
+    pub(crate) fn interrupted(&self) -> bool {
+        self.interrupt.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for WatchdogGuard {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Schedule one JavaScript runtime interrupt on the shared watchdog.
+pub(crate) fn arm_watchdog(interrupt: Arc<AtomicBool>, budget: Duration) -> WatchdogGuard {
+    SHARED_WATCHDOG.arm(interrupt, budget)
+}
 
 // --- Errors ---
 
@@ -92,10 +217,10 @@ pub struct JsEngine {
     #[allow(dead_code)]
     runtime: Runtime,
     context: Context,
-    /// Atomic flag the watchdog thread flips when the CPU budget
+    /// Atomic flag the watchdog scheduler flips when the CPU budget
     /// expires. The interrupt handler installed on `runtime` reads
     /// this on every poll and returns `true` to abort eval once set.
-    /// `Arc<...>` so both the closure and the watchdog can hold it.
+    /// `Arc<...>` so both the runtime and the watchdog can hold it.
     interrupt: Arc<AtomicBool>,
     /// The sandbox limits this engine was constructed with. Stored so
     /// `execute` / `call_function` / `match_request` / `waf_match`
@@ -231,15 +356,10 @@ impl JsEngine {
     ///
     /// 1. Clear the interrupt flag (in case a prior run was
     ///    interrupted, leaving it set).
-    /// 2. Spawn a detached watchdog thread that sleeps for
-    ///    `budget_ms` and then flips the flag. Its handle is dropped
-    ///    so the thread is not joined; if the closure finishes first
-    ///    the thread wakes, observes the closure-done signal, and
-    ///    exits without touching the flag.
+    /// 2. Register the deadline with the process-wide watchdog.
     /// 3. Run the closure. QuickJS calls the interrupt handler
     ///    periodically; the handler aborts when the flag is set.
-    /// 4. After the closure returns, clear the flag and signal the
-    ///    watchdog that the run is over.
+    /// 4. Drop the deadline guard so the watchdog knows the run is over.
     /// 5. If the flag observed `true` at any point, translate the
     ///    closure's error into [`JsExecutionError::Interrupt`];
     ///    otherwise wrap it in [`JsExecutionError::Other`].
@@ -247,56 +367,15 @@ impl JsEngine {
         &self,
         f: impl FnOnce() -> Result<T>,
     ) -> std::result::Result<T, JsExecutionError> {
-        // Reset before each run so a previously tripped flag does
-        // not pre-abort the new evaluation.
-        self.interrupt.store(false, Ordering::Relaxed);
-
-        // The watchdog and the runner share a "done" signal: when
-        // the closure completes (success or failure), the runner
-        // sets `done` and the watchdog can wake up and exit without
-        // tripping the interrupt. Without this, every script run
-        // would burn one watchdog thread for the full `budget_ms`
-        // even when the script finished in microseconds.
-        let done = Arc::new(AtomicBool::new(false));
-        let interrupt_for_watchdog = Arc::clone(&self.interrupt);
-        let done_for_watchdog = Arc::clone(&done);
         let budget_ms = self.sandbox.budget_ms;
-
-        // Detach the watchdog. We never join: if the script finishes
-        // early, the watchdog wakes up promptly, sees `done`, and
-        // exits.
-        let _watchdog = thread::spawn(move || {
-            // Sleep in small slices so a fast script does not have
-            // to wait the full budget for the thread to exit. The
-            // slice value is a balance between responsiveness and
-            // overhead; 5 ms is well under the smallest reasonable
-            // budget and keeps wakeups cheap.
-            let slice = Duration::from_millis(5);
-            let mut remaining = Duration::from_millis(budget_ms);
-            while remaining > Duration::ZERO {
-                if done_for_watchdog.load(Ordering::Relaxed) {
-                    return;
-                }
-                let step = remaining.min(slice);
-                thread::sleep(step);
-                remaining -= step;
-            }
-            if !done_for_watchdog.load(Ordering::Relaxed) {
-                interrupt_for_watchdog.store(true, Ordering::Relaxed);
-            }
-        });
+        let watchdog = arm_watchdog(
+            Arc::clone(&self.interrupt),
+            Duration::from_millis(budget_ms),
+        );
 
         let result = f();
-
-        // Signal the watchdog whether or not the run succeeded.
-        done.store(true, Ordering::Relaxed);
-
-        // Did the watchdog beat us? The atomic read here gives the
-        // authoritative answer: if the flag is set, the interrupt
-        // handler returned `true` at least once and we should treat
-        // any error as a budget interrupt regardless of the specific
-        // rquickjs error variant.
-        let interrupted = self.interrupt.load(Ordering::Relaxed);
+        let interrupted = watchdog.interrupted();
+        drop(watchdog);
 
         match result {
             Ok(v) => Ok(v),
@@ -1289,9 +1368,9 @@ mod tests {
             other => panic!("expected Interrupt, got {other:?}"),
         }
         // budget + generous slack. QuickJS polls every ~256 ops so
-        // there is some over-shoot beyond the watchdog firing, plus
-        // the watchdog itself sleeps in 5 ms slices. Use 500 ms as a
-        // generous upper bound that still catches "ran forever".
+        // there can be some over-shoot beyond the watchdog firing.
+        // Use 500 ms as a generous upper bound that still catches
+        // "ran forever".
         assert!(
             elapsed < Duration::from_millis(500),
             "infinite loop overran budget+slack: {elapsed:?}"

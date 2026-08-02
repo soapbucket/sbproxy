@@ -227,6 +227,13 @@ mlua = { version = "0.11", features = ["luau", "serialize", "vendored", "error-s
 
 # JavaScript scripting
 rquickjs = { version = "0.11", features = ["bindgen", "classes", "properties", "parallel"] }
+swc_common = "24"
+swc_ecma_ast = "27"
+swc_ecma_codegen = "30"
+swc_ecma_parser = { version = "43", default-features = false, features = ["typescript"] }
+swc_ecma_transforms_base = "47"
+swc_ecma_transforms_typescript = "53"
+swc_ecma_visit = "27"
 
 # WebAssembly scripting (sandboxed module runtime).
 # wasmtime + wasi-common move in lockstep; bump both together. The version
