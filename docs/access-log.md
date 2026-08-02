@@ -305,7 +305,7 @@ proxy:
           value: "${env.REGION}"
         - name: caller_tier                  # CEL expression
           engine: cel
-          source: 'has(request.headers["x-tier"]) ? request.headers["x-tier"] : "standard"'
+          source: '"x-tier" in request.headers ? request.headers["x-tier"] : "standard"'
         - name: route_class                  # Lua script (returns the value)
           engine: lua
           source: 'return string.find(ctx.request.method, "GET") and "read" or "write"'

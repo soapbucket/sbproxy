@@ -175,6 +175,32 @@ mod tests {
     }
 
     #[test]
+    fn has_needs_a_field_selection_and_in_is_what_a_hyphenated_header_wants() {
+        // This one shipped wrong. `has(request.headers["x-tier"])` reads
+        // like the obvious way to ask whether a header is present, and
+        // it is not CEL: the has() macro takes a field selection, not an
+        // index. It sat in an example, a doc, and the access-log page,
+        // where it compiled per record, failed, and silently omitted the
+        // field. Pinning both halves here so the next person reaching
+        // for a presence check finds the working form next to the
+        // broken one.
+        let err = CompiledCel::compile("probe", r#"has(request.headers["x-tier"])"#)
+            .err()
+            .expect("has() over an index must not compile");
+        assert!(
+            err.to_string().contains("has() macro"),
+            "the parse error should name the macro: {err}"
+        );
+
+        // Dotted access is a field selection, so has() takes it. Only
+        // useful for header names that are legal CEL identifiers.
+        CompiledCel::compile("probe", "has(request.headers.host)").expect("has() over a field");
+
+        // The form a hyphenated header actually needs.
+        CompiledCel::compile("probe", r#""x-tier" in request.headers"#).expect("in over a map");
+    }
+
+    #[test]
     fn site_and_source_are_readable_for_diagnostics() {
         let compiled =
             CompiledCel::compile("policy `rate_limiting` key", "request.key_id").expect("valid");

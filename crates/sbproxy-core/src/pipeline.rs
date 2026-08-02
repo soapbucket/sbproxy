@@ -4332,7 +4332,7 @@ proxy:
       custom_fields:
         - name: caller_tier
           engine: cel
-          source: 'has(request.headers["x-tier"]) ? request.headers["x-tier"] : "standard"'
+          source: '"x-tier" in request.headers ? request.headers["x-tier"] : "standard"'
 origins:
   "all.local":
     action:

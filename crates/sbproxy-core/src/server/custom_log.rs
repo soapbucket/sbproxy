@@ -520,7 +520,10 @@ mod tests {
         // CEL sees the top-level keys directly.
         assert_eq!(eval_cel(sources[0], &programs, &c).unwrap(), "acme");
         assert_eq!(eval_cel(sources[1], &programs, &c).unwrap(), "gold");
-        assert_eq!(eval_cel(sources[2], &programs, &c).unwrap(), "openai/gpt-4o");
+        assert_eq!(
+            eval_cel(sources[2], &programs, &c).unwrap(),
+            "openai/gpt-4o"
+        );
     }
 
     #[test]
