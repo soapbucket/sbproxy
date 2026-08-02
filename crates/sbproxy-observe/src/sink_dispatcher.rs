@@ -299,7 +299,8 @@ pub fn current_sink_dispatcher() -> Option<Arc<SinkDispatcher>> {
 /// Reset the dispatcher slot to empty. Used by tests that install a
 /// fixture dispatcher and need to restore the default fallback path
 /// before the next test runs.
-pub fn reset_sink_dispatcher_for_test() {
+#[cfg(test)]
+pub(crate) fn reset_sink_dispatcher_for_test() {
     let _ = install_sink_dispatcher(SinkDispatcher::empty());
 }
 

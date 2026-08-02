@@ -200,8 +200,8 @@ fn record_applied_bundle(bundle: &ConfigBundle) {
 
 /// Install an applied authority payload directly. Test-only; a running
 /// node only ever reaches this state by verifying and applying a bundle.
-#[doc(hidden)]
-pub fn set_applied_authority(applied: AppliedAuthority) {
+#[cfg(test)]
+pub(crate) fn set_applied_authority(applied: AppliedAuthority) {
     let mut slot = APPLIED_BUNDLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -256,8 +256,8 @@ pub fn overlay_applied_bundle(
 }
 
 /// Forget the applied authority payload. Test-only.
-#[doc(hidden)]
-pub fn clear_applied_bundle() {
+#[cfg(test)]
+pub(crate) fn clear_applied_bundle() {
     let mut slot = APPLIED_BUNDLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

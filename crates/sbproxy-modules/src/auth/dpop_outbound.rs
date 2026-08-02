@@ -154,7 +154,7 @@ impl DpopSigner {
     /// `DPoP-Nonce` header per RFC 9449 §8. The proof's `iat` is the
     /// current Unix time; the `jti` carries 128 fresh random bits so the inbound
     /// replay cache on the upstream cannot collide across calls.
-    pub fn mint_proof(
+    pub(crate) fn mint_proof(
         &self,
         method: &str,
         url: &str,

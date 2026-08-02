@@ -24,6 +24,11 @@ it, and only one of them is a deletion:
    to cross-check; without it, this script cannot tell you and says so.
 2. Over-exposed rather than dead: used inside its own file, so the fix is
    narrowing visibility, which also hands the item back to `dead_code`.
+   Read the caller before believing this one. An integration test under
+   `crates/<name>/tests/` compiles as its own crate and links against the
+   library's public API, so an item it reaches cannot be narrowed at all:
+   `pub` is the only visibility that compiles. That is most of this list,
+   and the scan now says so rather than proposing an impossible narrowing.
 3. Reachable through serde or schemars rather than a Rust caller. Config
    types are named in YAML and built by deserialization. `--json` carries
    a `derives` field so a reviewer can spot these.
@@ -101,6 +106,15 @@ def cfg_test_line_ranges(lines: list[str]) -> list[tuple[int, int]]:
     module's first line is `mod tests {` and the counting holds. A miscount
     would mis-file a reference as production, which is the conservative
     direction: it makes an item look more used, not less.
+
+    The attribute does not always sit on a braced item. `#[cfg(test)] mod
+    test_env;` and `#[cfg(test)] type Alias = ...;` carry no block at all,
+    and searching forward for a brace from one of those runs past it into
+    whatever unrelated construct opens the next `{`. In `sbproxy-config`
+    that was the `pub use config_authority::{...}` façade ten lines below,
+    so three genuinely public re-exported constants were filed as
+    test-only. Stop at the first `;` reached before any brace: that is the
+    end of a brace-less item.
     """
     ranges: list[tuple[int, int]] = []
     index = 0
@@ -116,6 +130,13 @@ def cfg_test_line_ranges(lines: list[str]) -> list[tuple[int, int]]:
                     started = True
                 if started and depth <= 0:
                     ranges.append((start, cursor + 1))
+                    index = cursor
+                    break
+                if not started and lines[cursor].rstrip().endswith(";"):
+                    # A brace-less item. When it shares the attribute's own
+                    # line there is nothing after it to cover.
+                    if cursor > index:
+                        ranges.append((start, cursor + 1))
                     index = cursor
                     break
                 cursor += 1
@@ -274,6 +295,14 @@ def verdict_for(item: dict) -> tuple[str, str]:
             "named by the out-of-tree consumer tree; deleting it breaks a build "
             "that does not live in this repository",
         )
+    if item.get("cross_crate_test"):
+        where = item["cross_crate_test"][0]
+        return (
+            "keep",
+            f"reached from `{where}`, which compiles as its own crate and links "
+            "against this one's public API, so `pub` is the only visibility that "
+            "resolves; narrowing it would not compile",
+        )
     if any("Deserialize" in d or "JsonSchema" in d for d in item.get("derives", [])):
         return (
             "keep",
@@ -321,8 +350,9 @@ def emit_triage(tests_only: list[dict], unreferenced: list[dict], cross_checked:
     print("## Verdicts")
     print()
     meanings = {
-        "keep": "Live through a consumer this repository cannot see: the out-of-tree "
-        "tree, serde/schemars, or a reason recorded in scripts/pub-item-verdicts.json.",
+        "keep": "Live through a consumer `pub(crate)` would not reach: an integration "
+        "test that compiles as its own crate, the out-of-tree tree, serde/schemars, or "
+        "a reason recorded in scripts/pub-item-verdicts.json.",
         "narrow": "Used inside its own file. Wrong visibility, not dead code. Narrowing "
         "to `pub(crate)` shrinks the public surface and lets `dead_code` police it from "
         "then on.",
@@ -436,6 +466,16 @@ def main() -> int:
             unreferenced.append(definition)
         elif not outside_prod and outside_test:
             definition["test_consumers"] = sorted(outside_test)
+            # Consumers outside the defining crate's own `src/` cannot see a
+            # `pub(crate)` item. An integration test under `tests/` is a
+            # separate crate, and so is any other workspace member's test
+            # module, so those items are not narrowable at any price.
+            own_src = f"crates/{definition['crate']}/src/"
+            definition["cross_crate_test"] = [
+                consumer
+                for consumer in definition["test_consumers"]
+                if not consumer.startswith(own_src)
+            ]
             tests_only.append(definition)
             unreferenced.append(definition)
 
@@ -497,6 +537,8 @@ def main() -> int:
         flag = ""
         if item.get("in_external_tree"):
             flag = "  [in external tree, do not delete]"
+        elif item.get("cross_crate_test"):
+            flag = f"  [reached from {item['cross_crate_test'][0]}: pub is required]"
         elif item.get("derives") and any(
             "Deserialize" in d or "JsonSchema" in d for d in item["derives"]
         ):

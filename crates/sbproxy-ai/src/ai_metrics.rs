@@ -610,7 +610,8 @@ pub fn shadow_inflight_value() -> f64 {
 
 /// Read the cumulative shadow-dropped counter value for one closed
 /// reason. Tests use this to assert that the expected path ticked.
-pub fn shadow_dropped_value(reason: ShadowDropReason) -> f64 {
+#[cfg(test)]
+pub(crate) fn shadow_dropped_value(reason: ShadowDropReason) -> f64 {
     AI_SHADOW_DROPPED
         .with_label_values(&[reason.as_str()])
         .get()
@@ -618,7 +619,8 @@ pub fn shadow_dropped_value(reason: ShadowDropReason) -> f64 {
 
 /// Read the cumulative shadow-timeout counter value. Tests use this
 /// to assert that a hung shadow was actually cancelled.
-pub fn shadow_timeout_value() -> f64 {
+#[cfg(test)]
+pub(crate) fn shadow_timeout_value() -> f64 {
     AI_SHADOW_TIMEOUT.get()
 }
 
@@ -1032,7 +1034,8 @@ pub fn record_ratelimit_rejected(axis: &str, key_id: &str, tenant: &str, model: 
 
 /// Read the cumulative value of the rate-limit rejection counter for
 /// one `(axis, key_id, tenant, model)` tuple. Used by tests.
-pub fn ratelimit_rejected_value(axis: &str, key_id: &str, tenant: &str, model: &str) -> f64 {
+#[cfg(test)]
+pub(crate) fn ratelimit_rejected_value(axis: &str, key_id: &str, tenant: &str, model: &str) -> f64 {
     AI_RATELIMIT_REJECTED
         .with_label_values(&[axis, key_id, tenant, model])
         .get()

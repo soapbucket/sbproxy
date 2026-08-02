@@ -69,9 +69,9 @@ impl TransportServer {
     /// inbound request routes directly to its `get_local` / `put_local` /
     /// `delete_local` methods.
     ///
-    /// Backwards-compatible wrapper around [`Self::start_with_cipher`] that
-    /// defaults to plaintext. K3 callers that want AEAD on the wire pass a
-    /// `Cipher` via [`Self::start_with_cipher`] instead.
+    /// Backwards-compatible wrapper that defaults to plaintext. K3 callers
+    /// that want AEAD on the wire pass a `Cipher` to
+    /// [`Self::start_with_security`] instead.
     pub async fn start(port: u16, cache: Arc<DistributedCache<Bytes>>) -> anyhow::Result<Self> {
         Self::start_with_cipher(port, cache, None).await
     }
@@ -84,7 +84,7 @@ impl TransportServer {
     /// failures tear down the connection immediately (unlike gossip's
     /// silent drop, because TCP is stateful and a cryptographic mismatch
     /// means the peer is misconfigured or hostile).
-    pub async fn start_with_cipher(
+    pub(crate) async fn start_with_cipher(
         port: u16,
         cache: Arc<DistributedCache<Bytes>>,
         cipher: Option<Cipher>,

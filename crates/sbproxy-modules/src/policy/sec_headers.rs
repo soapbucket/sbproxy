@@ -84,7 +84,7 @@ pub enum ContentSecurityPolicySpec {
 impl ContentSecurityPolicySpec {
     /// Returns the policy string for this spec. For detailed specs with an
     /// empty policy field, returns `None`.
-    pub fn as_legacy_str(&self) -> Option<&str> {
+    pub(crate) fn as_legacy_str(&self) -> Option<&str> {
         match self {
             Self::Simple(s) => Some(s.as_str()),
             Self::Detailed(d) if !d.policy.is_empty() => Some(d.policy.as_str()),
@@ -230,7 +230,7 @@ impl SecHeadersPolicy {
     /// This method does not handle CSP nonce generation or dynamic routes.
     /// Callers that need per-request features should use
     /// [`resolved_headers_for_request`](Self::resolved_headers_for_request).
-    pub fn resolved_headers(&self) -> Vec<(String, String)> {
+    pub(crate) fn resolved_headers(&self) -> Vec<(String, String)> {
         if !self.headers.is_empty() {
             return self
                 .headers
