@@ -2912,6 +2912,19 @@ fn handle_run_subcommand(args: &RunArgs, grace: sbproxy_core::GraceConfig) -> i3
     }
 }
 
+/// The ready banner, whose loopback URLs are a claim about where the
+/// listener actually is.
+///
+/// This prints `http://127.0.0.1:<port>` and hands the operator an
+/// `OPENAI_BASE_URL` built from it. That is only true because
+/// `prepare_run` pins `proxy.bind_address` to `127.0.0.1` in the config
+/// it generates (WOR-2199). Before it did, this banner said loopback
+/// while the listener was on every interface, which is worse than
+/// saying nothing: an operator reads it and concludes the gateway is
+/// not reachable from the network.
+///
+/// If the generated config ever binds something else, this has to print
+/// what was bound. A URL here is evidence, not decoration.
 fn run_ready_banner(name: &str, port: u16, admin_url: &str, admin_password: &str) -> String {
     format!(
         "\n{name} is ready on http://127.0.0.1:{port}\n\
@@ -3081,6 +3094,18 @@ fn prepare_run(args: &RunArgs) -> anyhow::Result<PreparedRun> {
     let config = serde_json::json!({
         "proxy": {
             "http_bind_port": args.port,
+            // WOR-2199: loopback, explicitly. This command generates a
+            // config for one machine to serve itself: the origins map
+            // below is keyed on 127.0.0.1 and localhost, the ready
+            // banner prints a loopback URL, and there is no
+            // authentication on this listener. Binding every interface
+            // would publish an unauthenticated model gateway to the
+            // network while telling the operator it was local.
+            //
+            // An operator who wants it reachable writes their own
+            // config and sets proxy.bind_address there, which is a
+            // decision rather than a default.
+            "bind_address": "127.0.0.1",
             "admin": {
                 "enabled": true,
                 "port": admin_port,
@@ -9800,6 +9825,11 @@ mod tests {
         assert_eq!(yaml["proxy"]["admin"]["enabled"], true);
         assert_eq!(yaml["proxy"]["admin"]["bind"], "127.0.0.1");
         assert_eq!(yaml["proxy"]["admin"]["port"], 9092);
+        // WOR-2199: the public listener gets the same assertion the
+        // admin listener already had. Before this, only the admin half
+        // of "secure defaults" was pinned, and the public half was
+        // hardcoded to every interface with nothing checking it.
+        assert_eq!(yaml["proxy"]["bind_address"], "127.0.0.1");
         assert_eq!(prepared.admin_password.len(), 64);
         assert!(!prepared.yaml.contains("serve:"));
     }

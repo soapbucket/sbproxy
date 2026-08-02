@@ -648,6 +648,25 @@ pub struct ProxyServerConfig {
     /// HTTP listener port. Defaults to 8080.
     #[serde(default = "default_http_port")]
     pub http_bind_port: u16,
+    /// Address the public listeners bind. Defaults to `0.0.0.0`, every
+    /// interface.
+    ///
+    /// Applies to both [`Self::http_bind_port`] and
+    /// [`Self::https_bind_port`], deliberately. Two fields would let an
+    /// operator lock down HTTP, leave HTTPS on every interface, and
+    /// believe the box was closed; one field cannot be half-applied.
+    ///
+    /// A server deployment wants the default, which is why it is the
+    /// default. Set `127.0.0.1` when the proxy serves only processes on
+    /// the same machine, or a specific interface address to pick one
+    /// NIC. `sbproxy run` and `sbproxy service install` generate
+    /// `127.0.0.1` (WOR-2199): they configure one machine for itself,
+    /// and the address they print has to be the address they bound.
+    ///
+    /// This is not a substitute for authentication. It limits who can
+    /// reach the listener, not what they may do once they reach it.
+    #[serde(default)]
+    pub bind_address: Option<String>,
     /// Enable HTTP/2 cleartext (h2c) on the plain HTTP listener.
     ///
     /// When `true`, the proxy detects the HTTP/2 connection preface on
@@ -1377,10 +1396,71 @@ pub struct OriginAttestationConfig {
     pub agreement_id: Option<String>,
 }
 
+/// Address the public listeners bind when the operator names none.
+///
+/// Every interface. A reverse proxy's job is usually to be reachable, so
+/// this preserves what every existing config already gets. The commands
+/// that generate a config for one machine override it; see
+/// [`ProxyServerConfig::bind_address`].
+pub const DEFAULT_PUBLIC_BIND_ADDRESS: &str = "0.0.0.0";
+
+impl ProxyServerConfig {
+    /// The address the public HTTP and HTTPS listeners bind.
+    ///
+    /// Falls back to [`DEFAULT_PUBLIC_BIND_ADDRESS`]. The value is
+    /// validated at config compile by
+    /// [`Self::validate_bind_address`], so the listener path can format
+    /// it into a socket address without re-checking.
+    pub fn effective_bind_address(&self) -> &str {
+        self.bind_address
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(DEFAULT_PUBLIC_BIND_ADDRESS)
+    }
+
+    /// Reject a `bind_address` that is not an IP literal.
+    ///
+    /// Refused at config load rather than at bind time, and refused
+    /// rather than warned past. A misspelled bind address that falls
+    /// back to a default is the failure this whole field exists to
+    /// prevent: the operator believes they restricted the listener and
+    /// the proxy is on every interface. There is no safe direction to
+    /// guess in, so the config does not load.
+    ///
+    /// Hostnames are refused too. A name can resolve to several
+    /// addresses, or to a different one after a DNS change, and a
+    /// listener that silently moves between interfaces is not something
+    /// an operator can reason about.
+    pub fn validate_bind_address(&self) -> anyhow::Result<()> {
+        let Some(raw) = self.bind_address.as_deref() else {
+            return Ok(());
+        };
+        let value = raw.trim();
+        if value.is_empty() {
+            anyhow::bail!(
+                "proxy.bind_address is empty. Remove the field to bind every interface \
+                 ({DEFAULT_PUBLIC_BIND_ADDRESS}), or set an IP address such as 127.0.0.1."
+            );
+        }
+        if value.parse::<std::net::IpAddr>().is_err() {
+            anyhow::bail!(
+                "proxy.bind_address {value:?} is not an IP address. Use an IP literal such \
+                 as 0.0.0.0 (every interface), 127.0.0.1 (this machine only), or the address \
+                 of one interface. Hostnames are not accepted: a name can resolve to more \
+                 than one address, and a listener that moves is not one an operator can \
+                 reason about."
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Default for ProxyServerConfig {
     fn default() -> Self {
         Self {
             http_bind_port: default_http_port(),
+            bind_address: None,
             http2_cleartext: false,
             https_bind_port: None,
             tls_cert_file: None,
@@ -10680,6 +10760,83 @@ mod sweep_header_capture_tests {
         let (compiled, _) = CompiledHeaderAllowlist::compile(&["*".to_string()]);
         for name in SENSITIVE_HEADER_DENYLIST {
             assert!(!compiled.matches(name), "{name} must stay excluded");
+        }
+    }
+
+    // --- WOR-2199: the public bind address ---
+
+    #[test]
+    fn bind_address_defaults_to_every_interface() {
+        // The default has to stay 0.0.0.0 or every existing config
+        // silently loses reachability on upgrade. This is the one
+        // behaviour in the feature that must not change.
+        let cfg = ProxyServerConfig::default();
+        assert_eq!(cfg.effective_bind_address(), DEFAULT_PUBLIC_BIND_ADDRESS);
+        assert_eq!(cfg.effective_bind_address(), "0.0.0.0");
+        cfg.validate_bind_address()
+            .expect("an absent field is valid");
+    }
+
+    #[test]
+    fn a_configured_bind_address_is_used_verbatim() {
+        for addr in ["127.0.0.1", "::1", "10.1.2.3", "0.0.0.0"] {
+            let cfg = ProxyServerConfig {
+                bind_address: Some(addr.to_string()),
+                ..Default::default()
+            };
+            cfg.validate_bind_address()
+                .unwrap_or_else(|e| panic!("{addr} must validate: {e}"));
+            assert_eq!(cfg.effective_bind_address(), addr);
+        }
+    }
+
+    #[test]
+    fn surrounding_whitespace_does_not_change_the_interface() {
+        // A trailing space in YAML must not turn a loopback bind into
+        // something that fails to parse and gets reported as invalid,
+        // nor into a different address.
+        let cfg = ProxyServerConfig {
+            bind_address: Some("  127.0.0.1  ".to_string()),
+            ..Default::default()
+        };
+        cfg.validate_bind_address()
+            .expect("padded address validates");
+        assert_eq!(cfg.effective_bind_address(), "127.0.0.1");
+    }
+
+    #[test]
+    fn a_hostname_is_refused_rather_than_resolved() {
+        // A name can resolve to several addresses, or to a different
+        // one later. Accepting it would make the listener's interface
+        // depend on DNS, which is not something an operator can reason
+        // about when they are trying to restrict reach.
+        let cfg = ProxyServerConfig {
+            bind_address: Some("localhost".to_string()),
+            ..Default::default()
+        };
+        let err = cfg
+            .validate_bind_address()
+            .expect_err("a hostname must not be accepted");
+        let msg = err.to_string();
+        assert!(msg.contains("localhost"), "{msg}");
+        assert!(msg.contains("not an IP address"), "{msg}");
+    }
+
+    #[test]
+    fn a_malformed_address_fails_instead_of_falling_back() {
+        // The failure this whole field exists to prevent: an operator
+        // restricts the listener, fat-fingers it, and gets every
+        // interface while believing otherwise. There is no safe
+        // direction to guess in, so it does not load.
+        for bad in ["127.0.0.999", "127.0.0", "not-an-ip", ""] {
+            let cfg = ProxyServerConfig {
+                bind_address: Some(bad.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                cfg.validate_bind_address().is_err(),
+                "{bad:?} must be refused rather than defaulted"
+            );
         }
     }
 }
