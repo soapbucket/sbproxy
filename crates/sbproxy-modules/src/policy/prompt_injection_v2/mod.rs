@@ -376,7 +376,7 @@ impl PromptInjectionV2Policy {
     }
 
     /// Override the score threshold. Used by tests.
-    pub fn with_threshold(mut self, threshold: f64) -> Self {
+    pub(crate) fn with_threshold(mut self, threshold: f64) -> Self {
         self.threshold = threshold;
         self
     }
