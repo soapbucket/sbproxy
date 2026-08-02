@@ -870,6 +870,7 @@ pub(super) async fn handle_action(
                                 )
                             })?;
                     let (status, headers, body) = apply_plugin_action_response_modifiers(
+                        session,
                         response.status,
                         response.headers,
                         response.body.unwrap_or_default(),
@@ -895,6 +896,7 @@ pub(super) async fn handle_action(
 }
 
 fn apply_plugin_action_response_modifiers(
+    session: &Session,
     mut status: u16,
     mut headers: Vec<(String, String)>,
     mut body: Bytes,
@@ -905,6 +907,7 @@ fn apply_plugin_action_response_modifiers(
     let Some(origin) = origin_idx.and_then(|idx| pipeline.config.origins.get(idx)) else {
         return (status, headers, body);
     };
+    let template_context = build_request_template_context(session, ctx, origin);
     let mut response_headers = serde_json::Map::new();
     for (name, value) in &headers {
         insert_json_header(&mut response_headers, name, value);
@@ -926,12 +929,14 @@ fn apply_plugin_action_response_modifiers(
                 response_headers.remove(name);
             }
             for (name, value) in &header_modifier.set {
-                set_plugin_action_response_header(&mut headers, name, value);
-                insert_json_header(&mut response_headers, name, value);
+                let resolved = template_context.resolve(value);
+                set_plugin_action_response_header(&mut headers, name, &resolved);
+                insert_json_header(&mut response_headers, name, &resolved);
             }
             for (name, value) in &header_modifier.add {
-                headers.push((name.clone(), value.clone()));
-                insert_json_header(&mut response_headers, name, value);
+                let resolved = template_context.resolve(value);
+                headers.push((name.clone(), resolved.clone()));
+                insert_json_header(&mut response_headers, name, &resolved);
             }
         }
         if let Some(script) = &modifier.lua_script {
@@ -1093,6 +1098,69 @@ mod plugin_action_tests {
     }
 
     #[tokio::test]
+    async fn plugin_action_http1_strips_transport_owned_and_hop_by_hop_headers() {
+        let action = response_action(
+            200,
+            vec![
+                ("content-length".into(), "999".into()),
+                ("x-safe-first".into(), "one".into()),
+                ("connection".into(), "x-plugin-hop".into()),
+                ("x-plugin-hop".into(), "remove-me".into()),
+                ("keep-alive".into(), "timeout=5".into()),
+                ("proxy-authenticate".into(), "Basic".into()),
+                ("proxy-authorization".into(), "Basic secret".into()),
+                ("proxy-connection".into(), "keep-alive".into()),
+                ("transfer-encoding".into(), "chunked".into()),
+                ("te".into(), "trailers".into()),
+                ("trailer".into(), "x-checksum".into()),
+                ("upgrade".into(), "websocket".into()),
+                ("content-type".into(), "text/plain".into()),
+                ("x-safe-last".into(), "two".into()),
+            ],
+            Bytes::from_static(b"actual"),
+        );
+        let pipeline = CompiledPipeline::empty_for_test();
+
+        let (result, wire) = exchange(&action, &pipeline, None).await;
+
+        assert!(result.expect("valid plugin response must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        let response_lower = response.to_ascii_lowercase();
+        assert!(
+            !response_lower.contains("content-length: 999"),
+            "response: {response}"
+        );
+        for header in [
+            "x-plugin-hop:",
+            "keep-alive:",
+            "proxy-authenticate:",
+            "proxy-authorization:",
+            "proxy-connection:",
+            "transfer-encoding:",
+            "te:",
+            "trailer:",
+            "upgrade:",
+        ] {
+            assert!(
+                !response_lower.lines().any(|line| line.starts_with(header)),
+                "response: {response}"
+            );
+        }
+        assert!(
+            response_lower.contains("content-type: text/plain"),
+            "response: {response}"
+        );
+        let first = response_lower
+            .find("x-safe-first: one")
+            .expect("first safe header");
+        let last = response_lower
+            .find("x-safe-last: two")
+            .expect("last safe header");
+        assert!(first < last, "response: {response}");
+        assert!(response.ends_with("\r\n\r\nactual"), "response: {response}");
+    }
+
+    #[tokio::test]
     async fn plugin_action_http1_applies_ordinary_response_modifiers() {
         let config = sbproxy_config::compile_config(
             r#"
@@ -1132,6 +1200,42 @@ origins:
         );
         assert!(
             response.ends_with("\r\n\r\nmodified"),
+            "response: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_interpolates_response_modifier_headers() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      body: placeholder
+    response_modifiers:
+      - headers:
+          set:
+            x-plugin-set: "{{request.method}} {{request.path}}"
+          add:
+            x-plugin-add: "path={{request.path}}"
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let action = response_action(200, Vec::new(), Bytes::from_static(b"ok"));
+
+        let (result, wire) = exchange(&action, &pipeline, Some(0)).await;
+
+        assert!(result.expect("valid plugin response must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        let response_lower = response.to_ascii_lowercase();
+        assert!(
+            response_lower.contains("x-plugin-set: post /jobs"),
+            "response: {response}"
+        );
+        assert!(
+            response_lower.contains("x-plugin-add: path=/jobs"),
             "response: {response}"
         );
     }

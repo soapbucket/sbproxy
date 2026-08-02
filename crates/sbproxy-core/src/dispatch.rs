@@ -385,7 +385,7 @@ const MAX_PLUGIN_ACTION_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 
 pub(crate) fn validate_plugin_action_response(
     status: u16,
-    headers: Vec<(String, String)>,
+    mut headers: Vec<(String, String)>,
     body: Bytes,
 ) -> Result<HttpResponse> {
     if !(100..=599).contains(&status) {
@@ -404,6 +404,19 @@ pub(crate) fn validate_plugin_action_response(
         http::HeaderValue::from_str(value)
             .with_context(|| format!("invalid plugin action response header {name:?}"))?;
     }
+    let connection_fields: Vec<String> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+    headers.retain(|(name, _)| {
+        !is_transport_owned_or_hop_by_hop_response_header(name)
+            && !connection_fields
+                .iter()
+                .any(|connection_name| connection_name.eq_ignore_ascii_case(name))
+    });
     if body.len() > MAX_PLUGIN_ACTION_RESPONSE_BODY_BYTES {
         anyhow::bail!(
             "plugin action response body exceeds 1 MiB (1048576 bytes): {} bytes",
@@ -415,6 +428,23 @@ pub(crate) fn validate_plugin_action_response(
         headers,
         body: Some(body),
     })
+}
+
+fn is_transport_owned_or_hop_by_hop_response_header(name: &str) -> bool {
+    [
+        "connection",
+        "content-length",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ]
+    .iter()
+    .any(|blocked| name.eq_ignore_ascii_case(blocked))
 }
 
 /// Build the standard 501 body for action types that the H3 dispatch path
@@ -708,6 +738,43 @@ mod tests {
             vec![("content-type".to_string(), "text/plain".to_string())]
         );
         assert_eq!(response.body.as_deref(), Some(&b"queued"[..]));
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_strips_transport_owned_and_hop_by_hop_headers() {
+        let action = plugin_action_response(
+            200,
+            vec![
+                ("content-length".into(), "999".into()),
+                ("x-safe-first".into(), "one".into()),
+                ("connection".into(), "x-plugin-hop".into()),
+                ("x-plugin-hop".into(), "remove-me".into()),
+                ("keep-alive".into(), "timeout=5".into()),
+                ("proxy-authenticate".into(), "Basic".into()),
+                ("proxy-authorization".into(), "Basic secret".into()),
+                ("proxy-connection".into(), "keep-alive".into()),
+                ("transfer-encoding".into(), "chunked".into()),
+                ("te".into(), "trailers".into()),
+                ("trailer".into(), "x-checksum".into()),
+                ("upgrade".into(), "websocket".into()),
+                ("content-type".into(), "text/plain".into()),
+                ("x-safe-last".into(), "two".into()),
+            ],
+            Bytes::from_static(b"actual"),
+        );
+
+        let response = dispatch_plugin_action(&action)
+            .await
+            .expect("valid plugin response");
+
+        assert_eq!(
+            response.headers,
+            vec![
+                ("x-safe-first".to_string(), "one".to_string()),
+                ("content-type".to_string(), "text/plain".to_string()),
+                ("x-safe-last".to_string(), "two".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]
