@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-07-29*
+*Last modified: 2026-08-01*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -258,7 +258,7 @@ dereference followed by a virtual or static call.
 
 The `sbproxy-config` crate contains type definitions, serde derives, and the
 compilation step. Its workspace dependencies are limited to `sbproxy-plugin`,
-`sbproxy-platform` (messenger configs plus the `KVStore` trait used by `build_l2_store`),
+`sbproxy-platform` (the `KVStore` trait used by `build_l2_store`),
 and `sbproxy-observe`. It does not pull in Pingora, the module set, or any networking
 runtime.
 

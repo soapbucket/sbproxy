@@ -32,6 +32,21 @@ const fn config_only(path: &'static str, note: &'static str) -> ConfigKeyCapabil
     }
 }
 
+/// A key the compiler refuses outright.
+///
+/// Distinct from [`config_only`], which describes a key that is accepted and
+/// quietly inert. An `Unsupported` key never reaches a running proxy at all:
+/// `compile_config` rejects the whole document and says why. The note here is
+/// the reviewer-facing record; the operator-facing text is the compile error.
+const fn unsupported(path: &'static str, note: &'static str) -> ConfigKeyCapability {
+    ConfigKeyCapability {
+        path,
+        support: SupportLevel::Unsupported,
+        consumer: None,
+        note: Some(note),
+    }
+}
+
 const OUTBOUND_CREDENTIAL_CONSUMER: &str =
     "sbproxy_core::pipeline::parse_outbound_credential_config";
 
@@ -482,6 +497,18 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "proxy.key_management.store.redis_source_of_truth",
         "Selecting the Redis store already makes Redis authoritative; this legacy boolean does \
          not alter runtime behavior. Classified under WOR-1976.",
+    ),
+    unsupported(
+        "proxy.messenger_settings.driver",
+        "WOR-2166: the shared message bus has no runtime consumer. Nothing subscribes to a topic \
+         and nothing publishes on one, so a configured bus moved no events between replicas. \
+         `compile_config` rejects the whole block and points at `proxy.config_authority` for \
+         config distribution and `POST /admin/cache/purge` for cache invalidation.",
+    ),
+    unsupported(
+        "proxy.messenger_settings.params.*",
+        "WOR-2166: driver parameters for the shared message bus, which has no runtime consumer. \
+         Never read: `compile_config` rejects the block before any driver is constructed.",
     ),
     stable(
         "proxy.model_host.cache.budget_gib",

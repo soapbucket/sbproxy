@@ -745,9 +745,16 @@ pub struct ProxyServerConfig {
     /// Process-owned path configuration for durable Local compression state.
     #[serde(default)]
     pub compression_state: Option<CompressionStateRuntimeConfig>,
-    /// Optional shared message bus for inter-component eventing (config
-    /// updates, semantic-cache purges, etc.). When unset, components that
-    /// need a bus degrade to no-op semantics.
+    /// Shared message bus. Not supported in this build: setting it fails
+    /// config compile (WOR-2166). The block still parses so the failure is
+    /// an explanatory diagnostic rather than an unknown-key error, and so
+    /// an archived schema-v1 document reaches that diagnostic.
+    ///
+    /// It was never wired to anything. Nothing subscribed to a topic and
+    /// nothing published on one, so an accepted bus moved no events. Config
+    /// distribution across replicas is `proxy.config_authority`; cache
+    /// invalidation is `POST /admin/cache/purge` against a shared Redis
+    /// tier configured through `proxy.l2_cache`.
     ///
     /// YAML key: `messenger_settings`.
     #[serde(default, rename = "messenger_settings")]
@@ -4696,25 +4703,22 @@ fn default_memcached_port() -> u16 {
 
 // --- Messenger Settings ---
 
-/// Configuration for the shared message bus used by inter-component events
-/// (config updates, semantic-cache purges, etc.).
+/// Shape of the `proxy.messenger_settings` block, retained only so the
+/// compiler can refuse it with an explanation (WOR-2166).
 ///
-/// The `driver` selects the backend implementation:
-/// * `"memory"` - in-process bounded mpsc channels (single-replica use only).
-/// * `"redis"`  - Redis Streams over the DSN in `params.dsn`.
-/// * `"sqs"`    - AWS SQS; requires `params.queue_url`, `params.region`,
-///   `params.api_key`.
-/// * `"gcp_pubsub"` - GCP Pub/Sub; requires `params.project`, `params.topic`,
-///   `params.subscription`, `params.access_token`.
-///
-/// Unknown drivers cause `build_messenger` to return an error; the caller
-/// decides whether to treat that as fatal or fall back to no-bus semantics.
+/// No value of this type is ever turned into a running bus. `compile_config`
+/// rejects the config the moment the block is present, whatever the driver
+/// says, because this build has no runtime consumer for a message bus: no
+/// production code subscribes to a topic and none publishes on one. The
+/// driver string is read for the diagnostic and nothing else.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MessengerSettings {
-    /// Backend driver name.
+    /// Backend driver name. Quoted back in the rejection diagnostic so an
+    /// operator sees which bus they configured; no backend is constructed.
     pub driver: String,
-    /// Free-form string parameters consumed by the driver-specific factory.
+    /// Free-form string parameters the driver factory used to consume.
+    /// Nothing reads them: the block is refused before any driver runs.
     #[serde(default)]
     pub params: HashMap<String, String>,
 }

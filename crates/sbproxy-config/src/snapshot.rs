@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use compact_str::CompactString;
-use sbproxy_platform::messenger::Messenger;
 use sbproxy_platform::storage::KVStore;
 use smallvec::SmallVec;
 
@@ -222,12 +221,6 @@ pub struct CompiledConfig {
     /// limit counters and response cache entries transparently use this
     /// shared backend so multiple proxy replicas share state.
     pub l2_store: Option<Arc<dyn KVStore>>,
-    /// Optional shared message bus. Built from
-    /// `proxy.messenger_settings` at compile time. When `Some`,
-    /// components such as a semantic-cache purge subscriber can fan
-    /// events across replicas; when `None`, those components must
-    /// degrade to no-op semantics.
-    pub messenger: Option<Arc<dyn Messenger>>,
     /// Mesh node handle, when the `mesh:` extension is configured.
     /// Type-erased as `Arc<dyn Any + Send + Sync>` so this crate
     /// stays independent of any concrete mesh implementation. Boot
@@ -281,7 +274,6 @@ mod tests {
         let cfg = CompiledConfig::default();
         assert!(cfg.mesh.is_none());
         assert!(cfg.l2_store.is_none());
-        assert!(cfg.messenger.is_none());
         assert!(cfg.access_log.is_none());
     }
 }

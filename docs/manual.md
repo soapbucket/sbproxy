@@ -1761,9 +1761,10 @@ is engaged, all built-ins read `false` and `extra` is empty.
 
 ### Workspace-level feature flags (planned)
 
-Workspace-level flags via messenger pub/sub are documented in earlier
-release notes. They are not implemented in v1.0; only per-request
-header / query parsing is wired today.
+Earlier release notes described workspace-level flags propagating over a
+message bus. That is not implemented, and the message bus it assumed does
+not exist: `proxy.messenger_settings` is refused at config load. Only
+per-request header and query parsing is wired today.
 
 ---
 

@@ -1430,7 +1430,6 @@ spec:
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),
             l2_store: None,
-            messenger: None,
             mesh: None,
             access_log: None,
             agent_classes: None,
