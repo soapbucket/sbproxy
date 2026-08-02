@@ -1,6 +1,6 @@
 # External AI guardrails
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 External guardrails let an AI route ask a moderation or policy service before SBproxy sends a request upstream, after it receives a non-streaming response, or in logging-only mode. The adapter receives the selected model and the inspected phase. SBproxy records bounded labels for provider, phase, and outcome. It does not put prompt text, headers, or credentials into those labels.
 
@@ -19,11 +19,11 @@ guardrails:
       allow_private_url: true
       mode: pre_call
       default_on: true
-      fail_open: false
+      failure_posture: closed
       timeout_ms: 500
 ```
 
-`name` is an operator-defined identifier used in logs and client error codes. Metrics use bounded provider, phase, and outcome labels instead. `provider: generic` selects the small JSON contract below. A loopback URL needs `allow_private_url: true`; public URLs are resolved and pinned before use, while private targets are rejected by default. `mode: pre_call` evaluates the request before provider dispatch. `default_on: true` automatically enables the configured phases on this route. `fail_open: false` makes a timeout, a non-success response, malformed JSON, or a response larger than 64 KiB block the request. `timeout_ms` accepts 1 through 30000 and defaults to 2000.
+`name` is an operator-defined identifier used in logs and client error codes. Metrics use bounded provider, phase, and outcome labels instead. `provider: generic` selects the small JSON contract below. A loopback URL needs `allow_private_url: true`; public URLs are resolved and pinned before use, while private targets are rejected by default. `mode: pre_call` evaluates the request before provider dispatch. `default_on: true` automatically enables the configured phases on this route. `failure_posture: closed` makes a timeout, a non-success response, malformed JSON, or a response larger than 64 KiB block the request; `open` admits it, and `degraded` admits it while recording that the content was never scanned. The vocabulary is shared across the config surface and defined in [degradation.md](degradation.md). The older boolean `fail_open: true|false` still parses and still means `open` and `closed`; setting both keys to values that disagree is a config-load error. `timeout_ms` accepts 1 through 30000 and defaults to 2000.
 
 Modes decide which content is sent to the adapter. `pre_call` checks input. `post_call` checks a buffered, non-streaming model response. `during_call` checks both. `logging_only` checks both input and output but never blocks.
 
@@ -92,7 +92,7 @@ Watch the fixture log while both run. It prints `method`, `path`, `model`, `phas
 
 ## Streaming and multipart content
 
-An enforcing output adapter with `fail_open: false` rejects a request with `stream: true` before replay, cache lookup, or provider dispatch. SBproxy cannot inspect a stream before forwarding its bytes. Adapters with `fail_open: true` and adapters in `logging_only` mode permit the stream and record that output content was unavailable.
+An enforcing output adapter with `failure_posture: closed` rejects a request with `stream: true` before replay, cache lookup, or provider dispatch. SBproxy cannot inspect a stream before forwarding its bytes. Adapters with an admitting posture (`open` or `degraded`) and adapters in `logging_only` mode permit the stream and record that output content was unavailable.
 
 Multipart request content is also unavailable to external input adapters. An enforcing, fail-closed input adapter rejects it before provider dispatch. Fail-open and logging-only adapters permit it and record the unavailable-content outcome. For a successful multipart response, SBproxy runs the output adapter when the media type is textual and the body is valid UTF-8. It applies the same unavailable-content policy to other response bodies before forwarding them.
 
@@ -133,6 +133,6 @@ Use the provider's own documentation for account setup and policy semantics: [La
 
 ## Troubleshooting
 
-If the route fails to load, check the selected provider's required fields and make sure environment or secret references resolved before compile time. A private endpoint needs `allow_private_url: true`; setting it does not permit non-HTTP URLs. A 400 with `guardrail_violation` means the adapter returned a block result or an enforcing adapter failed while `fail_open` was false. For a temporary availability investigation, set `fail_open: true` only after deciding that requests may pass without the external check. Logs identify the guardrail name, provider, phase, latency, categories, and outcome without including inspected content or credential values.
+If the route fails to load, check the selected provider's required fields and make sure environment or secret references resolved before compile time. A private endpoint needs `allow_private_url: true`; setting it does not permit non-HTTP URLs. A 400 with `guardrail_violation` means the adapter returned a block result or an enforcing adapter failed under `failure_posture: closed`. For a temporary availability investigation, set `failure_posture: degraded` only after deciding that requests may pass without the external check; it admits like `open` while recording that the content was never scanned. Logs identify the guardrail name, provider, phase, latency, categories, and outcome without including inspected content or credential values.
 
 The checked schema is [ai-external-guardrail.schema.json](../schemas/ai-external-guardrail.schema.json). Regenerate it with `cargo run -p sbproxy-ai --bin generate-ai-external-guardrail-schema` when the Rust configuration type changes.

@@ -30,7 +30,7 @@ proxy:
     crypto:
       pepper: demo-pepper-shared-by-all-replicas
       master_key: demo-master-shared-by-all-replicas
-    failure_mode_allow: false
+    failure_posture: closed
 origins:
   "openai.local":
     action:

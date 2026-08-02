@@ -52,7 +52,7 @@ proxy:
       # Upstream credentials, when stored encrypted, are sealed under this key.
       master_key: env:SBPROXY_KEY_MASTER
     # Fail closed: if the store is unreachable, deny rather than allow.
-    failure_mode_allow: false
+    failure_posture: closed
     seed:
       keys:
         - key_id: seed0001

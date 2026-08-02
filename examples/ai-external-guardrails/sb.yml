@@ -29,5 +29,5 @@ origins:
             allow_private_url: true
             mode: pre_call
             default_on: true
-            fail_open: false
+            failure_posture: closed
             timeout_ms: 500

@@ -61,7 +61,7 @@ proxy:
     crypto:
       pepper: env:SBPROXY_KEY_PEPPER
       master_key: env:SBPROXY_KEY_MASTER
-    failure_mode_allow: false
+    failure_posture: closed
     inbound:
       # Swept in the order listed; the first well-shaped token wins. Two
       # different tokens in two headers is a 400 rather than a silent pick.

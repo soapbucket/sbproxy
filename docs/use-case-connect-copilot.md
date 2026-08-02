@@ -1,6 +1,6 @@
 # Connect GitHub Copilot to a governed gateway
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 GitHub Copilot's bring-your-own-key (BYOK) support lets you register an OpenAI-compatible endpoint with an API key and use it in place of Copilot's own models. That is enough to reach a generic multi-provider proxy but buys nothing beyond it: no per-key budgets, no attribution, no guardrails on the prompt. This page registers SBproxy as that endpoint, so the same setup also buys per-key budgets, prompt guardrails, a local-model alias under the same endpoint, and a signed usage ledger.
 
@@ -45,7 +45,7 @@ proxy:
     crypto:
       pepper: demo-pepper-not-for-production
       master_key: demo-master-not-for-production
-    failure_mode_allow: false
+    failure_posture: closed
 
 origins:
   "localhost":

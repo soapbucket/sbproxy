@@ -1,6 +1,6 @@
 # API keys everywhere, accounting nowhere: stand up your own OpenRouter
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-02*
 
 ![Minting a virtual key, calling OpenAI and Anthropic through one governed endpoint, reading the spend ledger, and tripping a budget cap](assets/use-case-own-openrouter.gif)
 
@@ -62,7 +62,7 @@ Second, dynamic key management. This is what makes keys a runtime resource inste
     crypto:
       pepper: demo-pepper-not-for-production
       master_key: demo-master-not-for-production
-    failure_mode_allow: false   # store down means deny, never ungoverned traffic
+    failure_posture: closed     # store down means deny, never ungoverned traffic
 ```
 
 Third, the origin. Two providers sit behind one hostname. Before any routing strategy runs, the gateway narrows the provider set to those that declare the requested model, so `gpt-4o-mini` reaches OpenAI and `claude-haiku-4-5` reaches Anthropic through the same URL. Clients switch vendors by changing one string in the request body; nothing else about their code moves.

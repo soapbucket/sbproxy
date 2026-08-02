@@ -1,6 +1,6 @@
 # Connect Cline to a governed gateway
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 Cline's "OpenAI Compatible" provider takes a base URL, an API key, and a model id, which is enough to reach a generic multi-provider proxy but buys nothing beyond it: no per-key budgets, no attribution, no guardrails on the prompt. This page points that provider at SBproxy instead, so the same three fields also buy per-key budgets, prompt guardrails, a local-model alias under the same endpoint, and a signed usage ledger.
 
@@ -41,7 +41,7 @@ proxy:
     crypto:
       pepper: demo-pepper-not-for-production
       master_key: demo-master-not-for-production
-    failure_mode_allow: false
+    failure_posture: closed
 
 origins:
   "localhost":

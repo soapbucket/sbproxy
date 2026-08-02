@@ -23,7 +23,7 @@ proxy:
     crypto:
       pepper: demo-pepper-not-for-production
       master_key: demo-master-not-for-production
-    failure_mode_allow: false
+    failure_posture: closed
     seed:
       keys:
         - key_id: seed0001

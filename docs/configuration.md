@@ -2821,7 +2821,7 @@ policies:
       enabled: true
     action_on_match: block
     test_mode: false
-    fail_open: false
+    failure_posture: closed
     custom_rules: []
 ```
 
@@ -2831,7 +2831,8 @@ policies:
 | `owasp_crs` | object | | OWASP Core Rule Set configuration. |
 | `action_on_match` | string | "block" | Action when a rule matches: `block`, `log`. |
 | `test_mode` | bool | false | If true, log matches but do not block. |
-| `fail_open` | bool | false | If true, allow requests through on WAF engine failure. |
+| `failure_posture` | string | `closed` | What happens to a request the WAF could not fully evaluate: `closed` refuses with 403, `open` admits and claims nothing, `degraded` admits while recording that the WAF guarantee was not made. `observe` is rejected at config load. The shared vocabulary is defined in [degradation.md](degradation.md). |
+| `fail_open` | bool | false | Legacy spelling of the failure axis: `true` means `failure_posture: open`, `false` means `closed`. Still parses and is used only when `failure_posture` is absent. |
 | `custom_rules` | list | | Custom WAF rules (regex patterns or JS-defined matchers). |
 
 ### ddos

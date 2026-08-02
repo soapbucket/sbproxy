@@ -1,6 +1,6 @@
 # Connect Codex to a governed gateway
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 Codex CLI's config format makes it easy to point at any OpenAI-compatible endpoint. That is also exactly what a generic multi-provider proxy needs: no per-key budgets, no attribution, no guardrails on the prompt, nothing recording what got spent. This page connects Codex to SBproxy instead, so the same base-URL change also buys per-key budgets, prompt guardrails, a local-model alias under the same endpoint, and a signed usage ledger.
 
@@ -55,7 +55,7 @@ proxy:
     crypto:
       pepper: demo-pepper-not-for-production
       master_key: demo-master-not-for-production
-    failure_mode_allow: false
+    failure_posture: closed
 
 origins:
   "localhost":

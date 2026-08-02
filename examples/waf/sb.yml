@@ -32,4 +32,4 @@ origins:
           enabled: true
         action_on_match: block
         test_mode: false
-        fail_open: false
+        failure_posture: closed

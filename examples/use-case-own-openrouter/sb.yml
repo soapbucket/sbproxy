@@ -58,7 +58,7 @@ proxy:
       master_key: demo-master-not-for-production
     # Deny requests carrying a virtual key when the store is unreachable,
     # rather than letting ungoverned traffic through.
-    failure_mode_allow: false
+    failure_posture: closed
 
 origins:
   "ai.local":
