@@ -1604,10 +1604,11 @@ impl CompiledPipeline {
                         Ok(t) => t,
                         Err(e) => return Some(Err(e)),
                     };
+                    let failure_posture = wrapper.failure_posture();
                     Some(Ok(CompiledTransform {
                         transform,
                         content_types: wrapper.content_types,
-                        failure_posture: wrapper.failure_posture(),
+                        failure_posture,
                         max_body_size: wrapper.max_body_size,
                     }))
                 })
