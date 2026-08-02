@@ -733,13 +733,8 @@ sbproxy serve -f examples/rail-x402-base-sepolia/sb.yml
 Then walk the three cases in
 [`examples/rail-x402-base-sepolia/`](../examples/rail-x402-base-sepolia/):
 a reader who is never charged, a declared crawler who gets a price, and a
-credential the proxy never issued that buys nothing. The recorded
-walkthrough of that sequence is `docs/assets/payment-settlement.gif`,
-generated from `docs/tapes/payment-settlement.tape`:
-
-```bash
-scripts/record-tapes.sh payment-settlement
-```
+credential the proxy never issued that buys nothing. `make test` in that
+directory runs all three against a proxy you already have serving.
 
 The other configurations are linked rather than copied here, so there is
 one place to fix when a field moves:
