@@ -2542,8 +2542,8 @@ pub const METRICS: &[MetricCapability] = &[
     // Payment settlement families. Every label on all six is a closed enum
     // held in code, not a value copied off a request: `rail` is the
     // settlement rail, `operation` is the settlement or recovery step,
-    // `outcome` is the durable transition the store committed, and
-    // `provider_class` is the kind of provider rather than the provider.
+    // `outcome` is what that step concluded, and `provider_class` is the
+    // kind of provider rather than the provider.
     // No payer, tenant, quote, challenge, intent, provider reference,
     // credential, or provider error string is reachable from any writer
     // here, which is what keeps a settlement metric from becoming a way to
@@ -2589,7 +2589,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["rail", "operation", "outcome"],
-        description: "Durable payment settlement transitions, by rail, operation, and committed outcome.",
+        description: "Payment settlement transitions, by rail, deciding step, and outcome. The request-path gate reports `challenge` and `redeem`; the recovery sweep reports the reconciled attempt's own operation.",
         dead_reason: None,
     },
     MetricCapability {

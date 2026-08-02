@@ -77,6 +77,8 @@ use sbproxy_observe::metrics::{
 };
 use sbproxy_observe::telemetry;
 
+use crate::settlement_gate::{OP_CHALLENGE, OP_REDEEM, OUTCOME_PREPARED, OUTCOME_SUCCEEDED};
+
 #[cfg(feature = "payment-stripe")]
 use sbproxy_billing::recovery_crypto::RecoveryCipher;
 
@@ -589,6 +591,7 @@ impl PaymentsRuntimeCandidate {
         for rail in ALL_RAILS {
             record_payment_rail_enabled(rail.as_str(), rails.contains(&rail));
         }
+        seed_settlement_series(&rails);
 
         let mut builder = BillingService::builder(store)
             .adapters(registry)
@@ -895,7 +898,7 @@ async fn reconcile_with(
                 })?;
 
             let verdict = ReconciliationVerdict::from_outcome(&outcome);
-            record_payment_settlement(rail.as_str(), operation.as_str(), verdict.as_str());
+            record_payment_settlement(rail.as_str(), operation.as_str(), verdict.as_str(), 1);
             reports.push(ReconciliationReport {
                 rail,
                 operation,
@@ -1412,6 +1415,28 @@ fn worker_config(config: &PaymentsConfig) -> WorkerConfig {
     }
 }
 
+/// Create the settlement series for every rail this build registered.
+///
+/// The same `inc_by(0)` trick `record_worker_delta` uses below, for the
+/// same reason and one step earlier: a counter family that springs into
+/// existence on its first payment cannot tell an operator whether nothing
+/// has settled yet or this deployment records nothing at all, and the
+/// second is a bug the first one hides. Seeded from the registered rails
+/// rather than from `ALL_RAILS`, so the presence of a series still answers
+/// "is this rail configured" the way `sbproxy_payment_rail_enabled` does.
+///
+/// Only the two series an operator alerts on are seeded: challenges
+/// prepared, and payments that bought origin access. The refusal
+/// vocabulary is left to appear when a refusal happens, because a flat zero
+/// line for every payment problem code is noise, and a refusal that has
+/// never occurred is not a question anybody asks.
+fn seed_settlement_series(rails: &[SettlementRail]) {
+    for rail in rails {
+        record_payment_settlement(rail.as_str(), OP_CHALLENGE, OUTCOME_PREPARED, 0);
+        record_payment_settlement(rail.as_str(), OP_REDEEM, OUTCOME_SUCCEEDED, 0);
+    }
+}
+
 /// Convert the worker's cumulative counters into metric deltas.
 ///
 /// The worker counts durable rows, not events, so this diffs snapshots.
@@ -1555,6 +1580,44 @@ mod tests {
                 "{verdict} is outside the allowed outcome label set",
             );
         }
+    }
+
+    #[test]
+    fn seeding_creates_a_settlement_series_for_every_registered_rail() {
+        // The defect this guards is an absence, so the assertion is about a
+        // series existing rather than about a value. Without the seed, a
+        // scrape cannot separate "nothing has settled yet" from "this
+        // deployment records no settlements at all", and the second is a
+        // bug that hides behind the first for as long as traffic is quiet.
+        seed_settlement_series(&[SettlementRail::LightningCln]);
+
+        let seeded = |operation: &str, outcome: &str| {
+            prometheus::gather()
+                .into_iter()
+                .find(|family| family.name() == "sbproxy_payment_settlement_total")
+                .is_some_and(|family| {
+                    family.get_metric().iter().any(|metric| {
+                        let labelled = |name: &str, want: &str| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == name && label.value() == want)
+                        };
+                        labelled("rail", "lightning_cln")
+                            && labelled("operation", operation)
+                            && labelled("outcome", outcome)
+                    })
+                })
+        };
+
+        assert!(
+            seeded("challenge", "prepared"),
+            "a configured rail draws a flat line for challenges before its first one",
+        );
+        assert!(
+            seeded("redeem", "succeeded"),
+            "a configured rail draws a flat line for settlements before its first one",
+        );
     }
 
     #[test]
