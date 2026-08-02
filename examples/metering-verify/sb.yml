@@ -1,0 +1,127 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Attested metering: every served request cuts a signed receipt onto a
+# hash-chained ledger, and anyone holding the published key set can
+# re-derive the chain and catch a tampered entry.
+#
+# The receipt chain is this deployment's billing record. Metrics
+# describe traffic; the chain proves it. Tamper with one entry on disk
+# and the verifier names the broken sequence number.
+#
+# Run (clean state first; the tamper demo corrupts the chain on purpose):
+#   rm -rf /tmp/sbproxy-metering
+#   sbproxy serve -f sb.yml
+#
+# Test (three metered requests, each cuts a signed receipt):
+#   for i in 1 2 3; do curl -s -o /dev/null -w '%{http_code}\n' \
+#        -H 'Host: api.local' http://127.0.0.1:8080/anything/article; done
+#   # three 200s; each one appended a receipt to the chain
+#
+#   curl -s -u admin:demo-change-me -X POST \
+#        http://127.0.0.1:9090/api/meter/verify
+#   # outcome ok: every link re-derived from genesis
+#
+# Tamper, then verify again: edit any past entry in
+# /tmp/sbproxy-metering/receipts.ndjson and the verifier names the
+# broken sequence number. The full walkthrough, including buyer-side
+# verification against the published JWKS, is docs/metering.md.
+
+# sbproxy-docs:begin
+proxy:
+  http_bind_port: 8080
+
+  # The meter's operator surface: /api/meter/summary, /api/meter/receipts,
+  # and POST /api/meter/verify all live on the admin server.
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    # Demo password for local runs. Change before any non-loopback bind.
+    password: demo-change-me
+
+  # The signing identity receipts are cut with. Demo key only: this is
+  # the published RFC 8032 test vector, the same pair
+  # docs/web-bot-auth.md uses, so the walkthrough runs without
+  # generating keys. Generate your own before metering real traffic.
+  web_bot_auth:
+    key_id: metering-demo-2026
+    ed25519_seed_hex: "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+
+  attestation:
+    # This proxy records what calls actually consumed, after serving
+    # them. `claim` asserts cost before the call; `both` does both.
+    role: receipt
+
+    # What happens when metering itself breaks (full ledger disk,
+    # unusable signing key): serve the call, mark the guarantee as not
+    # made, count the gap. `closed` refuses traffic instead.
+    failure_mode: degraded
+
+    # What happens when attestation reaches a "refuse" verdict.
+    # `observe` records the verdict without acting on it.
+    enforcement_mode: block
+
+    # Receipts sign with the identity above; the ledger chain signs
+    # with the same key, so a buyer fetches one key set for both.
+    sign_with: proxy.web_bot_auth
+
+    # Claims wait here between "call started" and "call settled".
+    queue:
+      path: '/tmp/sbproxy-metering/claims'
+
+    # The receipt chain: an append-only JSONL file, one signed,
+    # hash-chained entry per metered call. This is the tamper target
+    # in the verify demo.
+    ledger:
+      path: '/tmp/sbproxy-metering/receipts.ndjson'
+
+    # The outcome table: all eight answers are required, and none is
+    # defaulted. "yes" bills every unit, "no" bills nothing (the call
+    # is still recorded), "partial" bills the work performed before a
+    # cut, "collapse" folds retries into one invoice line.
+    billable:
+      delivered: "yes"
+      client_disconnected: partial
+      origin_4xx: "no"
+      origin_5xx: "no"
+      policy_blocked: "no"
+      rate_limited: "no"
+      # Both answers are defensible here; this deployment sells
+      # answers, so a cache hit bills. See docs/metering.md.
+      cache_hit: "yes"
+      retry: collapse
+
+    # Units the proxy counted itself: bytes on the wire, kibibyte
+    # granularity, partial units bill whole.
+    measured:
+      - name: egress_kib
+        quantity: bytes_out
+        per: 1024
+
+    # Routes priced in this document. The signed config revision on
+    # each receipt is what lets a buyer check the price applied.
+    route_weights:
+      - name: api_call
+        path: '/anything/*'
+        weight: 1
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    # Names the commercial agreement receipts on this origin bill
+    # under. The role is inherited from proxy.attestation.
+    attestation:
+      agreement_id: agreement-2026-001
+
+    # Publish the signing key's public half, JWKS-shaped, at
+    # /.well-known/http-message-signatures-directory on this origin.
+    # This is the key set a buyer verifies receipts against.
+    web_bot_auth_publish:
+      enabled: true
+      key_id: metering-demo-2026
+      public_key_hex: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+      agent_name: metering-demo
+      directory_url: "https://api.local/.well-known/http-message-signatures-directory"
+# sbproxy-docs:end
