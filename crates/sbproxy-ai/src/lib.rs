@@ -25,6 +25,7 @@ pub mod governance_crdt;
 pub mod governance_redis;
 pub mod guardrails;
 pub mod handler;
+pub mod health_probe;
 pub mod identity;
 pub mod ids;
 pub mod judge;
