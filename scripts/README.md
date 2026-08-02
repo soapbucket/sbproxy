@@ -31,6 +31,13 @@ lane to keep local disk growth bounded. Set `SBPROXY_RELEASE_TESTS=1`
 for release-profile test binaries and `SBPROXY_CHECK_E2E=1` when you
 need to include the full e2e package locally.
 
+`SBPROXY_CHECK_PAYMENTS=1` adds the settlement feature union, which no
+other phase compiles because no payment feature is in any default set.
+CI requires the matching `payments` lane, so leaving it off is a real
+gap rather than a shortcut, and the run says so in `SKIPPED PHASES`. It
+is opt-in only because that union recompiles the graph instead of
+reusing the rest of the gate's artifacts.
+
 It fails when the working tree is dirty at the end of the run, because
 the gate validates the working tree while `git push` ships HEAD. Set
 `SBPROXY_ALLOW_DIRTY_TREE=1` for a deliberate work-in-progress run.

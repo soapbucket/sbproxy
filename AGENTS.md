@@ -31,6 +31,7 @@ ten-minute build.
 | Doctest | `cargo test --workspace --exclude sbproxy-e2e --locked --doc` |
 | Clippy | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Docs | `RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --workspace --no-deps --locked` |
+| Payment features (opt-in) | `SBPROXY_CHECK_PAYMENTS=1 bash scripts/check.sh` |
 
 Two rows in that table are easy to get subtly wrong.
 
@@ -47,6 +48,19 @@ build` silently rewrites the root `Cargo.lock` in place, and the
 `--locked` test step that follows then passes against the file the build
 just regenerated. Lockfile drift gets quietly repaired instead of
 reported.
+
+The last row is the only opt-in entry, and opt-in is not the same as
+optional: CI requires the `payments` lane like every other one here. No
+payment feature is in any default set, so every other row in this table
+resolves a union that compiles none of the settlement path, and until
+WOR-2222 nothing anywhere did. The phase is behind a variable because
+the settlement union has a different fingerprint from the rest of the
+gate and recompiles the graph rather than reusing it, which is not a
+price worth paying on a change that cannot reach payments. Run it before
+pushing anything that touches `crates/sbproxy-billing`,
+`crates/sbproxy-core`'s settle or billing modules, `sbproxy-modules`'
+crawl pricing, or the shared HTTP kit those reach the network through. A
+run without it prints the skip in the `SKIPPED PHASES` block.
 
 Fix the issue before pushing. Do not paper over with `#[allow(...)]`
 unless you also write a one-line comment explaining the deliberate
@@ -77,6 +91,7 @@ full release/e2e runs.
 |---|---|
 | `SBPROXY_RELEASE_TESTS=1` | compile test binaries in release mode |
 | `SBPROXY_CHECK_E2E=1` | include the `sbproxy-e2e` package |
+| `SBPROXY_CHECK_PAYMENTS=1` | clippy + test the settlement feature union |
 | `SBPROXY_CLEAN_AFTER_BUILD=0` | keep every build artifact after the run |
 | `SBPROXY_ALLOW_DIRTY_TREE=1` | do not fail on an uncommitted working tree |
 | `SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1` | permit the serial `cargo test` fallback |

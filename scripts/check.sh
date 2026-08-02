@@ -25,6 +25,9 @@
 #
 #   SBPROXY_RELEASE_TESTS=1              run test binaries in release mode
 #   SBPROXY_CHECK_E2E=1                  include the sbproxy-e2e package
+#   SBPROXY_CHECK_PAYMENTS=1             clippy + test the settlement feature
+#                                        union (a required CI lane; see that
+#                                        phase for why it is opt-in here)
 #   SBPROXY_CLEAN_AFTER_BUILD=0          keep all build artifacts after the run
 #   SBPROXY_ALLOW_DIRTY_TREE=1           do not fail on an uncommitted tree
 #   SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1  permit the serial cargo test fallback
@@ -378,6 +381,66 @@ bash "$ROOT/scripts/check-config-readers.sh"
 step "generated docs are current"
 bash "$ROOT/scripts/check-metrics-stability.sh"
 bash "$ROOT/scripts/check-model-host-capabilities.sh"
+
+# CI: ci.yml payments lane (WOR-2222). Last in this phase because it is the
+# most expensive thing in this file, so every cheaper failure above is found
+# first.
+#
+# Opt-in, and opt-in is not the same as optional. Every cargo call above
+# resolves the workspace's default union, and no payment feature is in any
+# default set, so without this phase the gate compiles none of the settlement
+# path: not sbproxy-core's inline settle gate, not the recovery worker or the
+# reconciliation sweep in billing_runtime, not the usage bridge's runtime
+# half, and not the feature-gated majority of sbproxy-billing, which is most
+# of that crate plus eleven of its twelve integration test files. That is why
+# the else branch records a skip instead of saying nothing: this is a required
+# CI lane, so a local run without it has not checked what it appears to have
+# checked.
+#
+# It is opt-in rather than default because the settlement union has a
+# different fingerprint from every cargo call above, so both commands below
+# recompile the graph from scratch and reuse nothing. ci.yml pays the same
+# rebuild by giving the lane its own job and its own cache key.
+if [ "${SBPROXY_CHECK_PAYMENTS:-0}" = "1" ]; then
+  # One feature selection for both commands, matching ci.yml's
+  # PAYMENT_FEATURES exactly. It names the `sbproxy` binary's flags rather
+  # than sbproxy-core's so the union is the released payments binary's:
+  # everything the workspace lane already resolves, plus settlement. A
+  # narrower `-p sbproxy-core` selection would resolve fewer features than CI
+  # does, report dead-code failures CI never sees, and miss sbproxy-billing's
+  # test targets outright.
+  payment_features='sbproxy/payment-mpp,sbproxy/payment-stripe,sbproxy/payment-x402,sbproxy/payment-lightning-cln,sbproxy/payment-lightning-lnd'
+
+  # clippy first: it compiles every target in the selection, so a type error
+  # or a lint in never-built code surfaces before this phase pays for codegen.
+  step "cargo clippy (payment settlement features)"
+  cargo clippy --workspace --exclude sbproxy-e2e --all-targets --locked \
+    --features "$payment_features" -- -D warnings
+
+  # Narrow the tests, never the packages. The selection stays --workspace so
+  # the feature union is the one clippy just checked; the filterset picks the
+  # three crates carrying payment-gated code. `package(...)` rather than a
+  # list of module names, because a payment test in a module nobody added to
+  # a hand-maintained list would silently not run, which is this ticket's bug
+  # wearing a different hat.
+  step "cargo test (payment settlement features)"
+  if cargo nextest --version >/dev/null 2>&1; then
+    cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
+      --features "$payment_features" \
+      -E 'package(sbproxy-billing) + package(sbproxy-core) + package(sbproxy-modules)'
+  else
+    # Reaching here means the main test phase already accepted the serial
+    # fallback, so the missing nextest is not re-explained. What matters is
+    # that filtersets have no `cargo test` equivalent: writing the same
+    # narrowing as `-p sbproxy-billing -p sbproxy-core` would change the
+    # package selection and therefore the feature union, so this runs the
+    # whole selection rather than narrowing it wrong.
+    note_skip "payment test narrowing (no nextest, so the serial fallback ran the whole workspace selection instead of the three payment-gated crates)"
+    cargo test --workspace --exclude sbproxy-e2e --locked --features "$payment_features"
+  fi
+else
+  note_skip "payment settlement features (set SBPROXY_CHECK_PAYMENTS=1 to run it). No other phase in this gate compiles crates/sbproxy-billing's runtime, sbproxy-core's settlement gate, or the ~217 tests inside them, so all of it stayed unbuilt. CI requires this lane."
+fi
 
 # =======================================================================
 # Phase 4: what will actually be pushed.
