@@ -34,14 +34,14 @@ proxy:
 
   payments:
     state_path: /var/lib/sbproxy/payments.sqlite3
-    challenge_binding_key: secret://env/SBPROXY_PAYMENT_BINDING_KEY
+    challenge_binding_key: env:SBPROXY_PAYMENT_BINDING_KEY
     authorization_timeout_ms: 2000
     max_body_bytes: 1048576
 
     # Required because rails.stripe is enabled below.
     recovery_encryption:
       key_id: payments-2026-08
-      key: secret://env/SBPROXY_PAYMENT_RECOVERY_KEY
+      key: env:SBPROXY_PAYMENT_RECOVERY_KEY
       max_age_hours: 23
 
     worker:
@@ -78,7 +78,7 @@ proxy:
           half_open_max: 1
 
       stripe:
-        api_key: secret://env/STRIPE_SECRET_KEY
+        api_key: env:STRIPE_SECRET_KEY
         api_version: 2026-06-24.dahlia
         account_context: platform
         business_network_id: profile_test_example
