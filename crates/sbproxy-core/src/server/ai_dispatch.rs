@@ -4540,7 +4540,16 @@ pub(super) async fn handle_ai_proxy(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let token_ceiling = sbproxy_ai::estimate_tokens(&model, &parsed_messages);
+            // WOR-1845: reserve against a ceiling that cannot under-hold.
+            // Recognized models use their exact BPE count; unknown and
+            // self-hosted models floor the estimate at one token per raw
+            // request byte, so a strict backend never holds fewer tokens
+            // than the prompt could settle.
+            let token_ceiling = sbproxy_ai::estimate_tokens_for_reservation(
+                &model,
+                &parsed_messages,
+                body_bytes.len(),
+            );
             // WOR-1835 (task 7): price the same token ceiling against the
             // resolved model so a governed key's `total_micro_usd` limit is
             // pre-gated instead of only caught after the fact at
