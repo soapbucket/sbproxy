@@ -16,6 +16,18 @@
         }
       ]
     },
+    "extensions": {
+      "description": "Extension bundle discovery sources. Paths stay unresolved in this parsed representation and are interpreted only by the runtime loader.",
+      "default": {
+        "bundles_dir": null,
+        "sources": []
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/ExtensionBundlesConfig"
+        }
+      ]
+    },
     "proxy": {
       "description": "Server-wide settings parsed from the top-level `proxy:` block.",
       "default": {
@@ -287,6 +299,113 @@
               "items": {
                 "$ref": "#/definitions/ConfigSource"
               }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ExtensionBundlesConfig": {
+      "description": "Top-level extension bundle discovery configuration from `sb.yml`.",
+      "type": "object",
+      "properties": {
+        "bundles_dir": {
+          "description": "Short local-directory form. Relative paths remain relative here and are interpreted by the runtime that loads the configuration.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sources": {
+          "description": "Additional bundle sources, consumed in declaration order.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/BundleSourceConfig"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "BundleSourceConfig": {
+      "description": "One ordered source of extension bundle directories.",
+      "oneOf": [
+        {
+          "description": "A directory on the local filesystem.",
+          "type": "object",
+          "required": [
+            "path",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "directory"
+              ]
+            },
+            "path": {
+              "description": "Directory containing bundle subdirectories.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A directory materialized from a pinned or signed Git revision.",
+          "type": "object",
+          "required": [
+            "path",
+            "repo",
+            "revision",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "git"
+              ]
+            },
+            "repo": {
+              "description": "Repository URL accepted by the system Git client.",
+              "type": "string"
+            },
+            "revision": {
+              "description": "Full commit SHA or signed tag selected for this source.",
+              "type": "string"
+            },
+            "path": {
+              "description": "Bundle directory inside the repository.",
+              "type": "string"
+            },
+            "credential": {
+              "description": "Optional secret reference used to authenticate the fetch.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "verify_signature": {
+              "description": "Require a valid signature on the selected tag or commit.",
+              "default": false,
+              "type": "boolean"
+            },
+            "timeout_secs": {
+              "description": "Hard timeout for one fetch, in seconds.",
+              "default": 60,
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "refresh_interval_secs": {
+              "description": "Refresh cadence in seconds. Zero resolves only during ordinary startup and reload operations.",
+              "default": 60,
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
             }
           },
           "additionalProperties": false

@@ -1535,7 +1535,13 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // back to every interface.
     config_file.proxy.validate_bind_address()?;
 
+    config_file
+        .extensions
+        .validate()
+        .context("config compile: invalid extension bundle source")?;
+
     Ok(CompiledConfig {
+        extension_bundles: config_file.extensions,
         origins,
         host_map,
         server: config_file.proxy,

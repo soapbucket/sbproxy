@@ -211,6 +211,9 @@ pub struct CompiledOrigin {
 /// The complete compiled config: all origins plus host-based routing.
 #[derive(Default)]
 pub struct CompiledConfig {
+    /// Extension bundle discovery configuration preserved for the pipeline
+    /// candidate loader. This crate does not resolve paths or fetch sources.
+    pub extension_bundles: crate::extensions::ExtensionBundlesConfig,
     /// All compiled origins, in the order they were registered.
     pub origins: Vec<CompiledOrigin>,
     /// Maps hostname to index into `origins`.

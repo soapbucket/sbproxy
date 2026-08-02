@@ -30,6 +30,10 @@ pub struct ConfigFile {
     /// default), the file is treated as inline config.
     #[serde(default)]
     pub source: Option<ConfigSource>,
+    /// Extension bundle discovery sources. Paths stay unresolved in this
+    /// parsed representation and are interpreted only by the runtime loader.
+    #[serde(default)]
+    pub extensions: crate::extensions::ExtensionBundlesConfig,
     /// Server-wide settings parsed from the top-level `proxy:` block.
     #[serde(default)]
     pub proxy: ProxyServerConfig,
