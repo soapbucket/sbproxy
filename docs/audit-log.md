@@ -1,7 +1,7 @@
 # Audit log
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
-SBproxy's audit surface is a set of narrow, structured channels rather than one audit framework. This page documents what actually ships: the admin-action audit rows served at `/api/audit/recent`, the `config_audit` / `security_audit` / `key_audit` tracing channels, the `AdminAuditEmitter` plugin seam, and the emission metric. There is no `sbproxy_audit` crate, no envelope middleware, and no append-only storage trait in the OSS tree; durable persistence and hash-chained verification live in the commercial distribution.
+SBproxy's audit surface is a set of narrow, structured channels rather than one audit framework. This page documents what actually ships: the admin-action audit rows served at `/api/audit/recent`, the `config_audit` / `security_audit` / `key_audit` tracing channels, the `AdminAuditEmitter` plugin seam, and the emission metric. There is no `sbproxy_audit` crate, no envelope middleware, and no append-only storage trait: admin-action rows live in an in-memory ring, and the tracing channels hand off to whatever sink you point at them. Hash-chained, signature-verifiable records are a different surface, covered in [ai-usage-ledger.md](ai-usage-ledger.md) and [metering.md](metering.md).
 
 ## Admin-action audit rows
 
@@ -29,7 +29,7 @@ The response is a JSON array of rows, newest first. `limit` defaults to 50.
 
 ### Compatibility-only sink selector
 
-The top-level `audit:` block remains parseable, but the OSS runtime does not
+The top-level `audit:` block remains parseable, but the runtime does not
 use its `sink` value:
 
 ```yaml

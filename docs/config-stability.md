@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-02*
 
 This page defines the stability tiers and applies them to representative or
 high-impact configuration leaves. It also lists the current reviewed
@@ -87,7 +87,7 @@ and stale entries fail when their schema path is removed or renamed.
 
 | Field or subtree | What happens today |
 |---|---|
-| `agent_classes.hosted_feed.url`, `.bootstrap_keys` | The OSS resolver uses builtin or inline catalogs; it does not fetch or verify a hosted feed. |
+| `agent_classes.hosted_feed.url`, `.bootstrap_keys` | The resolver uses builtin or inline catalogs; it does not fetch or verify a hosted feed. |
 | `audit.sink` | Admin-action rows always use the in-memory ring and tracing mirror; this selector has no effect. |
 | `origins.*.agent_skills[].max_clock_skew_secs` | Reserved for signed artifact freshness headers that are not emitted yet. |
 | `origins.*.connection_pool` | Pingora's built-in upstream pool is used; these per-origin limits are not applied. |
@@ -99,7 +99,7 @@ and stale entries fail when their schema path is removed or renamed.
 | `origins.*.rate_limit_headers` | Use the live rate-limit policy's `headers` block instead. |
 | `origins.*.response_modifiers[].status.text` | The status code is applied; the compatibility reason text is ignored. |
 | `origins.*.sessions.ttl_seconds` | Reserved retention hint; the in-process request ring does not expire entries from it. |
-| `origins.*.traffic_capture` | No OSS capture consumer; use `mirror` for live fire-and-forget request mirroring. |
+| `origins.*.traffic_capture` | No capture consumer; use `mirror` for live fire-and-forget request mirroring. |
 | `proxy.device_parser_file` | The current pure-Rust device parser does not load this catalog override. |
 | `proxy.key_management.governance.key_introspection` | The caller-only introspection route is not installed. |
 | `proxy.key_management.store.redis_source_of_truth` | Redis is authoritative whenever `store.backend: redis`; this legacy boolean changes nothing. |
@@ -181,7 +181,7 @@ HTTP/3 is not served by this build. The block is retained for forward compatibil
 | `threat_protection` | - | object | - | **alpha** | Dynamic threat blocklist config. |
 | `rate_limit_headers` | - | object | - | **config-only** | Use the live rate-limit policy's `headers` block. |
 | `error_pages` | - | array | - | **beta** | Custom error page entries, each matching one status or a list of statuses. |
-| `traffic_capture` | - | object | - | **config-only** | No OSS consumer; use `mirror` for request mirroring. |
+| `traffic_capture` | - | object | - | **config-only** | No consumer; use `mirror` for request mirroring. |
 | `connection_pool` | - | object | - | **config-only** | Retained for compatibility; Pingora's built-in pool settings apply. |
 | `message_signatures` | - | object | - | **alpha** | HTTP message signing config. |
 

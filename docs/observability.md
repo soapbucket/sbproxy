@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -394,7 +394,7 @@ Required when the line is request-scoped:
 | `request_id` | string (32 lowercase hex, UUIDv7) | The proxy-minted correlation id described at the top of this page. Note the `RequestEvent` envelope's own `request_id` field is a ULID, a different format minted for that stream. |
 | `trace_id` | string (32 hex) | Current OTel trace id |
 | `span_id` | string (16 hex) | Current OTel span id |
-| `tenant_id` | string | Workspace id; `default` in OSS |
+| `tenant_id` | string | Workspace id; `__default__` when the origin declares no `tenant_id` |
 | `route` | string | Origin route key |
 
 Per-request lifecycle lines (`request_started`, `request_completed`, `request_error`) carry the same body as `RequestEvent` (`agent_id`, `agent_class`, `rail`, `shape`, `status_code`, `latency_ms`, `error_class`).

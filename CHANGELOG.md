@@ -2354,9 +2354,10 @@ First Rust release of SBproxy on this repository.
   policies, and scripting (CEL, Lua, JavaScript, WebAssembly) all ship
   open source in this release. See [`docs/architecture.md`](docs/architecture.md)
   for the request pipeline shape.
-- **Enterprise tier**: see [`docs/enterprise.md`](docs/enterprise.md) for
-  what enterprise adds on top of the OSS data plane and how to request
-  access.
+- **Editions**: this release originally described a separate paid tier
+  layered on the open-source data plane. That split no longer exists.
+  Every feature ships in one Apache-2.0 binary; the `1.2.0` entry
+  records the relicensing that got there.
 
 ### Upgrading from v0.1.x (Go)
 

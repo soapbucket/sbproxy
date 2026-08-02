@@ -1,6 +1,6 @@
 # Glossary
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-02*
 
 A plain-English mapping of the terms that appear in SBproxy configuration and documentation. Start with the gateway words below, then use the longer protocol list when you meet an acronym.
 
@@ -21,8 +21,8 @@ See [core-concepts.md](core-concepts.md) for the request flow and [configuration
 
 | Term                | Stands for / source                                  | What it means in SBproxy                                                                                                                                          |
 |---------------------|------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| OLP                 | Open Licensing Protocol                              | A four-step flow for publishers to advertise a licence catalogue, agents to discover it, and the gateway to issue licence tokens (`jti` claims) bound to a licence row. The verifier ships in OSS via the AI crawl control policy; the issuer is enterprise-side. |
-| CAP                 | Crawler Authorization Protocol                       | A JWT-based capability-token format that an agent presents in `CAP-Token:` or `Authorization: CAP <jwt>`. The OSS verifier checks signature, claims, audience, glob-allowed paths, and (optionally) per-token rate limits. The issuer ships enterprise-side. |
+| OLP                 | Open Licensing Protocol                              | A four-step flow for publishers to advertise a licence catalogue, agents to discover it, and the gateway to issue licence tokens (`jti` claims) bound to a licence row. SBproxy is both ends of it: the AI crawl control policy verifies tokens, and the origin-level `olp` block runs the issuer, minting at `POST /.well-known/olp/token` and publishing its JWK set at `GET /.well-known/olp/key`. |
+| CAP                 | Crawler Authorization Protocol                       | A JWT-based capability-token format that an agent presents in `CAP-Token:` or `Authorization: CAP <jwt>`. SBproxy verifies signature, claims, audience, glob-allowed paths, and (optionally) per-token rate limits. Tokens are minted by whichever CAP issuer the deployment trusts, named by `jwks_url` or pinned inline with `jwks_static`. |
 | MCP                 | Model Context Protocol                               | The Anthropic-originated tool-and-resource catalogue protocol. SBproxy ships an MCP federation action that aggregates tool catalogues across upstream MCP servers and routes `tools/call` per tool. |
 | x402                | x402 protocol (Linux Foundation x402 Foundation)     | A stablecoin-on-chain payment rail riding HTTP 402. x402 moved to a Linux Foundation project on 2026-04-02. SBproxy emits x402 challenge entries in multi-rail 402 responses and verifies redemption tokens via the x402 facilitator. v2 is the emitted and accepted version. |
 | MPP                 | Merchant Payment Protocol                            | The card-and-stablecoin-on-Stripe payment rail. SBproxy emits MPP challenge entries that carry a Stripe `payment_intent` id; redemption confirms against Stripe. |
