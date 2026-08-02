@@ -286,6 +286,78 @@ async fn an_unfinalized_or_expired_challenge_fails_before_the_provider() {
 }
 
 #[tokio::test]
+async fn a_stranded_payment_waits_however_old_its_challenge_is() {
+    // WOR-2230. Nothing expires an intent whose settle attempt is
+    // outstanding: `expire_stale_challenges` sweeps `Pending` only, and skips
+    // any intent with a dispatched, unanswered attempt. So the challenge's own
+    // expiry is the only clock that moves here, and reading it first turned
+    // the 503 into a 402 `challenge_expired`. The payer, whose money may
+    // already have gone, was then handed a fresh invoice for the same content.
+    let world = World::new();
+    let signed = world.challenge("req-1", "request-key").await;
+    world.state.set_behavior(Behavior::NotSettled);
+
+    // The payer retries a little early. The rail verifies and does not
+    // settle, which is exactly the state that must not be retried from here.
+    let early = world.redeem(&signed, "request-key", "spt_value").await;
+    assert!(
+        matches!(early, AuthorizationDecision::Unavailable { .. }),
+        "an outstanding write asserts nothing about the funds",
+    );
+    assert_eq!(
+        world.status("request-key").await,
+        IntentStatus::NeedsReconciliation,
+    );
+
+    // The payer pays. The provider stays unreachable, and the challenge ages
+    // out underneath both facts.
+    world.clock.advance(700_000);
+    assert!(
+        signed.requirement.draft.is_expired(world.clock.now_ms()),
+        "the challenge has to be expired for this to test anything",
+    );
+
+    let stranded = world.redeem(&signed, "request-key", "spt_value").await;
+    assert!(
+        matches!(stranded, AuthorizationDecision::Unavailable { .. }),
+        "a stranded payment waits however old its challenge is; a refusal here \
+         sends the payer back for a second invoice",
+    );
+    assert_eq!(world.gate.releases(), 0);
+    assert!(!world.has_receipt("request-key").await);
+    assert_eq!(
+        world.state.settle_calls(),
+        1,
+        "the stranded intent was never dispatched again",
+    );
+}
+
+#[tokio::test]
+async fn a_refused_payment_that_aged_out_still_reads_as_expired() {
+    // The other half of the ordering WOR-2230 touched, pinned so a later
+    // reorder has to argue with it. The sweep collapses an expired `Pending`
+    // intent into `Terminal` with an `Expired` category, so the wall clock is
+    // the only thing that can tell a challenge that simply aged out from a
+    // payment a provider refused. Expiry therefore outranks `Terminal`, and
+    // only the reconciliation branch moved above it.
+    let world = World::new();
+    let signed = world.challenge("req-1", "request-key").await;
+    world.state.set_behavior(Behavior::Reject);
+
+    let refused = world.redeem(&signed, "request-key", "spt_value").await;
+    assert!(matches!(refused, AuthorizationDecision::PaymentRequired(_)));
+    assert_eq!(world.status("request-key").await, IntentStatus::Terminal);
+
+    world.clock.advance(700_000);
+    let expired = world.redeem(&signed, "request-key", "spt_value").await;
+    let AuthorizationDecision::PaymentRequired(problem) = expired else {
+        panic!("an expired challenge must be a refusal");
+    };
+    assert_eq!(problem.code, PaymentProblemCode::ChallengeExpired);
+    assert_eq!(world.gate.releases(), 0);
+}
+
+#[tokio::test]
 async fn a_requirement_that_was_not_advertised_is_refused() {
     let world = World::new();
     let signed = world.challenge("req-1", "request-key").await;

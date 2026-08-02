@@ -86,6 +86,26 @@ A `NeedsReconciliation` intent is never retried by the request path. A
 second attempt is how a payer gets charged twice, so the client waits for
 the recovery worker instead.
 
+That rule outranks the challenge's expiry, and it has to. Nothing expires
+an intent in this state: the challenge sweep only touches `Pending`, and
+it skips any intent whose provider write is still outstanding. So a
+`NeedsReconciliation` intent whose challenge has aged out means the
+provider has been unreachable for a while and nothing more. It keeps
+answering 503 with `Retry-After`, because the payer whose funds may
+already have moved is owed a resolution rather than a fresh bill.
+
+The same reasoning applies one step earlier. While an intent for a route
+sits in `NeedsReconciliation`, no new challenge is issued for that route:
+the request gets 503 with `Retry-After` instead of a 402. Nothing durable
+records who is paying, so this holds for every payer of that route, not
+only the one whose payment is stuck. It is a deliberate trade. On a rail
+with an authoritative status query the wait is one worker sweep. On a
+rail without one, x402 v2 today, it lasts until an operator resolves the
+intent with the facilitator, and the route earns nothing in the meantime.
+Alert on it: the refusal is counted as
+`sbproxy_payment_settlement_total{operation="challenge",
+outcome="unresolved_payment"}` and logged at warn with the intent id.
+
 ## The request path, end to end
 
 With `proxy.payments` present, an `ai_crawl_control` 402 is settled
@@ -114,11 +134,15 @@ and every field in it is explained in the reference below.
    Stripe has no `Accept-Payment` token and is selected only when the
    client expresses no preference, because that mode is an operator
    opt-in rather than a negotiated one.
-3. The matched price compiles into one normalized requirement, and a
+3. If an intent for this route is already in `NeedsReconciliation`, the
+   gate stops here and answers 503 with `Retry-After`. That payment may
+   have moved a payer's money, and a fresh invoice for the same content
+   would be a second bill for it.
+4. The matched price compiles into one normalized requirement, and a
    durable `Pending` intent is committed before the 402 leaves the
    proxy. A crash after this point leaves a record, never a dangling
    provider object.
-4. The 402 is rendered in the rail's own wire shape. Whatever the rail,
+5. The 402 is rendered in the rail's own wire shape. Whatever the rail,
    the signed quote token rides the policy's configured challenge
    header (`crawler-payment` by default), and the retry re-presents it
    there verbatim.
@@ -717,13 +741,19 @@ path, and it does not retry the settle on its own.
 
 Resolving reconciliation never rescues the request that failed. That
 response has already been sent. A later retry from the client observes
-`Succeeded` and is allowed through.
+`Succeeded` and is allowed through, and the route it was blocking becomes
+challengeable again in the same moment.
 
 ## Metrics and logs
 
 Payment metrics carry four labels and no more: `rail`, `operation`,
-`outcome`, and `provider_class`. The allowed outcomes are `succeeded`,
-`terminal`, `retry_wait`, and `needs_reconciliation`.
+`outcome`, and `provider_class`. The recovery sweep's outcomes are
+`succeeded`, `terminal`, `retry_wait`, and `needs_reconciliation`. The
+request-path gate reports `operation="challenge"` with `prepared`,
+`no_acceptable_rail`, or `unresolved_payment`, and `operation="redeem"`
+with `succeeded`, `unavailable`, or one of the closed payment problem
+codes. Every one of those is a fixed word; none of them is derived from a
+provider response.
 
 No quote id, challenge id, tenant id, address, provider reference,
 PaymentIntent id, invoice, single-use token, credential, client secret,
