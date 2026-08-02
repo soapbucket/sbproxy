@@ -3565,13 +3565,15 @@ Encryption is worth configuring where data outlives the request. This table says
 | Response cache | Upstream headers and bodies | Yes, with the `file`, `redis`, and `memcached` backends | Yes, via `proxy.response_cache_store.encryption` |
 | Prompt persistence | Runtime prompt-overlay records | Yes, a redb file on disk | Yes, via `admin.prompt_persistence_encryption` |
 | Upstream credentials | Provider secrets | Yes, in the keystore | Yes, as an AEAD envelope or a vault reference. See [key-management.md](key-management.md) |
-| Prompt cache | Normalised prompts and responses | No, in-process only | Not applicable |
+| Semantic cache | Prompts and the model responses replayed for them | Depends on `action.semantic_cache.backend`: no on `memory` (the default), yes on `redis`, replicated on `mesh` | No. Secure the backing store yourself; startup warns once per distributed backend |
 | Judge cache | Guardrail verdicts | No, in-process only | Not applicable |
 | Mesh distributed cache | Key-plane records, compression sessions | No, excluded from persisted cluster state | Not applicable. Peer traffic is sealed on the wire, see below |
 
 Memory-only caches are deliberately not encrypted. An attacker who can read the process heap can read the derived key out of the same heap, so sealing there buys close to nothing while adding another key to manage. Encrypt what persists or replicates.
 
-The prompt cache and the judge cache are memory-only because their in-tree implementations are, not because nothing could change that: both are structured so a backend can be swapped in. Startup therefore refuses a pipeline in which one of those caches reports a backend that survives a restart or is shared across replicas while storing entries unsealed. The response cache is checked too, but only warns: running it unencrypted on a `file` or `redis` backend is a documented configuration an operator chose, and the fix is the same `encryption` block either way.
+The judge cache is memory-only because its in-tree implementation is, not because nothing could change that: it is structured so a backend can be swapped in. A boot-time check refuses to start a pipeline in which a registered cache reports a backend that survives a restart, or is shared across replicas, while storing entries unsealed. No cache registers through that check in a current build, so today it refuses nothing. It stays because the day one does, the exposure should not be able to appear silently.
+
+The semantic cache and the response cache are checked on their own paths, and both warn rather than abort. Running the semantic cache on `redis` or `mesh`, or the response cache on `file`, `redis`, or `memcached`, is a documented configuration an operator chose, so startup says what is now leaving the process instead of refusing to boot. The two differ in what closes the gap: the response cache has an `encryption` block, and the semantic cache has none, so sealing its Redis or mesh store is the operator's job. Treat those entries as sensitive: they are prompts and model output.
 
 A credential whose material is stored as plaintext (`kind: plaintext`, only reachable for config-seeded credentials) is never published to a shared cache tier at all, neither the mesh tier nor Redis. Those resolves read through to the keystore instead. Prefer a vault reference or an envelope so the credential can be cached.
 

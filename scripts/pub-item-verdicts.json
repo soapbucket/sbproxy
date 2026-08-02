@@ -33,26 +33,6 @@
     "crates/sbproxy-security/src/pii.rs::redact_body": {
       "verdict": "keep",
       "reason": "Called directly by the out-of-tree consumer. Also recorded in a doc comment at the definition."
-    },
-    "crates/sbproxy-cache/src/two_tier.rs::TwoTierCache": {
-      "verdict": "escalated",
-      "reason": "The whole two_tier module is unwired: no consumer in this repository and none in the out-of-tree tree. This is the sliding_window shape and needs a wire-or-delete decision of its own, not a visibility change inside a cleanup PR. Tracked at https://linear.app/soapbucket/issue/WOR-2081."
-    },
-    "crates/sbproxy-cache/src/two_tier.rs::AiCachedResponse": {
-      "verdict": "escalated",
-      "reason": "Part of the unwired two_tier module. See TwoTierCache."
-    },
-    "crates/sbproxy-cache/src/two_tier.rs::CacheStats": {
-      "verdict": "escalated",
-      "reason": "Part of the unwired two_tier module. See TwoTierCache."
-    },
-    "crates/sbproxy-cache/src/two_tier.rs::DEFAULT_SIMILARITY_THRESHOLD": {
-      "verdict": "escalated",
-      "reason": "Part of the unwired two_tier module. See TwoTierCache."
-    },
-    "crates/sbproxy-cache/src/two_tier.rs::exact_key": {
-      "verdict": "escalated",
-      "reason": "Part of the unwired two_tier module. See TwoTierCache."
     }
   }
 }

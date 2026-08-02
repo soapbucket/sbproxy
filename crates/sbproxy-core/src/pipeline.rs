@@ -4251,6 +4251,75 @@ origins:
     }
 
     #[test]
+    fn waf_persistent_block_key_with_invalid_cel_rejects_the_config() {
+        // The WAF tracking key is the fifth static-CEL surface, and it
+        // gets the same end-to-end proof as the other four rather than
+        // only a crate-local unit test: the compile has to happen on
+        // the path boot and reload actually take.
+        let msg = pipeline_rejection(
+            r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "waf.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: waf
+        persistent_block:
+          enabled: true
+          track_by: cel
+          key: 'this is not valid CEL !!!'
+"#,
+        );
+        assert!(
+            msg.contains("waf.local"),
+            "diagnostic must name the origin: {msg}"
+        );
+        assert!(
+            msg.contains("persistent_block") || msg.contains("waf"),
+            "diagnostic must name the policy surface: {msg}"
+        );
+    }
+
+    #[test]
+    fn waf_persistent_block_cel_tracking_without_a_key_rejects_the_config() {
+        // `track_by: cel` with no `key:` is the other way to write an
+        // unusable tracking key, and it has to be refused on the same
+        // path. Left unchecked it silently tracks nothing, which reads
+        // as "no attacker ever tripped the threshold".
+        let msg = pipeline_rejection(
+            r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "wafkey.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: waf
+        persistent_block:
+          enabled: true
+          track_by: cel
+"#,
+        );
+        assert!(
+            msg.contains("wafkey.local"),
+            "diagnostic must name the origin: {msg}"
+        );
+        assert!(
+            msg.contains("key"),
+            "diagnostic must say a key is required: {msg}"
+        );
+    }
+
+    #[test]
     fn the_static_cel_surfaces_all_keep_compiling_when_valid() {
         // One config exercising every surface this change touched, so
         // the rejection tests above cannot be satisfied by rejecting
@@ -4278,6 +4347,11 @@ origins:
       - type: rate_limiting
         requests_per_second: 10
         key: 'request.key_id'
+      - type: waf
+        persistent_block:
+          enabled: true
+          track_by: cel
+          key: 'request.key_id'
     transforms:
       - type: cel
         on_response: '"rewritten"'

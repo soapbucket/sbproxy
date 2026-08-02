@@ -7,7 +7,6 @@ pub mod at_rest;
 pub mod reserve;
 pub mod response;
 pub mod store;
-pub mod two_tier;
 
 pub use at_rest::{AtRestPosture, CacheDurability};
 pub use reserve::{
