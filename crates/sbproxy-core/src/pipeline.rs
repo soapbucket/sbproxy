@@ -3652,6 +3652,13 @@ origins:
         let yaml = r#"
 proxy:
   http_bind_port: 18080
+  # `compile_config` refuses a `secret://<backend>/...` naming a backend
+  # that is not declared, and this case is about the DPoP rule, not that
+  # one, so the backend is declared. Nothing resolves it here.
+  secrets:
+    backends:
+      - type: local
+        name: prod
 origins:
   "dpop-lb.test":
     action:
