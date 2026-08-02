@@ -26,10 +26,13 @@
 //!
 //! ## Independent value dimensions
 //!
-//! [`ValueSink`] records local completions only when a served model declares a
-//! cloud reference. Cloud-spill attribution remains a follow-up. Compression
-//! value is recorded separately after terminal provider success using the
-//! target model's configured or catalog input price. Unknown or unpriced models
+//! [`ValueSink`] records completions only when a served model declares a cloud
+//! reference, and puts each one in the lane that answered it: local when a
+//! hosted engine served the request, cloud when the request spilled to a
+//! provider instead. Both halves are priced at the same reference, so the
+//! saved and spent totals are one unit and subtract. Compression value is
+//! recorded separately after terminal provider success using the target
+//! model's configured or catalog input price. Unknown or unpriced models
 //! remain zero-valued. It never fabricates a local completion or folds internal
 //! summarizer spend into the gross avoided-cost value.
 
@@ -789,8 +792,20 @@ fn update_redb_lane(
     Ok(())
 }
 
+/// Which serving lane answered one finished completion.
+///
+/// Derived from the usage event rather than from a model name, because
+/// after a spill the name the cloud provider billed under is its own.
+#[derive(Clone, Copy)]
+enum Lane<'event> {
+    /// A locally hosted engine answered, under this serve-entry name.
+    Local(&'event str),
+    /// The request left the box, displacing this served model's lane.
+    Cloud(&'event str),
+}
+
 /// A [`UsageSink`] that records the
-/// local-vs-cloud savings of every finished completion whose served model
+/// local-vs-cloud split of every finished completion whose served model
 /// has a configured cloud reference price.
 #[derive(Debug)]
 pub struct ValueSink {
@@ -833,27 +848,67 @@ impl ValueSink {
         }
         references
     }
+
+    /// Which lane answered `event`, when it belongs to a served model
+    /// that declares a reference price. `None` means the completion is
+    /// outside this recorder's scope and nothing is written.
+    ///
+    /// The lane comes from [`LlmUsageEvent::served_model`], never from
+    /// comparing model names: a fallback provider configured without a
+    /// `model_map` bills a spilled completion under the same id the local
+    /// lane serves, and a name comparison would credit it as a saving.
+    fn lane<'event>(&self, event: &'event LlmUsageEvent) -> Option<Lane<'event>> {
+        if let Some(served) = event.served_model.as_deref() {
+            return Some(Lane::Local(served));
+        }
+        // The requested model, not the billed one. A spill is only
+        // attributable to the lane it displaced through the name the
+        // caller asked for.
+        let logical = event.logical_model.as_deref()?;
+        self.references
+            .contains_key(logical)
+            .then_some(Lane::Cloud(logical))
+    }
 }
 
 impl UsageSink for ValueSink {
     fn record(&self, event: &LlmUsageEvent) {
-        // Only local completions of a served model with a configured
-        // reference are priced. Match the served model name first, then
-        // the provider name.
-        // TODO(WOR-1913): cloud-spill lane attribution.
+        let Some(lane) = self.lane(event) else {
+            return;
+        };
+        let model = match lane {
+            Lane::Local(model) | Lane::Cloud(model) => model,
+        };
+        // Only models with a configured reference are priced: sbproxy
+        // never guesses what a completion would have cost. Match the
+        // model name first, then the provider name.
         let Some((_reference, price)) = self
             .references
-            .get(&event.model)
+            .get(model)
             .or_else(|| self.references.get(&event.provider))
         else {
             return;
         };
-        self.ledger.record_local(
-            &event.model,
-            event.prompt_tokens,
-            event.completion_tokens,
-            *price,
-        );
+        match lane {
+            Lane::Local(model) => self.ledger.record_local(
+                model,
+                event.prompt_tokens,
+                event.completion_tokens,
+                *price,
+            ),
+            // Priced at the same reference the local lane is credited
+            // against, so the two halves of the report are one unit and
+            // subtract. The spend lands under the served model's key
+            // rather than the provider's billing id, because the question
+            // the report answers is what this lane cost when the box
+            // could not take it.
+            Lane::Cloud(model) => self.ledger.record_cloud(
+                model,
+                event.prompt_tokens,
+                event.completion_tokens,
+                *price,
+            ),
+        }
     }
 
     fn name(&self) -> &str {
@@ -876,6 +931,9 @@ mod tests {
         }
     }
 
+    /// What the logging hook emits for a completion a local engine served:
+    /// the serve entry answered under its own name, so both model fields
+    /// and the lane marker agree.
     fn event(model: &str, prompt_tokens: u64, completion_tokens: u64) -> LlmUsageEvent {
         LlmUsageEvent {
             provider: "local".into(),
@@ -902,6 +960,27 @@ mod tests {
             a2a_context_id: None,
             a2a_identity_verified: None,
             workflow_id: None,
+            logical_model: Some(model.into()),
+            served_model: Some(model.into()),
+        }
+    }
+
+    /// What the logging hook emits after the local lane for `model` could
+    /// not take the request and the failover loop advanced to a cloud
+    /// provider: no lane marker, the provider's billing id in `model`, and
+    /// the model the caller asked for still in `logical_model`.
+    fn spilled_event(
+        model: &str,
+        billed_as: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) -> LlmUsageEvent {
+        LlmUsageEvent {
+            provider: "openai".into(),
+            model: billed_as.into(),
+            logical_model: Some(model.into()),
+            served_model: None,
+            ..event(model, prompt_tokens, completion_tokens)
         }
     }
 
@@ -951,6 +1030,74 @@ mod tests {
         assert_eq!(report.models.len(), 1);
         assert_eq!(report.models[0].model, "qwen");
         assert_eq!(sink.name(), "value");
+    }
+
+    #[test]
+    fn value_sink_records_a_spilled_completion_on_the_cloud_lane() {
+        // WOR-2223: the local lane had a caller for the whole life of this
+        // recorder while the cloud lane had none, so the report was gross
+        // savings presented as a hybrid split. One spill has to move both
+        // cloud numbers, or the split is still fiction.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Arc::new(ValueLedger::open(dir.path().join("spill.redb")).expect("open"));
+        let mut references = BTreeMap::new();
+        references.insert("qwen".to_string(), ("gpt-4o".to_string(), cloud()));
+        let sink = ValueSink::new(ledger.clone(), references);
+
+        sink.record(&event("qwen", 1000, 500));
+        sink.record(&spilled_event("qwen", "gpt-4o", 1000, 500));
+
+        let report = ledger.report();
+        assert_eq!(report.total_local_completions, 1);
+        assert_eq!(report.total_cloud_completions, 1);
+        assert_eq!(report.total_saved_micros, 10_500);
+        assert_eq!(
+            report.total_cloud_spent_micros, 10_500,
+            "the spill is priced at the same reference as the saving"
+        );
+        assert_eq!(
+            report.models.len(),
+            1,
+            "both lanes land on the served model, not on the provider's billing id"
+        );
+        assert_eq!(report.models[0].model, "qwen");
+        assert_eq!(report.models[0].cloud_completions, 1);
+    }
+
+    #[test]
+    fn a_spill_that_keeps_the_requested_model_id_is_not_a_local_saving() {
+        // A fallback provider configured without a `model_map` bills under
+        // the id the caller sent, which is the id the local lane serves. The
+        // lane has to come from the route decision, not from that name.
+        let ledger = Arc::new(ValueLedger::open("").expect("memory ledger"));
+        let mut references = BTreeMap::new();
+        references.insert("qwen".to_string(), ("gpt-4o".to_string(), cloud()));
+        let sink = ValueSink::new(ledger.clone(), references);
+
+        sink.record(&spilled_event("qwen", "qwen", 1000, 500));
+
+        let report = ledger.report();
+        assert_eq!(report.total_local_completions, 0);
+        assert_eq!(report.total_saved_micros, 0);
+        assert_eq!(report.total_cloud_completions, 1);
+        assert_eq!(report.total_cloud_spent_micros, 10_500);
+    }
+
+    #[test]
+    fn a_spill_to_an_unreferenced_model_records_nothing() {
+        // No `reference:` means no savings claim, and the same silence has
+        // to hold for the cloud half: sbproxy does not guess a price.
+        let ledger = Arc::new(ValueLedger::open("").expect("memory ledger"));
+        let mut references = BTreeMap::new();
+        references.insert("qwen".to_string(), ("gpt-4o".to_string(), cloud()));
+        let sink = ValueSink::new(ledger.clone(), references);
+
+        sink.record(&spilled_event("llama", "gpt-4o", 1000, 500));
+
+        let report = ledger.report();
+        assert_eq!(report.total_cloud_completions, 0);
+        assert_eq!(report.total_cloud_spent_micros, 0);
+        assert!(report.models.is_empty());
     }
 
     #[test]

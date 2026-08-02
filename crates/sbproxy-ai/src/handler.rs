@@ -331,11 +331,16 @@ impl AiHandlerConfig {
             .get_or_init(|| {
                 let mut sinks = crate::usage_sink::build_sinks(&self.usage_sinks);
                 // WOR-1913: a served model that declares a `reference:` cloud
-                // price gets a value recorder that prices each local completion
-                // it serves at that reference, so the admin value route and the
-                // dollars-saved doc claim are backed by a real per-completion
-                // tally. No reference configured means no recorder, never a
-                // guessed saving.
+                // price gets a value recorder that prices each of its
+                // completions at that reference, so the admin value route and
+                // the dollars-saved doc claim are backed by a real
+                // per-completion tally. No reference configured means no
+                // recorder, never a guessed saving.
+                //
+                // WOR-2223: "each of its completions" covers both lanes. This
+                // map prices a completion that spilled past the local engine
+                // too, which is why it is keyed on the served model name
+                // rather than on the provider that ends up billing.
                 let mut references = std::collections::BTreeMap::new();
                 let mut ledger_dir: Option<String> = None;
                 for provider in &self.providers {

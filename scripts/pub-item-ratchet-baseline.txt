@@ -143,4 +143,16 @@
 # `LedgerPayload::provenance_conflict`, and the two admin read paths ask
 # the claims directly. This is the ratchet's first option, wiring the item
 # to a production call site, rather than a narrowing.
-288
+
+# Lowered to 287 on WOR-2223, 2026-08-02, answering another one.
+# `LaneSplit::record_cloud` (sbproxy-model-host/src/hybrid.rs) is the
+# cloud half of the hybrid savings split, and the escalation asked where
+# the cloud-spill path should call it. The answer is the same place the
+# local half is recorded: `ValueSink`, the usage sink that prices every
+# finished completion of a model with a configured `reference`. It now
+# reads the serving lane off the usage event instead of assuming local,
+# so a completion that spilled to a cloud provider lands in
+# cloud_completions and cloud_spent_micros rather than nowhere. The
+# ratchet's first option again, a production call site rather than a
+# narrowing.
+287
