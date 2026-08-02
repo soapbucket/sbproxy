@@ -613,7 +613,12 @@ on a provider, which is the whole point of metering through a queue rather
 than through a callback.
 
 The visible half of that is the row's status: a freshly queued row reads
-`queued`, and only the worker moves it on.
+`queued`, and only the worker moves it on. It does move it on, and quickly,
+so `queued` is what the request path leaves behind rather than what a
+reader looking at the table a moment later will find. Where the row comes
+to rest is the worker's report of the provider: `terminal` once the
+provider has answered authoritatively, with `failure_category` naming
+which answer it was.
 
 ### Seeing it work
 
@@ -625,9 +630,12 @@ call to it:
 
 <!-- CAPTURE: bash examples/usage-bridge-queue/bin/bill-one-call.sh -->
 
-The queue then holds one row per billable unit:
+The queue then holds one row per billable unit. `usage_reports` has no
+`quantity` column: the number is a field of the serialized event in
+`event_jcs`, so the row cannot disagree with what the worker actually
+sends. `json_extract` reads it back out.
 
-<!-- CAPTURE: sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 'select reporter, usage_identifier, tenant_id, origin_id, status, quantity from usage_reports order by created_at_ms' -->
+<!-- CAPTURE: sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 "select reporter, usage_identifier, tenant_id, origin_id, status, failure_category, json_extract(event_jcs, '\$.quantity') as quantity from usage_reports order by created_at_ms" -->
 
 The full event the worker will hand the reporter, including the resource
 attribution and the customer the charge lands on:
@@ -649,6 +657,13 @@ which is the shape of a silently dropped charge.
 served request produced a billable unit that never reached the queue, so
 the customer will be under-billed and nothing downstream notices on its
 own.
+
+Both families are registered on first use rather than at startup, which is
+why only one of them is in the scrape above. Until a bridge has had a gap
+there is no gap series, and a scrape of a healthy bridge is byte for byte
+what a scrape of a build that never records one would look like. Pair the
+threshold with an `absent()` alert so the missing series is itself the
+alert, rather than the reason the alert never fires.
 
 A gap marker is an ordinary chained, signed entry, so a chain carrying one
 still verifies. That surface belongs to the meter rather than to the

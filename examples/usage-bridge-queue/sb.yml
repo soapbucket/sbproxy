@@ -10,9 +10,12 @@
 # The request path enqueues and nothing more. The HTTP call to the
 # provider belongs to the recovery worker, behind its own lease and its
 # own idempotency key, so nothing on the request path ever waits on
-# Stripe. That split is visible here: rows appear with status `queued`
-# and stay there, because the provider is not reachable from this stack
-# and the reporter's API root is a compiled-in constant with no override.
+# Stripe. That split is visible here: a row appears with status `queued`,
+# and the worker is the only thing that moves it on. It does so inside a
+# second, because the reporter's API root is a compiled-in constant with
+# no override and the demo key below is not a real credential, so Stripe
+# answers authoritatively and the row settles at `terminal` with
+# failure_category `rejected`.
 #
 # The customer a row bills comes from the authenticated credential's
 # metadata, never from a request header. A caller who could name the

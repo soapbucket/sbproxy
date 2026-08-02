@@ -22,7 +22,10 @@
     "e2e/tests/usage_bridge.rs asserts the same outcomes automatically:",
     "it starts at an HTTP request through the harness and finishes by",
     "reading the same SQLite file, so a producer that disappears again",
-    "fails there.",
+    "fails there. One test in that file also runs bin/bill-one-call.sh and",
+    "every sqlite3 command the README's CAPTURE markers name, against a",
+    "stack of its own, so the documented walkthrough cannot rot unnoticed",
+    "the way it did in WOR-2220.",
     "",
     "audit_check stays false until the OSS /api/audit/recent endpoint",
     "lands."

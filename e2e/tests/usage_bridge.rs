@@ -45,6 +45,7 @@
 use std::io::Read as _;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
@@ -60,6 +61,14 @@ const CUSTOMER: &str = "cus_wor2169e2e";
 
 /// The Stripe meter event name the reporter is configured with.
 const EVENT_NAME: &str = "sbproxy_ai_tokens";
+
+/// `examples/usage-bridge-queue/`, resolved from the crate that is running.
+fn example_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("e2e crate lives under workspace root")
+        .join("examples/usage-bridge-queue")
+}
 
 fn http_client() -> Client {
     Client::builder()
@@ -425,6 +434,98 @@ fn a_served_ai_request_queues_one_billable_unit() {
         row.usage_identifier.len() <= 200,
         "Stripe bounds an identifier at 200 characters: {}",
         row.usage_identifier
+    );
+}
+
+#[test]
+fn the_examples_own_walkthrough_still_runs() {
+    // Everything above drives the proxy directly, which is why all of it
+    // stayed green while the example next to it rotted (WOR-2220). The
+    // example's entry point fed a non-2xx admin body to a JSON parser and
+    // reported a missing `token` field instead of the HTTP status that
+    // explained it, and the README's documented query selected a `quantity`
+    // column that `usage_reports` does not have. Nothing ran either one:
+    // `scripts/examples-smoke.sh` gates on a `docker-compose.yml`, and this
+    // example ships none because the shared image compiles the default
+    // feature set while the meter needs `payment-stripe`.
+    //
+    // So this test runs the shipped script and the README's own sqlite3
+    // commands rather than reimplementing them. A walkthrough that stops
+    // working is a failure here.
+    let stack = start(&reporter_block("ai", "total_tokens", "degraded"));
+    let example = example_dir();
+    let state = stack.state_path.display().to_string();
+
+    let output = Command::new("bash")
+        .arg(example.join("bin/bill-one-call.sh"))
+        .env("ADMIN", format!("http://127.0.0.1:{}", stack.admin_port))
+        .env("ADMIN_AUTH", "admin:secret")
+        .env("PROXY", stack.proxy.base_url())
+        .env("HOST", AI_HOST)
+        .env("MODEL", "gpt-client")
+        .env("CUSTOMER", CUSTOMER)
+        .env("STATE", &state)
+        .output()
+        .expect("run examples/usage-bridge-queue/bin/bill-one-call.sh");
+
+    let status = output.status;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        status.success(),
+        "bin/bill-one-call.sh is the example's own entry point and has to run \
+         clean: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // Reported by the walkthrough itself, so a script that stops billing
+    // fails here rather than printing a reassuring zero.
+    let reported = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("rows on the usage queue"))
+        .map(str::trim)
+        .next();
+    assert_eq!(
+        reported,
+        Some("1"),
+        "one call, one billable unit:\nstdout:\n{stdout}"
+    );
+
+    // Every sqlite3 command the README promises output for, run against the
+    // file this stack actually wrote. Parsed out of the CAPTURE markers so
+    // the assertion cannot drift from the text the reader is given.
+    let readme = std::fs::read_to_string(example.join("README.md"))
+        .expect("read examples/usage-bridge-queue/README.md");
+    let mut ran = 0_usize;
+    for line in readme.lines() {
+        let documented = match line
+            .strip_prefix("<!-- CAPTURE: ")
+            .and_then(|rest| rest.strip_suffix(" -->"))
+        {
+            Some(command) if command.starts_with("sqlite3 ") => command,
+            _ => continue,
+        };
+        let command = documented.replace("/tmp/sbproxy-usage-bridge/payments.sqlite3", &state);
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(&command)
+            .output()
+            .expect("run a documented sqlite3 command");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "the README documents this command and promises its output:\n  \
+             {documented}\n{stderr}"
+        );
+        assert!(
+            !output.stdout.is_empty(),
+            "this documented command returned nothing, so the block under it \
+             in the README would be empty:\n  {documented}"
+        );
+        ran += 1;
+    }
+    assert!(
+        ran >= 2,
+        "the README's sqlite3 walkthrough commands went missing; ran {ran}"
     );
 }
 
