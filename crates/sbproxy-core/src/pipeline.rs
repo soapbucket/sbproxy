@@ -2959,7 +2959,8 @@ mod tests {
             })],
         );
         let err = CompiledPipeline::from_config(config)
-            .expect_err("disagreeing spellings must fail config load")
+            .err()
+            .expect("disagreeing spellings must fail config load")
             .to_string();
         assert!(err.contains("fail_on_error"), "{err}");
         assert!(err.contains("failure_posture"), "{err}");
@@ -2980,7 +2981,8 @@ mod tests {
             })],
         );
         let err = CompiledPipeline::from_config(config)
-            .expect_err("observe must fail config load")
+            .err()
+            .expect("observe must fail config load")
             .to_string();
         assert!(err.contains("observe"), "{err}");
     }
