@@ -1,14 +1,12 @@
 # x402 v2 settlement on a priced route
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 An article route that costs $0.001 to a declared AI crawler and nothing to
 a reader, with x402 v2 `exact` configured as the settlement rail. The point
 of the example is the boundary: a crawler gets a price, a credential the
 proxy never issued gets nothing, and the origin is never called until a
 durable record says the payment settled.
-
-![x402 challenge and the closed failure path](../../docs/assets/payment-settlement.gif)
 
 ## What is in the bundle
 

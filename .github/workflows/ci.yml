@@ -227,6 +227,16 @@ jobs:
       - name: no tape renders a credential into a GIF
         run: bash scripts/check-tape-secrets.sh
 
+      # A tape whose output was never recorded, and a README embedding the
+      # GIF that recording would have produced, are one failure seen from
+      # two sides. `make tapes-check` keeps tapes in sync with their example
+      # configs and never opens docs/assets/; wire-example-gifs.py only
+      # inserts an image that already exists. Neither can see this, and both
+      # passed while a reader got a broken image mid-walkthrough. Also runs
+      # in docs-ci.yml, which is the lane a docs-only PR actually reaches.
+      - name: every promised doc asset exists
+        run: python3 scripts/check-doc-assets.py
+
       # Shares one script with scripts/check.sh so the local gate fails on
       # the same drift, instead of this being the only place that looks.
       # The script discovers the nested workspaces rather than listing

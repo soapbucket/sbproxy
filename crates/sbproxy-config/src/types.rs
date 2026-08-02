@@ -6871,11 +6871,18 @@ pub struct AgentSkillEntry {
     ///
     /// - A path-absolute reference (`/skills/foo.md`) re-hosted by
     ///   the proxy on the same origin.
+    /// - A relative reference (`skills/foo.md`), which names the same
+    ///   artifact as the path-absolute spelling and resolves the same
+    ///   way.
     /// - A fully-qualified URL fetched once at config-load and
     ///   re-emitted verbatim in the manifest (the proxy does not
     ///   re-host external artifacts).
-    /// - A relative reference (`skills/foo.md`) resolved per RFC 3986
-    ///   against the request authority at serve time.
+    ///
+    /// The two re-hosted spellings resolve against the path prefix the
+    /// serving surface answers on, not against the manifest's own
+    /// directory: the bare path for this `agent_skills:` block, and
+    /// `/.well-known/agent-skills/<listing>/` for the same entry shape
+    /// under a Listing's `spec.skills[]`.
     pub url: String,
     /// Visibility gate. `public` (default) returns the entry to every
     /// caller. `authenticated` filters the entry out of the manifest

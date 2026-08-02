@@ -31,6 +31,8 @@ origins:
       body: "<h1>catalog</h1>"
     # Top-level WOR-193 agent_skills block: serves as the per-origin
     # surface and as one source of entries for the aggregated index.
+    # Both url spellings appear so WOR-2217's property test covers
+    # each one.
     agent_skills:
       - name: "origin-pinned"
         type: skill-md
@@ -40,6 +42,14 @@ origins:
         body: |
           # origin-pinned
           From the top-level agent_skills block.
+      - name: "origin-relative"
+        type: skill-md
+        description: "Origin-level skill declared with a relative url."
+        url: "skills/origin-relative.md"
+        visibility: public
+        body: |
+          # origin-relative
+          Declared with the relative url spelling.
 "#;
 
 const LISTING_PUBLIC: &str = r#"
@@ -72,6 +82,14 @@ spec:
       body: |
         # listing-private
         Authenticated callers see this entry.
+    - name: listing-relative
+      type: skill-md
+      description: "Listing-scoped skill declared with a relative url"
+      url: skills/listing-relative.md
+      visibility: public
+      body: |
+        # listing-relative
+        Declared with the relative url spelling.
 "#;
 
 const LISTING_OTHER_HOSTNAME: &str = r#"
@@ -267,6 +285,141 @@ fn per_listing_index_does_not_serve_manifest_for_unknown_listing() {
     assert!(
         !is_manifest,
         "unknown listing must not serve a v0.2.0 manifest envelope; body={body}"
+    );
+}
+
+// --- WOR-2217: every URL the manifest advertises must be fetchable ---
+
+/// Strip scheme and authority off a manifest URL, leaving the path to
+/// request. The harness always sends a `Host` header, so a re-hosted
+/// entry always renders fully-qualified.
+fn path_of(url: &str) -> String {
+    for prefix in ["http://", "https://"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            return match rest.find('/') {
+                Some(i) => rest[i..].to_string(),
+                None => "/".to_string(),
+            };
+        }
+    }
+    url.to_string()
+}
+
+/// Fetch every URL a rendered manifest advertises and require the
+/// proxy to actually serve the pinned artifact there.
+///
+/// The status code alone is not a sufficient check on this fixture:
+/// the origin's action is `static`, so a path the well-known handler
+/// declines falls through and gets a 200 carrying `<h1>catalog</h1>`.
+/// The digest comparison is what makes the assertion real. It is also
+/// the right check on its own terms, since the digest is the contract
+/// the manifest offers a cooperative agent.
+fn assert_manifest_urls_are_fetchable(h: &ProxyHarness, manifest_path: &str, host: &str) {
+    use sha2::{Digest, Sha256};
+
+    let resp = h.get(manifest_path, host).expect("GET manifest");
+    assert_eq!(
+        resp.status,
+        200,
+        "manifest at {manifest_path} must serve; body: {}",
+        resp.text().unwrap_or_default()
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&resp.text().unwrap()).expect("manifest is JSON");
+    let entries = v["entries"].as_array().expect("entries array");
+    assert!(
+        !entries.is_empty(),
+        "manifest at {manifest_path} advertised no entries; the assertion below would be vacuous"
+    );
+
+    for e in entries {
+        let name = e["name"].as_str().expect("entry name");
+        let url = e["url"].as_str().expect("entry url");
+        let kind = e["type"].as_str().expect("entry type");
+        let manifest_digest = e["digest"].as_str().expect("entry digest");
+        let path = path_of(url);
+
+        let art = h.get(&path, host).expect("GET advertised artifact");
+        assert_ne!(
+            art.status, 404,
+            "manifest at {manifest_path} advertises {url} for skill '{name}', but the proxy \
+             returns 404 for {path}"
+        );
+        assert_eq!(
+            art.status, 200,
+            "manifest at {manifest_path} advertises {url} for skill '{name}'; got status {}",
+            art.status
+        );
+
+        let observed = format!("sha256:{}", hex::encode(Sha256::digest(&art.body)));
+        assert_eq!(
+            manifest_digest,
+            observed,
+            "manifest at {manifest_path} advertises {url} for skill '{name}' and pins digest \
+             {manifest_digest}, but the body served at {path} hashes to {observed}. The \
+             advertised URL does not resolve to the pinned artifact. Body: {}",
+            String::from_utf8_lossy(&art.body)
+        );
+
+        if kind == "skill-md" {
+            let ct = art.headers.get("content-type").cloned().unwrap_or_default();
+            assert!(
+                ct.starts_with("text/markdown"),
+                "skill '{name}' at {path} must serve as text/markdown; got {ct}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_url_in_the_per_listing_manifest_is_fetchable() {
+    let h = start().expect("start proxy");
+    assert_manifest_urls_are_fetchable(
+        &h,
+        "/.well-known/agent-skills/public-listing/index.json",
+        "catalog.localhost",
+    );
+}
+
+#[test]
+fn every_url_in_the_aggregated_manifest_is_fetchable() {
+    // The aggregated document mixes the top-level `agent_skills:`
+    // entries, re-hosted at the bare path, with the Listing entries
+    // re-hosted under `/.well-known/agent-skills/<listing>/`. Both
+    // have to be right in one manifest.
+    let h = start().expect("start proxy");
+    assert_manifest_urls_are_fetchable(
+        &h,
+        "/.well-known/agent-skills/index.json",
+        "catalog.localhost",
+    );
+}
+
+#[test]
+fn per_listing_manifest_advertises_the_listing_scoped_artifact_path() {
+    // WOR-2217 regression pin. A path-absolute `url` used to render
+    // as `https://catalog.localhost/skills/listing-public.md`, an
+    // address only the top-level `agent_skills:` block re-hosts.
+    let h = start().expect("start proxy");
+    let resp = h
+        .get(
+            "/.well-known/agent-skills/public-listing/index.json",
+            "catalog.localhost",
+        )
+        .expect("GET per-listing index");
+    let v: serde_json::Value = serde_json::from_str(&resp.text().unwrap()).unwrap();
+    let url = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "listing-public")
+        .expect("listing-public entry")["url"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        url.ends_with("/.well-known/agent-skills/public-listing/skills/listing-public.md"),
+        "per-listing manifest must advertise the listing-scoped path; got {url}"
     );
 }
 
