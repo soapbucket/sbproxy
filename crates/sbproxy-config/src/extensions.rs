@@ -507,8 +507,16 @@ impl BundleManifest {
                     return invalid("runtime javascript entry must end in .ts or .js");
                 }
                 for hook in &self.hooks {
-                    if hook.kind == BundleHookKind::ProxyWasm {
-                        return invalid("runtime javascript cannot declare a proxy_wasm hook");
+                    match hook.kind {
+                        BundleHookKind::ProxyWasm => {
+                            return invalid("runtime javascript cannot declare a proxy_wasm hook");
+                        }
+                        BundleHookKind::AiStreamEvent => {
+                            return invalid(
+                                "runtime javascript cannot declare an ai_stream_event hook",
+                            );
+                        }
+                        _ => {}
                     }
                     let export = hook.export.as_deref().ok_or_else(|| {
                         BundleManifestError::Invalid(sanitize_detail(&format!(
@@ -525,8 +533,14 @@ impl BundleManifest {
                 }
                 validate_wasm_entry(&self.entry)?;
                 for hook in &self.hooks {
-                    if hook.kind == BundleHookKind::ProxyWasm {
-                        return invalid("runtime wasm cannot declare a proxy_wasm hook");
+                    match hook.kind {
+                        BundleHookKind::ProxyWasm => {
+                            return invalid("runtime wasm cannot declare a proxy_wasm hook");
+                        }
+                        BundleHookKind::AiStreamEvent => {
+                            return invalid("runtime wasm cannot declare an ai_stream_event hook");
+                        }
+                        _ => {}
                     }
                     if hook.export.is_some() {
                         return invalid(format!(
@@ -600,7 +614,9 @@ fn invalid<T>(message: impl Into<String>) -> Result<T, BundleManifestError> {
 }
 
 fn sanitize_detail(detail: &str) -> String {
-    const MAX_DETAIL_BYTES: usize = 480;
+    // The longest BundleManifestError display prefix is 33 bytes, so a
+    // 479-byte detail keeps the complete public error at or below 512 bytes.
+    const MAX_DETAIL_BYTES: usize = 479;
     let mut sanitized = detail
         .chars()
         .map(|character| {

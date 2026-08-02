@@ -128,6 +128,19 @@ fn manifest_parses_the_versioned_javascript_contract_and_defaults() {
 }
 
 #[test]
+fn javascript_runtime_accepts_direct_js_entry() {
+    let yaml = replace_once(
+        JAVASCRIPT_MANIFEST,
+        "entry: src/index.ts",
+        "entry: dist/index.js",
+    );
+
+    let manifest = parse_manifest(&yaml);
+    assert_eq!(manifest.runtime, BundleRuntime::Javascript);
+    assert_eq!(manifest.entry, "dist/index.js");
+}
+
+#[test]
 fn manifest_is_strict_and_versioned() {
     for (from, to, needle) in [
         (
@@ -251,6 +264,39 @@ fn runtime_entry_and_export_contracts_are_enforced() {
 }
 
 #[test]
+fn javascript_runtime_rejects_ai_stream_event_hooks() {
+    let yaml = replace_once(
+        JAVASCRIPT_MANIFEST,
+        "  - kind: policy\n",
+        "  - kind: ai_stream_event\n",
+    );
+
+    let error = manifest_error(&yaml);
+    assert!(
+        error.contains("javascript") && error.contains("ai_stream_event"),
+        "{error}"
+    );
+}
+
+#[test]
+fn envelope_wasm_runtime_rejects_ai_stream_event_hooks() {
+    let yaml = JAVASCRIPT_MANIFEST
+        .replace(
+            "runtime: javascript",
+            "runtime: wasm\nabi: sbproxy-envelope/v1",
+        )
+        .replace("entry: src/index.ts", "entry: dist/bundle.wasm")
+        .replace("  - kind: policy\n", "  - kind: ai_stream_event\n")
+        .replace("    export: enforce\n", "");
+
+    let error = manifest_error(&yaml);
+    assert!(
+        error.contains("wasm") && error.contains("ai_stream_event"),
+        "{error}"
+    );
+}
+
+#[test]
 fn manifest_rejects_inactive_permissions_and_unsafe_schemas() {
     let permissions = replace_once(
         JAVASCRIPT_MANIFEST,
@@ -318,6 +364,25 @@ fn manifest_errors_are_bounded_and_do_not_echo_remote_ref_credentials() {
     );
     let ref_error = manifest_error(&remote_ref);
     assert!(!ref_error.contains("secret"), "{ref_error}");
+}
+
+#[test]
+fn malformed_manifest_yaml_errors_render_within_512_bytes() {
+    let unknown_runtime = "x".repeat(700);
+    let yaml = replace_once(
+        JAVASCRIPT_MANIFEST,
+        "runtime: javascript",
+        &format!("runtime: {unknown_runtime}"),
+    );
+
+    let rendered = BundleManifest::parse_yaml(yaml.as_bytes())
+        .expect_err("unknown runtime must be rejected as malformed manifest YAML")
+        .to_string();
+    assert!(
+        rendered.len() <= 512,
+        "rendered error is {} bytes: {rendered}",
+        rendered.len()
+    );
 }
 
 #[test]
