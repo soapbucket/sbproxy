@@ -134,8 +134,7 @@ mod tests {
     #[test]
     fn compile_rejects_malformed_source_and_names_the_site() {
         let err = CompiledCel::compile("policy `assertion` (no-5xx)", "this is not valid CEL !!!")
-            .err()
-            .expect("malformed CEL must not compile");
+            .expect_err("malformed CEL must not compile");
         let msg = err.to_string();
         assert!(msg.contains("policy `assertion` (no-5xx)"), "{msg}");
         assert!(msg.contains("this is not valid CEL !!!"), "{msg}");
@@ -185,8 +184,7 @@ mod tests {
         // for a presence check finds the working form next to the
         // broken one.
         let err = CompiledCel::compile("probe", r#"has(request.headers["x-tier"])"#)
-            .err()
-            .expect("has() over an index must not compile");
+            .expect_err("has() over an index must not compile");
         assert!(
             err.to_string().contains("has() macro"),
             "the parse error should name the macro: {err}"
