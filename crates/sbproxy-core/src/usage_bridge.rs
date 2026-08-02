@@ -347,7 +347,6 @@ mod runtime {
     use std::sync::Arc;
 
     use sbproxy_billing::registry::UsageEvent;
-    use sbproxy_billing::store::SettlementStore;
     use sbproxy_config::payments::{PaymentsConfig, UsageSource};
     use sbproxy_config::types::FailureMode;
 
