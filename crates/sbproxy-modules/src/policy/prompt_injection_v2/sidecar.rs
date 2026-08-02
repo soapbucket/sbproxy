@@ -250,6 +250,7 @@ impl SidecarDetector {
             ));
         }
         cfg.validate_failure_posture()?;
+        let failure_posture = cfg.failure_posture();
         Ok(Self {
             endpoint: cfg.endpoint,
             timeout: Duration::from_millis(cfg.timeout_ms),
@@ -257,7 +258,7 @@ impl SidecarDetector {
             model: cfg.model,
             injection_label: cfg.injection_label,
             threshold: cfg.threshold,
-            failure_posture: cfg.failure_posture(),
+            failure_posture,
             name: SIDECAR_DETECTOR_NAME,
         })
     }
