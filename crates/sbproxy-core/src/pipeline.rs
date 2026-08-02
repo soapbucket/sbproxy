@@ -2936,9 +2936,7 @@ mod tests {
         let config = make_config_with_transforms(
             "t.example.com",
             serde_json::json!({"type": "noop"}),
-            vec![
-                serde_json::json!({"type": "json", "set": {"a": 1}, "failure_posture": "closed"}),
-            ],
+            vec![serde_json::json!({"type": "json", "set": {"a": 1}, "failure_posture": "closed"})],
         );
         let pipeline = CompiledPipeline::from_config(config).unwrap();
         assert_eq!(

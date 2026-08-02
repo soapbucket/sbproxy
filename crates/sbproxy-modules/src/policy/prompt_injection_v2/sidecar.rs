@@ -581,7 +581,10 @@ mod tests {
         for (config, expected) in [
             (serde_json::json!({}), FailureMode::Open),
             (serde_json::json!({"fail_closed": false}), FailureMode::Open),
-            (serde_json::json!({"fail_closed": true}), FailureMode::Closed),
+            (
+                serde_json::json!({"fail_closed": true}),
+                FailureMode::Closed,
+            ),
         ] {
             let det = SidecarDetector::parse(&config).expect("valid config");
             assert_eq!(det.failure_posture, expected, "{config}");

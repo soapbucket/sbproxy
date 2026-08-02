@@ -958,7 +958,8 @@ mod tests {
         ] {
             let cfg = transform_config(config.clone());
             assert_eq!(cfg.failure_posture(), expected, "{config}");
-            cfg.validate_failure_posture().expect("legacy-only is valid");
+            cfg.validate_failure_posture()
+                .expect("legacy-only is valid");
         }
     }
 
