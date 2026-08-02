@@ -3748,6 +3748,7 @@ origins:
         };
 
         let compiled = CompiledConfig {
+            extension_bundles: Default::default(),
             origins: vec![origin],
             host_map: std::collections::HashMap::new(),
             server,

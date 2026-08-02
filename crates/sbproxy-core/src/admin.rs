@@ -7301,6 +7301,7 @@ origins:
         host_map.insert(CompactString::new("alpha.example"), 0);
         host_map.insert(CompactString::new("beta.example"), 1);
         let cfg = sbproxy_config::CompiledConfig {
+            extension_bundles: Default::default(),
             origins: vec![
                 make_origin("alpha.example", "kid-alpha"),
                 make_origin("beta.example", "kid-beta"),

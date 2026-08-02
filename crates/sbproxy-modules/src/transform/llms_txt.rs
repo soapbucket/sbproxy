@@ -633,6 +633,7 @@ mod tests {
             host_map.insert(origin.hostname.clone(), idx);
         }
         Arc::new(CompiledConfig {
+            extension_bundles: Default::default(),
             origins,
             host_map,
             server: ProxyServerConfig::default(),

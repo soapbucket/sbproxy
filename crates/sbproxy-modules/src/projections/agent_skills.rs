@@ -1714,6 +1714,7 @@ spec:
         host_map.insert(CompactString::new("with.example.com"), 0);
         host_map.insert(CompactString::new("without.example.com"), 1);
         let cfg = CompiledConfig {
+            extension_bundles: Default::default(),
             origins: vec![with_skills, without],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),

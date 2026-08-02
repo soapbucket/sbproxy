@@ -447,6 +447,7 @@ mod tests {
             }
         })];
         CompiledConfig {
+            extension_bundles: Default::default(),
             origins: vec![origin],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),
