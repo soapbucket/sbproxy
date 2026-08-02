@@ -215,18 +215,11 @@ impl EgressPolicy {
 }
 
 /// System DNS resolver for production OpenAPI / MCP egress checks.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SystemHostResolver;
-
-impl HostResolver for SystemHostResolver {
-    fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
-        use std::net::ToSocketAddrs;
-        (host, port)
-            .to_socket_addrs()
-            .map(|i| i.collect())
-            .map_err(|_| ())
-    }
-}
+///
+/// Re-exported from the GF egress foundation (WOR-2165) so every
+/// consumer that needs a live answer names the same resolver. The
+/// duplicate definition that used to live here is gone.
+pub use sbproxy_security::egress::SystemHostResolver;
 
 /// Resolver used by [`EgressPolicy::check_url`] when no caller-injected
 /// resolver is available. Returns a fixed public address so host/scheme/

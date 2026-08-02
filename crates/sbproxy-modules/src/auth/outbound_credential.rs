@@ -17,14 +17,16 @@
 //! enterprise line and `docs/outbound-dpop.md` for RFC 9449 sender
 //! constraint configuration.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use dashmap::DashMap;
-use sbproxy_security::egress::{EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver};
+use sbproxy_security::egress::{
+    record_egress_refused, CachedSystemResolver, EgressAuthorizer, EgressDenied, EgressPurpose,
+    HostResolver,
+};
 use serde::Deserialize;
 
 use super::dpop_outbound::{validate_nonce, DpopOutboundConfig, DpopRuntime, DpopSignerError};
@@ -546,15 +548,22 @@ pub fn authorize_token_endpoint(
         .map(|_| ())
 }
 
-struct PublicPinResolver;
-
-impl HostResolver for PublicPinResolver {
-    fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
-        Ok(vec![SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
-            port,
-        )])
-    }
+/// Gate one token endpoint, attributing a refusal to `origin_id`
+/// (WOR-2165).
+///
+/// The resolver is live. The fixed synthetic pin this gate used to run
+/// against was public and resolvable for every hostname, so an IdP name
+/// that resolves onto the pod network passed, and every recorded pin
+/// described the fixture rather than DNS.
+fn gate_token_endpoint(
+    egress: Option<&EgressAuthorizer>,
+    url: &str,
+    origin_id: &str,
+) -> Result<()> {
+    authorize_token_endpoint(egress, url, &CachedSystemResolver).map_err(|denied| {
+        record_egress_refused(EgressPurpose::TokenExchange, denied, "unset", origin_id);
+        anyhow::anyhow!("egress denied: {denied:?}")
+    })
 }
 
 /// Resolve the outbound credential for `cfg`.
@@ -576,6 +585,10 @@ pub async fn resolve(
 
 /// Like [`resolve`], with an optional fail-closed egress authorizer for
 /// token-endpoint HTTP (`EgressPurpose::TokenExchange`).
+///
+/// Refusals are attributed to `origin_id` when one is known;
+/// [`resolve`] has no origin in scope and passes the empty string,
+/// which the counter renders as `unset`.
 pub async fn resolve_with_egress(
     cfg: &OutboundCredentialConfig,
     http: &reqwest::Client,
@@ -583,10 +596,24 @@ pub async fn resolve_with_egress(
     secret_lookup: &(dyn Fn(&str) -> Result<String> + Sync),
     egress: Option<&EgressAuthorizer>,
 ) -> Result<MintedCredential> {
+    resolve_with_egress_for_origin(cfg, http, subject_token, secret_lookup, egress, "").await
+}
+
+/// [`resolve_with_egress`] with an explicit origin id for refusal
+/// attribution (WOR-2165). This deployment is multi-tenant, so an
+/// egress refusal that cannot say whose origin it belongs to is not
+/// actionable.
+pub async fn resolve_with_egress_for_origin(
+    cfg: &OutboundCredentialConfig,
+    http: &reqwest::Client,
+    subject_token: Option<&str>,
+    secret_lookup: &(dyn Fn(&str) -> Result<String> + Sync),
+    egress: Option<&EgressAuthorizer>,
+    origin_id: &str,
+) -> Result<MintedCredential> {
     match cfg {
         OutboundCredentialConfig::TokenExchange(c) => {
-            authorize_token_endpoint(egress, &c.token_endpoint, &PublicPinResolver)
-                .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))?;
+            gate_token_endpoint(egress, &c.token_endpoint, origin_id)?;
             let subject =
                 subject_token.context("token_exchange requires an inbound subject token")?;
             validate_subject_token(subject, &c.subject_token_issuers, c.act_depth_cap)?;
@@ -631,8 +658,7 @@ pub async fn resolve_with_egress(
             })
         }
         OutboundCredentialConfig::ClientCredentials(c) => {
-            authorize_token_endpoint(egress, &c.token_endpoint, &PublicPinResolver)
-                .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))?;
+            gate_token_endpoint(egress, &c.token_endpoint, origin_id)?;
             let secret = secret_lookup(&c.client_secret)?;
             let mut form: Vec<(&str, &str)> = vec![("grant_type", "client_credentials")];
             if let Some(scope) = c.scope.as_deref() {
@@ -739,7 +765,15 @@ pub async fn resolve_cached_isolated(
     egress: Option<&EgressAuthorizer>,
 ) -> Result<MintedCredential> {
     if matches!(cfg, OutboundCredentialConfig::VaultSecret(_)) {
-        return resolve_with_egress(cfg, http, subject_token, secret_lookup, egress).await;
+        return resolve_with_egress_for_origin(
+            cfg,
+            http,
+            subject_token,
+            secret_lookup,
+            egress,
+            origin_id,
+        )
+        .await;
     }
 
     let subject_fp = subject_token
@@ -763,7 +797,15 @@ pub async fn resolve_cached_isolated(
         }
     }
 
-    let cred = resolve_with_egress(cfg, http, subject_token, secret_lookup, egress).await?;
+    let cred = resolve_with_egress_for_origin(
+        cfg,
+        http,
+        subject_token,
+        secret_lookup,
+        egress,
+        origin_id,
+    )
+    .await?;
     // Cache only when the endpoint reported a lifetime; reuse it until
     // 30s before expiry to avoid serving a token that dies in flight.
     if let Some(secs) = cred.expires_in {
@@ -1012,6 +1054,36 @@ mod tests {
         assert_eq!(cred.expires_in, Some(3600));
     }
 
+    /// Test resolver mapping a host to fixed addresses. Production
+    /// gates pass `CachedSystemResolver`.
+    struct MapResolver {
+        map: std::collections::HashMap<String, Vec<std::net::SocketAddr>>,
+    }
+
+    impl MapResolver {
+        fn new(entries: Vec<(&str, Vec<std::net::SocketAddr>)>) -> Self {
+            Self {
+                map: entries
+                    .into_iter()
+                    .map(|(h, a)| (h.to_string(), a))
+                    .collect(),
+            }
+        }
+    }
+
+    impl HostResolver for MapResolver {
+        fn resolve(&self, host: &str, _port: u16) -> Result<Vec<std::net::SocketAddr>, ()> {
+            self.map.get(host).cloned().ok_or(())
+        }
+    }
+
+    fn public_addr(port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+            port,
+        )
+    }
+
     fn enforce_token_exchange(hosts: &[&str]) -> EgressAuthorizer {
         use sbproxy_security::egress::{EgressConfig, PurposeAllowlist};
         use std::collections::HashMap;
@@ -1031,20 +1103,37 @@ mod tests {
     #[test]
     fn token_exchange_egress_denies_unlisted_host_with_shared_vocabulary() {
         let auth = enforce_token_exchange(&["idp.example.com"]);
-        let err = authorize_token_endpoint(
-            Some(&auth),
-            "https://evil.example/token",
-            &PublicPinResolver,
-        )
-        .expect_err("unlisted token endpoint");
+        let resolver = MapResolver::new(vec![("evil.example", vec![public_addr(443)])]);
+        let err = authorize_token_endpoint(Some(&auth), "https://evil.example/token", &resolver)
+            .expect_err("unlisted token endpoint");
         assert_eq!(err, EgressDenied::UnlistedHost);
         assert!(!format!("{err:?}").contains("evil.example"));
     }
 
     #[test]
+    fn token_exchange_egress_denies_a_listed_idp_that_resolves_internal() {
+        // Unreachable under the old fixed synthetic pin, which reported
+        // a public address for every hostname regardless of DNS.
+        let auth = enforce_token_exchange(&["idp.internal"]);
+        let resolver = MapResolver::new(vec![(
+            "idp.internal",
+            vec![std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 169, 254)),
+                443,
+            )],
+        )]);
+        assert_eq!(
+            authorize_token_endpoint(Some(&auth), "https://idp.internal/token", &resolver)
+                .unwrap_err(),
+            EgressDenied::PrivateAddress
+        );
+    }
+
+    #[test]
     fn omitted_egress_preserves_legacy_token_exchange_compatibility() {
-        authorize_token_endpoint(None, "https://evil.example/token", &PublicPinResolver)
-            .expect("omitted egress must not deny");
+        let resolver = MapResolver::new(vec![]);
+        authorize_token_endpoint(None, "https://evil.example/token", &resolver)
+            .expect("omitted egress must not deny, and must not even resolve");
     }
 
     #[tokio::test]

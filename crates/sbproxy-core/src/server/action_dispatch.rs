@@ -2048,7 +2048,18 @@ pub(super) async fn handle_mcp_action(
                                         )
                                         .await;
                                     };
-                                    let http = reqwest::Client::new();
+                                    // WOR-2165: the token-exchange POST
+                                    // carries the caller's subject token
+                                    // in the form body, which a 307 or
+                                    // 308 replays verbatim at whatever
+                                    // host the Location names. The
+                                    // client must not follow redirects
+                                    // on its own; `mint_token_exchange`
+                                    // re-authorizes each hop instead.
+                                    let http = reqwest::Client::builder()
+                                        .redirect(reqwest::redirect::Policy::none())
+                                        .build()
+                                        .unwrap_or_else(|_| reqwest::Client::new());
                                     let subject_token = session
                                         .req_header()
                                         .headers

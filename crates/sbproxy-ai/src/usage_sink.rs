@@ -10,9 +10,10 @@
 //! Sinks must be non-blocking on the request hot path and must never propagate
 //! a failure: a broken sink cannot fail the request it is logging.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-use sbproxy_security::egress::{EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver};
+use sbproxy_security::egress::{
+    evaluate_hop, record_egress_refused, CachedSystemResolver, EgressAuthorizer, EgressDenied,
+    EgressPurpose, HostResolver, RedirectRule,
+};
 use serde::{Deserialize, Serialize};
 
 /// A record of one completed LLM call, handed to every configured sink.
@@ -243,14 +244,79 @@ pub fn authorize_usage_http(
     auth.authorize(purpose, url, resolver).map(|_| ())
 }
 
-struct PublicPinResolver;
+/// Build the sink transport (WOR-2165).
+///
+/// Sinks carry collector credentials in headers the HTTP client does
+/// not treat as sensitive (`DD-API-KEY`) and in `Authorization`, so the
+/// client must not follow a redirect on its own; [`send_sink_post`]
+/// re-authorizes every hop instead.
+fn sink_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
 
-impl HostResolver for PublicPinResolver {
-    fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
-        Ok(vec![SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
-            port,
-        )])
+/// POST to a usage sink, re-authorizing each redirect hop (WOR-2165).
+///
+/// A usage sink URL is operator configuration naming exactly one
+/// collector, so [`RedirectRule::SameOriginOnly`] is the whole policy
+/// when no authorizer is attached: a 302 that walks the collector
+/// credential to another host is refused rather than followed. Refusals
+/// are attributed to the tenant whose event was being shipped, because
+/// in a multi-tenant deployment a refusal on one tenant's traffic is
+/// not the same signal as a refusal on everyone's.
+async fn send_sink_post(
+    client: &reqwest::Client,
+    egress: Option<&EgressAuthorizer>,
+    purpose: EgressPurpose,
+    sink_name: &'static str,
+    tenant: &str,
+    mut request: reqwest::Request,
+) -> Result<reqwest::Response, String> {
+    let mut hop = 0usize;
+    loop {
+        let replay = request.try_clone();
+        let from = request.url().clone();
+        let resp = client
+            .execute(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !resp.status().is_redirection() {
+            return Ok(resp);
+        }
+        let Some(location) = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+        else {
+            return Ok(resp);
+        };
+        hop += 1;
+        let next = match evaluate_hop(
+            egress,
+            purpose,
+            &from,
+            &location,
+            hop,
+            RedirectRule::SameOriginOnly,
+            &CachedSystemResolver,
+        ) {
+            Ok(next) => next,
+            Err(denied) => {
+                record_egress_refused(purpose, denied, tenant, sink_name);
+                return Err(format!("egress denied: {denied:?}"));
+            }
+        };
+        let Some(mut replay) = replay else {
+            return Ok(resp);
+        };
+        if next.strip_credentials {
+            crate::client::strip_sensitive_headers(replay.headers_mut());
+        }
+        *replay.url_mut() = next.url;
+        request = replay;
     }
 }
 
@@ -267,7 +333,7 @@ impl WebhookSink {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
-            client: reqwest::Client::new(),
+            client: sink_client(),
             egress: None,
         }
     }
@@ -281,13 +347,14 @@ impl WebhookSink {
 
 impl UsageSink for WebhookSink {
     fn record(&self, event: &LlmUsageEvent) {
+        let tenant = event.tenant_id.clone().unwrap_or_default();
         if let Err(denied) = authorize_usage_http(
             self.egress.as_ref(),
             EgressPurpose::Webhook,
             &self.url,
-            &PublicPinResolver,
+            &CachedSystemResolver,
         ) {
-            tracing::warn!(reason = ?denied, "usage sink: webhook egress denied");
+            record_egress_refused(EgressPurpose::Webhook, denied, &tenant, "webhook");
             return;
         }
         let body = match serde_json::to_vec(event) {
@@ -299,15 +366,31 @@ impl UsageSink for WebhookSink {
         };
         let url = self.url.clone();
         let client = self.client.clone();
+        let egress = self.egress.clone();
         // Fire-and-forget so the request hot path is never blocked or failed by
         // the sink.
         tokio::spawn(async move {
-            if let Err(e) = client
+            let request = match client
                 .post(&url)
                 .header("content-type", "application/json")
                 .body(body)
-                .send()
-                .await
+                .build()
+            {
+                Ok(request) => request,
+                Err(e) => {
+                    tracing::warn!(error = %e, "usage sink: webhook request build failed");
+                    return;
+                }
+            };
+            if let Err(e) = send_sink_post(
+                &client,
+                egress.as_ref(),
+                EgressPurpose::Webhook,
+                "webhook",
+                &tenant,
+                request,
+            )
+            .await
             {
                 tracing::warn!(error = %e, "usage sink: webhook POST failed");
             }
@@ -461,7 +544,7 @@ impl LangfuseSink {
             url: format!("{}/api/public/ingestion", host.trim_end_matches('/')),
             public_key: public_key.into(),
             secret_key: secret_key.into(),
-            client: reqwest::Client::new(),
+            client: sink_client(),
             egress: None,
         }
     }
@@ -475,13 +558,14 @@ impl LangfuseSink {
 
 impl UsageSink for LangfuseSink {
     fn record(&self, event: &LlmUsageEvent) {
+        let tenant = event.tenant_id.clone().unwrap_or_default();
         if let Err(denied) = authorize_usage_http(
             self.egress.as_ref(),
             EgressPurpose::UsageSink,
             &self.url,
-            &PublicPinResolver,
+            &CachedSystemResolver,
         ) {
-            tracing::warn!(reason = ?denied, "usage sink: langfuse egress denied");
+            record_egress_refused(EgressPurpose::UsageSink, denied, &tenant, "langfuse");
             return;
         }
         let timestamp = chrono::Utc::now().to_rfc3339();
@@ -493,13 +577,24 @@ impl UsageSink for LangfuseSink {
         let url = self.url.clone();
         let (pk, sk) = (self.public_key.clone(), self.secret_key.clone());
         let client = self.client.clone();
+        let egress = self.egress.clone();
         tokio::spawn(async move {
-            if let Err(e) = client
-                .post(&url)
-                .basic_auth(pk, Some(sk))
-                .json(&body)
-                .send()
-                .await
+            let request = match client.post(&url).basic_auth(pk, Some(sk)).json(&body).build() {
+                Ok(request) => request,
+                Err(e) => {
+                    tracing::warn!(error = %e, "usage sink: langfuse request build failed");
+                    return;
+                }
+            };
+            if let Err(e) = send_sink_post(
+                &client,
+                egress.as_ref(),
+                EgressPurpose::UsageSink,
+                "langfuse",
+                &tenant,
+                request,
+            )
+            .await
             {
                 tracing::warn!(error = %e, "usage sink: langfuse POST failed");
             }
@@ -529,7 +624,7 @@ impl DatadogSink {
             url: format!("https://http-intake.logs.{site}/api/v2/logs"),
             api_key: api_key.into(),
             service: service.into(),
-            client: reqwest::Client::new(),
+            client: sink_client(),
             egress: None,
         }
     }
@@ -543,26 +638,55 @@ impl DatadogSink {
 
 impl UsageSink for DatadogSink {
     fn record(&self, event: &LlmUsageEvent) {
+        let tenant = event.tenant_id.clone().unwrap_or_default();
         if let Err(denied) = authorize_usage_http(
             self.egress.as_ref(),
             EgressPurpose::UsageSink,
             &self.url,
-            &PublicPinResolver,
+            &CachedSystemResolver,
         ) {
-            tracing::warn!(reason = ?denied, "usage sink: datadog egress denied");
+            record_egress_refused(EgressPurpose::UsageSink, denied, &tenant, "datadog");
             return;
         }
         let body = datadog_log_body(event, &self.service);
         let url = self.url.clone();
         let key = self.api_key.clone();
         let client = self.client.clone();
+        let egress = self.egress.clone();
         tokio::spawn(async move {
-            if let Err(e) = client
+            // WOR-2165: `DD-API-KEY` is a vendor header name, so the
+            // HTTP client's own cross-origin credential stripping does
+            // not cover it. Marking it sensitive puts it under the
+            // shared strip that `send_sink_post` applies.
+            let mut key_value = match reqwest::header::HeaderValue::from_str(&key) {
+                Ok(value) => value,
+                Err(e) => {
+                    tracing::warn!(error = %e, "usage sink: datadog api key is not a valid header");
+                    return;
+                }
+            };
+            key_value.set_sensitive(true);
+            let request = match client
                 .post(&url)
-                .header("DD-API-KEY", key)
+                .header("DD-API-KEY", key_value)
                 .json(&body)
-                .send()
-                .await
+                .build()
+            {
+                Ok(request) => request,
+                Err(e) => {
+                    tracing::warn!(error = %e, "usage sink: datadog request build failed");
+                    return;
+                }
+            };
+            if let Err(e) = send_sink_post(
+                &client,
+                egress.as_ref(),
+                EgressPurpose::UsageSink,
+                "datadog",
+                &tenant,
+                request,
+            )
+            .await
             {
                 tracing::warn!(error = %e, "usage sink: datadog POST failed");
             }
@@ -1341,6 +1465,36 @@ mod tests {
         }
     }
 
+    /// Test resolver mapping a host to fixed addresses. Production
+    /// sinks pass `CachedSystemResolver`.
+    struct MapResolver {
+        map: std::collections::HashMap<String, Vec<std::net::SocketAddr>>,
+    }
+
+    impl MapResolver {
+        fn new(entries: Vec<(&str, Vec<std::net::SocketAddr>)>) -> Self {
+            Self {
+                map: entries
+                    .into_iter()
+                    .map(|(h, a)| (h.to_string(), a))
+                    .collect(),
+            }
+        }
+    }
+
+    impl HostResolver for MapResolver {
+        fn resolve(&self, host: &str, _port: u16) -> Result<Vec<std::net::SocketAddr>, ()> {
+            self.map.get(host).cloned().ok_or(())
+        }
+    }
+
+    fn public_addr(port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+            port,
+        )
+    }
+
     fn enforce_purpose(purpose: EgressPurpose, hosts: &[&str]) -> EgressAuthorizer {
         use sbproxy_security::egress::{EgressConfig, PurposeAllowlist};
         use std::collections::HashMap;
@@ -1358,11 +1512,12 @@ mod tests {
     #[test]
     fn webhook_egress_denies_unlisted_host_with_shared_vocabulary() {
         let auth = enforce_purpose(EgressPurpose::Webhook, &["collector.example.com"]);
+        let resolver = MapResolver::new(vec![("evil.example", vec![public_addr(443)])]);
         let err = authorize_usage_http(
             Some(&auth),
             EgressPurpose::Webhook,
             "https://evil.example/ingest",
-            &PublicPinResolver,
+            &resolver,
         )
         .expect_err("unlisted webhook host");
         assert_eq!(err, EgressDenied::UnlistedHost);
@@ -1371,25 +1526,51 @@ mod tests {
     #[test]
     fn usage_sink_egress_denies_unlisted_host_with_shared_vocabulary() {
         let auth = enforce_purpose(EgressPurpose::UsageSink, &["cloud.langfuse.com"]);
+        let resolver = MapResolver::new(vec![("evil.example", vec![public_addr(443)])]);
         let err = authorize_usage_http(
             Some(&auth),
             EgressPurpose::UsageSink,
             "https://evil.example/api/public/ingestion",
-            &PublicPinResolver,
+            &resolver,
         )
         .expect_err("unlisted usage-sink host");
         assert_eq!(err, EgressDenied::UnlistedHost);
     }
 
     #[test]
+    fn usage_sink_egress_denies_a_listed_host_that_resolves_internal() {
+        // Unreachable under the old fixed synthetic pin, which was
+        // public for every host no matter what DNS actually said.
+        let auth = enforce_purpose(EgressPurpose::UsageSink, &["collector.internal"]);
+        let resolver = MapResolver::new(vec![(
+            "collector.internal",
+            vec![std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5)),
+                443,
+            )],
+        )]);
+        assert_eq!(
+            authorize_usage_http(
+                Some(&auth),
+                EgressPurpose::UsageSink,
+                "https://collector.internal/api/public/ingestion",
+                &resolver,
+            )
+            .unwrap_err(),
+            EgressDenied::PrivateAddress
+        );
+    }
+
+    #[test]
     fn omitted_egress_preserves_legacy_usage_sink_compatibility() {
+        let resolver = MapResolver::new(vec![]);
         authorize_usage_http(
             None,
             EgressPurpose::Webhook,
             "https://evil.example/ingest",
-            &PublicPinResolver,
+            &resolver,
         )
-        .expect("omitted egress must not deny");
+        .expect("omitted egress must not deny, and must not even resolve");
     }
 
     #[test]
@@ -1400,5 +1581,84 @@ mod tests {
             &["collector.example.com"],
         ));
         sink.record(&sample_event());
+    }
+
+    /// One-shot loopback fixture serving `response` verbatim, reporting
+    /// whether anything connected.
+    fn dial_fixture(
+        response: String,
+    ) -> Option<(
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    )> {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        let addr = listener.local_addr().ok()?;
+        let hit = std::sync::Arc::new(AtomicBool::new(false));
+        let hit_writer = std::sync::Arc::clone(&hit);
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                hit_writer.store(true, Ordering::SeqCst);
+                let mut scratch = [0u8; 2048];
+                let _ = stream.read(&mut scratch);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        Some((addr, hit))
+    }
+
+    #[tokio::test]
+    async fn usage_sink_refuses_a_cross_origin_redirect_hop() {
+        use std::sync::atomic::Ordering;
+        // The collector 302s the credential-bearing POST at a different
+        // host. The hop must be refused and the second listener must
+        // never see a connection.
+        let Some((sink_addr, sink_hit)) = dial_fixture(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        ) else {
+            return;
+        };
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/ingest\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            sink_addr.port()
+        );
+        let Some((collector_addr, collector_hit)) = dial_fixture(redirect) else {
+            return;
+        };
+
+        let client = sink_client();
+        let mut key = reqwest::header::HeaderValue::from_static("dd-secret");
+        key.set_sensitive(true);
+        let request = client
+            .post(format!("http://{collector_addr}/api/v2/logs"))
+            .header("DD-API-KEY", key)
+            .json(&serde_json::json!([{"ddsource": "sbproxy"}]))
+            .build()
+            .expect("test request builds");
+
+        let err = send_sink_post(
+            &client,
+            None,
+            EgressPurpose::UsageSink,
+            "datadog",
+            "tenant-a",
+            request,
+        )
+        .await
+        .expect_err("a cross-origin hop must be refused, not followed");
+        assert!(
+            err.contains("RedirectToUnlistedHost"),
+            "expected RedirectToUnlistedHost, got: {err}"
+        );
+        assert!(
+            collector_hit.load(Ordering::SeqCst),
+            "the configured collector must have served the redirect"
+        );
+        assert!(
+            !sink_hit.load(Ordering::SeqCst),
+            "the redirect target must never be contacted"
+        );
     }
 }

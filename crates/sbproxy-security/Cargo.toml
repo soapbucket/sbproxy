@@ -43,5 +43,13 @@ serde_yaml.workspace = true
 tracing.workspace = true
 hickory-resolver = "0.26.1"
 tokio.workspace = true
+# WOR-2165: `sbproxy_egress_refused_total` lives beside the authorizer
+# that produces the refusal so every consumer crate reports through one
+# family. sbproxy-security is a leaf; the alternative was a per-crate
+# counter in each of sbproxy-ai, sbproxy-modules, sbproxy-extension, and
+# sbproxy-model-host, and only two of those can reach sbproxy-observe.
+# Same workspace version the observe, ai, and mesh crates already
+# resolve, so this adds no new lock entries.
+prometheus.workspace = true
 
 [dev-dependencies]

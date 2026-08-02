@@ -4,13 +4,15 @@
 //! Artifact transport seam and the reqwest implementation.
 
 use std::fmt;
-#[cfg(any(test, feature = "weights"))]
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
+#[cfg(feature = "weights")]
+use sbproxy_security::egress::{
+    evaluate_hop, record_egress_refused, CachedSystemResolver, RedirectRule,
+};
 use sbproxy_security::egress::{EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver};
 use zeroize::Zeroize;
 
@@ -142,25 +144,19 @@ pub fn authorize_artifact_url(
 /// Engine-download seam: today always omitted-config (legacy). GS may
 /// thread an authorizer later; the call site still goes through the
 /// shared closed vocabulary.
+///
+/// WOR-2165: the resolver is live. With no authorizer attached this
+/// short-circuits before resolving, so the change costs nothing until
+/// an operator configures egress.
 #[cfg(feature = "weights")]
 pub(crate) fn authorize_engine_download(url: &str) -> Result<(), String> {
-    authorize_artifact_url(None, EgressPurpose::EngineArtifact, url, &PublicPinResolver)
-        .map_err(|e| format!("egress denied: {e:?}"))
-}
-
-/// Resolver that pins a fixed public address so gates never touch the
-/// network during unit tests. Production GS wiring may inject real DNS.
-#[cfg(any(test, feature = "weights"))]
-pub(crate) struct PublicPinResolver;
-
-#[cfg(any(test, feature = "weights"))]
-impl HostResolver for PublicPinResolver {
-    fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
-        Ok(vec![SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
-            port,
-        )])
-    }
+    authorize_artifact_url(
+        None,
+        EgressPurpose::EngineArtifact,
+        url,
+        &CachedSystemResolver,
+    )
+    .map_err(|e| format!("egress denied: {e:?}"))
 }
 
 /// Redirect-following HTTP artifact transport.
@@ -173,9 +169,18 @@ pub struct HttpArtifactTransport {
 
 #[cfg(feature = "weights")]
 impl HttpArtifactTransport {
-    /// Construct a transport using reqwest's safe default redirect policy.
+    /// Construct a transport that follows redirects only under the
+    /// governed egress contract (WOR-2165).
+    ///
+    /// The client's own redirect following is off. Artifact downloads
+    /// legitimately hop off the origin host (a registry hands the
+    /// request to object storage or a CDN), so a cross-origin hop is
+    /// followed rather than refused, but
+    /// each one is re-authorized first and the source credential is
+    /// dropped before the request leaves the origin it was minted for.
     pub fn new() -> Result<Self, ArtifactError> {
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| ArtifactError::Transport(format!("build HTTP client: {error}")))?;
         Ok(Self {
@@ -189,6 +194,71 @@ impl HttpArtifactTransport {
         self.egress = Some(authorizer);
         self
     }
+
+    /// Follow the redirect chain for one artifact `GET`, re-authorizing
+    /// each hop (WOR-2165).
+    ///
+    /// A registry handing a download to object storage is the normal
+    /// case, so a cross-origin hop is followed rather than refused. The
+    /// source credential does not follow it: the bearer was minted for
+    /// the origin the operator named, and a presigned storage URL
+    /// carries its own authorization in the query string.
+    async fn follow_governed(
+        &self,
+        mut request: reqwest::Request,
+        origin_label: &str,
+    ) -> Result<reqwest::Response, String> {
+        let mut hop = 0usize;
+        loop {
+            let replay = request.try_clone();
+            let from = request.url().clone();
+            let response = self
+                .client
+                .execute(request)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !response.status().is_redirection() {
+                return Ok(response);
+            }
+            let Some(location) = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+            else {
+                return Ok(response);
+            };
+            hop += 1;
+            let next = evaluate_hop(
+                self.egress.as_ref(),
+                EgressPurpose::ModelArtifact,
+                &from,
+                &location,
+                hop,
+                RedirectRule::CrossOriginAllowed,
+                &CachedSystemResolver,
+            )
+            .map_err(|denied| {
+                record_egress_refused(
+                    EgressPurpose::ModelArtifact,
+                    denied,
+                    "unset",
+                    origin_label,
+                );
+                format!("egress denied: {denied:?}")
+            })?;
+            let Some(mut replay) = replay else {
+                return Ok(response);
+            };
+            if next.strip_credentials {
+                replay
+                    .headers_mut()
+                    .remove(reqwest::header::AUTHORIZATION);
+            }
+            *replay.url_mut() = next.url;
+            request = replay;
+        }
+    }
 }
 
 #[cfg(feature = "weights")]
@@ -198,13 +268,20 @@ impl ArtifactTransport for HttpArtifactTransport {
         use futures::StreamExt;
         use reqwest::header::{AUTHORIZATION, CONTENT_RANGE, ETAG, IF_RANGE, RANGE};
 
+        let artifact_host = reqwest::Url::parse(&request.url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| "unset".to_string());
         authorize_artifact_url(
             self.egress.as_ref(),
             EgressPurpose::ModelArtifact,
             &request.url,
-            &PublicPinResolver,
+            &CachedSystemResolver,
         )
-        .map_err(|denied| ArtifactError::Transport(format!("egress denied: {denied:?}")))?;
+        .map_err(|denied| {
+            record_egress_refused(EgressPurpose::ModelArtifact, denied, "unset", &artifact_host);
+            ArtifactError::Transport(format!("egress denied: {denied:?}"))
+        })?;
 
         let mut builder = self.client.get(&request.url);
         if request.offset > 0 {
@@ -227,9 +304,15 @@ impl ArtifactTransport for HttpArtifactTransport {
             builder = builder.header(AUTHORIZATION, header);
         }
 
-        let response = builder.send().await.map_err(|error| {
+        let built = builder.build().map_err(|error| {
             ArtifactError::Transport(format!("request {}: {error}", request.url))
         })?;
+        let response = self
+            .follow_governed(built, &artifact_host)
+            .await
+            .map_err(|error| {
+                ArtifactError::Transport(format!("request {}: {error}", request.url))
+            })?;
         let status = response.status();
         let disposition = match status.as_u16() {
             200 => ResponseDisposition::Replacement,
@@ -409,6 +492,36 @@ mod tests {
         assert!(!format!("{credential:?}").contains("hf_fixture_secret"));
     }
 
+    /// Test resolver mapping a host to fixed addresses. Production
+    /// gates pass `CachedSystemResolver`.
+    struct MapResolver {
+        map: HashMap<String, Vec<std::net::SocketAddr>>,
+    }
+
+    impl MapResolver {
+        fn new(entries: Vec<(&str, Vec<std::net::SocketAddr>)>) -> Self {
+            Self {
+                map: entries
+                    .into_iter()
+                    .map(|(h, a)| (h.to_string(), a))
+                    .collect(),
+            }
+        }
+    }
+
+    impl HostResolver for MapResolver {
+        fn resolve(&self, host: &str, _port: u16) -> Result<Vec<std::net::SocketAddr>, ()> {
+            self.map.get(host).cloned().ok_or(())
+        }
+    }
+
+    fn public_addr(port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+            port,
+        )
+    }
+
     fn enforce_model_artifact(hosts: &[&str]) -> EgressAuthorizer {
         let mut allow = PurposeAllowlist::default();
         for h in hosts {
@@ -428,7 +541,7 @@ mod tests {
             Some(&auth),
             EgressPurpose::ModelArtifact,
             "https://evil.example/model.bin",
-            &PublicPinResolver,
+            &MapResolver::new(vec![("evil.example", vec![public_addr(443)])]),
         )
         .expect_err("unlisted artifact host");
         assert_eq!(err, EgressDenied::UnlistedHost);
@@ -440,9 +553,9 @@ mod tests {
             None,
             EgressPurpose::ModelArtifact,
             "https://evil.example/model.bin",
-            &PublicPinResolver,
+            &MapResolver::new(vec![]),
         )
-        .expect("omitted egress must not deny");
+        .expect("omitted egress must not deny, and must not even resolve");
     }
 
     #[test]
@@ -458,7 +571,7 @@ mod tests {
             Some(&auth),
             EgressPurpose::EngineArtifact,
             "https://evil.example/llama.tar.gz",
-            &PublicPinResolver,
+            &MapResolver::new(vec![("evil.example", vec![public_addr(443)])]),
         )
         .expect_err("unlisted engine host");
         assert_eq!(err, EgressDenied::UnlistedHost);

@@ -14,13 +14,15 @@
 //! outbound POST. Never put credentials in tool arguments.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 use sbproxy_plugin::{McpExecutionContext, Principal, PrincipalSource};
-use sbproxy_security::egress::{EgressAuthorizer, EgressPurpose, HostResolver};
+use sbproxy_security::egress::{
+    evaluate_hop, record_egress_refused, CachedSystemResolver, EgressAuthorizer, EgressPurpose,
+    RedirectRule,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -218,6 +220,7 @@ pub async fn mint_upstream_authorization(
                 secret_lookup,
                 http,
                 egress,
+                ctx.principal.tenant_id.as_str(),
             )
             .await
         }
@@ -255,14 +258,63 @@ pub fn assert_args_unmutated(before: &serde_json::Value, after: &serde_json::Val
             .unwrap_or(true)
 }
 
-struct PublicPinResolver;
-
-impl HostResolver for PublicPinResolver {
-    fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
-        Ok(vec![SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
-            port,
-        )])
+/// Send one token-exchange POST, re-authorizing each redirect hop
+/// (WOR-2165).
+///
+/// The subject token travels in the form body, and a 307 or 308 replays
+/// that body at whatever host the `Location` names. The HTTP client's
+/// own credential stripping does not reach a request body, so the only
+/// safe handling is to refuse the hop: a token endpoint is operator
+/// configuration naming one IdP, and a token endpoint that redirects
+/// off its own origin is indistinguishable from an attack.
+async fn send_token_exchange(
+    http: &reqwest::Client,
+    egress: Option<&EgressAuthorizer>,
+    tenant: &str,
+    origin: &str,
+    mut request: reqwest::Request,
+) -> Result<reqwest::Response, UpstreamAuthError> {
+    let mut hop = 0usize;
+    loop {
+        let replay = request.try_clone();
+        let from = request.url().clone();
+        let resp = http
+            .execute(request)
+            .await
+            .map_err(|_| UpstreamAuthError::TokenExchangeFailed)?;
+        if !resp.status().is_redirection() {
+            return Ok(resp);
+        }
+        let Some(location) = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+        else {
+            return Ok(resp);
+        };
+        hop += 1;
+        let next = evaluate_hop(
+            egress,
+            EgressPurpose::TokenExchange,
+            &from,
+            &location,
+            hop,
+            RedirectRule::SameOriginOnly,
+            &CachedSystemResolver,
+        )
+        .map_err(|denied| {
+            record_egress_refused(EgressPurpose::TokenExchange, denied, tenant, origin);
+            UpstreamAuthError::EgressDenied
+        })?;
+        let Some(mut replay) = replay else {
+            return Ok(resp);
+        };
+        if next.strip_credentials {
+            replay.headers_mut().remove(reqwest::header::AUTHORIZATION);
+        }
+        *replay.url_mut() = next.url;
+        request = replay;
     }
 }
 
@@ -306,11 +358,24 @@ async fn mint_token_exchange(
     secret_lookup: &(dyn Fn(&str) -> Result<String, ()> + Sync),
     http: &reqwest::Client,
     egress: Option<&EgressAuthorizer>,
+    tenant: &str,
 ) -> Result<UpstreamAuthorization, UpstreamAuthError> {
     let endpoint = token_endpoint.as_str();
+    // WOR-2165: a live resolver, so the pins recorded here describe DNS
+    // rather than a fixture, and `allow_private` can actually refuse an
+    // IdP hostname that resolves onto the pod network.
+    let endpoint_host = token_endpoint.host_str().unwrap_or("unset").to_string();
     if let Some(auth) = egress {
-        auth.authorize(EgressPurpose::TokenExchange, endpoint, &PublicPinResolver)
-            .map_err(|_| UpstreamAuthError::EgressDenied)?;
+        auth.authorize(EgressPurpose::TokenExchange, endpoint, &CachedSystemResolver)
+            .map_err(|denied| {
+                record_egress_refused(
+                    EgressPurpose::TokenExchange,
+                    denied,
+                    tenant,
+                    &endpoint_host,
+                );
+                UpstreamAuthError::EgressDenied
+            })?;
     }
 
     let key = cache_key(endpoint, audience, subject_id, subject_token);
@@ -352,10 +417,10 @@ async fn mint_token_exchange(
         req = req.basic_auth(client_ref, Some(secret));
     }
 
-    let resp = req
-        .send()
-        .await
+    let request = req
+        .build()
         .map_err(|_| UpstreamAuthError::TokenExchangeFailed)?;
+    let resp = send_token_exchange(http, egress, tenant, &endpoint_host, request).await?;
     if !resp.status().is_success() {
         return Err(UpstreamAuthError::TokenExchangeFailed);
     }
@@ -446,6 +511,11 @@ mod tests {
             allow.ports.insert(443);
             allow.ports.insert(80);
         }
+        // WOR-2165: the gate resolves for real now, and these tests point
+        // at a loopback fixture. Under the old fixed synthetic pin every
+        // host looked public; a live answer for 127.0.0.1 is private, so
+        // the allowlist has to say so explicitly.
+        allow.allow_private = true;
         let mut purposes = StdHashMap::new();
         purposes.insert(EgressPurpose::TokenExchange, allow);
         EgressAuthorizer::new(EgressConfig { purposes })
@@ -787,13 +857,72 @@ mod tests {
         }
     }
 
-    #[test]
-    fn public_pin_resolver_returns_socket() {
-        let r = PublicPinResolver;
-        let addrs = r.resolve("example.com", 443).unwrap();
-        assert_eq!(
-            addrs[0],
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443)
+    /// One-shot loopback fixture serving `response` verbatim.
+    fn dial_fixture(
+        response: String,
+    ) -> Option<(
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    )> {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        let addr = listener.local_addr().ok()?;
+        let hit = std::sync::Arc::new(AtomicBool::new(false));
+        let hit_writer = std::sync::Arc::clone(&hit);
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                hit_writer.store(true, Ordering::SeqCst);
+                let mut scratch = [0u8; 4096];
+                let _ = stream.read(&mut scratch);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        Some((addr, hit))
+    }
+
+    #[tokio::test]
+    async fn token_exchange_refuses_a_cross_origin_redirect_hop() {
+        use std::sync::atomic::Ordering;
+        // The IdP 302s the exchange at another host. The subject token
+        // is in the form body, which a 307 or 308 would replay verbatim
+        // and no client-side credential stripping would touch, so the
+        // hop must be refused and the target never contacted.
+        let Some((sink_addr, sink_hit)) = dial_fixture(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_string(),
+        ) else {
+            return;
+        };
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            sink_addr.port()
+        );
+        let Some((idp_addr, idp_hit)) = dial_fixture(redirect) else {
+            return;
+        };
+
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("test client builds");
+        let request = http
+            .post(format!("http://{idp_addr}/token"))
+            .form(&[("subject_token", "user-secret-token")])
+            .build()
+            .expect("test request builds");
+
+        let err = send_token_exchange(&http, None, "tenant-a", "idp.test", request)
+            .await
+            .expect_err("a cross-origin hop must be refused, not followed");
+        assert_eq!(err, UpstreamAuthError::EgressDenied);
+        assert!(
+            idp_hit.load(Ordering::SeqCst),
+            "the configured token endpoint must have served the redirect"
+        );
+        assert!(
+            !sink_hit.load(Ordering::SeqCst),
+            "the redirect target must never receive the subject token"
         );
     }
 }
