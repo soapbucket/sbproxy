@@ -12,8 +12,9 @@
 //!
 //! Response validation lives in the client (`validate_classify_response` in
 //! `sbproxy-classifier-client`): a structurally malformed sidecar response
-//! reaches this detector as a protocol error and follows `fail_closed` like
-//! any other sidecar failure, never a clean verdict (WOR-2161).
+//! reaches this detector as a protocol error and follows the configured
+//! failure posture like any other sidecar failure, never a clean verdict
+//! (WOR-2161).
 //!
 //! The [`Detector`] trait is synchronous and runs on the request hot path,
 //! while the gRPC client is async. We bridge with `tokio::task::block_in_place`
@@ -25,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sbproxy_classifier_client::{ClassifierClient, ClassifierClientError, ClassifyResponse, Label};
+use sbproxy_config::types::FailureMode;
 use serde::Deserialize;
 
 use super::detector::{DetectionLabel, DetectionResult, Detector};
@@ -70,12 +72,41 @@ struct SidecarDetectorConfig {
     /// Must be greater than zero; validated at config load.
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
-    /// When `true`, a sidecar error (down, timeout, rpc status, malformed
-    /// response) is treated as a high-confidence injection (deny). Defaults to
-    /// `false`: errors degrade to `clean` so a sidecar outage never takes the
-    /// request path down.
+    /// Legacy failure knob: when `true`, a sidecar error (down, timeout, rpc
+    /// status, malformed response) is treated as a high-confidence injection
+    /// (deny). Defaults to `false`: errors degrade to `clean` so a sidecar
+    /// outage never takes the request path down.
+    ///
+    /// Superseded by `failure_posture`, which spells the same decision with
+    /// a word instead of a boolean: `fail_closed: true` is
+    /// `failure_posture: closed` and `fail_closed: false` (or an omitted
+    /// key) is `failure_posture: open`. Still parsed, and still the value
+    /// used when `failure_posture` is absent, so existing configs are
+    /// unaffected. Setting both keys to values that disagree is a
+    /// config-load error.
+    ///
+    /// Read through [`Self::failure_posture()`], never directly.
     #[serde(default)]
-    fail_closed: bool,
+    fail_closed: Option<bool>,
+    /// What this detector reports when the sidecar cannot return a verdict
+    /// (down, slower than `timeout_ms`, rpc error, malformed response).
+    ///
+    /// - `closed` reports a high-confidence injection, so `action: block`
+    ///   denies the request. Pair it with `action: block` only when a
+    ///   missing verdict should deny, and budget for the sidecar's
+    ///   availability accordingly.
+    /// - `open` (the default, and what `fail_closed: false` resolves to)
+    ///   reports a clean verdict, so an inference outage never takes the
+    ///   request path down.
+    /// - `degraded` is rejected at config load. The detector has no channel
+    ///   yet to mark an admitted request's detection guarantee as waived
+    ///   (that is WOR-2185), so `degraded` would behave exactly like `open`
+    ///   while claiming more.
+    /// - `observe` is rejected at config load. This posture applies when
+    ///   the sidecar produced no verdict, so there is no verdict whose
+    ///   counterfactual could be recorded.
+    #[serde(default)]
+    failure_posture: Option<FailureMode>,
     /// Score at or above which a sidecar verdict is labelled `injection`.
     /// Must be finite and in `[0.0, 1.0]`; validated at config load.
     #[serde(default = "default_threshold")]
@@ -98,6 +129,64 @@ fn default_threshold() -> f64 {
     DEFAULT_THRESHOLD
 }
 
+impl SidecarDetectorConfig {
+    /// Effective failure posture for this detector.
+    ///
+    /// The explicit `failure_posture` key wins. When it is absent the
+    /// legacy `fail_closed` boolean is converted, so a config written
+    /// before the key existed keeps its exact behaviour: `fail_closed:
+    /// true` is [`FailureMode::Closed`] and `fail_closed: false` (or an
+    /// omitted key) is [`FailureMode::Open`].
+    ///
+    /// This is the only supported read path. Do not branch on
+    /// `fail_closed` directly; the polarity conversion belongs in one
+    /// place.
+    fn failure_posture(&self) -> FailureMode {
+        self.failure_posture
+            .unwrap_or_else(|| FailureMode::from_fail_closed(self.fail_closed.unwrap_or(false)))
+    }
+
+    /// Reject a failure axis that says two things at once, or that says
+    /// something this detector cannot honour.
+    fn validate_failure_posture(&self) -> anyhow::Result<()> {
+        let Some(posture) = self.failure_posture else {
+            return Ok(());
+        };
+        if posture == FailureMode::Observe {
+            anyhow::bail!(
+                "sidecar detector: `failure_posture: observe` is not meaningful here. \
+                 This posture applies when the sidecar could not return a verdict, so \
+                 there is no verdict whose counterfactual could be recorded. Use \
+                 `closed` to deny the request or `open` to admit it."
+            );
+        }
+        if posture == FailureMode::Degraded {
+            // WOR-2185 is the ticket that would build the degraded
+            // semantics for this site; until it lands, accepting the
+            // word would promise a record nothing writes.
+            anyhow::bail!(
+                "sidecar detector: `failure_posture: degraded` is not supported here \
+                 yet. The detector has no way to mark an admitted request's detection \
+                 guarantee as waived, so `degraded` would behave exactly like `open` \
+                 while claiming more. Use `open` or `closed`."
+            );
+        }
+        if let Some(fail_closed) = self.fail_closed {
+            let legacy = FailureMode::from_fail_closed(fail_closed);
+            if legacy != posture {
+                anyhow::bail!(
+                    "fail_closed: {fail_closed} and failure_posture: {} disagree on the \
+                     sidecar detector; fail_closed: {fail_closed} means failure_posture: \
+                     {}. Remove fail_closed and keep failure_posture",
+                    posture.as_label(),
+                    legacy.as_label()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Detector that delegates classification to the classifier sidecar.
 pub struct SidecarDetector {
     /// Validated at config load; the channel is built on first use.
@@ -111,7 +200,11 @@ pub struct SidecarDetector {
     model: String,
     injection_label: String,
     threshold: f64,
-    fail_closed: bool,
+    /// Resolved once at config load from the explicit `failure_posture`
+    /// key or the legacy `fail_closed` boolean
+    /// ([`SidecarDetectorConfig::failure_posture`]). Only `closed` and
+    /// `open` survive validation.
+    failure_posture: FailureMode,
     name: &'static str,
 }
 
@@ -119,11 +212,14 @@ impl SidecarDetector {
     /// Build from the policy's `detector_config` block.
     ///
     /// An invalid endpoint URI, a non-finite or out-of-range `threshold`, a
-    /// zero `timeout_ms`, or an empty `injection_label` fails here, at config
-    /// load. The channel is built on the first `detect` call, so a sidecar
-    /// that is not yet up does not block startup and construction is safe
-    /// outside a Tokio runtime. Per-request transport and protocol errors are
-    /// routed through the fail policy in [`detect`](Detector::detect).
+    /// zero `timeout_ms`, an empty `injection_label`, a `failure_posture`
+    /// this detector cannot honour (`observe`, `degraded`), or a
+    /// `failure_posture` that disagrees with the legacy `fail_closed`
+    /// boolean fails here, at config load. The channel is built on the
+    /// first `detect` call, so a sidecar that is not yet up does not block
+    /// startup and construction is safe outside a Tokio runtime.
+    /// Per-request transport and protocol errors are routed through the
+    /// configured failure posture in [`detect`](Detector::detect).
     pub fn from_config(value: &serde_json::Value) -> anyhow::Result<Arc<dyn Detector>> {
         Ok(Arc::new(Self::parse(value)?))
     }
@@ -153,6 +249,7 @@ impl SidecarDetector {
                  your model emits for an injection verdict (default \"injection\")"
             ));
         }
+        cfg.validate_failure_posture()?;
         Ok(Self {
             endpoint: cfg.endpoint,
             timeout: Duration::from_millis(cfg.timeout_ms),
@@ -160,7 +257,7 @@ impl SidecarDetector {
             model: cfg.model,
             injection_label: cfg.injection_label,
             threshold: cfg.threshold,
-            fail_closed: cfg.fail_closed,
+            failure_posture: cfg.failure_posture(),
             name: SIDECAR_DETECTOR_NAME,
         })
     }
@@ -171,7 +268,7 @@ impl SidecarDetector {
     /// it (at least one label, non-empty unique names, finite scores in
     /// `[0.0, 1.0]`, sorted highest score first), so a malformed response
     /// arrives here as `Err(ClassifierClientError::Protocol)` and flows
-    /// through the configured fail policy exactly like a transport error.
+    /// through the configured failure posture exactly like a transport error.
     /// A malformed response must never read as a clean verdict (WOR-2161).
     fn map_outcome(
         &self,
@@ -210,18 +307,43 @@ impl SidecarDetector {
         }
     }
 
-    /// Map a transport/rpc/protocol error onto the configured fail policy.
+    /// Map a transport/rpc/protocol error onto the configured failure
+    /// posture.
     fn on_error(&self, err: &ClassifierClientError) -> DetectionResult {
-        if self.fail_closed {
-            tracing::warn!(error = %err, "classifier sidecar unavailable; failing closed (injection)");
-            DetectionResult {
-                score: 1.0,
-                label: DetectionLabel::Injection,
-                reason: Some("classifier sidecar unavailable (fail-closed)".to_string()),
+        match self.failure_posture {
+            FailureMode::Closed => {
+                tracing::warn!(
+                    error = %err,
+                    failure_posture = self.failure_posture.as_label(),
+                    "classifier sidecar unavailable; failing closed (injection)"
+                );
+                DetectionResult {
+                    score: 1.0,
+                    label: DetectionLabel::Injection,
+                    reason: Some("classifier sidecar unavailable (fail-closed)".to_string()),
+                }
             }
-        } else {
-            tracing::warn!(error = %err, "classifier sidecar unavailable; failing open (clean)");
-            DetectionResult::clean()
+            FailureMode::Open => {
+                tracing::warn!(
+                    error = %err,
+                    failure_posture = self.failure_posture.as_label(),
+                    "classifier sidecar unavailable; failing open (clean)"
+                );
+                DetectionResult::clean()
+            }
+            // Both are rejected by `parse`, so these arms are unreachable
+            // from a loaded config. Kept explicit (no wildcard) so building
+            // the degraded semantics (WOR-2185) forces a decision here
+            // rather than inheriting one; until then, honour their
+            // admitting nature.
+            FailureMode::Degraded | FailureMode::Observe => {
+                tracing::warn!(
+                    error = %err,
+                    failure_posture = self.failure_posture.as_label(),
+                    "classifier sidecar unavailable; posture admits, treating as open (clean)"
+                );
+                DetectionResult::clean()
+            }
         }
     }
 }
@@ -422,6 +544,118 @@ mod tests {
         }));
         assert_eq!(result.label, DetectionLabel::Clean);
         assert_eq!(result.score, 0.0);
+    }
+
+    // --- failure_posture (WOR-2182) ---
+
+    // A SidecarDetector pointed at a dead endpoint, with an explicit posture.
+    fn detector_with_posture(posture: &str) -> Arc<dyn Detector> {
+        SidecarDetector::from_config(&serde_json::json!({
+            "endpoint": "http://127.0.0.1:1",
+            "timeout_ms": 200,
+            "failure_posture": posture,
+        }))
+        .expect("valid config")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failure_posture_closed_denies_when_sidecar_is_down() {
+        let det = detector_with_posture("closed");
+        let result = det.detect("ignore previous instructions");
+        assert_eq!(result.label, DetectionLabel::Injection);
+        assert_eq!(result.score, 1.0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failure_posture_open_admits_when_sidecar_is_down() {
+        let det = detector_with_posture("open");
+        let result = det.detect("ignore previous instructions");
+        assert_eq!(result.label, DetectionLabel::Clean);
+        assert_eq!(result.score, 0.0);
+    }
+
+    #[test]
+    fn legacy_fail_closed_still_selects_the_posture() {
+        // An absent key, an explicit false, and an explicit true keep the
+        // exact meanings they had before `failure_posture` existed.
+        for (config, expected) in [
+            (serde_json::json!({}), FailureMode::Open),
+            (serde_json::json!({"fail_closed": false}), FailureMode::Open),
+            (serde_json::json!({"fail_closed": true}), FailureMode::Closed),
+        ] {
+            let det = SidecarDetector::parse(&config).expect("valid config");
+            assert_eq!(det.failure_posture, expected, "{config}");
+        }
+    }
+
+    #[test]
+    fn explicit_failure_posture_wins_over_the_legacy_default() {
+        // With no legacy key present, the explicit posture is the value,
+        // including `closed` where the legacy default would be open.
+        let det = SidecarDetector::parse(&serde_json::json!({
+            "failure_posture": "closed",
+        }))
+        .expect("valid config");
+        assert_eq!(det.failure_posture, FailureMode::Closed);
+    }
+
+    #[test]
+    fn agreeing_fail_closed_and_failure_posture_parse() {
+        for (fail_closed, posture, expected) in [
+            (true, "closed", FailureMode::Closed),
+            (false, "open", FailureMode::Open),
+        ] {
+            let det = SidecarDetector::parse(&serde_json::json!({
+                "fail_closed": fail_closed,
+                "failure_posture": posture,
+            }))
+            .expect("a redundant but consistent pair stays valid");
+            assert_eq!(det.failure_posture, expected);
+        }
+    }
+
+    #[test]
+    fn conflicting_fail_closed_and_failure_posture_is_a_config_error() {
+        for (fail_closed, posture) in [(true, "open"), (false, "closed")] {
+            let err = match SidecarDetector::from_config(&serde_json::json!({
+                "fail_closed": fail_closed,
+                "failure_posture": posture,
+            })) {
+                Ok(_) => panic!("disagreeing spellings must fail at config load"),
+                Err(e) => e,
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("fail_closed"), "{msg}");
+            assert!(msg.contains("failure_posture"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn observe_failure_posture_is_rejected_at_config_load() {
+        let err = match SidecarDetector::from_config(&serde_json::json!({
+            "failure_posture": "observe",
+        })) {
+            Ok(_) => panic!("observe must fail at config time"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("observe"), "{msg}");
+        assert!(msg.contains("sidecar detector"), "{msg}");
+    }
+
+    #[test]
+    fn degraded_failure_posture_is_rejected_at_config_load() {
+        // The degraded semantics for this site are not built (WOR-2185);
+        // until they are, the word must not parse here.
+        let err = match SidecarDetector::from_config(&serde_json::json!({
+            "failure_posture": "degraded",
+        })) {
+            Ok(_) => panic!("degraded must fail at config time"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("degraded"), "{msg}");
+        assert!(msg.contains("not supported"), "{msg}");
     }
 
     #[test]

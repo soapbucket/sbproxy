@@ -1,5 +1,5 @@
 # prompt_injection_v2
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 Successor to the v1 `prompt_injection` heuristic guardrail. The v2
 policy splits *detection* from *enforcement*: a swappable detector
@@ -242,8 +242,8 @@ policies:
       injection_label: injection
       # Per-call timeout in milliseconds (covers the lazy connect).
       timeout_ms: 250
-      # Fail policy when the sidecar is unreachable or slow.
-      fail_closed: false
+      # Failure posture when the sidecar is unreachable or slow.
+      failure_posture: open
 ```
 
 The client connects lazily, so the proxy starts even when the sidecar
@@ -253,23 +253,33 @@ rejects an invalid `endpoint` URI, a `threshold` that is not a finite
 number in `[0.0, 1.0]`, a `timeout_ms` of zero, or an empty
 `injection_label`.
 
-### Fail policy
+### Failure posture
 
 A sidecar that is down, slower than `timeout_ms`, or returning an error
-is handled by `fail_closed`:
+is handled by `failure_posture`, in the shared vocabulary from
+[degradation.md](degradation.md):
 
-- `fail_closed: false` (default) returns a clean verdict and lets the
-  request through, so an inference outage never blocks traffic.
-- `fail_closed: true` returns a high-confidence injection. Pair this
-  with `action: block` only when a missing verdict should deny the
+- `failure_posture: open` (default) returns a clean verdict and lets
+  the request through, so an inference outage never blocks traffic.
+- `failure_posture: closed` returns a high-confidence injection. Pair
+  this with `action: block` only when a missing verdict should deny the
   request, and budget for the sidecar's availability accordingly.
+- `degraded` and `observe` are rejected at config load. The detector
+  has no channel yet to mark an admitted request's detection guarantee
+  as waived, and a sidecar that never answered produced no verdict to
+  shadow-record.
+
+The older boolean `fail_closed` still parses and still means what it
+always meant: `true` resolves to `closed` and `false` (the default)
+resolves to `open`, so an existing config keeps its exact behavior.
+Setting both keys to values that disagree is a config-load error.
 
 Malformed responses follow the same posture. Every classification
 response is validated before the detector reads it: it must carry at
 least one label, every label needs a non-empty name that is unique
 within the response (compared case-insensitively), and every score must
 be a finite number between 0.0 and 1.0. A response that fails any of
-these checks is a protocol error and is handled by `fail_closed`
+these checks is a protocol error and is handled by `failure_posture`
 exactly like a sidecar that is down; it is never interpreted as a clean
 verdict. Labels are ordered highest score first after validation, so
 the verdict does not depend on the order the sidecar sent them in.

@@ -23,8 +23,8 @@
 # Run the proxy:
 #   make run CONFIG=examples/prompt-injection-sidecar/sb.yml
 #
-# See docs/prompt-injection-v2.md for the fail policy and a Kubernetes
-# co-location manifest.
+# See docs/prompt-injection-v2.md for the failure posture and a
+# Kubernetes co-location manifest.
 
 proxy:
   http_bind_port: 8080
@@ -60,9 +60,11 @@ origins:
           # Per-call timeout in milliseconds. Covers the lazy connect
           # on the first request after the sidecar comes online.
           timeout_ms: 250
-          # Fail-open: if the sidecar is down or slow, treat the prompt
-          # as clean and let the request through. This is the default.
-          fail_closed: false
+          # If the sidecar is down or slow, treat the prompt as clean
+          # and let the request through. This is the default. The older
+          # `fail_closed: false` spelling still parses and means the
+          # same thing.
+          failure_posture: open
 
   # block mode with fail-closed: requests are rejected on an injection
   # verdict, and a missing verdict (sidecar down) is also a reject.
@@ -84,8 +86,8 @@ origins:
           model: prompt-injection
           injection_label: injection
           timeout_ms: 250
-          # Fail-closed: a missing verdict denies the request. Pair
-          # this with action: block only when you would rather drop
-          # traffic than let it through unscored, and budget for the
-          # sidecar's availability accordingly.
-          fail_closed: true
+          # Closed: a missing verdict denies the request. Pair this
+          # with action: block only when you would rather drop traffic
+          # than let it through unscored, and budget for the sidecar's
+          # availability accordingly.
+          failure_posture: closed

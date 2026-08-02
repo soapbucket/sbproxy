@@ -1,5 +1,5 @@
 # Local inference for gateway helper models
-*Last modified: 2026-07-29*
+*Last modified: 2026-08-02*
 
 SBproxy can run four AI-gateway features on local ONNX models instead of paid
 APIs:
@@ -232,7 +232,7 @@ origins:
           model: prompt-injection
           injection_label: INJECTION
           timeout_ms: 250
-          fail_closed: false     # a sidecar outage degrades to "clean" (allow)
+          failure_posture: open  # a sidecar outage degrades to "clean" (allow)
 ```
 
 An explicit `detector: sidecar` always wins. If `detector` is omitted instead,
