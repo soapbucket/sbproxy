@@ -1,0 +1,93 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "cases": [
+    {
+      "name": "a reader is never challenged",
+      "request": {
+        "method": "GET",
+        "path": "/article",
+        "headers": {
+          "Host": "blog.local",
+          "User-Agent": "Mozilla/5.0"
+        }
+      },
+      "expect": {"status": 200}
+    },
+    {
+      "name": "a declared crawler is challenged with an invoice",
+      "request": {
+        "method": "GET",
+        "path": "/article",
+        "headers": {
+          "Host": "blog.local",
+          "User-Agent": "GPTBot/1.0"
+        }
+      },
+      "expect": {
+        "status": 402,
+        "headers": {"crawler-payment": "."},
+        "body": {
+          "type": "jsonShape",
+          "shape": {"error": "payment_required", "rail": "lightning", "currency": "BTC"}
+        }
+      }
+    },
+    {
+      "name": "a rail preference that overlaps nothing is a 406",
+      "request": {
+        "method": "GET",
+        "path": "/article",
+        "headers": {
+          "Host": "blog.local",
+          "User-Agent": "GPTBot/1.0",
+          "Accept-Payment": "x402"
+        }
+      },
+      "expect": {
+        "status": 406,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"error": "no_acceptable_rail", "supported_rails": ["lightning"]}
+        }
+      }
+    },
+    {
+      "name": "a free path stays free for a crawler",
+      "request": {
+        "method": "GET",
+        "path": "/robots.txt",
+        "headers": {
+          "Host": "blog.local",
+          "User-Agent": "GPTBot/1.0"
+        }
+      },
+      "expect": {"status": 200}
+    }
+  ],
+  "audit_check": false,
+  "_notes": [
+    "This example ships no docker-compose.yml, so the smoke runner",
+    "(which gates on a compose file) does not pick it up. The reason is",
+    "the build, not the stack: settlement lives behind cargo features",
+    "and Dockerfile.cloudbuild builds the default set, so the image the",
+    "other examples use would start this config and fail on the",
+    "configured rail's missing feature. Build the binary with",
+    "--features payment-lightning-cln and run fixture.py beside it, as",
+    "the README shows.",
+    "",
+    "The four cases above are the order-independent half of the",
+    "contract, true at any point in a run. The paid path is not",
+    "expressible here because it needs an out-of-band payment between",
+    "two requests; bin/settle-once.sh runs that sequence and prints the",
+    "origin's own hit counter after each step.",
+    "",
+    "The same five outcomes are asserted automatically by",
+    "e2e/tests/settlement_gate.rs, which stands up the same stub node",
+    "and the same counting origin in Rust.",
+    "",
+    "audit_check stays false until the OSS /api/audit/recent endpoint",
+    "lands."
+  ]
+}

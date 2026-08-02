@@ -207,20 +207,55 @@ finding the next time `sbproxy plan` runs against the Repo.
 
 ![a request proxied through the origin declared by the pinned listing](assets/listing-primitive.gif)
 
-The listing supplies the origin; the proxy serves it like any other ([config](../examples/listing-primitive/)).
-
-The runnable example in `examples/listing-primitive/` ships:
-
-- `sb.yml` with one origin (`api.example.com`).
-- `listings/example.yaml` that publishes the origin as `example-api`,
-  pins it to a short commit SHA, and advertises one auth strategy
-  (`jwt`).
-
-Run it like any other example:
+The runnable example in [`examples/listing-primitive/`](../examples/listing-primitive/)
+ships two origins and two Listings, so both halves of the surface are
+reachable: `listings/example.yaml` publishes `api.example.com` as
+`example-api`, pinned to a short SHA and carrying one skill;
+`listings/internal-tools.yaml` publishes `internal.example.com` as
+`internal-tools`, tracking a branch and advertising the auth strategy
+that origin actually accepts. Both origins answer from the proxy itself,
+so the example needs no upstream.
 
 ```bash
 make run CONFIG=examples/listing-primitive/sb.yml
 ```
 
-The Listing is not on the data path today: it is the input the
-hosted-Catalog surface and the agent-skills extension will consume.
+### Plan time
+
+`plan` discovers the `listings/` directory beside the config it is given,
+prints the load summary on stderr, and folds the per-Listing findings into
+the same validation stream as the config diff:
+
+<!-- CAPTURE: sbproxy plan -f examples/listing-primitive/sb.yml 2>&1 -->
+
+The rules above are what a wrong manifest runs into. The example keeps a
+deliberately broken one outside its own `listings/` directory, and a
+script assembles a throwaway Repo from it:
+
+<!-- CAPTURE: bash examples/listing-primitive/bin/plan-error.sh -->
+
+### Serve time
+
+Most of a Listing is input for a future Catalog surface: nothing routes on
+`accessPlan`, `publish`, or `lifecycle`, and no request is priced or gated
+by them. `spec.skills[]` is the exception, and it is on the data path. The
+projection layer serves a per-Listing manifest on every origin the Listing
+publishes:
+
+<!-- CAPTURE: curl -s -H 'Host: api.example.com' http://127.0.0.1:8080/.well-known/agent-skills/example-api/index.json -->
+
+Each artifact body is re-hosted under that same prefix, with the digest the
+manifest pinned re-checked on every fetch:
+
+<!-- CAPTURE: curl -s -D - -H 'Host: api.example.com' http://127.0.0.1:8080/.well-known/agent-skills/example-api/skills/place-order.md -->
+
+A Listing does not advertise onto a hostname it does not publish. The
+second origin declares no skills and is named by no Listing that does, so
+it has no manifest, and the 404 arrives before that origin's own jwt
+authentication runs:
+
+<!-- CAPTURE: curl -s -i -H 'Host: internal.example.com' http://127.0.0.1:8080/.well-known/agent-skills/index.json -->
+
+The Resource itself is served like any other origin:
+
+<!-- CAPTURE: curl -s -H 'Host: api.example.com' http://127.0.0.1:8080/orders -->

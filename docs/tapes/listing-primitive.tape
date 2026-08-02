@@ -10,7 +10,7 @@ Require curl
 Set Shell "bash"
 Set FontSize 16
 Set Width 1280
-Set Height 470
+Set Height 600
 Set Padding 24
 Set TypingSpeed 30ms
 Set Theme { "name": "sbproxy", "background": "#0d0d0f", "foreground": "#e6e6e6", "cursor": "#ffb454", "selection": "#2a2a33", "black": "#1a1a1f", "red": "#ff6b6b", "green": "#a8d96a", "yellow": "#ffb454", "blue": "#7aa2f7", "magenta": "#bb9af7", "cyan": "#7dcfff", "white": "#e6e6e6", "brightBlack": "#5c5c66", "brightRed": "#ff8888", "brightGreen": "#c3f088", "brightYellow": "#ffd194", "brightBlue": "#9bb8ff", "brightMagenta": "#d4b8ff", "brightCyan": "#a4e0ff", "brightWhite": "#ffffff" }
@@ -20,7 +20,11 @@ Type `export PS1='$ '; clear`
 Enter
 Show
 
-Type `curl -H 'Host: api.example.com' http://127.0.0.1:8080/echo`
+Type `curl -s -H 'Host: api.example.com' http://127.0.0.1:8080/orders`
+Enter
+Sleep 1.6s
+
+Type `curl -s -H 'Host: api.example.com' http://127.0.0.1:8080/.well-known/agent-skills/example-api/index.json`
 Enter
 Sleep 1.6s
 

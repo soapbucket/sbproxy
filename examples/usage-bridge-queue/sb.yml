@@ -1,0 +1,163 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# usage-bridge-queue - a served request lands one durable row on the
+# settlement queue, and stops there.
+#
+# `proxy.payments.usage_reporters.stripe_meter` configures a reporter, a
+# durable queue, and a recovery worker that drains it. What produces the
+# usage is the request path: a completed AI call's own token counts. This
+# config is the smallest pairing of the two.
+#
+# The request path enqueues and nothing more. The HTTP call to the
+# provider belongs to the recovery worker, behind its own lease and its
+# own idempotency key, so nothing on the request path ever waits on
+# Stripe. That split is visible here: rows appear with status `queued`
+# and stay there, because the provider is not reachable from this stack
+# and the reporter's API root is a compiled-in constant with no override.
+#
+# The customer a row bills comes from the authenticated credential's
+# metadata, never from a request header. A caller who could name the
+# account their usage bills to could name somebody else's, so every
+# request below authenticates with a governed key minted through the
+# admin API with `metadata.stripe_customer_id` set.
+#
+# This config needs a binary built with the payments features. The
+# default build has none of them:
+#
+#   CARGO_TARGET_DIR=target/payments cargo build --release -p sbproxy \
+#     --features payment-stripe
+#
+# Run:
+#   mkdir -p /tmp/sbproxy-usage-bridge
+#   printf '%s' "$(openssl rand -hex 32)" > /tmp/sbproxy-usage-bridge/binding.key
+#   printf '%s' 'sk_test_usage_bridge_demo' > /tmp/sbproxy-usage-bridge/stripe.key
+#   chmod 600 /tmp/sbproxy-usage-bridge/*.key
+#   python3 examples/usage-bridge-queue/fixture.py &
+#   target/payments/release/sbproxy serve -f examples/usage-bridge-queue/sb.yml
+#
+# Test (mint a key, then bill one call to it):
+#   bash examples/usage-bridge-queue/bin/bill-one-call.sh
+
+# sbproxy-docs:begin
+proxy:
+  http_bind_port: 8080
+
+  # A tenant to file the spend under. Every queued row carries one.
+  tenants:
+    - id: tenant-a
+
+  # The admin server mints the governed key the reporter reads the
+  # customer id from.
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    # Demo password for local runs. Change before any non-loopback bind.
+    password: demo-change-me
+
+  # Runtime-minted virtual keys, hashed at rest. The reporter needs a
+  # credential carrying `metadata.stripe_customer_id`, and a config-file
+  # credential cannot carry arbitrary metadata, so the key is minted
+  # through POST /admin/keys instead.
+  key_management:
+    enabled: true
+    store:
+      # An embedded redb file. `redis` is the clustered alternative.
+      backend: embedded
+      path: /tmp/sbproxy-usage-bridge/keys.redb
+    cache:
+      # How long a resolved key stays in the per-process cache.
+      ttl_secs: 60
+    crypto:
+      # Demo values. Rotate and store these as secrets in production;
+      # changing either invalidates every minted key.
+      pepper: usage-bridge-demo-pepper
+      master_key: usage-bridge-demo-master
+    # Fail closed: a request whose key cannot be checked is refused
+    # rather than admitted ungoverned.
+    failure_mode_allow: false
+
+  payments:
+    # The same SQLite file settlement uses. The usage queue is a table in
+    # it, not a second store.
+    state_path: /tmp/sbproxy-usage-bridge/payments.sqlite3
+
+    # Required whenever proxy.payments is present, even for a deployment
+    # that only meters. Named, never inlined.
+    challenge_binding_key: file:/tmp/sbproxy-usage-bridge/binding.key
+
+    # Required because rails.stripe is configured. The worker seals
+    # provider responses it could not record at the time, so an
+    # interrupted write can be recovered rather than replayed blind. The
+    # key must decode to exactly 32 bytes, checked at startup.
+    recovery_encryption:
+      key_id: usage-bridge-demo-2026
+      key: file:/tmp/sbproxy-usage-bridge/binding.key
+      # How long a sealed envelope stays usable. 23 is the default.
+      max_age_hours: 23
+
+    worker:
+      # The worker is what drains the queue. It leases a row, calls the
+      # provider once, and records the outcome. Nothing on the request
+      # path does any of that.
+      reconcile_interval_ms: 1000
+      max_reconcile_batch: 4
+      shutdown_timeout_ms: 2000
+
+    rails:
+      # The reporter borrows this rail's API credentials, so configuring
+      # a meter without it is a load error. This example never settles a
+      # payment; the rail is here because the meter needs its key.
+      stripe:
+        api_key: file:/tmp/sbproxy-usage-bridge/stripe.key
+        business_network_id: profile_test_example
+        quote_currency: USD
+        currency_decimals: 2
+        payment_method_types: [card]
+
+    usage_reporters:
+      stripe_meter:
+        # The meter event name registered in the Stripe dashboard. Stripe
+        # rejects one it does not recognise.
+        event_name: sbproxy_ai_tokens
+
+        # Which entry in the authenticated credential's metadata map
+        # holds the Stripe customer id. A request whose principal carries
+        # no such entry queues nothing.
+        customer_field: stripe_customer_id
+
+        # Which request-path record is authoritative for this event:
+        # `http` (a proxy.attestation receipt), `ai` (the completed call's
+        # token counts), or `mcp` (tool calls). No default, because one
+        # request can honestly be described more than one way and
+        # reporting two of them against one meter charges twice.
+        source: ai
+
+        # The one quantity this event bills. For `ai`: prompt_tokens,
+        # completion_tokens, or total_tokens.
+        unit: total_tokens
+
+        # What the request path does when the queue will not take a row.
+        # `degraded` is the default: serve, and leave a signed usage_gap
+        # marker plus sbproxy_usage_bridge_gap_total behind so the hole is
+        # provable. `closed` shuts the bridge and refuses the next
+        # response; `open` counts and nothing else; `observe` is rejected
+        # at load because nothing here refuses a request.
+        failure_posture: degraded
+
+origins:
+  "billing.local":
+    tenant_id: tenant-a
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          provider_type: openai
+          # The fixture ignores this; OpenAI-shaped provider config
+          # carries a credential field. A real deployment puts
+          # ${OPENAI_API_KEY} here.
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18080/v1
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models: [gpt-4o-mini]
+# sbproxy-docs:end

@@ -1,0 +1,30 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 9090,
+  "health_path": "/healthz",
+  "feature_endpoints": [],
+  "audit_check": false,
+  "_notes": [
+    "This example ships no docker-compose.yml, so the smoke runner",
+    "(which gates on a compose file) does not pick it up. The reason is",
+    "the build, not the stack: the meter reporter lives behind the",
+    "payment-stripe cargo feature and Dockerfile.cloudbuild compiles the",
+    "default set, so the shared image would start this config and fail",
+    "on the configured reporter. Build with --features payment-stripe",
+    "and run fixture.py beside it, as the README shows.",
+    "",
+    "cases[] is empty rather than guessed. The interesting outcome here",
+    "is not an HTTP status: it is the row that lands in the usage_reports",
+    "table of the SQLite file at proxy.payments.state_path, which the",
+    "smoke runner has no way to read. bin/bill-one-call.sh mints the key,",
+    "bills one call, and prints the row count.",
+    "",
+    "e2e/tests/usage_bridge.rs asserts the same outcomes automatically:",
+    "it starts at an HTTP request through the harness and finishes by",
+    "reading the same SQLite file, so a producer that disappears again",
+    "fails there.",
+    "",
+    "audit_check stays false until the OSS /api/audit/recent endpoint",
+    "lands."
+  ]
+}

@@ -1,0 +1,44 @@
+# A second Listing, showing the other two things the primitive carries.
+#
+# `revision.mode: track-branch` resolves to whatever the branch points at
+# when the proxy reloads, which is the right answer for an internal
+# Listing advertised to one team. `pin` is the recommended default for
+# anything on a paid plan, and `tag` suits a release-tag workflow.
+#
+# `spec.auth.strategies` has to include the underlying Resource's own
+# `authentication.type`. `internal.example.com` declares `jwt`, so a list
+# that omitted it would be advertising auth the Resource does not accept,
+# and the plan would report `listing-auth-mismatch` as an error.
+#
+# No `spec.skills[]`, so this Listing has no data-plane surface: it is
+# input for a future Catalog projection and nothing serves it today.
+apiVersion: sbproxy.dev/v1
+kind: Listing
+metadata:
+  name: internal-tools
+  labels:
+    team: platform
+    tier: internal
+spec:
+  type: api
+  # `draft` and `retired` are the other two. A value outside the set
+  # parses and surfaces as an `unknown-listing-status` warning, so a new
+  # status can land in the schema before the validator learns it.
+  status: draft
+  resources:
+    - ref: origins/internal.example.com
+      revision:
+        mode: track-branch
+        value: main
+  auth:
+    strategies: [jwt]
+  accessPlan:
+    free:
+      rate: "10/min"
+  publish:
+    # `public`, `authenticated`, or `restricted`.
+    visibility: authenticated
+    docsUrl: "/docs/internal-tools"
+  lifecycle:
+    deprecation: null
+    sunsetDate: null
