@@ -3629,6 +3629,13 @@ origins:
         let compiled = compile_config(yaml).unwrap();
         assert_eq!(compiled.server.http_bind_port, 9090);
         assert_eq!(compiled.origins.len(), 1);
+
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+        assert_eq!(origin.hostname.as_str(), "api.example.com");
+        assert!(origin.force_ssl);
+        assert_eq!(origin.allowed_methods.len(), 2);
+        assert!(origin.allowed_methods.contains(&http::Method::GET));
+        assert!(origin.allowed_methods.contains(&http::Method::POST));
     }
 
     #[test]
@@ -3670,13 +3677,6 @@ origins:
 "#;
         let compiled = compile_config(yaml).expect("config without the field compiles");
         assert_eq!(compiled.server.effective_bind_address(), "0.0.0.0");
-
-        let origin = compiled.resolve_origin("api.example.com").unwrap();
-        assert_eq!(origin.hostname.as_str(), "api.example.com");
-        assert!(origin.force_ssl);
-        assert_eq!(origin.allowed_methods.len(), 2);
-        assert!(origin.allowed_methods.contains(&http::Method::GET));
-        assert!(origin.allowed_methods.contains(&http::Method::POST));
     }
 
     #[test]
