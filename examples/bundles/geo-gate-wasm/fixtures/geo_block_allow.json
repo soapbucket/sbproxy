@@ -1,0 +1,6 @@
+{
+  "hook": { "kind": "policy", "type": "geo_block" },
+  "config": { "denylist": ["KP", "IR"], "country_header": "x-geo-country" },
+  "request": { "headers": { "x-geo-country": "US" } },
+  "expect": { "kind": "allow" }
+}

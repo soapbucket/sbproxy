@@ -1,0 +1,33 @@
+# Proposed manifest format — see examples/bundles/README.md.
+# Design doc: https://app.notion.com/p/3b068ca7910e81f6b086ff1ecf912054 (§3)
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: geo-gate-proxy-wasm
+version: 0.1.0
+runtime: proxy_wasm            # distinct from `runtime: wasm` (envelope-routed) — see ../geo-gate-wasm/
+
+entry: target/wasm32-unknown-unknown/release/geo_gate_proxy_wasm.wasm
+
+# proxy-wasm modules attach as a filter across the whole request/response
+# lifecycle (their own on_http_request_headers / on_http_response_headers
+# / etc. callbacks decide what to do), not as individual policy/transform
+# hooks — so there is no hooks[] list here the way runtime: javascript
+# and runtime: wasm (envelope-routed) have. Exact attachment semantics
+# (how a proxy-wasm filter composes with sbproxy's own policy/transform
+# chain) are an open question for #893, not resolved by this example.
+
+failure_posture: closed
+
+sandbox:
+  timeout_ms: 500
+  max_memory_pages: 256
+
+permissions: []
+
+# Config reaches the module through proxy-wasm's own mechanism
+# (on_configure/get_plugin_configuration), not sbproxy's config_schema —
+# see the doc comment in src/lib.rs for why. This is what this module
+# expects at that seam.
+proxy_wasm_config:
+  denylist: ["KP", "IR"]
+  country_header: "x-geo-country"

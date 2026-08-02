@@ -1,0 +1,34 @@
+# Proposed manifest format — see examples/bundles/README.md.
+# Design doc: https://app.notion.com/p/3b068ca7910e81f6b086ff1ecf912054 (§2)
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: rate-limit-by-plan
+version: 0.1.0
+runtime: javascript          # javascript (QuickJS) | wasm
+
+entry: src/index.ts          # raw TypeScript; sbproxy transpiles in-process, no dist/ required
+                              # (only bundles that declare a package.json need a build step —
+                              # this one doesn't, so there's no package.json here)
+
+hooks:
+  - kind: policy
+    type: rate_limit_by_plan   # becomes policies[].type: rate_limit_by_plan in sb.yml
+    export: enforce            # exported function name in src/index.ts
+    config_schema:              # the "variables" this hook accepts from sb.yml
+      type: object
+      additionalProperties: false
+      properties:
+        requests_per_minute: { type: integer, default: 60 }
+        plan_header: { type: string, default: "x-plan" }
+      required: []
+
+failure_posture: closed        # deny on error/timeout/panic; can be overridden per-attachment
+                                # in sb.yml, e.g. `failure_posture: open`
+
+sandbox:
+  budget_ms: 50                # wall-clock per invocation (JS watchdog)
+  memory_mb: 16
+  stack_kb: 512
+
+permissions: []                 # reserved for future network/KV egress allowlisting; must stay
+                                 # empty for runtime: javascript today

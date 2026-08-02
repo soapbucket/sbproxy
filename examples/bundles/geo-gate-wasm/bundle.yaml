@@ -1,0 +1,35 @@
+# Proposed manifest format — see examples/bundles/README.md.
+# Design doc: https://app.notion.com/p/3b068ca7910e81f6b086ff1ecf912054 (§§2-3)
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: geo-gate
+version: 0.1.0
+runtime: wasm
+
+entry: geo_gate.wasm          # built by build.sh; see that script for the exact target/output path
+
+hooks:
+  # WASM hooks have no `export:` field (unlike JS): dispatch happens on
+  # the envelope's `hook.type`, not a named function export — see §3
+  # "WASM hook dispatch and ABI" for why (envelope-routed dispatch was
+  # chosen over adopting proxy-wasm).
+  - kind: policy
+    type: geo_block
+    config_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        denylist: { type: array, items: { type: string }, default: [] }
+        country_header: { type: string, default: "x-geo-country" }
+      required: []
+  - kind: transform
+    type: tag_geo_header
+
+failure_posture: closed
+
+sandbox:
+  timeout_ms: 500              # same semantics as the existing `wasm` transform's timeout_ms:
+                                # epoch-interruption trap on wall-clock overrun
+  max_memory_pages: 256        # 64 KiB pages; 256 = 16 MiB
+
+permissions: []

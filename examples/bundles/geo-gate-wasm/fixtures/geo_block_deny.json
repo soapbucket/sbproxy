@@ -1,0 +1,10 @@
+{
+  "hook": { "kind": "policy", "type": "geo_block" },
+  "config": { "denylist": ["KP", "IR"], "country_header": "x-geo-country" },
+  "request": { "headers": { "x-geo-country": "KP" } },
+  "expect": {
+    "kind": "deny",
+    "status": 451,
+    "message": "requests from 'KP' are not permitted"
+  }
+}

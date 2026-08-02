@@ -1,0 +1,15 @@
+{
+  "hook": "enforce",
+  "config": { "requests_per_minute": 60, "plan_header": "x-plan" },
+  "request": {
+    "method": "POST",
+    "uri": "/v1/chat/completions",
+    "headers": { "x-plan": "free", "x-request-count": "84" },
+    "origin": "api.example.com"
+  },
+  "expect": {
+    "kind": "deny",
+    "status": 429,
+    "message": "plan 'free' exceeded 60 requests/minute"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "hook": { "kind": "transform", "type": "tag_geo_header" },
+  "config": {},
+  "request": { "headers": { "x-geo-country": "US" } },
+  "expect": { "headers": [["x-geo-gate-evaluated", "US"]] }
+}
