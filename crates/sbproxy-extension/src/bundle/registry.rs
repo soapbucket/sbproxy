@@ -6,6 +6,8 @@ use sbproxy_config::{BundleHook, BundleHookKind, BundleManifest};
 use sbproxy_plugin::ExtensionRegistrationSource;
 use thiserror::Error;
 
+use crate::wasm::WasmRuntime;
+
 /// Safe source provenance retained by one loaded bundle hook.
 ///
 /// Directory provenance records only declaration position. Git provenance
@@ -71,6 +73,7 @@ pub struct LoadedBundleHook {
     pub(crate) hook: BundleHook,
     pub(crate) artifact: Arc<[u8]>,
     pub(crate) javascript_source: Option<Arc<str>>,
+    pub(crate) wasm_runtime: Option<Arc<WasmRuntime>>,
     pub(crate) sha256: String,
     pub(crate) config_validator: Option<Arc<JSONSchema>>,
     pub(crate) provenance: BundleProvenance,
@@ -111,6 +114,11 @@ impl LoadedBundleHook {
     /// Return the source prepared once for a JavaScript runtime hook.
     pub(crate) fn prepared_javascript_source(&self) -> Option<&Arc<str>> {
         self.javascript_source.as_ref()
+    }
+
+    /// Return the module compiled once for all hooks in a WASM bundle.
+    pub(crate) fn prepared_wasm_runtime(&self) -> Option<&Arc<WasmRuntime>> {
+        self.wasm_runtime.as_ref()
     }
 
     /// Return the lowercase SHA-256 digest computed from [`Self::artifact`].

@@ -12,7 +12,6 @@ use sbproxy_plugin::{
     ActionHandler, ActionOutcome, PluginError, PluginResult, PolicyDecision, PolicyEnforcer,
     TransformContext, TransformHandler,
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
 use swc_common::{sync::Lrc, FileName, Globals, Mark, SourceMap, GLOBALS};
 use swc_ecma_ast::{Callee, EsVersion, ModuleDecl, Program};
@@ -23,14 +22,12 @@ use swc_ecma_transforms_typescript::strip;
 use swc_ecma_visit::{Visit, VisitWith};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
+use super::envelope::{self, EnvelopeError};
 use super::{BundleLoadError, LoadedBundleHook};
 use crate::js::arm_watchdog;
 
 /// Version placed on every JavaScript hook request and response envelope.
-pub const JAVASCRIPT_ENVELOPE_VERSION: &str = "sbproxy-envelope/v1";
-
-const MAX_POLICY_MESSAGE_BYTES: usize = 4 * 1024;
-const MAX_ACTION_HEADERS: usize = 64;
+pub const JAVASCRIPT_ENVELOPE_VERSION: &str = envelope::ENVELOPE_VERSION;
 const MAX_JAVASCRIPT_WORKERS: usize = 4;
 const QUEUE_SLOTS_PER_WORKER: usize = 2;
 
@@ -100,6 +97,12 @@ impl RuntimeFailure {
                 PluginError::Internal(anyhow::anyhow!("javascript bundle hook failed: {code}"))
             }
         }
+    }
+}
+
+impl From<EnvelopeError> for RuntimeFailure {
+    fn from(error: EnvelopeError) -> Self {
+        Self::Code(error.code())
     }
 }
 
@@ -510,7 +513,7 @@ fn prepare_program(
     })?;
     let mut config = config;
     if let Some(schema) = hook.hook().config_schema.as_ref() {
-        apply_schema_defaults(&mut config, schema);
+        envelope::apply_schema_defaults(&mut config, schema);
     }
     hook.validate_config(&config)
         .map_err(|error| BundleLoadError::new("config", error.to_string()))?;
@@ -525,7 +528,7 @@ fn prepare_program(
         JavascriptProgram {
             source: Arc::clone(source),
             export: Arc::from(export),
-            hook_kind: hook_kind_label(expected_kind),
+            hook_kind: envelope::hook_kind_label(expected_kind),
             type_name: Arc::from(type_name),
             config: Arc::new(config),
             limits,
@@ -533,81 +536,12 @@ fn prepare_program(
     ))
 }
 
-const fn hook_kind_label(kind: BundleHookKind) -> &'static str {
-    match kind {
-        BundleHookKind::Policy => "policy",
-        BundleHookKind::Transform => "transform",
-        BundleHookKind::Action => "action",
-        BundleHookKind::AiToolCall => "ai_tool_call",
-        BundleHookKind::AiGuardrailInput => "ai_guardrail_input",
-        BundleHookKind::AiGuardrailOutput => "ai_guardrail_output",
-        BundleHookKind::AiStreamEvent => "ai_stream_event",
-        BundleHookKind::AiClose => "ai_close",
-        BundleHookKind::ProxyWasm => "proxy_wasm",
-    }
-}
-
-fn apply_schema_defaults(value: &mut Value, schema: &Value) {
-    if value.is_null() {
-        if let Some(default) = schema.get("default") {
-            *value = default.clone();
-        }
-    }
-    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
-        for branch in branches {
-            apply_schema_defaults(value, branch);
-        }
-    }
-    if let (Some(object), Some(properties)) = (
-        value.as_object_mut(),
-        schema.get("properties").and_then(Value::as_object),
-    ) {
-        for (name, property_schema) in properties {
-            if !object.contains_key(name) {
-                if let Some(default) = property_schema.get("default") {
-                    object.insert(name.clone(), default.clone());
-                }
-            }
-            if let Some(property_value) = object.get_mut(name) {
-                apply_schema_defaults(property_value, property_schema);
-            }
-        }
-    }
-    if let (Some(items), Some(item_schema)) = (value.as_array_mut(), schema.get("items")) {
-        for item in items {
-            apply_schema_defaults(item, item_schema);
-        }
-    }
-}
-
 fn request_value(request: &http::Request<Bytes>, maximum: usize) -> Result<Value, RuntimeFailure> {
-    if request.body().len() > maximum {
-        return Err(RuntimeFailure::Code("input_limit"));
-    }
-    let headers = request
-        .headers()
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| json!([name.as_str(), value]))
-        })
-        .collect::<Vec<_>>();
-    Ok(json!({
-        "method": request.method().as_str(),
-        "uri": request.uri().to_string(),
-        "headers": headers,
-        "body_base64": base64::engine::general_purpose::STANDARD.encode(request.body()),
-    }))
+    envelope::request_value(request, maximum).map_err(Into::into)
 }
 
 fn serialize_envelope(envelope: &Value, maximum: usize) -> Result<Vec<u8>, RuntimeFailure> {
-    let bytes = serde_json::to_vec(envelope).map_err(|_| RuntimeFailure::Code("input_invalid"))?;
-    if bytes.len() > maximum {
-        return Err(RuntimeFailure::Code("input_limit"));
-    }
-    Ok(bytes)
+    envelope::serialize_envelope(envelope, maximum).map_err(Into::into)
 }
 
 async fn invoke_program(
@@ -623,159 +557,25 @@ async fn invoke_program(
 }
 
 fn hook_envelope(payload_name: &str, program: &JavascriptProgram, payload: Value) -> Value {
-    let mut envelope = json!({
-        "version": JAVASCRIPT_ENVELOPE_VERSION,
-        "hook": {
-            "kind": program.hook_kind,
-            "type": program.type_name.as_ref(),
-        },
-        "config": program.config.as_ref(),
-    });
-    envelope
-        .as_object_mut()
-        .expect("literal JavaScript envelope should be an object")
-        .insert(payload_name.to_owned(), payload);
-    envelope
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PolicyWire {
-    version: String,
-    decision: String,
-    #[serde(default)]
-    status: Option<u16>,
-    #[serde(default)]
-    message: Option<String>,
-    #[serde(default)]
-    headers: Vec<(String, String)>,
+    envelope::hook_envelope(
+        payload_name,
+        program.hook_kind,
+        program.type_name.as_ref(),
+        program.config.as_ref(),
+        payload,
+    )
 }
 
 fn decode_policy(bytes: &[u8]) -> Result<PolicyDecision, RuntimeFailure> {
-    let response: PolicyWire =
-        serde_json::from_slice(bytes).map_err(|_| RuntimeFailure::Code("invalid_envelope"))?;
-    if response.version != JAVASCRIPT_ENVELOPE_VERSION {
-        return Err(RuntimeFailure::Code("invalid_version"));
-    }
-    match response.decision.as_str() {
-        "allow"
-            if response.status.is_none()
-                && response.message.is_none()
-                && response.headers.is_empty() =>
-        {
-            Ok(PolicyDecision::Allow)
-        }
-        "deny" => {
-            if !response.headers.is_empty() {
-                return Err(RuntimeFailure::Code("invalid_envelope"));
-            }
-            let status = response
-                .status
-                .filter(|status| (400..=599).contains(status))
-                .ok_or(RuntimeFailure::Code("invalid_envelope"))?;
-            let message = response
-                .message
-                .filter(|message| message.len() <= MAX_POLICY_MESSAGE_BYTES)
-                .ok_or(RuntimeFailure::Code("invalid_envelope"))?;
-            Ok(PolicyDecision::Deny { status, message })
-        }
-        "allow_with_headers" if response.status.is_none() && response.message.is_none() => {
-            validate_headers(&response.headers)?;
-            Ok(PolicyDecision::AllowWithHeaders {
-                headers: response.headers,
-            })
-        }
-        _ => Err(RuntimeFailure::Code("invalid_envelope")),
-    }
-}
-
-fn validate_headers(headers: &[(String, String)]) -> Result<(), RuntimeFailure> {
-    if headers.len() > MAX_ACTION_HEADERS {
-        return Err(RuntimeFailure::Code("invalid_envelope"));
-    }
-    for (name, value) in headers {
-        http::header::HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| RuntimeFailure::Code("invalid_envelope"))?;
-        http::header::HeaderValue::from_str(value)
-            .map_err(|_| RuntimeFailure::Code("invalid_envelope"))?;
-    }
-    Ok(())
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TransformWire {
-    version: String,
-    body_base64: String,
+    envelope::decode_policy(bytes).map_err(Into::into)
 }
 
 fn decode_body(bytes: &[u8], maximum: usize) -> Result<Vec<u8>, RuntimeFailure> {
-    let response: TransformWire =
-        serde_json::from_slice(bytes).map_err(|_| RuntimeFailure::Code("invalid_envelope"))?;
-    if response.version != JAVASCRIPT_ENVELOPE_VERSION {
-        return Err(RuntimeFailure::Code("invalid_version"));
-    }
-    let body = base64::engine::general_purpose::STANDARD
-        .decode(response.body_base64)
-        .map_err(|_| RuntimeFailure::Code("invalid_envelope"))?;
-    if body.len() > maximum {
-        return Err(RuntimeFailure::Code("output_limit"));
-    }
-    Ok(body)
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ActionWire {
-    version: String,
-    outcome: String,
-    #[serde(default)]
-    status: Option<u16>,
-    #[serde(default)]
-    headers: Vec<(String, String)>,
-    #[serde(default)]
-    body_base64: Option<String>,
+    envelope::decode_body(bytes, maximum).map_err(Into::into)
 }
 
 fn decode_action(bytes: &[u8], maximum: usize) -> Result<ActionOutcome, RuntimeFailure> {
-    let response: ActionWire =
-        serde_json::from_slice(bytes).map_err(|_| RuntimeFailure::Code("invalid_envelope"))?;
-    if response.version != JAVASCRIPT_ENVELOPE_VERSION {
-        return Err(RuntimeFailure::Code("invalid_version"));
-    }
-    match response.outcome.as_str() {
-        "proxy"
-            if response.status.is_none()
-                && response.headers.is_empty()
-                && response.body_base64.is_none() =>
-        {
-            Ok(ActionOutcome::Proxy)
-        }
-        "response" => {
-            let status = response
-                .status
-                .filter(|status| (100..=599).contains(status))
-                .ok_or(RuntimeFailure::Code("invalid_envelope"))?;
-            validate_headers(&response.headers)?;
-            let body = response
-                .body_base64
-                .ok_or(RuntimeFailure::Code("invalid_envelope"))
-                .and_then(|body| {
-                    base64::engine::general_purpose::STANDARD
-                        .decode(body)
-                        .map_err(|_| RuntimeFailure::Code("invalid_envelope"))
-                })?;
-            if body.len() > maximum {
-                return Err(RuntimeFailure::Code("output_limit"));
-            }
-            Ok(ActionOutcome::Response {
-                status,
-                headers: response.headers,
-                body: Bytes::from(body),
-            })
-        }
-        _ => Err(RuntimeFailure::Code("invalid_envelope")),
-    }
+    envelope::decode_action(bytes, maximum).map_err(Into::into)
 }
 
 /// Buffered JavaScript policy adapter backed by the shared worker pool.

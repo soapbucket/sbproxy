@@ -23,9 +23,31 @@ use sha2::{Digest, Sha256};
 
 use super::javascript::prepare_javascript_artifact;
 use super::registry::{lookup, BundleProvenance, BundleRegistry, LoadedBundleHook};
+use crate::wasm::{WasmBundleLimits, WasmRuntime};
 
 /// Largest executable artifact accepted by the bundle loader.
 pub const MAX_BUNDLE_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+
+impl WasmBundleLimits {
+    fn from_sandbox(sandbox: &sbproxy_config::BundleSandbox) -> Result<Self, BundleLoadError> {
+        let checked_bytes = |value: u64, multiplier: usize, name: &str| {
+            usize::try_from(value)
+                .ok()
+                .and_then(|value| value.checked_mul(multiplier))
+                .ok_or_else(|| BundleLoadError::new("wasm", format!("{name} limit is unsupported")))
+        };
+        Ok(Self {
+            budget: Duration::from_millis(sandbox.budget_ms),
+            memory_bytes: checked_bytes(sandbox.memory_mb, 1024 * 1024, "memory")?,
+            stack_bytes: checked_bytes(sandbox.stack_kb, 1024, "stack")?,
+            fuel: sandbox.max_fuel,
+            max_input_bytes: usize::try_from(sandbox.max_buffer_bytes)
+                .map_err(|_| BundleLoadError::new("wasm", "input limit is unsupported"))?,
+            max_output_bytes: usize::try_from(sandbox.max_output_bytes)
+                .map_err(|_| BundleLoadError::new("wasm", "output limit is unsupported"))?,
+        })
+    }
+}
 
 /// A bounded, sanitized candidate-loading failure.
 pub struct BundleLoadError {
@@ -403,6 +425,15 @@ impl<'a> Candidate<'a> {
         } else {
             None
         };
+        let wasm_runtime = if manifest.runtime == BundleRuntime::Wasm {
+            let limits = WasmBundleLimits::from_sandbox(&manifest.sandbox)?;
+            Some(Arc::new(
+                WasmRuntime::from_bundle_bytes(&artifact, limits)
+                    .map_err(|failure| BundleLoadError::new("wasm", failure.code()))?,
+            ))
+        } else {
+            None
+        };
 
         let source = provenance.source();
         let runtime = inventory_runtime(manifest.runtime);
@@ -420,6 +451,7 @@ impl<'a> Candidate<'a> {
                 hook: hook.clone(),
                 artifact: artifact.clone(),
                 javascript_source: javascript_source.clone(),
+                wasm_runtime: wasm_runtime.clone(),
                 sha256: digest.clone(),
                 config_validator: validator,
                 provenance: provenance.clone(),

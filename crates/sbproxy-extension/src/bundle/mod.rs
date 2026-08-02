@@ -4,12 +4,18 @@
 //! configuration schemas, and safe provenance. Loading never mutates the
 //! process-wide static plugin registries.
 
+mod envelope;
+mod envelope_wasm;
 mod javascript;
 mod loader;
 mod registry;
 #[cfg(test)]
 mod tests;
 
+pub use envelope_wasm::{
+    build_wasm_action, build_wasm_policy, build_wasm_transform, WasmActionAdapter,
+    WasmPolicyAdapter, WasmTransformAdapter,
+};
 pub use javascript::{
     build_javascript_action, build_javascript_policy, build_javascript_transform,
     transpile_typescript, JavascriptActionAdapter, JavascriptPolicyAdapter,

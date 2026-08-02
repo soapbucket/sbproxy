@@ -35,6 +35,7 @@ swc_ecma_visit.workspace = true
 # WebAssembly scripting engine (wasmtime + WASI).
 wasmtime.workspace = true
 wasi-common.workspace = true
+wasmtime-wasi.workspace = true
 
 # Serialization
 serde = { workspace = true }
