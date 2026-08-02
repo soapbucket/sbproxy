@@ -10,12 +10,31 @@ use std::pin::Pin;
 use crate::PluginResult;
 
 /// Outcome of an action handler - either proxied upstream or responded directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionOutcome {
     /// Request should be proxied to the upstream returned by upstream_peer.
     Proxy,
     /// Response was written directly (static, redirect, echo, etc.).
     Responded,
+    /// Handler supplied a complete response for ordinary response middleware.
+    Response {
+        /// HTTP response status code.
+        status: u16,
+        /// Response header name and value pairs in source order.
+        headers: Vec<(String, String)>,
+        /// Complete response body.
+        body: bytes::Bytes,
+    },
+}
+
+impl ActionOutcome {
+    /// Return the supplied response status for a structured response outcome.
+    pub const fn response_status(&self) -> Option<u16> {
+        match self {
+            Self::Response { status, .. } => Some(*status),
+            Self::Proxy | Self::Responded => None,
+        }
+    }
 }
 
 /// Origin of a subject resolved by an auth provider.
@@ -208,7 +227,7 @@ impl PolicyDecision {
 /// them upstream or respond directly.
 pub trait ActionHandler: Send + Sync + 'static {
     /// Returns the handler type identifier (e.g. "my-custom-action").
-    fn handler_type(&self) -> &'static str;
+    fn handler_type(&self) -> &str;
 
     /// Handle an incoming request.
     ///
@@ -242,7 +261,7 @@ pub trait ActionHandler: Send + Sync + 'static {
 /// or custom auth system.
 pub trait AuthProvider: Send + Sync + 'static {
     /// Returns the auth type identifier (e.g. "my-custom-auth").
-    fn auth_type(&self) -> &'static str;
+    fn auth_type(&self) -> &str;
 
     /// Classify the meaning of a denied authentication decision.
     ///
@@ -298,7 +317,7 @@ pub trait AuthProvider: Send + Sync + 'static {
 /// Implementations enforce custom policies (rate limiting, geo-blocking, etc.).
 pub trait PolicyEnforcer: Send + Sync + 'static {
     /// Returns the policy type identifier (e.g. "my-custom-policy").
-    fn policy_type(&self) -> &'static str;
+    fn policy_type(&self) -> &str;
 
     /// Enforce the policy against an incoming request.
     ///
@@ -375,7 +394,7 @@ impl<'a> TransformContext<'a> {
 /// (e.g. custom encoding, field masking).
 pub trait TransformHandler: Send + Sync + 'static {
     /// Returns the transform type identifier (e.g. "my-custom-transform").
-    fn transform_type(&self) -> &'static str;
+    fn transform_type(&self) -> &str;
 
     /// Apply the transform to a body buffer.
     ///
@@ -409,7 +428,7 @@ pub trait TransformHandler: Send + Sync + 'static {
 /// Request enricher - adds data to request context (GeoIP, UA parsing, etc.).
 pub trait RequestEnricher: Send + Sync + 'static {
     /// Returns the enricher name (e.g. "geoip", "ua-parser").
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// Enrich the request context with additional data.
     ///
@@ -438,6 +457,16 @@ pub trait RequestEnricher: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_response_keeps_status_headers_and_body() {
+        let outcome = ActionOutcome::Response {
+            status: 202,
+            headers: vec![("content-type".into(), "text/plain".into())],
+            body: bytes::Bytes::from_static(b"queued"),
+        };
+        assert_eq!(outcome.response_status(), Some(202));
+    }
 
     /// Confirm carries reason + optional webhook + optional expiry.
     /// A past `expires_at` must compare as already elapsed; the

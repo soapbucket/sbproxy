@@ -18,6 +18,7 @@
 pub mod audit;
 pub mod context;
 pub mod error;
+pub mod extensions;
 pub mod identity;
 pub mod lifecycle;
 pub mod mcp;
@@ -32,6 +33,7 @@ pub use audit::{
 };
 pub use context::*;
 pub use error::{PluginError, PluginResult};
+pub use extensions::*;
 pub use identity::{
     anomaly_hooks, identity_hooks, ml_classifier_hooks, register_anomaly_hook,
     register_identity_hook, register_ml_classifier_hook, AgentIdSourceLabel, AnomalyDetectorHook,
@@ -50,3 +52,70 @@ pub use principal::{
 pub use registry::*;
 pub use traits::*;
 pub use verdict_combine::{combine_verdicts, CombinedVerdict};
+
+#[cfg(test)]
+mod extension_contract_tests {
+    use super::*;
+
+    inventory::submit! {
+        ExtensionBundleDeclaration {
+            id: "fixture-z",
+            name: "Fixture Z",
+            version: "1.0.0",
+            package: None,
+            runtime: ExtensionRuntime::Rust,
+            hooks: &[],
+        }
+    }
+
+    inventory::submit! {
+        ExtensionBundleDeclaration {
+            id: "fixture-a",
+            name: "Fixture A",
+            version: "1.0.0",
+            package: Some("fixture-a-package"),
+            runtime: ExtensionRuntime::Rust,
+            hooks: &[],
+        }
+    }
+
+    #[test]
+    fn linked_extension_declarations_are_sorted_by_bundle_id() {
+        let declarations = collect_linked_extension_declarations();
+        assert!(declarations.windows(2).all(|pair| pair[0].id <= pair[1].id));
+        assert!(declarations.iter().any(|bundle| bundle.id == "fixture-a"));
+        assert!(declarations.iter().any(|bundle| bundle.id == "fixture-z"));
+    }
+
+    #[test]
+    fn extension_inventory_enums_serialize_as_snake_case() {
+        assert_eq!(
+            serde_json::to_value(ExtensionRuntime::ProxyWasm).unwrap(),
+            "proxy_wasm"
+        );
+        assert_eq!(
+            serde_json::to_value(ExtensionHookKind::AiGuardrailInput).unwrap(),
+            "ai_guardrail_input"
+        );
+        assert_eq!(
+            serde_json::to_value(ExtensionDispatch::Exclusive).unwrap(),
+            "exclusive"
+        );
+        assert_eq!(
+            serde_json::to_value(ExtensionBodyMode::Streamed).unwrap(),
+            "streamed"
+        );
+        assert_eq!(
+            serde_json::to_value(ExtensionRegistrationSource::LinkTime).unwrap(),
+            "link_time"
+        );
+        assert_eq!(
+            serde_json::to_value(ExtensionState::NotEvaluated).unwrap(),
+            "not_evaluated"
+        );
+        assert_eq!(
+            serde_json::to_value(ExtensionScopeMode::Running).unwrap(),
+            "running"
+        );
+    }
+}

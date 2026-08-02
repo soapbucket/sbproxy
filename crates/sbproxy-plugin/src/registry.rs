@@ -6,7 +6,8 @@
 
 use anyhow::Result;
 
-use crate::traits::AuthProvider;
+use crate::traits::{ActionHandler, AuthProvider, PolicyEnforcer, TransformHandler};
+use crate::PluginResult;
 
 /// Which kind of plugin this registration covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -140,9 +141,163 @@ pub fn list_auth_plugins() -> Vec<&'static str> {
         .collect()
 }
 
+/// Factory for a strongly typed policy plugin.
+pub type PolicyPluginFactory = fn(serde_json::Value) -> PluginResult<Box<dyn PolicyEnforcer>>;
+
+/// Strongly typed policy plugin registration.
+pub struct PolicyPluginRegistration {
+    /// Unique policy type name.
+    pub name: &'static str,
+    /// Factory that builds the policy from JSON configuration.
+    pub factory: PolicyPluginFactory,
+}
+
+inventory::collect!(PolicyPluginRegistration);
+
+/// Build a registered policy plugin from JSON configuration.
+///
+/// Returns `None` when no policy is registered under `name`.
+pub fn build_policy_plugin(
+    name: &str,
+    config: serde_json::Value,
+) -> Option<PluginResult<Box<dyn PolicyEnforcer>>> {
+    let registration =
+        inventory::iter::<PolicyPluginRegistration>().find(|item| item.name == name)?;
+    Some((registration.factory)(config))
+}
+
+/// Factory for a strongly typed transform plugin.
+pub type TransformPluginFactory = fn(serde_json::Value) -> PluginResult<Box<dyn TransformHandler>>;
+
+/// Strongly typed transform plugin registration.
+pub struct TransformPluginRegistration {
+    /// Unique transform type name.
+    pub name: &'static str,
+    /// Factory that builds the transform from JSON configuration.
+    pub factory: TransformPluginFactory,
+}
+
+inventory::collect!(TransformPluginRegistration);
+
+/// Build a registered transform plugin from JSON configuration.
+///
+/// Returns `None` when no transform is registered under `name`.
+pub fn build_transform_plugin(
+    name: &str,
+    config: serde_json::Value,
+) -> Option<PluginResult<Box<dyn TransformHandler>>> {
+    let registration =
+        inventory::iter::<TransformPluginRegistration>().find(|item| item.name == name)?;
+    Some((registration.factory)(config))
+}
+
+/// Factory for a strongly typed action plugin.
+pub type ActionPluginFactory = fn(serde_json::Value) -> PluginResult<Box<dyn ActionHandler>>;
+
+/// Strongly typed action plugin registration.
+pub struct ActionPluginRegistration {
+    /// Unique action type name.
+    pub name: &'static str,
+    /// Factory that builds the action from JSON configuration.
+    pub factory: ActionPluginFactory,
+}
+
+inventory::collect!(ActionPluginRegistration);
+
+/// Build a registered action plugin from JSON configuration.
+///
+/// Returns `None` when no action is registered under `name`.
+pub fn build_action_plugin(
+    name: &str,
+    config: serde_json::Value,
+) -> Option<PluginResult<Box<dyn ActionHandler>>> {
+    let registration =
+        inventory::iter::<ActionPluginRegistration>().find(|item| item.name == name)?;
+    Some((registration.factory)(config))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use serde_json::json;
+
     use super::*;
+    use crate::{
+        ActionHandler, ActionOutcome, PluginResult, PolicyDecision, PolicyEnforcer,
+        TransformContext, TransformHandler,
+    };
+
+    struct FixturePolicy;
+
+    impl PolicyEnforcer for FixturePolicy {
+        fn policy_type(&self) -> &'static str {
+            "fixture_policy"
+        }
+
+        fn enforce(
+            &self,
+            _req: &http::Request<bytes::Bytes>,
+            _ctx: &mut dyn std::any::Any,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<PolicyDecision>> + Send + '_>> {
+            Box::pin(async { Ok(PolicyDecision::Allow) })
+        }
+    }
+
+    struct FixtureTransform;
+
+    impl TransformHandler for FixtureTransform {
+        fn transform_type(&self) -> &'static str {
+            "fixture_transform"
+        }
+
+        fn apply<'a>(
+            &'a self,
+            _body: &'a mut bytes::BytesMut,
+            _content_type: Option<&'a str>,
+            _ctx: &'a TransformContext<'a>,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct FixtureAction;
+
+    impl ActionHandler for FixtureAction {
+        fn handler_type(&self) -> &'static str {
+            "fixture_action"
+        }
+
+        fn handle(
+            &self,
+            _req: &mut http::Request<bytes::Bytes>,
+            _ctx: &mut dyn std::any::Any,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<ActionOutcome>> + Send + '_>> {
+            Box::pin(async { Ok(ActionOutcome::Proxy) })
+        }
+    }
+
+    inventory::submit! {
+        PolicyPluginRegistration {
+            name: "fixture_policy",
+            factory: |_config| Ok(Box::new(FixturePolicy)),
+        }
+    }
+
+    inventory::submit! {
+        TransformPluginRegistration {
+            name: "fixture_transform",
+            factory: |_config| Ok(Box::new(FixtureTransform)),
+        }
+    }
+
+    inventory::submit! {
+        ActionPluginRegistration {
+            name: "fixture_action",
+            factory: |_config| Ok(Box::new(FixtureAction)),
+        }
+    }
 
     // --- Test plugin registrations ---
 
@@ -213,5 +368,15 @@ mod tests {
         let boxed = result.unwrap();
         let value = boxed.downcast_ref::<u32>().unwrap();
         assert_eq!(*value, 42);
+    }
+
+    #[test]
+    fn typed_registries_build_each_plugin_kind() {
+        assert!(build_policy_plugin("fixture_policy", json!({"type":"fixture_policy"})).is_some());
+        assert!(
+            build_transform_plugin("fixture_transform", json!({"type":"fixture_transform"}))
+                .is_some()
+        );
+        assert!(build_action_plugin("fixture_action", json!({"type":"fixture_action"})).is_some());
     }
 }
