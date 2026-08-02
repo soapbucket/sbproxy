@@ -1,5 +1,5 @@
 # Routing Strategies
-*Last modified: 2026-07-26*
+*Last modified: 2026-08-02*
 
 The `RoutingStrategy` trait is an extension point for custom upstream selection in a `load_balancer` action. It lives in `sbproxy-modules::action::routing`. The trait runs synchronously on the request hot path, receives already-projected request and target state, and returns the index of a chosen eligible target or `None` to use the configured `algorithm`.
 
@@ -176,3 +176,52 @@ action:
 A request for `adapter=alice-tone` selects the less-loaded of the first and third targets. A request for an unknown adapter or no adapter falls through to `least_connections`.
 
 A runnable configuration lives at `examples/lora-aware-routing/sb.yml`.
+
+## Watching a strategy choose
+
+Which target a strategy picked is not visible when every target is the same address, which is the reason a config alone cannot demonstrate any of this. [`examples/routing-strategies/`](../examples/routing-strategies/) ships two upstreams that report their own name and points three origins at the same pair.
+
+```bash
+cd examples/routing-strategies
+docker compose up -d --wait
+```
+
+`gpu-aware` picks the lowest valid `metadata.gpu_utilization`, and keeps picking it, because the value is configuration rather than telemetry it polls:
+
+```bash
+for i in 1 2 3 4; do curl -s -H 'Host: gpu.local' http://127.0.0.1:8080/infer; echo; done
+```
+
+```
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+```
+
+The `percent.local` origin carries the same two targets with `72` and `31` in that field, the percent-versus-fraction typo. Both are outside `[0.0, 1.0]`, so the strategy ignores them rather than reading a busy replica as the idle one, and its deterministic round robin runs instead:
+
+```bash
+for i in 1 2 3 4; do curl -s -H 'Host: percent.local' http://127.0.0.1:8080/infer; echo; done
+```
+
+```
+{"target":"replica-a","path":"/infer","adapter_requested":""}
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+{"target":"replica-a","path":"/infer","adapter_requested":""}
+{"target":"replica-b","path":"/infer","adapter_requested":""}
+```
+
+`lora-aware` prefers the replica advertising the requested adapter, and returns no selection when none does, at which point the configured `algorithm` picks from the same eligible slice:
+
+```bash
+curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: alice-tone' http://127.0.0.1:8080/infer; echo
+curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: nobody-has-this' http://127.0.0.1:8080/infer
+```
+
+```
+{"target":"replica-a","path":"/infer","adapter_requested":"alice-tone"}
+{"target":"replica-a","path":"/infer","adapter_requested":"nobody-has-this"}
+```
+
+`docker compose down -v` tears it down.

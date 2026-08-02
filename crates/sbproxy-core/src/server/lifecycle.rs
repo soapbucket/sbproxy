@@ -3744,7 +3744,6 @@ origins:
             host_map: std::collections::HashMap::new(),
             server,
             l2_store: None,
-            messenger: None,
             mesh: None,
             access_log: None,
             agent_classes: None,

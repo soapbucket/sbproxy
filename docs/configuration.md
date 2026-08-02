@@ -79,9 +79,9 @@ sbproxy --config /etc/sbproxy/production.yml --check
 ```
 
 The config has two main sections: `proxy` (server-level settings) and `origins`
-(per-hostname routing and behavior). Optional shared-state blocks
-(`l2_cache_settings`, `messenger_settings`) and process-owned
-`compression_state` live nested under `proxy`.
+(per-hostname routing and behavior). The optional shared-state block
+`l2_cache_settings` and the process-owned `compression_state` block live
+nested under `proxy`.
 
 Unknown keys are rejected. A misspelled key anywhere inside `proxy` or an
 origin (`force_ssl` typed as `forced_ssl`, `mtls` as `mtsl`, a stray field in
@@ -191,12 +191,6 @@ proxy:
     params:
       dsn: redis://localhost:6379/0
 
-  # Messenger (Redis) for real-time config updates
-  messenger_settings:
-    driver: redis
-    params:
-      dsn: redis://localhost:6379
-
   # Opaque per-server extensions consumed by out-of-tree crates.
   extensions: { ... }
 
@@ -235,7 +229,7 @@ origins:
     extensions: { ... }
 ```
 
-`l2_cache_settings` and `messenger_settings` are nested under `proxy:` (the deserializer also accepts `l2_cache` as a canonical alias).
+`l2_cache_settings` is nested under `proxy:` (the deserializer also accepts `l2_cache` as a canonical alias).
 
 ### Top-level fields
 
@@ -335,7 +329,7 @@ proxy:
 | `cache_reserve` | object | unset | Optional cold-tier response cache backed by memory, filesystem, or Redis. |
 | `compression_state` | object | unset | Process-owned Local AI summary-state path. See [compression_state](#compression_state). |
 | `response_cache_store` | object | unset | Picks the backing store for the shared response cache and optionally encrypts entries at rest. See [Choosing the backing store](#choosing-the-backing-store). When unset, the store is Redis if `l2_cache_settings` is configured and an in-process map otherwise. |
-| `messenger_settings` | object | | Optional shared message bus for inter-component eventing. |
+| `messenger_settings` | object | | Not supported. Setting it fails config load. See [messenger_settings](#messenger_settings). |
 | `trusted_proxies` | array of CIDR strings | `[]` | Source ranges whose inbound `X-Forwarded-For` / `X-Real-IP` / `Forwarded` headers are honoured. Connections from outside the list have those headers stripped on ingress so they cannot spoof identity. IPv6 CIDRs work. See [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers). |
 | `correlation_id` | object | enabled, `X-Request-Id`, echo on | Correlation-ID propagation policy. See [Correlation ID](#correlation-id). |
 | `mtls` | object | unset | mTLS client-certificate verification on the HTTPS listener. See [mTLS client authentication](#mtls-client-authentication). |
@@ -796,44 +790,39 @@ processes.
 
 ### messenger_settings
 
-The `messenger_settings` block configures the message bus the proxy uses for inter-component events such as config updates and semantic-cache purges. When unset, the proxy runs without a bus, which is fine for single-replica deployments.
+Not supported. A config that sets `proxy.messenger_settings` fails `serve`,
+`validate`, and hot reload with an error explaining why.
 
-The `driver` field picks the implementation; `params` is a flat string map whose keys depend on the driver. Unknown driver names cause startup to error.
+Earlier releases accepted this block and built a message bus from it, with a
+choice of in-process, Redis, SQS, or GCP Pub/Sub backends. Nothing ever used
+that bus. No part of the proxy subscribed to a topic and no part published on
+one, so an operator who configured a cluster message bus got a configuration
+that loaded cleanly and then carried no events between replicas for the life
+of the process. A configuration surface that validates and then does nothing
+is worse than one that is absent, because it reads as a working feature. The
+block is now refused at load rather than accepted and ignored.
 
-```yaml
-proxy:
-  messenger_settings:
-    driver: redis
-    params:
-      dsn: redis://redis.internal:6379
-```
+Remove it. If you had it set for one of the two jobs it was documented for,
+each has a surface that works:
 
-Supported drivers and their `params` keys:
+**Getting configuration to every replica.** Use `proxy.config_authority`. One
+node publishes a signed configuration bundle on its own listener and the other
+nodes pull it, verify the signature, merge it, and apply it. Subscribers poll
+on an interval, hold a cursor, and can be required to have a bundle before they
+will boot at all. See [Config authority](#config-authority-fleet-configuration-distribution).
 
-`memory` takes no `params`. It uses bounded in-process channels and only works for a single replica.
+**Invalidating cached responses across replicas.** Point the response cache at
+a shared tier with `proxy.l2_cache` and purge it with `POST /admin/cache/purge`
+on the admin API. Because the entries live in the shared backend rather than in
+each process, a single purge is already fleet-wide; there is nothing to fan
+out. The body selects the scope: `{"key": "..."}` for one entry,
+`{"prefix": "..."}` for a prefix, an empty body for everything. See
+[`l2_cache_settings`](#l2_cache_settings) and
+[the admin API guide](admin-api-guide.md).
 
-`redis`:
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `dsn` | string | `redis://127.0.0.1:6379` | Redis messenger connection string. The secure L2 fields and connection behavior described above do not apply to `messenger_settings`. |
-
-`sqs` (all required):
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `queue_url` | string | Full SQS queue URL. |
-| `region` | string | AWS region the queue lives in. |
-| `api_key` | string | AWS access key used to sign requests. |
-
-`gcp_pubsub` (all required):
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `project` | string | GCP project ID that owns the topic. |
-| `topic` | string | Pub/Sub topic name. |
-| `subscription` | string | Pub/Sub subscription name. |
-| `access_token` | string | OAuth2 access token used on requests. |
+The bus implementations are still in the tree. They are not reachable from
+configuration and will not be until something in the proxy actually produces
+and consumes an event.
 
 ---
 
@@ -4878,21 +4867,17 @@ lazy connection behavior. The runnable
 [`redis-l2-secure`](../examples/redis-l2-secure/) example exercises private-CA
 verification, client mTLS, password authentication, and database 7.
 
-### Messenger (real-time config updates)
+### Getting config changes to every replica
 
-```yaml
-proxy:
-  messenger_settings:
-    driver: redis
-    params:
-      dsn: redis://redis.internal:6379
-```
+There is no message bus. `proxy.messenger_settings` is refused at load; see
+[messenger_settings](#messenger_settings) for why and for the migration.
 
-When configured, config changes pushed via the API propagate to all proxy instances in real time over Redis Streams.
+Fleet configuration distribution is `proxy.config_authority`: one node signs
+and serves a configuration bundle, the others pull it on an interval, verify
+the signature, and apply it. See
+[Config authority](#config-authority-fleet-configuration-distribution).
 
-The Redis driver expects `params.dsn`. SQS uses `queue_url`, `region`, `api_key`. GCP Pub/Sub uses `project`, `topic`, `subscription`, `access_token`. The `memory` driver takes no params and is single-replica only.
-
-### L2 plus messenger setup
+### Full shared-state setup
 
 ```yaml
 proxy:
@@ -4905,10 +4890,6 @@ proxy:
       ca_file: /etc/sbproxy/redis/ca.pem
       cert_file: /etc/sbproxy/redis/client.pem
       key_file: /etc/sbproxy/redis/client-key.pem
-  messenger_settings:
-    driver: redis
-    params:
-      dsn: redis://redis.internal:6379
 
 origins:
   "api.example.com":
@@ -4923,9 +4904,10 @@ origins:
       ttl_secs: 300
 ```
 
-The messenger DSN above is intentionally shown separately. Do not add the L2
-TLS file fields under `messenger_settings` or assume that the messenger inherits
-the L2 connection.
+Every replica pointed at that Redis tier shares one set of rate-limit counters
+and one set of cached responses. That also makes invalidation a single call:
+`POST /admin/cache/purge` against any replica removes the entry from the shared
+tier, so there is nothing to broadcast.
 
 ---
 

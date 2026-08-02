@@ -5,6 +5,14 @@
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
 
+It is reference material rather than a walkthrough: it explains how the parts fit together and
+what each one is for, and there is nothing here to run. Every claim about how a feature behaves
+belongs to that feature's own page, and those pages carry the config, the commands, and the
+output. Start at [getting-started.md](getting-started.md) to stand a proxy up, and use
+[configuration.md](configuration.md) for the field-by-field schema. The performance numbers in
+§11 are reproduced in [performance.md](performance.md), which owns the harness and the
+methodology behind them.
+
 ---
 
 ## 1. Overview
@@ -258,7 +266,7 @@ dereference followed by a virtual or static call.
 
 The `sbproxy-config` crate contains type definitions, serde derives, and the
 compilation step. Its workspace dependencies are limited to `sbproxy-plugin`,
-`sbproxy-platform` (messenger configs plus the `KVStore` trait used by `build_l2_store`),
+`sbproxy-platform` (the `KVStore` trait used by `build_l2_store`),
 and `sbproxy-observe`. It does not pull in Pingora, the module set, or any networking
 runtime.
 

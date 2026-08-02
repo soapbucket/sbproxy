@@ -1,0 +1,71 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "cases": [
+    {
+      "name": "first fetch of /a misses both tiers and reaches the upstream",
+      "request": {
+        "method": "GET",
+        "path": "/a",
+        "headers": {"Host": "cache.local"}
+      },
+      "expect": {
+        "status": 200,
+        "body": {"type": "jsonShape", "shape": {"path": "/a", "upstream_hits": 1}}
+      }
+    },
+    {
+      "name": "second fetch of /a is served from the hot tier",
+      "request": {
+        "method": "GET",
+        "path": "/a",
+        "headers": {"Host": "cache.local"}
+      },
+      "expect": {
+        "status": 200,
+        "headers": {"x-sbproxy-cache": "^HIT$"},
+        "body": {"type": "jsonShape", "shape": {"path": "/a", "upstream_hits": 1}}
+      }
+    },
+    {
+      "name": "a second path fills the one-entry hot tier and evicts /a from it",
+      "request": {
+        "method": "GET",
+        "path": "/b",
+        "headers": {"Host": "cache.local"}
+      },
+      "expect": {
+        "status": 200,
+        "body": {"type": "jsonShape", "shape": {"path": "/b", "upstream_hits": 1}}
+      }
+    },
+    {
+      "name": "/a comes back from the reserve, not the upstream",
+      "request": {
+        "method": "GET",
+        "path": "/a",
+        "headers": {"Host": "cache.local"}
+      },
+      "expect": {
+        "status": 200,
+        "headers": {"x-sbproxy-cache": "^HIT-RESERVE$"},
+        "body": {"type": "jsonShape", "shape": {"path": "/a", "upstream_hits": 1}}
+      }
+    },
+    {
+      "name": "the reserve hit promoted /a back into the hot tier",
+      "request": {
+        "method": "GET",
+        "path": "/a",
+        "headers": {"Host": "cache.local"}
+      },
+      "expect": {
+        "status": 200,
+        "headers": {"x-sbproxy-cache": "^HIT$"},
+        "body": {"type": "jsonShape", "shape": {"path": "/a", "upstream_hits": 1}}
+      }
+    }
+  ],
+  "audit_check": false
+}

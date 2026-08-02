@@ -7,7 +7,9 @@
 //! ## Failure posture (WOR-2162)
 //!
 //! The CEL source is compiled exactly once, in [`ExpressionPolicy::from_config`],
-//! at config-compile time. Malformed CEL rejects the candidate config
+//! at config-compile time, through the shared
+//! [`sbproxy_extension::cel::CompiledCel`] seam every static-config CEL
+//! surface uses (WOR-2164). Malformed CEL rejects the candidate config
 //! with an error naming the policy and the bad expression; it never
 //! reaches the request path, so there is no compile-error admission
 //! path at evaluation time. Runtime evaluation errors (a missing map
@@ -16,6 +18,7 @@
 
 use std::sync::Arc;
 
+use sbproxy_extension::cel::CompiledCel;
 use serde::Deserialize;
 
 use crate::policy::aipref::AiprefSignal;
@@ -39,7 +42,7 @@ pub struct ExpressionPolicy {
     pub deny_message: String,
     /// The expression compiled once at config-compile time. Shared via
     /// `Arc` so cloning the policy does not recompile.
-    compiled: Arc<sbproxy_extension::cel::CelExpression>,
+    compiled: Arc<CompiledCel>,
 }
 
 fn default_deny_status() -> u16 {
@@ -75,10 +78,7 @@ impl ExpressionPolicy {
     /// source once. Returns an error naming the policy type and the
     /// bad expression when the source does not compile.
     pub fn new(expression: String, deny_status: u16, deny_message: String) -> anyhow::Result<Self> {
-        let engine = sbproxy_extension::cel::CelEngine::new();
-        let compiled = engine.compile(&expression).map_err(|e| {
-            anyhow::anyhow!("policy `expression`: invalid CEL expression {expression:?}: {e}")
-        })?;
+        let compiled = CompiledCel::compile("policy `expression`", &expression)?;
         Ok(Self {
             expression,
             deny_status,
@@ -160,7 +160,6 @@ impl ExpressionPolicy {
         hostname: &str,
         views: ExpressionViews<'_>,
     ) -> bool {
-        let engine = sbproxy_extension::cel::CelEngine::new();
         let mut ctx = sbproxy_extension::cel::context::build_request_context(
             method, path, headers, query, client_ip, hostname,
         );
@@ -232,7 +231,7 @@ impl ExpressionPolicy {
         // The expression was compiled once at config-compile time.
         // Runtime evaluation errors fail closed: the expression could
         // not prove the request is allowed, so it is denied.
-        engine.eval_bool(&self.compiled, &ctx).unwrap_or(false)
+        self.compiled.eval_bool(&ctx).unwrap_or(false)
     }
 }
 

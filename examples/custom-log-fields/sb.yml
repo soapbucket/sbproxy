@@ -39,7 +39,7 @@ proxy:
         # CEL expression over the request context.
         - name: caller_tier
           engine: cel
-          source: 'has(request.headers["x-tier"]) ? request.headers["x-tier"] : "standard"'
+          source: '"x-tier" in request.headers ? request.headers["x-tier"] : "standard"'
 
         # Defined at all three scopes; the origin value wins on api.local.
         - name: scope

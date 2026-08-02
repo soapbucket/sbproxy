@@ -12,7 +12,9 @@
 //!
 //! 1. A passing assertion does not change the response.
 //! 2. A failing assertion does not change the response.
-//! 3. Mis-typed CEL fails open and never blocks traffic.
+//! 3. Mis-typed CEL is a config error: the proxy refuses to boot
+//!    rather than serving with the assertion silently disabled
+//!    (WOR-2179).
 
 use sbproxy_e2e::ProxyHarness;
 
@@ -66,18 +68,21 @@ fn failing_assertion_does_not_block_traffic() {
 }
 
 #[test]
-fn malformed_assertion_fails_open_and_proxy_stays_up() {
-    // A garbled CEL expression should not crash the proxy or cause
-    // a 5xx. AssertionPolicy::evaluate fails open on compile error.
+fn malformed_assertion_refuses_to_boot() {
+    // WOR-2179: a garbled CEL expression used to be swallowed at
+    // response time, so the proxy served happily with the assertion
+    // the operator wrote quietly disabled. It is a config error now:
+    // the process refuses to start.
     let yaml = format!(
         "{STATIC_OK}    policies:\n      - type: assertion\n        expression: 'this is not valid CEL @@@'\n        name: garbled\n",
     );
-    let harness = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
-    let resp = harness.get("/", "assert.localhost").expect("send");
-
-    assert_eq!(
-        resp.status, 200,
-        "malformed CEL must fail open; proxy must keep serving traffic"
+    let err = ProxyHarness::start_with_yaml(&yaml)
+        .err()
+        .expect("malformed assertion CEL must not boot");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("assert.localhost") || msg.contains("assertion") || msg.contains("CEL"),
+        "the startup failure must point at the offending policy: {msg}"
     );
 }
 

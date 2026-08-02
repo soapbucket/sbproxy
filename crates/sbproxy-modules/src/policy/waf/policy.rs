@@ -301,7 +301,9 @@ impl WafPolicy {
         }
         if let Some(block_cfg) = policy.persistent_block.clone() {
             if block_cfg.enabled {
-                policy.block_store = Some(Arc::new(PersistentBlockStore::new(block_cfg)));
+                // Compiles the `track_by: cel` key expression, so a
+                // malformed one rejects the config here (WOR-2164).
+                policy.block_store = Some(Arc::new(PersistentBlockStore::new(block_cfg)?));
             }
         }
         Ok(policy)
@@ -322,16 +324,13 @@ impl WafPolicy {
         origin_id: &str,
     ) -> Self {
         if let Some(existing) = self.block_store.take() {
-            // Rebuild the store with the shared backend attached. The
-            // config is the source of truth; the local map is freshly
-            // seeded (a replica restart starts with an empty hot cache and
-            // relies on the shared tier for durable state anyway).
-            if let Some(cfg) = self.persistent_block.clone() {
-                let rebuilt = PersistentBlockStore::new(cfg).with_store(store, origin_id);
-                self.block_store = Some(Arc::new(rebuilt));
-            } else {
-                self.block_store = Some(existing);
-            }
+            // Rebuild the store with the shared backend attached,
+            // reusing the compiled CEL key rather than reparsing it
+            // (WOR-2164). The local map is freshly seeded (a replica
+            // restart starts with an empty hot cache and relies on the
+            // shared tier for durable state anyway).
+            let rebuilt = existing.rebuilt_with_store(store, origin_id);
+            self.block_store = Some(Arc::new(rebuilt));
         }
         self
     }

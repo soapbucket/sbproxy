@@ -4,6 +4,7 @@
 //! contexts. Used for conditional routing, access control, header matching,
 //! and other policy decisions.
 
+pub mod compiled;
 pub mod context;
 pub mod functions;
 
@@ -16,6 +17,7 @@ use cel::objects::Key;
 // --- Re-exports ---
 
 pub use cel::Value as CelRawValue;
+pub use compiled::CompiledCel;
 pub use functions::{set_tls_fingerprint_matcher, TlsFingerprintMatcher};
 
 // --- Types ---
@@ -230,14 +232,22 @@ impl CelEngine {
         Ok(from_cel_value(&result))
     }
 
-    /// Compile and evaluate a CEL expression in one step. Convenience method
-    /// for one-off evaluations where caching the compiled expression is not needed.
+    /// Compile and evaluate a CEL expression in one step.
+    ///
+    /// This parses `source` on **every** call, so it is for genuinely
+    /// one-off source: text that arrived with the request, or a
+    /// throwaway evaluation in a test. Expressions that come from
+    /// static operator config must not go through here on a request or
+    /// response path; compile them once at config load with
+    /// [`compiled::CompiledCel`] instead (WOR-2164).
     pub fn eval_source(&self, source: &str, ctx: &CelContext) -> Result<CelValue> {
         let expr = self.compile(source)?;
         self.eval(&expr, ctx)
     }
 
     /// Compile and evaluate a CEL expression as a boolean in one step.
+    /// Parses on every call; see [`Self::eval_source`] for when that is
+    /// the right thing to do.
     pub fn eval_bool_source(&self, source: &str, ctx: &CelContext) -> Result<bool> {
         let expr = self.compile(source)?;
         self.eval_bool(&expr, ctx)

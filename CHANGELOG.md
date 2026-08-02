@@ -285,6 +285,48 @@ the next version cut.
 
 ### Changed
 
+- **A CEL syntax error is now a config error, everywhere CEL comes from
+  config.** `assertion` policies, `cel` transform bodies and header
+  rules, rate-limit `key:` expressions, WAF `persistent_block.key`, and
+  `engine: cel` custom log fields all compile while the config compiles,
+  the same way `expression` policies already did. A malformed expression
+  refuses the config at boot, and a reload carrying one is rejected with
+  the previously active config still serving. Before, each of these
+  parsed again on every request or response and swallowed the parse
+  error at that point, so a typo booted fine and then silently disabled
+  the thing the operator wrote: an assertion that never ran, a header
+  rule that never fired, a log field that never appeared. **A config
+  with a CEL typo that used to start will now refuse to start.** That is
+  the point, but it is a startup-behavior change, so run `sbproxy
+  validate` against your config before upgrading; it reports the same
+  errors with the owning origin, policy, and field named.
+
+  Turning the check on immediately found two expressions that had never
+  worked, both of them ours. `docs/access-log.md` and
+  `examples/custom-log-fields/sb.yml` both used
+  `has(request.headers["x-tier"])` to test for a header. CEL's `has()`
+  macro takes a field selection, not an index, so that expression has
+  never parsed, and the log field it guarded has never once appeared in
+  an access line. The working form for a hyphenated header name is
+  `"x-tier" in request.headers`, and both pages now use it. Separately,
+  `examples/rate-limiting/sb.yml` wrote `key: ip` as though `key` took a
+  keyword; it is a CEL expression, so `ip` was an undefined identifier
+  that failed every request and dropped the policy into the default
+  bucket, which happens to be keyed by client IP. It looked like it
+  worked because the fallback did. It is now
+  `key: 'connection.remote_ip'`, which is the same partitioning, said in
+  the language the field actually speaks.
+- **A rate-limit `key:` expression that fails to evaluate no longer
+  drops the request into the default bucket.** It buckets under a
+  `__cel_key_error__:` prefix on the default client key instead. The old
+  fallback was a rate-limit bypass: the default key is the client IP, or
+  the hostname when no client IP is known, so a caller that could force
+  the expression to fail left its own identity bucket, and its
+  accumulated count, behind. Rate limiting stays on either way, and
+  error traffic no longer shares a bucket with correctly keyed traffic.
+  An expression that evaluates cleanly to null or an empty string still
+  means "no key for this request" and still falls back to the default
+  client key, because that is the operator's own logic talking.
 - **Outbound HTTP no longer follows a redirect without re-authorizing it,
   and the AI provider client no longer follows one at all.** The AI
   client, the webhook, Langfuse, and Datadog usage sinks, the MCP token

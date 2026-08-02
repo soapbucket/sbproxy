@@ -10,12 +10,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use compact_str::CompactString;
-use sbproxy_platform::messenger::aws_sqs::SqsConfig;
-use sbproxy_platform::messenger::gcp_pubsub::GcpPubSubConfig;
-use sbproxy_platform::messenger::redis::RedisMessengerConfig;
-use sbproxy_platform::messenger::{
-    GcpPubSubMessenger, MemoryMessenger, Messenger, RedisMessenger, SqsMessenger,
-};
 use sbproxy_platform::storage::{
     KVStore, RedisConfig, RedisKVStore, RedisTlsConfig, ValidatedRedisConnection,
 };
@@ -26,47 +20,11 @@ use crate::types::{
     AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig,
     AttestationMeasuredConfig, AttestationOriginHeaderConfig, AttestationQueueConfig,
     AttestationRole, AttestationRouteWeightConfig, ConfigFile, EnforcementMode, FailureMode,
-    L2CacheConfig, L2CacheParams, MessengerSettings, OriginAttestationConfig, RawOriginConfig,
-    WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, MAX_ATTESTATION_QUEUE_ENTRIES,
+    L2CacheConfig, L2CacheParams, OriginAttestationConfig, RawOriginConfig, WebBotAuthConfig,
+    ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, MAX_ATTESTATION_QUEUE_ENTRIES,
 };
 
 const MAX_REDIS_TLS_FILE_BYTES: u64 = 1_048_576;
-
-/// Extract the Redis host:port pair from a DSN like `redis://host:6379/0`.
-///
-/// Accepts either a bare `host:port` form (as used by the raw RESP client)
-/// or a `redis://[user[:pass]@]host:port[/db]` URL. The database index is
-/// ignored since the single-connection RESP client does not issue SELECT.
-fn parse_redis_messenger_addr(dsn: &str) -> Result<String> {
-    let s = dsn.trim();
-    let without_scheme = s
-        .strip_prefix("redis://")
-        .or_else(|| s.strip_prefix("rediss://"))
-        .unwrap_or(s);
-
-    // Drop any auth prefix (`user:pass@`).
-    let without_auth = without_scheme
-        .rsplit_once('@')
-        .map(|(_, h)| h)
-        .unwrap_or(without_scheme);
-
-    // Drop any trailing /db path and query string.
-    let host_port = without_auth
-        .split(['/', '?'])
-        .next()
-        .unwrap_or(without_auth);
-
-    if host_port.is_empty() {
-        anyhow::bail!("redis DSN missing host:port");
-    }
-
-    // If no port specified, default to 6379.
-    if host_port.contains(':') {
-        Ok(host_port.to_string())
-    } else {
-        Ok(format!("{}:6379", host_port))
-    }
-}
 
 fn read_redis_tls_file(path: &str, error: &'static str) -> Result<Vec<u8>> {
     let file = File::open(path).map_err(|_| anyhow::anyhow!(error))?;
@@ -126,102 +84,6 @@ pub fn build_l2_store(cfg: &L2CacheConfig) -> Result<Arc<dyn KVStore>> {
             Ok(Arc::new(RedisKVStore::new(RedisConfig::new(connection))))
         }
         other => anyhow::bail!("unsupported l2_cache driver: '{}'", other),
-    }
-}
-
-// --- Messenger factory ---
-
-/// Default bound on per-subscriber queue depth for the in-process memory
-/// messenger. Chosen to match the admin-endpoint / purge-subscriber fan-out
-/// scale without risking unbounded memory growth if a subscriber stalls.
-const DEFAULT_MEMORY_MESSENGER_CAPACITY: usize = 1024;
-
-/// Build a concrete `Messenger` for the given settings block.
-///
-/// This is the single entry point that maps YAML-level driver strings to
-/// concrete platform-crate messenger implementations. Unknown drivers
-/// produce an `Err` so the caller can decide whether to degrade to no-bus
-/// semantics (the recommended posture: log + continue) or to hard-fail.
-///
-/// Each driver accepts a small set of string parameters under
-/// `messenger_settings.params`:
-///
-/// * `memory`     - no params. (`capacity` is hardcoded to a sane default.)
-/// * `redis`      - `dsn` (default `redis://127.0.0.1:6379`).
-/// * `sqs`        - `queue_url`, `region`, `api_key` (all required).
-/// * `gcp_pubsub` - `project`, `topic`, `subscription`, `access_token` (all required).
-///
-/// # Errors
-///
-/// Returns an error if the `driver` is not one of `memory`, `redis`,
-/// `sqs`, or `gcp_pubsub`, if the `redis` DSN cannot be parsed, or if an
-/// `sqs` or `gcp_pubsub` driver is missing any of its required params.
-pub fn build_messenger(settings: &MessengerSettings) -> Result<Arc<dyn Messenger>> {
-    match settings.driver.as_str() {
-        "memory" => Ok(Arc::new(MemoryMessenger::new(
-            DEFAULT_MEMORY_MESSENGER_CAPACITY,
-        ))),
-        "redis" => {
-            let dsn = settings
-                .params
-                .get("dsn")
-                .cloned()
-                .unwrap_or_else(|| "redis://127.0.0.1:6379".to_string());
-            let addr = parse_redis_messenger_addr(&dsn)
-                .with_context(|| format!("invalid redis messenger DSN '{}'", dsn))?;
-            Ok(Arc::new(RedisMessenger::new(RedisMessengerConfig { addr })))
-        }
-        "sqs" => {
-            let queue_url = settings
-                .params
-                .get("queue_url")
-                .cloned()
-                .context("sqs messenger: missing 'queue_url' param")?;
-            let region = settings
-                .params
-                .get("region")
-                .cloned()
-                .context("sqs messenger: missing 'region' param")?;
-            let api_key = settings
-                .params
-                .get("api_key")
-                .cloned()
-                .context("sqs messenger: missing 'api_key' param")?;
-            Ok(Arc::new(SqsMessenger::new(SqsConfig {
-                queue_url,
-                region,
-                api_key,
-            })))
-        }
-        "gcp_pubsub" => {
-            let project = settings
-                .params
-                .get("project")
-                .cloned()
-                .context("gcp_pubsub messenger: missing 'project' param")?;
-            let topic = settings
-                .params
-                .get("topic")
-                .cloned()
-                .context("gcp_pubsub messenger: missing 'topic' param")?;
-            let subscription = settings
-                .params
-                .get("subscription")
-                .cloned()
-                .context("gcp_pubsub messenger: missing 'subscription' param")?;
-            let access_token = settings
-                .params
-                .get("access_token")
-                .cloned()
-                .context("gcp_pubsub messenger: missing 'access_token' param")?;
-            Ok(Arc::new(GcpPubSubMessenger::new(GcpPubSubConfig {
-                project,
-                topic,
-                subscription,
-                access_token,
-            })))
-        }
-        other => anyhow::bail!("unsupported messenger driver: '{}'", other),
     }
 }
 
@@ -1215,8 +1077,9 @@ fn validate_compression_state_local_path(path: &str) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the YAML fails to parse, if a config mixes the
-/// legacy `features.*` blocks with the canonical `extensions` shape, or
-/// if any origin, L2 cache backend, or messenger fails to compile.
+/// legacy `features.*` blocks with the canonical `extensions` shape, if
+/// any origin or L2 cache backend fails to compile, or if the config
+/// sets `proxy.messenger_settings`, which this build refuses (WOR-2166).
 pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // Interpolate environment variables before parsing YAML.
     let yaml = interpolate_env_vars(yaml);
@@ -1556,14 +1419,30 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         None => None,
     };
 
-    // Instantiate the shared message bus if configured. An invalid driver
-    // here surfaces as a compile-time error so operators see the misconfig
-    // at startup (not only when the bus is first published to). A missing
-    // block is the graceful "no bus" path and simply yields `None`.
-    let messenger = match &config_file.proxy.messenger_settings {
-        Some(cfg) => Some(build_messenger(cfg)?),
-        None => None,
-    };
+    // WOR-2166: refuse the shared message bus. The block used to compile a
+    // memory, Redis, SQS, or GCP Pub/Sub messenger and hang it off the
+    // compiled snapshot, and nothing in the request path, the reload path,
+    // or the admin path ever subscribed to a topic or published on one. An
+    // operator who configured a cluster bus got a valid snapshot and not a
+    // single cross-replica event, for the life of the process. A knob that
+    // parses, validates, and does not govern is a defect, so the config is
+    // rejected instead of accepted into a snapshot where it does nothing.
+    // The bus implementations stay in `sbproxy-platform` for whoever builds
+    // the first consumer; this gate comes out with them.
+    if let Some(settings) = &config_file.proxy.messenger_settings {
+        anyhow::bail!(
+            "config compile: proxy.messenger_settings is set (driver '{}'), but this build has \
+             no runtime consumer for the message bus. Nothing subscribes to a topic and nothing \
+             publishes on one, so the block would validate at boot and then move no events \
+             between replicas for the life of the process. Remove it. Both uses this block was \
+             documented for have a working surface today: config distribution across replicas \
+             is `proxy.config_authority`, where one node publishes a signed bundle and the \
+             others pull and verify it, and cache invalidation is `POST /admin/cache/purge` on \
+             the admin API, which reaches every replica when `proxy.l2_cache` puts the response \
+             cache on a shared Redis tier. See `docs/configuration.md`.",
+            settings.driver,
+        );
+    }
 
     // WOR-805: validate the Web Bot Auth signing identity up front so a
     // malformed seed fails config load rather than silently disabling
@@ -1656,7 +1535,6 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         host_map,
         server: config_file.proxy,
         l2_store,
-        messenger,
         // A pipeline lifecycle extension builds the mesh node when configured,
         // so compilation always yields `None` here.
         mesh: None,
@@ -4994,74 +4872,77 @@ origins:
         assert_eq!(headers.set.get("X-Team").unwrap(), "platform");
     }
 
-    // --- build_messenger tests ---
+    // --- WOR-2166: messenger_settings is rejected, not compiled ---
 
+    /// Every driver the block used to accept is refused, and the error
+    /// explains why rather than just naming the key. The block used to
+    /// build a live bus and attach it to the snapshot; nothing ever
+    /// subscribed or published, so an operator who set this got a valid
+    /// config and zero cross-replica events.
     #[test]
-    fn build_messenger_memory_driver() {
-        // The in-process driver needs no params and must always succeed
-        // so that the single-replica dev experience is never gated on
-        // external dependencies.
-        use crate::types::MessengerSettings;
-        let settings = MessengerSettings {
-            driver: "memory".to_string(),
-            params: std::collections::HashMap::new(),
-        };
-        let bus = build_messenger(&settings).expect("memory messenger must build");
-        // Publish -> subscribe roundtrip proves the Arc is a live instance.
-        let mut sub = bus.subscribe("t").expect("subscribe");
-        bus.publish(&sbproxy_platform::messenger::Message {
-            topic: "t".into(),
-            payload: serde_json::json!({"ok": true}),
-            timestamp: 1,
-        })
-        .expect("publish");
-        drop(bus);
-        let msg = sub.next().expect("message");
-        assert_eq!(msg.payload["ok"], serde_json::json!(true));
+    fn messenger_settings_is_rejected_for_every_driver() {
+        for driver in ["memory", "redis", "sqs", "gcp_pubsub", "invalid_backend"] {
+            let yaml = format!(
+                r#"
+proxy:
+  messenger_settings:
+    driver: {driver}
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+"#
+            );
+            let err = compile_config(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("driver {driver} must be refused"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("proxy.messenger_settings"),
+                "error must name the key: {msg}"
+            );
+            assert!(
+                msg.contains(driver),
+                "error must name the configured driver: {msg}"
+            );
+            assert!(
+                msg.contains("no runtime consumer"),
+                "error must say the bus has no consumer in this build: {msg}"
+            );
+        }
     }
 
+    /// The diagnostic has to leave the operator somewhere to go. Both
+    /// documented uses of the bus have a working surface today, and the
+    /// error names each one.
     #[test]
-    fn build_messenger_redis_driver_uses_default_dsn() {
-        // No DSN supplied should not fail: the redis messenger only opens
-        // its connection lazily, so construction is always cheap.
-        use crate::types::MessengerSettings;
-        let settings = MessengerSettings {
-            driver: "redis".to_string(),
-            params: std::collections::HashMap::new(),
-        };
-        let _bus = build_messenger(&settings).expect("redis messenger must build");
-    }
-
-    #[test]
-    fn build_messenger_unknown_driver_errors() {
-        // Unknown drivers must surface an error so misconfigured YAML is
-        // caught at compile time rather than silently producing a no-op bus.
-        use crate::types::MessengerSettings;
-        let settings = MessengerSettings {
-            driver: "invalid_backend".to_string(),
-            params: std::collections::HashMap::new(),
-        };
-        assert!(build_messenger(&settings).is_err());
-    }
-
-    #[test]
-    fn compile_config_attaches_messenger_when_settings_present() {
-        // End-to-end: `messenger_settings: {driver: memory}` in YAML must
-        // land on `CompiledConfig.messenger` as a live `Arc<dyn Messenger>`.
+    fn messenger_rejection_names_the_surfaces_that_do_work() {
         let yaml = r#"
 proxy:
   messenger_settings:
-    driver: memory
+    driver: redis
+    params:
+      dsn: redis://127.0.0.1:6379
 origins:
   "api.example.com":
     action:
       type: proxy
       url: http://127.0.0.1:18888
 "#;
-        let compiled = compile_config(yaml).expect("compile");
+        let msg = format!(
+            "{:#}",
+            compile_config(yaml)
+                .err()
+                .expect("a configured bus must be refused")
+        );
         assert!(
-            compiled.messenger.is_some(),
-            "messenger must be built from messenger_settings block"
+            msg.contains("proxy.config_authority"),
+            "config distribution has a working surface and the error must name it: {msg}"
+        );
+        assert!(
+            msg.contains("/admin/cache/purge"),
+            "cache invalidation has a working surface and the error must name it: {msg}"
         );
     }
 
@@ -5144,10 +5025,11 @@ origins:
         assert_eq!(ac.entries[0]["expected_keyids"][0], "conformance-key");
     }
 
+    /// The rejection is scoped to configs that actually author the block.
+    /// A config without `messenger_settings` is the overwhelming majority
+    /// and must be untouched by WOR-2166.
     #[test]
-    fn compile_config_no_messenger_when_settings_absent() {
-        // Absent messenger_settings: `CompiledConfig.messenger` stays None
-        // so consumers (e.g. the purge subscriber) cleanly skip spawning.
+    fn a_config_without_messenger_settings_still_compiles() {
         let yaml = r#"
 origins:
   "api.example.com":
@@ -5156,7 +5038,7 @@ origins:
       url: http://127.0.0.1:18888
 "#;
         let compiled = compile_config(yaml).expect("compile");
-        assert!(compiled.messenger.is_none());
+        assert!(compiled.resolve_origin("api.example.com").is_some());
     }
 
     // --- Wave 4 day-4 auto-wire tests (G4.1 + G4.10 + G4.4) ---

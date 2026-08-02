@@ -1,0 +1,53 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "cases": [
+    {
+      "name": "the store is down, degraded admits, and the origin's own auth recognises the token",
+      "request": {
+        "method": "GET",
+        "path": "/",
+        "headers": {
+          "Host": "keys.local",
+          "Authorization": "Bearer sbp_a1b2c3d4e5f60718_9f3c1d2e4b5a6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"served": true}
+        }
+      }
+    },
+    {
+      "name": "degraded is not a blanket admit: an unknown token still fails the origin's auth",
+      "request": {
+        "method": "GET",
+        "path": "/",
+        "headers": {
+          "Host": "keys.local",
+          "Authorization": "Bearer sbp_0f1e2d3c4b5a6978_1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809"
+        }
+      },
+      "expect": {
+        "status": 401
+      }
+    },
+    {
+      "name": "a request with no credential at all is refused by the origin's auth",
+      "request": {
+        "method": "GET",
+        "path": "/",
+        "headers": {
+          "Host": "keys.local"
+        }
+      },
+      "expect": {
+        "status": 401
+      }
+    }
+  ],
+  "audit_check": false
+}

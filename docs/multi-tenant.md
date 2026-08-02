@@ -1,6 +1,6 @@
 # Multi-tenant deployment
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-02*
 
 SBproxy serves multiple tenants from a single binary. Each tenant gets its own configuration scope under `proxy.tenants[]`; origins bind to a tenant via `origin.tenant_id`; request-time resolution walks origin → tenant → proxy with most-specific-wins by name.
 
@@ -29,13 +29,16 @@ Resolution at request time walks origin → tenant → proxy. A block at a more 
 
 A tenant entry carries exactly three fields today: `id`, `credentials`, and `observability`. Policies stay at proxy and origin scope (there is no `tenants[].policies:` block), and secret backends are declared once at proxy scope under `proxy.secrets.backends:` (a per-tenant `vault:` block is a future direction, not a shipped key).
 
+A credential's `key:` is the value an inbound caller presents, and the policy, budget, and attribution attached to it are what that caller then gets. The provider key SBproxy swaps in on the way out is a different field, `providers[].api_key`, and it is the one that takes a `vault://` or `awssm://` reference.
+
 ```yaml
 proxy:
   credentials:
     - name: openai-shared
       type: ai_provider
       provider: openai
-      key: ${OPENAI_PROXY_DEFAULT}
+      key: sk-shared-default
+      attrs: { project: shared-default }
 
   tenants:
     - id: acme-corp
@@ -43,7 +46,7 @@ proxy:
         - name: openai-shared              # same NAME as proxy default, different key
           type: ai_provider
           provider: openai
-          key: vault://primary/secret/data/acme/openai?key=api_key
+          key: sk-acme-shared
           attrs: { project: acme-prod }
 
     - id: beta-corp
@@ -51,7 +54,7 @@ proxy:
         - name: openai-experimental         # NEW credential, only for beta-corp
           type: ai_provider
           provider: openai
-          key: awssm://primary/beta/openai-experimental?key=api_key
+          key: sk-beta-experimental
           attrs: { project: beta-experimental }
 
 origins:
@@ -59,18 +62,24 @@ origins:
     tenant_id: acme-corp
     action:
       type: ai_proxy
+      require_governed_key: true
       providers:
         - name: openai
+          api_key: vault://primary/secret/data/acme/openai?key=api_key
 
   api.beta.example.com:
     tenant_id: beta-corp
     action:
       type: ai_proxy
+      require_governed_key: true
       providers:
         - name: openai
+          api_key: awssm://primary/beta/openai-experimental?key=api_key
 ```
 
-In this config, a request to `api.acme.example.com` resolves `openai-shared` to acme-corp's HashiCorp-backed key; the same name on the proxy default is shadowed. A request to `api.beta.example.com` sees `openai-shared` from the proxy default plus `openai-experimental` from the tenant. The `__default__` tenant (any origin without `tenant_id`) sees only `openai-shared` from the proxy default.
+In this config, a request to `api.acme.example.com` resolves `openai-shared` to acme-corp's copy; the same name on the proxy default is shadowed, so the proxy default's key does not authenticate there at all. A request to `api.beta.example.com` sees `openai-shared` from the proxy default plus `openai-experimental` from the tenant. The `__default__` tenant (any origin without `tenant_id`) sees only `openai-shared` from the proxy default.
+
+`require_governed_key: true` is what makes any of that observable. Without it, a key that resolved at no scope still reaches the provider, with no policy, no budget, and no attribution, and nothing says so.
 
 ## The `__default__` tenant
 
@@ -147,13 +156,80 @@ The recommended sequence:
 4. **Stand up per-tenant sinks.** Declare per-tenant observability sinks under `tenants[].observability.log.sinks:` once the credentials shape is stable. Tenant sinks default to the `external` redaction profile.
 5. **Wire isolation tests.** Add an e2e fixture per tenant that asserts the tenant cannot read another tenant's secrets through any reference shape.
 
+## Run it
+
+The scope walk is invisible from a config listing and obvious from a curl, so [`examples/multi-tenant-saas/`](../examples/multi-tenant-saas/) is the config above with the provider pointed at a local OpenAI-shaped fixture. Every tenant reaches the same upstream, which means anything that differs between them came from the credential scopes.
+
+```bash
+cd examples/multi-tenant-saas
+docker compose up -d --wait
+```
+
+Acme's own copy of `openai-shared` resolves at acme's origin:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/chat/completions -H 'Host: acme.local' \
+  -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-acme-shared' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+```
+
+```
+{"id":"chatcmpl-fixture","object":"chat.completion","created":0,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"fixture response"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}
+```
+
+The proxy default carries the same name, so at acme's origin it is shadowed and its key is not a key:
+
+```bash
+curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H 'Host: acme.local' \
+  -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-shared-default' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+```
+
+```
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+content-length: 40
+Date: Sun, 02 Aug 2026 05:24:23 GMT
+Connection: close
+
+{"error":"governed credential required"}
+```
+
+Beta declared a new name instead, which adds rather than shadows, so both keys resolve at beta's origin. And `shared.local`, which declares no `tenant_id`, resolves to `__default__` and refuses beta's tenant-scoped key:
+
+```bash
+curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H 'Host: shared.local' \
+  -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-beta-experimental' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+```
+
+```
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+content-length: 40
+Date: Sun, 02 Aug 2026 05:24:23 GMT
+Connection: close
+
+{"error":"governed credential required"}
+```
+
+Each served request is filed under the tenant that served it, which is what makes per-tenant spend reporting possible:
+
+```
+sbproxy_ai_requests_attributed_total{api_key_id="",model="",origin="acme.local",outcome="auth_denied",provider="",surface="chat_completions",tenant_id="acme-corp"} 1
+sbproxy_ai_requests_attributed_total{api_key_id="",model="",origin="shared.local",outcome="auth_denied",provider="",surface="chat_completions",tenant_id="__default__"} 1
+sbproxy_ai_requests_attributed_total{api_key_id="cfg:9:acme-corp:10:acme.local:openai-shared",model="gpt-4o-mini",origin="acme.local",outcome="ok",provider="openai",surface="chat_completions",tenant_id="acme-corp"} 1
+```
+
+`docker compose down -v` tears it down.
+
 ## Worked examples
 
 The repository ships three worked examples covering the common shapes:
 
+* `examples/multi-tenant-saas/`: the config above, runnable, with the three scopes asserted against a local fixture.
 * `examples/ai-virtual-keys/`: single-tenant credentials block with two team-scoped keys.
 * `examples/vault-reference/`: multi-tenant provider references across HashiCorp, AWS, GCP, Kubernetes, file, and static-map backends.
-* `examples/multi-tenant-saas/` (planned): full SaaS deployment with per-tenant vaults, credentials, observability sinks, and isolation tests.
 
 ## Related reading
 

@@ -46,12 +46,6 @@ l2_cache_settings:
   params:
     dsn: redis://redis:6379/0
 
-# Messenger for pub/sub config reloads and event delivery (also uses Redis).
-messenger_settings:
-  driver: redis
-  params:
-    addr: redis:6379
-
 origins:
   # Example origin: proxies httpbin.org and applies a Redis-backed rate limit.
   # Test with: curl -H "Host: demo.localhost" http://localhost:8080/get

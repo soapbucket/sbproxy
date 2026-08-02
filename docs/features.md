@@ -2092,7 +2092,7 @@ base64_decode, url_encode, and url_decode are the other modes ([config](../examp
 
 ### Proxy-level extras
 
-`l2_cache` (alias `l2_cache_settings`) and `messenger_settings` configure the shared backend for multi-replica deployments. `l2_cache` keeps rate-limit counters and response-cache entries cluster-wide; `messenger_settings` carries config-update and semantic-cache events between replicas:
+`l2_cache` (alias `l2_cache_settings`) configures the shared backend for multi-replica deployments. It keeps rate-limit counters and response-cache entries cluster-wide, so every replica reads and writes one set of counters and one set of cached responses:
 
 ```yaml
 proxy:
@@ -2100,13 +2100,11 @@ proxy:
     driver: redis
     params:
       dsn: redis://cache.internal:6379/0
-  messenger_settings:
-    driver: redis
-    params:
-      dsn: redis://cache.internal:6379/0
 ```
 
-Both are required when running more than one proxy replica behind a load balancer.
+Set it when running more than one proxy replica behind a load balancer.
+
+There is no message bus. `proxy.messenger_settings` parsed for several releases without ever being connected to a publisher or a subscriber, and is now refused at config load. Distribute configuration across replicas with `proxy.config_authority` and invalidate shared cache entries with `POST /admin/cache/purge`. See [configuration.md](configuration.md#messenger_settings).
 
 ---
 

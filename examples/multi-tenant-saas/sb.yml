@@ -1,0 +1,168 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Multi-tenant SaaS: three credential scopes, resolved per request.
+#
+# One binary, three tenants, one shared upstream. Credentials are
+# declared at three scopes and resolution walks origin -> tenant ->
+# proxy, most-specific-wins by name. That rule is invisible from a
+# config listing and obvious from a curl, so this config makes each half
+# of it reachable:
+#
+#   proxy.credentials         `openai-shared`       sk-shared-default
+#   tenants[acme-corp]        `openai-shared`       sk-acme-shared
+#                             (same NAME, so it shadows the proxy
+#                              default for acme's origins only)
+#   tenants[beta-corp]        `openai-experimental` sk-beta-experimental
+#                             (a NEW name, so beta sees both it and the
+#                              proxy default)
+#
+# `require_governed_key: true` on each origin is what makes the
+# resolution observable: a key that did not resolve at that origin's
+# scope is refused instead of dispatching ungoverned.
+#
+# The provider points at the example's own OpenAI-shaped fixture, so
+# every tenant reaches the same upstream and anything that differs
+# between them came from the config.
+#
+# Run:
+#   python3 examples/multi-tenant-saas/fixture.py &
+#   make run CONFIG=examples/multi-tenant-saas/sb.yml
+#
+# Test:
+#   # 200 - acme's own copy of `openai-shared`.
+#   curl -sS http://127.0.0.1:8080/v1/chat/completions -H 'Host: acme.local' \
+#     -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-acme-shared' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+#
+#   # 401 - the proxy default is shadowed for acme, so this key does not
+#   # exist at this origin.
+#   curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H 'Host: acme.local' \
+#     -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-shared-default' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+#
+#   # 200 - beta added a credential rather than shadowing one, so the
+#   # proxy default still resolves here.
+#   curl -sS http://127.0.0.1:8080/v1/chat/completions -H 'Host: beta.local' \
+#     -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-shared-default' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+#
+#   # 401 - a tenant-scoped credential does not leak to the __default__
+#   # tenant.
+#   curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H 'Host: shared.local' \
+#     -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-beta-experimental' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+
+# sbproxy-docs:begin
+proxy:
+  http_bind_port: 8080
+
+  # --- Scope 1: operator defaults, shared by every tenant ------------
+  credentials:
+    - name: openai-shared
+      type: ai_provider
+      provider: openai
+      # The inbound key a caller presents. Demo placeholder; in
+      # production this is a minted value and the upstream provider key
+      # lives on the provider block, never here.
+      key: sk-shared-default
+      attrs:
+        project: shared-default
+        tags: [shared]
+      models:
+        allow: [gpt-4o-mini]
+
+  tenants:
+    # --- Scope 2a: same NAME as the proxy default, so it shadows -----
+    - id: acme-corp
+      credentials:
+        - name: openai-shared
+          type: ai_provider
+          provider: openai
+          key: sk-acme-shared
+          attrs:
+            project: acme-prod
+            tags: [acme]
+          models:
+            allow: [gpt-4o-mini]
+      observability:
+        cardinality:
+          # Cap unique label values per metric label for this tenant, so
+          # a noisy tenant cannot demote every other tenant's labels.
+          max_series: 5000
+
+    # --- Scope 2b: a NEW name, so it adds rather than replaces -------
+    - id: beta-corp
+      credentials:
+        - name: openai-experimental
+          type: ai_provider
+          provider: openai
+          key: sk-beta-experimental
+          attrs:
+            project: beta-experimental
+            tags: [beta]
+          models:
+            # Beta's experimental credential is allowed the larger
+            # model; the shared default that beta also sees is not.
+            allow: [gpt-4o-mini, gpt-4o]
+      observability:
+        cardinality:
+          max_series: 1000
+
+origins:
+  "acme.local":
+    tenant_id: acme-corp
+    action:
+      type: ai_proxy
+
+      # Refuse rather than dispatch ungoverned. Without this a key that
+      # resolved at no scope would still reach the provider, silently,
+      # with no policy, budget, or attribution.
+      require_governed_key: true
+
+      providers:
+        - name: openai
+          provider_type: openai
+          # The fixture ignores this; the field exists because
+          # OpenAI-shaped provider configuration carries one. A real
+          # deployment puts ${OPENAI_API_KEY} here, and this is the only
+          # place an upstream provider key belongs.
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18080/v1
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+            - gpt-4o
+
+  "beta.local":
+    tenant_id: beta-corp
+    action:
+      type: ai_proxy
+      require_governed_key: true
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18080/v1
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+            - gpt-4o
+
+  # No tenant_id, so this origin resolves to the synthetic `__default__`
+  # tenant and sees the proxy-scope defaults and nothing else.
+  "shared.local":
+    action:
+      type: ai_proxy
+      require_governed_key: true
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18080/v1
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+            - gpt-4o
+# sbproxy-docs:end

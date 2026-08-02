@@ -1,0 +1,92 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "cases": [
+    {
+      "name": "gpu-aware picks the lowest valid utilization",
+      "request": {
+        "method": "GET",
+        "path": "/infer",
+        "headers": {"Host": "gpu.local"}
+      },
+      "expect": {
+        "status": 200,
+        "body": {"type": "jsonShape", "shape": {"target": "replica-b"}}
+      }
+    },
+    {
+      "name": "gpu-aware keeps picking it, because the signal has not moved",
+      "request": {
+        "method": "GET",
+        "path": "/infer",
+        "headers": {"Host": "gpu.local"}
+      },
+      "expect": {
+        "status": 200,
+        "body": {"type": "jsonShape", "shape": {"target": "replica-b"}}
+      }
+    },
+    {
+      "name": "an out-of-range utilization is ignored, so the round-robin fallback runs",
+      "request": {
+        "method": "GET",
+        "path": "/infer",
+        "headers": {"Host": "percent.local"}
+      },
+      "expect": {
+        "status": 200,
+        "body": {"type": "jsonShape", "shape": {"target": "replica-a"}}
+      }
+    },
+    {
+      "name": "the fallback advances to the next healthy target",
+      "request": {
+        "method": "GET",
+        "path": "/infer",
+        "headers": {"Host": "percent.local"}
+      },
+      "expect": {
+        "status": 200,
+        "body": {"type": "jsonShape", "shape": {"target": "replica-b"}}
+      }
+    },
+    {
+      "name": "lora-aware prefers the replica that advertises the requested adapter",
+      "request": {
+        "method": "GET",
+        "path": "/infer",
+        "headers": {"Host": "lora.local", "X-LoRA-Adapter": "alice-tone"}
+      },
+      "expect": {
+        "status": 200,
+        "body": {"type": "jsonShape", "shape": {"target": "replica-a"}}
+      }
+    },
+    {
+      "name": "a different adapter selects the other replica",
+      "request": {
+        "method": "GET",
+        "path": "/infer",
+        "headers": {"Host": "lora.local", "X-LoRA-Adapter": "carol-voice"}
+      },
+      "expect": {
+        "status": 200,
+        "body": {"type": "jsonShape", "shape": {"target": "replica-b"}}
+      }
+    },
+    {
+      "name": "an adapter nobody advertises defers to the configured algorithm",
+      "request": {
+        "method": "GET",
+        "path": "/infer",
+        "headers": {"Host": "lora.local", "X-LoRA-Adapter": "nobody-has-this"}
+      },
+      "expect": {
+        "status": 200,
+        "body": {"type": "jsonShape", "shape": {"path": "/infer"}}
+      }
+    }
+  ],
+  "audit_check": false
+}
