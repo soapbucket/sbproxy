@@ -13,11 +13,6 @@
 //! the lifecycle check warns once per distributed backend instead of
 //! staying quiet about it.
 //!
-//! [`crate::two_tier`] holds an older prompt-cache implementation that
-//! nothing in this workspace constructs. It stores no entries in any
-//! build, so it is not an at-rest surface today whatever else is decided
-//! about it.
-//!
 //! Encrypting a memory-only cache is not the answer. An attacker who can
 //! read process heap can read the derived key out of the same heap, so
 //! it buys close to nothing and adds a key-management surface. What is
