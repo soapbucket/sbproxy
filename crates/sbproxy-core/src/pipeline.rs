@@ -1591,6 +1591,12 @@ impl CompiledPipeline {
                             return Some(Err(anyhow::anyhow!("invalid transform config: {}", e)))
                         }
                     };
+                    // Validated before the disabled check on purpose: a
+                    // failure axis that says two things at once is a config
+                    // error even on a transform that is currently off.
+                    if let Err(e) = wrapper.validate_failure_posture() {
+                        return Some(Err(e));
+                    }
                     if wrapper.disabled {
                         return None;
                     }
@@ -1601,7 +1607,7 @@ impl CompiledPipeline {
                     Some(Ok(CompiledTransform {
                         transform,
                         content_types: wrapper.content_types,
-                        fail_on_error: wrapper.fail_on_error,
+                        failure_posture: wrapper.failure_posture(),
                         max_body_size: wrapper.max_body_size,
                     }))
                 })
@@ -2893,7 +2899,10 @@ mod tests {
         assert_eq!(pipeline.transforms[0][0].transform.transform_type(), "json");
         assert_eq!(pipeline.transforms[0][1].transform.transform_type(), "noop");
         // Default metadata values.
-        assert!(!pipeline.transforms[0][0].fail_on_error);
+        assert_eq!(
+            pipeline.transforms[0][0].failure_posture,
+            sbproxy_config::types::FailureMode::Open
+        );
         assert_eq!(pipeline.transforms[0][0].max_body_size, 10 * 1024 * 1024);
         assert!(pipeline.transforms[0][0].content_types.is_empty());
     }
@@ -2914,8 +2923,67 @@ mod tests {
         assert_eq!(pipeline.transforms[0].len(), 2);
         assert_eq!(pipeline.transforms[0][0].transform.transform_type(), "json");
         assert_eq!(pipeline.transforms[0][1].transform.transform_type(), "json");
-        assert!(pipeline.transforms[0][1].fail_on_error);
+        // The legacy `fail_on_error: true` wire spelling resolves to closed.
+        assert_eq!(
+            pipeline.transforms[0][1].failure_posture,
+            sbproxy_config::types::FailureMode::Closed
+        );
         assert_eq!(pipeline.transforms[0][1].max_body_size, 512);
+    }
+
+    #[test]
+    fn pipeline_transform_failure_posture_wire_key_resolves() {
+        let config = make_config_with_transforms(
+            "t.example.com",
+            serde_json::json!({"type": "noop"}),
+            vec![
+                serde_json::json!({"type": "json", "set": {"a": 1}, "failure_posture": "closed"}),
+            ],
+        );
+        let pipeline = CompiledPipeline::from_config(config).unwrap();
+        assert_eq!(
+            pipeline.transforms[0][0].failure_posture,
+            sbproxy_config::types::FailureMode::Closed
+        );
+    }
+
+    #[test]
+    fn pipeline_transform_conflicting_failure_spellings_error() {
+        let config = make_config_with_transforms(
+            "t.example.com",
+            serde_json::json!({"type": "noop"}),
+            vec![serde_json::json!({
+                "type": "json",
+                "set": {"a": 1},
+                "fail_on_error": true,
+                "failure_posture": "open",
+            })],
+        );
+        let err = CompiledPipeline::from_config(config)
+            .expect_err("disagreeing spellings must fail config load")
+            .to_string();
+        assert!(err.contains("fail_on_error"), "{err}");
+        assert!(err.contains("failure_posture"), "{err}");
+    }
+
+    #[test]
+    fn pipeline_transform_observe_posture_errors_even_when_disabled() {
+        // Rejecting before the disabled check keeps a nonsense axis from
+        // hiding inside a switched-off transform.
+        let config = make_config_with_transforms(
+            "t.example.com",
+            serde_json::json!({"type": "noop"}),
+            vec![serde_json::json!({
+                "type": "json",
+                "set": {"a": 1},
+                "disabled": true,
+                "failure_posture": "observe",
+            })],
+        );
+        let err = CompiledPipeline::from_config(config)
+            .expect_err("observe must fail config load")
+            .to_string();
+        assert!(err.contains("observe"), "{err}");
     }
 
     #[test]

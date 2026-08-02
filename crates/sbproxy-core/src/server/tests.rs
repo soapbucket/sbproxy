@@ -2461,7 +2461,7 @@ fn compiled_html_to_markdown() -> sbproxy_modules::CompiledTransform {
     sbproxy_modules::CompiledTransform {
         transform: sbproxy_modules::Transform::HtmlToMarkdown(inner),
         content_types: vec![],
-        fail_on_error: false,
+        failure_posture: sbproxy_config::types::FailureMode::Open,
         max_body_size: 10 * 1024 * 1024,
     }
 }
@@ -2472,7 +2472,7 @@ fn compiled_boilerplate() -> sbproxy_modules::CompiledTransform {
             sbproxy_modules::BoilerplateTransform::default(),
         ),
         content_types: vec![],
-        fail_on_error: false,
+        failure_posture: sbproxy_config::types::FailureMode::Open,
         max_body_size: 10 * 1024 * 1024,
     }
 }
@@ -2555,7 +2555,7 @@ fn compiled_json_envelope() -> sbproxy_modules::CompiledTransform {
             sbproxy_modules::JsonEnvelopeTransform::default(),
         ),
         content_types: vec![],
-        fail_on_error: false,
+        failure_posture: sbproxy_config::types::FailureMode::Open,
         max_body_size: 10 * 1024 * 1024,
     }
 }
@@ -2608,7 +2608,7 @@ fn compiled_citation_block() -> sbproxy_modules::CompiledTransform {
             sbproxy_modules::CitationBlockTransform::default(),
         ),
         content_types: vec![],
-        fail_on_error: false,
+        failure_posture: sbproxy_config::types::FailureMode::Open,
         max_body_size: 10 * 1024 * 1024,
     }
 }

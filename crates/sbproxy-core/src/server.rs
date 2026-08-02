@@ -483,7 +483,7 @@ fn apply_transform_with_ctx(
             // WOR-168: `evaluate_headers` now returns
             // `TransformError::InvariantViolated` instead of panicking
             // when the inner Remove arm is reached. Propagate as
-            // `anyhow::Error` so the body-buffer pipeline's `fail_on_error`
+            // `anyhow::Error` so the body-buffer pipeline's typed-error
             // path takes over and synthesises a 500 with attribution.
             match t.evaluate_headers_with_request(
                 body.as_ref(),

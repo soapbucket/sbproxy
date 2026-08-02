@@ -44,6 +44,7 @@ pub use text::{
 };
 
 use bytes::{BufMut, BytesMut};
+use sbproxy_config::types::FailureMode;
 use sbproxy_plugin::{TransformContext, TransformHandler};
 use serde::Deserialize;
 
@@ -418,9 +419,40 @@ pub struct TransformConfig {
     /// Only apply to these content types (empty = all).
     #[serde(default)]
     pub content_types: Vec<String>,
-    /// If true, an error in this transform fails the entire response.
+    /// Legacy failure knob: if true, an error in this transform fails the
+    /// entire response.
+    ///
+    /// Superseded by `failure_posture`, which spells the same decision
+    /// with a word instead of a boolean: `fail_on_error: true` is
+    /// `failure_posture: closed` and `fail_on_error: false` (or an
+    /// omitted key) is `failure_posture: open`. Still parsed, and still
+    /// the value used when `failure_posture` is absent, so existing
+    /// configs are unaffected. Setting both keys to values that disagree
+    /// is a config-load error.
+    ///
+    /// Read through [`Self::failure_posture()`], never directly.
     #[serde(default)]
-    pub fail_on_error: bool,
+    pub fail_on_error: Option<bool>,
+    /// What the pipeline does with the response when this transform
+    /// fails.
+    ///
+    /// - `closed` (what `fail_on_error: true` resolves to): replace the
+    ///   body with a generic error instead of forwarding bytes the
+    ///   transform could not produce.
+    /// - `open` (the default, and what `fail_on_error: false` resolves
+    ///   to): skip the failed transform and continue with the next one.
+    /// - `degraded` is rejected at config load: admitting the response
+    ///   while marking the transform guarantee as waived has no defined
+    ///   semantics here yet.
+    /// - `observe` is rejected at config load: a transform that failed
+    ///   produced no transformed body whose effect could be
+    ///   shadow-recorded.
+    ///
+    /// This is the failure axis only. What happens to a body larger
+    /// than `max_body_size` (the transform is skipped) is a separate
+    /// axis and is not governed by this key.
+    #[serde(default)]
+    pub failure_posture: Option<FailureMode>,
     /// Max body size to buffer for this transform (default 10MB).
     #[serde(default = "default_max_body")]
     pub max_body_size: usize,
@@ -432,6 +464,65 @@ pub struct TransformConfig {
     pub config: serde_json::Value,
 }
 
+impl TransformConfig {
+    /// Effective failure posture for this transform.
+    ///
+    /// The explicit `failure_posture` key wins. When it is absent the
+    /// legacy [`Self::fail_on_error`] boolean is converted, so a config
+    /// written before the key existed keeps its exact behaviour:
+    /// `fail_on_error: true` is [`FailureMode::Closed`] and the default
+    /// `false` is [`FailureMode::Open`].
+    ///
+    /// This is the only supported read path. Do not branch on
+    /// `fail_on_error` directly; the polarity conversion belongs in one
+    /// place.
+    pub fn failure_posture(&self) -> FailureMode {
+        self.failure_posture
+            .unwrap_or_else(|| FailureMode::from_fail_closed(self.fail_on_error.unwrap_or(false)))
+    }
+
+    /// Reject a failure axis that says two things at once, or that says
+    /// something meaningless for this site.
+    pub fn validate_failure_posture(&self) -> anyhow::Result<()> {
+        let Some(posture) = self.failure_posture else {
+            return Ok(());
+        };
+        if posture == FailureMode::Observe {
+            anyhow::bail!(
+                "transform {}: `failure_posture: observe` is not meaningful here. \
+                 This posture applies when the transform could not run, so there is \
+                 no transformed body whose effect could be shadow-recorded. Use \
+                 `open` to skip the failed transform or `closed` to fail the \
+                 response.",
+                self.transform_type
+            );
+        }
+        if posture == FailureMode::Degraded {
+            anyhow::bail!(
+                "transform {}: `failure_posture: degraded` is not supported here. \
+                 Admitting the response while marking the transform guarantee as \
+                 waived has no defined semantics for this site yet. Use `open` to \
+                 skip the failed transform or `closed` to fail the response.",
+                self.transform_type
+            );
+        }
+        if let Some(fail_on_error) = self.fail_on_error {
+            let legacy = FailureMode::from_fail_closed(fail_on_error);
+            if legacy != posture {
+                anyhow::bail!(
+                    "transform {}: fail_on_error: {fail_on_error} and failure_posture: \
+                     {} disagree; fail_on_error: {fail_on_error} means failure_posture: \
+                     {}. Remove fail_on_error and keep failure_posture",
+                    self.transform_type,
+                    posture.as_label(),
+                    legacy.as_label()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 // --- CompiledTransform (pipeline entry) ---
 
 /// A compiled transform with its pipeline metadata.
@@ -441,8 +532,12 @@ pub struct CompiledTransform {
     pub transform: Transform,
     /// Content-Type substrings this transform applies to (empty matches all).
     pub content_types: Vec<String>,
-    /// When true, transform errors abort the request instead of being skipped.
-    pub fail_on_error: bool,
+    /// What the pipeline does with the response when this transform
+    /// fails. Resolved once at config load from the explicit
+    /// `failure_posture` key or the legacy `fail_on_error` boolean
+    /// ([`TransformConfig::failure_posture`]). Only [`FailureMode::Closed`]
+    /// and [`FailureMode::Open`] survive validation.
+    pub failure_posture: FailureMode,
     /// Maximum body size, in bytes, before the transform is skipped.
     pub max_body_size: usize,
 }
@@ -815,7 +910,8 @@ mod tests {
         let cfg: TransformConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.transform_type, "json");
         assert!(cfg.content_types.is_empty());
-        assert!(!cfg.fail_on_error);
+        assert_eq!(cfg.fail_on_error, None);
+        assert_eq!(cfg.failure_posture(), FailureMode::Open);
         assert_eq!(cfg.max_body_size, 10 * 1024 * 1024);
         assert!(!cfg.disabled);
     }
@@ -833,9 +929,111 @@ mod tests {
         let cfg: TransformConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.transform_type, "json_projection");
         assert_eq!(cfg.content_types, vec!["application/json"]);
-        assert!(cfg.fail_on_error);
+        assert_eq!(cfg.fail_on_error, Some(true));
+        assert_eq!(cfg.failure_posture(), FailureMode::Closed);
         assert_eq!(cfg.max_body_size, 1024);
         assert!(cfg.disabled);
+    }
+
+    // --- failure_posture (WOR-2183) ---
+
+    fn transform_config(value: serde_json::Value) -> TransformConfig {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn legacy_fail_on_error_still_selects_the_posture() {
+        // An absent key, an explicit false, and an explicit true keep the
+        // exact meanings they had before `failure_posture` existed.
+        for (config, expected) in [
+            (serde_json::json!({"type": "json"}), FailureMode::Open),
+            (
+                serde_json::json!({"type": "json", "fail_on_error": false}),
+                FailureMode::Open,
+            ),
+            (
+                serde_json::json!({"type": "json", "fail_on_error": true}),
+                FailureMode::Closed,
+            ),
+        ] {
+            let cfg = transform_config(config.clone());
+            assert_eq!(cfg.failure_posture(), expected, "{config}");
+            cfg.validate_failure_posture().expect("legacy-only is valid");
+        }
+    }
+
+    #[test]
+    fn explicit_failure_posture_wins_over_the_legacy_default() {
+        let cfg = transform_config(serde_json::json!({
+            "type": "json",
+            "failure_posture": "closed",
+        }));
+        assert_eq!(cfg.failure_posture(), FailureMode::Closed);
+        cfg.validate_failure_posture()
+            .expect("posture alone is valid");
+    }
+
+    #[test]
+    fn agreeing_fail_on_error_and_failure_posture_parse() {
+        for (fail_on_error, posture, expected) in [
+            (true, "closed", FailureMode::Closed),
+            (false, "open", FailureMode::Open),
+        ] {
+            let cfg = transform_config(serde_json::json!({
+                "type": "json",
+                "fail_on_error": fail_on_error,
+                "failure_posture": posture,
+            }));
+            cfg.validate_failure_posture()
+                .expect("a redundant but consistent pair stays valid");
+            assert_eq!(cfg.failure_posture(), expected);
+        }
+    }
+
+    #[test]
+    fn conflicting_fail_on_error_and_failure_posture_is_a_config_error() {
+        for (fail_on_error, posture) in [(true, "open"), (false, "closed")] {
+            let cfg = transform_config(serde_json::json!({
+                "type": "json",
+                "fail_on_error": fail_on_error,
+                "failure_posture": posture,
+            }));
+            let msg = cfg
+                .validate_failure_posture()
+                .expect_err("disagreeing spellings must fail at config load")
+                .to_string();
+            assert!(msg.contains("fail_on_error"), "{msg}");
+            assert!(msg.contains("failure_posture"), "{msg}");
+            assert!(msg.contains("json"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn observe_failure_posture_is_rejected_for_transforms() {
+        let msg = transform_config(serde_json::json!({
+            "type": "template",
+            "failure_posture": "observe",
+        }))
+        .validate_failure_posture()
+        .expect_err("observe must not validate")
+        .to_string();
+        assert!(msg.contains("observe"), "{msg}");
+        assert!(msg.contains("template"), "{msg}");
+    }
+
+    #[test]
+    fn degraded_failure_posture_is_rejected_for_transforms() {
+        // The degraded semantics for this site are undecided; until they
+        // are, the word must not parse here.
+        let msg = transform_config(serde_json::json!({
+            "type": "template",
+            "failure_posture": "degraded",
+        }))
+        .validate_failure_posture()
+        .expect_err("degraded must not validate")
+        .to_string();
+        assert!(msg.contains("degraded"), "{msg}");
+        assert!(msg.contains("not supported"), "{msg}");
     }
 
     // --- CompiledTransform content-type matching ---
@@ -845,7 +1043,7 @@ mod tests {
         let ct = CompiledTransform {
             transform: Transform::Noop,
             content_types: vec![],
-            fail_on_error: false,
+            failure_posture: FailureMode::Open,
             max_body_size: 1024,
         };
         assert!(ct.matches_content_type(Some("text/html")));
@@ -858,7 +1056,7 @@ mod tests {
         let ct = CompiledTransform {
             transform: Transform::Noop,
             content_types: vec!["application/json".into()],
-            fail_on_error: false,
+            failure_posture: FailureMode::Open,
             max_body_size: 1024,
         };
         assert!(ct.matches_content_type(Some("application/json")));
@@ -878,7 +1076,7 @@ mod tests {
                 rename: Default::default(),
             }),
             content_types: vec!["application/json".into()],
-            fail_on_error: false,
+            failure_posture: FailureMode::Open,
             max_body_size: 1024,
         };
         let mut body = BytesMut::from(&b"{\"a\":1}"[..]);

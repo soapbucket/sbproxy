@@ -42,7 +42,7 @@ origins:
         # Hard ceiling on wall-clock execution per request. Modules
         # that exceed this are aborted with an epoch-interruption
         # trap; the response falls back to the unmodified upstream
-        # body via the standard transform fail_on_error path.
+        # body via the transform's failure_posture (default open).
         timeout_ms: 500
         # 64 KiB per page. 256 = 16 MiB, plenty for most text
         # transforms. Raise for transforms that read large bodies.

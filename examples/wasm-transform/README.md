@@ -36,8 +36,8 @@ hello from sbproxy
 
 ```bash
 # A runaway module is aborted at 500ms by the epoch-interruption trap.
-# When fail_on_error is in effect, the response falls back to the unmodified
-# upstream body via the standard transform error path.
+# Under the default failure_posture: open, the response falls back to the
+# unmodified upstream body via the standard transform error path.
 ```
 
 ## What this exercises

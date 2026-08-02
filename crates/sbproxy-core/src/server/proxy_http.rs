@@ -9,6 +9,7 @@
 use super::*;
 use crate::context::{LoadBalancerActionKey, LoadBalancerAttemptToken};
 use anyhow::Context as _;
+use sbproxy_config::types::FailureMode;
 
 fn active_action<'a>(pipeline: &'a CompiledPipeline, ctx: &RequestContext) -> Option<&'a Action> {
     let origin_idx = ctx.origin_idx?;
@@ -5053,8 +5054,8 @@ impl ProxyHttp for SbProxy {
                             // WOR-168: a `TransformError::InvariantViolated`
                             // or `TransformError::Plugin` is a code-level
                             // bug or a misbehaving plugin; both must
-                            // surface as a 500 regardless of
-                            // `fail_on_error`. The transform name flows
+                            // surface as a 500 regardless of the
+                            // configured failure posture. The transform name flows
                             // onto the response as
                             // `x-sbproxy-transform-error` so the caller
                             // and operator can correlate.
@@ -5075,25 +5076,51 @@ impl ProxyHttp for SbProxy {
                                 buf.extend_from_slice(b"{\"error\":\"internal server error\"}");
                                 break;
                             }
-                            if compiled_transform.fail_on_error {
-                                warn!(
-                                    hostname = %ctx.hostname,
-                                    transform = transform_name,
-                                    error = %e,
-                                    "transform failed (fail_on_error=true), sending error"
-                                );
-                                // Replace body with generic error. Internal details are
-                                // logged above but never sent to the client.
-                                buf.clear();
-                                buf.extend_from_slice(b"{\"error\":\"internal server error\"}");
-                                break;
+                            // Read the resolved posture off the compiled
+                            // transform, never the legacy `fail_on_error`
+                            // wire boolean: the conversion happened once at
+                            // config load ([`TransformConfig::failure_posture`]).
+                            let posture = compiled_transform.failure_posture;
+                            match posture {
+                                FailureMode::Closed => {
+                                    warn!(
+                                        hostname = %ctx.hostname,
+                                        transform = transform_name,
+                                        error = %e,
+                                        failure_posture = posture.as_label(),
+                                        "transform failed; response failed by failure_posture"
+                                    );
+                                    // Replace body with generic error. Internal details are
+                                    // logged above but never sent to the client.
+                                    buf.clear();
+                                    buf.extend_from_slice(b"{\"error\":\"internal server error\"}");
+                                    break;
+                                }
+                                FailureMode::Open => {
+                                    warn!(
+                                        hostname = %ctx.hostname,
+                                        transform = transform_name,
+                                        error = %e,
+                                        "transform failed, continuing with next transform"
+                                    );
+                                }
+                                // Both are rejected at config load
+                                // (`TransformConfig::validate_failure_posture`),
+                                // so these arms are unreachable from a loaded
+                                // config. Kept explicit (no wildcard) so
+                                // defining degraded semantics here forces a
+                                // decision rather than inheriting one; until
+                                // then, honour their admitting nature.
+                                FailureMode::Degraded | FailureMode::Observe => {
+                                    warn!(
+                                        hostname = %ctx.hostname,
+                                        transform = transform_name,
+                                        error = %e,
+                                        failure_posture = posture.as_label(),
+                                        "transform failed; posture admits, continuing"
+                                    );
+                                }
                             }
-                            warn!(
-                                hostname = %ctx.hostname,
-                                transform = transform_name,
-                                error = %e,
-                                "transform failed, continuing with next transform"
-                            );
                         }
                     }
                 }
