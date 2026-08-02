@@ -21,11 +21,20 @@
 //! This module is the producer. It is the only place in the request path
 //! that calls `sbproxy_billing::store::SettlementStore::enqueue_usage_event`.
 //!
-//! Every reference to the billing crate in this file's documentation is a
-//! plain code span rather than an intra-doc link, on purpose. `payments` is
-//! not a default feature, and the docs lane builds with default features, so
-//! a link to a feature-gated item resolves on a `payments` build and fails
-//! the gate on every other one.
+//! Names in this file's documentation are plain code spans rather than
+//! intra-doc links, on purpose, for two separate reasons.
+//!
+//! For anything in the billing crate: `payments` is not a default feature,
+//! and the docs lane builds with default features, so a link to a
+//! feature-gated item resolves on a `payments` build and fails the gate on
+//! every other one.
+//!
+//! For anything in this module: it is `pub mod` only because `McpToolCall`
+//! types a `pub` field on `RequestContext`, while everything else here is
+//! `pub(crate)`. rustdoc documents the module, cannot see the `pub(crate)`
+//! items, and refuses a link to them under `-D warnings`. Widening an item
+//! to `pub` so a doc link resolves would be letting the documentation
+//! decide the API surface.
 //!
 //! # Why the bridge lives here rather than in the meter
 //!
@@ -47,13 +56,13 @@
 //!
 //! # The identifier is the whole correctness story
 //!
-//! [`usage_identifier`] derives the provider deduplication key. Getting it
+//! `usage_identifier` derives the provider deduplication key. Getting it
 //! wrong has exactly two outcomes and both are bad: an identifier that
 //! collides drops a charge, and one that varies between two reports of the
 //! same unit charges the customer twice. So it is derived from the claim,
 //! the reporter, the resource, and the unit, by a pure function over
 //! length-framed inputs, with no clock, no counter, and no randomness in it.
-//! Read [`usage_identifier`]'s own documentation before changing anything
+//! Read `usage_identifier`'s own documentation before changing anything
 //! about it.
 //!
 //! # Doing nothing is the common case and costs nothing
