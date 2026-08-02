@@ -384,15 +384,24 @@ pub fn current_key_plane() -> Option<Arc<KeyPlane>> {
     plane_slot().load_full()
 }
 
-/// Install (or replace) the live key plane.
-pub fn install_key_plane(plane: Arc<KeyPlane>) {
+/// Publish a bare key plane for a test that only needs the admin routes to
+/// find one.
+///
+/// [`activate_key_plane`] is the only way a running proxy installs or
+/// removes a plane, and it does more than write this slot: it clears the
+/// mesh readiness view when the committed generation is not mesh-backed,
+/// starts the cross-replica invalidation subscriber, and hands a Redis key
+/// store to the shared budget counters. A test that wants none of that
+/// still needs the slot populated, so this writes it and nothing else.
+///
+/// Gated to `cfg(test)` and named for it, because a second entry point
+/// spelled `install_key_plane` reads like the production installer and is
+/// the shape where a later invariant lands on one path only. There is no
+/// uninstall counterpart: [`TestPlaneGuard`] clears the slot on drop, so a
+/// test cannot leave one behind for the next one to find.
+#[cfg(test)]
+pub(crate) fn install_key_plane_for_test(plane: Arc<KeyPlane>) {
     plane_slot().store(Some(plane));
-}
-
-/// Remove the live key plane when dynamic key management is disabled or
-/// removed during reload.
-pub fn uninstall_key_plane() {
-    plane_slot().store(None);
 }
 
 /// A dedicated, process-lifetime runtime that hosts key-plane async work

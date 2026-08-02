@@ -13893,7 +13893,19 @@ mod compression_selection_tests {
             .compression_runtimes
             .get_set(0)
             .expect("compiled compression runtime set");
-        let selected = runtime_set.select_default();
+        // Resolve the way a request with no selector does, rather than
+        // reaching for the default directly: the intent this produces is
+        // what dispatch binds, so a change to either half shows up here.
+        let intent = resolve_compression_selection_intent(None, None, None)
+            .expect("no selector is always a valid route default");
+        assert_eq!(intent.source, CompressionSelectionSource::RouteDefault);
+        let bound = bind_compression_selection(intent, Some(runtime_set.as_ref()))
+            .expect("the route default binds");
+        assert!(
+            !bound.invalid_operator_selector,
+            "the route default is never an invalid operator selection"
+        );
+        let selected = bound.selected.expect("route-default pipeline");
         let runtime = selected.runtime().expect("route-default runtime");
         let has_captured_session = false;
 
@@ -13904,6 +13916,76 @@ mod compression_selection_tests {
 
         assert!(!semantic_cache_read_enabled);
         assert!(!semantic_cache_write_enabled);
+    }
+
+    /// WOR-2225: the route default has one resolver.
+    ///
+    /// A request that names no selector resolves the default through
+    /// `resolve_compression_selection_intent` and `bind_compression_selection`;
+    /// `CompressionRuntimeSet::select_default` is the name for the same
+    /// answer. They used to be independent readings of "the default" and
+    /// nothing checked that they agreed, so a change to either could have
+    /// left the request path on one pipeline while every test asserted
+    /// against the other. Comparing the pinned runtime by pointer and the
+    /// behaviour fingerprint by value fails if they ever diverge.
+    ///
+    /// The `off` half is the control: it proves the comparison has teeth
+    /// by showing a different selector does resolve somewhere else.
+    #[test]
+    fn the_route_default_dispatch_binds_is_the_set_default() {
+        let config = serde_json::json!({
+            "origins": {
+                "ai.example.com": {
+                    "action": {
+                        "type": "ai_proxy",
+                        "providers": [{"name": "openai", "api_key": "test-key"}],
+                        "compression": {
+                            "levers": [{
+                                "type": "rag_select",
+                                "min_tokens": 512,
+                                "max_chunks": 8
+                            }]
+                        }
+                    }
+                }
+            }
+        });
+        let compiled =
+            sbproxy_config::compile_config(&config.to_string()).expect("route default compiles");
+        let pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .expect("runtime compiles without Redis");
+        let runtime_set = pipeline
+            .compression_runtimes
+            .get_set(0)
+            .expect("compiled compression runtime set");
+
+        let intent = resolve_compression_selection_intent(None, None, None)
+            .expect("no selector is always a valid route default");
+        let bound = bind_compression_selection(intent, Some(runtime_set.as_ref()))
+            .expect("the route default binds");
+        let dispatched = bound.selected.expect("route-default pipeline");
+        let named = runtime_set.select_default();
+
+        assert!(
+            std::sync::Arc::ptr_eq(
+                dispatched.runtime().expect("dispatched runtime"),
+                named.runtime().expect("named runtime"),
+            ),
+            "dispatch must bind the same compiled default pipeline select_default names"
+        );
+        assert_eq!(
+            dispatched.behavior_fingerprint(),
+            named.behavior_fingerprint()
+        );
+
+        let off = runtime_set
+            .select(&CompressionSelector::Off)
+            .expect("off is always compiled");
+        assert!(
+            off.runtime().is_none(),
+            "off must not resolve to the default pipeline"
+        );
+        assert_ne!(off.behavior_fingerprint(), named.behavior_fingerprint());
     }
 
     #[test]

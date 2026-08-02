@@ -2619,8 +2619,8 @@ mod tests {
     #[test]
     fn classify_fine_tuning_surface_uses_underscore_path() {
         // OpenAI uses /v1/fine_tuning (underscore), not /v1/fine-tuning.
-        // The pre-existing parse_endpoint test treated /v1/fine-tuning/jobs
-        // as Unknown; classify_surface accepts the canonical underscore form.
+        // The hyphenated spelling stays Unknown, which is the right
+        // answer: it is not a path OpenAI serves.
         for path in [
             "/v1/fine_tuning/jobs",
             "/v1/fine_tuning/jobs/ftjob_abc",

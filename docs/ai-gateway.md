@@ -1771,10 +1771,12 @@ the returned JSON, and there is no `structured_output:` config key.
 Assistants, threads, batches, image generation, audio, and fine-tuning remain
 live passthrough surfaces. `classify_surface(method, path)` in
 `crates/sbproxy-ai/src/handler.rs` labels every request with an `AiSurface`,
-and `parse_endpoint(path)` in `crates/sbproxy-ai/src/api_routes.rs` types the
-endpoint subset used by provider capability checks. The gateway forwards the
-request to an eligible provider; it does not emulate those provider APIs
-locally, and there are no per-surface emulation config blocks.
+and `provider_supports_surface(provider, surface)` in
+`crates/sbproxy-ai/src/api_routes.rs` answers whether that provider exposes it.
+Those two are the whole path: a surface the classifier names is a surface the
+matrix answers for. The gateway forwards the request to an eligible provider;
+it does not emulate those provider APIs locally, and there are no per-surface
+emulation config blocks.
 
 ### `realtime`
 
