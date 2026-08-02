@@ -1228,7 +1228,7 @@ impl InternalSummarizer for RuntimeInternalSummarizer {
             .await?;
 
         if let Some(budget) = self.budget.as_ref() {
-            crate::server::ai_support::record_budget_usage(
+            crate::server::ai_support::debit_budget_without_billing_event(
                 budget,
                 &budget_keys,
                 request.model,

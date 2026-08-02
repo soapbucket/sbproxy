@@ -1695,9 +1695,12 @@ impl SseUsageScanner {
 /// moderations, reranking, files, batches, fine-tuning) ship today
 /// as `PerCall` events with `cost_usd = 0.0`; per-unit pricing for
 /// images, audio seconds, and rerank documents lands when the
-/// pricing tables ship. Chat completions continue to bill through
-/// `record_budget_usage` until the chat usage-extraction is reworked
-/// to emit the new event shape.
+/// pricing tables ship.
+///
+/// This is the **only** writer into the in-process `BudgetTracker`
+/// (WOR-2212). Every dispatch path that spends budget reaches it, and
+/// a second writer beside it is the bug that made a configured budget
+/// enforce at half its value for as long as one existed.
 /// Map an HTTP status code to a stable RFC 9209 `Proxy-Status`
 /// `error` token. Returns `None` for status codes that don't have
 /// a canonical proxy-error mapping (the header is still emitted
@@ -2370,7 +2373,25 @@ pub(super) fn inprocess_embed(
     }
 }
 
-pub(crate) fn record_budget_usage(
+/// Debit a scope directly, for the one caller that spends without
+/// emitting a billing event.
+///
+/// `compression_runtime`'s internal summarization calls a provider on
+/// the operator's account and never builds an `AiBillingEvent`, so
+/// `record_billing_event` never sees it. Without this it would spend
+/// real money against no budget at all.
+///
+/// **Do not call this from a dispatch path.** Anything that reaches
+/// [`emit_ai_billing_event`] is already debited by
+/// `record_billing_event`, and adding a second debit beside it is
+/// exactly WOR-2212: every AI request spent its budget twice, so a
+/// configured `$100/day` cap stopped traffic at `$50` of real spend,
+/// and nothing looked wrong because the gauge, the admin key detail,
+/// and every budget assertion all read the same doubled tracker.
+///
+/// The right long-term shape is for the compression path to emit a
+/// billing event like everything else, at which point this goes away.
+pub(crate) fn debit_budget_without_billing_event(
     cfg: &sbproxy_ai::BudgetConfig,
     keys: &[(usize, String)],
     model: &str,
@@ -2382,8 +2403,31 @@ pub(crate) fn record_budget_usage(
     }
     let total_tokens = prompt_tokens + completion_tokens;
     let cost = sbproxy_ai::estimate_cost(model, prompt_tokens, completion_tokens);
-    for (limit_idx, key) in keys {
+    for (_, key) in keys {
         BUDGET_TRACKER.record_usage(key, total_tokens, cost);
+    }
+    refresh_budget_utilization(cfg, keys);
+}
+
+/// Republish the budget-utilization gauge for each scope this request
+/// touched.
+///
+/// **This does not debit anything.** `record_billing_event`, reached
+/// through [`emit_ai_billing_event`], is the single writer into
+/// `BUDGET_TRACKER` (WOR-2212). This function used to debit as well,
+/// five hundred lines above the billing event that debited the same
+/// cost against the same scope keys, so every AI request spent its
+/// budget twice and a configured `$100/day` cap stopped traffic at
+/// `$50` of real spend.
+///
+/// Nothing looked wrong because the gauge, the admin key detail, and
+/// every budget assertion all read the same doubled tracker and
+/// therefore agreed with each other.
+///
+/// Call this **after** the billing event, so the gauge reflects the
+/// debit rather than lagging it by one request.
+pub(crate) fn refresh_budget_utilization(cfg: &sbproxy_ai::BudgetConfig, keys: &[(usize, String)]) {
+    for (limit_idx, key) in keys {
         let limit = &cfg.limits[*limit_idx];
         let usage = BUDGET_TRACKER.get_usage(key);
         if let Some(ratio) = limit_utilization(usage.tokens, usage.cost_usd, limit) {
@@ -4168,5 +4212,93 @@ mod budget_window_tests {
         }
         let flood = serde_json::json!({"choices": [{"message": {"tool_calls": many}}]});
         assert_eq!(extract_tool_calls(&flood).len(), AI_TOOL_CALL_EVENTS_MAX);
+    }
+
+    // --- WOR-2212: one request, one debit ---
+
+    use super::{debit_budget_without_billing_event, refresh_budget_utilization};
+    use crate::server::BUDGET_TRACKER;
+
+    /// One api-key-scoped token cap, spelled out because neither
+    /// `BudgetConfig` nor `BudgetLimit` implements `Default`.
+    fn api_key_token_cap(max_tokens: u64) -> BudgetConfig {
+        BudgetConfig {
+            limits: vec![BudgetLimit {
+                scope: BudgetScope::ApiKey,
+                max_tokens: Some(max_tokens),
+                max_cost_usd: None,
+                period: None,
+                downgrade_to: None,
+            }],
+            on_exceed: OnExceedAction::default(),
+            soft_landing: None,
+        }
+    }
+
+    /// The regression guard for the double debit.
+    ///
+    /// `refresh_budget_utilization` used to be `record_budget_usage`,
+    /// which debited the tracker *and* refreshed the gauge, while sitting
+    /// five hundred lines above a billing event that debited the same
+    /// cost against the same scope keys. Every AI request therefore spent
+    /// its budget twice and a configured `$100/day` cap stopped traffic
+    /// at `$50` of real spend.
+    ///
+    /// Nothing looked wrong because the gauge, the admin key detail, and
+    /// every budget assertion read the same doubled tracker and so agreed
+    /// with each other. The only assertion that catches it is one that
+    /// compares the tracker against an independently known number, which
+    /// is what this does: refresh the gauge and require the tracker not
+    /// to have moved at all.
+    #[test]
+    fn refreshing_the_gauge_does_not_debit_the_tracker() {
+        let key = format!("wor2212:{}:gauge-refresh", std::process::id());
+        let cfg = api_key_token_cap(1_000);
+        let keys = vec![(0usize, key.clone())];
+
+        // A known starting point that this test owns outright.
+        BUDGET_TRACKER.record_usage(&key, 100, 0.25);
+        let before = BUDGET_TRACKER.get_usage(&key);
+
+        // Refreshing the gauge is a read. Doing it repeatedly must not
+        // accumulate anything, which is the property the old shape broke.
+        for _ in 0..5 {
+            refresh_budget_utilization(&cfg, &keys);
+        }
+
+        let after = BUDGET_TRACKER.get_usage(&key);
+        assert_eq!(
+            after.tokens, before.tokens,
+            "refreshing the utilization gauge must not debit tokens"
+        );
+        assert!(
+            (after.cost_usd - before.cost_usd).abs() < 1e-9,
+            "refreshing the utilization gauge must not debit cost"
+        );
+        assert_eq!(
+            after.request_count, before.request_count,
+            "refreshing the utilization gauge must not count a request"
+        );
+    }
+
+    /// The compression path spends without a billing event, so it keeps
+    /// its own debit. This pins that it still debits, because the fix for
+    /// the double debit was to remove a debit and it would be easy to
+    /// remove this one too.
+    #[test]
+    fn the_billing_event_free_path_still_debits_exactly_once() {
+        let key = format!("wor2212:{}:no-billing-event", std::process::id());
+        let cfg = api_key_token_cap(10_000);
+        let keys = vec![(0usize, key.clone())];
+
+        let before = BUDGET_TRACKER.get_usage(&key);
+        debit_budget_without_billing_event(&cfg, &keys, "gpt-4o", 300, 200);
+        let after = BUDGET_TRACKER.get_usage(&key);
+
+        assert_eq!(
+            after.tokens - before.tokens,
+            500,
+            "one call must debit its tokens once, not twice and not zero times"
+        );
     }
 }

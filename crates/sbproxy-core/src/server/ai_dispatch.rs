@@ -8361,14 +8361,13 @@ pub(super) async fn relay_ai_response_with_cache(
                     }
                 }
             }
-            record_budget_usage(
-                args.config,
-                args.keys,
-                args.model,
-                budget_prompt_tokens,
-                budget_completion_tokens,
-            );
-            // WOR-1722: also accumulate into the cluster-shared counters
+            // WOR-2212: the local debit lives in `record_billing_event`,
+            // reached through the `emit_ai_billing_event` call below.
+            // This used to debit here as well, so every request spent
+            // its budget twice. The gauge refresh moved down beside that
+            // call so it reads the tracker after the debit.
+            //
+            // WOR-1722: accumulate into the cluster-shared counters
             // (no-op without a shared store) so other replicas enforce
             // against this spend.
             super::budget_share::record_shared_budget_usage(
@@ -8433,6 +8432,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 args.agent_identity(),
                 &ai_span,
             );
+            refresh_budget_utilization(args.config, args.keys);
             if cost_micros > 0 {
                 if let Some(ctx_ref) = ctx.as_mut() {
                     ctx_ref.ai_cost_usd_micros = Some(cost_micros);
@@ -10489,13 +10489,10 @@ pub(super) async fn relay_ai_stream(
     if let (Some(args), Some(parser)) = (budget_recorder.as_ref(), usage_parser.as_ref()) {
         if (200..300).contains(&status) {
             if let Some(tokens) = parser.snapshot() {
-                record_budget_usage(
-                    args.config,
-                    args.keys,
-                    args.model,
-                    tokens.prompt_tokens as u64,
-                    tokens.completion_tokens as u64,
-                );
+                // WOR-2212: same single-writer rule as the relay path.
+                // The local debit is `record_billing_event`, below; the
+                // gauge refresh follows it.
+                //
                 // WOR-1722: mirror into the cluster-shared counters.
                 super::budget_share::record_shared_budget_usage(
                     args.config,
@@ -10547,6 +10544,7 @@ pub(super) async fn relay_ai_stream(
                     args.agent_identity(),
                     &ai_span,
                 );
+                refresh_budget_utilization(args.config, args.keys);
                 // WOR-1835: governed-key settlement. `ai_admission` never
                 // reconciles on the streaming path (its reservation is
                 // simply refunded in full on drop), a pre-existing gap
