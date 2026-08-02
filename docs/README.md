@@ -74,6 +74,7 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [cloudflare-code-mode.md](cloudflare-code-mode.md) - typed TypeScript module emission for Cloudflare Code Mode agents over the MCP federation registry.
 - [ai-crawl-control.md](ai-crawl-control.md) - the `ai_crawl_control` policy: Pay Per Crawl token challenge and ledger trait.
 - [payment-settlement.md](payment-settlement.md) - `proxy.payments`: charge for a request and prove it was paid before the origin is called.
+- [metering.md](metering.md) - attested metering: signed, hash-chained consumption receipts, the operator surface that reads and verifies the chain, and buyer-side verification against the published key set.
 - [content-for-agents.md](content-for-agents.md) - operator guide to agent-aware content delivery: shape negotiation, body transforms, well-known license posture.
 - [rsl.md](rsl.md) - RSL 1.0 licensing cookbook: expressing license stance via YAML and the resulting `/licenses.xml` projection.
 - [web-bot-auth.md](web-bot-auth.md) - the `bot_auth` provider: verifying RFC 9421-signed AI crawlers against a published key directory.
